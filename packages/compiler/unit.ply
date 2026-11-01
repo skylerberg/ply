@@ -8,12 +8,12 @@ import compiler.emit.output (Output, RootOutput, Tables, DefinitionSymbol, Proto
                              no_tables, GenericCall, Generics, Need, ForwardedParameter, NeedKind,
                              Scalar, Layout, Exact, EffectsGeneric, needs_specialisation,
                              PublishedSignature, Keyed, KeyedTag, KeyedField, KeyedEntry,
-                             shared_function_bin)
+                             shared_function_bin, prototype_bin, published_signature_bin, need_bin)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticFile, StaticWords, StaticWord,
-                                       FieldWord, AddressWord, named_by_content, words_of,
-                                       static_definition_bin)
+                                       FieldWord, AddressWord, EntryWord, named_by_content,
+                                       words_of, entries_of, static_definition_bin)
 import compiler.emit.c (escaped, c_string)
-import compiler.emit.print.statics (static_c, static_extern)
+import compiler.emit.print.statics (static_c, static_extern, static_cells, StaticCell)
 import compiler.emit.release (root_of)
 import compiler.emit.statics (StringDatum, statics_of)
 import compiler.emit.roots (builtin_helper, symbol_of, entry_symbol, root_id)
@@ -24,14 +24,14 @@ import compiler.emit.keys (printed, RootKey, Named, Specialisation, Generated, T
                            LawPart, InlinedLambda, KeyArg, KeyType, KeyLayout, RootName, root_name,
                            root_text, definition_of, site_owner, inlined_lambdas, key_types,
                            specialisation_key, module_of, modules_lowered, key_bytes, root_key_bin,
-                           test_key, law_key, entry_name, claims_key)
+                           test_key, law_key, entry_name, claims_key, root_name_bin, unspecialised)
 import compiler.store.records (Record, record_store, with_record_store)
 import compiler.emit
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
 import compiler.emit.representations (Constructors, layout_variables, has_variables, is_scalar_type,
                                       constructor_sums, constructors_of, type_variables, layout_key,
-                                      no_constructors, numeric_sum, type_names, with_sums_laid,
-                                      with_released)
+                                      layout_representative, no_constructors, numeric_sum,
+                                      type_names, with_sums_laid, with_released)
 import compiler.front.rows (Dump, EmitterRoot, EmitterConstructor, ConstructorRow, KeyRow,
                             ModuleRow, OrdinalRow, KnownDefinitionRow, DefinitionRow, SpecRow,
                             TestRow, LawRow, BinderRow, TypeRow, EffectRow, HashTableRow,
@@ -52,7 +52,8 @@ import compiler.cc
 import compiler.cc (part_mark, written_part, Source, WrittenPart, toolchain)
 import compiler.emit.abi
 import compiler.emit.abi (Native, Runtime, RuntimeMismatch, runtime_mismatches, mismatch_line,
-                          runtime_of, word_native, serving_runtime, Machine, machine_name)
+                          runtime_of, word_native, serving_runtime, Machine, machine_name,
+                          native_bin)
 import compiler.prelude_source
 import compiler.front.interface (embed_read_digest, length_prefixed)
 import compiler.expand.embed (ModuleEmbed, embed_file)
@@ -467,6 +468,8 @@ pub fn write_cached_file<[r]>(
 
 pub type RequestedRoot = { name: RootName, arity: Int, constant: Bool, site: RootName, home: Bytes }
 
+derive bin for RequestedRoot
+
 pub type Constructor = { name: Bytes, arity: Int }
 
 pub type UnitContents = {
@@ -542,6 +545,7 @@ fn taken_bodies(
   results: Map<RootName, Output>,
   stored: Map<RootName, Stored>,
   taken: List<RootName>,
+  foreign: Map<RootName, Prototype>,
 ) -> { bodies: List<UnitBody>, defined: Map<RootName, DefinitionSymbol> } / {abort.raise} = {
   let set = taken.fold(Map::new(), |accumulator: Map<RootName, Bool>, n: RootName|
     accumulator.insert(n, true));
@@ -555,7 +559,8 @@ fn taken_bodies(
               Bytes::concat_all([b"the emitter returned nothing for `", root_text(name), b"`"]),
             ),
           ),
-        Some(b) -> match b.tables.calls.map(root_name).find(|c: RootName| !set.contains(c)) {
+        Some(b) -> match b.tables.calls.map(root_name).find(|c: RootName|
+            !set.contains(c) && !foreign.contains(c)) {
           Some(callee) ->
             panic(
               String::of_bytes_lossy(
@@ -927,14 +932,16 @@ fn tables_part(
   lambdas: List<Bytes>,
   exports: Bytes,
   taken: Int,
+  linked: Bool,
 ) -> Bytes / {abort.raise} =
   section(
     "tables",
     Bytes::concat_all([
+      if linked { b"extern const struct ply_links ply_links;\n" } else { b"" },
       Bytes::concat_all(
         parts.filter(|p: Planned| p.places.len() > 0).map(|p: Planned|
           Bytes::concat_all([
-            b"const uint32_t ",
+            if linked { b"uint32_t " } else { b"const uint32_t " },
             part_table(p.label),
             b"[] = {",
             Bytes::concat_all(
@@ -952,7 +959,9 @@ fn tables_part(
       b"extern const struct ply_taken ply_taken[];\n",
       b"void ply_bind(void **fns);\n",
       b"struct ply_descriptor { const char *exports; unsigned long exports_len; void *bind; void *bind_singletons; void *const *code; unsigned long code_count; const struct ply_taken *taken; unsigned long taken_count; };\n",
-      b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, (void *)0, ply_code, ",
+      b"const struct ply_descriptor ply_descriptor = { ply_exports, sizeof ply_exports - 1, (void *)ply_bind, ",
+      if linked { b"(void *)&ply_links" } else { b"(void *)0" },
+      b", ply_code, ",
       ascii_of_int(lambdas.len()),
       b", ply_taken, ",
       ascii_of_int(taken),
@@ -962,12 +971,14 @@ fn tables_part(
 
 fn fields_part(
   statics: List<StaticDefinition>,
+  relocated: (StaticDefinition) -> Bool,
   constant_c: (StaticDefinition) -> Bytes / {abort.raise},
+  cells: Bytes,
 ) -> Bytes / {abort.raise} = {
-  let with_fields = statics.filter(has_fields);
+  let with_fields = statics.filter(relocated);
   let own = with_fields.fold(Map::new(), |accumulator: Map<Bytes, Bool>, d: StaticDefinition|
     accumulator.insert(d.name, true));
-  if with_fields.len() == 0 { b"" } else {
+  if with_fields.len() == 0 && cells.len() == 0 { b"" } else {
     section(
       "fields",
       Bytes::concat_all([
@@ -980,6 +991,7 @@ fn fields_part(
           ),
         ),
         Bytes::concat_all(with_fields.map(constant_c)),
+        cells,
       ]),
     )
   }
@@ -1037,6 +1049,7 @@ fn part_keys(group: List<BodyHoles>) -> List<Bytes> =
 fn constants_defined(
   group: List<BodyHoles>,
   defined: Map<Bytes, Bool>,
+  relocated: (StaticDefinition) -> Bool,
 ) -> { constants: List<StaticDefinition>, defined: Map<Bytes, Bool> } =
   group.fold(
     { constants: [], defined: defined },
@@ -1044,7 +1057,7 @@ fn constants_defined(
       m.body.tables.statics.fold(
         accumulator,
         |a: { constants: List<StaticDefinition>, defined: Map<Bytes, Bool> }, d: StaticDefinition|
-          if has_fields(d) || a.defined.contains(d.name) { a }
+          if relocated(d) || a.defined.contains(d.name) { a }
           else { { constants: a.constants.push(d), defined: a.defined.insert(d.name, true) } },
       ),
   )
@@ -1144,12 +1157,13 @@ fn planned(
   bodies: List<BodyHoles>,
   rule: PartRule,
   position: (Bytes) -> Int / {abort.raise},
+  relocated: (StaticDefinition) -> Bool,
 ) -> List<Planned> / {abort.raise} =
   split_into_parts(bodies, rule).fold(
     { parts: [], defined: Map::new() },
     |accumulator: { parts: List<Planned>, defined: Map<Bytes, Bool> }, group: List<BodyHoles>| {
       let keys = part_keys(group);
-      let c = constants_defined(group, accumulator.defined);
+      let c = constants_defined(group, accumulator.defined, relocated);
       {
         parts: accumulator.parts.push({
           label: part_label(group.get(0).body.name),
@@ -1190,12 +1204,19 @@ fn part_written<| e>(
   named: Map<RootName, List<RootName>>,
   read: (Bytes) -> Option<Bytes> / e,
   source_cached: (String) -> Bool / e,
+  foreign: Map<RootName, Prototype>,
 ) -> { part: WrittenPart, records: List<Record> } / {abort.raise | e} = {
   let prototypes = sorted_unique_names(
     p.group.fold([], |accumulator: List<RootName>, m: BodyHoles|
       accumulator.concat(reachable_names(m.body.name, m.body.tables))),
   ).map(|name: RootName|
-    match taken.get(name) { Some(t) -> prototype(t.symbol, t.prototype), None -> b"" });
+    match taken.get(name) {
+      Some(t) -> prototype(t.symbol, t.prototype),
+      None -> match foreign.get(name) {
+        Some(head) -> slot_declared(symbol_named(name), head),
+        None -> b"",
+      },
+    });
   let called = p.group.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: BodyHoles|
     m.body.tables.natives.fold(accumulator, |x: Map<Bytes, Bool>, n: Bytes| x.insert(n, true)));
   let natives = machine.filter(|n: Native| called.contains(n.name));
@@ -1272,7 +1293,10 @@ pub fn produce<| e>(
   named: Map<RootName, List<RootName>>,
   read: (Bytes) -> Option<Bytes> / e,
   source_cached: (String) -> Bool / e,
+  foreign: Option<Map<RootName, Prototype>> = None,
 ) -> UnitOutput / {abort.raise | e} = {
+  let linked = foreign != None;
+  let outside = match foreign { Some(m) -> m, None -> Map::new() };
   let offers = offered.fold(
     Map::new(),
     |accumulator: Map<RootName, RequestedRoot>, o: RequestedRoot| accumulator.insert(o.name, o),
@@ -1283,7 +1307,7 @@ pub fn produce<| e>(
       None -> panic("every body in the compiled program must have been requested"),
     };
   let names = sorted_unique_names(offered.map(|o: RequestedRoot| o.name));
-  let s = taken_bodies(results, stored, names);
+  let s = taken_bodies(results, stored, names, outside);
   let machine = machine_called(s.bodies, machine_of);
   let published = |n: RootName|
     match s.defined.get(n) {
@@ -1297,10 +1321,11 @@ pub fn produce<| e>(
   let constants = names.filter(|n: RootName|
     match offers.get(n) { Some(o) -> o.constant, None -> false });
   let statics = ordered_statics(s.bodies);
-  let pools = pools_of(
-    s.bodies,
-    statics,
-    constants.map(|n: RootName| { name: n, entry: entry(n) }),
+  let elsewhere = |k: RootKey| outside.contains(root_name(k));
+  let relocated = |d: StaticDefinition| has_fields(d) || entries_of(d).any(elsewhere);
+  let pools = own_entries_of(
+    pools_of(s.bodies, statics, constants.map(|n: RootName| { name: n, entry: entry(n) })),
+    outside,
   );
   let placed = table_positions(pools);
   let constant_c = |d: StaticDefinition|
@@ -1316,6 +1341,7 @@ pub fn produce<| e>(
               "the compiled program embeds a file whose contents were not supplied, but the build must supply the contents of every file the program embeds",
             ),
         },
+      linking: if linked && relocated(d) { Some(elsewhere) } else { None },
     );
   let tags = positions(constructors.map(|c: Constructor| c.name));
   let taken = names.map(|n: RootName|
@@ -1359,7 +1385,12 @@ pub fn produce<| e>(
       }),
   ).values(
   );
-  let plans = planned(marked, rule, |k: Bytes| unit_position(k, placed, tags));
+  let plans = planned(
+    marked,
+    rule,
+    |k: Bytes| if linked { 0 } else { unit_position(k, placed, tags) },
+    relocated,
+  );
   let exports = exports_text(
     bound_functions().concat(machine),
     constants.map(|n: RootName|
@@ -1385,15 +1416,22 @@ pub fn produce<| e>(
         named,
         read,
         source_cached,
+        outside,
       );
       { parts: accumulator.parts.push(w.part), records: accumulator.records.concat(w.records) }
     },
   );
   let tail = [
     { label: "runtime", text: unit_tail(machine) },
-    { label: "fields", text: fields_part(statics, constant_c) },
+    {
+      label: "fields",
+      text: fields_part(statics, relocated, constant_c, if linked {
+        cells_of(statics.filter(relocated), outside)
+      } else { b"" }),
+    },
     { label: "taken", text: taken_part(by_name.values()) },
-    { label: "tables", text: tables_part(plans, pools.lambdas, exports, by_name.len()) },
+    { label: "tables", text: tables_part(plans, pools.lambdas, exports, by_name.len(), linked) },
+    { label: "links", text: if linked { links_part(plans, pools.lambdas, by_name) } else { b"" } },
   ].filter(|s: { label: String, text: Bytes }| s.text.len() > 0).map(
     |s: { label: String, text: Bytes }| written_part(unit_header(), s.label, s.text),
   );
@@ -1404,6 +1442,141 @@ pub fn produce<| e>(
     records: written.records,
   }
 }
+
+fn own_entries_of(pools: Pools, foreign: Map<RootName, Prototype>) -> Pools / {abort.raise} = {
+  let theirs = foreign.fold(Map::new(), |m: Map<Bytes, Bool>, n: RootName, _: Prototype|
+    m.insert(entry_symbol(root_text(n)), true));
+  { ..pools, lambdas: pools.lambdas.filter(|l: Bytes| !theirs.contains(l)) }
+}
+
+fn slot_of(symbol: Bytes) -> Bytes = b"ply_slot_".concat(symbol)
+
+fn slot_declared(symbol: Bytes, head: Prototype) -> Bytes =
+  Bytes::concat_all([
+    b"extern ",
+    prototype(Bytes::concat_all([b"(*", slot_of(symbol), b")"]), head),
+    b"#define ",
+    symbol,
+    b" (*",
+    slot_of(symbol),
+    b")\n",
+  ])
+
+fn name_rows(table: Bytes, rows: List<{ name: Bytes, cell: Bytes }>) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"const struct ply_name_cell ",
+    table,
+    b"[] = {\n",
+    Bytes::concat_all(
+      rows.map(|r: { name: Bytes, cell: Bytes }|
+        Bytes::concat_all([b"  { \"", escaped(r.name), b"\", (void *)", r.cell, b" },\n"])),
+    ),
+    b"  { 0, 0 } };\n",
+  ])
+
+fn name_cell_struct() -> Bytes = b"struct ply_name_cell { const char *name; void *cell; };\n"
+
+fn cells_of(
+  relocated: List<StaticDefinition>,
+  foreign: Map<RootName, Prototype>,
+) -> Bytes / {abort.raise} = {
+  let cells = relocated.fold([], |accumulator: List<StaticCell>, d: StaticDefinition|
+    accumulator.concat(static_cells(d)));
+  let slot_cells = foreign.keys().map(|n: RootName|
+    { name: symbol_named(n), cell: b"&".concat(slot_of(symbol_named(n))) });
+  let entry_cells = cells.fold(
+    [],
+    |accumulator: List<{ name: Bytes, cell: Bytes }>, c: StaticCell|
+      match c.word {
+        EntryWord(k) -> if foreign.contains(root_name(k)) {
+          accumulator.push({ name: symbol_named(root_name(k)), cell: b"&".concat(c.cell) })
+        } else { accumulator },
+        _ -> accumulator,
+      },
+  );
+  let field_cells = cells.fold(
+    [],
+    |accumulator: List<{ name: Bytes, cell: Bytes }>, c: StaticCell|
+      match c.word {
+        FieldWord(f) -> accumulator.push({ name: f, cell: b"&".concat(c.cell) }),
+        _ -> accumulator,
+      },
+  );
+  Bytes::concat_all([
+    name_cell_struct(),
+    Bytes::concat_all(
+      foreign.keys().map(|n: RootName|
+        Bytes::concat_all([b"void *", slot_of(symbol_named(n)), b";\n"])),
+    ),
+    name_rows(b"ply_slots", slot_cells.concat(entry_cells)),
+    name_rows(b"ply_field_words", field_cells),
+  ])
+}
+
+fn links_part(
+  plans: List<Planned>,
+  lambdas: List<Bytes>,
+  own: Map<RootName, IncludedRoot>,
+) -> Bytes / {abort.raise} = {
+  let keys = plans.fold([], |accumulator: List<{ name: Bytes, cell: Bytes }>, p: Planned|
+    range(0, p.keys.len()).fold(accumulator, |a: List<{ name: Bytes, cell: Bytes }>, i: Int|
+      a.push({
+        name: p.keys.get(i),
+        cell: Bytes::concat_all([b"&", part_table(p.label), b"[", ascii_of_int(i), b"]"]),
+      })));
+  let defined = own.values();
+  section(
+    "links",
+    Bytes::concat_all([
+      name_cell_struct(),
+      b"extern const struct ply_name_cell ply_slots[];\n",
+      b"extern const struct ply_name_cell ply_field_words[];\n",
+      Bytes::concat_all(defined.map(|t: IncludedRoot| prototype(t.symbol, t.prototype))),
+      Bytes::concat_all(
+        plans.filter(|p: Planned| p.places.len() > 0).map(|p: Planned|
+          Bytes::concat_all([b"extern uint32_t ", part_table(p.label), b"[];\n"])),
+      ),
+      name_rows(
+        b"ply_exported",
+        defined.map(|t: IncludedRoot| { name: t.symbol, cell: b"&".concat(t.symbol) }),
+      ),
+      name_rows(b"ply_keys", keys),
+      b"const char *const ply_code_names[] = {\n",
+      Bytes::concat_all(lambdas.map(|l: Bytes| Bytes::concat_all([b"  \"", escaped(l), b"\",\n"]))),
+      b"  0 };\n",
+      b"struct ply_links { const struct ply_name_cell *slots, *exported, *keys, *field_words; const char *const *code_names; };\n",
+      b"const struct ply_links ply_links = { ply_slots, ply_exported, ply_keys, ply_field_words, ply_code_names };\n",
+    ]),
+  )
+}
+
+pub fn part_library(
+  codes: List<UnitCode>,
+  foreign: Map<RootName, Prototype>,
+  inputs: Map<Bytes, Bytes>,
+) -> UnitOutput / {abort.raise} =
+  produce(
+    [],
+    codes.fold([], |accumulator: List<RequestedRoot>, c: UnitCode| accumulator.concat(c.requested)),
+    1,
+    codes.fold(Map::new(), |accumulator: Map<RootName, Output>, c: UnitCode|
+      results_by_name(c.results).fold(
+        accumulator,
+        |m: Map<RootName, Output>, n: RootName, a: Output| m.insert(n, a),
+      )),
+    inputs,
+    |called: Map<Bytes, Bool>|
+      codes.fold([], |accumulator: List<Native>, c: UnitCode|
+        accumulator.concat(c.natives.filter(|n: Native| called.contains(n.name)))),
+    { bits: part_rule().bits, min: library_part_size(), max: library_part_size() },
+    Map::new(),
+    Map::new(),
+    |_: Bytes| None,
+    |_: String| false,
+    foreign: Some(foreign),
+  )
+
+fn library_part_size() -> Int = 1 << 60
 
 pub fn cache_parts(
   parts: List<WrittenPart>,
@@ -1474,7 +1647,7 @@ pub fn codes(made: UnitContents) -> Map<RootName, Bytes> / {abort.raise} = {
   })
 }
 
-type Program = {
+pub type Program = {
   roots: Map<RootName, EmitterRoot>,
   keys: Map<RootName, Bytes>,
   modules: List<ModuleRow>,
@@ -1490,7 +1663,11 @@ type Program = {
   constructor_functions: Map<Bytes, Bool>,
 }
 
-fn program_of(dump: Dump, sources: List<Bytes>, roots: List<RootKey>) -> Program / {abort.raise} = {
+pub fn program_of(
+  dump: Dump,
+  sources: List<Bytes>,
+  roots: List<RootKey>,
+) -> Program / {abort.raise} = {
   let results_and_keys = roots_by_row_name(dump);
   let named = |row: Bytes|
     match results_and_keys.get(row) { Some(k) -> Some(root_name(k)), None -> None };
@@ -1617,7 +1794,7 @@ fn required_modules(p: Program, ks: List<RootKey>) -> Map<Bytes, Bool> / {abort.
   ).closed
 }
 
-fn types_keyed(k: RootKey) -> List<Type> =
+pub fn types_keyed(k: RootKey) -> List<Type> =
   match k {
     Specialisation(_, _) ->
       inlined_lambdas(k).fold(key_types(k), |accumulator: List<Type>, f: InlinedLambda|
@@ -1969,7 +2146,7 @@ fn results_to_cache<| e>(
       },
   )
 
-fn program_constructors(dump: Dump, constructors: List<Constructor>) -> Constructors = {
+pub fn program_constructors(dump: Dump, constructors: List<Constructor>) -> Constructors = {
   let table = constructors_of(
     constructors.map(|c: Constructor| c.name),
     dump.emitter_constructors.filter(|c: EmitterConstructor| c.key != None).map(
@@ -2711,6 +2888,346 @@ fn specialise_generic_calls<s>(
 
 pub fn entered_timeout_ms() -> Int = 60000
 
+fn constructor_names(dump: Dump) -> List<Constructor> =
+  dump.emitter_constructors.map(|c: EmitterConstructor| { name: c.name, arity: c.arity })
+
+fn entered_roots(
+  p: Program,
+  every: List<RootKey>,
+  entered: Option<List<RootKey>>,
+) -> List<RootKey> =
+  (match entered { Some(ks) -> ks, None -> every }).filter(|k: RootKey| runtime_enters(p, k)).map(
+    EntryPoint,
+  )
+
+fn walked_whole<| e>(
+  dump: Dump,
+  p: Program,
+  offered: List<RootKey>,
+  read: (Bytes) -> Option<Bytes> / e,
+  keep: (List<Record>) -> Unit / e,
+  phases: Option<{ now: () -> Int / e, outcome: (LevelTally) -> Unit / e }>,
+) -> EmissionProgress<EmitterScope> / {abort.raise | e} = {
+  let constructors = constructor_names(dump);
+  walk_levels(
+    p,
+    types_digest(dump),
+    program_constructors(dump, constructors),
+    offered,
+    read,
+    keep,
+    phases,
+    initial_emitter_scope,
+    |scope: EmitterScope, roots: List<RootKey>, ownership: Map<RootName, OwnershipSignature>, done: KnownResults|
+      emit_scoped(dump, p, constructors, offered, scope, roots, ownership, done),
+  )
+}
+
+pub type WholeLowering = {
+  results: Map<RootName, Output>,
+  order: List<RootKey>,
+  constructors: Constructors,
+  natives: List<Extern>,
+  program: Program,
+}
+
+pub fn lowered_whole(
+  dump: Dump,
+  sources: List<Bytes>,
+  every: List<RootKey>,
+  entered: Option<List<RootKey>>,
+) -> WholeLowering / {abort.raise} = {
+  let p = program_of(dump, sources, every);
+  let all = walked_whole(
+    dump,
+    p,
+    every.concat(entered_roots(p, every, entered)),
+    |_: Bytes| None,
+    |_: List<Record>| (),
+    None,
+  );
+  let places = module_levels(p);
+  let place = |k: RootKey| match places.get(owning_module(k)) { Some(l) -> l, None -> 0 };
+  {
+    results: all.results,
+    order: all.keys.values().sort_by(|a: RootKey, b: RootKey| place(a) <= place(b)),
+    constructors: program_constructors(dump, constructor_names(dump)),
+    natives: read_natives(
+      p,
+      all.results.fold(Map::new(), |accumulator: Map<Bytes, Bool>, _: RootName, a: Output|
+        a.tables.natives.fold(accumulator, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true))),
+    ),
+    program: p,
+  }
+}
+
+pub type RootSummary = { key: RootKey, calls: List<RootKey>, head: Option<Prototype> }
+
+pub type UnitSummary = {
+  published: List<PublishedSignature>,
+  needs: Map<RootName, List<Need>>,
+  called: Map<RootName, List<Int>>,
+  roots: List<RootSummary>,
+}
+
+pub type UnitCode = {
+  results: List<RootOutput>,
+  requested: List<RequestedRoot>,
+  natives: List<Native>,
+}
+
+derive bin for RootSummary
+
+derive bin for UnitSummary
+
+derive bin for UnitCode
+
+pub type LoweredUnit = { code: UnitCode, summary: UnitSummary }
+
+pub type LoweredBatch = {
+  results: List<RootOutput>,
+  constructors: Constructors,
+  program: Program,
+  natives: List<Extern>,
+}
+
+pub type CalleeFacts = {
+  published: Map<RootName, PublishedSignature>,
+  ownership: Map<RootName, OwnershipSignature>,
+  needs: Map<RootName, List<Need>>,
+  called: Map<RootName, List<Int>>,
+  read: Map<RootName, Bool>,
+}
+
+pub fn no_callee_facts() -> CalleeFacts =
+  {
+    published: Map::new(),
+    ownership: Map::new(),
+    needs: Map::new(),
+    called: Map::new(),
+    read: Map::new(),
+  }
+
+pub fn with_callee(facts: CalleeFacts, s: UnitSummary) -> CalleeFacts =
+  {
+    published: s.published.fold(
+      facts.published,
+      |m: Map<RootName, PublishedSignature>, h: PublishedSignature| m.insert(h.definition, h),
+    ),
+    ownership: signatures_from(s.published).fold(
+      facts.ownership,
+      |m: Map<RootName, OwnershipSignature>, n: RootName, h: OwnershipSignature| m.insert(n, h),
+    ),
+    needs: s.needs.fold(facts.needs, |m: Map<RootName, List<Need>>, n: RootName, x: List<Need>|
+      m.insert(n, x)),
+    called: s.called.fold(facts.called, |m: Map<RootName, List<Int>>, n: RootName, x: List<Int>|
+      m.insert(n, x)),
+    read: facts.read,
+  }
+
+type UnitWalk<s> = {
+  results: Map<RootName, Output>,
+  keys: Map<RootName, RootKey>,
+  batches: Map<RootName, LoweredBatch>,
+  facts: CalleeFacts,
+  needs: Map<RootName, List<Need>>,
+  called: Map<RootName, List<Int>>,
+  state: s,
+}
+
+fn callees_named(a: Output) -> List<RootKey> =
+  a.tables.calls.concat(a.tables.generics.calls.map(|g: GenericCall| g.callee)).map(unspecialised)
+
+fn with_lowered<s>(
+  w: UnitWalk<s>,
+  asked: List<RootKey>,
+  state: s,
+  batches: List<LoweredBatch>,
+) -> UnitWalk<s> =
+  batches.fold(
+    {
+      ..w,
+      state: state,
+      keys: asked.fold(w.keys, |m: Map<RootName, RootKey>, k: RootKey| m.insert(root_name(k), k)),
+    },
+    |walk: UnitWalk<s>, b: LoweredBatch| {
+      let made = results_by_name(b.results);
+      {
+        ..walk,
+        results: made.fold(walk.results, |m: Map<RootName, Output>, n: RootName, a: Output|
+          m.insert(n, a)),
+        batches: made.fold(
+          walk.batches,
+          |m: Map<RootName, LoweredBatch>, n: RootName, _: Output| m.insert(n, b),
+        ),
+      }
+    },
+  )
+
+pub fn unit_lowered<s | e>(
+  roots: List<RootKey>,
+  start: s,
+  ask: (s, List<RootKey>, Map<RootName, OwnershipSignature>) -> { state: s, batches: List<LoweredBatch> } / {abort.raise | e},
+  callees_read: (CalleeFacts, List<RootKey>) -> CalleeFacts / {abort.raise | e},
+  belongs: (RootKey) -> Bool / {abort.raise | e},
+) -> LoweredUnit / {abort.raise | e} = {
+  let seeded = callees_read(no_callee_facts(), roots.map(unspecialised));
+  let first = ask(start, roots, seeded.ownership);
+  let settled = iterate(
+    with_lowered(
+      {
+        results: Map::new(),
+        keys: Map::new(),
+        batches: Map::new(),
+        facts: seeded,
+        needs: Map::new(),
+        called: Map::new(),
+        state: first.state,
+      },
+      roots,
+      first.state,
+      first.batches,
+    ),
+    66,
+    |w: UnitWalk<s>| {
+      let facts = w.results.fold(w.facts, |f: CalleeFacts, _: RootName, a: Output|
+        callees_read(f, callees_named(a)));
+      let published = published_signatures(facts.published, w.results);
+      let names = w.results.keys();
+      let bodies = generic_bodies(w.results, w.keys, names);
+      let needs = extended_needs(bodies, facts.needs);
+      let called = extended_called(bodies, facts.called);
+      let more = names.fold(Map::new(), |accumulator: Map<RootName, RootKey>, n: RootName|
+        match ((w.results.get(n), w.batches.get(n))) {
+          (Some(b), Some(batch)) -> if specialised_by_callers(w.keys, n, b.tables, needs) {
+            accumulator
+          } else {
+            b.tables.generics.calls.fold(accumulator, |m: Map<RootName, RootKey>, g: GenericCall| {
+              let root = call_specialisation(g, needs, called, batch.constructors);
+              let name = root_name(root);
+              if w.results.contains(name) || m.contains(name) || !belongs(root) { m }
+              else { m.insert(name, root) }
+            })
+          },
+          _ -> accumulator,
+        });
+      let stale = stale_of(w.results, published, w.keys);
+      let asking = more.values().concat(stale);
+      let walked = { ..w, facts: facts, needs: needs, called: called };
+      if asking.len() == 0 { Stop(walked) } else {
+        let got = ask(w.state, asking, merged_ownership(facts.ownership, w.results));
+        Continue(with_lowered(walked, asking, got.state, got.batches))
+      }
+    },
+  );
+  unit_finished(settled)
+}
+
+fn unit_finished<s>(w: UnitWalk<s>) -> LoweredUnit / {abort.raise} = {
+  let constructors_at = |n: RootName|
+    match w.batches.get(n) {
+      Some(b) -> b.constructors,
+      None -> panic("a unit's root was lowered in no batch"),
+    };
+  let resolved = generic_calls_specialised(w.results, w.keys, w.needs, w.called, constructors_at);
+  let kept = with_unemitted_rejected(resolved.results, w.keys, resolved.unemitted);
+  let finished = kept.fold(
+    Map::new(),
+    |accumulator: Map<RootName, Output>, n: RootName, a: Output|
+      accumulator.insert(n, match resolved.named.get(n) {
+        Some(names) -> { ..a, text: placeholders_named(a.text, names) },
+        None -> a,
+      }),
+  );
+  let distinct_outputs = finished.fold(
+    { seen: Map::new(), out: [] },
+    |accumulator: { seen: Map<RootName, Bool>, out: List<RootOutput> }, n: RootName, a: Output|
+      if accumulator.seen.contains(n) { accumulator } else {
+        {
+          seen: a.tables.members.map(root_name).fold(
+            accumulator.seen.insert(n, true),
+            |m: Map<RootName, Bool>, x: RootName| m.insert(x, true),
+          ),
+          out: accumulator.out.push({ name: n, result: a }),
+        }
+      },
+  ).out;
+  let called_natives = finished.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bool>, _: RootName, a: Output|
+      a.tables.natives.fold(accumulator, |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true)),
+  );
+  {
+    code: {
+      results: distinct_outputs,
+      requested: w.keys.fold([], |accumulator: List<RequestedRoot>, n: RootName, k: RootKey|
+        match w.batches.get(n) {
+          Some(b) -> if finished.contains(n) {
+            accumulator.push(requested_root(b.program, k, home_of(k)))
+          } else { accumulator },
+          None -> accumulator,
+        }),
+      natives: w.batches.fold(
+        Map::new(),
+        |accumulator: Map<Bytes, Native>, _: RootName, b: LoweredBatch|
+          extern_natives(called_externs(called_natives, b.natives)).fold(
+            accumulator,
+            |m: Map<Bytes, Native>, x: Native| m.insert(x.name, x),
+          ),
+      ).values(
+      ),
+    },
+    summary: {
+      published: published_signatures(Map::new(), w.results).values(),
+      needs: w.keys.fold(
+        Map::new(),
+        |accumulator: Map<RootName, List<Need>>, n: RootName, _: RootKey|
+          match w.needs.get(n) {
+            Some(ns) -> if ns.len() == 0 { accumulator } else { accumulator.insert(n, ns) },
+            None -> accumulator,
+          },
+      ),
+      called: w.keys.fold(
+        Map::new(),
+        |accumulator: Map<RootName, List<Int>>, n: RootName, _: RootKey|
+          match w.called.get(n) {
+            Some(cs) -> if cs.len() == 0 { accumulator } else { accumulator.insert(n, cs) },
+            None -> accumulator,
+          },
+      ),
+      roots: w.keys.fold([], |accumulator: List<RootSummary>, n: RootName, k: RootKey|
+        match finished.get(n) {
+          Some(a) ->
+            accumulator.push({
+              key: k,
+              calls: a.tables.calls,
+              head: match a.tables.defined.at(0) {
+                Some(_) -> Some(defined_symbol(n, a.tables).head),
+                None -> None,
+              },
+            }),
+          None -> accumulator,
+        }),
+    },
+  }
+}
+
+pub fn program_batch(
+  dump: Dump,
+  results: List<RootOutput>,
+  stated: List<Bytes>,
+  natives: List<Extern>,
+) -> LoweredBatch / {abort.raise} = {
+  let table = program_constructors(dump, constructor_names(dump));
+  {
+    results: results,
+    constructors: stated.fold(table, |c: Constructors, n: Bytes|
+      { ..c, stated: c.stated.insert(n, true) }),
+    program: program_of(dump, [], []),
+    natives: natives,
+  }
+}
+
 pub fn emitted<| e>(
   runtime: Runtime,
   dump: Dump,
@@ -2725,29 +3242,19 @@ pub fn emitted<| e>(
 ) -> Result<Emission, Bytes> / e =
   handle {
     let p = program_of(dump, sources, every);
-    let constructors = dump.emitter_constructors.map(|c: EmitterConstructor|
-      { name: c.name, arity: c.arity });
-    let entries = (match entered { Some(ks) -> ks, None -> every }).filter(|k: RootKey|
-      runtime_enters(p, k)).map(
-      EntryPoint,
-    );
-    let offered = every.concat(entries);
+    let constructors = constructor_names(dump);
+    let entries = entered_roots(p, every, entered);
     let program = program_constructors(dump, constructors);
-    let all = walk_levels(
-      p,
-      types_digest(dump),
-      program,
-      offered,
-      read,
-      keep,
-      phases,
-      initial_emitter_scope,
-      |scope: EmitterScope, roots: List<RootKey>, ownership: Map<RootName, OwnershipSignature>, done: KnownResults|
-        emit_scoped(dump, p, constructors, offered, scope, roots, ownership, done),
-    );
+    let all = walked_whole(dump, p, every.concat(entries), read, keep, phases);
     {
       let c = compiled(all.results, all.keys, all.stored);
-      let resolved = generic_calls_specialised(c.results, c.keys, all.needs, all.called, program);
+      let resolved = generic_calls_specialised(
+        c.results,
+        c.keys,
+        all.needs,
+        all.called,
+        |_: RootName| program,
+      );
       let unemitted = resolved.unemitted;
       let outputs = with_unemitted_rejected(resolved.results, c.keys, unemitted);
       let roots = every.concat(all.added).filter(|k: RootKey|
@@ -2768,32 +3275,8 @@ pub fn emitted<| e>(
       );
       let produced = produce(
         constructors,
-        compiled_roots.values().map(|o: { key: RootKey, home: Bytes }| {
-          let k = o.key;
-          match k {
-            EntryPoint(_) ->
-              { name: root_name(k), arity: 0, constant: false, site: site_owner(k), home: o.home },
-            _ -> match p.roots.get(site_owner(k)) {
-              Some(r) ->
-                {
-                  name: root_name(k),
-                  arity: r.arity,
-                  constant: r.pure && r.arity == 0
-                    && (match k { Specialisation(_, _) -> false, Coded(_) -> false, _ -> true }),
-                  site: site_owner(k),
-                  home: o.home,
-                },
-              None ->
-                {
-                  name: root_name(k),
-                  arity: 0,
-                  constant: false,
-                  site: site_owner(k),
-                  home: o.home,
-                },
-            },
-          }
-        }),
+        compiled_roots.values().map(|o: { key: RootKey, home: Bytes }|
+          requested_root(p, o.key, o.home)),
         p.modules.len(),
         outputs,
         inputs,
@@ -2820,6 +3303,24 @@ pub fn emitted<| e>(
     }
   } with {
     abort.raise(m) -> Err(Bytes::of_string(m)),
+  }
+
+fn requested_root(p: Program, k: RootKey, home: Bytes) -> RequestedRoot =
+  match k {
+    EntryPoint(_) ->
+      { name: root_name(k), arity: 0, constant: false, site: site_owner(k), home: home },
+    _ -> match p.roots.get(site_owner(k)) {
+      Some(r) ->
+        {
+          name: root_name(k),
+          arity: r.arity,
+          constant: r.pure && r.arity == 0
+            && (match k { Specialisation(_, _) -> false, Coded(_) -> false, _ -> true }),
+          site: site_owner(k),
+          home: home,
+        },
+      None -> { name: root_name(k), arity: 0, constant: false, site: site_owner(k), home: home },
+    },
   }
 
 pub fn built(
@@ -2997,7 +3498,11 @@ fn call_specialisation(
   let open = KeyType(unknown_type());
   let args = range(0, call.args.len()).map(|j: Int| {
     let arg = call.args.get(j);
-    let loader_tables = || KeyLayout({ key: layout_key(constructors, arg), at: arg });
+    let loader_tables = ||
+      KeyLayout({
+        key: layout_key(constructors, arg),
+        at: layout_representative(constructors, arg),
+      });
     if has_variables(arg) { open }
     else if ns.contains({ var: j, reads: Exact }) { KeyType(arg) }
     else if call.specialised_variables.contains(j) || ns.contains({ var: j, reads: Layout }) {
@@ -3023,10 +3528,9 @@ fn generic_calls_specialised(
   keys: Map<RootName, RootKey>,
   needs: Map<RootName, List<Need>>,
   called: Map<RootName, List<Int>>,
-  constructors: Constructors,
+  constructors: (RootName) -> Constructors / {abort.raise},
 ) -> { results: Map<RootName, Output>, named: Map<RootName, List<RootName>>, unemitted: Map<RootName, Bool> } / {abort.raise} = {
   let unemitted = unemitted_generics(results, keys, needs);
-  let canonical_key = |k: RootKey| match keys.get(root_name(k)) { Some(x) -> x, None -> k };
   let named = results.fold(
     Map::new(),
     |accumulator: Map<RootName, List<RootName>>, n: RootName, a: Output|
@@ -3034,7 +3538,7 @@ fn generic_calls_specialised(
         accumulator.insert(
           n,
           a.tables.generics.calls.map(|g: GenericCall|
-            root_name(canonical_key(call_specialisation(g, needs, called, constructors)))),
+            root_name(call_specialisation(g, needs, called, constructors(n)))),
         )
       },
   );
@@ -3043,7 +3547,7 @@ fn generic_calls_specialised(
     |accumulator: Map<RootName, Output>, n: RootName, a: Output|
       accumulator.insert(n, if a.tables.generics.calls.len() == 0 { a } else {
         let resolved = a.tables.generics.calls.map(|g: GenericCall|
-          canonical_key(call_specialisation(g, needs, called, constructors)));
+          call_specialisation(g, needs, called, constructors(n)));
         let roots = resolved.map(root_name);
         let calls = resolved.fold(a.tables.calls, |cs: List<RootKey>, r: RootKey|
           if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) });
@@ -3395,7 +3899,7 @@ test "a generic call is compiled for an argument type only in the detail its cal
   assert_eq(call(b"m.lay", b"_"), b"m.lay@_");
   assert_eq(call(b"m.lay", b"{x:m.Shape}"), b"m.lay@{x:_}");
   assert_eq(call(b"m.lay", b"{x:m.Date}"), call(b"m.lay", b"{x:m.Shape}"));
-  assert_eq(key_types(root(b"m.lay", b"{x:m.Date}")), [parsed_type(b"{x:m.Date}")]);
+  assert_eq(key_types(root(b"m.lay", b"{x:m.Date}")), key_types(root(b"m.lay", b"{x:m.Shape}")));
   assert_eq(call(b"m.same", b"List<m.Shape>"), b"m.same@List<m.Shape>");
   assert_eq(call(b"m.same", b"m.Date{day:Int}"), b"m.same@m.Date{day:Int}");
   assert_eq(call(b"m.add", b"Float"), b"m.add@Float");
@@ -3567,9 +4071,12 @@ test "a generic function that reads a type variable's size, layout or exact type
 test "a body that calls a function missing from its unit, such as a generic function, fails with an internal error" {
   let calling = { text: b"", tables: { ..no_tables(), calls: [Named(b"m.same")] } };
   let message = handle {
-    taken_bodies(by_definition([{ key: b"m.main", value: calling }]), Map::new(), [
-      definition_root(b"m.main"),
-    ]);
+    taken_bodies(
+      by_definition([{ key: b"m.main", value: calling }]),
+      Map::new(),
+      [definition_root(b"m.main")],
+      Map::new(),
+    );
     b""
   } with {
     abort.raise(m) -> Bytes::of_string(m),
@@ -3649,7 +4156,7 @@ fn program_calling_f_at(
     c.keys,
     transitive_needs(had.results, had.keys),
     transitive_called(had.results, had.keys),
-    no_constructors(),
+    |_: RootName| no_constructors(),
   );
   {
     coded: c.coded.map(|x: { key: RootKey, home: Bytes }| x.key),
@@ -4889,7 +5396,10 @@ fn unit_against_runtime(
   match parts { Ok(ps) -> Ok(unit_text(ps)), Err(diagnostics) -> Err(diagnostics) }
 }
 
-fn sources_in_order(dump: Dump, modules: List<{ name: Bytes, source_text: Bytes }>) -> List<Bytes> = {
+pub fn sources_in_order(
+  dump: Dump,
+  modules: List<{ name: Bytes, source_text: Bytes }>,
+) -> List<Bytes> = {
   let texts = modules.fold(
     Map::new().insert(prelude_module(), prelude_source::text()),
     |accumulator: Map<Bytes, Bytes>, s: { name: Bytes, source_text: Bytes }|
@@ -6354,7 +6864,7 @@ test "a unit lists its definitions sorted by name in byte order, with each name 
       b"const struct ply_taken ply_taken[] = {\n  { \"m.\\\"q\\\"\", (void *)&e, 0 },\n  { 0, 0, 0 } };\n",
     ]),
   );
-  let tables = tables_part([], [], b"", 1);
+  let tables = tables_part([], [], b"", 1, false);
   assert(
     tables.starts_with(b"/* --- part tables --- */\nvoid *const ply_code[] = {\n  0 };\n"),
     None,

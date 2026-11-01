@@ -1,0 +1,144 @@
+import std.bin
+import std.list
+import compiler.check.resolve.tables (Source)
+import compiler.emit.keys (Named, EntryPoint, test_key)
+import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone, over_decoding,
+                                prelude_frames, prelude_files, query_load)
+import compiler.front.checking.groups (GroupKey)
+import compiler.front.checking.units (CodeUnit, OfGroup, Entries, PartMembers, code_query,
+                                      code_unit_bin, program_reached, unit_code, made_part,
+                                      part_written, first_build)
+import compiler.front.checking.world (CheckQuery, RunEffects)
+import compiler.cc (WrittenPart)
+import compiler.front.diagnostics (parse_all)
+import compiler.front.published (analyse, dump_of)
+import compiler.store.memo (MemoryStore, Run, empty_memory_store, executed_for, in_session)
+import compiler.unit (UnitCode, unit_code_bin, lowered_whole, requested_roots, sources_in_order)
+
+type Built = { codes: Map<Bytes, Bytes>, text: Bytes }
+
+type Finished = { store: MemoryStore, run: Run, built: Built }
+
+fn main_entry() -> Entries / {abort.raise} =
+  {
+    roots: [EntryPoint(Named(b"app.main")), EntryPoint(test_key(b"app", b"it adds"))],
+    tested: false,
+  }
+
+fn built_over(
+  qs: Map<Bytes, CheckQuery>,
+  run: Run,
+) -> { run: Run, value: { run: Run, value: Built } } / {RunEffects, abort.raise} = {
+  let reached = program_reached(qs, run, main_entry());
+  let walked = reached.value.parts.fold(
+    { run: reached.run, codes: Map::new(), text: b"" },
+    |accumulator: { run: Run, codes: Map<Bytes, Bytes>, text: Bytes }, part: PartMembers| {
+      let made = made_part(qs, accumulator.run, part);
+      let written = part_written(qs, made.run, part, made.value, Map::new());
+      let coded = part.units.fold(
+        { run: written.run, codes: accumulator.codes },
+        |a: { run: Run, codes: Map<Bytes, Bytes> }, u: CodeUnit| {
+          let c = unit_code(qs, a.run, u);
+          {
+            run: c.run,
+            codes: a.codes.insert(
+              bin::encode(u, code_unit_bin()),
+              bin::encode(c.value, unit_code_bin()),
+            ),
+          }
+        },
+      );
+      {
+        run: coded.run,
+        codes: coded.codes,
+        text: written.value.fold(accumulator.text, |t: Bytes, p: WrittenPart|
+          match p.text { Some(x) -> t.concat(x), None -> t }),
+      }
+    },
+  );
+  let built = { codes: walked.codes, text: walked.text };
+  { run: walked.run, value: { run: walked.run, value: built } }
+}
+
+fn built_from(store: MemoryStore, sources: List<Source>, whole: Bool) -> Finished / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  let first = if !whole { None } else {
+    let dump = dump_of(analyse(parse_all(sources)));
+    Some(
+      lowered_whole(
+        dump,
+        sources_in_order(dump, sources),
+        requested_roots(dump).keys,
+        Some([Named(b"app.main"), test_key(b"app", b"it adds")]),
+      ),
+    )
+  };
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run| {
+        let checked = query_load(qs, w.own, [], false, run);
+        built_over(qs, match first {
+          Some(l) -> first_build(qs, checked.run, l, false),
+          None -> checked.run,
+        })
+      }),
+  );
+  { store: done.store, run: done.value.run, built: done.value.value }
+}
+
+fn library(limit: Bytes) -> Source =
+  {
+    name: b"lib",
+    source_text: b"pub type Shape = | Dot | Box(Int)\n\npub type Pair = { left: Shape, right: Int }\n\npub fn area(s: Shape) -> Int = match s { Dot -> 0, Box(n) -> n * n }\n\npub fn twice<a>(xs: List<a>, f: (a) -> a) -> List<a> = xs.map(|x: a| f(f(x)))\n\npub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n\npub fn first<a>(xs: List<a>) -> Option<a> = xs.at(0)\n\npub type Id = | Id(Int)\n\nfn id_key(i: Id) -> Int = match i { Id(n) -> n }\n\nkey for Id by id_key\n\nfn id_text(i: Id) -> String = \"id\"\n\nshow for Id by id_text\n\npub effect counter {\n  read next() -> Int\n}\n\npub fn counted(go: () -> Int / {counter.read}) -> Int =\n  handle {\n    go()\n  } with {\n    counter.next() -> 1,\n  }\n\npub const fn limit() -> Int = ".concat(
+      limit,
+    ),
+  }
+
+fn program(body: Bytes) -> Source =
+  {
+    name: b"app",
+    source_text: Bytes::concat_all([
+      b"import lib\n\nfn total(xs: List<Int>) -> Int = xs.fold(0, |n: Int, x: Int| n + x)\n\nfn helper(n: Int) -> Int = ",
+      body,
+      b"\n\nfn pairs() -> List<lib::Pair> = [{ left: lib::Dot, right: 1 }]\n\npub fn main() -> Int = helper(total(lib::twice([1, 2, 3], |x: Int| x + 1)) + lib::area(lib::Box(2))) + (if lib::even(4) { 1 } else { 0 }) + (match lib::first(pairs()) { Some(p) -> p.right, None -> 0 }) + lib::counted(|| lib::counter.next()) + lib::limit() + Map::new().insert(lib::Id(1), 2).len()\n\ntest \"it adds\" {\n  assert_eq(helper(1), helper(1));\n  assert_eq(pairs(), pairs());\n  assert_eq(lib::Id(1), lib::Id(1))\n}\n",
+    ]),
+  }
+
+test "a unit lowered alone equals the same unit from the whole-program pipeline" {
+  let sources = [library(b"3"), program(b"n * 2")];
+  let alone = built_from(empty_memory_store(), sources, false);
+  let whole = built_from(empty_memory_store(), sources, true);
+  assert(alone.built.codes.len() > 0, None);
+  assert_eq(whole.built.codes, alone.built.codes);
+  assert_eq(whole.built.text, alone.built.text)
+}
+
+test "editing one function's body lowers that function's unit and no other" {
+  let before = built_from(empty_memory_store(), [library(b"3"), program(b"n * 2")], false);
+  let after = built_from(before.store, [library(b"3"), program(b"n * 3")], false);
+  let helper = OfGroup({ module: b"app", shipped: false, tested: false, owners: [b"helper"] });
+  assert_eq(executed_for(after.run, code_query()), [bin::encode(helper, code_unit_bin())])
+}
+
+test "after a series of edits each unit's code equals a build from nothing" {
+  let steps = [
+    { limit: b"3", body: b"n * 2" },
+    { limit: b"3", body: b"n * 3" },
+    { limit: b"4", body: b"lib::area(lib::Dot) + n" },
+    { limit: b"4", body: b"n * n" },
+  ];
+  steps.fold(empty_memory_store(), |store: MemoryStore, step: { limit: Bytes, body: Bytes }| {
+    let sources = [library(step.limit), program(step.body)];
+    let warm = built_from(store, sources, false);
+    let cold = built_from(empty_memory_store(), sources, false);
+    assert_eq(warm.built.codes, cold.built.codes);
+    assert_eq(warm.built.text, cold.built.text);
+    warm.store
+  });
+  ()
+}
