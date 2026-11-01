@@ -59,7 +59,7 @@ import compiler.emit.lower.base (Context, Lowering, LoweredValue, Target, ToCons
                                  substitute_evidence_vars, exit_block)
 import compiler.emit.lower.data (constructed)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read,
-                                       empty_list_with_capacity, intrinsic_call)
+                                       empty_list_with_capacity, intrinsic_call, list_pushed)
 import compiler.emit.lower.marshalling (pending_abort_raise)
 import compiler.emit.lower.strings (range_guarded)
 import compiler.emit.lower.handling (performed)
@@ -338,18 +338,24 @@ pub fn target(
     } else { Some(ToInlinedBody(KnownLambda)) },
     CodeVar(_) -> Some(ToValue),
     NConstructor(c) -> Some(ToConstructor(c.name)),
-    NDefinition(f) -> match defined(context, f.full) {
-      Some(d) -> match walk_of(context, d, function, args) {
-        Some(w) -> Some(ToInlinedBody(WalkFunction(w))),
-        None -> Some(ToDefinition(d.full)),
+    NDefinition(f) -> match list_builtin_of(f.full) {
+      Some(b) -> Some(ToBuiltin(b)),
+      None -> match defined(context, f.full) {
+        Some(d) -> match walk_of(context, d, function, args) {
+          Some(w) -> Some(ToInlinedBody(WalkFunction(w))),
+          None -> Some(ToDefinition(d.full)),
+        },
+        None -> None,
       },
-      None -> None,
     },
     NBuiltin(b) -> if b.name == b"iterate" && iterate_inlinable(args) {
       Some(ToInlinedBody(IterateStep))
     } else { Some(ToBuiltin(simple_name_of(b.name))) },
     _ -> Some(ToValue),
   }
+
+fn list_builtin_of(full: Bytes) -> Option<Bytes> =
+  [b"List::at", b"List::push", b"List::set"].find(|b: Bytes| qualify(prelude_module(), b) == full)
 
 fn walk_of(
   context: Context,
@@ -466,7 +472,10 @@ pub fn named_function_call(
               None -> acc,
             },
         );
-        called(context, read.st, d.full, f, a.args, read.args, false, f.span)
+        match list_builtin_of(v.full) {
+          Some(b) -> called_builtin(context, read.st, b, read.args, f, f.span),
+          None -> called(context, read.st, d.full, f, a.args, read.args, false, f.span),
+        }
       },
       _ -> unreachable(b"a definition named as a value the module does not define"),
     },
@@ -1289,12 +1298,19 @@ fn exit_walk(
   let went = |s: Lowering, held: Arg| emitted(s, Next([after.arg, held]));
   let item = match w.kind {
     Mapping -> {
-      let o = list_push(context, after.st, VarOperand(v.accumulator), body.arg, w.accumulator, at);
+      let o = list_pushed(
+        context,
+        after.st,
+        VarOperand(v.accumulator),
+        body.arg,
+        w.accumulator,
+        at,
+      );
       went(o.st, o.arg)
     },
     Filtering -> {
       let k = represented_as({ st: after.st, arg: body.arg }, AsBool, at);
-      let o = list_push(
+      let o = list_pushed(
         context,
         enter_block(k.st),
         VarOperand(v.accumulator),
@@ -1322,6 +1338,7 @@ fn exit_walk(
         Some(Some(init)) -> represented_as({ st: s, arg: init }, v.accumulator.representation, at),
         _ -> unreachable(b"a fold with no first accumulator"),
       },
+      Filtering -> empty_list_with_capacity(context, s, w.accumulator, IntOperand(0), at),
       _ -> empty_list_with_capacity(context, s, w.accumulator, n, at),
     };
     let ended = fresh(first.st, bool_type(), AsBool);
@@ -1473,22 +1490,6 @@ fn exit_map_walk(
     _ -> unreachable(b"a fold of a map with no map or no seed"),
   }
 }
-
-fn list_push(
-  context: Context,
-  st: Lowering,
-  out: Arg,
-  x: Arg,
-  list: Type,
-  at: Span,
-) -> LoweredValue / {abort.raise} =
-  match ((prelude_defined(context, b"List::push"), list)) {
-    (Some(d), NamedType(c)) -> match c.args.at(0) {
-      Some(item) -> defined_called(context, st, d, [item], [], [], [out, x], at),
-      None -> unreachable(b"a push onto a list of no item type"),
-    },
-    _ -> unreachable(b"a push the prelude defines no `List::push` for"),
-  }
 
 fn prelude_defined(context: Context, name: Bytes) -> Option<NamedDefinition> =
   if context.setting.module == prelude_module() {

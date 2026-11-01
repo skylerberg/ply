@@ -4,7 +4,6 @@ mod effects;
 mod escape;
 mod float;
 mod host;
-mod rc;
 mod sim;
 mod span;
 mod sqlite;

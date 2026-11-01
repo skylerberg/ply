@@ -293,10 +293,11 @@ pub enum Rejected {
     SecretDecode,
     SecretEncode,
     SecretRsaJwk,
+    ListSet,
 }
 
 /// Every [`Rejected`], each numbered by its place here as emitted code numbers it.
-pub const REJECTED: [Rejected; 26] = [
+pub const REJECTED: [Rejected; 27] = [
     Rejected::ArrayNew,
     Rejected::ColumnsNew,
     Rejected::ArrayOfList,
@@ -323,6 +324,7 @@ pub const REJECTED: [Rejected; 26] = [
     Rejected::SecretDecode,
     Rejected::SecretEncode,
     Rejected::SecretRsaJwk,
+    Rejected::ListSet,
 ];
 
 impl Rejected {
@@ -355,6 +357,7 @@ impl Rejected {
             Rejected::SecretDecode => "Secret::decode",
             Rejected::SecretEncode => "Secret::encode",
             Rejected::SecretRsaJwk => "Secret::rsa_jwk",
+            Rejected::ListSet => "List::set",
         }
     }
 
@@ -400,7 +403,7 @@ pub(crate) fn rejected_unknown(c: &mut Ctx, what: I64) {
 /// An operation emitted code writes in place, rejected numbers among its operands: left in the
 /// context as [`refuse`] leaves the builtin's own rejection of them. `what` numbers the builtin as
 /// [`REJECTED`] does; `a`, `b` and `c` are what its rejection names: `Array::new`, `Columns::new`,
-/// `Array::of_list` and `Columns::of_list` a length `a`; `Array::get`, `Array::set`,
+/// `Array::of_list` and `Columns::of_list` a length `a`; `Array::get`, `Array::set`, `List::set`,
 /// `Columns::get`, `Columns::set`, `Bytes::at` and `Bytes::u32_le` an index `a` into `b` elements or
 /// bytes; `Bytes::slice` and `String::slice` a range `a..b` of `c` bytes or characters;
 /// `byte_of_int` and `Bytes::index_of_byte` a byte `a`; `Bytes::index_of_from` a start `a` in `b`
@@ -423,9 +426,11 @@ pub unsafe extern "C" fn rt_refused(ctx: *mut Ctx, what: I64, a: I64, b: I64, c:
         | Rejected::ColumnsNew
         | Rejected::ArrayOfList
         | Rejected::ColumnsOfList => said::array_length(site, name, a.0),
-        Rejected::ArrayGet | Rejected::ArraySet | Rejected::ColumnsGet | Rejected::ColumnsSet => {
-            said::out_of_range(site, name, a.0, len(b), "elements")
-        }
+        Rejected::ArrayGet
+        | Rejected::ArraySet
+        | Rejected::ColumnsGet
+        | Rejected::ColumnsSet
+        | Rejected::ListSet => said::out_of_range(site, name, a.0, len(b), "elements"),
         Rejected::BytesAt => said::out_of_range(site, name, a.0, len(b), "bytes"),
         // Told at the last index it would read, as the builtin tells it.
         Rejected::BytesU32Le => {
@@ -533,7 +538,5 @@ pub unsafe extern "C" fn rt_shift_count(ctx: *mut Ctx, n: i64, which: i64) {
     ctx.fail(d);
 }
 
-/// A write of one element the emitted code made: in place, or into a copy of `copied` elements.
-pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, in_place: i64, copied: i64) {
-    ply_core::rc::note_update_of(in_place != 0, copied as usize, Span::DUMMY);
-}
+/// Does nothing: the release's emitter still calls it in the builder it makes.
+pub unsafe extern "C" fn rt_note_update(_ctx: *mut Ctx, _in_place: i64, _copied: i64) {}

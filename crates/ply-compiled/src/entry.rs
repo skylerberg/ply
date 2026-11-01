@@ -185,8 +185,8 @@ pub struct Usage {
     /// the runtime keeps handled.
     pub performs: u64,
     pub held: Held,
-    pub updates: u64,
-    pub updates_in_place: u64,
+    /// The blocks the program took through the runtime, whatever became of them.
+    pub runtime_blocks: u64,
     /// Objects of the program's still live once a test's entry returned and gave back what its
     /// bodies held: each one nothing let go of. 0 for any other entry.
     pub live: u64,
@@ -279,8 +279,6 @@ pub fn enter(
         .unwrap_or_else(|| (Seed::default(), ply_core::sim::DEFAULT_STEPS));
     ctx.seed = seed;
     ctx.sim_steps = steps.max(1);
-    // The counters are this thread's, an outer entry's among them, so the entry's are a difference.
-    let counted = ply_core::rc::stats();
     let started = Instant::now();
     let entered = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         entered(&mut ctx, entry, arguments, run, root)
@@ -291,26 +289,20 @@ pub fn enter(
         0
     };
     let mut outcome = match entered {
-        Ok((ended, last)) => {
-            let counters = ply_core::rc::stats();
-            Outcome {
-                ended,
-                usage: Usage {
-                    nanos,
-                    host: ctx.host_use.acted(),
-                    performs: last.performs,
-                    held: last.held,
-                    updates: counters.updates.saturating_sub(counted.updates),
-                    updates_in_place: counters
-                        .updates_in_place
-                        .saturating_sub(counted.updates_in_place),
-                    live: last.live,
-                },
-                warnings: std::mem::take(&mut ctx.teardown),
-                interleaving: last.interleaving,
-                trace: None,
-            }
-        }
+        Ok((ended, last)) => Outcome {
+            ended,
+            usage: Usage {
+                nanos,
+                host: ctx.host_use.acted(),
+                performs: last.performs,
+                held: last.held,
+                runtime_blocks: last.runtime_blocks,
+                live: last.live,
+            },
+            warnings: std::mem::take(&mut ctx.teardown),
+            interleaving: last.interleaving,
+            trace: None,
+        },
         Err(payload) => {
             abandoned(ctx);
             Outcome::of(Ended::Panicked(panic_message(payload.as_ref())))
@@ -348,6 +340,7 @@ struct Last {
     performs: u64,
     held: Held,
     interleaving: Option<Vec<u8>>,
+    runtime_blocks: u64,
     live: u64,
 }
 
@@ -400,6 +393,7 @@ fn entered(
     if run.tested && matches!(ended, Ended::Returned(_)) {
         last.live = ctx.left_live() as u64;
     }
+    last.runtime_blocks = ctx.heap.runtime_blocks() as u64;
     ctx.end();
     std::mem::forget(giving_back);
     (ended, last)
@@ -422,6 +416,7 @@ fn returned(ctx: &mut Ctx) -> Last {
         performs: ctx.performed.len() as u64,
         held,
         interleaving: ctx.interleaving.take(),
+        runtime_blocks: 0,
         live: 0,
     }
 }
@@ -806,7 +801,7 @@ fn read_seed(r: &mut Reader<'_>) -> Result<(Seed, u32), String> {
 /// `outcome := ended, option(int) exit, usage, list(failure) warnings, option(interleaving),
 /// option(bytes) trace`; `ended := tag 0 bytes answer | 1 failure | 2 string panic | 3 no root |
 /// 4 string why unanswerable`; `usage := int nanos, bool host, int performs, int native_objects,
-/// int scheduled, int task_stacks, int frame_tables, int updates, int updates_in_place, int live`.
+/// int scheduled, int task_stacks, int frame_tables, int runtime_blocks, int live`.
 fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Option<i32>) {
     match &outcome.ended {
         Ended::Returned(bytes) => {
@@ -837,8 +832,7 @@ fn write_outcome(w: &mut Writer, opened: &Opened, outcome: &Outcome, exit: Optio
         .count(u.held.scheduled)
         .count(u.held.task_stacks)
         .count(u.held.frame_tables)
-        .count(u.updates)
-        .count(u.updates_in_place)
+        .count(u.runtime_blocks)
         .count(u.live);
     w.list(outcome.warnings.iter(), |w, d| {
         write_failure(w, d, Some(opened))
