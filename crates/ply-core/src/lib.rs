@@ -22,7 +22,6 @@ pub mod sim;
 mod span;
 pub mod sqlite;
 
-pub use builtins::assert_failure;
 pub use crypto::constant_time_eq;
 pub use effects::{Effect, Mode, Resource, label_var_name};
 pub use escape::{Boundary, Escapee, Handle};
