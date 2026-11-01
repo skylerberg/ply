@@ -1,4 +1,5 @@
 use crate::bare::context;
+use crate::unit::ignored_test_command;
 use ply_compiled::emitted::Block;
 use ply_compiled::heap::{
     HEADER, Heap, Native, Obj, Word, enter, leave, native_of, poison_freed, poisoning_enabled,
