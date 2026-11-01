@@ -230,6 +230,38 @@ fn cancel_carried(c: &mut Ctx) {
     c.failed = FAILED_CANCELLED;
 }
 
+/// Fails the run with a diagnostic compiled code wrote, or raises it for `abort.raise` to handle
+/// where `raises` is not 0. `texts` holds an address and a byte count for each of: the code, the
+/// message, the primary label, `notes` notes, then `shown` values as PLV1 bytes. The diagnostic is
+/// placed at the site the body last stored.
+pub unsafe extern "C" fn rt_failed(
+    ctx: *mut Ctx,
+    raises: I64,
+    texts: *const Word,
+    notes: I64,
+    shown: I64,
+) {
+    let c = unsafe { &mut *ctx };
+    let bytes = |at: usize| {
+        let (address, count) = unsafe { (*texts.add(2 * at), *texts.add(2 * at + 1)) };
+        unsafe { borrowed(Addr(address as *mut u8), I64(count)) }
+    };
+    let text = |at: usize| String::from_utf8_lossy(bytes(at)).into_owned();
+    let (notes, shown) = (notes.0 as usize, shown.0 as usize);
+    let code = ply_core::intern_code(&text(0));
+    let mut d = Diagnostic::error(code, text(1)).primary(Span::DUMMY, text(2));
+    for at in 3..3 + notes {
+        d = d.note(text(at));
+    }
+    let values = (3 + notes..3 + notes + shown).map(|at| bytes(at).to_vec());
+    let d = d.showing(values.collect());
+    if raises.0 != 0 {
+        raise_error(c, d);
+    } else {
+        c.fail(d);
+    }
+}
+
 /// A builtin emitted code writes in place whose rejection of its operands it hands the runtime:
 /// through [`rt_refused`] where the rejection names numbers, and through
 /// [`rt_refused_text`](crate::machine::rt_refused_text) where it names text.
