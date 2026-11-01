@@ -2,11 +2,12 @@
 //! length-delimited fields, written and read by field number.
 //!
 //! This is the encoding only, with no schema. A writer writes the fields it chooses, in the order
-//! it chooses. A reader reads a message as the list of its fields, each with its number, the offset
-//! of its tag, and its payload as the wire type frames it. The function a payload is read through
-//! decides what it means: whether a varint is an `int64`, a `sint64` or a `bool`, and whether a
-//! delimited payload is text, bytes, a message or a packed run. A reader skips a field number it
-//! does not know, which is how a message gains fields without breaking its readers.
+//! it chooses. A reader reads a message as the list of its fields. Each field has its number, the
+//! offset of its tag, and its payload bytes, whose extent is set by the wire type. The function
+//! that reads a payload decides what it means: whether a varint is an `int64`, a `sint64` or a
+//! `bool`, and whether a delimited payload is text, bytes, a message or a packed run. A reader
+//! skips a field number it does not know, which is how a message gains fields without breaking its
+//! readers.
 //!
 //! `fields` takes a `Message`: bytes together with the `Limits` they are read under. Only `message`
 //! and `message_of` create one. A nested message is a range of its parent's bytes and is never
@@ -23,8 +24,6 @@
 import std.bin (zigzag_decode, zigzag_encode)
 import std.bytes (u32_le, u64_le)
 import std.gen
-
-// --- Writing ----------------------------------------------------------------
 
 /// `n` as a base-128 varint, least significant group first: its 64 bits read as unsigned, so a
 /// negative number takes ten bytes, as an `int64` does.
@@ -47,7 +46,7 @@ pub type WireType =
 fn wire_number(w: WireType) -> Int =
   match w { VarintWire -> 0, Fixed64Wire -> 1, DelimitedWire -> 2, Fixed32Wire -> 5 }
 
-/// The greatest field number a tag holds: 29 bits.
+/// Returns the greatest field number a tag can encode, which is 29 bits wide.
 pub fn max_field_number() -> Int = 536870911
 
 /// A field's tag. Raises for a field number below one or above `max_field_number`, which no message
@@ -116,8 +115,6 @@ fn packed(field: Int, items: List<Bytes>) -> Bytes / {abort.raise} =
 fn fixed64(n: U64) -> Bytes / {abort.raise} =
   u32_le(Int::of_u64(n & 0xFFFF_FFFFu64)).concat(u32_le(Int::of_u64(n >>> 32)))
 
-// --- Errors -----------------------------------------------------------------
-
 /// Why a reader failed.
 pub type ErrorKind =
   /// The input ends inside a field, or a length counts more bytes than its message has left.
@@ -126,7 +123,8 @@ pub type ErrorKind =
   | Overflow
   /// Wire type 3 or 4: a group, which proto2 wrote and proto3 does not.
   | Group
-  /// Wire type 6 or 7, whose number it contains. Neither is defined.
+  /// Wire type 6 or 7, neither of which is defined. The `Int` is the wire type number that was
+  /// found.
   | UnknownWireType(Int)
   /// A field number of zero, or one past `max_field_number`.
   | BadFieldNumber
@@ -134,11 +132,12 @@ pub type ErrorKind =
   | TooDeep
   /// An input longer than `Limits.length`.
   | TooLong
-  /// A field read as a type its wire type cannot frame, such as a varint read as a message.
+  /// A field read as a type that does not match its wire type, such as a varint read as a message.
   | WrongWireType
   /// A `string` field that is not UTF-8.
   | NotUtf8
-  /// A packed run of fixed-width numbers whose length is not a whole number of them.
+  /// A packed run of fixed-width numbers whose length in bytes is not a multiple of the width of
+  /// one number.
   | UnevenPackedLength
 
 /// A reading error, and the offset in the outermost input of the byte the reader was at.
@@ -153,20 +152,18 @@ pub effect protobuf {
 fn fail<a>(at: Int, reason: ErrorKind) -> a / {protobuf.fail} =
   protobuf.fail({ at: at, reason: reason })
 
-// --- Reading ----------------------------------------------------------------
-
 /// The limits a reader enforces on an input.
 pub type Limits = new {
   /// How many messages may nest inside the outermost one.
   depth: Int,
-  /// The most bytes the input may hold.
+  /// The largest input, in bytes, that a reader accepts.
   length: Int,
 }
 
 /// A message's bytes, as a range of the input they were read from.
 pub opaque type Message = new { data: Bytes, from: Int, to: Int, room: Int }
 
-/// A field's payload, as its wire type frames it.
+/// The contents of a field, decoded according to the field's wire type.
 pub type Value =
   /// The 64 bits a varint encodes.
   | Varint(Int)
@@ -182,7 +179,7 @@ pub fn message(data: Bytes, limits: Limits) -> Message / {protobuf.fail} =
   if data.len() > limits.length { fail(limits.length, TooLong) }
   else { { data: data, from: 0, to: data.len(), room: limits.depth } }
 
-/// A message's bytes.
+/// Returns the bytes that make up `m`, without the surrounding input.
 pub fn payload(m: Message) -> Bytes / {abort.raise} = m.data.slice(m.from, m.to)
 
 /// Where a message starts in the outermost input.
@@ -192,11 +189,15 @@ pub fn offset(m: Message) -> Int = m.from
 /// message nested deeper than the limit it was made under.
 pub fn fields(m: Message) -> List<Field> / {protobuf.fail, abort.raise} =
   if m.room < 0 { fail(m.from, TooDeep) } else {
-    iterate({ at: m.from, acc: [] }, m.to - m.from + 1, |s: { at: Int, acc: List<Field> }|
-      if s.at >= m.to { Stop(s.acc) } else {
-        let read = field_at(m, s.at);
-        Continue({ at: read.next, acc: s.acc.push(read.field) })
-      })
+    iterate(
+      { at: m.from, accumulator: [] },
+      m.to - m.from + 1,
+      |s: { at: Int, accumulator: List<Field> }|
+        if s.at >= m.to { Stop(s.accumulator) } else {
+          let read = field_at(m, s.at);
+          Continue({ at: read.next, accumulator: s.accumulator.push(read.field) })
+        },
+    )
   }
 
 /// The fields of `data` read as one message, or why it is not one.
@@ -258,7 +259,6 @@ fn delimited_at(
   }
 }
 
-/// The four bytes at `at`, least significant first.
 fn fixed32_at(m: Message, at: Int) -> Int / {protobuf.fail} =
   if at + 4 > m.to { fail(at, Truncated) }
   else { match m.data.u32_at(at) { Some(n) -> n, None -> fail(at, Truncated) } }
@@ -275,19 +275,19 @@ fn varint_at(m: Message, at: Int) -> VarintRead / {protobuf.fail, abort.raise} =
       }
     })
 
-// --- Reading a field ----------------------------------------------------------
-
 /// An `int32`, `int64`, `uint64` or enum field: the 64 bits its varint encodes.
 pub fn int_of(f: Field) -> Int / {protobuf.fail} =
   match f.value { Varint(n) -> n, _ -> fail(f.at, WrongWireType) }
 
-/// A `sint32` or `sint64` field.
+/// Returns the value of a `sint32` or `sint64` field, zigzag-decoding the varint into a signed
+/// integer.
 pub fn sint_of(f: Field) -> Int / {protobuf.fail} = zigzag_decode(int_of(f))
 
 /// A `bool` field: any varint but zero is true.
 pub fn bool_of(f: Field) -> Bool / {protobuf.fail} = int_of(f) != 0
 
-/// A `uint32` field: the low 32 bits of its varint, as every protobuf reader truncates it.
+/// Returns the low 32 bits of the field's varint. Protobuf readers discard the higher bits of a
+/// `uint32` that was written with more than 32 bits.
 pub fn uint32_of(f: Field) -> U32 / {protobuf.fail, abort.raise} =
   U32::of_int(int_of(f) & 0xFFFF_FFFF)
 
@@ -295,7 +295,7 @@ pub fn uint32_of(f: Field) -> U32 / {protobuf.fail, abort.raise} =
 pub fn fixed64_of(f: Field) -> U64 / {protobuf.fail} =
   match f.value { Fixed64(n) -> n, _ -> fail(f.at, WrongWireType) }
 
-/// An `sfixed64` field.
+/// Returns the value of an `sfixed64` field, reading its 64 bits as a signed integer.
 pub fn sfixed64_of(f: Field) -> Int / {protobuf.fail, abort.raise} = signed(fixed64_of(f))
 
 /// A `double` field.
@@ -326,11 +326,15 @@ pub fn ints_of(f: Field) -> List<Int> / {protobuf.fail, abort.raise} =
   match f.value {
     Varint(n) -> [n],
     Delimited(m) ->
-      iterate({ at: m.from, acc: [] }, m.to - m.from + 1, |s: { at: Int, acc: List<Int> }|
-        if s.at >= m.to { Stop(s.acc) } else {
-          let v = varint_at(m, s.at);
-          Continue({ at: v.next, acc: s.acc.push(v.value) })
-        }),
+      iterate(
+        { at: m.from, accumulator: [] },
+        m.to - m.from + 1,
+        |s: { at: Int, accumulator: List<Int> }|
+          if s.at >= m.to { Stop(s.accumulator) } else {
+            let v = varint_at(m, s.at);
+            Continue({ at: v.next, accumulator: s.accumulator.push(v.value) })
+          },
+      ),
     _ -> fail(f.at, WrongWireType),
   }
 
@@ -350,11 +354,8 @@ pub fn fixed64s_of(f: Field) -> List<U64> / {protobuf.fail, abort.raise} =
 pub fn doubles_of(f: Field) -> List<Float> / {protobuf.fail, abort.raise} =
   fixed64s_of(f).map(|n: U64| Float::of_bits(signed(n)))
 
-/// The `Int` with the same 64 bits as `n`.
 fn signed(n: U64) -> Int / {abort.raise} =
   Int::of_u64(n >>> 32) << 32 | Int::of_u64(n & 0xFFFF_FFFFu64)
-
-// --- Tests ------------------------------------------------------------------
 
 fn generous() -> Limits = { depth: 16, length: 1048576 }
 
@@ -371,8 +372,6 @@ fn error_of(text: String, limits: Limits) -> Option<Error> / {abort.raise} =
 
 type EncodingExample = { name: String, bytes: Bytes, hex: String }
 
-/// The examples of the encoding guide (protobuf.dev/programming-guides/encoding), each as the
-/// guide writes its bytes.
 fn encoding_examples() -> List<EncodingExample> / {abort.raise} =
   [
     { name: "150 is two groups of seven bits", bytes: varint(150), hex: "9601" },
@@ -406,9 +405,8 @@ fn encoding_examples() -> List<EncodingExample> / {abort.raise} =
     },
   ]
 
-test "the encoding guide: {c.name}" for c: EncodingExample in encoding_examples() {
-  assert_eq(hex(c.bytes), c.hex)
-}
+test "the protobuf encoding guide example `{c.name}` encodes to the hex bytes the guide lists" for c: EncodingExample in encoding_examples(
+  ) { assert_eq(hex(c.bytes), c.hex) }
 
 type Zigzag = { number: Int, encoded: Int }
 
@@ -435,19 +433,19 @@ test "a varint field reads back, whatever its sign" {
 test "a packed run reads back as the numbers it was written from" {
   gen::check2(gen::list(gen::any_int()), gen::list(gen::u64()), |ns: List<Int>, wide: List<U64>| {
     (try {
-        read(packed_ints(1, ns)).fold([], |acc: List<Int>, f: Field|
-          ints_of(f).fold(acc, |inner: List<Int>, n: Int| inner.push(n)))
+        read(packed_ints(1, ns)).fold([], |accumulator: List<Int>, f: Field|
+          ints_of(f).fold(accumulator, |inner: List<Int>, n: Int| inner.push(n)))
       })
       == Ok(ns)
       && (try {
-        read(packed_fixed64(2, wide)).fold([], |acc: List<U64>, f: Field|
-          fixed64s_of(f).fold(acc, |inner: List<U64>, n: U64| inner.push(n)))
+        read(packed_fixed64(2, wide)).fold([], |accumulator: List<U64>, f: Field|
+          fixed64s_of(f).fold(accumulator, |inner: List<U64>, n: U64| inner.push(n)))
       })
       == Ok(wide)
   })
 }
 
-test "a field's number and the fields after it survive any payload before them" {
+test "reading a bytes field followed by an integer field returns both field numbers correctly, whatever bytes the first field contains" {
   gen::check3(gen::any_int(), gen::bytes(), gen::any_int(), |k: Int, b: Bytes, n: Int| {
     (try {
         read(bytes_field(to_field_number(k), b).concat(int_field(to_field_number(k), n))).map(
@@ -458,22 +456,21 @@ test "a field's number and the fields after it survive any payload before them" 
   })
 }
 
-/// A valid field number derived from any `Int`.
 fn to_field_number(k: Int) -> Int = 1 + (k & 536870910)
 
 test "a reader accepts a repeated number packed or one at a time" {
   let unpacked = int_field(6, 3).concat(int_field(6, 270));
   let packed = packed_ints(6, [3, 270]);
   let numbers = |data: Bytes|
-    read(data).fold([], |acc: List<Int>, f: Field|
-      ints_of(f).fold(acc, |inner: List<Int>, n: Int| inner.push(n)));
+    read(data).fold([], |accumulator: List<Int>, f: Field|
+      ints_of(f).fold(accumulator, |inner: List<Int>, n: Int| inner.push(n)));
   assert_eq(try { numbers(unpacked) }, Ok([3, 270]));
   assert_eq(try { numbers(packed) }, Ok([3, 270]));
   let doubles = double_field(7, 1.5).concat(packed_doubles(7, [2.5, -0.5]));
   assert_eq(
     try {
-      read(doubles).fold([], |acc: List<Float>, f: Field|
-        doubles_of(f).fold(acc, |inner: List<Float>, x: Float| inner.push(x)))
+      read(doubles).fold([], |accumulator: List<Float>, f: Field|
+        doubles_of(f).fold(accumulator, |inner: List<Float>, x: Float| inner.push(x)))
     },
     Ok([1.5, 2.5, -0.5]),
   )
@@ -488,8 +485,12 @@ test "a reader skips a field it does not know, whatever its wire type" {
     string_field(2, "kept"),
   ]);
   let named = try {
-    read(data).fold({ a: 0, b: "" }, |acc: { a: Int, b: String }, f: Field|
-      match f.number { 1 -> { ..acc, a: int_of(f) }, 2 -> { ..acc, b: string_of(f) }, _ -> acc })
+    read(data).fold({ a: 0, b: "" }, |accumulator: { a: Int, b: String }, f: Field|
+      match f.number {
+        1 -> { ..accumulator, a: int_of(f) },
+        2 -> { ..accumulator, b: string_of(f) },
+        _ -> accumulator,
+      })
   };
   assert_eq(named, Ok({ a: 7, b: "kept" }))
 }
@@ -525,9 +526,8 @@ fn error_cases() -> List<ErrorCase> =
     { name: "wire type seven", hex: "0f", at: 0, reason: UnknownWireType(7) },
   ]
 
-test "rejected: {c.name}" for c: ErrorCase in error_cases() {
-  assert_eq(error_of(c.hex, generous()), Some({ at: c.at, reason: c.reason }))
-}
+test "`error_of` rejects the malformed protobuf input `{c.name}` with the expected position and reason" for c: ErrorCase in error_cases(
+  ) { assert_eq(error_of(c.hex, generous()), Some({ at: c.at, reason: c.reason })) }
 
 test "an input past the length limit is rejected before any of it is read" {
   let limits: Limits = { depth: 4, length: 3 };
@@ -573,7 +573,7 @@ test "a field read as a type its wire type cannot frame is rejected at its tag" 
   )
 }
 
-test "the raising reader raises the error `parse` returns, and a task may perform it" {
+test "`read` on malformed input inside a spawned task fails with the same rejection that `parse` returns" {
   let got = simulate {
     let t = task.spawn(|| try { read(Bytes::of_hex("0b")) });
     task.join(t)

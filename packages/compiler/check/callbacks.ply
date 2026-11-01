@@ -33,8 +33,8 @@ pub fn prelude_callback_use(name: Bytes) -> Option<CallbackUse> = table().get(in
 fn in_prelude(name: Bytes) -> Bytes = Bytes::concat_all([prelude_module(), b".", name])
 
 fn table() -> Map<Bytes, CallbackUse> =
-  entries().fold(Map::new(), |acc: Map<Bytes, CallbackUse>, e: Entry|
-    acc.insert(e.name, e.callback_use))
+  entries().fold(Map::new(), |accumulator: Map<Bytes, CallbackUse>, e: Entry|
+    accumulator.insert(e.name, e.callback_use))
 
 type Entry = { name: Bytes, callback_use: CallbackUse }
 
@@ -113,8 +113,8 @@ fn prelude_declaration(name: Bytes) -> Option<PreludeDeclaration> / {abort.raise
     })
 
 fn functions_of(items: List<Item>) -> Map<Bytes, FnDefinition> =
-  items.fold(Map::new(), |acc: Map<Bytes, FnDefinition>, item: Item|
-    match item { FunctionItem(d) -> acc.insert(d.name.name, d), _ -> acc })
+  items.fold(Map::new(), |accumulator: Map<Bytes, FnDefinition>, item: Item|
+    match item { FunctionItem(d) -> accumulator.insert(d.name.name, d), _ -> accumulator })
 
 fn unqualified_name(name: Bytes) -> Bytes / {abort.raise} =
   name.slice(prelude_module().len() + 1, name.len())
@@ -128,11 +128,15 @@ fn callback_arity(p: Option<Param>) -> Option<Int> =
 fn positions(i: CallbackUse) -> List<Int> =
   i.params.fold(
     i.iterated_parameters.push(i.callback),
-    |acc: List<Int>, h: CallbackArgument|
-      match h { Accumulator(k) -> acc.push(k), ExtractedFrom(k) -> acc.push(k), _ -> acc },
+    |accumulator: List<Int>, h: CallbackArgument|
+      match h {
+        Accumulator(k) -> accumulator.push(k),
+        ExtractedFrom(k) -> accumulator.push(k),
+        _ -> accumulator,
+      },
   ).concat(match i.result { Updated(k) -> [k], _ -> [] })
 
-test "every entry names a function the prelude declares, and a function parameter it calls" {
+test "each callback-use entry names a function declared in the standard prelude and describes a function parameter that function calls" {
   entries().fold((), |u: Unit, e: Entry| {
     let i = e.callback_use;
     assert_eq(in_prelude(unqualified_name(e.name)), e.name);
@@ -149,13 +153,13 @@ test "every entry names a function the prelude declares, and a function paramete
   })
 }
 
-fn var_name(e: Expression) -> Option<Bytes> =
+fn variable_name(e: Expression) -> Option<Bytes> =
   match unwrap_block(e) {
     NameExpression(v) -> match v.name.module { None -> Some(v.name.name.name), Some(_) -> None },
     _ -> None,
   }
 
-fn is_var(e: Expression, name: Bytes) -> Bool = var_name(e) == Some(name)
+fn is_variable(e: Expression, name: Bytes) -> Bool = variable_name(e) == Some(name)
 
 fn unwrap_block(e: Expression) -> Expression =
   match e {
@@ -197,7 +201,7 @@ fn push_operands(e: Expression) -> Option<{ onto: Expression, x: Expression }> =
         _ -> None,
       },
       PerformExpression(p) -> match p.args {
-        [x] -> if p.op.name == b"push" && p.resource == None {
+        [x] -> if p.operation.name == b"push" && p.resource == None {
           Some({ onto: NameExpression({ span: p.span, name: p.effect_name }), x: x })
         } else { None },
         _ -> None,
@@ -215,24 +219,32 @@ fn empty_list(e: Expression) -> Bool =
 fn is_int(e: Expression, n: Int) -> Bool =
   match unwrap_block(e) { LiteralExpression(l) -> l.literal == LiteralInt(n), _ -> false }
 
-fn binary(e: Expression, op: Bytes) -> Option<{ lhs: Expression, rhs: Expression }> =
+fn binary(
+  e: Expression,
+  operator: Bytes,
+) -> Option<{ left_operand: Expression, right_operand: Expression }> =
   match unwrap_block(e) {
-    BinaryExpression(b) -> if b.op == op { Some({ lhs: b.lhs, rhs: b.rhs }) } else { None },
+    BinaryExpression(b) -> if b.operation == operator {
+      Some({ left_operand: b.left_operand, right_operand: b.right_operand })
+    } else { None },
     _ -> None,
   }
 
 fn is_increment(e: Expression, name: Bytes) -> Bool =
-  match binary(e, b"add") { Some(b) -> is_var(b.lhs, name) && is_int(b.rhs, 1), None -> false }
+  match binary(e, b"add") {
+    Some(b) -> is_variable(b.left_operand, name) && is_int(b.right_operand, 1),
+    None -> false,
+  }
 
 fn at_least(e: Expression, name: Bytes) -> Option<Expression> =
   match binary(e, b"ge") {
-    Some(b) -> if is_var(b.lhs, name) { Some(b.rhs) } else { None },
+    Some(b) -> if is_variable(b.left_operand, name) { Some(b.right_operand) } else { None },
     None -> None,
   }
 
-fn calls_on(e: Expression, name: Bytes, vars: List<Bytes>) -> Bool =
+fn calls_on(e: Expression, name: Bytes, variable_names: List<Bytes>) -> Bool =
   match call_arguments(e, name) {
-    Some(args) -> args.map(var_name) == vars.map(|v: Bytes| Some(v)),
+    Some(args) -> args.map(variable_name) == variable_names.map(|v: Bytes| Some(v)),
     None -> false,
   }
 
@@ -240,13 +252,13 @@ type Uses = { calls: List<List<Expression>>, reads: Int }
 
 fn uses(e: Expression, name: Bytes) -> Uses =
   match unwrap_block(e) {
-    NameExpression(_) -> { calls: [], reads: if is_var(e, name) { 1 } else { 0 } },
+    NameExpression(_) -> { calls: [], reads: if is_variable(e, name) { 1 } else { 0 } },
     LiteralExpression(_) -> { calls: [], reads: 0 },
     CallExpression(a) ->
       a.args.fold(
-        if is_var(a.function, name) { { calls: [a.args], reads: 0 } }
+        if is_variable(a.function, name) { { calls: [a.args], reads: 0 } }
         else { uses(a.function, name) },
-        |acc: Uses, x: Expression| combined(acc, uses(x, name)),
+        |accumulator: Uses, x: Expression| combined(accumulator, uses(x, name)),
       ),
     FieldExpression(f) -> uses(f.base, name),
     PerformExpression(p) ->
@@ -256,15 +268,15 @@ fn uses(e: Expression, name: Bytes) -> Uses =
           reads: if p.effect_name.module == None && p.effect_name.name.name == name { 1 }
           else { 0 },
         },
-        |acc: Uses, x: Expression| combined(acc, uses(x, name)),
+        |accumulator: Uses, x: Expression| combined(accumulator, uses(x, name)),
       ),
-    BinaryExpression(b) -> combined(uses(b.lhs, name), uses(b.rhs, name)),
+    BinaryExpression(b) -> combined(uses(b.left_operand, name), uses(b.right_operand, name)),
     UnaryExpression(u) -> uses(u.operand, name),
     IfExpression(i) ->
       combined(uses(i.cond, name), combined(uses(i.then_branch, name), uses(i.else_branch, name))),
     MatchExpression(m) ->
-      m.arms.fold(uses(m.scrutinee, name), |acc: Uses, a: MatchArm|
-        combined(combined(acc, uses(a.body, name)), match a.guard {
+      m.arms.fold(uses(m.scrutinee, name), |accumulator: Uses, a: MatchArm|
+        combined(combined(accumulator, uses(a.body, name)), match a.guard {
           Some(g) -> uses(g, name),
           None -> { calls: [], reads: 0 },
         })),
@@ -279,38 +291,38 @@ type Pass = { params: List<CallbackArgument>, result: ReturnShape }
 fn pass(
   walk: FnDefinition,
   f: Int,
-  acc: Int,
+  accumulator: Int,
   r: Reading,
   read: (Expression) -> Bool,
 ) -> Option<Pass> / {abort.raise} = {
   let ps = walk.params;
   let fname = ps.get(f).name.name;
-  let accumulator_name = ps.get(acc).name.name;
-  let item = |x: Expression| read(x) || (r.bound != None && var_name(x) == r.bound);
+  let accumulator_name = ps.get(accumulator).name.name;
+  let item = |x: Expression| read(x) || (r.bound != None && variable_name(x) == r.bound);
   match unwrap_block(r.back) {
-    CallExpression(b) -> if !is_var(b.function, walk.name.name) || b.args.len() != ps.len()
-        || !is_var(b.args.get(f), fname) { None } else {
+    CallExpression(b) -> if !is_variable(b.function, walk.name.name) || b.args.len() != ps.len()
+        || !is_variable(b.args.get(f), fname) { None } else {
       let seen = range(0, ps.len()).fold({ calls: [], reads: 0 }, |u: Uses, k: Int|
         if k == f { u } else { combined(u, uses(b.args.get(k), fname)) });
       match ((seen.calls, seen.reads)) {
         ([args], 0) -> {
           let call = |e: Expression|
             match unwrap_block(e) {
-              CallExpression(c) -> is_var(c.function, fname) && c.args == args,
+              CallExpression(c) -> is_variable(c.function, fname) && c.args == args,
               _ -> false,
             };
           let params = args.map(|x: Expression|
             if item(x) { Element }
-            else if is_var(x, accumulator_name) { Accumulator(0) }
+            else if is_variable(x, accumulator_name) { Accumulator(0) }
             else { UnknownArgument });
-          let next = b.args.get(acc);
+          let next = b.args.get(accumulator);
           let result = match push_operands(next) {
-            Some(p) -> if is_var(p.onto, accumulator_name) && call(p.x) { Some(Mapped) }
+            Some(p) -> if is_variable(p.onto, accumulator_name) && call(p.x) { Some(Mapped) }
             else { None },
             None -> match unwrap_block(next) {
               IfExpression(c) -> match push_operands(c.then_branch) {
-                Some(p) -> if call(c.cond) && is_var(p.onto, accumulator_name) && item(p.x)
-                    && is_var(c.else_branch, accumulator_name) { Some(Filtered) }
+                Some(p) -> if call(c.cond) && is_variable(p.onto, accumulator_name) && item(p.x)
+                    && is_variable(c.else_branch, accumulator_name) { Some(Filtered) }
                 else { None },
                 None -> None,
               },
@@ -336,22 +348,22 @@ type Reading = { back: Expression, bound: Option<Bytes> }
 fn steps_to_next_position(walk: FnDefinition, back: Expression) -> Bool / {abort.raise} =
   match ((walk.params, unwrap_block(back))) {
     ([xs, p, _, _], CallExpression(b)) ->
-      b.args.len() == 4 && is_var(b.args.get(0), xs.name.name)
+      b.args.len() == 4 && is_variable(b.args.get(0), xs.name.name)
         && is_increment(b.args.get(1), p.name.name),
     _ -> false,
   }
 
 fn list_walk_pass(walk: FnDefinition) -> Option<Pass> / {abort.raise} =
   match walk.params {
-    [xs, p, f, acc] -> {
+    [xs, p, f, accumulator] -> {
       let xn = xs.name.name;
       let pn = p.name.name;
-      let an = acc.name.name;
+      let an = accumulator.name.name;
       match unwrap_block(walk.body) {
         IfExpression(outer) -> match ((at_least(outer.cond, pn), unwrap_block(outer.else_branch))) {
           (Some(len), MatchExpression(m)) -> match m.arms {
             [some, none] -> match some_arm(some) {
-              Some(s) -> if calls_on(len, b"List::len", [xn]) && is_var(outer.then_branch, an)
+              Some(s) -> if calls_on(len, b"List::len", [xn]) && is_variable(outer.then_branch, an)
                   && calls_on(m.scrutinee, b"List::at", [xn, pn])
                   && none_arm(none, an)
                   && uses_exactly(walk.body, f.name.name, 1, 1)
@@ -372,8 +384,8 @@ fn list_walk_pass(walk: FnDefinition) -> Option<Pass> / {abort.raise} =
 
 fn reads_entry(e: Expression, node: Bytes, slot: (Expression) -> Bool) -> Bool =
   match ((call_arguments(e, b"MapNode::key"), call_arguments(e, b"MapNode::value"))) {
-    (Some([x, s]), _) -> is_var(x, node) && slot(s),
-    (_, Some([x, s])) -> is_var(x, node) && slot(s),
+    (Some([x, s]), _) -> is_variable(x, node) && slot(s),
+    (_, Some([x, s])) -> is_variable(x, node) && slot(s),
     _ -> false,
   }
 
@@ -385,7 +397,8 @@ fn steps_to_next_entry(
 ) -> Bool / {abort.raise} =
   match ((walk.params, unwrap_block(back))) {
     ([m, _, _, done, _, _], CallExpression(b)) ->
-      b.args.len() == 6 && is_var(b.function, walk.name.name) && is_var(b.args.get(0), m.name.name)
+      b.args.len() == 6 && is_variable(b.function, walk.name.name)
+        && is_variable(b.args.get(0), m.name.name)
         && node(b.args.get(1))
         && slot(b.args.get(2))
         && is_increment(b.args.get(3), done.name.name),
@@ -394,21 +407,23 @@ fn steps_to_next_entry(
 
 fn map_fold_pass(walk: FnDefinition) -> Option<Pass> / {abort.raise} =
   match walk.params {
-    [m, n, i, done, acc, f] -> {
+    [m, n, i, done, accumulator, f] -> {
       let mn = m.name.name;
       let nn = n.name.name;
       let iname = i.name.name;
-      let an = acc.name.name;
-      let here = |e: Expression| reads_entry(e, nn, |s: Expression| is_var(s, iname));
+      let an = accumulator.name.name;
+      let here = |e: Expression| reads_entry(e, nn, |s: Expression| is_variable(s, iname));
       match unwrap_block(walk.body) {
         IfExpression(outer) -> match ((
             at_least(outer.cond, done.name.name),
             unwrap_block(outer.else_branch),
           )) {
           (Some(len), IfExpression(inner)) -> {
-            let guarded = calls_on(len, b"Map::len", [mn]) && is_var(outer.then_branch, an)
+            let guarded = calls_on(len, b"Map::len", [mn]) && is_variable(outer.then_branch, an)
               && (match binary(inner.cond, b"lt") {
-                Some(c) -> is_var(c.lhs, iname) && calls_on(c.rhs, b"MapNode::count", [nn]),
+                Some(c) ->
+                  is_variable(c.left_operand, iname)
+                    && calls_on(c.right_operand, b"MapNode::count", [nn]),
                 None -> false,
               })
               && uses_exactly(walk.body, f.name.name, 2, 2);
@@ -416,7 +431,7 @@ fn map_fold_pass(walk: FnDefinition) -> Option<Pass> / {abort.raise} =
             let stays = steps_to_next_entry(
               walk,
               on.back,
-              |x: Expression| is_var(x, nn),
+              |x: Expression| is_variable(x, nn),
               |x: Expression| is_increment(x, iname),
             );
             match ((guarded && stays, unwrap_block(inner.else_branch))) {
@@ -424,16 +439,15 @@ fn map_fold_pass(walk: FnDefinition) -> Option<Pass> / {abort.raise} =
                 (Some(LetStatement(l)), Some(MatchExpression(mt))) -> match ((l.pattern, mt.arms)) {
                   (PatternVariable(next), [none, some]) -> match some_arm(some) {
                     None -> None,
-                    Some(s) -> if !is_var(mt.scrutinee, next.name.name) || !none_arm(none, an) {
-                      None
-                    } else {
+                    Some(s) -> if !is_variable(mt.scrutinee, next.name.name)
+                        || !none_arm(none, an) { None } else {
                       let first = |e: Expression| reads_entry(e, s.element, is_zero);
                       let r: Reading = { back: s.body, bound: None };
                       match ((
                           steps_to_next_entry(
                             walk,
                             s.body,
-                            |x: Expression| is_var(x, s.element),
+                            |x: Expression| is_variable(x, s.element),
                             |x: Expression| is_int(x, 1),
                           ),
                           pass(walk, 5, 4, on, here),
@@ -465,18 +479,20 @@ fn derive_map_fold_entry(
 ) -> Option<CallbackUse> / {abort.raise} =
   match unwrap_block(definition.body) {
     MatchExpression(top) -> match ((call_arguments(top.scrutinee, b"MapNode::root"), top.arms)) {
-      (Some([mx]), [none, some]) -> match ((var_name(mx), some_arm(some))) {
+      (Some([mx]), [none, some]) -> match ((variable_name(mx), some_arm(some))) {
         (Some(mn), Some(s)) -> match unwrap_block(s.body) {
-          CallExpression(a) -> match ((var_name(a.function), a.args)) {
+          CallExpression(a) -> match ((variable_name(a.function), a.args)) {
             (Some(w), [m, start, i, done, init, f]) -> match ((
                 functions.get(w),
-                var_name(init),
-                var_name(f),
+                variable_name(init),
+                variable_name(f),
               )) {
               (Some(walk), Some(seed), Some(fname)) -> {
-                let entered = is_var(m, mn) && none_arm(none, seed) && is_zero(i) && is_zero(done)
+                let entered = is_variable(m, mn) && none_arm(none, seed) && is_zero(i)
+                  && is_zero(done)
                   && (match call_arguments(start, b"first_leaf") {
-                    Some([r, h]) -> is_var(r, s.element) && calls_on(h, b"MapNode::height", [mn]),
+                    Some([r, h]) ->
+                      is_variable(r, s.element) && calls_on(h, b"MapNode::height", [mn]),
                     _ -> false,
                   })
                   && uses_exactly(definition.body, fname, 0, 1);
@@ -539,7 +555,7 @@ fn bound_to(statements: List<Statement>, name: Bytes) -> Option<Expression> =
 
 fn field_of(e: Expression, base: Bytes, field: Bytes) -> Bool =
   match unwrap_block(e) {
-    FieldExpression(f) -> f.field.name == field && is_var(f.base, base),
+    FieldExpression(f) -> f.field.name == field && is_variable(f.base, base),
     _ -> false,
   }
 
@@ -576,21 +592,21 @@ fn updates_in_place(walk: FnDefinition) -> Bool =
                     taken.args,
                     call_arguments(t, b"MapNode::pair_put"),
                   )) {
-                  ([from, i], Some([into, j, k, x])) -> match var_name(i) {
+                  ([from, i], Some([into, j, k, x])) -> match variable_name(i) {
                     Some(slot) -> {
                       let tn = taken.name;
                       let applied = match unwrap_block(x) {
                         CallExpression(call) ->
-                          is_var(call.function, fname)
+                          is_variable(call.function, fname)
                             && (match call.args { [v] -> field_of(v, tn, b"value"), _ -> false }),
                         _ -> false,
                       };
                       let u = uses_in(leaf.statements, leaf.tail, fname);
-                      absent.op == b"not"
+                      absent.operation == b"not"
                         && calls_on(absent.operand, b"leaf_holds", [nn, slot, key.name.name])
-                        && is_var(h.then_branch, nn)
-                        && is_var(from, nn)
-                        && is_var(j, slot)
+                        && is_variable(h.then_branch, nn)
+                        && is_variable(from, nn)
+                        && is_variable(j, slot)
                         && field_of(into, tn, b"node")
                         && field_of(k, tn, b"key")
                         && applied
@@ -619,16 +635,17 @@ fn updates_in_place(walk: FnDefinition) -> Bool =
               )) {
               ([from, i], [below, lower, k, g], Some([into, j, back, _, _])) -> {
                 let u = uses_in(branch.statements, branch.tail, fname);
-                is_var(from, nn) && var_name(i) != None && var_name(i) == var_name(j)
+                is_variable(from, nn) && variable_name(i) != None
+                  && variable_name(i) == variable_name(j)
                   && field_of(below, out.name, b"kid")
                   && (match binary(lower, b"sub") {
-                    Some(d) -> is_var(d.lhs, dn) && is_int(d.rhs, 1),
+                    Some(d) -> is_variable(d.left_operand, dn) && is_int(d.right_operand, 1),
                     None -> false,
                   })
-                  && is_var(k, key.name.name)
-                  && is_var(g, fname)
+                  && is_variable(k, key.name.name)
+                  && is_variable(g, fname)
                   && field_of(into, out.name, b"node")
-                  && is_var(back, kid.name)
+                  && is_variable(back, kid.name)
                   && u.calls.len() == 0
                   && u.reads == 1
               },
@@ -636,7 +653,7 @@ fn updates_in_place(walk: FnDefinition) -> Bool =
             },
             _ -> false,
           };
-          is_var(at.lhs, dn) && is_zero(at.rhs) && put && down
+          is_variable(at.left_operand, dn) && is_zero(at.right_operand) && put && down
             && uses_exactly(walk.body, fname, 1, 1)
         },
         _ -> false,
@@ -657,7 +674,7 @@ fn derive_map_update_entry(
         (Some(taken), Some(MatchExpression(mt))) -> match ((taken.args, mt.arms)) {
           ([from, nothing, height, len], [none, some]) -> match ((
               some_arm(some),
-              var_name(height),
+              variable_name(height),
             )) {
             (Some(s), Some(hn)) -> {
               let tn = taken.name;
@@ -672,11 +689,12 @@ fn derive_map_update_entry(
               };
               let walked = |root: Expression|
                 match unwrap_block(root) {
-                  CallExpression(w) -> match ((var_name(w.function), w.args)) {
+                  CallExpression(w) -> match ((variable_name(w.function), w.args)) {
                     (Some(wn), [r, depth, k, g]) -> match functions.get(wn) {
                       Some(walk) ->
-                        is_var(r, s.element) && is_var(depth, hn) && is_var(k, key.name.name)
-                          && is_var(g, fname)
+                        is_variable(r, s.element) && is_variable(depth, hn)
+                          && is_variable(k, key.name.name)
+                          && is_variable(g, fname)
                           && updates_in_place(walk),
                       None -> false,
                     },
@@ -689,8 +707,8 @@ fn derive_map_update_entry(
                   whole.field.name == b"map"
                     && (match call_arguments(whole.base, b"MapNode::map_swap") {
                       Some([into, root, h2, l2]) ->
-                        field_of(into, tn, b"map") && is_var(h2, hn)
-                          && var_name(l2) == var_name(len)
+                        field_of(into, tn, b"map") && is_variable(h2, hn)
+                          && variable_name(l2) == variable_name(len)
                           && (match call_arguments(root, some_constructor()) {
                             Some([x]) -> walked(x),
                             _ -> false,
@@ -699,7 +717,7 @@ fn derive_map_update_entry(
                     }),
                 _ -> false,
               };
-              let out = is_var(from, mn) && is_var(nothing, none_constructor())
+              let out = is_variable(from, mn) && is_variable(nothing, none_constructor())
                 && field_of(mt.scrutinee, tn, b"old");
               match ((
                   out && tall && empty && put_back && uses_exactly(definition.body, fname, 0, 1),
@@ -739,10 +757,11 @@ fn some_arm(a: MatchArm) -> Option<{ element: Bytes, body: Expression }> =
     _ -> None,
   }
 
-fn none_arm(a: MatchArm, acc: Bytes) -> Bool =
+fn none_arm(a: MatchArm, accumulator: Bytes) -> Bool =
   match ((a.guard, a.pattern)) {
     (None, PatternConstructor(c)) ->
-      c.name.name.name == none_constructor() && c.args.len() == 0 && is_var(a.body, acc),
+      c.name.name.name == none_constructor() && c.args.len() == 0
+        && is_variable(a.body, accumulator),
     _ -> false,
   }
 
@@ -763,8 +782,12 @@ fn derive_list_entry(
   definition: FnDefinition,
 ) -> Option<CallbackUse> / {abort.raise} =
   match unwrap_block(definition.body) {
-    CallExpression(a) -> match ((var_name(a.function), a.args)) {
-      (Some(w), [xs, p, f, init]) -> match ((functions.get(w), var_name(xs), var_name(f))) {
+    CallExpression(a) -> match ((variable_name(a.function), a.args)) {
+      (Some(w), [xs, p, f, init]) -> match ((
+          functions.get(w),
+          variable_name(xs),
+          variable_name(f),
+        )) {
         (Some(walk), Some(xn), Some(fname)) -> {
           let entered = is_zero(p) && uses_exactly(definition.body, fname, 0, 1);
           match ((
@@ -774,7 +797,7 @@ fn derive_list_entry(
               index_of(definition.params, fname),
             )) {
             (true, Some(walked), Some(over), Some(callback)) -> if walked.result == Folded {
-              match var_name(init) {
+              match variable_name(init) {
                 Some(seed) -> match index_of(definition.params, seed) {
                   Some(k) ->
                     Some({
@@ -806,7 +829,7 @@ fn derive_list_entry(
     _ -> None,
   }
 
-test "each entry for a function the prelude writes in Ply is what its body does" {
+test "for each prelude function written in Ply, its callback-use entry equals the entry derived from the function's body" {
   let functions = functions_of(prelude_items());
   let written = entries().filter(|e: Entry|
     match prelude_declaration(unqualified_name(e.name)) {
@@ -914,7 +937,7 @@ fn map_fold_entry(w: MapFoldWalk) -> Option<CallbackUse> / {abort.raise} = {
   match functions.get(b"Map::fold") { Some(d) -> derive_entry(functions, d), None -> None }
 }
 
-test "a map's fold that skips an entry, calls twice or aside, reads past its entry, or starts past the first earns no entry" {
+test "`Map::fold` gets no callback-use entry when its loop is changed to skip slots, call the callback extra times, or start after the first slot" {
   assert_eq(map_fold_entry(map_fold_as_written()), callback_use(b"std.prelude.Map::fold"));
   [
     { ..map_fold_as_written(), step: b"i + 2" },
@@ -979,7 +1002,7 @@ fn map_update_entry(w: MapUpdateWalk) -> Option<CallbackUse> / {abort.raise} = {
   match functions.get(b"Map::update") { Some(d) -> derive_entry(functions, d), None -> None }
 }
 
-test "a map's update that checks another slot, loses a pair where the key is absent, reads the value in place, puts it elsewhere, calls twice, or walks the wrong depth earns no entry" {
+test "`Map::update` gets no callback-use entry when its body is changed to check the wrong slot, store the value wrongly, or call the callback twice" {
   assert_eq(map_update_entry(prelude_map_update()), callback_use(b"std.prelude.Map::update"));
   [
     { ..prelude_map_update(), key_slot: b"0" },

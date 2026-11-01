@@ -1,27 +1,27 @@
 //! The signals sent to a program, as an effect.
 //!
-//! `stopping` and `deadline_ms` report whether a stop has been requested, by `SIGINT` or
-//! `SIGTERM`, and how long the service's drain has left.
+//! `stopping` and `deadline_ms` report whether a stop has been requested by `SIGINT` or `SIGTERM`,
+//! and how much time the service's drain has left.
 //!
 //! `hangup`, `user1`, `user2` and `resized` each return whether their signal (`SIGHUP`, `SIGUSR1`,
-//! `SIGUSR2` or `SIGWINCH`) has arrived since the program last checked for it. The first check
-//! installs the handler. Until then the signal does what the platform does with it, which for the
-//! first three is to end the process, so a program that reloads on a hangup checks once at
-//! startup. The first check returns `false`. Arrivals are not counted: two hangups between checks
-//! give one `true`, so `true` means at least one arrived. No code runs in a signal handler's
-//! context. A program polls between its own steps, so to see a hangup within a second, check once
-//! a second.
+//! `SIGUSR2` or `SIGWINCH`) has arrived since the previous check. Arrivals are not counted: two
+//! hangups between checks give one `true`. The first check installs the signal handler and returns
+//! `false`. Before that check, the platform's default applies, and for `SIGHUP`, `SIGUSR1` and
+//! `SIGUSR2` the default ends the process. A program that reloads on a hangup should therefore
+//! check once at startup. No code runs inside the handler, so a program sees a signal only when it
+//! checks. To notice a hangup within a second, check once a second.
 //!
-//! `ply run` listens for a stop when its root performs `signal` or accepts connections; a stop's
-//! drain closes those connections. When its root starts a child process, `ply run` ends its
-//! children and exits at once on `INT` or `TERM`. The platform ends any other program at once. A
-//! run that does not listen for a stop, such as a test's, never sees a stop request or any signal:
-//! each check returns `false` and installs nothing, so every signal keeps the platform's behavior
-//! for the whole process.
+//! `ply run` listens for a stop when the root of the program performs `signal` or accepts
+//! connections. When a stop arrives, the drain closes those connections. If the root starts a child
+//! process, `ply run` ends the children and exits immediately on `INT` or `TERM`. For any other
+//! program the platform ends it immediately. A run that does not listen for a stop, such as a test,
+//! never sees a stop or any signal: each check returns `false`, no handler is installed, and the
+//! platform's default behavior applies to the whole process.
 //!
-//! A test handles the stop with a `Stop` and the other signals with `Arrivals`, and `run_scripted`
-//! handles all six operations from the pair. A signal is `std.process`'s `Signal`, the type a
-//! program uses to signal a child, so a test scripts arrivals with the values a supervisor sends.
+//! In a test, a `Stop` handles the stop operations and `Arrivals` handles the other signals.
+//! `run_scripted` handles all six operations from the pair. A signal is `std.process`'s `Signal`,
+//! the same type a program uses to signal a child, so a test scripts arrivals with the values a
+//! supervisor sends.
 
 import std.internal.native (native)
 import std.list
@@ -48,8 +48,6 @@ pub nondet effect signal {
 
 host for signal by host_handler
 
-/// Runs `go`, handling its operations with the run's stop request and the signals sent to the
-/// process.
 fn host_handler<a | e>(go: () -> a / {signal.read, signal.write | e}) -> a / {native.read | e} =
   handle {
     go()
@@ -62,14 +60,10 @@ fn host_handler<a | e>(go: () -> a / {signal.read, signal.write | e}) -> a / {na
     signal.resized() -> signal_arrived(3),
   }
 
-/// Whether a stop of the run has been requested.
 extern fn signal_stopping() -> Bool / {native.read}
 
-/// The milliseconds the drain has left, or -1 while no stop has been requested.
 extern fn signal_deadline_ms() -> Int / {native.read}
 
-/// Whether the signal numbered `which` (`SIGHUP` 0, `SIGUSR1` 1, `SIGUSR2` 2, `SIGWINCH` 3) has
-/// arrived since the last check for it.
 extern fn signal_arrived(which: Int) -> Bool / {native.read}
 
 /// The stop state a test passes to `stopping_step` and `stop_deadline_ms` in place of the host.
@@ -90,24 +84,27 @@ pub fn stop_deadline_ms(s: Stop) -> Int = s.deadline_ms
 /// Whether there is time to start work that needs `ms` milliseconds.
 pub fn has_time_for(s: Stop, ms: Int) -> Bool = if s.stopping { s.deadline_ms >= ms } else { true }
 
-/// The signals a test passes to the four checking operations in place of the host. `arrived` lists
-/// the signals that have arrived and not been checked for. `pending_batches` lists the batches still to
-/// come, one arriving just before each check. The operations check for `Hangup`, `User1`, `User2`
-/// and `WindowChange`. Any other signal in a script stays waiting, since no check consumes it.
+/// The signals a test supplies to the four signal checks in place of the host. `arrived` lists the
+/// signals that have arrived and not yet been checked. `pending_batches` lists the batches that
+/// have not arrived yet, one arriving just before each check. The checks cover `Hangup`, `User1`,
+/// `User2` and `WindowChange`. Any other signal in a script stays in `arrived` forever, because no
+/// check removes it.
 pub type Arrivals = { arrived: List<Signal>, pending_batches: List<List<Signal>> }
 
 /// A fake whose batches arrive in order, one just before each check, with nothing after the last.
 pub fn arrivals(script: List<List<Signal>>) -> Arrivals = { arrived: [], pending_batches: script }
 
-/// The fake after `which` arrives. A signal already waiting to be checked is not added twice.
+/// Returns `a` with `which` added to the arrived signals. Does nothing if `which` has already
+/// arrived and not been checked.
 pub fn delivered(a: Arrivals, which: Signal) -> Arrivals =
   { ..a, arrived: a.arrived.push_unique(which) }
 
 /// The result of one check, and the fake with the arrival consumed.
 pub type PollResult = { arrivals: Arrivals, arrived: Bool }
 
-/// What a check for `which` returns for `a`. The next batch arrives first. The result is whether
-/// `which` is among the arrived signals, and the check consumes it.
+/// Performs one check for `which` on `a`. First the next pending batch, if any, arrives, just
+/// before the check. The result says whether `which` is among the arrived signals, and removes it
+/// from them if so.
 pub fn poll_step(a: Arrivals, which: Signal) -> PollResult = {
   let now = match a.pending_batches {
     [] -> a,
@@ -135,35 +132,35 @@ pub fn run_scripted<a | e>(
     signal.stopping() -> stopping_step(stop),
     signal.deadline_ms() -> stop_deadline_ms(stop),
     signal.hangup() -> {
-      let asking = poll_step(fake, Hangup);
-      fake = asking.arrivals;
-      asking.arrived
+      let poll = poll_step(fake, Hangup);
+      fake = poll.arrivals;
+      poll.arrived
     },
     signal.user1() -> {
-      let asking = poll_step(fake, User1);
-      fake = asking.arrivals;
-      asking.arrived
+      let poll = poll_step(fake, User1);
+      fake = poll.arrivals;
+      poll.arrived
     },
     signal.user2() -> {
-      let asking = poll_step(fake, User2);
-      fake = asking.arrivals;
-      asking.arrived
+      let poll = poll_step(fake, User2);
+      fake = poll.arrivals;
+      poll.arrived
     },
     signal.resized() -> {
-      let asking = poll_step(fake, WindowChange);
-      fake = asking.arrivals;
-      asking.arrived
+      let poll = poll_step(fake, WindowChange);
+      fake = poll.arrivals;
+      poll.arrived
     },
     return value -> { value: value, arrivals: fake },
   }
 
-test "a running service has time for anything, and a draining one only before its deadline" {
+test "`has_time_for` is true for any duration while running, and while stopping only if the duration is shorter than the time left before the stop deadline" {
   assert(has_time_for(running(), 60000));
   assert(has_time_for(stopping_within(400), 100));
   assert(!has_time_for(stopping_within(400), 900))
 }
 
-test "a handled `signal` leaves no effect, so a stop-aware route stays deterministic" {
+test "`signal.stopping()` and `signal.deadline_ms()` can be handled with fixed values, so code that reads them gives the same result every run" {
   handle {
     assert(signal.stopping());
     assert_eq(signal.deadline_ms(), 250)
@@ -173,8 +170,6 @@ test "a handled `signal` leaves no effect, so a stop-aware route stays determini
   }
 }
 
-/// A daemon's loop. Each turn it reloads its configuration if a hangup arrived, and it stops once
-/// a stop is requested. Returns the turns on which it reloaded.
 fn serve(turns: Int) -> List<Int> / {signal.hangup, signal.stopping} =
   range(0, turns).fold([], |reloads: List<Int>, turn: Int|
     if signal.stopping() { reloads }
@@ -200,7 +195,7 @@ test "a check consumes its own signal and leaves the others waiting" {
   assert(poll_step(second.arrivals, User1).arrived)
 }
 
-test "each signal has its own operation, and a stop is read beside them" {
+test "`signal.user1()`, `user2()`, `resized()` and `hangup()` each check only their own signal, and `signal.stopping()` is true once a stop is scheduled" {
   let ran = run_scripted(stopping_within(100), arrivals([[User1, User2, WindowChange]]), ||
     [signal.user1(), signal.user2(), signal.resized(), signal.hangup(), signal.stopping()]);
   assert_eq(ran.value, [true, true, true, false, true])

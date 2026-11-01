@@ -1,20 +1,20 @@
-//! Hash functions as values, and what is written once for all of them: a digest, a digest of an
-//! input that arrives in parts, and HMAC. Also HMAC, HKDF and PBKDF2 under a key that is a
-//! `Secret`.
+//! Hash functions as values, plus the constructions built on them: digests of whole or
+//! incrementally supplied input, HMAC, HKDF and PBKDF2.
 //!
-//! A `Hash` is a block size, a digest size, and how to absorb a block and finish a message. The
-//! SHA-2 and SHA-3 families, SHAKE and BLAKE2b are here. MD5 and SHA-1, which are broken for
+//! A `Hash` is a block size, a digest size, and functions that absorb a block and finish a message.
+//! The SHA-2 and SHA-3 families, SHAKE and BLAKE2b are here. MD5 and SHA-1, which are broken for
 //! collisions, are in `std.hash.legacy`, so any use of them shows in an import. `blake3` is the
 //! `Bytes::blake3` builtin and is not a `Hash`.
 //!
-//! The digests are written in Ply, and the test vectors the standards publish are their tests. A
-//! round keeps its working words in parameters and its state in an array it updates in place, so a
-//! digest takes time linear in its input. None of it runs in constant time.
+//! The digests are written in Ply, and the test vectors the standards publish are their tests. Each
+//! round passes its working words as function parameters and updates the hash state in place in an
+//! array, so a digest takes time linear in its input. None of it runs in constant time.
 //!
-//! A key is a `Secret`, and only the runtime reads one. `hmac`, `hkdf` and `pbkdf2` run in the
-//! runtime, in constant time, over the hash a `Hash`'s `name` names, which must be SHA-1, SHA-256,
-//! SHA-384 or SHA-512. Any other is rejected as `UnkeyableHash`. `hmac_plain` is HMAC written in
-//! Ply over any `Hash`, for a key anyone may read: a salt, a published label, a standard's vector.
+//! A key is a `Secret`, and only the runtime can read one. `hmac`, `hkdf` and `pbkdf2` run in the
+//! runtime, in constant time, over the hash that the `name` of a `Hash` names, which must be SHA-1,
+//! SHA-256, SHA-384 or SHA-512. Any other name is rejected as `UnkeyableHash`. `hmac_plain` is HMAC
+//! written in Ply over any `Hash`, for a key that anyone may read: a salt, a published label, a
+//! standard's test vector.
 
 import std.bytes (u32_be, u64_be, u64_le)
 import std.list
@@ -23,11 +23,9 @@ import std.gen
 /// The 32-byte BLAKE3 hash of `input`.
 pub fn blake3(input: Bytes) -> Bytes = input.blake3()
 
-/// The first eight bytes of the BLAKE3 hash of `input`. It detects a frame that was not written
-/// completely; it is not an identity.
+/// Returns the first eight bytes of the BLAKE3 hash of `input`, a short checksum for detecting
+/// corrupted or incomplete data. It is too short to identify the input.
 pub fn checksum(input: Bytes) -> Bytes / {abort.raise} = input.blake3().slice(0, 8)
-
-// --- A hash as a value ------------------------------------------------------------
 
 /// A hash function: its sizes, and how its state, an array of words, absorbs a block and finishes.
 pub type Hash = new {
@@ -35,7 +33,6 @@ pub type Hash = new {
   name: String,
   /// The size of a block in bytes, which is what HMAC pads a key to.
   block_size: Int,
-  /// The size of a digest in bytes.
   digest_size: Int,
   /// The state before any input.
   start: Array<Int>,
@@ -74,11 +71,10 @@ pub fn digest_of(h: Hash, input: Bytes) -> Bytes / {abort.raise} = finish(update
 /// A digest under `h` that has absorbed no input yet.
 pub fn init(h: Hash) -> Hasher = { hash: h, words: h.start, seen: 0, pending: b"" }
 
-/// `s` after absorbing `data` as well. However an input is split across calls, `finish` returns the
-/// same digest.
+/// Returns `s` after it also absorbs `data`. However an input is split across calls, `finish`
+/// returns the same digest.
 pub fn update(s: Hasher, data: Bytes) -> Hasher / {abort.raise} = {
   let buffer = if s.pending.len() == 0 { data } else { s.pending.concat(data) };
-  // The last block stays pending even when it is whole: only `finish` knows it is the last.
   taken(s, buffer, max(buffer.len() - 1, 0) / s.hash.block_size)
 }
 
@@ -92,8 +88,6 @@ pub law schema any_split(h: Hash)
     finish(parts.fold(init(h), update)) == digest_of(h, Bytes::concat_all(parts))
   }
 
-/// `s` after absorbing the first `count` blocks of `buffer`, which contains all it has not absorbed
-/// yet. The rest stays pending.
 fn taken(s: Hasher, buffer: Bytes, count: Int) -> Hasher / {abort.raise} = {
   let size = s.hash.block_size;
   {
@@ -104,7 +98,6 @@ fn taken(s: Hasher, buffer: Bytes, count: Int) -> Hasher / {abort.raise} = {
   }
 }
 
-/// `words` after absorbing blocks `i` up to `count` of `data`, in order.
 fn absorbed(
   block: (Array<Int>, Int, Bytes, Int) -> Array<Int> / {abort.raise},
   size: Int,
@@ -142,20 +135,12 @@ pub fn merkle_damgard_finish(
 fn zeros(n: Int) -> Bytes / {abort.raise} =
   if n <= 256 { zero_run().slice(0, max(n, 0)) } else { zero_run().concat(zeros(n - 256)) }
 
-/// Zero bytes, more than any block here needs. They are built from literals with no call, so
-/// reading them costs no step.
 fn zero_run() -> Bytes = {
   let eight = b"\x00\x00\x00\x00\x00\x00\x00\x00";
   let run = Bytes::concat_all([eight, eight, eight, eight, eight, eight, eight, eight]);
   Bytes::concat_all([run, run, run, run])
 }
 
-// --- SHA-256 ----------------------------------------------------------------------
-
-// A word is an `Int` below 2^32; the bits a rotation leaves above it are dropped by a sum's mask.
-
-/// The first thirty-two bits of the fractional parts of the cube roots of the first sixty-four
-/// primes, as the standard publishes them.
 fn sha256_constants() -> List<Int> =
   [
     0x428A_2F98,
@@ -262,8 +247,6 @@ fn sha256_block(h: Array<Int>, k: Array<Int>, data: Bytes, at: Int) -> Array<Int
   sha256_rounds(h, k, Array::new(16, 0), data, at, 0, a, b, c, d, e, f, g, hh)
 }
 
-/// The rounds from `t` on. `w` contains the sixteen schedule words before `t`, with the word for
-/// `t - 16` in the slot where the word for `t` goes.
 fn sha256_rounds(
   h: Array<Int>,
   k: Array<Int>,
@@ -345,14 +328,9 @@ fn sha256_sum(
   h.set(7, hh)
 }
 
-/// Thirty-two bytes, of SHA-256 as the standard defines it.
+/// Returns the 32-byte SHA-256 digest of `input`, as the standard defines it.
 pub fn sha256(input: Bytes) -> Bytes / {abort.raise} = digest_of(sha256_hash(), input)
 
-// --- SHA-512, SHA-384 and SHA-512/256 ---------------------------------------------
-
-// A word is an `Int` read as sixty-four bits; `+` is checked, so sums go a half at a time.
-
-/// The first sixty-four bits of the fractional parts of the cube roots of the first eighty primes.
 fn sha512_constants() -> List<Int> =
   [
     0x428A_2F98_D728_AE22,
@@ -437,7 +415,6 @@ fn sha512_constants() -> List<Int> =
     0x6C44_198C_4A47_5817,
   ]
 
-/// The same for the square roots of the first eight primes, which is also BLAKE2b's starting state.
 fn sha512_initial() -> List<Int> =
   [
     0x6A09_E667_F3BC_C908,
@@ -450,8 +427,6 @@ fn sha512_initial() -> List<Int> =
     0x5BE0_CD19_137E_2179,
   ]
 
-/// SHA-512 from the state `start`, truncated to `size` bytes; the members of the family differ in
-/// nothing else.
 fn sha512_family(name: String, size: Int, start: List<Int>) -> Hash = {
   let k = Array::of_list(sha512_constants());
   let block = |h: Array<Int>, _: Int, data: Bytes, at: Int| sha512_block(h, k, data, at);
@@ -511,7 +486,6 @@ fn sha512_block(h: Array<Int>, k: Array<Int>, data: Bytes, at: Int) -> Array<Int
   sha512_rounds(h, k, Array::new(16, 0), data, at, 0, a, b, c, d, e, f, g, hh)
 }
 
-/// The rounds from `t` on, with `w` laid out as in `sha256_rounds`.
 fn sha512_rounds(
   h: Array<Int>,
   k: Array<Int>,
@@ -563,7 +537,6 @@ fn sha512_rounds(
     let kt = k.get(t);
     let s0 = (a >>> 28 | a << 36) ^ (a >>> 34 | a << 30) ^ (a >>> 39 | a << 25);
     let maj = a & b ^ a & c ^ b & c;
-    // `t1`, a half at a time; `a` and `e` each add their own words to it.
     let low = (hh & 0xFFFF_FFFF) + (s1 & 0xFFFF_FFFF) + (ch & 0xFFFF_FFFF) + (kt & 0xFFFF_FFFF)
       + (x & 0xFFFF_FFFF);
     let high = (hh >>> 32) + (s1 >>> 32) + (ch >>> 32) + (kt >>> 32) + (x >>> 32);
@@ -587,24 +560,20 @@ fn sha512_rounds(
     )
   }
 
-/// Two 64-bit words added, wrapping.
 fn add64(a: Int, b: Int) -> Int = {
   let low = (a & 0xFFFF_FFFF) + (b & 0xFFFF_FFFF);
   (a >>> 32) + (b >>> 32) + (low >>> 32) << 32 | low & 0xFFFF_FFFF
 }
 
-/// Sixty-four bytes, of SHA-512 as the standard defines it.
+/// Returns the 64-byte SHA-512 digest of `input`, as the standard defines it.
 pub fn sha512(input: Bytes) -> Bytes / {abort.raise} = digest_of(sha512_hash(), input)
 
-/// Forty-eight bytes, of SHA-384 as the standard defines it.
+/// Returns the 48-byte SHA-384 digest of `input`, as the standard defines it.
 pub fn sha384(input: Bytes) -> Bytes / {abort.raise} = digest_of(sha384_hash(), input)
 
-/// Thirty-two bytes, of SHA-512/256 as the standard defines it.
+/// Returns the 32-byte SHA-512/256 digest of `input`, as the standard defines it.
 pub fn sha512_256(input: Bytes) -> Bytes / {abort.raise} = digest_of(sha512_256_hash(), input)
 
-// --- SHA-3 and SHAKE --------------------------------------------------------------
-
-/// The round constants of Keccak-f[1600].
 fn keccak_constants() -> List<Int> =
   [
     0x0000_0000_0000_0001,
@@ -633,12 +602,10 @@ fn keccak_constants() -> List<Int> =
     0x8000_0000_8000_8008,
   ]
 
-/// A sponge over Keccak-f[1600] as FIPS 202 defines one: `rate` bytes a block, `size` bytes of
-/// output, and `suffix`, the bits a function appends to its message with the padding's first bit.
 fn sponge(name: String, rate: Int, size: Int, suffix: Int) -> Hash = {
-  let rc = Array::of_list(keccak_constants());
+  let round_constants = Array::of_list(keccak_constants());
   let block = |s: Array<Int>, _: Int, data: Bytes, at: Int|
-    keccak_rounds(keccak_xor_block(s, data, at, 0, rate / 8), rc, 0);
+    keccak_rounds(keccak_xor_block(s, data, at, 0, rate / 8), round_constants, 0);
   {
     name: name,
     block_size: rate,
@@ -651,7 +618,9 @@ fn sponge(name: String, rate: Int, size: Int, suffix: Int) -> Hash = {
       else { Bytes::concat_all([byte_of_int(suffix), zeros(fill - 2), b"\x80"]) };
       let last = tail.concat(padding);
       let full = absorbed(block, rate, s, seen, last, 0, last.len() / rate);
-      Bytes::concat_all(squeeze_blocks(full, rc, rate, 0, (size + rate - 1) / rate, [])).slice(
+      Bytes::concat_all(
+        squeeze_blocks(full, round_constants, rate, 0, (size + rate - 1) / rate, []),
+      ).slice(
         0,
         size,
       )
@@ -659,7 +628,6 @@ fn sponge(name: String, rate: Int, size: Int, suffix: Int) -> Hash = {
   }
 }
 
-/// The state with the block's first `lanes` lanes xored in, each least significant byte first.
 fn keccak_xor_block(
   s: Array<Int>,
   data: Bytes,
@@ -673,25 +641,25 @@ fn keccak_xor_block(
     keccak_xor_block(s.set(i, lane), data, at, i + 1, lanes)
   }
 
-/// Output of `rate` bytes per block, with the state permuted between blocks.
 fn squeeze_blocks(
   s: Array<Int>,
-  rc: Array<Int>,
+  round_constants: Array<Int>,
   rate: Int,
   i: Int,
   blocks: Int,
   out: List<Bytes>,
 ) -> List<Bytes> / {abort.raise} =
   if i >= blocks { out } else {
-    let next = if i == 0 { s } else { keccak_rounds(s, rc, 0) };
+    let next = if i == 0 { s } else { keccak_rounds(s, round_constants, 0) };
     let lanes = Bytes::concat_all(next.to_list().map(u64_le));
-    squeeze_blocks(next, rc, rate, i + 1, blocks, out.push(lanes.slice(0, rate)))
+    squeeze_blocks(next, round_constants, rate, i + 1, blocks, out.push(lanes.slice(0, rate)))
   }
 
-/// The rounds of Keccak-f[1600] from `round` on, each written out: the column parities `c` and what
-/// each column gets from its neighbours `d` (theta), every lane rotated into its new place `b` (rho
-/// and pi), then each row mixed (chi) and the round constant added (iota).
-fn keccak_rounds(s: Array<Int>, rc: Array<Int>, round: Int) -> Array<Int> / {abort.raise} =
+fn keccak_rounds(
+  s: Array<Int>,
+  round_constants: Array<Int>,
+  round: Int,
+) -> Array<Int> / {abort.raise} =
   if round >= 24 { s } else {
     let a0 = s.get(0);
     let a1 = s.get(1);
@@ -755,7 +723,7 @@ fn keccak_rounds(s: Array<Int>, rc: Array<Int>, round: Int) -> Array<Int> / {abo
     let b24 = (a21 ^ d1) << 2 | (a21 ^ d1) >>> 62;
     keccak_rounds(
       Array::of_list([
-        b0 ^ ~b1 & b2 ^ rc.get(round),
+        b0 ^ ~b1 & b2 ^ round_constants.get(round),
         b1 ^ ~b2 & b3,
         b2 ^ ~b3 & b4,
         b3 ^ ~b4 & b0,
@@ -781,21 +749,21 @@ fn keccak_rounds(s: Array<Int>, rc: Array<Int>, round: Int) -> Array<Int> / {abo
         b23 ^ ~b24 & b20,
         b24 ^ ~b20 & b21,
       ]),
-      rc,
+      round_constants,
       round + 1,
     )
   }
 
-/// SHA3-224 as FIPS 202 defines it.
+/// Returns the SHA3-224 hash, which produces 28-byte digests.
 pub fn sha3_224_hash() -> Hash = sponge("SHA3-224", 144, 28, 0x06)
 
-/// SHA3-256 as FIPS 202 defines it.
+/// Returns the SHA3-256 hash, which produces 32-byte digests.
 pub fn sha3_256_hash() -> Hash = sponge("SHA3-256", 136, 32, 0x06)
 
-/// SHA3-384 as FIPS 202 defines it.
+/// Returns the SHA3-384 hash, which produces 48-byte digests.
 pub fn sha3_384_hash() -> Hash = sponge("SHA3-384", 104, 48, 0x06)
 
-/// SHA3-512 as FIPS 202 defines it.
+/// Returns the SHA3-512 hash, which produces 64-byte digests.
 pub fn sha3_512_hash() -> Hash = sponge("SHA3-512", 72, 64, 0x06)
 
 /// SHAKE128 as FIPS 202 defines it, read to `length` bytes. A length below zero is rejected as an
@@ -828,10 +796,6 @@ pub fn shake128(input: Bytes, length: Int) -> Bytes / {hash.fail, abort.raise} =
 pub fn shake256(input: Bytes, length: Int) -> Bytes / {hash.fail, abort.raise} =
   digest_of(shake256_hash(length), input)
 
-// --- BLAKE2b ----------------------------------------------------------------------
-
-/// Which message word each step of each of the twelve rounds uses: RFC 7693's SIGMA, one hex digit
-/// per word.
 fn blake2b_schedule() -> Array<Int> =
   Array::of_list(
     String::chars(
@@ -859,8 +823,6 @@ pub fn blake2b_with(key: Bytes, size: Int) -> Hash / {hash.fail, abort.raise} =
   else if key.len() > 64 { hash.fail(KeyLength(key.len())) }
   else { blake2b_unchecked(key, size) }
 
-/// A key is a block of its own before the message. So the state's byte count runs a block ahead of
-/// the message's, and the key's block is absorbed just before the message's first block.
 fn blake2b_unchecked(key: Bytes, size: Int) -> Hash / {abort.raise} = {
   let iv = Array::of_list(sha512_initial());
   let sigma = blake2b_schedule();
@@ -896,8 +858,6 @@ fn blake2b_unchecked(key: Bytes, size: Int) -> Hash / {abort.raise} = {
   }
 }
 
-/// F of RFC 7693: `h` after compressing the block of `data` at `at`. `count` is the number of
-/// message bytes up to the end of that block, and `last` is whether it is the final block.
 fn blake2b_compress(
   h: Array<Int>,
   iv: Array<Int>,
@@ -923,8 +883,6 @@ fn blake2b_compress(
   Array::of_list(range(0, 8).map(|i: Int| h.get(i) ^ v.get(i) ^ v.get(i + 8)))
 }
 
-/// The ninety-six steps from `i` on, eight per round: four down the columns of `v`, then four along
-/// its diagonals.
 fn blake2b_rounds(
   v: Array<Int>,
   sigma: Array<Int>,
@@ -953,8 +911,6 @@ fn blake2b_rounds(
     )
   }
 
-/// G of RFC 7693 over the words `a`, `b`, `c` and `d` of `v`, with the message words at `px` and
-/// `py`.
 fn blake2b_g(
   v: Array<Int>,
   a: Int,
@@ -989,10 +945,6 @@ fn blake2b_g(
 /// Sixty-four bytes, of BLAKE2b as RFC 7693 defines it.
 pub fn blake2b(input: Bytes) -> Bytes / {abort.raise} = digest_of(blake2b_hash(), input)
 
-// --- HMAC -------------------------------------------------------------------------
-
-/// A key as HMAC uses it: its two pads, and the state after absorbing each pad, ready for the
-/// message that follows.
 type Keyed = { inner_pad: Bytes, outer_pad: Bytes, inner: Hasher, outer: Hasher }
 
 fn keyed(h: Hash, key: Bytes) -> Keyed / {abort.raise} = {
@@ -1008,17 +960,15 @@ fn keyed(h: Hash, key: Bytes) -> Keyed / {abort.raise} = {
   }
 }
 
-/// The digest of `pad` followed by `data`. `after` absorbed the pad's blocks as if more input
-/// followed, which is true only when `data` is not empty.
 fn digest_after_pad(after: Hasher, pad: Bytes, data: Bytes) -> Bytes / {abort.raise} =
   if data.len() == 0 { digest_of(after.hash, pad) } else { finish(update(after, data)) }
 
 fn tagged(k: Keyed, message: Bytes) -> Bytes / {abort.raise} =
   digest_after_pad(k.outer, k.outer_pad, digest_after_pad(k.inner, k.inner_pad, message))
 
-/// HMAC over `h` under a key anyone may read, as RFC 2104 defines it: a tag of `h.digest_size`
-/// bytes, over any `Hash`. Its running time depends on the key, so use it only for a key that is
-/// public by nature, such as a salt or a published label. A key worth protecting is a `Secret`, for
+/// Returns the HMAC of `message` under `key`, as RFC 2104 defines it, with any `Hash` `h`. The tag
+/// has `h.digest_size` bytes. Its running time depends on the key, so use it only for keys that are
+/// public, such as a salt or a published label. For a private key, wrap it in a `Secret` and call
 /// `hmac`.
 pub fn hmac_plain(h: Hash, key: Bytes, message: Bytes) -> Bytes / {abort.raise} =
   tagged(keyed(h, key), message)
@@ -1042,22 +992,20 @@ pub fn tags_match(a: Bytes, b: Bytes) -> Bool = Secret::of_bytes(a) == Secret::o
 fn keyed_tag(name: String, key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
   match Secret::hmac(name, key, message) {
     Some(tag) -> tag,
-    None -> panic(name ++ " is a hash the runtime keys"),
+    None -> panic(name ++ " is not a hash the runtime can compute HMAC with"),
   }
 
-/// HMAC-SHA-256, for which RFC 4231 publishes test vectors.
+/// Returns the HMAC-SHA-256 tag of `message` under `key`, which is 32 bytes.
 pub fn hmac_sha256(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
   keyed_tag("SHA-256", key, message)
 
-/// HMAC-SHA-384.
+/// Returns the HMAC-SHA-384 tag of `message` under `key`, which is 48 bytes.
 pub fn hmac_sha384(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
   keyed_tag("SHA-384", key, message)
 
-/// HMAC-SHA-512.
+/// Returns the HMAC-SHA-512 tag of `message` under `key`, which is 64 bytes.
 pub fn hmac_sha512(key: Secret<Bytes>, message: Bytes) -> Bytes / {abort.raise} =
   keyed_tag("SHA-512", key, message)
-
-// --- HKDF and PBKDF2 --------------------------------------------------------------
 
 /// HKDF's first step, as RFC 5869 defines it: a pseudorandom key of `h.digest_size` bytes out of
 /// `key`, which need not be uniform, and `salt`, which is public and may be empty.
@@ -1116,8 +1064,9 @@ pub fn pbkdf2(
     }
   }
 
-/// PBKDF2-HMAC-SHA-256 with one output block, which is thirty-two bytes: SCRAM's salted password.
-/// It raises for an iteration count below one.
+/// Returns the 32-byte PBKDF2-HMAC-SHA-256 key derived from `password` and `salt`. This is the
+/// salted password that the SCRAM login protocol uses to prove knowledge of a password. Panics when
+/// `iterations` is below one.
 pub fn pbkdf2_sha256(
   password: Secret<Bytes>,
   salt: Bytes,
@@ -1129,9 +1078,7 @@ pub fn pbkdf2_sha256(
     hash.fail(_) -> panic("PBKDF2 takes an iteration count of one or more"),
   }
 
-// --- Tests ------------------------------------------------------------------
-
-test "the empty input" {
+test "`blake3` of empty input returns the published digest" {
   assert_eq(
     blake3(b""),
     b"\xaf\x13\x49\xb9\xf5\xf9\xa1\xa6\xa0\x40\x4d\xea\x36\xdc\xc9\x49\x9b\xcb\x25\xc9\xad\xc1\x12\xb7\xcc\x9a\x93\xca\xe4\x1f\x32\x62",
@@ -1150,20 +1097,17 @@ test "a hash is thirty-two bytes whatever the input" {
   assert_eq(blake3(b"ply").len(), 32)
 }
 
-test "the block boundary is where a transcription goes wrong" {
+test "`blake3` returns 32 bytes for inputs of 63, 64 and 65 bytes, and different digests for 64 and 65 bytes" {
   assert_eq(blake3(b"a".repeat(63)).len(), 32);
   assert_eq(blake3(b"a".repeat(64)).len(), 32);
   assert(blake3(b"a".repeat(64)) != blake3(b"a".repeat(65)))
 }
 
-test "a second chunk is a tree, and a tree is not a longer chunk" {
-  // 1024 is one chunk and 1025 is two chunks joined by a parent node.
+test "`blake3` of 1025 bytes, which needs two 1024-byte chunks, differs from the digest of 1024 bytes" {
   assert(blake3(b"a".repeat(1024)) != blake3(b"a".repeat(1025)));
   assert_eq(blake3(b"a".repeat(2048)).len(), 32)
 }
 
-/// BLAKE3's published vectors, whose input is `length` bytes counting up modulo 251: either side of
-/// a block, a chunk and a two-chunk tree.
 fn blake3_vectors() -> List<{ length: Int, digest: String }> =
   [
     { length: 0, digest: "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262" },
@@ -1180,13 +1124,12 @@ fn blake3_vectors() -> List<{ length: Int, digest: String }> =
     { length: 2049, digest: "5f4d72f40d7a5f82b15ca2b2e44b1de3c2ef86c426c95c1af0b6879522563030" },
   ]
 
-test "BLAKE3 over {v.length} counting bytes is the published digest" for v: { length: Int, digest: String } in blake3_vectors(
+test "`blake3` of {v.length} bytes counting up from zero returns the published digest" for v: { length: Int, digest: String } in blake3_vectors(
   ) {
   let input = Bytes::concat_all(range(0, v.length).map(|i: Int| byte_of_int(i % 251)));
   assert_eq(blake3(input).hex_of(), v.digest)
 }
 
-/// Every hash here that takes no parameter.
 fn every() -> List<Hash> / {abort.raise} =
   [
     sha256_hash(),
@@ -1200,17 +1143,14 @@ fn every() -> List<Hash> / {abort.raise} =
     blake2b_hash(),
   ]
 
-/// The hash with that name, with a SHAKE read to thirty-two bytes.
 fn named(name: String) -> Hash / {hash.fail, abort.raise} =
   match every().push(shake128_hash(32)).push(shake256_hash(32)).find(|h: Hash| h.name == name) {
     Some(h) -> h,
     None -> panic("no hash here is named " ++ name),
   }
 
-/// One published digest.
 type Digest = { hash: String, message: String, input: Bytes, digest: String }
 
-/// FIPS 180-4's examples, and the empty and the million-byte messages NIST publishes beside them.
 fn fips_180() -> List<Digest> =
   [
     {
@@ -1311,10 +1251,8 @@ fn fips_180() -> List<Digest> =
     },
   ]
 
-/// One published output of a function read to a length.
 type Squeeze = { hash: String, message: String, input: Bytes, length: Int, output: String }
 
-/// NIST's SHA-3 example values for the 0-bit and the 1600-bit message, and `abc`.
 fn fips_202() -> List<Digest> =
   [
     {
@@ -1391,7 +1329,6 @@ fn fips_202() -> List<Digest> =
     },
   ]
 
-/// NIST's SHAKE example values, which are 4096 bits of output.
 fn shake_examples() -> List<Squeeze> =
   [
     {
@@ -1453,12 +1390,8 @@ test "FIPS 202: {v.hash} of {v.message}, read to {v.length} bytes" for v: Squeez
   assert_eq(output.hex_of(), v.output)
 }
 
-/// A hash and the single digest its sweep produces.
 type DigestOfDigests = { hash: String, digest: String }
 
-/// For each hash, the digest of its digests of the first `n` bytes of `varied` for every `n` up to
-/// 340, which is past two blocks of any of them. Another implementation computed the expected
-/// values.
 fn sweeps() -> List<DigestOfDigests> =
   [
     { hash: "SHA-256", digest: "bedbf56584b708fc9b41134658e504acf4a1997674d9f68ee930dfe060841106" },
@@ -1501,11 +1434,9 @@ fn sweeps() -> List<DigestOfDigests> =
     },
   ]
 
-/// `n` bytes in which no two blocks are alike.
 fn varied(n: Int) -> Bytes =
   Bytes::concat_all(range(0, n).map(|i: Int| byte_of_int(i * 7 + i / 64 & 0xFF)))
 
-// Covers every padding case: a full last block, one a byte short, and one the length just fits.
 test "{v.hash} of every length to 340 bytes, as one digest of the digests" for v: DigestOfDigests in sweeps(
   ) {
   let h = named(v.hash);
@@ -1515,14 +1446,14 @@ test "{v.hash} of every length to 340 bytes, as one digest of the digests" for v
   assert_eq(finish(all).hex_of(), v.digest)
 }
 
-test "a shorter SHAKE output is the start of a longer one, a block's edge or not" {
+test "a shorter SHAKE output is a prefix of a longer one, including lengths at and around the block size" {
   let long = shake128(b"abc", 512);
   assert([0, 1, 167, 168, 169, 336, 337].all(|n: Int| shake128(b"abc", n) == long.slice(0, n)));
   let longer = shake256(b"abc", 512);
   assert([0, 1, 135, 136, 137, 272, 273].all(|n: Int| shake256(b"abc", n) == longer.slice(0, n)))
 }
 
-test "each one-shot digest matches its hash" {
+test "each one-shot digest function returns the same bytes as `digest_of` with the matching hash" {
   let input = b"the quick brown fox";
   assert_eq(sha256(input), digest_of(sha256_hash(), input));
   assert_eq(sha384(input), digest_of(sha384_hash(), input));
@@ -1548,7 +1479,6 @@ test "BLAKE2b of abc, as RFC 7693 works it out" {
   )
 }
 
-/// What RFC 7693's self-test fills its inputs and keys with.
 fn filler(n: Int, seed: Int) -> Bytes =
   Bytes::concat_all(
     range(0, n).fold(
@@ -1560,7 +1490,6 @@ fn filler(n: Int, seed: Int) -> Bytes =
     ).out,
   )
 
-// Four digest sizes over six lengths, keyed and not, hashed into the one digest the RFC publishes.
 test "BLAKE2b's self-test, RFC 7693 appendix E" {
   let all = [20, 32, 48, 64].fold(init(blake2b_with(b"", 32)), |outer: Hasher, size: Int|
     [0, 3, 128, 129, 255, 1024].fold(outer, |s: Hasher, n: Int| {
@@ -1575,11 +1504,8 @@ test "BLAKE2b's self-test, RFC 7693 appendix E" {
   )
 }
 
-/// One keyed digest.
 type KeyedDigest = { key: Bytes, size: Int, input: Bytes, digest: String }
 
-/// Keyed BLAKE2b at the edges of what it accepts: a key of one byte and of sixty-four, a digest of
-/// one byte, and no message. Another implementation computed the expected values.
 fn blake2b_keyed() -> List<KeyedDigest> / {abort.raise} =
   [
     {
@@ -1635,8 +1561,7 @@ test "BLAKE2b of an input is one digest however it is split" {
   gen::check(gen::list(gen::bytes()), |parts: List<Bytes>| any_split(blake2b_hash(), parts))
 }
 
-// A random split seldom lands on a block's edge, which is where a buffer goes wrong.
-test "a split at, before and after a block's edge gives the digest of the whole" {
+test "splitting the input into parts at, before and after a block boundary gives the same digest as hashing it whole" {
   let hashes = every().push(blake2b_with(b"a key", 32)).push(shake256_hash(300));
   assert(
     hashes.all(|h: Hash| {
@@ -1659,14 +1584,13 @@ test "an input taken a byte at a time gives the digest of the whole" {
   )
 }
 
-test "a digest in progress is a value: finishing it does not end it" {
+test "a hasher can be finished and then updated again, because `finish` leaves the original hasher unchanged" {
   let half = update(init(sha256_hash()), b"ab");
   assert_eq(finish(half), sha256(b"ab"));
   assert_eq(finish(update(half, b"c")), sha256(b"abc"));
   assert_eq(finish(update(half, b"d")), sha256(b"abd"))
 }
 
-/// One of RFC 4231's cases, with the tag it publishes for each hash.
 type Mac = {
   test_case: Int,
   key: Bytes,
@@ -1676,7 +1600,6 @@ type Mac = {
   sha512: String,
 }
 
-/// RFC 4231's seven cases; the fifth publishes its tags truncated to sixteen bytes.
 fn rfc_4231() -> List<Mac> / {abort.raise} =
   [
     {
@@ -1737,11 +1660,10 @@ fn rfc_4231() -> List<Mac> / {abort.raise} =
     },
   ]
 
-/// The tag's first bytes, as many as `published` has, in hex.
 fn truncated_hex(tag: Bytes, published: String) -> String / {abort.raise} =
   tag.slice(0, published.len() / 2).hex_of()
 
-test "RFC 4231, case {v.test_case}, under a secret key and under a plain one" for v: Mac in rfc_4231(
+test "RFC 4231 case {v.test_case}: HMAC returns the published tag, with `Secret` keys and with plain byte keys" for v: Mac in rfc_4231(
   ) {
   handle {
     assert_eq(
@@ -1777,7 +1699,6 @@ test "HMAC of the empty message, and under the empty key" {
     "5d5d139563c95b5967b9bd9a8c9b233a9dedb45072794cd232dc1b74832607d0",
   );
   assert_eq(hmac_plain(sha256_hash(), b"", b""), hmac_sha256(Secret::of_bytes(b""), b""));
-  // BLAKE2b marks its last block specially, so with an empty message the pad is that last block.
   assert_eq(
     hmac_plain(blake2b_hash(), b"key", b"").hex_of(),
     "019fe04bf010b8d72772e6b46897ecf74b4878c394ff2c4d5cfa0b7cc9bbefcb28c36de23cef03089db9c3d900468c89804f135e9fdef7ec9b3c7abe50ed33d3",
@@ -1792,7 +1713,7 @@ test "HMAC of the empty message, and under the empty key" {
   )
 }
 
-test "a key of a block's length is used as it is, and a longer one is its digest" {
+test "an HMAC key exactly one block long is used unchanged, and a longer key is replaced by its digest" {
   assert(
     every().all(|h: Hash| {
       let whole = varied(h.block_size);
@@ -1809,7 +1730,7 @@ test "HMAC-SHA-256 under a secret key is HMAC over SHA-256 as Ply writes it" {
   })
 }
 
-test "two tags match when every byte does, and never across a length" {
+test "`tags_match` is true only when two tags have the same length and the same bytes, and `hmac_verify` agrees" {
   let tag = hmac_sha256(Secret::of_bytes(b"key"), b"message");
   assert(tags_match(tag, hmac_sha256(Secret::of_bytes(b"key"), b"message")));
   assert(!tags_match(tag, hmac_sha256(Secret::of_bytes(b"key"), b"massage")));
@@ -1836,8 +1757,6 @@ test "two tags match exactly when they are the same bytes" {
   })
 }
 
-/// One of RFC 5869's cases: what goes in, the pseudorandom key the first step makes of it, and the
-/// output.
 type Derivation = {
   test_case: Int,
   key: Bytes,
@@ -1848,7 +1767,6 @@ type Derivation = {
   okm: String,
 }
 
-/// RFC 5869's SHA-256 cases, A.1 to A.3.
 fn rfc_5869() -> List<Derivation> / {abort.raise} =
   [
     {
@@ -1886,7 +1804,8 @@ fn rfc_5869() -> List<Derivation> / {abort.raise} =
     },
   ]
 
-test "RFC 5869, case {v.test_case}" for v: Derivation in rfc_5869() {
+test "RFC 5869 case {v.test_case}: HKDF-SHA-256 extract, expand and the combined `hkdf` return the published values" for v: Derivation in rfc_5869(
+  ) {
   let h = sha256_hash();
   let derived = try {
     let prk = hkdf_extract(h, v.salt, Secret::of_bytes(v.key));
@@ -1903,7 +1822,7 @@ test "RFC 5869, case {v.test_case}" for v: Derivation in rfc_5869() {
   )
 }
 
-test "HKDF's first step is one HMAC under the salt, and a one-digest second step is one HMAC under the derived key" {
+test "`hkdf_extract` returns one HMAC keyed by the salt, and `hkdf_expand` asked for one hash-length block of output returns one HMAC keyed by the extracted key" {
   let h = sha256_hash();
   let prk = hmac_plain(h, b"salt", b"key");
   assert_eq(try { hkdf_extract(h, b"salt", Secret::of_bytes(b"key")) }, Ok(Secret::of_bytes(prk)));
@@ -1913,11 +1832,8 @@ test "HKDF's first step is one HMAC under the salt, and a one-digest second step
   )
 }
 
-/// One published PBKDF2 key.
 type Pbkdf2Vector = { password: Bytes, salt: Bytes, iterations: Int, length: Int, key: String }
 
-/// RFC 7914's first PBKDF2-HMAC-SHA-256 vector, which is two digests of output, then RFC 6070's
-/// inputs under SHA-256, as libraries have long published them.
 fn pbkdf2_sha256_vectors() -> List<Pbkdf2Vector> =
   [
     {
@@ -1972,7 +1888,7 @@ test "PBKDF2-HMAC-SHA-256 of {v.password} and {v.salt}, {v.iterations} rounds to
   )
 }
 
-test "pbkdf2_sha256 is PBKDF2 over SHA-256 to one digest, and raises for no iterations" {
+test "`pbkdf2_sha256` equals `pbkdf2` over SHA-256 with a 32-byte output, and raises for zero iterations" {
   assert_eq(Ok(pbkdf2_sha256(Secret::of_bytes(b"password"), b"salt", 2)), try {
     pbkdf2(sha256_hash(), Secret::of_bytes(b"password"), b"salt", 2, 32)
   });
@@ -1989,14 +1905,14 @@ test "PBKDF2's first round is one HMAC under the password" {
   )
 }
 
-test "zero bytes come in any number" {
+test "`zeros(n)` returns n zero bytes, and returns empty bytes for a negative n" {
   assert([0, 1, 255, 256, 257, 600].all(|n: Int| zeros(n) == b"\x00".repeat(n)));
   assert_eq(zeros(0 - 1), b"")
 }
 
 fn rejection<a>(r: Result<a, Error>) -> Option<Error> = match r { Ok(_) -> None, Err(e) -> Some(e) }
 
-test "a length, a key or a count outside what a function defines is rejected, with the rejected value" {
+test "`hkdf`, `hkdf_expand`, `pbkdf2` and `hmac` fail on an invalid output length, key length, iteration count or hash, and the error holds the invalid value" {
   let h = sha256_hash();
   let prk = Secret::of_bytes(b"\x0b".repeat(32));
   assert_eq(try { hkdf_expand(h, prk, b"", 255 * 32).len() }, Ok(255 * 32));

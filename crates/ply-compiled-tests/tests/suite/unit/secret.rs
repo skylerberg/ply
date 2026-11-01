@@ -1,7 +1,3 @@
-//! The natives a `Secret` is made, read and computed over through, called as a unit binds them over
-//! hand-built bytes: a name, plain bytes and integers in, and plain bytes, a count, a verdict or a
-//! secret's handle out, an empty result or a code below 0 where an operation has nothing.
-
 use crate::bare::{context, helper};
 use ply_compiled::c::builtin_helper_name;
 use ply_compiled::heap::{self, Word};
@@ -23,24 +19,19 @@ fn native<F: Copy>(name: &str) -> F {
     helper(&builtin_helper_name(name))
 }
 
-/// `bytes` as a native borrows them: their address, then their count.
 fn borrowed(bytes: &[u8]) -> (Word, Word) {
     (bytes.as_ptr() as Word, bytes.len() as Word)
 }
 
-/// A secret of `bytes`, a `Secret<String>` where `text`.
 pub(super) fn sealed(ctx: &mut Ctx, bytes: &[u8], text: bool) -> Word {
     let (p, n) = borrowed(bytes);
     unsafe { native::<A3>("?secret_of")(ctx, p, n, Word::from(text)) }
 }
 
-/// The secret the handle `w` holds, read where only a test may.
 fn held(w: Word) -> &'static Sealed {
     unsafe { heap::native_of::<Sealed>(w) }.expect("a secret")
 }
 
-/// The bytes a native left taken, `n` of them, copied out as emitted code copies them; none for a
-/// count below 0.
 fn taken(ctx: &mut Ctx, n: Word) -> Option<Vec<u8>> {
     let mut out = vec![0u8; usize::try_from(n).ok()?];
     unsafe { native::<N2>("?taken")(ctx, out.as_mut_ptr() as Word, n) };
@@ -54,20 +45,18 @@ fn hex(digits: &str) -> Vec<u8> {
         .collect()
 }
 
-/// What a native taking a name and a secret returns.
 fn named_secret(ctx: &mut Ctx, native_name: &str, name: &str, secret: Word) -> Word {
     let (p, n) = borrowed(name.as_bytes());
     unsafe { native::<A3>(native_name)(ctx, p, n, secret) }
 }
 
-/// What a native taking a name alone returns.
 fn of_name(ctx: &mut Ctx, native_name: &str, name: &str) -> Word {
     let (p, n) = borrowed(name.as_bytes());
     unsafe { native::<A2>(native_name)(ctx, p, n) }
 }
 
 #[test]
-fn a_secret_holds_a_copy_and_verifies_only_its_own_string() {
+fn a_secret_stores_its_own_copy_of_the_bytes_and_verify_succeeds_only_for_identical_bytes() {
     let mut ctx = context();
     let verify = |ctx: &mut Ctx, s: Word, b: &[u8]| unsafe {
         let (p, n) = borrowed(b);
@@ -82,13 +71,11 @@ fn a_secret_holds_a_copy_and_verifies_only_its_own_string() {
     assert_eq!(verify(&mut ctx, text, b"hunter2"), 1);
     assert_eq!(verify(&mut ctx, text, b"hunter3"), 0);
     assert_eq!(verify(&mut ctx, text, b""), 0);
-    // A `Secret<Bytes>` is no stored password.
     assert_eq!(verify(&mut ctx, raw, b"hunter2"), 0);
     let equal =
         |ctx: &mut Ctx, a: Word, b: Word| unsafe { native::<A2>("?secret_equal")(ctx, a, b) };
     let utf8 = unsafe { native::<A1>("?secret_bytes")(&mut ctx, text) };
     assert_eq!(equal(&mut ctx, utf8, raw), 1);
-    // Equal bytes of two types are two secrets.
     assert_eq!(equal(&mut ctx, text, raw), 0);
     let tail = sealed(&mut ctx, b"!", false);
     let joined = unsafe { native::<A2>("?secret_concat")(&mut ctx, raw, tail) };
@@ -98,7 +85,7 @@ fn a_secret_holds_a_copy_and_verifies_only_its_own_string() {
 }
 
 #[test]
-fn a_secret_text_is_written_and_read_in_the_encoding_its_name_names() {
+fn a_secret_is_encoded_to_text_and_decoded_back_using_the_encoding_named_by_the_name_argument() {
     let mut ctx = context();
     for (name, writes) in [("hex", 1), ("base32", 1), ("base32-typed", 0), ("rot13", 0)] {
         assert_eq!(of_name(&mut ctx, "?secret_encodes", name), writes, "{name}");
@@ -129,7 +116,6 @@ fn a_secret_text_is_written_and_read_in_the_encoding_its_name_names() {
     assert_eq!(ctx.failed, 0);
 }
 
-/// A PKCS #8 document of the Ed25519 key `seed` is.
 fn ed25519_document(seed: &[u8; 32]) -> Vec<u8> {
     [&hex("302e020100300506032b657004220420")[..], seed].concat()
 }
@@ -157,7 +143,6 @@ fn a_private_key_is_read_out_of_its_document_by_its_scheme() {
     assert_eq!(ctx.failed, 0);
 }
 
-/// The contents of each `INTEGER` a DER `SEQUENCE` of them holds, each without its leading zeros.
 fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     fn length(der: &[u8], at: &mut usize) -> usize {
         let first = der[*at];
@@ -191,8 +176,6 @@ fn integers(der: &[u8]) -> Vec<Vec<u8>> {
     out
 }
 
-/// The numbers' base64url texts, each behind a `.`, as one secret text: what the root written for
-/// `Secret::rsa_jwk` joins its list into.
 fn joined_texts(ctx: &mut Ctx, private: &[Vec<u8>]) -> Word {
     let mut joined = sealed(ctx, b"", false);
     for number in private {
@@ -207,7 +190,8 @@ fn joined_texts(ctx: &mut Ctx, private: &[Vec<u8>]) -> Word {
 }
 
 #[test]
-fn an_rsa_jwk_is_the_document_its_numbers_came_from_and_numbers_that_disagree_are_none() {
+fn an_rsa_json_web_key_rebuilds_the_original_der_key_document_and_returns_empty_for_inconsistent_numbers()
+ {
     let mut ctx = context();
     let document = std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -232,7 +216,7 @@ fn an_rsa_jwk_is_the_document_its_numbers_came_from_and_numbers_that_disagree_ar
 }
 
 #[test]
-fn a_keyed_hash_returns_under_the_hash_its_name_names() {
+fn a_keyed_hash_is_computed_with_the_hash_function_named_by_its_argument() {
     let mut ctx = context();
     let key = sealed(&mut ctx, b"key", false);
     let hmac = |ctx: &mut Ctx, hash: &str| {
@@ -253,7 +237,6 @@ fn a_keyed_hash_returns_under_the_hash_its_name_names() {
     assert_eq!(ctx.failed, 0);
 }
 
-/// RFC 5869's first case: the key HKDF extracts, and the bytes it expands that key to.
 #[test]
 fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_bound() {
     let mut ctx = context();
@@ -272,12 +255,14 @@ fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_boun
     };
     assert!(held(none).bytes().is_empty());
     let info = hex("f0f1f2f3f4f5f6f7f8f9");
-    let (ip, in_) = borrowed(&info);
+    let (ip, info_byte_count) = borrowed(&info);
     let expands = |ctx: &mut Ctx, length: Word| unsafe {
         native::<A3>("?secret_hkdf_expands")(ctx, hp, hn, length)
     };
     let expand = |ctx: &mut Ctx, length: Word| {
-        let w = unsafe { native::<A6>("?secret_hkdf_expand")(ctx, hp, hn, prk, ip, in_, length) };
+        let w = unsafe {
+            native::<A6>("?secret_hkdf_expand")(ctx, hp, hn, prk, ip, info_byte_count, length)
+        };
         held(w).bytes().to_vec()
     };
     assert_eq!(
@@ -292,7 +277,6 @@ fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_boun
         assert_eq!(expands(&mut ctx, rejected), -1, "{rejected}");
         assert_eq!(expand(&mut ctx, rejected), Vec::<u8>::new(), "{rejected}");
     }
-    // Even an empty key is none under a hash it has not.
     let (mp, mn) = borrowed(b"MD5");
     assert_eq!(
         unsafe { native::<A3>("?secret_hkdf_expands")(&mut ctx, mp, mn, 0) },
@@ -301,7 +285,6 @@ fn hkdf_extracts_and_expands_as_rfc_5869_does_and_rejects_a_length_past_its_boun
     assert_eq!(ctx.failed, 0);
 }
 
-/// RFC 6070's first case, and a count of rounds and a length past what it derives.
 #[test]
 fn pbkdf2_derives_as_rfc_6070_says_within_its_bounds() {
     let mut ctx = context();
@@ -324,7 +307,6 @@ fn pbkdf2_derives_as_rfc_6070_says_within_its_bounds() {
     assert_eq!(ctx.failed, 0);
 }
 
-/// What `crypto_sealed` or `crypto_opened` returns over `cipher`, `key`, `nonce` and `text`.
 fn sealing(
     ctx: &mut Ctx,
     native_name: &str,
@@ -344,7 +326,7 @@ fn sealing(
 }
 
 #[test]
-fn a_sealed_message_opens_under_its_key_alone() {
+fn a_sealed_message_opens_with_the_same_key_and_fails_with_a_wrong_key_or_cipher() {
     let mut ctx = context();
     for (cipher, nonce) in [
         ("aes-256-gcm", 12),
@@ -367,7 +349,6 @@ fn a_sealed_message_opens_under_its_key_alone() {
         sealing(&mut ctx, "crypto_opened", cipher, key, &nonce, &turned),
         [0]
     );
-    // What the Ply around them rejects: a short key, a nonce of another cipher's length.
     let short = sealed(&mut ctx, &[9; 16], false);
     let aes = "aes-256-gcm";
     assert!(sealing(&mut ctx, "crypto_sealed", aes, short, &nonce[..12], b"x").is_empty());
@@ -376,7 +357,7 @@ fn a_sealed_message_opens_under_its_key_alone() {
 }
 
 #[test]
-fn a_signature_and_a_public_key_are_found_under_their_scheme() {
+fn a_signature_and_a_public_key_are_produced_and_verified_for_the_named_scheme() {
     let mut ctx = context();
     let seed = sealed(&mut ctx, &[5; 32], false);
     let public = |ctx: &mut Ctx, scheme: &str, key: Word| {
@@ -405,7 +386,6 @@ fn a_signature_and_a_public_key_are_found_under_their_scheme() {
     let mut turned = signed[1..].to_vec();
     turned[3] ^= 1;
     assert_eq!(verify(&mut ctx, "ed25519", &found[1..], &turned), 0);
-    // A key that is none of its scheme is found to be none; a scheme it has not gives no result.
     let short = sealed(&mut ctx, &[5; 3], false);
     assert_eq!(public(&mut ctx, "p256", short), [0]);
     assert_eq!(sign(&mut ctx, "ecdsa-p256-sha256", short), [0]);
@@ -416,7 +396,7 @@ fn a_signature_and_a_public_key_are_found_under_their_scheme() {
 }
 
 #[test]
-fn two_keys_agree_on_one_secret_and_a_point_of_small_order_on_none() {
+fn two_keys_agree_on_one_shared_secret_and_a_low_order_point_yields_no_secret() {
     let mut ctx = context();
     assert_eq!(of_name(&mut ctx, "crypto_agrees", "x25519"), 1);
     assert_eq!(of_name(&mut ctx, "crypto_agrees", "p384"), 0);

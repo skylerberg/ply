@@ -1,11 +1,7 @@
-//! Fixed-width integers, with the arithmetic the value model checks them with.
-
 use std::fmt;
 
-/// A fixed-width integer type; `Int` is not one. Arithmetic is checked unless `wrap_*` is used.
-/// The 128-bit widths come last, so each narrower width keeps its number in every format.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
-pub enum IntTy {
+pub enum IntegerType {
     U8,
     U16,
     U32,
@@ -18,57 +14,60 @@ pub enum IntTy {
     I128,
 }
 
-pub const INT_TYPES: [IntTy; 10] = [
-    IntTy::U8,
-    IntTy::U16,
-    IntTy::U32,
-    IntTy::U64,
-    IntTy::I8,
-    IntTy::I16,
-    IntTy::I32,
-    IntTy::I64,
-    IntTy::U128,
-    IntTy::I128,
+pub const INT_TYPES: [IntegerType; 10] = [
+    IntegerType::U8,
+    IntegerType::U16,
+    IntegerType::U32,
+    IntegerType::U64,
+    IntegerType::I8,
+    IntegerType::I16,
+    IntegerType::I32,
+    IntegerType::I64,
+    IntegerType::U128,
+    IntegerType::I128,
 ];
 
-impl IntTy {
+impl IntegerType {
     pub fn name(self) -> &'static str {
         match self {
-            IntTy::U8 => "U8",
-            IntTy::U16 => "U16",
-            IntTy::U32 => "U32",
-            IntTy::U64 => "U64",
-            IntTy::I8 => "I8",
-            IntTy::I16 => "I16",
-            IntTy::I32 => "I32",
-            IntTy::I64 => "I64",
-            IntTy::U128 => "U128",
-            IntTy::I128 => "I128",
+            IntegerType::U8 => "U8",
+            IntegerType::U16 => "U16",
+            IntegerType::U32 => "U32",
+            IntegerType::U64 => "U64",
+            IntegerType::I8 => "I8",
+            IntegerType::I16 => "I16",
+            IntegerType::I32 => "I32",
+            IntegerType::I64 => "I64",
+            IntegerType::U128 => "U128",
+            IntegerType::I128 => "I128",
         }
     }
 
-    pub fn from_name(name: &str) -> Option<IntTy> {
+    pub fn from_name(name: &str) -> Option<IntegerType> {
         INT_TYPES.into_iter().find(|t| t.name() == name)
     }
 
     pub fn bits(self) -> u32 {
         match self {
-            IntTy::U8 | IntTy::I8 => 8,
-            IntTy::U16 | IntTy::I16 => 16,
-            IntTy::U32 | IntTy::I32 => 32,
-            IntTy::U64 | IntTy::I64 => 64,
-            IntTy::U128 | IntTy::I128 => 128,
+            IntegerType::U8 | IntegerType::I8 => 8,
+            IntegerType::U16 | IntegerType::I16 => 16,
+            IntegerType::U32 | IntegerType::I32 => 32,
+            IntegerType::U64 | IntegerType::I64 => 64,
+            IntegerType::U128 | IntegerType::I128 => 128,
         }
     }
 
     pub fn signed(self) -> bool {
         matches!(
             self,
-            IntTy::I8 | IntTy::I16 | IntTy::I32 | IntTy::I64 | IntTy::I128
+            IntegerType::I8
+                | IntegerType::I16
+                | IntegerType::I32
+                | IntegerType::I64
+                | IntegerType::I128
         )
     }
 
-    /// The largest value.
     pub fn max(self) -> u128 {
         if self.signed() {
             (1u128 << (self.bits() - 1)) - 1
@@ -77,22 +76,18 @@ impl IntTy {
         }
     }
 
-    /// The smallest value.
     pub fn min(self) -> i128 {
         if self.signed() {
-            // `i128::MIN` for `I128`, where the shift below would overflow.
             i128::MIN >> (128 - self.bits())
         } else {
             0
         }
     }
 
-    /// Whether `v` is one of this type's values.
     pub fn holds(self, v: i128) -> bool {
         v >= self.min() && (v < 0 || v as u128 <= self.max())
     }
 
-    /// Truncated to this width, then zero- or sign-extended; every `Fixed` is in this form.
     pub fn normalize(self, bits: u128) -> u128 {
         let w = self.bits();
         if w == 128 {
@@ -107,33 +102,30 @@ impl IntTy {
     }
 }
 
-impl fmt::Display for IntTy {
+impl fmt::Display for IntegerType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.name())
     }
 }
 
-/// A fixed-width integer; its bits are always normalized, so derived `Eq` and `Hash` are by value.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct Fixed {
-    pub ty: IntTy,
+    pub ty: IntegerType,
     bits: u128,
 }
 
 impl Fixed {
-    pub fn new(ty: IntTy, bits: u128) -> Fixed {
+    pub fn new(ty: IntegerType, bits: u128) -> Fixed {
         Fixed {
             ty,
             bits: ty.normalize(bits),
         }
     }
 
-    /// Truncated to the width and sign-extended past it.
     pub fn bits(self) -> u128 {
         self.bits
     }
 
-    /// The value, wherever an `i128` holds it: every width's but a `U128` past `i128::MAX`.
     pub fn to_i128(self) -> Option<i128> {
         if self.ty.signed() {
             Some(self.bits as i128)
@@ -142,7 +134,6 @@ impl Fixed {
         }
     }
 
-    /// The bits with nothing above this type's width.
     pub fn raw(self) -> u128 {
         if self.ty.bits() == 128 {
             self.bits

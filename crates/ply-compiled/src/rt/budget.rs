@@ -1,16 +1,8 @@
-//! Stacks, and the wall clock an entry runs within.
-
 use super::*;
 use std::sync::atomic::AtomicUsize;
 use std::sync::{Condvar, Once, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
-/// The slow path of a prologue or a loop's restart, for a frame below `ctx.stack_floor`: ends an
-/// entry whose wall clock ran out, which the watchdog marks by raising its floor past every frame;
-/// otherwise makes room below the floor of the stack it runs on and lowers the floor to match.
-/// Returns 1, or 0 with the context failed for a spent clock, a call nesting past what the native
-/// stack holds, on a thread's own stack, whose floor is final, on a runtime stack whose reservation
-/// is spent, and on a stack the runtime does not know.
 pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
@@ -18,13 +10,12 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     if c.out_of_time() {
         return 0;
     }
-    // A floor another context's growth or a switch of stacks left stale needs no system call.
     let floor = stack_floor();
     if at >= floor {
         c.stack_floor.store(floor, Relaxed);
         return 1;
     }
-    if ply_core::limit::running_low(at).is_some() && ply_core::limit::extend_running() {
+    if ply_core::limit::writable_stack_start(at).is_some() && ply_core::limit::grow_active_stack() {
         c.grown += 1;
         c.stack_floor.store(stack_floor(), Relaxed);
         return 1;
@@ -38,34 +29,25 @@ pub unsafe extern "C" fn rt_stack_more(ctx: *mut Ctx) -> Word {
     0
 }
 
-/// [`switch`] between two computations, each nesting on a stack of its own: returns when something
-/// switches back, with [`Ctx::frames`] and [`Ctx::task`] as this stack left them, whatever ran
-/// meanwhile, this stack the running one again and the floor its own.
-///
-/// # Safety
-/// As [`switch`], and `ctx` is the context both stacks run under.
-pub unsafe fn switch_keeping(ctx: *mut Ctx, from: *mut usize, to: usize) {
+pub unsafe fn switch_stack_preserving_context(ctx: *mut Ctx, from: *mut usize, to: usize) {
     let (frames, task) = unsafe { ((*ctx).frames, (*ctx).task) };
     let running = ply_core::limit::running();
     unsafe { switch(&mut *from, to) };
     unsafe {
-        ply_core::limit::set_running(running);
+        ply_core::limit::set_active_stack(running);
         (*ctx).frames = frames;
         (*ctx).task = task;
         (*ctx).stack_floor.store(stack_floor(), Relaxed);
     }
 }
 
-/// Runs `call`, which begins compiled code, where that code can make room as it nests: here, on a
-/// stack the runtime knows, or else, on a segment a Rust recursion grew onto, on a runtime stack of
-/// its own for the call's duration. Returns 0 with the context failed when no stack can be had.
 pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
     if let Some(floor) = floor_here() {
         unsafe { (*ctx).stack_floor.store(floor, Relaxed) };
         return call();
     }
     let Some(stack) = Stack::take() else {
-        return no_stack_to_take(unsafe { &mut *ctx });
+        return fail_out_of_stack(unsafe { &mut *ctx });
     };
     let mut hop = Hop {
         ctx,
@@ -75,12 +57,11 @@ pub fn on_known_stack<F: FnOnce() -> Word>(ctx: *mut Ctx, call: F) -> Word {
         back: 0,
     };
     let handover = &raw mut hop;
-    let sp = stack.prepare(hopped::<F>, handover as usize);
-    unsafe { switch_keeping(ctx, &raw mut (*handover).back, sp) };
+    let sp = stack.prepare(run_on_new_stack::<F>, handover as usize);
+    unsafe { switch_stack_preserving_context(ctx, &raw mut (*handover).back, sp) };
     unsafe { (*handover).result }
 }
 
-/// What [`on_known_stack`] hands the stack it hops onto, from its own frame, which outlives the hop.
 struct Hop<'a, F> {
     ctx: *mut Ctx,
     stack: &'a Stack,
@@ -89,7 +70,7 @@ struct Hop<'a, F> {
     back: usize,
 }
 
-extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
+extern "C" fn run_on_new_stack<F: FnOnce() -> Word>(arg: usize) {
     let hop = arg as *mut Hop<'_, F>;
     let call = unsafe {
         (*(*hop).ctx)
@@ -108,30 +89,24 @@ extern "C" fn hopped<F: FnOnce() -> Word>(arg: usize) {
     std::process::abort();
 }
 
-/// Fails `c` for a stack the system would not map, as when too many bodies and tasks are suspended
-/// at once.
-pub(crate) fn no_stack_to_take(c: &mut Ctx) -> Word {
+pub(crate) fn fail_out_of_stack(c: &mut Ctx) -> Word {
     let d = error("the system would map no further stack").note(
         "each live task, and each `handle` body whose clause resumes off the tail, holds one until it ends",
     );
     c.fail_with(FAILED_OUT_OF_STACK, d)
 }
 
-/// How soon the watchdog raises an expired entry's floor again, since a stack switch lowers it.
-const REWATCH: Duration = Duration::from_millis(10);
+const DEADLINE_RECHECK_INTERVAL: Duration = Duration::from_millis(10);
 
-/// The floors of the contexts running against a deadline, each by its address, which a thread
-/// raises past every frame once the deadline passes: the context's next call or loop restart then
-/// reaches [`rt_stack_more`], which ends the entry. Calls themselves pay nothing for the clock.
 struct Watch {
     watched: Mutex<Vec<(usize, Instant)>>,
     changed: Condvar,
 }
 
 fn watch() -> &'static Watch {
-    static WATCH: OnceLock<Watch> = OnceLock::new();
+    static DEADLINE_WATCHDOG: OnceLock<Watch> = OnceLock::new();
     static STARTED: Once = Once::new();
-    let w = WATCH.get_or_init(|| Watch {
+    let w = DEADLINE_WATCHDOG.get_or_init(|| Watch {
         watched: Mutex::new(Vec::new()),
         changed: Condvar::new(),
     });
@@ -152,9 +127,8 @@ impl Watch {
             let mut wake: Option<Instant> = None;
             for &(floor, deadline) in watched.iter() {
                 let next = if deadline <= now {
-                    // SAFETY: a context leaves the list before it moves or its memory goes.
                     unsafe { (*(floor as *const AtomicUsize)).store(usize::MAX, Relaxed) };
-                    now + REWATCH
+                    now + DEADLINE_RECHECK_INTERVAL
                 } else {
                     deadline
                 };
@@ -172,7 +146,6 @@ impl Watch {
     }
 }
 
-/// Has the watchdog raise `floor` once `deadline` passes, until [`unwatched`].
 pub(crate) fn watched(floor: &AtomicUsize, deadline: Instant) {
     let w = watch();
     let at = std::ptr::from_ref(floor) as usize;
@@ -180,7 +153,6 @@ pub(crate) fn watched(floor: &AtomicUsize, deadline: Instant) {
     w.changed.notify_one();
 }
 
-/// Takes `floor` off the watchdog's list, where it is on it.
 pub(crate) fn unwatched(floor: &AtomicUsize) {
     let at = std::ptr::from_ref(floor) as usize;
     let mut watched = watch()
@@ -190,24 +162,15 @@ pub(crate) fn unwatched(floor: &AtomicUsize) {
     watched.retain(|&(f, _)| f != at);
 }
 
-/// The stack of a thread that runs a program, as large as a runtime stack can grow, so a program
-/// nests as deeply on one as on the other. Reserved, not committed. A `parallel` block's thread is one: a
-/// run's lane enters a whole test on it.
 pub const PROGRAM_STACK: usize = crate::stack::RESERVE;
 
-/// Room below the floor for the runtime's frames and the deepest compiled frame itself.
 pub const STACK_MARGIN: usize = 512 * 1024;
 
 thread_local! {
-    /// This thread's own stack, asked of the platform once per thread: it can be a `/proc` read.
     static OWN: (usize, usize) = stack_of_this_thread();
 }
 
-/// Gives the system back the pages of this thread's own stack below the running frame, down to the
-/// floor: what a call that nested to the floor left touched, which the thread would otherwise hold
-/// as long as it lives. Nothing where this frame is on another stack, whose owner gives it back.
-pub(crate) fn let_go_below_here() {
-    // Left in place for the frames of the call that lets the rest go; a multiple of every page size.
+pub(crate) fn release_unused_stack_pages() {
     const KEPT: usize = 64 << 10;
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
@@ -223,13 +186,10 @@ pub(crate) fn let_go_below_here() {
     });
 }
 
-/// The floor compiled code honours on the stack this frame is on: the running runtime stack's, or
-/// this thread's own. `None` on a stack the runtime does not know, a segment a Rust recursion grew
-/// onto.
 pub(crate) fn floor_here() -> Option<usize> {
     let here = 0u8;
     let at = std::ptr::from_ref(&here) as usize;
-    if let Some(low) = ply_core::limit::running_low(at) {
+    if let Some(low) = ply_core::limit::writable_stack_start(at) {
         return Some(low + STACK_MARGIN);
     }
     OWN.with(|&(bottom, top)| {
@@ -239,13 +199,10 @@ pub(crate) fn floor_here() -> Option<usize> {
     })
 }
 
-/// [`floor_here`], or above every address on a stack the runtime does not know, where a probe then
-/// asks [`rt_stack_more`], which fails.
 pub(crate) fn stack_floor() -> usize {
     floor_here().unwrap_or(usize::MAX)
 }
 
-/// This thread's stack, from its lowest address to its top.
 #[cfg(target_os = "macos")]
 pub(super) fn stack_of_this_thread() -> (usize, usize) {
     unsafe extern "C" {
@@ -253,7 +210,6 @@ pub(super) fn stack_of_this_thread() -> (usize, usize) {
         fn pthread_get_stackaddr_np(thread: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
         fn pthread_get_stacksize_np(thread: *mut std::ffi::c_void) -> usize;
     }
-    // The address is the stack's *top*; the region runs down from it.
     let (top, size) = unsafe {
         let me = pthread_self();
         (
@@ -266,7 +222,6 @@ pub(super) fn stack_of_this_thread() -> (usize, usize) {
 
 #[cfg(target_os = "linux")]
 pub(super) fn stack_of_this_thread() -> (usize, usize) {
-    // Room for the opaque `pthread_attr_t`, at most 56 bytes on 64-bit libcs.
     #[repr(C, align(8))]
     struct Attr([u8; 64]);
     unsafe extern "C" {
@@ -301,8 +256,6 @@ pub(super) fn stack_of_this_thread() -> (usize, usize) {
     fallback_stack()
 }
 
-/// Assumes a spawned thread's default stack below this frame, and every address above that the
-/// thread's: failing early beats overflowing.
 #[cfg(not(target_os = "macos"))]
 pub(super) fn fallback_stack() -> (usize, usize) {
     let here = 0u8;

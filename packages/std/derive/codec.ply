@@ -1,21 +1,24 @@
-//! The codecs that `derive json`, `derive bin` and `derive sql` generate: the target's `std.json`
-//! `JsonCodec`, `std.bin` `BinCodec` and `std.sql` `RowCodec`, named `<snake_case(T)>_json`,
-//! `_bin` and `_row`. Each is the `derive` of its module.
+//! Generates the codecs for `derive json`, `derive bin` and `derive sql`: a `JsonCodec` from
+//! `std.json`, a `BinCodec` from `std.bin` and a `RowCodec` from `std.sql`. They are named
+//! `<snake_case(T)>_json`, `<snake_case(T)>_bin` and `<snake_case(T)>_row`.
 //!
-//! A codec is built from the codecs of the types its type contains. Scalars and containers use
-//! their runtime module's codecs. A type the module derives with the same deriver is referenced by
-//! its generated function, and an imported type by its module's. A parameterized type's codec takes
-//! one codec per type parameter, named after the parameter. A codec that is not on a cycle is one
-//! definition. A codec whose type reaches itself through types the module derives takes a
-//! remaining depth and passes one less to its cycle, so the checker can see the recursion ends. A
-//! `json` codec on a cycle is two definitions: the named one calls `_at` with `json::max_depth()`.
-//! A `bin` codec on a cycle is one definition per function, each calling its cycle's functions by
-//! name, and the named one passes each function to its definition with `bin::max_depth()`.
+//! A codec is built from the codecs of the types its type contains. Scalars and containers use the
+//! codecs of the runtime module for the format. A type this module derives with the same deriver is
+//! referenced by its generated function, and an imported type by the function in its own module. A
+//! parameterized type's codec takes one codec per type parameter, named after the parameter.
 //!
-//! A row is a record's fields, one column per field under the field's name. A scalar is read by
-//! `std.sql`'s reader for it, an `Option` by `optional_field`, a `List` of scalars as an array, a
-//! `Json` as the document it is, and anything else as a document through the type's own JSON
-//! codec, which requires the module to import `std.json`.
+//! A type whose codec reaches itself through other types this module derives is on a cycle. Off a
+//! cycle, a codec is one definition. On a cycle, the codec takes a remaining depth and passes one
+//! less when it calls the codecs on its cycle, so the checker can see the recursion ends. For
+//! `json`, a cycle gives two definitions: the public codec, and a function with the suffix `_at`
+//! that takes the depth. The public codec calls the `_at` function with `json::max_depth()`. For
+//! `bin`, a cycle gives one definition per type on it, and each calls the others by name. The
+//! public codec of each type calls its own definition with `bin::max_depth()`.
+//!
+//! A row is a record's fields, with one column per field, named after the field. A scalar is read
+//! with the `std.sql` reader for it, an `Option` with `optional_field`, a `List` of scalars as an
+//! array, and a `Json` as the document it is. Any other type is read as a document through the
+//! type's own JSON codec, which requires the module to import `std.json`.
 
 import std.derive
 import std.derive (applied_type, Declaration, TypeDeclaration, Type, TypeName, Field, Variant,
@@ -37,7 +40,6 @@ pub fn derive_bin(declaration: Declaration) -> Result<String, Refused> / {abort.
 pub fn derive_row(declaration: Declaration) -> Result<String, Refused> / {abort.raise} =
   derived(declaration, Row)
 
-/// The codec a derivation writes.
 type Format = | Json | Bin | Row
 
 fn derived(declaration: Declaration, format: Format) -> Result<String, Refused> / {abort.raise} = {
@@ -67,13 +69,8 @@ fn derived(declaration: Declaration, format: Format) -> Result<String, Refused> 
   }
 }
 
-/// The word a format's functions end with.
 fn suffix(format: Format) -> String = match format { Json -> "json", Bin -> "bin", Row -> "row" }
 
-/// What every step of a derivation reads: the format, how the module refers to the format's module
-/// (`json::`), a prefix for every generated binder that no type parameter starts with, the
-/// declaration, the derived types whose codecs call the target's and are called back by it, and how
-/// a row's document fields refer to `std.json`.
 type Context = {
   format: Format,
   runtime: String,
@@ -89,22 +86,15 @@ fn binder_prefix_for(target: TypeDeclaration) -> String / {abort.raise} =
 
 fn snake(name: String) -> String = text::snake_case(name)
 
-/// The function `format` writes for the type `name`.
 fn generated_name(format: Format, name: String) -> String = snake(name) ++ "_" ++ suffix(format)
 
-// --- What a codec cannot be derived over ----------------------------------------------------------
-
-/// How a format reads a value of a type constructor: as one of its runtime module's scalars, as a
-/// container through its runtime module, not at all and why, or through the type's own codec.
 type Shape = | Leaf | Structural | Blocked(Blocker) | OwnCodec
 
-/// Why a type blocks a derivation, and an optional note of advice for the error.
 type Blocker = { reason: String, note: Option<String> }
 
 fn is_fixed_width(name: String) -> Bool =
   ["U8", "U16", "U32", "U64", "U128", "I8", "I16", "I32", "I64", "I128"].contains(name)
 
-/// How `format` reads the type constructor `name`, or, `ordered`, how a `Map` key of it orders.
 fn codec_kind(format: Format, name: String, ordered: Bool) -> Shape =
   if ["Int", "Bool", "String", "Bytes", "Unit", "Decimal", "Char"].contains(name) { Leaf }
   else if name == "Float" {
@@ -127,7 +117,10 @@ fn codec_kind(format: Format, name: String, ordered: Bool) -> Shape =
   else if !ordered && format == Bin && is_fixed_width(name) { Leaf }
   else if !ordered && format == Bin && name == "Iter" { Structural }
   else if ["Scoped", "Task", "Chan"].contains(name) {
-    Blocked({ reason: "a `" ++ name ++ "` names a location rather than a value", note: None })
+    Blocked({
+      reason: "a `" ++ name ++ "` is a runtime resource, not data that can be encoded",
+      note: None,
+    })
   } else if name == "Secret" {
     if ordered {
       Blocked({
@@ -159,7 +152,6 @@ fn function_reason(format: Format, ordered: Bool) -> String =
     }
   }
 
-/// Whether `t` encodes as the document `null`, which is how an `Option` writes `None`.
 fn encodes_as_null(t: Type) -> Bool =
   match t {
     Unit -> true,
@@ -167,8 +159,6 @@ fn encodes_as_null(t: Type) -> Bool =
     _ -> false,
   }
 
-/// What blocks a value of `t` from `format`'s codec, if anything; `ordered`, from ordering it as a
-/// `Map` key. A type parameter is derivable by assumption.
 fn blocker_of(format: Format, t: Type, ordered: Bool) -> Option<Blocker> / {abort.raise} =
   match t {
     Param(_) -> None,
@@ -203,13 +193,11 @@ fn blocker_of(format: Format, t: Type, ordered: Bool) -> Option<Blocker> / {abor
   }
 
 fn first_blocker(format: Format, ts: List<Type>, ordered: Bool) -> Option<Blocker> / {abort.raise} =
-  ts.fold(None, |acc: Option<Blocker>, t: Type|
-    match acc { Some(_) -> acc, None -> blocker_of(format, t, ordered) })
+  ts.fold(None, |accumulator: Option<Blocker>, t: Type|
+    match accumulator { Some(_) -> accumulator, None -> blocker_of(format, t, ordered) })
 
-fn label_reason() -> String = "a type that takes a label has no derivation"
+fn label_reason() -> String = "a type with a label parameter cannot use `derive`"
 
-/// Why the target has no codec, if it has none: a label, a row whose target is not a record, or the
-/// first field that blocks it.
 fn error_of(
   declaration: Declaration,
   target: TypeDeclaration,
@@ -235,9 +223,9 @@ fn error_of(
   let body = |t: Type|
     match t {
       Record(fields) ->
-        fields.fold(None, |acc: Option<Refused>, f: Field|
-          match acc {
-            Some(_) -> acc,
+        fields.fold(None, |accumulator: Option<Refused>, f: Field|
+          match accumulator {
+            Some(_) -> accumulator,
             None -> match blocker_of(format, f.ty, false) {
               Some(b) -> field_rejected(b, Some(f.name), None),
               None -> None,
@@ -251,9 +239,9 @@ fn error_of(
   match target.labels.at(0) {
     Some(label) ->
       rejected(label_reason(), None, [
-        "a label is what a function's effects are performed under, and a type that contains a function has no derivation, so `["
+        "a label stands for the effects of a function, and a codec cannot encode a function, so `["
           ++ label
-          ++ "]` is used by no field a derivation could read",
+          ++ "]` is not part of any field the codec could encode",
         "drop `[" ++ label ++ "]` from `" ++ target.name ++ "`, or write the codec by hand",
       ]),
     None -> if format == Row { row_error(target, body) } else {
@@ -261,42 +249,42 @@ fn error_of(
         Alias(t) -> body(t),
         Nominal(t) -> body(t),
         Sum(variants) ->
-          variants.fold(None, |acc: Option<Refused>, v: Variant|
-            match acc {
-              Some(_) -> acc,
+          variants.fold(None, |accumulator: Option<Refused>, v: Variant|
+            match accumulator {
+              Some(_) -> accumulator,
               None -> match first_blocker(format, v.fields, false) {
                 Some(b) -> field_rejected(b, None, Some(v.name)),
                 None -> None,
               },
             }),
         Extern ->
-          rejected("laid out by the toolchain, with no field a derivation could read", None, [
-            "write the codec by hand over what its module's functions read of a value",
+          rejected("a built-in type has no fields that a codec could encode", None, [
+            "write the codec by hand using the functions this type's module provides to inspect a value",
           ]),
       }
     },
   }
 }
 
-/// Why the target has no row, if it has none. A row is a record's fields, one column per field,
-/// each of one type.
 fn row_error(
   target: TypeDeclaration,
   body: (Type) -> Option<Refused> / {abort.raise},
 ) -> Option<Refused> / {abort.raise} = {
   let rejected = |reason: String| Some({ message: reason, at: None, notes: [] });
   if target.types.len() > 0 || target.rows.len() > 0 {
-    rejected("a column holds one type, so a type with parameters has no row")
+    rejected(
+      "a type with type parameters cannot be used as a row, because each field of a row must have one fixed type",
+    )
   } else {
     match record_fields(target) {
-      None -> rejected("a row is a record's fields, a column each"),
-      Some(fields) -> if fields.len() == 0 { rejected("a row has a column at least") }
-      else { body(Record(fields)) },
+      None -> rejected("a row is made of a record's fields, so the type must be a record"),
+      Some(fields) -> if fields.len() == 0 {
+        rejected("a row needs at least one column, but this record has no fields")
+      } else { body(Record(fields)) },
     }
   }
 }
 
-/// The fields of a record type, as written.
 fn record_fields(target: TypeDeclaration) -> Option<List<Field>> =
   match target.body {
     Alias(Record(fields)) -> Some(fields),
@@ -304,20 +292,19 @@ fn record_fields(target: TypeDeclaration) -> Option<List<Field>> =
     _ -> None,
   }
 
-// --- Codecs on a cycle ----------------------------------------------------------------------------
-
-/// The types declared in this module that `t`'s codec calls by name.
 fn named_in(format: Format, t: Type) -> List<String> =
   match t {
     Applied(n, args, _, _) -> {
-      let inner = args.fold([], |acc: List<String>, a: Type| acc.concat(named_in(format, a)));
+      let inner = args.fold([], |accumulator: List<String>, a: Type|
+        accumulator.concat(named_in(format, a)));
       match codec_kind(format, n.name, false) {
         OwnCodec -> if n.module == None { inner.push(n.name) } else { inner },
         _ -> inner,
       }
     },
     Record(fields) ->
-      fields.fold([], |acc: List<String>, f: Field| acc.concat(named_in(format, f.ty))),
+      fields.fold([], |accumulator: List<String>, f: Field|
+        accumulator.concat(named_in(format, f.ty))),
     _ -> [],
   }
 
@@ -326,46 +313,38 @@ fn named_in_body(format: Format, body: derive::Body) -> List<String> =
     Alias(t) -> named_in(format, t),
     Nominal(t) -> named_in(format, t),
     Sum(variants) ->
-      variants.fold([], |acc: List<String>, v: Variant|
-        v.fields.fold(acc, |inner: List<String>, t: Type| inner.concat(named_in(format, t)))),
+      variants.fold([], |accumulator: List<String>, v: Variant|
+        v.fields.fold(accumulator, |inner: List<String>, t: Type|
+          inner.concat(named_in(format, t)))),
     Extern -> [],
   }
 
-/// A type the module derives with this deriver, and the derived types its codec calls by name.
 type Calls = { name: String, calls: List<String> }
 
 fn callees(calls: List<Calls>, name: String) -> List<String> =
-  calls.fold([], |acc: List<String>, c: Calls|
-    if c.name == name { acc.concat(c.calls) } else { acc })
+  calls.fold([], |accumulator: List<String>, c: Calls|
+    if c.name == name { accumulator.concat(c.calls) } else { accumulator })
 
-/// Every type reachable from `from` through one or more calls. No chain needs to be longer than the
-/// number of types.
 fn reached(calls: List<Calls>, from: String) -> List<String> =
   range(0, calls.len()).fold(callees(calls, from), |seen: List<String>, _: Int|
-    seen.fold(seen, |acc: List<String>, n: String|
-      callees(calls, n).fold(acc, |more: List<String>, m: String|
+    seen.fold(seen, |accumulator: List<String>, n: String|
+      callees(calls, n).fold(accumulator, |more: List<String>, m: String|
         if more.contains(m) { more } else { more.push(m) })))
 
-/// The types on `target`'s cycle: empty unless `target`'s codec calls itself, directly or through
-/// others.
 fn cycle_of(declaration: Declaration, format: Format, target: String) -> List<String> = {
   let names = declaration.derived;
-  let calls = names.fold([], |acc: List<Calls>, name: String|
+  let calls = names.fold([], |accumulator: List<Calls>, name: String|
     match declared(declaration, name) {
       Some(t) ->
-        acc.push({
+        accumulator.push({
           name: name,
           calls: named_in_body(format, t.body).filter(|n: String| names.contains(n)),
         }),
-      None -> acc,
+      None -> accumulator,
     });
   reached(calls, target).filter(|n: String| reached(calls, n).contains(target))
 }
 
-// --- Generated definitions, as Ply source ---------------------------------------------------------
-
-/// One of a codec's functions as it is generated: what it takes after the dictionaries, what it
-/// returns, and a body that refers to its parameters by name.
 type Member = {
   name: String,
   params: List<{ name: String, ty: String }>,
@@ -378,7 +357,6 @@ fn typed_parameters(m: Member) -> List<String> =
 
 fn param_names(m: Member) -> List<String> = m.params.map(|p: { name: String, ty: String }| p.name)
 
-/// A dictionary whose fields are `members`, each a lambda.
 fn literal(members: List<Member>) -> String =
   "{"
     ++ String::join(
@@ -388,15 +366,11 @@ fn literal(members: List<Member>) -> String =
     )
     ++ "}"
 
-/// The codec type of `arg`.
 fn dictionary_type(at: Context, arg: String) -> String =
   at.runtime ++ (match at.format { Json -> "JsonCodec<", Bin -> "BinCodec<", Row -> "RowCodec<" })
     ++ arg
     ++ ">"
 
-/// The definitions of the target's codec. Off a cycle it is one definition, its dictionary. On a
-/// cycle, a `bin` codec is one definition per function, and a `json` codec is the named definition
-/// and its `_at`.
 fn emitted(at: Context, target: TypeDeclaration) -> List<String> / {abort.raise} = {
   let name = generated_name(at.format, target.name);
   let annotation = target.name ++ derive::parameters_text(target);
@@ -473,7 +447,6 @@ fn dictionary(at: Context, target: TypeDeclaration, annotation: String) -> Strin
     },
   }
 
-/// The functions of the `bin` codec of `target`, a type on a cycle.
 fn cycle_members(
   at: Context,
   target: TypeDeclaration,
@@ -486,7 +459,6 @@ fn cycle_members(
     Extern -> [],
   }
 
-/// The functions of the `bin` codec of a type on a cycle that is written as `t`.
 fn aliased_members(at: Context, t: Type, annotation: String) -> List<Member> / {abort.raise} =
   match t {
     Record(fields) -> bin_record(at, fields, annotation),
@@ -513,7 +485,6 @@ fn record_members(
     _ -> json_record(at, fields, annotation),
   }
 
-/// An expression of the codec of `t`.
 fn codec(at: Context, t: Type, annotation: String) -> String / {abort.raise} =
   match t {
     Param(p) -> p,
@@ -522,14 +493,12 @@ fn codec(at: Context, t: Type, annotation: String) -> String / {abort.raise} =
     Record(fields) -> literal(record_members(at, fields, annotation)),
     Applied(n, args, _, _) -> {
       let codecs = args.map(|a: Type| codec(at, a, type_text(a)));
-      // A `Columns` is written as the list of its records, through its builtins.
       if n.name == "Columns" && args.len() == 1 {
         columns_codec(at, codecs.get(0), type_text(args.get(0)))
       } else if at.format == Json && n.name == "Map" && args.len() == 2
           && is_string(at, args.get(0)) { at.runtime ++ "string_map_json(" ++ codecs.get(1) ++ ")" }
       else {
         let call = generated_name(at.format, n.name) ++ "(" ++ String::join(codecs, ", ") ++ ")";
-        // A named type's codec is called by name, never inlined.
         match codec_kind(at.format, n.name, false) {
           OwnCodec -> match n.module {
             Some(m) -> m ++ "::" ++ call,
@@ -546,7 +515,6 @@ fn codec(at: Context, t: Type, annotation: String) -> String / {abort.raise} =
     },
   }
 
-/// Whether a written type *is* `String`, following the module's own parameterless aliases.
 fn is_string(at: Context, t: Type) -> Bool / {abort.raise} =
   iterate({ now: t, steps: 0 }, 66, |s: { now: Type, steps: Int }|
     if s.steps >= 64 { Stop(false) } else {
@@ -562,7 +530,6 @@ fn is_string(at: Context, t: Type) -> Bool / {abort.raise} =
       }
     })
 
-/// What the module's parameterless alias `name` names.
 fn alias_body(declaration: Declaration, name: String) -> Option<Type> =
   match declared(declaration, name) {
     Some(t) -> if t.types.len() > 0 || t.rows.len() > 0 || t.labels.len() > 0 { None }
@@ -570,15 +537,13 @@ fn alias_body(declaration: Declaration, name: String) -> Option<Type> =
     None -> None,
   }
 
-/// The JSON or binary codec of a `Columns` of `element`, whose records' codec is `item`: the list
-/// codec, over the records `Columns::to_list` returns and `Columns::of_list` collects again.
 fn columns_codec(at: Context, item: String, element: String) -> String = {
   let b = at.fresh;
   let rt = at.runtime;
-  let held = "Columns<" ++ element ++ ">";
+  let columns_type = "Columns<" ++ element ++ ">";
   if at.format == Json {
     let list = rt ++ "list_json(" ++ item ++ ")";
-    "{encode: |" ++ b ++ "c: " ++ held ++ "| (" ++ list ++ ".encode)(Columns::to_list(" ++ b
+    "{encode: |" ++ b ++ "c: " ++ columns_type ++ "| (" ++ list ++ ".encode)(Columns::to_list(" ++ b
       ++ "c)), decode: |"
       ++ b
       ++ "j: "
@@ -597,7 +562,8 @@ fn columns_codec(at: Context, item: String, element: String) -> String = {
       ++ b
       ++ "e)}}"
   } else {
-    "{put: |" ++ b ++ "w: Bytes, " ++ b ++ "c: " ++ held ++ "| " ++ rt ++ "put_list(" ++ b ++ "w, "
+    "{put: |" ++ b ++ "w: Bytes, " ++ b ++ "c: " ++ columns_type ++ "| " ++ rt ++ "put_list(" ++ b
+      ++ "w, "
       ++ "Columns::to_list("
       ++ b
       ++ "c), ("
@@ -638,8 +604,6 @@ fn columns_codec(at: Context, item: String, element: String) -> String = {
   }
 }
 
-// --- `json` ---------------------------------------------------------------------------------------
-
 fn json_members(at: Context, annotation: String, encode: String, decode: String) -> List<Member> =
   [
     {
@@ -656,7 +620,6 @@ fn json_members(at: Context, annotation: String, encode: String, decode: String)
     },
   ]
 
-/// The document of `x`, a value of the type `t`: a record's is written in place.
 fn json_encode(at: Context, t: Type, x: String) -> String / {abort.raise} =
   match t {
     Record(fields) -> json_object(at, fields, x),
@@ -681,7 +644,7 @@ fn json_record(
     fields.get(i).name ++ ": " ++ at.fresh ++ i.to_string());
   let decode = range(0, fields.len()).fold(
     "Ok({" ++ String::join(built, ", ") ++ "})",
-    |acc: String, k: Int| {
+    |accumulator: String, k: Int| {
       let i = fields.len() - 1 - k;
       let f = fields.get(i);
       "match " ++ at.runtime ++ "field(" ++ at.fresh ++ "j, \"" ++ f.name ++ "\", "
@@ -694,14 +657,13 @@ fn json_record(
         ++ at.fresh
         ++ i.to_string()
         ++ ") -> "
-        ++ acc
+        ++ accumulator
         ++ "}"
     },
   );
   json_members(at, annotation, json_object(at, fields, at.fresh ++ "v"), decode)
 }
 
-/// A variant is encoded by its declared name and its fields in order.
 fn json_sum(
   at: Context,
   variants: List<Variant>,
@@ -709,9 +671,9 @@ fn json_sum(
 ) -> List<Member> / {abort.raise} = {
   let b = at.fresh;
   let rt = at.runtime;
-  let held = |v: Variant| range(0, v.fields.len()).map(|i: Int| b ++ i.to_string());
+  let variant_binders = |v: Variant| range(0, v.fields.len()).map(|i: Int| b ++ i.to_string());
   let arms = variants.map(|v: Variant| {
-    let binders = held(v);
+    let binders = variant_binders(v);
     let pattern = if binders.len() == 0 { v.name }
     else { v.name ++ "(" ++ String::join(binders, ", ") ++ ")" };
     let values = range(0, v.fields.len()).map(|i: Int|
@@ -723,10 +685,10 @@ fn json_sum(
   let names = variants.map(|v: Variant| "\"" ++ v.name ++ "\"");
   let chain = range(0, variants.len()).fold(
     rt ++ "unknown_variant(" ++ b ++ "t.tag, [" ++ String::join(names, ", ") ++ "])",
-    |acc: String, k: Int| {
+    |accumulator: String, k: Int| {
       let v = variants.get(variants.len() - 1 - k);
       let arguments = if v.fields.len() == 0 { "" }
-      else { "(" ++ String::join(held(v), ", ") ++ ")" };
+      else { "(" ++ String::join(variant_binders(v), ", ") ++ ")" };
       let built = range(0, v.fields.len()).fold(
         "Ok(" ++ v.name ++ arguments ++ ")",
         |inner: String, kk: Int| {
@@ -747,11 +709,9 @@ fn json_sum(
             ++ "}"
         },
       );
-      // On a cycle the tag test is a call, not `==`: the emitter records an operator's type by
-      // span, every operator here shares the `derive` item's span, and the depth's are on `Int`s.
       let tested = if at.cycle.len() == 0 { b ++ "t.tag == \"" ++ v.name ++ "\"" }
       else { rt ++ "has_tag(" ++ b ++ "t, \"" ++ v.name ++ "\")" };
-      "if " ++ tested ++ " {" ++ built ++ "} else {" ++ acc ++ "}"
+      "if " ++ tested ++ " {" ++ built ++ "} else {" ++ accumulator ++ "}"
     },
   );
   let decode = "match " ++ rt ++ "variant_of(" ++ b ++ "j) {Err(" ++ b ++ "e) -> Err(" ++ b
@@ -762,8 +722,6 @@ fn json_sum(
     ++ "}";
   json_members(at, annotation, encode, decode)
 }
-
-// --- `bin` ----------------------------------------------------------------------------------------
 
 fn bin_members(
   at: Context,
@@ -794,7 +752,6 @@ fn bin_members(
     },
   ]
 
-/// A scalar is written and read by `std.bin`'s own functions rather than through a codec.
 fn bin_scalar(t: Type) -> Option<String> =
   match t {
     Unit -> Some("unit"),
@@ -805,25 +762,20 @@ fn bin_scalar(t: Type) -> Option<String> =
     _ -> None,
   }
 
-/// `x`, a value of the type `t`, appended to `w`: a record's fields in place.
 fn bin_put(at: Context, t: Type, w: String, x: String) -> String / {abort.raise} =
   match t {
     Record(fields) ->
-      fields.fold(w, |acc: String, f: Field| bin_put(at, f.ty, acc, x ++ "." ++ f.name)),
+      fields.fold(w, |accumulator: String, f: Field|
+        bin_put(at, f.ty, accumulator, x ++ "." ++ f.name)),
     _ -> binary_codec_call(at, t, "put", [w, x]),
   }
 
-/// The read of a value of the type `t` at `from`: a record's fields in place. `path` keeps the
-/// binders of a record's fields distinct from those of the enclosing record.
 fn bin_take(at: Context, t: Type, from: String, path: String) -> String / {abort.raise} =
   match t {
     Record(fields) -> record_take(at, fields, from, path),
     _ -> binary_codec_call(at, t, "take", [at.fresh ++ "d", from]),
   }
 
-/// The call of `member` (`put` or `take`) of the codec of `t`, which is not a record, on `args`.
-/// It calls `std.bin`'s function for a scalar, or for a builtin type with the functions of its
-/// parts; the definition of a type on the cycle; and a dictionary's field for any other type.
 fn binary_codec_call(
   at: Context,
   t: Type,
@@ -851,8 +803,6 @@ fn binary_codec_call(
   }
 }
 
-/// `member` (`put` or `take`) of the codec of `t` as a function value: a bare name when that is
-/// enough, otherwise a lambda around the call.
 fn bin_function(at: Context, t: Type, member: String) -> String / {abort.raise} = {
   let field = || codec(at, t, type_text(t)) ++ "." ++ member;
   let named = match bin_scalar(t) {
@@ -880,16 +830,12 @@ fn bin_function(at: Context, t: Type, member: String) -> String / {abort.raise} 
   }
 }
 
-/// Whether `t` is a type of this module on the target's cycle, whose `bin` codec's functions are
-/// separate definitions.
 fn on_cycle(at: Context, t: Type) -> Bool =
   match t {
     Applied(n, _, _, _) -> at.format == Bin && n.module == None && at.cycle.contains(n.name),
     _ -> false,
   }
 
-/// The call of `member` of the codec of `t` on `args`, where `t` is on the target's cycle: its
-/// definition by name, one level deeper, and no dictionary made for it.
 fn cycle_call(
   at: Context,
   t: Type,
@@ -908,8 +854,6 @@ fn cycle_call(
     _ -> None,
   }
 
-/// The `bin` codec of `t`, a type on the target's cycle, one level deeper: each of its functions
-/// passed to the definition of that name.
 fn cycle_codec(at: Context, t: Type) -> String / {abort.raise} = {
   let call = |member: String, args: List<String>|
     match cycle_call(at, t, member, args) { Some(c) -> c, None -> "()" };
@@ -925,7 +869,6 @@ fn cycle_codec(at: Context, t: Type) -> String / {abort.raise} = {
   )
 }
 
-/// Each of `ts` read where the last ended, the first at `start`, then `built` over their values.
 fn bin_takes(
   at: Context,
   ts: List<Type>,
@@ -938,7 +881,7 @@ fn bin_takes(
   let end_of = |i: Int| if i < 0 { start } else { binder(i) ++ ".at" };
   range(0, n).fold(
     "Ok({value: " ++ built ++ ", at: " ++ end_of(n - 1) ++ "})",
-    |acc: String, k: Int| {
+    |accumulator: String, k: Int| {
       let i = n - 1 - k;
       "match " ++ bin_take(at, ts.get(i), end_of(i - 1), path ++ i.to_string() ++ "_") ++ " {Err("
         ++ at.fresh
@@ -947,13 +890,12 @@ fn bin_takes(
         ++ "e), Ok("
         ++ binder(i)
         ++ ") -> "
-        ++ acc
+        ++ accumulator
         ++ "}"
     },
   )
 }
 
-/// A record's fields read in order from `from`, and the record built of them.
 fn record_take(
   at: Context,
   fields: List<Field>,
@@ -965,8 +907,6 @@ fn record_take(
   bin_takes(at, fields.map(|f: Field| f.ty), from, "{" ++ String::join(built, ", ") ++ "}", path)
 }
 
-/// The shape of the type `t` as a function of the shapes visited so far: a type on the cycle uses
-/// its definition, one level deeper.
 fn bin_shape(at: Context, t: Type) -> String / {abort.raise} = {
   let s = at.fresh ++ "s";
   match cycle_call(at, t, "shape", [s]) {
@@ -986,14 +926,13 @@ fn bin_record(
   bin_members(
     at,
     annotation,
-    fields.fold(at.fresh ++ "w", |acc: String, f: Field|
-      bin_put(at, f.ty, acc, v ++ "." ++ f.name)),
+    fields.fold(at.fresh ++ "w", |accumulator: String, f: Field|
+      bin_put(at, f.ty, accumulator, v ++ "." ++ f.name)),
     record_take(at, fields, at.fresh ++ "n", ""),
     at.runtime ++ "record_shape(" ++ at.fresh ++ "s, [" ++ String::join(shapes, ", ") ++ "])",
   )
 }
 
-/// A variant is its index among the declared constructors, then its fields in order.
 fn bin_sum(
   at: Context,
   target: TypeDeclaration,
@@ -1009,24 +948,23 @@ fn bin_sum(
     else { v.name ++ "(" ++ String::join(binders, ", ") ++ ")" };
     let tagged = at.runtime ++ "put_tag(" ++ b ++ "w, " ++ index.to_string() ++ ")";
     pattern ++ " -> "
-      ++ range(0, v.fields.len()).fold(tagged, |acc: String, i: Int|
-        bin_put(at, v.fields.get(i), acc, binders.get(i)))
+      ++ range(0, v.fields.len()).fold(tagged, |accumulator: String, i: Int|
+        bin_put(at, v.fields.get(i), accumulator, binders.get(i)))
   });
-  // A record argument is read field by field into a literal, so no separate record is made first.
   let cases = range(0, count).map(|index: Int| {
     let v = variants.get(index);
     let read = v.fields.fold(
       { types: [], args: [] },
-      |acc: { types: List<Type>, args: List<String> }, t: Type|
+      |accumulator: { types: List<Type>, args: List<String> }, t: Type|
         match t {
           Record(fields) ->
             {
-              types: acc.types.concat(fields.map(|f: Field| f.ty)),
-              args: acc.args.push(
+              types: accumulator.types.concat(fields.map(|f: Field| f.ty)),
+              args: accumulator.args.push(
                 "{"
                   ++ String::join(
                     range(0, fields.len()).map(|k: Int|
-                      fields.get(k).name ++ ": " ++ b ++ (acc.types.len() + k).to_string()
+                      fields.get(k).name ++ ": " ++ b ++ (accumulator.types.len() + k).to_string()
                         ++ ".value"),
                     ", ",
                   )
@@ -1035,8 +973,8 @@ fn bin_sum(
             },
           _ ->
             {
-              types: acc.types.push(t),
-              args: acc.args.push(b ++ acc.types.len().to_string() ++ ".value"),
+              types: accumulator.types.push(t),
+              args: accumulator.args.push(b ++ accumulator.types.len().to_string() ++ ".value"),
             },
         },
     );
@@ -1077,8 +1015,6 @@ fn bin_sum(
   )
 }
 
-// --- `sql`: a record's row ------------------------------------------------------------------------
-
 /// How a field of a row is read: by the named `std.sql` reader, as an `Option` of an inner read, as
 /// an array read by the named reader, as the document it contains, or through the type's own JSON
 /// codec.
@@ -1110,7 +1046,6 @@ pub fn row_columns(declaration: Declaration) -> Option<List<RowColumn>> / {abort
 /// The function `derive sql for T` writes: `<snake_case(T)>_row`.
 pub fn row_function(target: String) -> String = generated_name(Row, target)
 
-/// A field type as the module writes it, through its own parameterless aliases.
 fn resolve_aliases(at: Context, t: Type) -> Type / {abort.raise} =
   iterate({ now: t, steps: 0 }, 66, |s: { now: Type, steps: Int }|
     if s.steps >= 64 { Stop(s.now) } else {
@@ -1125,7 +1060,6 @@ fn resolve_aliases(at: Context, t: Type) -> Type / {abort.raise} =
       }
     })
 
-/// The `std.sql` reader of a scalar field type.
 fn row_scalar(t: Type) -> Option<String> =
   match t {
     Applied(n, args, _, _) -> if n.module != None || args.len() > 0 { None } else {
@@ -1161,12 +1095,9 @@ fn row_read(at: Context, t: Type, left: Int) -> ColumnRead / {abort.raise} = {
   }
 }
 
-/// Whether a field of this type is stored as a document through its JSON codec.
 fn reads_through_json(read: ColumnRead) -> Bool =
   match read { ByJson(_) -> true, Optional(inner) -> reads_through_json(inner), _ -> false }
 
-/// How a row's documents refer to `std.json`: by the name the module imports it as, which a row
-/// with a field stored through its JSON codec needs. Empty for any other derivation.
 fn json_module_of(
   declaration: Declaration,
   target: TypeDeclaration,
@@ -1198,7 +1129,6 @@ fn json_module_of(
   }
 }
 
-/// The reader of a field read this way, as an expression the module can write.
 fn row_reader(at: Context, read: ColumnRead) -> String / {abort.raise} =
   match read {
     Scalar(reader) -> at.runtime ++ reader ++ "()",
@@ -1221,7 +1151,7 @@ fn row_record(at: Context, fields: List<Field>, annotation: String) -> String / 
   let built = range(0, fields.len()).map(|i: Int| name(i) ++ ": " ++ b ++ i.to_string());
   let decode = range(0, fields.len()).fold(
     "Ok({" ++ String::join(built, ", ") ++ "})",
-    |acc: String, k: Int| {
+    |accumulator: String, k: Int| {
       let i = fields.len() - 1 - k;
       "match " ++ rt ++ "read(" ++ b ++ "r, \"" ++ name(i) ++ "\", " ++ readers.get(i) ++ ") {Err("
         ++ b
@@ -1231,7 +1161,7 @@ fn row_record(at: Context, fields: List<Field>, annotation: String) -> String / 
         ++ b
         ++ i.to_string()
         ++ ") -> "
-        ++ acc
+        ++ accumulator
         ++ "}"
     },
   );
@@ -1247,8 +1177,6 @@ fn row_record(at: Context, fields: List<Field>, annotation: String) -> String / 
     ++ String::join(params, ", ")
     ++ "]}"
 }
-
-// --- Tests ----------------------------------------------------------------------------------------
 
 fn record(name: String, fields: List<Field>) -> TypeDeclaration =
   { name: name, public: true, types: [], rows: [], labels: [], body: Alias(Record(fields)) }
@@ -1266,7 +1194,7 @@ fn declaring(target: String, types: List<TypeDeclaration>, binder: String) -> De
 fn derived_text(r: Result<String, Refused>) -> String =
   match r { Ok(text) -> text, Err(rejected) -> "rejected: " ++ rejected.message }
 
-test "a codec is built from its fields' codecs: a scalar's from its module, a derived type's by name" {
+test "a derived codec uses the module's codec for a scalar field and calls the derived codec by name for a field of a derived type" {
   let line = record("Line", [
     { name: "sku", ty: applied_type("String", []) },
     { name: "qty", ty: applied_type("Int", []) },
@@ -1281,7 +1209,7 @@ test "a codec is built from its fields' codecs: a scalar's from its module, a de
   assert(bin.contains("bin::put_string(") && bin.contains("bin::take_int("), Some(bin))
 }
 
-test "a codec of a parameterized type takes one for each parameter, named as the parameter is" {
+test "a derived codec for a parameterized type takes a codec argument for each type parameter, named after that parameter" {
   let boxed = {
     name: "Box",
     public: false,
@@ -1297,35 +1225,41 @@ test "a codec of a parameterized type takes one for each parameter, named as the
   )
 }
 
-test "a field no codec can write is rejected at its field, and a variant's at its variant" {
+test "deriving a codec fails at the field whose type has no encoding, or at the variant whose field has none" {
   let at = |types: List<TypeDeclaration>, target: String|
     match derive_json(declaring(target, types, "json")) {
       Ok(text) -> panic("derived " ++ text),
       Err(r) -> { message: r.message, at: r.at },
     };
-  let held = |ty: Type| at([record("R", [{ name: "x", ty: ty }])], "R");
-  assert(held(Function([], Unit, "")).message.contains("a function has no JSON encoding"), None);
-  assert_eq(held(Function([], Unit, "")).at, Some("x"));
+  let field_failure = |ty: Type| at([record("R", [{ name: "x", ty: ty }])], "R");
   assert(
-    held(applied_type("Secret", [applied_type("String", [])])).message.contains("credential"),
+    field_failure(Function([], Unit, "")).message.contains("a function has no JSON encoding"),
+    None,
+  );
+  assert_eq(field_failure(Function([], Unit, "")).at, Some("x"));
+  assert(
+    field_failure(applied_type("Secret", [applied_type("String", [])])).message.contains(
+      "credential",
+    ),
     None,
   );
   assert(
-    held(applied_type("Task", [applied_type("Int", [])])).message.contains("names a location"),
+    field_failure(applied_type("Task", [applied_type("Int", [])])).message.contains(
+      "is a runtime resource",
+    ),
     None,
   );
-  assert(held(applied_type("Option", [Unit])).message.contains("encodes as `null`"), None);
+  assert(field_failure(applied_type("Option", [Unit])).message.contains("encodes as `null`"), None);
   assert(
-    held(
+    field_failure(
       applied_type("Option", [applied_type("Option", [applied_type("Int", [])])]),
     ).message.contains(
       "encodes as `null`",
     ),
     None,
   );
-  // Two keys that encode alike would decode to one entry.
   assert(
-    held(
+    field_failure(
       applied_type("Map", [applied_type("Option", [Unit]), applied_type("Int", [])]),
     ).message.contains(
       "encodes as `null`",
@@ -1333,7 +1267,7 @@ test "a field no codec can write is rejected at its field, and a variant's at it
     None,
   );
   assert(
-    held(
+    field_failure(
       applied_type("Map", [applied_type("Float", []), applied_type("Int", [])]),
     ).message.contains(
       "must be ordered",
@@ -1371,7 +1305,7 @@ test "a field no codec can write is rejected at its field, and a variant's at it
   )
 }
 
-test "a codec whose type reaches itself takes how much deeper it may nest" {
+test "a derived codec for a recursive type takes a depth limit that bounds how deeply values may nest" {
   let tree = {
     name: "Tree",
     public: false,
@@ -1397,7 +1331,7 @@ test "a codec whose type reaches itself takes how much deeper it may nest" {
   )
 }
 
-test "a row reads a column per field, a document through the type's own codec" {
+test "a derived row codec maps each field to a column, and stores a list or record field as JSON using that type's own codec" {
   let line = record("Line", [{ name: "sku", ty: applied_type("String", []) }]);
   let order = record("Order", [
     { name: "id", ty: applied_type("Int", []) },
@@ -1414,17 +1348,16 @@ test "a row reads a column per field, a document through the type's own codec" {
       cs.map(|c: RowColumn| c.name)),
     Some(["id", "note", "lines"]),
   );
-  // A document is read through `std.json`, which the module must import.
   match derive_row({ ..declaring("Order", [line, order], "sql"), imports: [] }) {
     Ok(text) -> panic("derived " ++ text),
     Err(r) -> assert(r.message.contains("does not import `std.json`"), Some(r.message)),
   }
 }
 
-test "a row is a record's fields: a sum, a type with parameters and an empty record have none" {
+test "deriving a row codec fails for a sum type, a type with parameters and a record with no fields" {
   let rejected = |t: TypeDeclaration|
     match derive_row(declaring(t.name, [t], "sql")) { Ok(_) -> "", Err(r) -> r.message };
-  assert(rejected({ ..record("E", []) }).contains("a column at least"), None);
+  assert(rejected({ ..record("E", []) }).contains("at least one column"), None);
   assert(
     rejected({ ..record("P", [{ name: "x", ty: Param("a") }]), types: ["a"] }).contains(
       "parameters",

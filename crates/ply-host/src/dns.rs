@@ -1,19 +1,8 @@
-//! The system's resolver, which `std.dns`'s host handler asks off the program's thread. The resolver
-//! has its own patience and cannot be interrupted, so a caller that stops waiting (`std.dns`'s
-//! `resolve` cancels the task that asked) leaves the question on its thread until the system
-//! responds to it.
-//!
-//! A result is flat: byte 1 and then each address's bytes or each name as parts, or byte 0, the
-//! failure's kind (`NoSuchName` 1, `NoData` 2, `ServerFailure` 3, `Other` 4), and for `Other` its
-//! code and the resolver's words as parts.
-
 use crate::native::{int, parts};
 use std::net::IpAddr;
 
-/// Where the system's resolver keeps the servers it asks.
 pub const RESOLVER_CONFIGURATION: &str = "/etc/resolv.conf";
 
-/// A `std.dns.Failure` the system's resolver can respond with: a deadline is its caller's.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Failure {
     NoSuchName,
@@ -35,7 +24,6 @@ impl Failure {
     }
 }
 
-/// The addresses the system's resolver gives `name`, each once and in its order.
 pub fn lookup(name: &str) -> Vec<u8> {
     match system::addresses(name) {
         Ok(found) => {
@@ -47,7 +35,6 @@ pub fn lookup(name: &str) -> Vec<u8> {
     }
 }
 
-/// The names the system's resolver says `address` answers to.
 pub fn reverse(address: IpAddr) -> Vec<u8> {
     match system::names(address) {
         Ok(names) => {
@@ -58,8 +45,7 @@ pub fn reverse(address: IpAddr) -> Vec<u8> {
     }
 }
 
-/// The address four or sixteen bytes are, in network order.
-pub fn address_of(bytes: &[u8]) -> Option<IpAddr> {
+pub fn ip_address_from_bytes(bytes: &[u8]) -> Option<IpAddr> {
     match bytes.len() {
         4 => Some(IpAddr::from(<[u8; 4]>::try_from(bytes).ok()?)),
         16 => Some(IpAddr::from(<[u8; 16]>::try_from(bytes).ok()?)),
@@ -67,7 +53,6 @@ pub fn address_of(bytes: &[u8]) -> Option<IpAddr> {
     }
 }
 
-/// `address` in network order.
 pub fn address_bytes(address: &IpAddr) -> Vec<u8> {
     match address {
         IpAddr::V4(four) => four.octets().to_vec(),
@@ -75,7 +60,6 @@ pub fn address_bytes(address: &IpAddr) -> Vec<u8> {
     }
 }
 
-/// The system's resolver, through the C library, which is where its failures have codes.
 #[cfg(unix)]
 mod system {
     use super::Failure;
@@ -89,25 +73,20 @@ mod system {
             libc::EAI_NODATA => Failure::NoData,
             libc::EAI_AGAIN | libc::EAI_FAIL => Failure::ServerFailure,
             other => {
-                // SAFETY: the result is a static, terminated string for any code.
                 let text = unsafe { CStr::from_ptr(libc::gai_strerror(other)) };
                 Failure::Other(i64::from(other), text.to_string_lossy().into_owned())
             }
         }
     }
 
-    /// Each address of `name` once, in the resolver's order.
     pub fn addresses(name: &str) -> Result<Vec<IpAddr>, Failure> {
         let Ok(name) = CString::new(name) else {
             return Err(Failure::NoSuchName);
         };
-        // SAFETY: zeroed is the documented way to start a hints structure.
         let mut hints: libc::addrinfo = unsafe { std::mem::zeroed() };
         hints.ai_family = libc::AF_UNSPEC;
-        // One socket type, or every address comes back once for each.
         hints.ai_socktype = libc::SOCK_STREAM;
         let mut list: *mut libc::addrinfo = std::ptr::null_mut();
-        // SAFETY: `name` is terminated, `hints` is initialised, and `list` receives the result.
         let code = unsafe {
             libc::getaddrinfo(
                 name.as_ptr(),
@@ -122,18 +101,15 @@ mod system {
         let mut found = Vec::new();
         let mut entry = list;
         while !entry.is_null() {
-            // SAFETY: `entry` is a node of the list the call returned, valid until it is freed.
             let info = unsafe { &*entry };
             let address = match info.ai_family {
                 libc::AF_INET => {
-                    // SAFETY: an `AF_INET` entry's address is a `sockaddr_in`.
                     let four = unsafe { &*info.ai_addr.cast::<libc::sockaddr_in>() };
                     Some(IpAddr::V4(Ipv4Addr::from(u32::from_be(
                         four.sin_addr.s_addr,
                     ))))
                 }
                 libc::AF_INET6 => {
-                    // SAFETY: an `AF_INET6` entry's address is a `sockaddr_in6`.
                     let six = unsafe { &*info.ai_addr.cast::<libc::sockaddr_in6>() };
                     Some(IpAddr::V6(Ipv6Addr::from(six.sin6_addr.s6_addr)))
                 }
@@ -146,7 +122,6 @@ mod system {
             }
             entry = info.ai_next;
         }
-        // SAFETY: `list` is what the call returned, freed once.
         unsafe { libc::freeaddrinfo(list) };
         if found.is_empty() {
             return Err(Failure::NoData);
@@ -154,15 +129,12 @@ mod system {
         Ok(found)
     }
 
-    /// The name `address` answers to; an address with none is `NoSuchName`.
     pub fn names(address: IpAddr) -> Result<Vec<String>, Failure> {
         let socket = socket2::SockAddr::from(match address {
             IpAddr::V4(four) => SocketAddr::V4(SocketAddrV4::new(four, 0)),
             IpAddr::V6(six) => SocketAddr::V6(SocketAddrV6::new(six, 0, 0, 0)),
         });
         let mut host = [0 as libc::c_char; libc::NI_MAXHOST as usize];
-        // SAFETY: `socket` is an address of its own length, and `host` the buffer of the length
-        // given; no service name is asked for.
         let code = unsafe {
             libc::getnameinfo(
                 socket.as_ptr().cast(),
@@ -177,13 +149,11 @@ mod system {
         if code != 0 {
             return Err(failure(code));
         }
-        // SAFETY: a successful call left a terminated name in the buffer.
         let name = unsafe { CStr::from_ptr(host.as_ptr()) };
         Ok(vec![name.to_string_lossy().into_owned()])
     }
 }
 
-/// Without the C library's resolver there are no codes, so a failure is only what it says.
 #[cfg(not(unix))]
 mod system {
     use super::Failure;

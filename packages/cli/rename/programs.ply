@@ -6,7 +6,8 @@ import compiler.checkout (module_files)
 import std.path (normalize)
 import walk (Failure)
 import sources
-import program (ParsedSources, load_program, program_view, resolution_of)
+import program (ParsedSources, Program, load_program, program_view, renamed_resolution,
+                resolution_of, unchecked_program)
 import diagnostic (errors_text)
 import builder (builder)
 import std.random (entropy)
@@ -30,7 +31,7 @@ import compiler.check.typed (TypedBody, TypedExpression, TypedPattern, TypedFiel
                              TypedCase, TypedListPattern, TypedOr, typed_expression_nodes)
 import compiler.syntax.items (parse, Module, ImportDeclaration, Item, EffectItem, ExternItem,
                               FunctionItem, TypeItem, SumBody, AliasBody, NominalBody,
-                              VariantDefinition, OpDefinition, DeriveOrigin)
+                              VariantDefinition, OperationDefinition, DeriveOrigin)
 import compiler.syntax.type_syntax (TypeExpression, RecordTypeExpression)
 import compiler.syntax.parsing (Identifier)
 import compiler.check.resolve.tables (qualify)
@@ -49,7 +50,7 @@ pub fn root_relative(path: String, at: RootedPath) -> String / {abort.raise} =
 pub fn package_of(
   file: RootedPath,
   libraries: List<Library>,
-) -> Option<RootedPath> / {fs.kind[cwd], fs.kind[abs], abort.raise} = {
+) -> Option<RootedPath> / {fs.kind[cwd], fs.kind[abs]} = {
   let parts = file.path.split("/");
   match range(0, parts.len()).map(|k: Int| parts.len() - 1 - k).map(|k: Int|
       { label: file.label, path: String::join(parts.take(k), "/") }).find(|dir: RootedPath|
@@ -66,12 +67,12 @@ pub fn package_of(
 pub fn libraries_of(
   given: List<ResolvedPath>,
 ) -> List<Library> / {fs.resolved_kind[abs], fs.read_file[abs], abort.raise} =
-  given.fold([], |acc: List<Library>, r: ResolvedPath|
+  given.fold([], |accumulator: List<Library>, r: ResolvedPath|
     match library::part_of(r.absolute) {
       Some(part) -> if normalize(r.absolute) == part.dir {
-        acc.push({ root: rooted(r), name: part.prefix })
-      } else { acc },
-      None -> acc,
+        accumulator.push({ root: rooted(r), name: part.prefix })
+      } else { accumulator },
+      None -> accumulator,
     })
 
 pub type Entry = { owner: Bytes, names: Written }
@@ -99,8 +100,8 @@ pub type Read = {
 }
 
 pub fn derived_names(origin: DeriveOrigin) -> List<Bytes> / {abort.raise} =
-  origin.written.fold([], |acc: List<Bytes>, text: Bytes|
-    parse(text).node.items.fold(acc, |names: List<Bytes>, item: Item|
+  origin.written.fold([], |accumulator: List<Bytes>, text: Bytes|
+    parse(text).node.items.fold(accumulator, |names: List<Bytes>, item: Item|
       match item { FunctionItem(d) -> names.push(d.name.name), _ -> names }))
 
 pub fn derived_unbound(
@@ -108,8 +109,8 @@ pub fn derived_unbound(
   index: Int,
   origins: List<DeriveOrigin>,
 ) -> Map<Bytes, Bool> / {abort.raise} =
-  origins.fold(Map::new(), |acc: Map<Bytes, Bool>, origin: DeriveOrigin|
-    origin.written.fold(acc, |found: Map<Bytes, Bool>, text: Bytes|
+  origins.fold(Map::new(), |accumulator: Map<Bytes, Bool>, origin: DeriveOrigin|
+    origin.written.fold(accumulator, |found: Map<Bytes, Bool>, text: Bytes|
       written(resolution, index, numbered_module(parse(text).node)).fold(
         found,
         |into: Map<Bytes, Bool>, w: Written|
@@ -158,10 +159,10 @@ fn calls_by_module(
 ) -> Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>> / {abort.raise} =
   view.checked.facts.members.fold(
     Map::new(),
-    |acc: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>, s: MemberSite| {
+    |accumulator: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>, s: MemberSite| {
       let name = view.frame.outlines.get(s.module).name;
-      let module = acc.get(name).unwrap_or(Map::new());
-      acc.insert(
+      let module = accumulator.get(name).unwrap_or(Map::new());
+      accumulator.insert(
         name,
         module.insert(s.owner, module.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee)),
       )
@@ -180,7 +181,7 @@ fn with_record(
   types: TypeTable,
   site: Int,
   key: Bytes,
-) -> Map<Int, Record> / {abort.raise} =
+) -> Map<Int, Record> =
   match record_in(types, key) { Some(r) -> sites.insert(site, r), None -> sites }
 
 fn pattern_records(
@@ -212,65 +213,84 @@ fn body_records(
 ) -> Map<Int, Record> / {abort.raise} =
   typed_expression_nodes(body.body).fold(
     sites,
-    |acc: Map<Int, Record>, e: TypedExpression<Bytes>|
+    |accumulator: Map<Int, Record>, e: TypedExpression<Bytes>|
       match e.node {
-        TypedFieldRead(f) -> with_record(acc, types, e.span.site, f.base.ty),
-        TypedRecord(_) -> with_record(acc, types, e.span.site, e.ty),
-        TypedUpdate(_) -> with_record(acc, types, e.span.site, e.ty),
+        TypedFieldRead(f) -> with_record(accumulator, types, e.span.site, f.base.ty),
+        TypedRecord(_) -> with_record(accumulator, types, e.span.site, e.ty),
+        TypedUpdate(_) -> with_record(accumulator, types, e.span.site, e.ty),
         TypedCall(c) -> match c.callee.node {
-          TypedFieldRead(f) -> with_record(acc, types, e.span.site, f.base.ty),
-          _ -> acc,
+          TypedFieldRead(f) -> with_record(accumulator, types, e.span.site, f.base.ty),
+          _ -> accumulator,
         },
         TypedMatch(m) ->
-          m.arms.fold(acc, |into: Map<Int, Record>, arm: TypedArm<Bytes>|
+          m.arms.fold(accumulator, |into: Map<Int, Record>, arm: TypedArm<Bytes>|
             pattern_records(into, types, arm.pattern)),
         TypedBlock(b) ->
-          b.statements.fold(acc, |into: Map<Int, Record>, statement: TypedStatement<Bytes>|
-            match statement {
-              TypedLet(l) -> pattern_records(into, types, l.pattern),
-              TypedLetElse(l) -> pattern_records(into, types, l.pattern),
-              _ -> into,
-            }),
-        _ -> acc,
+          b.statements.fold(
+            accumulator,
+            |into: Map<Int, Record>, statement: TypedStatement<Bytes>|
+              match statement {
+                TypedLet(l) -> pattern_records(into, types, l.pattern),
+                TypedLetElse(l) -> pattern_records(into, types, l.pattern),
+                _ -> into,
+              },
+          ),
+        _ -> accumulator,
       },
   )
 
 fn records_by_owner(view: CheckedProgram) -> Map<Bytes, Map<Int, Record>> / {abort.raise} = {
   let types = view.checked.facts.types;
-  let with_body = |acc: Map<Bytes, Map<Int, Record>>, owner: Bytes, body: TypedBody<Bytes>|
-    acc.insert(owner, body_records(acc.get(owner).unwrap_or(Map::new()), types, body));
+  let with_body = |accumulator: Map<Bytes, Map<Int, Record>>, owner: Bytes, body: TypedBody<Bytes>|
+    accumulator.insert(
+      owner,
+      body_records(accumulator.get(owner).unwrap_or(Map::new()), types, body),
+    );
   view.checked.cached.fold(
     view.checked.facts.bodies.fold(
       Map::new(),
-      |acc: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>| with_body(acc, b.owner, b),
+      |accumulator: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
+        with_body(accumulator, b.owner, b),
     ),
-    |acc: Map<Bytes, Map<Int, Record>>, k: CachedFacts|
+    |accumulator: Map<Bytes, Map<Int, Record>>, k: CachedFacts|
       match decode_facts(k.facts, 0, k.name) {
         Some(f) ->
-          f.bodies.fold(acc, |into: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
+          f.bodies.fold(accumulator, |into: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
             with_body(into, k.name, b)),
-        None -> acc,
+        None -> accumulator,
       },
   )
 }
 
-fn declared_records(module: Bytes, tree: Module) -> List<DeclaredRecord> / {abort.raise} =
-  tree.items.fold([], |acc: List<DeclaredRecord>, item: Item|
+fn variant_records(name: Bytes, variants: List<VariantDefinition>) -> List<DeclaredRecord> =
+  variants.fold([], |found: List<DeclaredRecord>, v: VariantDefinition|
+    v.fields.fold(found, |records: List<DeclaredRecord>, payload: TypeExpression|
+      match payload {
+        RecordTypeExpression(r) -> {
+          let fields = r.fields.map(|f: { name: Identifier, ty: TypeExpression }| f.name.name);
+          records.push({ name: name, record: plain_record(fields), fields: fields })
+        },
+        _ -> records,
+      }))
+
+fn declared_records(module: Bytes, tree: Module) -> List<DeclaredRecord> =
+  tree.items.fold([], |accumulator: List<DeclaredRecord>, item: Item|
     match item {
       TypeItem(t) -> match t.body {
         AliasBody(RecordTypeExpression(r)) -> {
           let fields = r.fields.map(|f: { name: Identifier, ty: TypeExpression }| f.name.name);
-          acc.push({ name: t.name.name, record: plain_record(fields), fields: fields })
+          accumulator.push({ name: t.name.name, record: plain_record(fields), fields: fields })
         },
         NominalBody(RecordTypeExpression(r)) ->
-          acc.push({
+          accumulator.push({
             name: t.name.name,
             record: NewRecordType(qualify(module, t.name.name)),
             fields: r.fields.map(|f: { name: Identifier, ty: TypeExpression }| f.name.name),
           }),
-        _ -> acc,
+        SumBody(variants) -> accumulator.concat(variant_records(t.name.name, variants)),
+        _ -> accumulator,
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 
 pub fn entries_of(
@@ -309,49 +329,53 @@ fn read_of(
         calls: calls.get(name).unwrap_or(Map::new()),
         imports: range(0, tree.imports.len()).fold(
           [],
-          |acc: List<{ declaration: ImportDeclaration, target: Int }>, k: Int|
+          |accumulator: List<{ declaration: ImportDeclaration, target: Int }>, k: Int|
             match targets.at(k) {
-              Some(t) -> acc.push({ declaration: tree.imports.get(k), target: t }),
-              None -> acc,
+              Some(t) -> accumulator.push({ declaration: tree.imports.get(k), target: t }),
+              None -> accumulator,
             },
         ),
-        externs: tree.items.fold(Map::new(), |acc: Map<Bytes, Bool>, item: Item|
-          match item { ExternItem(x) -> acc.insert(x.name.name, true), _ -> acc }),
+        externs: tree.items.fold(Map::new(), |accumulator: Map<Bytes, Bool>, item: Item|
+          match item { ExternItem(x) -> accumulator.insert(x.name.name, true), _ -> accumulator }),
         effects: tree.items.fold(
           [],
-          |acc: List<{ name: Bytes, operations: List<Bytes> }>, item: Item|
+          |accumulator: List<{ name: Bytes, operations: List<Bytes> }>, item: Item|
             match item {
               EffectItem(e) ->
-                acc.push({
+                accumulator.push({
                   name: e.name.name,
-                  operations: e.operations.map(|op: OpDefinition| op.name.name),
+                  operations: e.operations.map(|operation: OperationDefinition|
+                    operation.name.name),
                 }),
-              _ -> acc,
+              _ -> accumulator,
             },
         ),
         sums: tree.items.fold(
           [],
-          |acc: List<{ name: Bytes, variants: List<Bytes> }>, item: Item|
+          |accumulator: List<{ name: Bytes, variants: List<Bytes> }>, item: Item|
             match item {
               TypeItem(t) -> match t.body {
                 SumBody(variants) ->
-                  acc.push({
+                  accumulator.push({
                     name: t.name.name,
                     variants: variants.map(|v: VariantDefinition| v.name.name),
                   }),
-                _ -> acc,
+                _ -> accumulator,
               },
-              _ -> acc,
+              _ -> accumulator,
             },
         ),
         records: declared_records(name, tree),
         derived: parsed.derived,
         derived_unbound: derived_unbound(resolved.resolution, index, parsed.derived),
-        typed_records: entries.fold(Map::new(), |acc: Map<Bytes, Map<Int, Record>>, e: Entry|
-          match owner_records.get(e.owner) {
-            Some(sites) -> acc.insert(e.owner, sites),
-            None -> acc,
-          }),
+        typed_records: entries.fold(
+          Map::new(),
+          |accumulator: Map<Bytes, Map<Int, Record>>, e: Entry|
+            match owner_records.get(e.owner) {
+              Some(sites) -> accumulator.insert(e.owner, sites),
+              None -> accumulator,
+            },
+        ),
       })
     },
   }
@@ -362,38 +386,90 @@ fn under(at: RootedPath, root: RootedPath) -> Bool =
     && (root.path == "" || root.path == "." || at.path == root.path
     || at.path.starts_with(root.path ++ "/"))
 
+type ProgramLoad = {
+  program: Program,
+  resolved: Result<ResolvedProgram, List<Diagnostic>>,
+  parses: ParsedSources,
+  calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
+  owner_records: Map<Bytes, Map<Int, Record>>,
+}
+
+fn checked_load(
+  path: ResolvedPath,
+  parses: ParsedSources,
+) -> ProgramLoad / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+  let program = load_program([path], false);
+  let resolution = resolution_of(program, parses);
+  let load = {
+    program: program,
+    resolved: resolution.resolved,
+    parses: resolution.parses,
+    calls: Map::new(),
+    owner_records: Map::new(),
+  };
+  match ((resolution.resolved, program_view(program))) {
+    (Err(_), _) -> load,
+    (_, None) -> { ..load, resolved: Err(program.diagnostics) },
+    (Ok(_), Some(view)) ->
+      { ..load, calls: calls_by_module(view), owner_records: records_by_owner(view) },
+  }
+}
+
+fn unchecked_load(
+  path: ResolvedPath,
+  shipping: ShippedInputs,
+  parses: ParsedSources,
+) -> ProgramLoad / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges} = {
+  let program = unchecked_program([path], shipping);
+  let resolution = renamed_resolution([path], program.shipping, parses);
+  {
+    program: program,
+    resolved: match resolution.resolved {
+      Ok(resolved) -> Ok(resolved),
+      Err(u) -> Err(u.diagnostics),
+    },
+    parses: resolution.parses,
+    calls: Map::new(),
+    owner_records: Map::new(),
+  }
+}
+
 pub fn loads_of(
   given: List<ResolvedPath>,
   pwd: String,
+  checked: Bool,
 ) -> { loads: List<Loaded>, failures: List<Failure> } / {fs.resolved_kind[abs], shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
   let roots = given.map(rooted);
+  let shipping = sources::shipping_of(if checked { [] } else { sources::shipped_names() });
   let done = given.fold(
     { loads: [], failures: [], parses: Map::new() },
-    |acc: { loads: List<Loaded>, failures: List<Failure>, parses: ParsedSources }, path: ResolvedPath| {
+    |accumulator: { loads: List<Loaded>, failures: List<Failure>, parses: ParsedSources }, path: ResolvedPath| {
       let root = rooted(path);
-      if acc.loads.any(|l: Loaded| l.files.any(|f: RootedPath| under(f, root))) { acc } else {
-        let program = load_program([path], false);
+      if accumulator.loads.any(|l: Loaded| l.files.any(|f: RootedPath| under(f, root))) {
+        accumulator
+      } else {
+        let load = if checked { checked_load(path, accumulator.parses) }
+        else { unchecked_load(path, shipping, accumulator.parses) };
+        let program = load.program;
         let library_files = shipped_files(path);
-        let resolution = resolution_of(program, acc.parses);
-        let rejected = |ds: List<Diagnostic>|
-          {
-            ..acc,
-            failures: acc.failures.push({
-              path: displayed(root),
-              reason: "does not check: " ++ errors_text(ds),
-            }),
-          };
-        match ((resolution.resolved, program_view(program))) {
-          (Err(ds), _) -> rejected(ds),
-          (_, None) -> rejected(program.diagnostics),
-          (Ok(resolved), Some(view)) -> {
-            let calls = calls_by_module(view);
-            let owner_records = records_by_owner(view);
-            let read_before = acc.loads.fold(Map::new(), |m: Map<String, Bool>, l: Loaded|
-              l.reads.fold(m, |into: Map<String, Bool>, r: Read|
-                into.insert(absolute(pwd, r.file.at), true)));
+        match load.resolved {
+          Err(ds) ->
             {
-              loads: acc.loads.push({
+              ..accumulator,
+              failures: accumulator.failures.push({
+                path: displayed(root),
+                reason: "does not check: " ++ errors_text(ds),
+              }),
+            },
+          Ok(resolved) -> {
+            let read_before = accumulator.loads.fold(
+              Map::new(),
+              |m: Map<String, Bool>, l: Loaded|
+                l.reads.fold(m, |into: Map<String, Bool>, r: Read|
+                  into.insert(absolute(pwd, r.file.at), true)),
+            );
+            {
+              loads: accumulator.loads.push({
                 path: path,
                 root: displayed(root),
                 files: program.files.map(|f: sources::File| f.at),
@@ -409,7 +485,7 @@ pub fn loads_of(
                     && !read_before.contains(absolute(pwd, f.at))).fold(
                   [],
                   |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, calls, owner_records, f) {
+                    match read_of(resolved, load.calls, load.owner_records, f) {
                       Some(r) -> reads.push(r),
                       None -> reads,
                     },
@@ -418,14 +494,14 @@ pub fn loads_of(
                   !roots.any(|r: RootedPath| under(f.at, r))).fold(
                   [],
                   |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, calls, owner_records, f) {
+                    match read_of(resolved, load.calls, load.owner_records, f) {
                       Some(r) -> reads.push(r),
                       None -> reads,
                     },
                 ),
               }),
-              failures: acc.failures,
-              parses: resolution.parses,
+              failures: accumulator.failures,
+              parses: load.parses,
             }
           },
         }

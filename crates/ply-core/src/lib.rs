@@ -1,5 +1,4 @@
-//! The runtime's vocabulary: PLV1, spans, diagnostics and their codes, effects, and
-//! the host boundary.
+#![allow(clippy::missing_safety_doc)]
 
 pub mod builtins;
 pub mod codec;
@@ -17,14 +16,14 @@ pub mod intty;
 pub mod limit;
 pub use expr::{BinOp, render_float};
 
-pub use intty::{Fixed, INT_TYPES, IntTy};
+pub use intty::{Fixed, INT_TYPES, IntegerType};
 pub mod sim;
 mod span;
 pub mod sqlite;
 
 pub use crypto::constant_time_eq;
 pub use effects::{Effect, Mode, Resource, label_var_name};
-pub use escape::{Boundary, Escapee, Handle};
+pub use escape::{Boundary, EscapedHandle, Handle};
 pub use host::{
     Determinism, HostBinding, HostRuntime, HostUse, Pending, RuntimeFactory, ShutdownReport,
 };

@@ -61,8 +61,8 @@ fn on_target<a | e>(
   target: Target,
   body: () -> a / {shipped.names, shipped.module, shipped.digests, shipped.read_pack, shipped.stamps, shipped.runtime, shipped.definitions, shipped.run_root | e},
 ) -> a / {toolchain.cache, toolchain.write_file, toolchain.run, abort.raise | e} = {
-  let by_name = target.files.fold(Map::new(), |acc: Map<String, Bytes>, f: ShippedFile|
-    acc.insert(f.name, f.bytes));
+  let by_name = target.files.fold(Map::new(), |accumulator: Map<String, Bytes>, f: ShippedFile|
+    accumulator.insert(f.name, f.bytes));
   let names = module_names(target.files);
   let digests = digests_of(target.files);
   handle {
@@ -115,8 +115,11 @@ fn definitions_of(listing: Bytes) -> Result<Bytes, String> / {abort.raise} =
   match json::parse(listing) {
     Ok(Object(members)) -> match members.get("definitions") {
       Some(Array(rows)) -> {
-        let held = rows.fold(Map::new(), |acc: Map<String, String>, row: Json|
-          match definition_line(row) { Some(d) -> acc.insert(d.name, d.hash), None -> acc });
+        let held = rows.fold(Map::new(), |accumulator: Map<String, String>, row: Json|
+          match definition_line(row) {
+            Some(d) -> accumulator.insert(d.name, d.hash),
+            None -> accumulator,
+          });
         Ok(
           Bytes::concat_all(
             held.fold([], |lines: List<Bytes>, name: String, hash: String|
@@ -207,7 +210,7 @@ fn append_pack(
   pack: Bytes,
 ) -> Result<String, String> / {toolchain.read, toolchain.write, abort.raise} =
   if toolchain.append(cache_relative(exe), pack) { Ok(exe) }
-  else { Err("the pack could not be written after `" ++ exe ++ "`") }
+  else { Err("the standard library files could not be added to the end of `" ++ exe ++ "`") }
 
 fn build_pack(files: List<ShippedFile>, front: Bytes, more: List<PackFile>) -> Bytes =
   native::pack(
@@ -222,11 +225,14 @@ fn build_pack(files: List<ShippedFile>, front: Bytes, more: List<PackFile>) -> B
 fn shipped_key(files: List<ShippedFile>) -> Bytes =
   blake3(
     Bytes::concat_all(
-      files.fold(Map::new(), |acc: Map<String, Bytes>, f: ShippedFile|
-        acc.insert(f.name, length_prefixed(Bytes::of_string(f.path)).concat(blake3(f.bytes)))).fold(
+      files.fold(Map::new(), |accumulator: Map<String, Bytes>, f: ShippedFile|
+        accumulator.insert(
+          f.name,
+          length_prefixed(Bytes::of_string(f.path)).concat(blake3(f.bytes)),
+        )).fold(
         [b"ply shipped modules 1\0"],
-        |acc: List<Bytes>, name: String, held: Bytes|
-          acc.push(length_prefixed(Bytes::of_string(name))).push(held),
+        |accumulator: List<Bytes>, name: String, held: Bytes|
+          accumulator.push(length_prefixed(Bytes::of_string(name))).push(held),
       ),
     ),
   )
@@ -329,7 +335,7 @@ fn build_shipped_results(
           { path: "answers/" ++ packs::store_file(), bytes: store },
           { path: "answers/" ++ packs::index_file(), bytes: index },
         ]),
-      _ -> Err("the new `ply` wrote no pack of the shipped modules' results"),
+      _ -> Err("the new `ply` did not write check results for the standard library modules"),
     }
   }
 }
@@ -347,18 +353,18 @@ fn shipped_results(
     match append_pack(returning, build_pack(target.files, front, [])) {
       Err(reason) -> Err(reason),
       Ok(_) -> {
-        let asked = toolchain.run(cache_relative(returning), ["std", "--answering"]);
-        let kept = if asked.code != 0 { None } else {
+        let results_run = toolchain.run(cache_relative(returning), ["std", "--answering"]);
+        let cached_results = if results_run.code != 0 { None } else {
           Some(
             shipped_results_cache_key(
               keys.shipped,
               keys.linking,
-              Bytes::of_string(String::of_bytes_lossy(asked.out).trim()),
+              Bytes::of_string(String::of_bytes_lossy(results_run.out).trim()),
               identity_of(target.definitions, shipped_results_roots()),
             ),
           )
         };
-        let had = match kept {
+        let had = match cached_results {
           None -> None,
           Some(at) -> match read_if_present(at) {
             Some(bytes) -> decode_shipped_results(bytes),
@@ -369,7 +375,7 @@ fn shipped_results(
           Some(a) -> Ok({ returned: a, taken: true }),
           None -> match build_shipped_results(returning, target.work) {
             Err(reason) -> Err(reason),
-            Ok(files) -> match kept {
+            Ok(files) -> match cached_results {
               None -> Ok({ returned: files, taken: false }),
               Some(at) -> if toolchain.write_file(at, encode_shipped_results(files)) {
                 Ok({ returned: files, taken: false })
@@ -387,11 +393,12 @@ fn install(
   out: String,
   pack: Bytes,
 ) -> Result<Unit, String> / {fs.write[abs], entropy.next, abort.raise} = {
-  let tmp = out ++ "." ++ entropy.next().to_string() ++ ".tmp";
-  if fs.create_dir[abs](strip_root(parent(out))) && fs.copy[abs](strip_root(exe), strip_root(tmp))
-      && fs.append[abs](strip_root(tmp), pack) != None
-      && fs.rename[abs](strip_root(tmp), strip_root(out)) { Ok(()) } else {
-    let _ = fs.remove[abs](strip_root(tmp));
+  let temporary_path = out ++ "." ++ entropy.next().to_string() ++ ".tmp";
+  if fs.create_dir[abs](strip_root(parent(out)))
+      && fs.copy[abs](strip_root(exe), strip_root(temporary_path))
+      && fs.append[abs](strip_root(temporary_path), pack) != None
+      && fs.rename[abs](strip_root(temporary_path), strip_root(out)) { Ok(()) } else {
+    let _ = fs.remove[abs](strip_root(temporary_path));
     Err("the new `ply` could not be written to `" ++ out ++ "`")
   }
 }
@@ -418,7 +425,7 @@ fn precompile_and_install(
       match install(exe, options.out, build_pack(target.files, built.front, a.returned)) {
         Err(reason) -> Err(reason),
         Ok(_) -> {
-          timed(phases, "packed and wrote `ply`", at);
+          timed(phases, "added the standard library files to `ply` and wrote it", at);
           Ok(())
         },
       }
@@ -460,7 +467,7 @@ fn bootstrap_ply(
               tool: tool,
               work: work,
             };
-            timed(phases, "described the runtime", started);
+            timed(phases, "read the runtime library's description", started);
             let at = time.elapsed_ms();
             match on_target(target, ||
                 build::build_program(
@@ -648,7 +655,7 @@ test "a profile is named as the C toolchain's, and any other name is rejected" {
   assert_eq(profile_named("fast"), Err("no C toolchain is named `fast`"))
 }
 
-test "a ply installed below a directory not yet made is written there" {
+test "`install` creates missing parent directories and writes the `ply` binary into them" {
   let ran = fs::on_mem[abs](fs::mem_of([{ path: "work/exe", body: b"code" }]), ||
     handle { install("/work/exe", "/out/stage1/ply", b"pack") } with { entropy.next() -> 7 });
   assert_eq(ran.value, Ok(()));
@@ -656,7 +663,7 @@ test "a ply installed below a directory not yet made is written there" {
   assert_eq(fs::mem_list(ran.tree, "out/stage1"), Some([{ name: "ply", kind: fs::File }]))
 }
 
-test "the shipped modules' key moves with a module's bytes and its name, and not with their order" {
+test "`shipped_key` changes when a shipped module's bytes or name changes or a module is added, but not when the modules are reordered" {
   let files = two_files();
   let key = shipped_key(files);
   assert_eq(shipped_key([files.get(1), files.get(0)]), key);
@@ -665,7 +672,7 @@ test "the shipped modules' key moves with a module's bytes and its name, and not
   assert(shipped_key([files.get(0)]) != key)
 }
 
-test "a link's key moves with the compiler, its level, the library and what is linked after it" {
+test "`linking_key` changes when the compiler, the optimization level, the library or the extra link flags change" {
   let t = { identity: b"cc 1", support_flags: [], level: "-O2", checked: false };
   let key = linking_key(t, b"library", ["-lm"]);
   assert_eq(linking_key(t, b"library", ["-lm"]), key);
@@ -675,7 +682,7 @@ test "a link's key moves with the compiler, its level, the library and what is l
   assert(linking_key(t, b"library", ["-lm", "-ldl"]) != key)
 }
 
-test "a file's digest is of its ranges' digests, however many reads it takes" {
+test "`chunked_digest` of a file hashes the hashes of its chunks, whatever the chunk size, and returns `None` for a missing file" {
   let tree = fs::mem_of([{ path: "lib/a", body: b"0123456789" }]);
   let over = |path: String, step: Int| fs::on_mem[abs](tree, || chunked_digest(path, step)).value;
   assert_eq(
@@ -686,24 +693,31 @@ test "a file's digest is of its ranges' digests, however many reads it takes" {
   assert_eq(over("lib/absent", 4), None)
 }
 
-test "a ply's cached results are stored under how it computes them, and under nothing of its own front end" {
-  let kept = shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering");
-  assert(kept.ends_with(".answers"));
-  assert_eq(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering"), kept);
-  assert(shipped_results_cache_key(b"moved", b"linking", b"returning", b"gathering") != kept);
-  assert(shipped_results_cache_key(b"shipped", b"moved", b"returning", b"gathering") != kept);
-  assert(shipped_results_cache_key(b"shipped", b"linking", b"moved", b"gathering") != kept);
-  assert(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"moved") != kept)
+test "`shipped_results_cache_key` returns a key ending in `.answers`, equal for equal arguments and different when the shipped, linking, returning or gathering argument differs" {
+  let results_key = shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering");
+  assert(results_key.ends_with(".answers"));
+  assert_eq(
+    shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering"),
+    results_key,
+  );
+  assert(
+    shipped_results_cache_key(b"moved", b"linking", b"returning", b"gathering") != results_key,
+  );
+  assert(
+    shipped_results_cache_key(b"shipped", b"moved", b"returning", b"gathering") != results_key,
+  );
+  assert(shipped_results_cache_key(b"shipped", b"linking", b"moved", b"gathering") != results_key);
+  assert(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"moved") != results_key)
 }
 
-test "what was stored of a ply's cached results reads back, and bytes that are not the whole of it read as none" {
+test "`decode_shipped_results` returns the stored results that `encode_shipped_results` produced, and `None` for truncated, extended or too-short bytes" {
   let shipped_results = [
     { path: "answers/store", bytes: b"frames" },
     { path: "answers/index", bytes: b"" },
   ];
-  let kept = encode_shipped_results(shipped_results);
-  assert_eq(decode_shipped_results(kept), Some(shipped_results));
-  assert_eq(decode_shipped_results(kept.slice(0, kept.len() - 1)), None);
-  assert_eq(decode_shipped_results(kept.concat(b"x")), None);
+  let encoded = encode_shipped_results(shipped_results);
+  assert_eq(decode_shipped_results(encoded), Some(shipped_results));
+  assert_eq(decode_shipped_results(encoded.slice(0, encoded.len() - 1)), None);
+  assert_eq(decode_shipped_results(encoded.concat(b"x")), None);
   assert_eq(decode_shipped_results(b"short"), None)
 }

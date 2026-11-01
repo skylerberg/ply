@@ -6,10 +6,11 @@ import compiler.emit.emit_harness (Program, program_of, lowered_root, checked, p
                                    printed_in, build_failures, printed_by_ir)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.typed_ir (reps_of, Representation, AsFloat, AsWord, AsInt, AsSum, AsFlattened,
-                               Var, VarOperand, IntOperand, ZeroOperand, Rvalue, OperandsOnly,
-                               Allocate, Get, Convert, Aggregate, Update, LeafPath, FieldPath,
-                               InlineRecordPath, Inst, Let, Declaration, Assign, If, Case, Match,
-                               Block, Fn, Leaf, is_refcounted, operand_representation)
+                               Variable, VariableOperand, IntOperand, ZeroOperand, Rvalue,
+                               OperandsOnly, Allocate, Get, Convert, Aggregate, Update, LeafPath,
+                               FieldPath, InlineRecordPath, Instruction, Let, Declaration, Assign,
+                               If, Case, Match, Block, Function, Leaf, is_refcounted,
+                               operand_representation)
 import compiler.emit.lower.representation (c_values_of)
 import compiler.emit.lower.base (initial_lowering, represented_as)
 import compiler.emit.typing (unknown_type)
@@ -124,47 +125,48 @@ fn lowered_roots() -> List<Bytes> =
 fn program() -> Program / {abort.raise} =
   match program_of(corpus()) { Ok(p) -> p, Err(reason) -> panic(String::of_bytes_lossy(reason)) }
 
-fn lowered_of(p: Program, name: Bytes) -> Fn / {abort.raise} = {
+fn lowered_of(p: Program, name: Bytes) -> Function / {abort.raise} = {
   let f = lowered_root(p, name);
   f
 }
 
-fn lets(b: Block) -> List<{ var: Var, value: Rvalue }> =
-  b.fold([], |acc: List<{ var: Var, value: Rvalue }>, i: Inst|
+fn lets(b: Block) -> List<{ var: Variable, value: Rvalue }> =
+  b.fold([], |accumulator: List<{ var: Variable, value: Rvalue }>, i: Instruction|
     match i {
-      Let(l) -> acc.push({ var: l.var, value: l.value }),
-      If(x) -> acc.concat(lets(x.then)).concat(lets(x.otherwise)),
+      Let(l) -> accumulator.push({ var: l.var, value: l.value }),
+      If(x) -> accumulator.concat(lets(x.then)).concat(lets(x.otherwise)),
       Case(c) ->
         c.arms.fold(
-          acc,
-          |a: List<{ var: Var, value: Rvalue }>, arm: { when: Int, body: Block }|
+          accumulator,
+          |a: List<{ var: Variable, value: Rvalue }>, arm: { when: Int, body: Block }|
             a.concat(lets(arm.body)),
         ).concat(
           lets(c.rest),
         ),
       Match(m) ->
-        m.arms.fold(acc, |a: List<{ var: Var, value: Rvalue }>, arm: Block|
+        m.arms.fold(accumulator, |a: List<{ var: Variable, value: Rvalue }>, arm: Block|
           a.concat(lets(arm))).concat(
           lets(m.rest),
         ),
-      _ -> acc,
+      _ -> accumulator,
     })
 
-fn vals(f: Fn) -> List<Rvalue> = lets(f.body).map(|l: { var: Var, value: Rvalue }| l.value)
+fn values(f: Function) -> List<Rvalue> =
+  lets(f.body).map(|l: { var: Variable, value: Rvalue }| l.value)
 
-fn param(f: Fn, i: Int) -> Var / {abort.raise} = f.params.get(i)
+fn param(f: Function, i: Int) -> Variable / {abort.raise} = f.params.get(i)
 
 fn floats(names: List<Bytes>) -> Representation =
   AsFlattened(names.map(|n: Bytes| { name: n, representation: AsFloat }))
 
-test "a record or a sum a type variable lays out is lowered as a placeholder its callers' layouts resolve" {
-  let src = Bytes::concat_all([
+test "a record or sum whose layout depends on a type variable is lowered with a placeholder that its callers' concrete layouts fill in" {
+  let source = Bytes::concat_all([
     b"type Sample<a> = { value: Option<a>, record: List<Int>, discards: Int }\n",
     b"type Found<a> = { value: a, record: List<Int>, size: Int }\n",
     b"fn sample<a>(x: a, n: Int) -> Sample<a> = { value: Some(x), record: [n], discards: 0 }\n",
     b"fn direct<a>(x: a, n: Int) -> Found<a> = { let drew = sample(x, n); match drew.value { Some(v) -> { value: v, record: drew.record, size: n }, None -> { value: x, record: [], size: 0 } } }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
       assert_eq(
@@ -177,26 +179,26 @@ test "a record or a sum a type variable lays out is lowered as a placeholder its
   }
 }
 
-test "each leaf read out of a record held in place is read at its own type" {
-  let src = Bytes::concat_all([
+test "each field read from a record stored as separate values is read at the field's own type" {
+  let source = Bytes::concat_all([
     b"type Inner = new { out: List<Int>, at: Int }\n",
     b"type Outer = new { inner: Inner, n: Int }\n",
     b"fn whole(o: Outer) -> Inner = o.inner\n",
     b"fn opened(o: Outer) -> Int = { let { inner: i, n } = o; i.at + n }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
       [b"whole", b"opened"].fold((), |_: Unit, n: Bytes|
         assert_eq(
-          lets(lowered_of(p, n).body).filter(|l: { var: Var, value: Rvalue }|
-            l.var.ty == unknown_type()).map(|l: { var: Var, value: Rvalue }| l.var.id),
+          lets(lowered_of(p, n).body).filter(|l: { var: Variable, value: Rvalue }|
+            l.var.ty == unknown_type()).map(|l: { var: Variable, value: Rvalue }| l.var.id),
           [],
         )),
   }
 }
 
-test "a case of a sum a type variable leaves open is gathered where every layout holds it inline, and boxed where one may not" {
+test "a sum case with a type-variable payload is built inline when every possible layout fits it, and allocated when a layout might not" {
   let many = Bytes::concat_all([
     b"type Many<a> = | M1(a) | M2(a) | M3(a) | M4(a) | M5(a) | M6(a) | M7(a) | M8(a) | M9(a)\n",
     b"fn ninth<a>(x: a) -> Many<a> = M9(x)\n",
@@ -210,59 +212,62 @@ test "a case of a sum a type variable leaves open is gathered where every layout
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let none = lowered_of(p, b"none");
-      assert_eq(vals(none), [Aggregate({ parts: [IntOperand(0)] })]);
-      assert_eq(lets(none.body).map(|l: { var: Var, value: Rvalue }| l.var.representation), [
+      assert_eq(values(none), [Aggregate({ parts: [IntOperand(0)] })]);
+      assert_eq(lets(none.body).map(|l: { var: Variable, value: Rvalue }| l.var.representation), [
         AsWord,
       ]);
       let some = lowered_of(p, b"some");
-      assert_eq(vals(some), [Aggregate({ parts: [IntOperand(1), VarOperand(param(some, 0))] })]);
+      assert_eq(values(some), [
+        Aggregate({ parts: [IntOperand(1), VariableOperand(param(some, 0))] }),
+      ]);
       assert(
-        vals(lowered_of(p, b"ninth")).any(|v: Rvalue| match v { Allocate(_) -> true, _ -> false }),
+        values(lowered_of(p, b"ninth")).any(|v: Rvalue|
+          match v { Allocate(_) -> true, _ -> false }),
         None,
       )
     },
   }
 }
 
-test "a record literal is gathered in its type's order and held as its leaves" {
+test "a record literal builds its fields in the order of its type and is represented as separate field values" {
   let f = lowered_of(program(), b"point");
   let made = lets(f.body);
-  assert_eq(made.map(|l: { var: Var, value: Rvalue }| l.value), [
-    Aggregate({ parts: [VarOperand(param(f, 0)), VarOperand(param(f, 1))] }),
+  assert_eq(made.map(|l: { var: Variable, value: Rvalue }| l.value), [
+    Aggregate({ parts: [VariableOperand(param(f, 0)), VariableOperand(param(f, 1))] }),
   ]);
-  assert_eq(made.map(|l: { var: Var, value: Rvalue }| l.var.representation), [
+  assert_eq(made.map(|l: { var: Variable, value: Rvalue }| l.var.representation), [
     floats([b"x", b"y"]),
   ]);
   assert_eq(f.convention.result, floats([b"x", b"y"]))
 }
 
-test "a field of a record held as its leaves is the leaf it borrows" {
+test "reading a field of a record represented as separate values reads the matching value directly" {
   let f = lowered_of(program(), b"sum");
   let p = param(f, 0);
   assert_eq(p.representation, floats([b"x", b"y"]));
-  assert_eq(vals(f).filter(|v: Rvalue| match v { Get(_) -> true, _ -> false }), [
+  assert_eq(values(f).filter(|v: Rvalue| match v { Get(_) -> true, _ -> false }), [
     Get({ of: p, path: LeafPath(0) }),
     Get({ of: p, path: LeafPath(1) }),
   ])
 }
 
-test "a record wider than a call's registers is held as its box, a field read out of it alone" {
+test "a record wider than the registers of a call is passed as one pointer, and reading a field reads only that field" {
   let f = lowered_of(program(), b"last");
   let w = param(f, 0);
   assert_eq(w.representation, AsWord);
   assert_eq(
-    lets(f.body).map(|l: { var: Var, value: Rvalue }|
+    lets(f.body).map(|l: { var: Variable, value: Rvalue }|
       { representation: l.var.representation, value: l.value }),
     [{ representation: AsFloat, value: Get({ of: w, path: FieldPath({ name: b"e", at: 4 }) }) }],
   )
 }
 
-test "a record held as its leaves lies in place in the box holding it, read out of it as them" {
+test "a record stored as separate values inside a larger record is read directly from the larger record's memory" {
   let p = program();
   let s = lowered_of(p, b"start");
   assert_eq(param(s, 0).representation, AsWord);
   assert_eq(
-    lets(s.body).map(|l: { var: Var, value: Rvalue }|
+    lets(s.body).map(|l: { var: Variable, value: Rvalue }|
       { representation: l.var.representation, value: l.value }).take(
       1,
     ),
@@ -274,54 +279,57 @@ test "a record held as its leaves lies in place in the box holding it, read out 
     ],
   );
   let e = lowered_of(p, b"end_x");
-  assert(vals(e).contains(Get({ of: param(e, 0), path: FieldPath({ name: b"to", at: 3 }) })), None)
+  assert(
+    values(e).contains(Get({ of: param(e, 0), path: FieldPath({ name: b"to", at: 3 }) })),
+    None,
+  )
 }
 
-test "an update gathers what it keeps from its base and what it sets" {
+test "a record update copies the unchanged fields from the original record and uses the new values for the changed fields" {
   let f = lowered_of(program(), b"moved");
   let made = lets(f.body);
   match made.at(0) {
     Some(y) -> {
       assert_eq(y.value, Get({ of: param(f, 0), path: LeafPath(1) }));
-      assert_eq(made.map(|l: { var: Var, value: Rvalue }| l.value).drop(1), [
-        Aggregate({ parts: [VarOperand(param(f, 1)), VarOperand(y.var)] }),
+      assert_eq(made.map(|l: { var: Variable, value: Rvalue }| l.value).drop(1), [
+        Aggregate({ parts: [VariableOperand(param(f, 1)), VariableOperand(y.var)] }),
       ])
     },
     None -> assert(false),
   }
 }
 
-test "a record wider than a call's registers is held as its box, and an update writes over it with nothing gathered" {
+test "a record wider than the registers of a call is passed as a pointer, and an update modifies it directly without building new values" {
   let f = lowered_of(program(), b"relabelled");
   let s = param(f, 0);
   assert_eq(s.representation, AsWord);
   assert_eq(
-    vals(f).filter(|v: Rvalue|
+    values(f).filter(|v: Rvalue|
       match v { Allocate(_) -> true, Convert(_) -> true, Aggregate(_) -> true, _ -> false }),
     [],
   );
-  match vals(f).at(vals(f).len() - 1) { Some(Update(_)) -> (), other -> assert_eq(other, None) }
+  match values(f).at(values(f).len() - 1) { Some(Update(_)) -> (), other -> assert_eq(other, None) }
 }
 
-test "a record copying fields of another of its layout but other fields is made, never written over the other" {
-  let src = Bytes::concat_all([
+test "a record built from another record's fields creates a new value when the types differ, and updates that record when the types match" {
+  let source = Bytes::concat_all([
     b"type P = { a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int }\n",
     b"type V = { p: P, text: String }\n",
     b"type A = { p: P, texts: List<String> }\n",
     b"fn next(v: V, xs: List<String>) -> A = { p: v.p, texts: xs }\n",
     b"fn again(v: V, t: String) -> V = { p: v.p, text: t }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let written = |name: Bytes|
-        vals(lowered_of(p, name)).any(|v: Rvalue| match v { Update(_) -> true, _ -> false });
+        values(lowered_of(p, name)).any(|v: Rvalue| match v { Update(_) -> true, _ -> false });
       assert_eq([written(b"next"), written(b"again")], [false, true])
     },
   }
 }
 
-test "a join of records is a variable of their type held as its leaves, each arm setting it" {
+test "records merged from `if` branches become one variable of the record type, stored as separate values, and each branch assigns it" {
   let f = lowered_of(program(), b"pick");
   match f.body.at(0) {
     Some(Declaration(j)) -> {
@@ -330,9 +338,9 @@ test "a join of records is a variable of their type held as its leaves, each arm
         f.body.at(1),
         Some(
           If({
-            cond: VarOperand(param(f, 0)),
-            then: [Assign({ var: j, arg: VarOperand(param(f, 1)) })],
-            otherwise: [Assign({ var: j, arg: VarOperand(param(f, 2)) })],
+            cond: VariableOperand(param(f, 0)),
+            then: [Assign({ var: j, arg: VariableOperand(param(f, 1)) })],
+            otherwise: [Assign({ var: j, arg: VariableOperand(param(f, 2)) })],
           }),
         ),
       )
@@ -341,86 +349,92 @@ test "a join of records is a variable of their type held as its leaves, each arm
   }
 }
 
-fn joins(b: Block) -> List<Var> =
-  b.fold([], |acc: List<Var>, i: Inst|
+fn joins(b: Block) -> List<Variable> =
+  b.fold([], |accumulator: List<Variable>, i: Instruction|
     match i {
-      Declaration(v) -> acc.push(v),
-      If(x) -> acc.concat(joins(x.then)).concat(joins(x.otherwise)),
-      _ -> acc,
+      Declaration(v) -> accumulator.push(v),
+      If(x) -> accumulator.concat(joins(x.then)).concat(joins(x.otherwise)),
+      _ -> accumulator,
     })
 
-test "a record joined however deep, from a parameter or a literal, and an Option joined with a word, hold as their type" {
+test "records merged from branches (nested, from a parameter or a literal) and an `Option` merged with an integer keep the same representation, with no conversion" {
   let p = program();
   let deep = lowered_of(p, b"deep_pick");
-  assert_eq(joins(deep.body).map(|v: Var| v.representation), [
+  assert_eq(joins(deep.body).map(|v: Variable| v.representation), [
     floats([b"x", b"y"]),
     floats([b"x", b"y"]),
   ]);
-  assert_eq(vals(deep).filter(|v: Rvalue| match v { Convert(_) -> true, _ -> false }), []);
+  assert_eq(values(deep).filter(|v: Rvalue| match v { Convert(_) -> true, _ -> false }), []);
   let reset = lowered_of(p, b"reset");
-  assert_eq(joins(reset.body).map(|v: Var| v.representation), [floats([b"x", b"y"])]);
-  assert_eq(vals(reset).map(|v: Rvalue| match v { Aggregate(_) -> true, _ -> false }), [true]);
+  assert_eq(joins(reset.body).map(|v: Variable| v.representation), [floats([b"x", b"y"])]);
+  assert_eq(values(reset).map(|v: Rvalue| match v { Aggregate(_) -> true, _ -> false }), [true]);
   let opt = lowered_of(p, b"opt_join");
-  assert_eq(joins(opt.body).map(|v: Var| c_values_of(v.representation).len()), [1]);
+  assert_eq(joins(opt.body).map(|v: Variable| c_values_of(v.representation).len()), [1]);
   assert_eq(
-    vals(opt).filter(|v: Rvalue| match v { Convert(_) -> true, Allocate(_) -> true, _ -> false }),
+    values(opt).filter(|v: Rvalue| match v { Convert(_) -> true, Allocate(_) -> true, _ -> false }),
     [],
   )
 }
 
-test "a record holds an Option among its leaves as its words, and a record in place as its leaves" {
+test "a record stores an Option field as a sum value among its separate values, and a nested record as its flattened fields" {
   let p = program();
-  let held = lowered_of(p, b"held");
+  let option_holder = lowered_of(p, b"held");
   assert_eq(
-    lets(held.body).map(|l: { var: Var, value: Rvalue }|
+    lets(option_holder.body).map(|l: { var: Variable, value: Rvalue }|
       { sum: match l.var.representation { AsSum(_) -> true, _ -> false }, value: l.value }),
-    [{ sum: true, value: Get({ of: param(held, 0), path: LeafPath(0) }) }],
+    [{ sum: true, value: Get({ of: param(option_holder, 0), path: LeafPath(0) }) }],
   );
   let o = lowered_of(p, b"inner_a");
   match param(o, 0).representation {
     AsFlattened(ls) -> assert_eq(ls.map(|l: Leaf| l.name), [b"b", b"i.a"]),
     other -> assert_eq(other, AsWord),
   };
-  assert_eq(vals(o).filter(|v: Rvalue| match v { Get(g) -> g.of == param(o, 0), _ -> false }), [
+  assert_eq(values(o).filter(|v: Rvalue| match v { Get(g) -> g.of == param(o, 0), _ -> false }), [
     Get({ of: param(o, 0), path: LeafPath(1) }),
   ])
 }
 
-test "a sum is gathered from its case's place and its arguments, nothing for a case of no words" {
+test "a sum is built from its case number and its arguments, and a case with no arguments is only the case number" {
   let p = program();
   let none = lets(lowered_of(p, b"nothing").body);
-  assert_eq(none.map(|l: { var: Var, value: Rvalue }| l.value), [
+  assert_eq(none.map(|l: { var: Variable, value: Rvalue }| l.value), [
     Aggregate({ parts: [IntOperand(0)] }),
   ]);
   assert_eq(
-    none.map(|l: { var: Var, value: Rvalue }|
+    none.map(|l: { var: Variable, value: Rvalue }|
       match l.var.representation { AsSum(_) -> true, _ -> false }),
     [true],
   );
-  assert_eq(lets(lowered_of(p, b"none_of").body).map(|l: { var: Var, value: Rvalue }| l.value), [
-    Aggregate({ parts: [IntOperand(0)] }),
-  ])
+  assert_eq(
+    lets(lowered_of(p, b"none_of").body).map(|l: { var: Variable, value: Rvalue }| l.value),
+    [Aggregate({ parts: [IntOperand(0)] })],
+  )
 }
 
-test "a sum whose constructors take nothing is held as its one word, gathered from its case's place" {
+test "a sum whose constructors take no arguments is represented as one integer built from its case number" {
   let made = lets(lowered_of(program(), b"least").body);
-  assert_eq(made.map(|l: { var: Var, value: Rvalue }| c_values_of(l.var.representation).len()), [
-    1,
-  ]);
-  assert_eq(made.map(|l: { var: Var, value: Rvalue }| l.value).take(1), [
+  assert_eq(
+    made.map(|l: { var: Variable, value: Rvalue }| c_values_of(l.var.representation).len()),
+    [1],
+  );
+  assert_eq(made.map(|l: { var: Variable, value: Rvalue }| l.value).take(1), [
     Aggregate({ parts: [IntOperand(0)] }),
   ])
 }
 
-test "a declared sum's constructor is gathered from its case's place and its arguments" {
+test "a declared sum's constructor is built from its case number and its arguments" {
   let p = program();
   let circle = lowered_of(p, b"circle");
   let boxed = lowered_of(p, b"boxed");
-  assert_eq(vals(circle), [Aggregate({ parts: [IntOperand(0), VarOperand(param(circle, 0))] })]);
-  assert_eq(vals(boxed), [
-    Aggregate({ parts: [IntOperand(1), VarOperand(param(boxed, 0)), VarOperand(param(boxed, 1))] }),
+  assert_eq(values(circle), [
+    Aggregate({ parts: [IntOperand(0), VariableOperand(param(circle, 0))] }),
   ]);
-  assert_eq(vals(lowered_of(p, b"dot")), [Aggregate({ parts: [IntOperand(2)] })])
+  assert_eq(values(boxed), [
+    Aggregate({
+      parts: [IntOperand(1), VariableOperand(param(boxed, 0)), VariableOperand(param(boxed, 1))],
+    }),
+  ]);
+  assert_eq(values(lowered_of(p, b"dot")), [Aggregate({ parts: [IntOperand(2)] })])
 }
 
 fn unchecked_c(p: Program, name: Bytes) -> Bytes / {abort.raise} = {
@@ -431,7 +445,7 @@ fn unchecked_c(p: Program, name: Bytes) -> Bytes / {abort.raise} = {
   }
 }
 
-test "a record made its word is a box of its words, its floats as their bits" {
+test "a record converted to a single pointer is copied into a new allocation, with float fields stored as their bits" {
   let p = program();
   let has = |text: Bytes|
     [b"wides", b"segments", b"relabelleds"].map(|n: Bytes|
@@ -443,7 +457,7 @@ test "a record made its word is a box of its words, its floats as their bits" {
   assert_eq(has(b"rt_alloc_p("), [false, false, false])
 }
 
-test "a record handed as its word twice in one block is boxed once, the box read again" {
+test "a record converted to a pointer twice in one block is allocated once, and the same pointer is reused" {
   let ty = RecordType([{ name: b"at", ty: int_type() }, { name: b"n", ty: int_type() }]);
   let c = {
     id: 0,
@@ -454,46 +468,48 @@ test "a record handed as its word twice in one block is boxed once, the box read
     ]),
   };
   let once = represented_as(
-    { st: initial_lowering([c]), arg: VarOperand(c) },
+    { st: initial_lowering([c]), arg: VariableOperand(c) },
     AsWord,
     dummy_span(),
   );
-  let again = represented_as({ st: once.st, arg: VarOperand(c) }, AsWord, dummy_span());
+  let again = represented_as({ st: once.st, arg: VariableOperand(c) }, AsWord, dummy_span());
   assert_eq(again.arg, once.arg);
   assert_eq(
-    again.st.insts.filter(|i: Inst|
+    again.st.instructions.filter(|i: Instruction|
       match i { Let(l) -> match l.value { Convert(_) -> true, _ -> false }, _ -> false }).len(
     ),
     1,
   )
 }
 
-test "a record whose layout a type variable leaves open is what only a specialisation makes" {
+test "a record whose layout depends on a type variable is built only in a version of the function compiled for concrete types" {
   let f = lowered_of(program(), b"wrapped");
-  assert_eq(vals(f), [OperandsOnly([{ arg: VarOperand(param(f, 0)), takes: true }])])
+  assert_eq(values(f), [OperandsOnly([{ arg: VariableOperand(param(f, 0)), takes: true }])])
 }
 
-test "a field a type variable lays out is read and updated only by a specialisation, which its callers resolve" {
-  let src = Bytes::concat_all([
+test "a field whose layout depends on a type variable is read and updated only in a version compiled for concrete types, using the layout its callers supply" {
+  let source = Bytes::concat_all([
     b"fn inner_of<a>(r: { inner: a, n: Int }) -> a = r.inner\n",
     b"fn renamed<a>(r: { inner: a, n: Int }, m: Int) -> { inner: a, n: Int } = { ..r, n: m }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let read = lowered_of(p, b"inner_of");
-      assert_eq(vals(read), [OperandsOnly([{ arg: VarOperand(param(read, 0)), takes: false }])]);
+      assert_eq(values(read), [
+        OperandsOnly([{ arg: VariableOperand(param(read, 0)), takes: false }]),
+      ]);
       let update = lowered_of(p, b"renamed");
       assert_eq(
-        vals(update).map(|v: Rvalue| match v { OperandsOnly(_) -> true, _ -> false }).filter(
+        values(update).map(|v: Rvalue| match v { OperandsOnly(_) -> true, _ -> false }).filter(
           |u: Bool| u,
         ),
         [true],
       );
-      assert_eq([read, update].map(|f: Fn| f.links.needs.map(|n: Need| n.reads == Layout)), [
-        [true],
-        [true],
-      ]);
+      assert_eq(
+        [read, update].map(|f: Function| f.links.needs.map(|n: Need| n.reads == Layout)),
+        [[true], [true]],
+      );
       assert_eq(
         [b"inner_of", b"renamed"].map(|n: Bytes|
           match checked(p, n) { Ok(_) -> true, Err(_) -> false }),
@@ -503,22 +519,22 @@ test "a field a type variable lays out is read and updated only by a specialisat
   }
 }
 
-test "an Option's constructor applied is typed where it is written" {
+test "`Some(s)` lowers directly to an Option value built from the case number and the string" {
   match program_of(b"fn some(s: String) -> Option<String> = Some(s)\n") {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      assert_eq(vals(lowered_of(p, b"some")), [
-        Aggregate({ parts: [IntOperand(1), VarOperand(param(lowered_of(p, b"some"), 0))] }),
+      assert_eq(values(lowered_of(p, b"some")), [
+        Aggregate({ parts: [IntOperand(1), VariableOperand(param(lowered_of(p, b"some"), 0))] }),
       ]),
   }
 }
 
-test "every root of the corpus lowers, passes the check and prints" {
+test "every function in the record and sum test programs lowers, type-checks and prints without failures" {
   assert_eq(build_failures(program(), lowered_roots().concat([b"walk", b"origin_x"])), [])
 }
 
-pub fn program_from(src: Bytes) -> Program / {abort.raise} =
-  match program_of(src) { Ok(p) -> p, Err(reason) -> panic(String::of_bytes_lossy(reason)) }
+pub fn program_from(source: Bytes) -> Program / {abort.raise} =
+  match program_of(source) { Ok(p) -> p, Err(reason) -> panic(String::of_bytes_lossy(reason)) }
 
 fn checked_c(p: Program, name: Bytes) -> Bytes / {abort.raise} =
   match checked(p, name) {
@@ -557,12 +573,12 @@ fn nested() -> Program / {abort.raise} =
     ]),
   )
 
-test "a case's record argument is read out of the sum's words where its case lays it" {
+test "a record argument of a sum case is read directly from the sum value, with no cast to memory words" {
   let dx = checked_c(nested(), b"dx");
   assert_eq(dx.index_of(b"(ply_words("), None)
 }
 
-test "a case holding a record wider than the registers holds its box, made only where the record is" {
+test "a sum case with a record wider than the registers of a call stores a pointer to it, allocating only where the record is created" {
   let p = nested();
   let made = [b"line", b"line_of"].map(|n: Bytes| checked_c(p, n));
   assert_eq(
@@ -571,14 +587,14 @@ test "a case holding a record wider than the registers holds its box, made only 
   )
 }
 
-test "a record in place in its holder's box is read where it lies, nothing copied" {
+test "a record stored inline in its containing record is read directly from the container, with no copy or allocation" {
   let p = nested();
   let f = lowered_of(p, b"first_x");
-  assert(vals(f).contains(Get({ of: param(f, 0), path: InlineRecordPath(1) })), None);
+  assert(values(f).contains(Get({ of: param(f, 0), path: InlineRecordPath(1) })), None);
   assert(!allocates(checked_c(p, b"first_x")), None)
 }
 
-test "a value's layout is read off its node's type where the value carries none" {
+test "a value without its own recorded layout takes its layout from the type of its expression" {
   let p = program_from(
     Bytes::concat_all([
       b"type P = { x: Int, y: Int }\n",
@@ -592,7 +608,7 @@ test "a value's layout is read off its node's type where the value carries none"
   assert_eq(roots.map(|n: Bytes| checked_c(p, n) != b""), [true, true, true, true])
 }
 
-test "a record rebuilt from a captured record's fields reads them where they lie" {
+test "a closure that rebuilds a record from a captured record's fields lowers to C that reads those fields directly" {
   let p = program_from(
     Bytes::concat_all([
       b"type Sp = { start: Int, end: Int, gen: Int }\n",
@@ -603,7 +619,7 @@ test "a record rebuilt from a captured record's fields reads them where they lie
   assert(checked_c(p, b"rebuilt") != b"", None)
 }
 
-test "an Option is the words its payload lays out, crossing a call and stored with no object made" {
+test "an Option is represented as the values of its payload, so passing it to a call and storing it allocate no object" {
   let p = program_from(
     Bytes::concat_all([
       b"fn picked(c: Bool, s: String) -> Int = match if c { Some(s) } else { None } { Some(_) -> 1, None -> 0 }\n",
@@ -639,7 +655,7 @@ test "an Option is the words its payload lays out, crossing a call and stored wi
   assert_eq(words(b"either"), [1, 1, 1, 1])
 }
 
-test "a Result is its case's words, its error's record laid inline" {
+test "a `Result` is represented as its case and payload values, with a large error record stored inline and no allocation" {
   let p = program_from(
     Bytes::concat_all([
       b"type Bad = { why: Bytes, a: Int, b: Int, c: Int, d: Int }\n",
@@ -654,7 +670,7 @@ test "a Result is its case's words, its error's record laid inline" {
   assert_eq(c_contains(p, roots, b"ply_alloc"), none)
 }
 
-test "a Result whose error is a small record crosses a call as its constructor and the record's fields" {
+test "a `Result` whose error is a small record is passed to calls as its case and the record's fields, with no allocation" {
   let p = program_from(
     Bytes::concat_all([
       b"type Bad = { why: Bytes }\n",
@@ -668,7 +684,7 @@ test "a Result whose error is a small record crosses a call as its constructor a
   assert_eq(c_contains(p, roots, b"rt_alloc_p"), none)
 }
 
-test "a sum's constructors hold their arguments at the sum's arguments, as their types lay them" {
+test "a sum constructor stores `Int` arguments unboxed and generic arguments as words, based on the concrete type arguments" {
   let p = program_from(
     Bytes::concat_all([
       b"type Q<a, b> = | L(a) | R(b, a) | N\n",
@@ -677,7 +693,7 @@ test "a sum's constructors hold their arguments at the sum's arguments, as their
     ]),
   );
   let gathered = |n: Bytes|
-    vals(lowered_of(p, n)).filter(|v: Rvalue| match v { Aggregate(_) -> true, _ -> false });
+    values(lowered_of(p, n)).filter(|v: Rvalue| match v { Aggregate(_) -> true, _ -> false });
   assert_eq(
     gathered(b"r").map(|v: Rvalue|
       match v { Aggregate(g) -> g.parts.map(operand_representation), _ -> [] }),
@@ -686,7 +702,7 @@ test "a sum's constructors hold their arguments at the sum's arguments, as their
   assert_eq(c_contains(p, [b"l"], b"rt_box_int_p"), [false])
 }
 
-test "a sum a generic root returns at a type its call carries raw crosses as its words, the record's among them" {
+test "a generic function that returns a `Result` holding a record gives the caller that record without converting it to a word array or allocating" {
   let p = program_from(
     Bytes::concat_all([
       b"type Replay = { lines: List<String>, errs: List<String>, code: Int, json: String }\n",
@@ -699,7 +715,7 @@ test "a sum a generic root returns at a type its call carries raw crosses as its
   assert_eq([text.index_of(b"(ply_words("), text.index_of(b"ply_alloc")], [None, None])
 }
 
-test "a record held in place that holds a count, read through a borrow, passes the check" {
+test "reading fields through a borrowed record that contains lists passes the reference-count checker" {
   let p = program_from(
     Bytes::concat_all([
       b"type S = { start: Int, end: Int }\n",
@@ -713,12 +729,12 @@ test "a record held in place that holds a count, read through a borrow, passes t
     ]),
   );
   let roots = [b"arg_len", b"field_len", b"field_at", b"kept"];
-  let faults = roots.fold([], |acc: List<Bytes>, n: Bytes| {
+  let faults = roots.fold([], |accumulator: List<Bytes>, n: Bytes| {
     let f = lowered_root(p, n);
     match checked(p, n) {
-      Ok(_) -> acc,
+      Ok(_) -> accumulator,
       Err(reason) ->
-        acc.push(
+        accumulator.push(
           Bytes::concat_all([
             b"== ",
             n,
@@ -733,15 +749,15 @@ test "a record held in place that holds a count, read through a borrow, passes t
   assert(faults == [], Some(String::of_bytes_lossy(Bytes::join(faults, b"\n"))))
 }
 
-test "a record or a sum of scalars holds no count: nothing lets go of it or of what is read out of it" {
-  let src = Bytes::concat_all([
+test "a record or sum of scalars has no reference count, so no code releases it or the values read from it" {
+  let source = Bytes::concat_all([
     b"type P = { x: Int, y: Int }\n",
     b"effect store { write keep(p: P) -> Unit }\n",
     b"fn summed(p: P) -> Int = p.x + p.y\n",
     b"fn inner(o: Option<P>) -> Int = match o { Some({ x, y }) -> x + y, None -> 0 }\n",
     b"fn kept(start: P) -> Int = handle { store.keep(start) } with { var seen = 0, store.keep(p) -> { seen = p.x + p.y; }, return u -> seen }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       assert_eq(build_failures(p, [b"summed", b"inner", b"kept"]), []);

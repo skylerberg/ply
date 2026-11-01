@@ -1,15 +1,10 @@
-//! What the host boundary says when it rejects a call: each rejection names the operation and what
-//! serves it, and says what would or would not help. Which calls reach these is the CLI suite's
-//! `host_boundary` module, over real host operations.
-
-use ply_core::host::err_withheld;
+use ply_core::host::err_unbound_operation;
 use ply_core::{Span, Symbol, codes};
 
-/// A run that withholds an operation names the handler that serves it, where it serves it, and the
-/// fake a test handles it with.
 #[test]
-fn a_withheld_rejection_names_the_handler_and_where_it_serves() {
-    let d = err_withheld(
+fn an_unbound_handler_error_names_the_effect_and_the_handler_and_says_which_command_the_handler_serves_it_under()
+ {
+    let d = err_unbound_operation(
         Span::DUMMY,
         "std.process.process.out[proc]",
         &Symbol::new("std.process.process"),

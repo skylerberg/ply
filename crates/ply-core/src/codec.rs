@@ -1,14 +1,8 @@
-//! PLV1: plain values as bytes, the one format a compiled value crosses into the runtime and back
-//! in, written and read a part at a time. A value the bytes cannot hold (a task, a channel, a
-//! credential, a scoped value, a function the program wrote) becomes a [`tag::HANDLE`], a position.
-
-use crate::{Fixed, INT_TYPES, IntTy, Symbol};
+use crate::{Fixed, INT_TYPES, IntegerType, Symbol};
 use std::collections::HashMap;
 
-/// What every encoding opens with.
 pub const FORMAT: &[u8; 4] = b"PLV1";
 
-/// The byte each value opens with.
 pub mod tag {
     pub const UNIT: u8 = 0;
     pub const FALSE: u8 = 1;
@@ -25,47 +19,31 @@ pub mod tag {
     pub const CTOR: u8 = 12;
     pub const CHAR: u8 = 13;
     pub const ARRAY: u8 = 14;
-    /// Position `n` of the handles kept beside the bytes.
     pub const HANDLE: u8 = 15;
-    /// A function as `std.value.Fun` describes one: one of [`super::fun`]'s cases follows.
     pub const FUN: u8 = 16;
-    /// The `n`th string, bytes, list, array or map these bytes hold, numbered from 0 in the order
-    /// each opens, again: written where a value is shared.
-    pub const AGAIN: u8 = 17;
+    pub const BACK_REFERENCE: u8 = 17;
 }
 
-/// What follows [`tag::FUN`], `std.value.Fun`'s cases in its order. `NAMED` is followed by the
-/// name; `CONST` by its arity and value; `PROJECT` by its arity and the index of the argument it
-/// returns; `TABLE` by its arity, how many entries, each entry's key and value, and its default.
 pub mod fun {
     pub const NAMED: u8 = 0;
     pub const ANON: u8 = 1;
     pub const CONST: u8 = 2;
     pub const PROJECT: u8 = 3;
     pub const TABLE: u8 = 4;
-    /// A function the program wrote that holds what may not leave the run that made it, as a
-    /// continuation does: read back as a continuation, which the boundary rejects by name.
-    pub const RESUMES: u8 = 5;
+    pub const RESUMPTION: u8 = 5;
 }
 
-/// The position a [`tag::HANDLE`] is written at in a value a diagnostic shows, which keeps nothing
-/// beside its bytes: what the runtime object is, as `std.value.decode_shown` reads it.
 pub mod shown {
-    /// A credential, or any other runtime object but a scoped value.
     pub const SEALED: u64 = 0;
     pub const SCOPED: u64 = 1;
 }
 
-/// Whether a value of `tag` is numbered for [`tag::AGAIN`].
 pub fn shareable(t: u8) -> bool {
     matches!(t, tag::STR | tag::BYTES | tag::LIST | tag::ARRAY | tag::MAP)
 }
 
-/// PLV1 written a part at a time: what compiled code writes a value with through the runtime. Each method writes one whole part; which parts make a value
-/// is the caller's to keep.
 pub struct Writer {
     out: Vec<u8>,
-    // Names repeat in every row of a table, so each is written once and then by number.
     symbols: HashMap<Box<[u8]>, u64>,
 }
 
@@ -76,7 +54,6 @@ impl Default for Writer {
 }
 
 impl Writer {
-    /// Bytes holding nothing yet past [`FORMAT`].
     pub fn new() -> Writer {
         Writer {
             out: FORMAT.to_vec(),
@@ -84,7 +61,6 @@ impl Writer {
         }
     }
 
-    /// A value that is its tag alone: [`tag::UNIT`], [`tag::FALSE`] or [`tag::TRUE`].
     pub fn tag(&mut self, t: u8) {
         self.out.push(t);
     }
@@ -94,13 +70,11 @@ impl Writer {
         self.varint(((n << 1) ^ (n >> 63)) as u64);
     }
 
-    /// A `Float` by its bits, as `float::bits` gives them.
     pub fn float(&mut self, bits: u64) {
         self.out.push(tag::FLOAT);
         self.out.extend_from_slice(&bits.to_le_bytes());
     }
 
-    /// A `Decimal` as `rust_decimal` serializes it.
     pub fn decimal(&mut self, d: [u8; 16]) {
         self.out.push(tag::DECIMAL);
         self.out.extend_from_slice(&d);
@@ -109,20 +83,17 @@ impl Writer {
     pub fn fixed(&mut self, f: Fixed) {
         self.out.push(tag::FIXED);
         self.out.push(width_index(f.ty));
-        // The low word is all a narrower width has; decoding sign-extends it again.
         self.varint(f.bits() as u64);
         if f.ty.bits() == 128 {
             self.varint((f.bits() >> 64) as u64);
         }
     }
 
-    /// A `Char` by its scalar value.
     pub fn char(&mut self, c: u32) {
         self.out.push(tag::CHAR);
         self.varint(u64::from(c));
     }
 
-    /// A `String` by its UTF-8, which a reader checks.
     pub fn str(&mut self, s: &[u8]) {
         self.out.push(tag::STR);
         self.blob(s);
@@ -133,22 +104,17 @@ impl Writer {
         self.blob(b);
     }
 
-    /// The head of a list, array or map of `n` items or of a record of `n` fields: `t`, which is
-    /// one of those four, and `n`. The items follow, a map's as each key then its value and a
-    /// record's as each field's [`Writer::name`] then its value, in name order.
     pub fn count(&mut self, t: u8, n: u64) {
         self.out.push(t);
         self.varint(n);
     }
 
-    /// The head of the constructor `name` given `n` arguments, which follow.
     pub fn ctor(&mut self, name: &[u8], n: u64) {
         self.out.push(tag::CTOR);
         self.name(name);
         self.varint(n);
     }
 
-    /// A record field's name, or a named function's.
     pub fn name(&mut self, name: &[u8]) {
         let next = self.symbols.len() as u64 + 1;
         match self.symbols.get(name) {
@@ -161,19 +127,16 @@ impl Writer {
         }
     }
 
-    /// Position `at` of the handles kept beside the bytes.
     pub fn handle(&mut self, at: u64) {
         self.out.push(tag::HANDLE);
         self.varint(at);
     }
 
-    /// The `n`th shareable value written before, again.
     pub fn again(&mut self, n: u64) {
-        self.out.push(tag::AGAIN);
+        self.out.push(tag::BACK_REFERENCE);
         self.varint(n);
     }
 
-    /// The head of a function: [`tag::FUN`] and which of [`fun`]'s cases, whose parts follow.
     pub fn fun(&mut self, case: u8) {
         self.out.push(tag::FUN);
         self.out.push(case);
@@ -197,9 +160,6 @@ impl Writer {
     }
 }
 
-/// PLV1 read a part at a time, over bytes it borrows or owns: what compiled code reads a value with
-/// through the runtime. Every read returns an error where the bytes end early or do not hold what
-/// it reads.
 pub struct Reader<B> {
     bytes: B,
     at: usize,
@@ -207,7 +167,6 @@ pub struct Reader<B> {
 }
 
 impl<B: AsRef<[u8]>> Reader<B> {
-    /// A reader at the first value of `bytes`, which open with [`FORMAT`].
     pub fn new(bytes: B) -> Result<Reader<B>, String> {
         if !bytes.as_ref().starts_with(FORMAT) {
             return Err("not an encoded value".into());
@@ -219,12 +178,10 @@ impl<B: AsRef<[u8]>> Reader<B> {
         })
     }
 
-    /// Where the next byte is read from.
     pub fn at(&self) -> usize {
         self.at
     }
 
-    /// An error unless every byte has been read.
     pub fn end(&self) -> Result<(), String> {
         let left = self.bytes.as_ref().len() - self.at;
         if left != 0 {
@@ -243,7 +200,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
         Ok(b)
     }
 
-    /// Reads a tag, which must be `t`.
     pub fn expect(&mut self, t: u8) -> Result<(), String> {
         match self.byte()? {
             found if found == t => Ok(()),
@@ -265,7 +221,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
         Err("a number longer than 64 bits".into())
     }
 
-    /// An `Int`'s body, after its tag.
     pub fn int(&mut self) -> Result<i64, String> {
         let z = self.varint()?;
         Ok(((z >> 1) as i64) ^ -((z & 1) as i64))
@@ -281,7 +236,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
         Ok(b.try_into().expect("a slice of N bytes"))
     }
 
-    /// A fixed width's body, after its tag.
     pub fn fixed(&mut self) -> Result<Fixed, String> {
         let ty = *INT_TYPES
             .get(self.byte()? as usize)
@@ -295,7 +249,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
         Ok(Fixed::new(ty, high | low))
     }
 
-    /// A `Char`'s body, after its tag.
     pub fn char(&mut self) -> Result<char, String> {
         u32::try_from(self.varint()?)
             .ok()
@@ -303,7 +256,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
             .ok_or_else(|| "a character that is not a Unicode scalar value".into())
     }
 
-    /// A string's or bytes value's body, after its tag.
     pub fn blob(&mut self) -> Result<&[u8], String> {
         let n = self.count()?;
         let at = self.at;
@@ -311,12 +263,10 @@ impl<B: AsRef<[u8]>> Reader<B> {
         Ok(&self.bytes.as_ref()[at..at + n])
     }
 
-    /// A string's body, after its tag.
     pub fn str(&mut self) -> Result<&str, String> {
         std::str::from_utf8(self.blob()?).map_err(|_| "a string that is not UTF-8".into())
     }
 
-    /// A length no larger than what is left, so a corrupt count cannot ask for a huge allocation.
     pub fn count(&mut self) -> Result<usize, String> {
         let n = self.varint()?;
         if n > (self.bytes.as_ref().len() - self.at) as u64 {
@@ -325,7 +275,6 @@ impl<B: AsRef<[u8]>> Reader<B> {
         Ok(n as usize)
     }
 
-    /// A record field's name, a constructor's or a named function's.
     pub fn symbol(&mut self) -> Result<Symbol, String> {
         match self.varint()? {
             0 => {
@@ -344,7 +293,7 @@ impl<B: AsRef<[u8]>> Reader<B> {
     }
 }
 
-fn width_index(ty: IntTy) -> u8 {
+fn width_index(ty: IntegerType) -> u8 {
     INT_TYPES
         .iter()
         .position(|t| *t == ty)

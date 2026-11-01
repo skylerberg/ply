@@ -13,7 +13,7 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     WithScopeExpression, SimulateExpression, ParallelExpression,
                                     InvalidExpression, HoleExpression, TryBlockExpression, Param,
                                     LetStatement, LetElseStatement, ExpressionStatement,
-                                    AssignmentStatement, HandlerVar, RecordLiteralField,
+                                    AssignmentStatement, HandlerStateVariable, RecordLiteralField,
                                     expression_span, TaggedLiteralExpression, TaggedLiteral, Hole,
                                     TaggedPart, tagged_parts, tagged_part_bin, prelude_module,
                                     prelude_hosts)
@@ -23,9 +23,10 @@ import compiler.check.types (unit_type, TypeTable, InternedType, interned_type_b
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Resolution, qualify,
                                       import_module_name)
 import compiler.check.resolve.scopes (post_order)
-import compiler.store.hash.graph (Index, tagged_target, denotation, DenotesFn, DenotesConstructor,
-                                  DenotesNothing, qualified_effect_name, qualified_type_name)
-import compiler.store.hash.forms (HashOutput, CachedHashes, by_name, reached_functions, Subject,
+import compiler.store.hash.graph (Index, tagged_target, denotation, DenotesFunction,
+                                  DenotesConstructor, DenotesNothing, qualified_effect_name,
+                                  qualified_type_name)
+import compiler.store.hash.forms (HashOutput, CachedHashes, by_name, reachable_functions, Subject,
                                   FunctionNamed, DeclarationNamed, ItemKeyed, hashes_from_cache)
 import compiler.store.hash (UseNode)
 import compiler.store.hash.encoding (hex)
@@ -33,7 +34,7 @@ import compiler.check.typed (TypedBody)
 import compiler.check.infer (CheckOutput, types_joined, measured_definitions, EmitFacts,
                              emit_facts_bin, remap_fact_modules, facts_filtered)
 import compiler.check.infer.checker (Location, DefinitionInfo, TestInfo, LawInfo, EffectInfo,
-                                     OpInfo, ConstructorInfo, CachedFacts, CheckedBody,
+                                     OperationInfo, ConstructorInfo, CachedFacts, CheckedBody,
                                      WitnessOrder, MemberSite, InstanceInfo, NumericInfo,
                                      definition_info_bin, test_info_bin, law_info_bin,
                                      effect_info_bin, constructor_info_bin, instance_info_bin,
@@ -69,10 +70,10 @@ fn outline_of(
 ) -> Outline / {abort.raise} =
   {
     name: parsed.name,
-    items: parsed.module.items.fold([], |acc: List<OutlineItem>, item: Item|
+    items: parsed.module.items.fold([], |accumulator: List<OutlineItem>, item: Item|
       match item {
         FunctionItem(d) ->
-          acc.push(
+          accumulator.push(
             OutlinedFunction({
               name: d.name.name,
               public: is_pub(d.visibility),
@@ -95,12 +96,13 @@ fn outline_of(
             }),
           ),
         TestItem(d) ->
-          acc.push(
+          accumulator.push(
             OutlinedTest({ name: d.name, label_span: d.label_span, cases: d.cases != None }),
           ),
-        LawItem(d) -> acc.push(OutlinedLaw({ name: d.name, literals: claim_literals(modules, d) })),
+        LawItem(d) ->
+          accumulator.push(OutlinedLaw({ name: d.name, literals: claim_literals(modules, d) })),
         TypeItem(d) ->
-          acc.push(
+          accumulator.push(
             OutlinedType({
               name: d.name.name,
               public: is_pub(d.visibility),
@@ -109,7 +111,7 @@ fn outline_of(
             }),
           ),
         EffectItem(d) ->
-          acc.push(
+          accumulator.push(
             OutlinedEffect({
               name: d.name.name,
               public: is_pub(d.visibility),
@@ -117,17 +119,20 @@ fn outline_of(
               span: d.name.span,
             }),
           ),
-        _ -> acc,
+        _ -> accumulator,
       }),
     declared: module_items(parsed),
     imports: imported_names(parsed.module.imports.filter(is_explicit_import)),
     schemas: schemas_declared(parsed),
     sets: sets,
     cuts: cuts,
-    stated: parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
-      match target_type(item) { Some(t) -> acc.push(qualify(parsed.name, t.name)), None -> acc }),
-    set_texts: parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
-      match item { EffectSetItem(_) -> acc.push(dump_item(item)), _ -> acc }),
+    stated: parsed.module.items.fold([], |accumulator: List<Bytes>, item: Item|
+      match target_type(item) {
+        Some(t) -> accumulator.push(qualify(parsed.name, t.name)),
+        None -> accumulator,
+      }),
+    set_texts: parsed.module.items.fold([], |accumulator: List<Bytes>, item: Item|
+      match item { EffectSetItem(_) -> accumulator.push(dump_item(item)), _ -> accumulator }),
     derived: parsed.derived.map(derivation_of),
   }
 
@@ -151,13 +156,13 @@ pub fn outlines_of(w: Analysis) -> List<Outline> / {abort.raise} =
   })
 
 pub fn effect_visibility(outlines: List<Outline>) -> Map<Bytes, Bool> =
-  outlines.fold(Map::new(), |acc: Map<Bytes, Bool>, o: Outline|
-    o.items.fold(acc, |a: Map<Bytes, Bool>, item: OutlineItem|
+  outlines.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: Outline|
+    o.items.fold(accumulator, |a: Map<Bytes, Bool>, item: OutlineItem|
       match item { OutlinedEffect(e) -> a.insert(qualify(o.name, e.name), e.public), _ -> a }))
 
 pub fn effect_hosts(outlines: List<Outline>) -> Map<Bytes, Bytes> =
-  outlines.fold(Map::new(), |acc: Map<Bytes, Bytes>, o: Outline| {
-    let declared = o.items.fold(acc, |a: Map<Bytes, Bytes>, item: OutlineItem|
+  outlines.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, o: Outline| {
+    let declared = o.items.fold(accumulator, |a: Map<Bytes, Bytes>, item: OutlineItem|
       match item {
         OutlinedEffect(e) -> match e.host {
           Some(by) -> a.insert(qualify(o.name, e.name), qualify(o.name, by)),
@@ -180,9 +185,9 @@ pub fn effect_public_of(m: Map<Bytes, Bool>, effect_info: EffectInfo) -> Bool =
   match m.get(effect_info.name) { Some(b) -> b, None -> true }
 
 pub fn type_rows(outlines: List<Outline>) -> List<TypeRow> / {abort.raise} =
-  range(0, outlines.len()).fold([], |acc: List<TypeRow>, i: Int| {
+  range(0, outlines.len()).fold([], |accumulator: List<TypeRow>, i: Int| {
     let o = outlines.get(i);
-    o.items.fold(acc, |a: List<TypeRow>, item: OutlineItem|
+    o.items.fold(accumulator, |a: List<TypeRow>, item: OutlineItem|
       match item {
         OutlinedType(t) ->
           a.push({
@@ -198,48 +203,51 @@ pub fn type_rows(outlines: List<Outline>) -> List<TypeRow> / {abort.raise} =
   })
 
 pub fn test_label_spans(outlines: List<Outline>) -> List<Location> / {abort.raise} =
-  range(0, outlines.len()).fold([], |acc: List<Location>, i: Int|
-    outlines.get(i).items.fold(acc, |a: List<Location>, item: OutlineItem|
+  range(0, outlines.len()).fold([], |accumulator: List<Location>, i: Int|
+    outlines.get(i).items.fold(accumulator, |a: List<Location>, item: OutlineItem|
       match item { OutlinedTest(t) -> a.push({ module: i, span: t.label_span }), _ -> a }))
 
 fn int_literal(k: Int) -> Bytes = b"int ".concat(ascii_of_int(k))
 
-fn literal_text(acc: List<Bytes>, literal: SourceLiteral) -> List<Bytes> / {abort.raise} =
+fn literal_text(accumulator: List<Bytes>, literal: SourceLiteral) -> List<Bytes> / {abort.raise} =
   match literal {
-    LiteralInt(k) -> acc.push_unique(int_literal(k)),
-    LiteralString(s) -> acc.push_unique(b"str ".concat(s)),
-    LiteralBytes(b) -> acc.push_unique(b"bytes ".concat(hex(b))),
-    _ -> acc,
+    LiteralInt(k) -> accumulator.push_unique(int_literal(k)),
+    LiteralString(s) -> accumulator.push_unique(b"str ".concat(s)),
+    LiteralBytes(b) -> accumulator.push_unique(b"bytes ".concat(hex(b))),
+    _ -> accumulator,
   }
 
-fn neg_literal(acc: List<Bytes>, expression: Expression) -> List<Bytes> =
+fn neg_literal(accumulator: List<Bytes>, expression: Expression) -> List<Bytes> =
   match expression {
     LiteralExpression(v) -> match v.literal {
-      LiteralInt(k) -> acc.push_unique(int_literal(0 - k)),
-      _ -> acc,
+      LiteralInt(k) -> accumulator.push_unique(int_literal(0 - k)),
+      _ -> accumulator,
     },
-    _ -> acc,
+    _ -> accumulator,
   }
 
-fn lits(acc: List<Bytes>, expression: Expression) -> List<Bytes> / {abort.raise} = {
+fn lits(accumulator: List<Bytes>, expression: Expression) -> List<Bytes> / {abort.raise} = {
   let backwards = |a: List<Bytes>, xs: List<Expression>|
     range(0, xs.len()).fold(a, |b: List<Bytes>, k: Int|
       match xs.at(xs.len() - 1 - k) { Some(x) -> lits(b, x), None -> b });
   match expression {
-    LiteralExpression(v) -> literal_text(acc, v.literal),
-    NameExpression(_) -> acc,
-    TaggedLiteralExpression(v) -> backwards(acc, v.holes.map(|h: Hole| h.value)),
-    HoleExpression(_) -> acc,
-    InvalidExpression(_) -> acc,
-    BinaryExpression(v) -> lits(lits(acc, v.rhs), v.lhs),
+    LiteralExpression(v) -> literal_text(accumulator, v.literal),
+    NameExpression(_) -> accumulator,
+    TaggedLiteralExpression(v) -> backwards(accumulator, v.holes.map(|h: Hole| h.value)),
+    HoleExpression(_) -> accumulator,
+    InvalidExpression(_) -> accumulator,
+    BinaryExpression(v) -> lits(lits(accumulator, v.right_operand), v.left_operand),
     UnaryExpression(v) ->
-      lits(if v.op == b"neg" { neg_literal(acc, v.operand) } else { acc }, v.operand),
-    LambdaExpression(v) -> lits(acc, v.body),
-    CallExpression(v) -> lits(backwards(acc, v.args), v.function),
-    IfExpression(v) -> lits(lits(lits(acc, v.else_branch), v.then_branch), v.cond),
+      lits(
+        if v.operation == b"neg" { neg_literal(accumulator, v.operand) } else { accumulator },
+        v.operand,
+      ),
+    LambdaExpression(v) -> lits(accumulator, v.body),
+    CallExpression(v) -> lits(backwards(accumulator, v.args), v.function),
+    IfExpression(v) -> lits(lits(lits(accumulator, v.else_branch), v.then_branch), v.cond),
     MatchExpression(v) -> {
       let n = v.arms.len();
-      let armed = range(0, n).fold(acc, |a: List<Bytes>, k: Int|
+      let armed = range(0, n).fold(accumulator, |a: List<Bytes>, k: Int|
         match v.arms.at(n - 1 - k) {
           Some(arm) -> match arm.guard {
             Some(g) -> lits(lits(a, arm.body), g),
@@ -250,7 +258,7 @@ fn lits(acc: List<Bytes>, expression: Expression) -> List<Bytes> / {abort.raise}
       lits(armed, v.scrutinee)
     },
     BlockExpression(v) -> {
-      let tailed = match v.tail { Some(t) -> lits(acc, t), None -> acc };
+      let tailed = match v.tail { Some(t) -> lits(accumulator, t), None -> accumulator };
       let n = v.statements.len();
       range(0, n).fold(tailed, |a: List<Bytes>, k: Int|
         match v.statements.at(n - 1 - k) {
@@ -261,44 +269,49 @@ fn lits(acc: List<Bytes>, expression: Expression) -> List<Bytes> / {abort.raise}
           None -> a,
         })
     },
-    RecordExpression(v) -> backwards(acc, v.fields.map(|field: RecordLiteralField| field.value)),
+    RecordExpression(v) ->
+      backwards(accumulator, v.fields.map(|field: RecordLiteralField| field.value)),
     RecordUpdateExpression(v) ->
-      lits(backwards(acc, v.fields.map(|field: RecordLiteralField| field.value)), v.base),
-    FieldExpression(v) -> lits(acc, v.base),
-    PropagateExpression(v) -> lits(acc, v.operand),
-    ListExpression(v) -> backwards(acc, v.items),
-    PerformExpression(v) -> backwards(acc, v.args),
-    HandleExpression(v) -> backwards(lits(acc, v.body), v.vars.map(|x: HandlerVar| x.init)),
-    WithScopeExpression(v) -> lits(lits(lits(acc, v.body), v.release), v.acquire),
-    SimulateExpression(v) -> lits(acc, v.body),
-    ParallelExpression(v) -> backwards(acc, v.branches),
-    TryBlockExpression(v) -> lits(acc, v.body),
+      lits(backwards(accumulator, v.fields.map(|field: RecordLiteralField| field.value)), v.base),
+    FieldExpression(v) -> lits(accumulator, v.base),
+    PropagateExpression(v) -> lits(accumulator, v.operand),
+    ListExpression(v) -> backwards(accumulator, v.items),
+    PerformExpression(v) -> backwards(accumulator, v.args),
+    HandleExpression(v) ->
+      backwards(
+        lits(accumulator, v.body),
+        v.handler_variables.map(|x: HandlerStateVariable| x.init),
+      ),
+    WithScopeExpression(v) -> lits(lits(lits(accumulator, v.body), v.release), v.acquire),
+    SimulateExpression(v) -> lits(accumulator, v.body),
+    ParallelExpression(v) -> backwards(accumulator, v.branches),
+    TryBlockExpression(v) -> lits(accumulator, v.body),
   }
 }
 
 pub fn literals_of(written: List<Expression>) -> List<Bytes> / {abort.raise} =
-  written.fold([], |acc: List<Bytes>, expression: Expression| lits(acc, expression))
+  written.fold([], |accumulator: List<Bytes>, expression: Expression| lits(accumulator, expression))
 
 pub fn schema_definitions(modules: List<ParsedModule>) -> Map<Bytes, Bool> =
-  modules.fold(Map::new(), |acc: Map<Bytes, Bool>, parsed: ParsedModule|
-    schemas_declared(parsed).fold(acc, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)))
+  modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, parsed: ParsedModule|
+    schemas_declared(parsed).fold(accumulator, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)))
 
 fn schemas_declared(parsed: ParsedModule) -> List<Bytes> =
-  parsed.module.items.fold([], |acc: List<Bytes>, item: Item|
+  parsed.module.items.fold([], |accumulator: List<Bytes>, item: Item|
     match item {
       SchemaItem(d) -> {
-        let named = acc.push(qualify(parsed.name, d.name.name));
+        let named = accumulator.push(qualify(parsed.name, d.name.name));
         match d.guard {
           Some(_) -> named.push(qualify(parsed.name, schema_guard_name(d.name.name))),
           None -> named,
         }
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 
 pub fn schemas_instantiated(modules: List<ParsedModule>) -> Map<Bytes, Bytes> =
-  modules.fold(Map::new(), |acc: Map<Bytes, Bytes>, parsed: ParsedModule|
-    parsed.module.items.fold(acc, |a: Map<Bytes, Bytes>, item: Item|
+  modules.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, parsed: ParsedModule|
+    parsed.module.items.fold(accumulator, |a: Map<Bytes, Bytes>, item: Item|
       match item {
         LawItem(d) -> match d.of {
           Some(of) -> match of.module {
@@ -359,7 +372,7 @@ fn farthest_end() -> Int = 1000000000000
 fn int_of(e: Expression) -> Option<Int> =
   match e {
     LiteralExpression(v) -> match v.literal { LiteralInt(k) -> Some(k), _ -> None },
-    UnaryExpression(v) -> if v.op != b"neg" { None } else {
+    UnaryExpression(v) -> if v.operation != b"neg" { None } else {
       match v.operand {
         LiteralExpression(x) -> match x.literal { LiteralInt(k) -> Some(0 - k), _ -> None },
         _ -> None,
@@ -374,48 +387,55 @@ fn bare_name(e: Expression) -> Option<Bytes> =
     _ -> None,
   }
 
-fn end_of(acc: List<Limit>, name: Bytes, op: Bytes, k: Int) -> List<Limit> =
-  if k > farthest_end() || k < 0 - farthest_end() { acc }
-  else if op == b"gt" { acc.push({ name: name, lower: true, at: k + 1 }) }
-  else if op == b"ge" { acc.push({ name: name, lower: true, at: k }) }
-  else if op == b"lt" { acc.push({ name: name, lower: false, at: k - 1 }) }
-  else if op == b"le" { acc.push({ name: name, lower: false, at: k }) } else if op == b"eq" {
-    acc.push({ name: name, lower: true, at: k }).push({ name: name, lower: false, at: k })
-  } else { acc }
+fn end_of(accumulator: List<Limit>, name: Bytes, comparison: Bytes, k: Int) -> List<Limit> =
+  if k > farthest_end() || k < 0 - farthest_end() { accumulator }
+  else if comparison == b"gt" { accumulator.push({ name: name, lower: true, at: k + 1 }) }
+  else if comparison == b"ge" { accumulator.push({ name: name, lower: true, at: k }) }
+  else if comparison == b"lt" { accumulator.push({ name: name, lower: false, at: k - 1 }) }
+  else if comparison == b"le" { accumulator.push({ name: name, lower: false, at: k }) }
+  else if comparison == b"eq" {
+    accumulator.push({ name: name, lower: true, at: k }).push({ name: name, lower: false, at: k })
+  } else { accumulator }
 
-fn flipped_comparison(op: Bytes) -> Bytes =
-  if op == b"gt" { b"lt" }
-  else if op == b"ge" { b"le" }
-  else if op == b"lt" { b"gt" }
-  else if op == b"le" { b"ge" }
-  else { op }
+fn flipped_comparison(comparison: Bytes) -> Bytes =
+  if comparison == b"gt" { b"lt" }
+  else if comparison == b"ge" { b"le" }
+  else if comparison == b"lt" { b"gt" }
+  else if comparison == b"le" { b"ge" }
+  else { comparison }
 
-fn add_limits(acc: List<Limit>, guard: Expression) -> List<Limit> =
+fn add_limits(accumulator: List<Limit>, guard: Expression) -> List<Limit> =
   match guard {
-    BinaryExpression(v) -> if v.op == b"and" { add_limits(add_limits(acc, v.lhs), v.rhs) } else {
-      match bare_name(v.lhs) {
-        Some(name) -> match int_of(v.rhs) { Some(k) -> end_of(acc, name, v.op, k), None -> acc },
-        None -> match bare_name(v.rhs) {
-          Some(name) -> match int_of(v.lhs) {
-            Some(k) -> end_of(acc, name, flipped_comparison(v.op), k),
-            None -> acc,
+    BinaryExpression(v) -> if v.operation == b"and" {
+      add_limits(add_limits(accumulator, v.left_operand), v.right_operand)
+    } else {
+      match bare_name(v.left_operand) {
+        Some(name) -> match int_of(v.right_operand) {
+          Some(k) -> end_of(accumulator, name, v.operation, k),
+          None -> accumulator,
+        },
+        None -> match bare_name(v.right_operand) {
+          Some(name) -> match int_of(v.left_operand) {
+            Some(k) -> end_of(accumulator, name, flipped_comparison(v.operation), k),
+            None -> accumulator,
           },
-          None -> acc,
+          None -> accumulator,
         },
       }
     },
-    _ -> acc,
+    _ -> accumulator,
   }
 
 pub fn bounds_of(guards: List<Expression>) -> List<Bounded> = {
   let ends = guards.fold([], add_limits);
-  ends.fold([], |acc: List<Bounded>, e: Limit|
-    if acc.fold(false, |seen: Bool, b: Bounded| seen || b.name == e.name) { acc } else {
+  ends.fold([], |accumulator: List<Bounded>, e: Limit|
+    if accumulator.fold(false, |seen: Bool, b: Bounded| seen || b.name == e.name) { accumulator }
+    else {
       let own = ends.filter(|x: Limit| x.name == e.name);
       let lows = own.filter(|x: Limit| x.lower);
       let highs = own.filter(|x: Limit| !x.lower);
-      if lows.len() == 0 || highs.len() == 0 { acc } else {
-        acc.push({
+      if lows.len() == 0 || highs.len() == 0 { accumulator } else {
+        accumulator.push({
           name: e.name,
           low: lows.fold(0 - farthest_end() - 1, |m: Int, x: Limit| max(m, x.at)),
           high: highs.fold(farthest_end() + 1, |m: Int, x: Limit| min(m, x.at)),
@@ -425,8 +445,8 @@ pub fn bounds_of(guards: List<Expression>) -> List<Bounded> = {
 }
 
 pub fn law_literals(outlines: List<Outline>) -> List<List<Bytes>> =
-  outlines.fold([], |acc: List<List<Bytes>>, o: Outline|
-    o.items.fold(acc, |a: List<List<Bytes>>, item: OutlineItem|
+  outlines.fold([], |accumulator: List<List<Bytes>>, o: Outline|
+    o.items.fold(accumulator, |a: List<List<Bytes>>, item: OutlineItem|
       match item { OutlinedLaw(l) -> a.push(l.literals), _ -> a }))
 
 pub type ModuleShape = {
@@ -501,7 +521,7 @@ pub fn encode_tables(t: ModuleTables) -> Bytes / {abort.raise} = {
 
 pub fn decode_tables(b: Bytes) -> ModuleTables / {abort.raise} =
   match bin::decode(b, encoded_tables_bin()) {
-    Err(e) -> panic("a module's tables do not read back: " ++ e.message),
+    Err(e) -> panic("cannot decode the stored facts about a module: " ++ e.message),
     Ok(k) -> {
       let types = types_of(k.types);
       {
@@ -549,7 +569,12 @@ fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> M
     tests: t.tests.map(|x: TestInfo| { ..x, at: at(x.at), index: x.index + tests }),
     laws: t.laws.map(|l: LawInfo| { ..l, at: at(l.at), index: l.index + laws }),
     effects: t.effects.map(|x: EffectInfo|
-      { ..x, at: at(x.at), operations: x.operations.map(|op: OpInfo| { ..op, at: at(op.at) }) }),
+      {
+        ..x,
+        at: at(x.at),
+        operations: x.operations.map(|operation: OperationInfo|
+          { ..operation, at: at(operation.at) }),
+      }),
     constructors: t.constructors.map(|c: ConstructorInfo| { ..c, at: at(c.at) }),
     instances: t.instances.map(|x: InstanceInfo| { ..x, at: at(x.at) }),
     numeric: t.numeric.map(|x: NumericInfo| { ..x, at: at(x.at) }),
@@ -616,28 +641,28 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
 }
 
 pub fn named_imports(parsed: ParsedModule, targets: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  range(0, parsed.module.imports.len()).fold([], |acc: List<Bytes>, k: Int|
+  range(0, parsed.module.imports.len()).fold([], |accumulator: List<Bytes>, k: Int|
     match parsed.module.imports.get(k).kind {
       SelectedNames(names) -> match targets.at(k) {
         Some(module) ->
-          names.fold(acc, |a: List<Bytes>, n: Identifier| a.push(qualify(module, n.name))),
-        None -> acc,
+          names.fold(accumulator, |a: List<Bytes>, n: Identifier| a.push(qualify(module, n.name))),
+        None -> accumulator,
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 
 fn first_index(xs: List<Int>) -> Int = match xs { [x, ..] -> x, [] -> 0 }
 
-fn reached_shipped_functions(
+fn reachable_shipped_functions(
   shapes: List<ModuleShape>,
   hashes: HashOutput,
   shipped: Map<Bytes, Bool>,
 ) -> Map<Bytes, Bool> / {abort.raise} = {
-  let roots = shapes.fold([], |acc: List<Subject>, s: ModuleShape| {
+  let roots = shapes.fold([], |accumulator: List<Subject>, s: ModuleShape| {
     let o = s.outline;
     if shipped.contains(o.name) {
       o.items.fold(
-        acc.concat(o.stated.map(|t: Bytes| DeclarationNamed(t))),
+        accumulator.concat(o.stated.map(|t: Bytes| DeclarationNamed(t))),
         |a: List<Subject>, item: OutlineItem|
           match item {
             OutlinedType(x) -> a.push(DeclarationNamed(qualify(o.name, x.name))),
@@ -646,7 +671,7 @@ fn reached_shipped_functions(
           },
       )
     } else {
-      let own = o.items.fold(acc, |a: List<Subject>, item: OutlineItem|
+      let own = o.items.fold(accumulator, |a: List<Subject>, item: OutlineItem|
         match item {
           OutlinedFunction(x) -> a.push(FunctionNamed(qualify(o.name, x.name))),
           OutlinedType(x) -> a.push(DeclarationNamed(qualify(o.name, x.name))),
@@ -658,39 +683,39 @@ fn reached_shipped_functions(
         if hashes.refs.declared.contains(n) { a } else { a.push(FunctionNamed(n)) })
     }
   });
-  reached_functions(hashes, roots)
+  reachable_functions(hashes, roots)
 }
 
-fn survives_cut(o: Outline, reached: Map<Bytes, Bool>, item: OutlineItem) -> Bool =
+fn survives_cut(o: Outline, reachable: Map<Bytes, Bool>, item: OutlineItem) -> Bool =
   match item {
-    OutlinedFunction(x) -> reached.contains(qualify(o.name, x.name)),
+    OutlinedFunction(x) -> reachable.contains(qualify(o.name, x.name)),
     OutlinedTest(_) -> false,
     OutlinedLaw(_) -> false,
     _ -> true,
   }
 
-fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
+fn cut_shape(s: ModuleShape, reachable: Map<Bytes, Bool>) -> ModuleShape = {
   let o = s.outline;
-  let gone = o.items.fold(Map::new(), |acc: Map<Bytes, Int>, item: OutlineItem|
+  let gone = o.items.fold(Map::new(), |accumulator: Map<Bytes, Int>, item: OutlineItem|
     match item {
-      OutlinedFunction(x) -> if survives_cut(o, reached, item) { acc } else {
+      OutlinedFunction(x) -> if survives_cut(o, reachable, item) { accumulator } else {
         let name = qualify(o.name, x.name);
-        acc.insert(name, match acc.get(name) { Some(n) -> n + 1, None -> 1 })
+        accumulator.insert(name, match accumulator.get(name) { Some(n) -> n + 1, None -> 1 })
       },
-      _ -> acc,
+      _ -> accumulator,
     });
   {
     ..s,
     outline: {
       ..o,
-      items: o.items.filter(|item: OutlineItem| survives_cut(o, reached, item)),
+      items: o.items.filter(|item: OutlineItem| survives_cut(o, reachable, item)),
       declared: o.declared.fold(
         { left: gone, names: [] },
-        |acc: { left: Map<Bytes, Int>, names: List<Bytes> }, n: Bytes|
-          match acc.left.get(n) {
-            Some(k) -> if k > 0 { { ..acc, left: acc.left.insert(n, k - 1) } }
-            else { { ..acc, names: acc.names.push(n) } },
-            None -> { ..acc, names: acc.names.push(n) },
+        |accumulator: { left: Map<Bytes, Int>, names: List<Bytes> }, n: Bytes|
+          match accumulator.left.get(n) {
+            Some(k) -> if k > 0 { { ..accumulator, left: accumulator.left.insert(n, k - 1) } }
+            else { { ..accumulator, names: accumulator.names.push(n) } },
+            None -> { ..accumulator, names: accumulator.names.push(n) },
           },
       ).names,
       cuts: o.cuts.filter(|c: Cut| c.braced && !gone.contains(c.name)),
@@ -701,25 +726,25 @@ fn cut_shape(s: ModuleShape, reached: Map<Bytes, Bool>) -> ModuleShape = {
 fn cut_tables(
   t: ModuleTables,
   o: Outline,
-  reached: Map<Bytes, Bool>,
+  reachable: Map<Bytes, Bool>,
 ) -> ModuleTables / {abort.raise} = {
   {
     ..t,
-    definitions: t.definitions.filter(|d: DefinitionInfo| reached.contains(d.name)),
+    definitions: t.definitions.filter(|d: DefinitionInfo| reachable.contains(d.name)),
     tests: [],
     laws: [],
     facts: {
-      ..facts_filtered(t.facts, |module: Int, owner: Bytes| reached.contains(owner)),
-      pure: t.facts.pure.filter(|n: Bytes| reached.contains(n)),
-      orders: t.facts.orders.filter(|x: WitnessOrder| reached.contains(qualify(o.name, x.name))),
+      ..facts_filtered(t.facts, |module: Int, owner: Bytes| reachable.contains(owner)),
+      pure: t.facts.pure.filter(|n: Bytes| reachable.contains(n)),
+      orders: t.facts.orders.filter(|x: WitnessOrder| reachable.contains(qualify(o.name, x.name))),
     },
-    cached: t.cached.filter(|k: CachedFacts| reached.contains(k.name)),
+    cached: t.cached.filter(|k: CachedFacts| reachable.contains(k.name)),
   }
 }
 
 fn test_and_law_owners(outlines: List<Outline>) -> Map<Bytes, Bool> / {abort.raise} =
-  outlines.fold(Map::new(), |acc: Map<Bytes, Bool>, o: Outline|
-    o.items.fold(acc, |m: Map<Bytes, Bool>, item: OutlineItem|
+  outlines.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: Outline|
+    o.items.fold(accumulator, |m: Map<Bytes, Bool>, item: OutlineItem|
       match item {
         OutlinedTest(t) -> m.insert(test_owner(o.name, t.name), true),
         OutlinedLaw(l) -> m.insert(law_owner(o.name, l.name), true),
@@ -733,19 +758,20 @@ fn in_check_order<a>(
   first: (a) -> Bool / {abort.raise},
 ) -> List<a> / {abort.raise} =
   placed.fold(
-    checked.fold([], |acc: List<a>, t: ModuleTables| acc.concat(pick(t).filter(first))),
-    |acc: List<a>, t: ModuleTables| acc.concat(pick(t).filter(|x: a| !first(x))),
+    checked.fold([], |accumulator: List<a>, t: ModuleTables|
+      accumulator.concat(pick(t).filter(first))),
+    |accumulator: List<a>, t: ModuleTables| accumulator.concat(pick(t).filter(|x: a| !first(x))),
   )
 
-fn fn_spans_of(o: Outline) -> List<Span> =
-  o.items.fold([], |acc: List<Span>, item: OutlineItem|
-    match item { OutlinedFunction(x) -> acc.push(x.span), _ -> acc })
+fn function_spans_of(o: Outline) -> List<Span> =
+  o.items.fold([], |accumulator: List<Span>, item: OutlineItem|
+    match item { OutlinedFunction(x) -> accumulator.push(x.span), _ -> accumulator })
 
 fn within_any(spans: List<Span>, span: Span) -> Bool =
   spans.fold(false, |b: Bool, at: Span| b || (span.start >= at.start && span.end <= at.end))
 
 fn untested_shape(s: ModuleShape) -> ModuleShape = {
-  let spans = fn_spans_of(s.outline);
+  let spans = function_spans_of(s.outline);
   {
     ..s,
     outline: {
@@ -780,10 +806,10 @@ fn views_read(
   let declarations = by_name(hashes.declarations);
   let hash_of = |table: Map<Bytes, Bytes>, name: Bytes|
     match table.get(name) { Some(hash) -> hash, None -> b"" };
-  shapes.fold([], |acc: List<ShippedModuleSummary>, s: ModuleShape| {
+  shapes.fold([], |accumulator: List<ShippedModuleSummary>, s: ModuleShape| {
     let o = s.outline;
     match texts.get(o.name) {
-      None -> acc,
+      None -> accumulator,
       Some(text) -> {
         let declared = o.items.fold([], |a: List<Bytes>, item: OutlineItem| {
           let line = |name: Bytes|
@@ -800,7 +826,7 @@ fn views_read(
         let shape = declared.concat(s.imports.map(|m: Bytes| b"imports ".concat(m))).concat(
           o.set_texts.map(|t: Bytes| b"set ".concat(t)),
         );
-        acc.push({
+        accumulator.push({
           module: o.name,
           text: hex(blake3(text)),
           form: hex(blake3(Bytes::join(shape, b"\n"))),
@@ -843,11 +869,11 @@ pub type Frame = {
 
 pub type CheckedProgram = { frame: Frame, checked: CheckOutput }
 
-pub type TableReads = { reads: List<TablesRead>, reached: Map<Bytes, Bool> }
+pub type TableReads = { reads: List<TablesRead>, reachable: Map<Bytes, Bool> }
 
 pub type TablesRead = { outline: Outline, untested: Bool, trimmed: Bool }
 
-pub fn no_reads() -> TableReads = { reads: [], reached: Map::new() }
+pub fn no_reads() -> TableReads = { reads: [], reachable: Map::new() }
 
 pub fn functions_of(frame: Frame) -> Int =
   frame.outlines.fold(0, |n: Int, o: Outline|
@@ -869,7 +895,7 @@ pub fn framed_program(
   fixing: CachedHashes,
   shipped: Map<Bytes, Bytes>,
   tested: Bool,
-  reached: Bool,
+  prune_unreachable: Bool,
   warnings: List<Diagnostic>,
   manifest: Option<Manifest>,
   packages: List<PackageDependencies>,
@@ -879,11 +905,11 @@ pub fn framed_program(
 ) -> { frame: Frame, reads: TableReads, views: List<ShippedModuleSummary> } / {abort.raise} = {
   let untested = |s: ModuleShape| !tested && !shipped.contains(s.outline.name);
   let read = shapes.map(|s: ModuleShape| if untested(s) { untested_shape(s) } else { s });
-  let cutting = reached
+  let cutting = prune_unreachable
     && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
   let whole = hashes_from_cache(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), fixing);
   let reach = if cutting {
-    reached_shipped_functions(
+    reachable_shipped_functions(
       read,
       whole,
       shipped.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes, _: Bytes| m.insert(n, true)),
@@ -907,8 +933,12 @@ pub fn framed_program(
       pins: pins,
       module_packages: module_packages,
       embeds: embeds,
-      embed_items: read.fold(Map::new(), |acc: Map<Bytes, List<ItemEmbeds>>, s: ModuleShape|
-        if s.embed_items.len() == 0 { acc } else { acc.insert(s.outline.name, s.embed_items) }),
+      embed_items: read.fold(
+        Map::new(),
+        |accumulator: Map<Bytes, List<ItemEmbeds>>, s: ModuleShape|
+          if s.embed_items.len() == 0 { accumulator }
+          else { accumulator.insert(s.outline.name, s.embed_items) },
+      ),
       tagged: root_tagged(module_packages, hashes, merged.tagged),
       statements: root_statements(module_packages, hashes, merged.statements),
       consts: root_consts(module_packages, merged.consts),
@@ -916,7 +946,7 @@ pub fn framed_program(
     reads: {
       reads: shapes.map(|s: ModuleShape|
         { outline: s.outline, untested: untested(s), trimmed: cut(s) }),
-      reached: reach,
+      reachable: reach,
     },
     views: if cutting { views_read(read, whole, reach, shipped) } else { [] },
   }
@@ -929,15 +959,15 @@ pub fn checked_program_over(
 ) -> CheckedProgram / {abort.raise} = {
   let placed = range(0, tables.len()).fold(
     { out: [], tests: 0, laws: 0 },
-    |acc: { out: List<ModuleTables>, tests: Int, laws: Int }, k: Int| {
+    |accumulator: { out: List<ModuleTables>, tests: Int, laws: Int }, k: Int| {
       let r = reads.reads.get(k);
       let plain = if r.untested { untested_tables(tables.get(k), r.outline) }
       else { tables.get(k) };
-      let t = if r.trimmed { cut_tables(plain, r.outline, reads.reached) } else { plain };
+      let t = if r.trimmed { cut_tables(plain, r.outline, reads.reachable) } else { plain };
       {
-        out: acc.out.push(moved_tables(t, 0, k, acc.tests, acc.laws)),
-        tests: acc.tests + t.tests.len(),
-        laws: acc.laws + t.laws.len(),
+        out: accumulator.out.push(moved_tables(t, 0, k, accumulator.tests, accumulator.laws)),
+        tests: accumulator.tests + t.tests.len(),
+        laws: accumulator.laws + t.laws.len(),
       }
     },
   ).out;
@@ -949,7 +979,7 @@ pub fn assembled_program(
   fixing: CachedHashes,
   shipped: Map<Bytes, Bytes>,
   tested: Bool,
-  reached: Bool,
+  prune_unreachable: Bool,
   warnings: List<Diagnostic>,
   manifest: Option<Manifest>,
   packages: List<PackageDependencies>,
@@ -962,7 +992,7 @@ pub fn assembled_program(
     fixing,
     shipped,
     tested,
-    reached,
+    prune_unreachable,
     warnings,
     manifest,
     packages,
@@ -980,14 +1010,18 @@ pub fn pulled_next(
   read: List<Bytes>,
   written: Map<Bytes, List<Bytes>>,
   listed: Map<Bytes, Bool>,
-  asked: List<Bytes>,
+  requested_modules: List<Bytes>,
 ) -> List<Bytes> = {
-  let present = read.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
-  let wants = |acc: Map<Bytes, Bool>, w: Bytes|
-    if is_shipped(w) && !present.contains(w) && listed.contains(w) { acc.insert(w, true) }
-    else { acc };
-  read.fold(asked.fold(Map::new(), wants), |acc: Map<Bytes, Bool>, n: Bytes|
-    List::fold(match written.get(n) { Some(ws) -> ws, None -> [] }, acc, wants)).keys(
+  let present = read.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
+    accumulator.insert(n, true));
+  let wants = |accumulator: Map<Bytes, Bool>, w: Bytes|
+    if is_shipped(w) && !present.contains(w) && listed.contains(w) { accumulator.insert(w, true) }
+    else { accumulator };
+  read.fold(
+    requested_modules.fold(Map::new(), wants),
+    |accumulator: Map<Bytes, Bool>, n: Bytes|
+      List::fold(match written.get(n) { Some(ws) -> ws, None -> [] }, accumulator, wants),
+  ).keys(
   )
 }
 
@@ -1007,22 +1041,23 @@ pub fn assembled_load(
   listed: List<Bytes>,
   texts: Map<Bytes, Bytes>,
   tested: Bool,
-  reached: Bool,
+  prune_unreachable: Bool,
   warnings: List<Diagnostic>,
 ) -> AssembledLoad / {abort.raise} = {
   let clo = closure(packages, own);
-  let users = own.concat(clo.modules.map(|m: { pkg: Int, src: Source }| m.src.name));
+  let users = own.concat(clo.modules.map(|m: { pkg: Int, source: Source }| m.source.name));
   let names = users.concat(pulled);
   let read = names.map(|n: Bytes| match shapes.get(n) { Some(s) -> s, None -> no_shape(n) });
-  let embeds = read.fold([], |acc: List<ModuleEmbed>, s: ModuleShape| acc.concat(s.embeds));
+  let embeds = read.fold([], |accumulator: List<ModuleEmbed>, s: ModuleShape|
+    accumulator.concat(s.embeds));
   let tables = package_tables(names, own.len(), clo, toolchain_tree(own, listed));
   let program = framed_program(
     read,
     fixing,
-    pulled.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes|
-      match texts.get(n) { Some(t) -> acc.insert(n, t), None -> acc }),
+    pulled.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, n: Bytes|
+      match texts.get(n) { Some(t) -> accumulator.insert(n, t), None -> accumulator }),
     tested,
-    reached,
+    prune_unreachable,
     warnings,
     clo.packages.get(0).manifest,
     tables.packages,
@@ -1034,11 +1069,11 @@ pub fn assembled_load(
 }
 
 fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {abort.raise} = {
-  let at_name = range(0, names.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-    acc.insert(names.get(i), i));
+  let at_name = range(0, names.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
+    accumulator.insert(names.get(i), i));
   let edges = imports.map(|xs: List<Bytes>|
-    xs.fold([], |acc: List<Int>, x: Bytes|
-      match at_name.get(x) { Some(t) -> acc.push(t), None -> acc }));
+    xs.fold([], |accumulator: List<Int>, x: Bytes|
+      match at_name.get(x) { Some(t) -> accumulator.push(t), None -> accumulator }));
   post_order(edges).map(|i: Int| names.get(i))
 }
 
@@ -1051,12 +1086,15 @@ fn merged_shapes(
     outlines: placed.map(|s: ModuleShape| s.outline),
     order: order_of(placed.map(|s: ModuleShape| s.outline.name), imports),
     imports: imports.map(|xs: List<Bytes>|
-      xs.fold([], |acc: List<Bytes>, x: Bytes| if acc.contains(x) { acc } else { acc.push(x) })),
+      xs.fold([], |accumulator: List<Bytes>, x: Bytes|
+        if accumulator.contains(x) { accumulator } else { accumulator.push(x) })),
     unimported: placed.map(|s: ModuleShape| s.unimported),
-    tagged: placed.fold([], |acc: List<TaggedSite>, s: ModuleShape| acc.concat(s.tagged)),
-    statements: placed.fold([], |acc: List<StatementSite>, s: ModuleShape|
-      acc.concat(s.statements)),
-    consts: placed.fold([], |acc: List<TypedConst>, s: ModuleShape| acc.concat(s.consts)),
+    tagged: placed.fold([], |accumulator: List<TaggedSite>, s: ModuleShape|
+      accumulator.concat(s.tagged)),
+    statements: placed.fold([], |accumulator: List<StatementSite>, s: ModuleShape|
+      accumulator.concat(s.statements)),
+    consts: placed.fold([], |accumulator: List<TypedConst>, s: ModuleShape|
+      accumulator.concat(s.consts)),
   }
 }
 
@@ -1066,32 +1104,36 @@ fn merged_tables(
   order: List<Bytes>,
   placed: List<ModuleTables>,
 ) -> CheckOutput / {abort.raise} = {
-  let at_name = range(0, outlines.len()).fold(Map::new(), |acc: Map<Bytes, Int>, k: Int|
-    acc.insert(outlines.get(k).name, k));
-  let checked_order = order.fold([], |acc: List<ModuleTables>, n: Bytes|
-    match at_name.get(n) { Some(k) -> acc.push(placed.get(k)), None -> acc });
+  let at_name = range(0, outlines.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, k: Int|
+    accumulator.insert(outlines.get(k).name, k));
+  let checked_order = order.fold([], |accumulator: List<ModuleTables>, n: Bytes|
+    match at_name.get(n) { Some(k) -> accumulator.push(placed.get(k)), None -> accumulator });
   let apart = test_and_law_owners(outlines);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ok: true,
     diagnostics: [],
-    holes: [],
-    definitions: checked_order.fold([], |acc: List<DefinitionInfo>, t: ModuleTables|
-      acc.concat(t.definitions)),
-    tests: placed.fold([], |acc: List<TestInfo>, t: ModuleTables| acc.concat(t.tests)),
-    laws: placed.fold([], |acc: List<LawInfo>, t: ModuleTables| acc.concat(t.laws)),
-    effects: checked_order.fold(prelude.effects, |acc: List<EffectInfo>, t: ModuleTables|
-      acc.concat(t.effects)),
+    warnings: [],
+    definitions: checked_order.fold([], |accumulator: List<DefinitionInfo>, t: ModuleTables|
+      accumulator.concat(t.definitions)),
+    tests: placed.fold([], |accumulator: List<TestInfo>, t: ModuleTables|
+      accumulator.concat(t.tests)),
+    laws: placed.fold([], |accumulator: List<LawInfo>, t: ModuleTables| accumulator.concat(t.laws)),
+    effects: checked_order.fold(
+      prelude.effects,
+      |accumulator: List<EffectInfo>, t: ModuleTables| accumulator.concat(t.effects),
+    ),
     constructors: checked_order.fold(
       prelude.constructors,
-      |acc: List<ConstructorInfo>, t: ModuleTables| acc.concat(t.constructors),
+      |accumulator: List<ConstructorInfo>, t: ModuleTables| accumulator.concat(t.constructors),
     ),
     seeded: [],
     cached_tests: [],
     facts: {
-      pure: checked_order.fold([], |acc: List<Bytes>, t: ModuleTables| acc.concat(t.facts.pure)),
-      orders: checked_order.fold([], |acc: List<WitnessOrder>, t: ModuleTables|
-        acc.concat(t.facts.orders)),
+      pure: checked_order.fold([], |accumulator: List<Bytes>, t: ModuleTables|
+        accumulator.concat(t.facts.pure)),
+      orders: checked_order.fold([], |accumulator: List<WitnessOrder>, t: ModuleTables|
+        accumulator.concat(t.facts.orders)),
       members: in_check_order(
         checked_order,
         placed,
@@ -1104,30 +1146,34 @@ fn merged_tables(
         |t: ModuleTables| t.facts.bodies,
         |x: TypedBody<Bytes>| of_definitions(x.owner),
       ),
-      types: checked_order.fold(Map::new(), |acc: TypeTable, t: ModuleTables|
-        types_joined(acc, t.facts.types)),
+      types: checked_order.fold(Map::new(), |accumulator: TypeTable, t: ModuleTables|
+        types_joined(accumulator, t.facts.types)),
     },
-    cached: checked_order.fold([], |acc: List<CachedFacts>, t: ModuleTables| acc.concat(t.cached)),
-    instances: checked_order.fold([], |acc: List<InstanceInfo>, t: ModuleTables|
-      acc.concat(t.instances)),
-    numeric_types: checked_order.fold([], |acc: List<NumericInfo>, t: ModuleTables|
-      acc.concat(t.numeric)),
+    cached: checked_order.fold([], |accumulator: List<CachedFacts>, t: ModuleTables|
+      accumulator.concat(t.cached)),
+    instances: checked_order.fold([], |accumulator: List<InstanceInfo>, t: ModuleTables|
+      accumulator.concat(t.instances)),
+    numeric_types: checked_order.fold([], |accumulator: List<NumericInfo>, t: ModuleTables|
+      accumulator.concat(t.numeric)),
   }
 }
 
-fn keeps_body(definition: FnDefinition) -> Bool =
+fn exposes_body(definition: FnDefinition) -> Bool =
   definition.generics.labels.len() > 0
     || (match definition.transparent { Some(_) -> true, None -> false })
 
 pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
-  let generated = parsed.derived.fold(Map::new(), |acc: Map<Bytes, Bool>, d: DeriveOrigin|
-    acc.insert(span_key(d.span), true));
-  parsed.module.items.fold([], |acc: List<Cut>, item: Item|
+  let generated = parsed.derived.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bool>, d: DeriveOrigin| accumulator.insert(span_key(d.span), true),
+  );
+  parsed.module.items.fold([], |accumulator: List<Cut>, item: Item|
     match item {
-      FunctionItem(d) -> if generated.contains(span_key(d.span)) || keeps_body(d) { acc } else {
+      FunctionItem(d) -> if generated.contains(span_key(d.span)) || exposes_body(d) { accumulator }
+      else {
         let b = expression_span(d.body);
-        if b.end - b.start < 2 { acc } else {
-          acc.push({
+        if b.end - b.start < 2 { accumulator } else {
+          accumulator.push({
             start: b.start,
             end: b.end,
             braced: true,
@@ -1137,10 +1183,22 @@ pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
         }
       },
       TestItem(d) ->
-        acc.push({ start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
+        accumulator.push({
+          start: d.span.start,
+          end: d.span.end,
+          braced: false,
+          name: b"",
+          test: false,
+        }),
       LawItem(d) ->
-        acc.push({ start: d.span.start, end: d.span.end, braced: false, name: b"", test: false }),
-      _ -> acc,
+        accumulator.push({
+          start: d.span.start,
+          end: d.span.end,
+          braced: false,
+          name: b"",
+          test: false,
+        }),
+      _ -> accumulator,
     })
 }
 
@@ -1195,9 +1253,10 @@ pub fn root_tagged(
   sites: List<TaggedSite>,
 ) -> List<TaggedSite> = {
   let hashed = by_name(hashes.definitions);
-  sites.fold([], |acc: List<TaggedSite>, t: TaggedSite|
-    if module_packages.at(t.module) != Some(0) { acc }
-    else { acc.push({ ..t, hash: match hashed.get(t.callee) { Some(h) -> h, None -> b"" } }) })
+  sites.fold([], |accumulator: List<TaggedSite>, t: TaggedSite|
+    if module_packages.at(t.module) != Some(0) { accumulator } else {
+      accumulator.push({ ..t, hash: match hashed.get(t.callee) { Some(h) -> h, None -> b"" } })
+    })
 }
 
 pub type TypedConst = { module: Int, name: Bytes, type_name: Bytes }
@@ -1205,21 +1264,21 @@ pub type TypedConst = { module: Int, name: Bytes, type_name: Bytes }
 derive bin for TypedConst
 
 pub fn typed_consts_of(w: Analysis, i: Int) -> List<TypedConst> / {abort.raise} =
-  w.modules.get(i).module.items.fold([], |acc: List<TypedConst>, item: Item|
+  w.modules.get(i).module.items.fold([], |accumulator: List<TypedConst>, item: Item|
     match item {
-      FunctionItem(d) -> match ((d.constant, d.ret)) {
+      FunctionItem(d) -> match ((d.constant, d.return_type)) {
         (Some(_), Some(NamedTypeExpression(c))) -> match qualified_type_name(w.index, i, c.name) {
           Some(type_name) ->
-            acc.push({
+            accumulator.push({
               module: i,
               name: qualify(w.modules.get(i).name, d.name.name),
               type_name: type_name,
             }),
-          None -> acc,
+          None -> accumulator,
         },
-        _ -> acc,
+        _ -> accumulator,
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 
 pub fn root_consts(module_packages: List<Int>, consts: List<TypedConst>) -> List<TypedConst> =
@@ -1266,8 +1325,8 @@ derive bin for RowRead
 derive bin for RowField
 
 fn derived_rows(modules: List<ParsedModule>) -> Map<Bytes, List<RowField>> / {abort.raise} =
-  modules.fold(Map::new(), |acc: Map<Bytes, List<RowField>>, parsed: ParsedModule|
-    parsed.module.items.fold(acc, |rows: Map<Bytes, List<RowField>>, item: Item|
+  modules.fold(Map::new(), |accumulator: Map<Bytes, List<RowField>>, parsed: ParsedModule|
+    parsed.module.items.fold(accumulator, |rows: Map<Bytes, List<RowField>>, item: Item|
       match item {
         DeriveItem(d) -> if deriver_module(parsed.module, d.deriver) != Some(b"std.sql") { rows }
         else {
@@ -1328,9 +1387,9 @@ pub fn root_statements(
   sites: List<StatementSite>,
 ) -> List<StatementSite> / {abort.raise} = {
   let hashed = by_name(hashes.definitions);
-  sites.fold([], |acc: List<StatementSite>, x: StatementSite|
-    if module_packages.at(x.module) != Some(0) { acc }
-    else { acc.push({ ..x, args: x.args.map(|a: Argument| hashed_argument(hashed, a)) }) })
+  sites.fold([], |accumulator: List<StatementSite>, x: StatementSite|
+    if module_packages.at(x.module) != Some(0) { accumulator }
+    else { accumulator.push({ ..x, args: x.args.map(|a: Argument| hashed_argument(hashed, a)) }) })
 }
 
 fn hashed_argument(hashed: Map<Bytes, Bytes>, a: Argument) -> Argument / {abort.raise} = {
@@ -1368,7 +1427,7 @@ fn statement_site(
         Some({
           module: module,
           span: p.span,
-          callee: Bytes::concat_all([named, b".", p.op.name]),
+          callee: Bytes::concat_all([named, b".", p.operation.name]),
           label: label.name,
           args: args(p.args),
         }),
@@ -1376,7 +1435,7 @@ fn statement_site(
     },
     CallExpression(a) -> match ((a.function, a.labels.at(0))) {
       (NameExpression(v), Some(label)) -> match denotation(reading.index, module, v.name) {
-        DenotesFn(callee) ->
+        DenotesFunction(callee) ->
           Some({
             module: module,
             span: a.span,
@@ -1399,8 +1458,11 @@ fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {a
       LiteralString(s) -> TextArgument(s),
       _ -> OtherArgument,
     },
-    BinaryExpression(b) -> if b.op != b"++" { OtherArgument } else {
-      match ((argument(reading, module, b.lhs), argument(reading, module, b.rhs))) {
+    BinaryExpression(b) -> if b.operation != b"++" { OtherArgument } else {
+      match ((
+          argument(reading, module, b.left_operand),
+          argument(reading, module, b.right_operand),
+        )) {
         (TextArgument(x), TextArgument(y)) -> TextArgument(x.concat(y)),
         _ -> OtherArgument,
       }
@@ -1412,7 +1474,7 @@ fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {a
     CallExpression(a) -> if a.labels.len() > 0 || a.named.len() > 0 { OtherArgument } else {
       match a.function {
         NameExpression(v) -> match denotation(reading.index, module, v.name) {
-          DenotesFn(callee) -> match reading.rows.get(callee) {
+          DenotesFunction(callee) -> match reading.rows.get(callee) {
             Some(fields) -> if a.args.len() == 0 { RowArgument(fields) } else { OtherArgument },
             None ->
               CallArgument({

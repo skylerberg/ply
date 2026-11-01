@@ -95,22 +95,24 @@ fn modules_in<[r]>(
   match listing {
     None -> { ..found, unread: found.unread.push(under) },
     Some(files_below) ->
-      files_below.fold(found, |acc: Modules, l: Listed| {
+      files_below.fold(found, |accumulator: Modules, l: Listed| {
         let path = joined(under, l.name);
         match l.kind {
-          File -> if is_ply(l.name) { { ..acc, files: acc.files.push(path) } } else { acc },
-          Dir -> if is_skipped(l.name) || depth_left <= 0 { acc } else {
+          File -> if is_ply(l.name) { { ..accumulator, files: accumulator.files.push(path) } }
+          else { accumulator },
+          Dir -> if is_skipped(l.name) || depth_left <= 0 { accumulator } else {
             let inner = fs.list_dir[r](joined(dir, path));
-            if own && holds_package(inner) { acc }
-            else { modules_in[r](dir, path, inner, acc, depth_left - 1, own) }
+            if own && contains_package(inner) { accumulator }
+            else { modules_in[r](dir, path, inner, accumulator, depth_left - 1, own) }
           },
-          Symlink -> acc,
-          Missing -> if is_ply(l.name) { { ..acc, unread: acc.unread.push(path) } } else { acc },
+          Symlink -> accumulator,
+          Missing -> if is_ply(l.name) { { ..accumulator, unread: accumulator.unread.push(path) } }
+          else { accumulator },
         }
       }),
   }
 
-fn holds_package(listing: Option<List<Listed>>) -> Bool =
+fn contains_package(listing: Option<List<Listed>>) -> Bool =
   match listing {
     Some(files_below) -> files_below.any(|l: Listed| l.name == "ply.pkg"),
     None -> false,
@@ -123,8 +125,8 @@ fn package_at<[r]>(
 ) -> Result<Package, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} = {
   let read = modules_below[r](root, true).files.sort().fold(
     Ok([]),
-    |acc: Result<List<SourceFile>, List<Diagnostic>>, p: String|
-      match acc {
+    |accumulator: Result<List<SourceFile>, List<Diagnostic>>, p: String|
+      match accumulator {
         Err(e) -> Err(e),
         Ok(done) -> match module_of(p) {
           Err(reason) ->
@@ -144,7 +146,7 @@ fn package_at<[r]>(
 }
 
 fn sources_of(files: List<SourceFile>) -> List<Source> =
-  files.map(|f: SourceFile| { name: Bytes::of_string(f.name), src: f.text })
+  files.map(|f: SourceFile| { name: Bytes::of_string(f.name), source_text: f.text })
 
 fn supplied_of(package: Package) -> SuppliedPackage =
   {
@@ -162,8 +164,8 @@ fn git_dependency_error(key: Bytes) -> Diagnostic =
 fn packages_of<[r]>(
   root: Package,
 ) -> Result<List<Package>, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
-  iterate(Ok([]), 4096, |acc: Result<List<Package>, List<Diagnostic>>|
-    match acc {
+  iterate(Ok([]), 4096, |accumulator: Result<List<Package>, List<Diagnostic>>|
+    match accumulator {
       Err(e) -> Stop(Err(e)),
       Ok(read) -> {
         let known = read.push(root).map(|p: Package| Bytes::of_string(p.root));
@@ -208,28 +210,34 @@ fn embedded_in<[r]>(
   match fs.list_dir[r](joined(dir, under)) {
     None -> Err({ path: joined(dir, under), reason: "could not be listed" }),
     Some(entries) ->
-      entries.fold(Ok(found), |acc: Result<Map<String, String>, EmbeddedFilesError>, l: Listed|
-        match acc {
-          Err(_) -> acc,
-          Ok(m) -> if l.name.starts_with(".") { acc } else {
-            let path = joined(under, l.name);
-            match l.kind {
-              Dir -> if depth_left <= 0 {
-                Err({ path: joined(dir, path), reason: "is deeper than a path can name" })
-              } else { embedded_in[r](dir, path, m, depth_left - 1) },
-              _ -> Ok(m.insert(path, joined(dir, path))),
-            }
+      entries.fold(
+        Ok(found),
+        |accumulator: Result<Map<String, String>, EmbeddedFilesError>, l: Listed|
+          match accumulator {
+            Err(_) -> accumulator,
+            Ok(m) -> if l.name.starts_with(".") { accumulator } else {
+              let path = joined(under, l.name);
+              match l.kind {
+                Dir -> if depth_left <= 0 {
+                  Err({
+                    path: joined(dir, path),
+                    reason: "is nested in too many directories to embed",
+                  })
+                } else { embedded_in[r](dir, path, m, depth_left - 1) },
+                _ -> Ok(m.insert(path, joined(dir, path))),
+              }
+            },
           },
-        }),
+      ),
   }
 
 fn read_dir<[r]>(dir: String) -> EmbedBytesResult / {fs.list_dir[r], fs.read_file[r]} =
   match embedded_below[r](dir) {
     Err(stopped) -> read_error(stopped.path, stopped.reason),
     Ok(found) ->
-      found.fold(Ok([]), |acc: EmbedBytesResult, name: String, path: String|
-        match acc {
-          Err(_) -> acc,
+      found.fold(Ok([]), |accumulator: EmbedBytesResult, name: String, path: String|
+        match accumulator {
+          Err(_) -> accumulator,
           Ok(files) -> match fs.read_file[r](path) {
             Some(b) -> Ok(files.push({ name: Bytes::of_string(name), bytes: b })),
             None -> read_error(path, "could not be read"),
@@ -243,7 +251,7 @@ fn read_embed<[r]>(
   dir: Bool,
 ) -> EmbedBytesResult / {fs.list_dir[r], fs.kind[r], fs.read_file[r]} =
   if is_absolute(path) {
-    read_error(path, "is absolute, and a program's own load reads below its root")
+    read_error(path, "is absolute, and a program can embed only files below its root directory")
   } else {
     let target = embed_target(file, path);
     match fs.kind[r](target) {
@@ -280,8 +288,8 @@ fn shipped_path(name: String) -> String / {abort.raise} = {
     None -> name,
     Some(root) ->
       "<" ++ root ++ ">/"
-        ++ range(1, segments.len()).fold("", |acc: String, i: Int|
-          if i == 1 { segments.get(i) } else { acc ++ "/" ++ segments.get(i) })
+        ++ range(1, segments.len()).fold("", |accumulator: String, i: Int|
+          if i == 1 { segments.get(i) } else { accumulator ++ "/" ++ segments.get(i) })
         ++ ".ply",
   }
 }
@@ -292,8 +300,8 @@ fn indexed_sources(
   pulled: List<Bytes>,
   shipped: Map<Bytes, Bytes>,
 ) -> List<SourceFile> / {abort.raise} = {
-  let modules = dependencies.fold(own.files, |acc: List<SourceFile>, package: Package|
-    acc.concat(package.files));
+  let modules = dependencies.fold(own.files, |accumulator: List<SourceFile>, package: Package|
+    accumulator.concat(package.files));
   let shipped_sources = modules.concat(
     pulled.map(|n: Bytes|
       {
@@ -302,11 +310,15 @@ fn indexed_sources(
         text: match Map::get(shipped, n) { Some(t) -> t, None -> b"" },
       }),
   );
-  [own].concat(dependencies).fold(shipped_sources, |acc: List<SourceFile>, package: Package|
-    match package.manifest {
-      None -> acc,
-      Some(text) -> acc.push({ path: joined(package.root, "ply.pkg"), name: "pkg", text: text }),
-    })
+  [own].concat(dependencies).fold(
+    shipped_sources,
+    |accumulator: List<SourceFile>, package: Package|
+      match package.manifest {
+        None -> accumulator,
+        Some(text) ->
+          accumulator.push({ path: joined(package.root, "ply.pkg"), name: "pkg", text: text }),
+      },
+  )
 }
 
 pub type ProgramPackages = {
@@ -457,12 +469,15 @@ pub fn fresh_check_results<[s]>(
 }
 
 fn pulled_texts(pulled: List<Bytes>) -> Map<Bytes, Bytes> / {shipped.module, abort.raise} =
-  pulled.fold(Map::new(), |acc: Map<Bytes, Bytes>, n: Bytes|
-    match shipped_module_text(n) { Some(text) -> acc.insert(n, imported(text)), None -> acc })
+  pulled.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, n: Bytes|
+    match shipped_module_text(n) {
+      Some(text) -> accumulator.insert(n, imported(text)),
+      None -> accumulator,
+    })
 
 fn entry_module(entry: Bytes) -> Bytes / {abort.raise} = {
-  let k = range(0, entry.len()).fold(0 - 1, |acc: Int, i: Int|
-    if entry.at(i) == 46 { i } else { acc });
+  let k = range(0, entry.len()).fold(0 - 1, |accumulator: Int, i: Int|
+    if entry.at(i) == 46 { i } else { accumulator });
   if k < 0 { b"" } else { entry.slice(0, k) }
 }
 
@@ -471,20 +486,20 @@ fn rejections(
   files: List<SourceFile>,
   own: List<Bytes>,
 ) -> List<Diagnostic> / {abort.raise} = {
-  let placed_at = range(0, files.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-    acc.insert(
+  let placed_at = range(0, files.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
+    accumulator.insert(
       match own.at(i) { Some(name) -> name, None -> Bytes::of_string(files.get(i).name) },
       i,
     ));
-  rejected_first(results).fold([], |acc: List<Diagnostic>, a: CheckedModule| {
+  rejected_first(results).fold([], |accumulator: List<Diagnostic>, a: CheckedModule| {
     let i = match placed_at.get(a.module) {
       Some(k) -> k,
       None ->
         panic(
-          f"`{String::of_bytes_lossy(a.module)}` has errors, and the load placed no file of it to report them in",
+          f"`{String::of_bytes_lossy(a.module)}` has errors, but the program has no source file for that module, so the errors cannot be reported",
         ),
     };
-    acc.concat(
+    accumulator.concat(
       a.result.rejected.map(|d: Diagnostic|
         { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
     )
@@ -519,8 +534,8 @@ pub fn checked_program<[s]>(
       let loaded = assembled_load(
         p.main_package.files.map(|f: SourceFile| Bytes::of_string(f.name)),
         p.packages,
-        results.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
-          acc.insert(a.module, a.result.shape)),
+        results.fold(Map::new(), |accumulator: Map<Bytes, ModuleShape>, a: CheckedModule|
+          accumulator.insert(a.module, a.result.shape)),
         joined_cached_hashes(check_modules.modules),
         check_modules.shipped_module_names,
         files_below,
@@ -532,8 +547,8 @@ pub fn checked_program<[s]>(
       let view = checked_program_from_results(
         loaded.frame,
         loaded.reads,
-        results.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
-          acc.insert(a.module, a.result)),
+        results.fold(Map::new(), |accumulator: Map<Bytes, ModuleResult>, a: CheckedModule|
+          accumulator.insert(a.module, a.result)),
       );
       report_viewed(loaded.views, true);
       let dump = view_dump(view, None);
@@ -588,8 +603,8 @@ pub fn report_viewed(
   if viewed.len() == 0 { () } else { shipped.report_view_used(viewed_text(viewed), pulled) }
 
 fn texts_of(shipped_sources: List<Source>) -> Map<Bytes, Bytes> =
-  shipped_sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, source: Source|
-    acc.insert(source.name, source.src))
+  shipped_sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, source: Source|
+    accumulator.insert(source.name, source.source_text))
 
 pub type InMemoryAnalysis = { out: AnalysisOutcome, files: List<SourceFile> }
 
@@ -600,7 +615,7 @@ fn input_bytes(inputs: Map<Bytes, Bytes>, want: EmbedRequest) -> Option<Bytes> /
 fn input_read(inputs: Map<Bytes, Bytes>, want: EmbedRequest) -> EmbedResult / {abort.raise} =
   match input_bytes(inputs, want) {
     Some(b) -> Ok([embed_file(b"", b)]),
-    None -> Err(b"the program was handed no file of that digest"),
+    None -> Err(b"the program was given no input file whose hash matches the requested file"),
   }
 
 pub fn analyse_in_memory(
@@ -629,8 +644,8 @@ pub fn check_in_memory(
   inputs: Map<Bytes, Bytes>,
 ) -> Result<LoadedAnalysis, LoadFailure> / {shipped.names, shipped.module, shipped.report_view_used, abort.raise} = {
   let returned = analyse_in_memory(files, inputs);
-  let own = files.fold(Map::new(), |acc: Map<Bytes, Bool>, f: SourceFile|
-    acc.insert(Bytes::of_string(f.name), true));
+  let own = files.fold(Map::new(), |accumulator: Map<Bytes, Bool>, f: SourceFile|
+    accumulator.insert(Bytes::of_string(f.name), true));
   match returned.out {
     Rejected(diagnostics) -> Err({ diagnostics: diagnostics, files: returned.files }),
     Analysed(w) -> {
@@ -641,7 +656,8 @@ pub fn check_in_memory(
           } else {
             match input_bytes(inputs, request_of_key(e.key)) {
               Some(b) -> Ok([{ name: b"", bytes: b }]),
-              None -> Err(b"the program was handed no file of that digest"),
+              None ->
+                Err(b"the program was given no input file whose hash matches the requested file"),
             }
           }) {
         Err(diagnostics) -> Err({ diagnostics: diagnostics, files: returned.files }),
@@ -666,7 +682,7 @@ pub fn every_root(front: LoadedAnalysis) -> List<RootKey> / {abort.raise} =
 fn named_roots(every: List<RootKey>, reached: Map<Bytes, Bool>) -> List<RootKey> =
   every.filter(|k: RootKey| match k { Named(n) -> reached.contains(n), _ -> false })
 
-pub fn reached_roots(
+pub fn reachable_roots(
   front: LoadedAnalysis,
   reached: Map<Bytes, Bool>,
 ) -> List<RootKey> / {abort.raise} = named_roots(every_root(front), reached)
@@ -676,7 +692,7 @@ pub fn entry_roots(
   hashes: HashOutput,
   entries: List<Bytes>,
 ) -> List<RootKey> / {abort.raise} =
-  reached_roots(
+  reachable_roots(
     front,
     entries.fold(
       reach(hashes, entries.map(FunctionNamed)).functions,
@@ -719,14 +735,14 @@ pub fn load<[r]>(
 
 pub effect set Derives = {shipped.names, shipped.module, shipped.digests, shipped.report_view_used, shipped.definitions, shipped.runtime, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
 
-type ReachedModule = { name: Bytes, text: Bytes }
+type DeriverModule = { name: Bytes, text: Bytes }
 
 pub fn derivation_result(
   ask: DeriverRequest,
   own: Map<Bytes, Bytes>,
 ) -> DeriverResponse / {Derives, abort.raise} = {
-  let reached = deriver_modules(ask.module, own);
-  let deriver = deriver_key(ask.module, reached);
+  let modules = deriver_modules(ask.module, own);
+  let deriver = deriver_key(ask.module, modules);
   let path = "derived/" ++ String::of_bytes(hex(blake3(deriver.concat(ask.declaration))));
   match match toolchain.read_file(path) {
       Some(b) -> match bin::decode(b, deriver_response_bin()) { Ok(a) -> Some(a), Err(_) -> None },
@@ -734,7 +750,7 @@ pub fn derivation_result(
     } {
     Some(a) -> a,
     None -> {
-      let ran = run_derivation(ask, deriver, reached);
+      let ran = run_derivation(ask, deriver, modules);
       if ran.keep {
         let _ = toolchain.write_file(path, bin::encode(ran.result, deriver_response_bin()));
         ()
@@ -744,7 +760,7 @@ pub fn derivation_result(
   }
 }
 
-fn deriver_key(module: Bytes, reached: List<ReachedModule>) -> Bytes / {Derives, abort.raise} =
+fn deriver_key(module: Bytes, modules: List<DeriverModule>) -> Bytes / {Derives, abort.raise} =
   blake3(
     Bytes::concat_all([
       blake3(shipped.definitions()),
@@ -753,32 +769,32 @@ fn deriver_key(module: Bytes, reached: List<ReachedModule>) -> Bytes / {Derives,
       module,
       b"\x00",
       Bytes::concat_all(
-        reached.map(|r: ReachedModule| Bytes::concat_all([r.name, b"\x00", blake3(r.text)])),
+        modules.map(|r: DeriverModule| Bytes::concat_all([r.name, b"\x00", blake3(r.text)])),
       ),
     ]),
   )
 
-fn deriver_modules(module: Bytes, own: Map<Bytes, Bytes>) -> List<ReachedModule> / {abort.raise} =
+fn deriver_modules(module: Bytes, own: Map<Bytes, Bytes>) -> List<DeriverModule> / {abort.raise} =
   iterate(
     { seen: [], frontier: [module] },
     own.len() + 1,
-    |walk: { seen: List<ReachedModule>, frontier: List<Bytes> }| {
-      let fresh = walk.frontier.fold([], |acc: List<ReachedModule>, name: Bytes|
+    |walk: { seen: List<DeriverModule>, frontier: List<Bytes> }| {
+      let fresh = walk.frontier.fold([], |accumulator: List<DeriverModule>, name: Bytes|
         match if is_shipped(name) { None } else { own.get(name) } {
-          Some(text) -> if walk.seen.concat(acc).any(|reached: ReachedModule|
-              reached.name == name) { acc }
-          else { acc.push({ name: name, text: text }) },
-          None -> acc,
+          Some(text) -> if walk.seen.concat(accumulator).any(|module: DeriverModule|
+              module.name == name) { accumulator }
+          else { accumulator.push({ name: name, text: text }) },
+          None -> accumulator,
         });
       if fresh.len() == 0 { Stop(walk) } else {
         Continue({
           seen: walk.seen.concat(fresh),
-          frontier: fresh.fold([], |acc: List<Bytes>, reached: ReachedModule| {
-            let imports = match header(reached.text) {
+          frontier: fresh.fold([], |accumulator: List<Bytes>, module: DeriverModule| {
+            let imports = match header(module.text) {
               Some(head) -> head.imports,
-              None -> parse(reached.text).node.imports,
+              None -> parse(module.text).node.imports,
             };
-            acc.concat(imports.map(import_path))
+            accumulator.concat(imports.map(import_path))
           }),
         })
       }
@@ -802,10 +818,10 @@ fn diagnostic_line(d: Diagnostic) -> Bytes = Bytes::concat_all([d.code, b": ", d
 fn run_derivation(
   ask: DeriverRequest,
   deriver: Bytes,
-  reached: List<ReachedModule>,
+  modules: List<DeriverModule>,
 ) -> DerivationRun / {Derives, abort.raise} = {
-  let name = derivation_name(reached);
-  match deriver_library(ask.module, deriver, name, reached) {
+  let name = derivation_name(modules);
+  match deriver_library(ask.module, deriver, name, modules) {
     Err(ran) -> ran,
     Ok(library) ->
       derivation_run_of(
@@ -820,9 +836,9 @@ fn run_derivation(
   }
 }
 
-fn derivation_name(reached: List<ReachedModule>) -> Bytes / {abort.raise} =
-  iterate(b"derivation", reached.len() + 1, |n: Bytes|
-    if reached.any(|r: ReachedModule| r.name == n) { Continue(n.concat(b"_")) } else { Stop(n) })
+fn derivation_name(modules: List<DeriverModule>) -> Bytes / {abort.raise} =
+  iterate(b"derivation", modules.len() + 1, |n: Bytes|
+    if modules.any(|r: DeriverModule| r.name == n) { Continue(n.concat(b"_")) } else { Stop(n) })
 
 fn derived_root(name: Bytes) -> Bytes = name.concat(b".derived")
 
@@ -830,25 +846,26 @@ fn deriver_library(
   module: Bytes,
   deriver: Bytes,
   name: Bytes,
-  reached: List<ReachedModule>,
+  modules: List<DeriverModule>,
 ) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
-  let kept = "derivers/" ++ String::of_bytes(hex(deriver));
-  match toolchain.read_file(kept) {
+  let library_record = "derivers/" ++ String::of_bytes(hex(deriver));
+  match toolchain.read_file(library_record) {
     Some(library) -> {
       let path = String::of_bytes(library);
-      if toolchain.exists(path) { Ok(path) } else { compile_deriver(module, kept, name, reached) }
+      if toolchain.exists(path) { Ok(path) }
+      else { compile_deriver(module, library_record, name, modules) }
     },
-    None -> compile_deriver(module, kept, name, reached),
+    None -> compile_deriver(module, library_record, name, modules),
   }
 }
 
 fn compile_deriver(
   module: Bytes,
-  kept: String,
+  library_record: String,
   name: Bytes,
-  reached: List<ReachedModule>,
+  modules: List<DeriverModule>,
 ) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
-  let files = reached.map(|r: ReachedModule|
+  let files = modules.map(|r: DeriverModule|
     {
       path: String::of_bytes(r.name) ++ ".ply",
       name: String::of_bytes(r.name),
@@ -862,9 +879,9 @@ fn compile_deriver(
     Err({
       result: unran(
         b"E0160",
-        Bytes::concat_all([b"`", module, b"` is no deriver a `derive` can run"]),
+        Bytes::concat_all([b"`", module, b"` cannot be run by `derive`"]),
         [
-          b"a deriver's module declares `pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`, performing nothing but a raise, and whose modules derive nothing through a deriver",
+          b"a module run by `derive` must declare `pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`, the only effect it may perform is raising, and none of the modules it depends on may use `derive`",
         ].concat(
           diagnostics.map(diagnostic_line),
         ),
@@ -900,8 +917,9 @@ fn compile_deriver(
               unkept(b"the deriver's program did not compile", [Bytes::of_string(reason)]),
             Ok(l) -> {
               let library = cache_relative(l);
-              if toolchain.write_file(kept, Bytes::of_string(library)) { Ok(library) } else {
-                unkept(b"the deriver's program could not be kept in the toolchain's cache", [])
+              if toolchain.write_file(library_record, Bytes::of_string(library)) { Ok(library) }
+              else {
+                unkept(b"the deriver's program could not be saved in the toolchain's cache", [])
               }
             },
           }
@@ -916,10 +934,7 @@ pub fn cache_relative(path: String) -> String / {toolchain.read, abort.raise} = 
   if path.starts_with(cache ++ "/") { path.slice(cache.len() + 1, path.len()) } else { path }
 }
 
-fn derivation_run_of(
-  ask: DeriverRequest,
-  returned: Option<Bytes>,
-) -> DerivationRun / {abort.raise} = {
+fn derivation_run_of(ask: DeriverRequest, returned: Option<Bytes>) -> DerivationRun = {
   let failed = {
     result: unran(
       b"E0155",
@@ -928,7 +943,7 @@ fn derivation_run_of(
         Bytes::concat_all([
           b"a deriver has ",
           Bytes::of_string(unit::entered_timeout_ms().to_string()),
-          b" ms of wall clock, and one that raises derives nothing",
+          b" ms of wall clock, and a deriver that raises produces no output",
         ]),
       ],
     ),
@@ -952,8 +967,11 @@ fn rejected_of(fields: List<value::Field>) -> Option<Rejection> =
       value::field_named(fields, "notes"),
     )) {
     (Some(VStr(message)), Some(VCtor(at, check_in_memory)), Some(VList(notes))) -> {
-      let texts = notes.fold(Some([]), |acc: Option<List<Bytes>>, n: Value|
-        match ((acc, n)) { (Some(xs), VStr(t)) -> Some(xs.push(Bytes::of_string(t))), _ -> None });
+      let texts = notes.fold(Some([]), |accumulator: Option<List<Bytes>>, n: Value|
+        match ((accumulator, n)) {
+          (Some(xs), VStr(t)) -> Some(xs.push(Bytes::of_string(t))),
+          _ -> None,
+        });
       let place = match check_in_memory {
         [VStr(p)] -> Some(Some(Bytes::of_string(p))),
         [] -> Some(None),
@@ -1002,7 +1020,7 @@ fn loaded_from(
   }
 }
 
-test "a derivation asked with a declaration that is no value returns nothing, and runs no deriver" {
+test "a derivation request naming a declaration that is not a value returns nothing and runs no derive function" {
   let w = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   let ask = { module: b"std.derive.map", declaration: b"no value" };
   assert_eq(
@@ -1011,9 +1029,9 @@ test "a derivation asked with a declaration that is no value returns nothing, an
   )
 }
 
-test "a deriver's reach is every module of the load's own it imports, whatever else they import" {
+test "`deriver_modules` returns the project's own modules that a deriver module imports, directly or through other modules, and no standard library modules" {
   let reach = |own: Map<Bytes, Bytes>, module: Bytes|
-    deriver_modules(module, own).map(|reached: ReachedModule| reached.name);
+    deriver_modules(module, own).map(|module: DeriverModule| module.name);
   assert_eq(reach(Map::new(), b"std.derive.map"), []);
   let own = Map::new().insert(
     b"app.deriver",
@@ -1063,10 +1081,11 @@ fn codes(r: Result<LoadedProgram, List<Diagnostic>>) -> List<Bytes> =
 
 fn messages(diagnostics: List<Diagnostic>) -> String / {abort.raise} =
   String::of_bytes(
-    diagnostics.fold(b"", |acc: Bytes, diagnostic: Diagnostic| acc.concat(diagnostic.message)),
+    diagnostics.fold(b"", |accumulator: Bytes, diagnostic: Diagnostic|
+      accumulator.concat(diagnostic.message)),
   )
 
-test "a program is the `.ply` files below its root, in path order, each the module its path names" {
+test "a program is the `.ply` files below its directory, in path order, each named as the module its path gives" {
   match loaded_from([
       { path: "p/b.ply", body: b"import a.c (two)\n\nfn main() -> Int = two()\n" },
       { path: "p/a/c.ply", body: b"pub fn two() -> Int = 2\n" },
@@ -1087,7 +1106,7 @@ test "a program is the `.ply` files below its root, in path order, each the modu
   }
 }
 
-test "a module's path sorts before a directory's that it prefixes, as `ply` reads a project" {
+test "a file `a.ply` sorts before the files in directory `a/`, as `ply` orders the files of a project" {
   match loaded_from([
       { path: "p/a/b.ply", body: b"pub fn two() -> Int = 2\n" },
       { path: "p/a.ply", body: b"import a.b (two)\n\nfn main() -> Int = two()\n" },
@@ -1115,7 +1134,7 @@ fn path_dependency(name: String, path: String) -> String =
     ++ path
     ++ "\") }"
 
-test "a path dependency is read from the directory its manifest names, its modules placed after the root's" {
+test "a path dependency is read from the directory its manifest names, and its modules come after the main package's modules" {
   match loaded_from([
       { path: "p/ply.pkg", body: manifest("app", path_dependency("lib", "../lib")) },
       { path: "p/m.ply", body: b"import lib.deep (seven)\n\nfn main() -> Int = seven()\n" },
@@ -1134,7 +1153,7 @@ test "a path dependency is read from the directory its manifest names, its modul
   }
 }
 
-test "a package below the root is its own: read as the dependency it is, and no module of the root" {
+test "a package in a subdirectory of the root is loaded as a dependency, not as modules of the root package" {
   match loaded_from([
       { path: "p/ply.pkg", body: manifest("app", path_dependency("lib", "vendor/lib")) },
       { path: "p/m.ply", body: b"import lib.deep (seven)\n\nfn main() -> Int = seven()\n" },
@@ -1158,7 +1177,7 @@ test "a package below the root is its own: read as the dependency it is, and no 
   }
 }
 
-test "a dependency's module that does not check is labelled in its own file" {
+test "an error in a dependency's module is reported against the dependency's own file" {
   match loaded_from([
       { path: "p/ply.pkg", body: manifest("app", path_dependency("lib", "../lib")) },
       { path: "p/m.ply", body: b"import lib.deep (seven)\n\nfn main() -> Int = seven()\n" },
@@ -1167,8 +1186,8 @@ test "a dependency's module that does not check is labelled in its own file" {
     ]) {
     Ok(_) -> panic("the dependency rejects"),
     Err(diagnostics) -> {
-      let labelled = diagnostics.fold([], |acc: List<Int>, d: Diagnostic|
-        acc.concat(d.labels.map(|l: Label| l.module)));
+      let labelled = diagnostics.fold([], |accumulator: List<Int>, d: Diagnostic|
+        accumulator.concat(d.labels.map(|l: Label| l.module)));
       assert(labelled.len() > 0);
       assert_eq(labelled.filter(|m: Int| m != 1), [])
     },
@@ -1184,7 +1203,7 @@ fn embedding_program_files() -> List<{ path: String, body: Bytes }> =
     { path: "p/hello.txt", body: b"hello" },
   ]
 
-test "a module embeds a file beside it, which its result knows by digest and its unit holds" {
+test "a module can embed a file next to it: the loaded program records the file's digest and the generated C contains its bytes" {
   match loaded_from(embedding_program_files()) {
     Err(diagnostics) -> panic(messages(diagnostics)),
     Ok(l) -> {
@@ -1202,10 +1221,13 @@ test "a module embeds a file beside it, which its result knows by digest and its
 }
 
 fn definition_hash(d: Dump, name: Bytes) -> Option<Bytes> =
-  d.hashes.fold(None, |acc: Option<Bytes>, f: HashTableRow|
-    match f { DefinitionHashRow(r) -> if r.name == name { r.definition } else { acc }, _ -> acc })
+  d.hashes.fold(None, |accumulator: Option<Bytes>, f: HashTableRow|
+    match f {
+      DefinitionHashRow(r) -> if r.name == name { r.definition } else { accumulator },
+      _ -> accumulator,
+    })
 
-test "a program held in memory embeds the file its embed names by digest, as one read from disk" {
+test "a program given in memory embeds the file its `embed` names by digest, with the same result as a program read from disk" {
   let digest = b"hello".blake3();
   let files = [
     {
@@ -1244,7 +1266,7 @@ test "a program held in memory embeds the file its embed names by digest, as one
   )
 }
 
-test "an embed whose file reads otherwise once the program is checked is rejected, not emitted" {
+test "an embedded file whose contents change between two reads during checking is rejected instead of emitted" {
   let tree = fs::mem_of(embedding_program_files());
   let loaded = handle {
     forbid_derivers(|| load[t]("p"))
@@ -1267,11 +1289,11 @@ test "an embed whose file reads otherwise once the program is checked is rejecte
   assert_eq(codes(loaded), [b"E0146"]);
   assert_eq(
     messages(match loaded { Ok(_) -> [], Err(diagnostics) -> diagnostics }),
-    "`hello.txt`, which `m` embeds, could not be embedded",
+    "`hello.txt`, which `m` embeds, could not be embedded because it changed after the program was checked",
   )
 }
 
-test "a shipped module a program imports embeds a data file the binary holds" {
+test "a standard library module that a program imports can embed a data file shipped inside the `ply` binary" {
   let tree = fs::mem_of([
     { path: "p/m.ply", body: b"import std.words (list)\n\nfn main() -> Int = list().len()\n" },
   ]);
@@ -1305,7 +1327,7 @@ test "a shipped module a program imports embeds a data file the binary holds" {
   assert_eq(codes(over(None)), [b"E0146"])
 }
 
-test "a shipped module is placed as the load read it, what a module importing it reads in place" {
+test "a standard library module is loaded from its shipped source, and a module that imports it sees that source after `imported` is applied to it" {
   let whole = b"/// Two.\npub fn count() -> Int = 2\n\ntest \"two\" {\n  assert_eq(count(), 2)\n}\n";
   let tree = fs::mem_of([
     { path: "p/m.ply", body: b"import std.words (count)\n\nfn main() -> Int = count()\n" },
@@ -1334,7 +1356,7 @@ test "a shipped module is placed as the load read it, what a module importing it
   }
 }
 
-test "a law over a sort it leaves uninterpreted loads, its body lowered as a generic body as it stands" {
+test "a law over an unconstrained type variable loads, and its body is lowered like a generic function body" {
   match loaded_from([
       {
         path: "p/m.ply",
@@ -1358,7 +1380,7 @@ test "a program that does not check is rejected with what the checker said" {
   assert(messages.len() > 0 && messages.filter(|c: Bytes| c == b"E0502").len() == 0)
 }
 
-test "a root module that claims a built-in package's prefix is rejected, the bare root among them" {
+test "a root module whose name starts with a built-in package's prefix is rejected, including a module named exactly `std`" {
   ["p/std.ply", "p/std/json.ply", "p/compiler.ply", "p/compiler/front.ply"].fold(
     (),
     |u: Unit, path: String|

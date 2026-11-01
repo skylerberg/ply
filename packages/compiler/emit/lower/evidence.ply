@@ -2,9 +2,9 @@ import compiler.syntax.parsing (Span)
 import compiler.check.types (Type, Effects, Effect, Resource, NamedResource, SingletonResource,
                              ResourceVariable, AnyResource, Scheme, int_type, no_effects)
 import compiler.check.infer.checker (simulated_effect_names)
-import compiler.emit.code (Code, CodeLabel, CodeVar, NDefinition, NBuiltin, CodePerform, CodeLambda,
-                           CodeSimulate, CodeHandle, CodeClause, is_label_binder, code_children,
-                           labels_among)
+import compiler.emit.code (Code, CodeLabel, CodeVariable, NDefinition, NBuiltin, CodePerform,
+                           CodeLambda, CodeSimulate, CodeHandle, CodeClause, is_label_binder,
+                           code_children, labels_among)
 import compiler.emit.keys (RootKey, EntryPoint, Evidence, key_effects, unspecialised)
 import compiler.emit.evidence (EffectsEvidence, KeyedEvidence, effects_evidence, declared_effects,
                                offset_labels, passed_label_count, renumber_labels, key_effects_of,
@@ -12,10 +12,10 @@ import compiler.emit.evidence (EffectsEvidence, KeyedEvidence, effects_evidence,
                                max_evidence_params, evidence_param_count, evidence_array_type,
                                evidence_array_of, effects_descriptor_type)
 import compiler.emit.representations (Definition)
-import compiler.emit.typed_ir (Representation, AsInt, AsImmediate, Var, Arg, VarOperand, IntOperand,
-                               ZeroOperand, Op, OfHandling, Static, Convention, BorrowedParam,
-                               reads)
-import compiler.emit.typed_ir.handling (HandleOp, WordArray, WordAt, SchedulerEvidence,
+import compiler.emit.typed_ir (Representation, AsInt, AsImmediate, Variable, Arg, VariableOperand,
+                               IntOperand, ZeroOperand, OperationCall, OfHandling, Static,
+                               Convention, BorrowedParam, reads)
+import compiler.emit.typed_ir.handling (HandleOperation, WordArray, WordAt, SchedulerEvidence,
                                         UnhandledEvidence)
 import compiler.emit.typed_ir.statics (StaticLayout, StaticWord, StaticWords, RawWord, FieldWord)
 import compiler.emit.lower.module_context (ModuleContext)
@@ -28,17 +28,21 @@ pub type EvidenceParameters = {
   unfilled: Bool,
 }
 
-pub fn evidence_parameters(s: ModuleContext, key: RootKey) -> EvidenceParameters / {abort.raise} =
-  match s.definitions.fold(None, |acc: Option<Scheme>, d: Definition|
-      if d.root == unspecialised(key) { d.scheme } else { acc }) {
+pub fn evidence_parameters(s: ModuleContext, key: RootKey) -> EvidenceParameters =
+  match s.definitions.fold(None, |accumulator: Option<Scheme>, d: Definition|
+      if d.root == unspecialised(key) { d.scheme } else { accumulator }) {
     None -> { declared: [], labels: 0, hidden: 0, unfilled: false },
-    Some(sc) -> {
+    Some(scheme) -> {
       let effect_evidence = key_effects(key);
       {
-        declared: effects_evidence(declared_effects(sc), effect_evidence, sc.label_variables.len()),
-        labels: sc.label_variables.len(),
+        declared: effects_evidence(
+          declared_effects(scheme),
+          effect_evidence,
+          scheme.label_variables.len(),
+        ),
+        labels: scheme.label_variables.len(),
         hidden: passed_label_count(effect_evidence),
-        unfilled: sc.effect_variables.len() > effect_evidence.len(),
+        unfilled: scheme.effect_variables.len() > effect_evidence.len(),
       }
     },
   }
@@ -63,7 +67,7 @@ pub fn evidence_parameter_types(h: EvidenceParameters) -> List<Type> =
 pub fn enter_root_body(
   context: Context,
   st: Lowering,
-  params: List<Var>,
+  params: List<Variable>,
   declared: Int,
   h: EvidenceParameters,
 ) -> { context: Context, st: Lowering } = {
@@ -79,8 +83,8 @@ pub fn enter_root_body(
       words: read.words,
       label_values: labels_among(params.take(declared), h.labels).concat(
         params.drop(declared).take(h.hidden),
-      ).map(|v: Var| Some(VarOperand(v))),
-      evidence_arguments: params.drop(declared).map(VarOperand),
+      ).map(|v: Variable| Some(VariableOperand(v))),
+      evidence_arguments: params.drop(declared).map(VariableOperand),
     },
     st: read.st,
   }
@@ -92,29 +96,34 @@ pub fn entry_body_start(
 ) -> { context: Context, st: Lowering } =
   match o.context.key {
     EntryPoint(_) -> {
-      let effects = performs.listed.fold([], |acc: List<Bytes>, a: Effect|
-        if !needs_evidence(a.effect) || acc.contains(a.effect) { acc } else { acc.push(a.effect) });
-      let held = effects.fold(
+      let effects = performs.listed.fold([], |accumulator: List<Bytes>, a: Effect|
+        if !needs_evidence(a.effect) || accumulator.contains(a.effect) { accumulator }
+        else { accumulator.push(a.effect) });
+      let entry_evidence = effects.fold(
         { st: o.st, made: [], words: [] },
-        |acc: { st: Lowering, made: List<EntryObject>, words: List<EvidenceWord> }, e: Bytes| {
-          let op = entry_object(e);
-          let w = match acc.made.find(|m: EntryObject| m.op == op) {
-            Some(m) -> { st: acc.st, made: acc.made, arg: m.arg },
+        |accumulator: { st: Lowering, made: List<EntryObject>, words: List<EvidenceWord> }, e: Bytes| {
+          let operation = entry_object(e);
+          let w = match accumulator.made.find(|m: EntryObject| m.operation == operation) {
+            Some(m) -> { st: accumulator.st, made: accumulator.made, arg: m.arg },
             None -> {
               let b = bound_as(
-                acc.st,
+                accumulator.st,
                 evidence_type(),
                 AsImmediate,
-                Op({ op: OfHandling(op), args: [], uses: reads(0) }),
+                OperationCall({ operation: OfHandling(operation), args: [], uses: reads(0) }),
                 o.context.body.span,
               );
-              { st: b.st, made: acc.made.push({ op: op, arg: b.arg }), arg: b.arg }
+              {
+                st: b.st,
+                made: accumulator.made.push({ operation: operation, arg: b.arg }),
+                arg: b.arg,
+              }
             },
           };
           {
             st: w.st,
             made: w.made,
-            words: acc.words.push({
+            words: accumulator.words.push({
               evidence: { effect: e, resource: AnyResource },
               word: w.arg,
               inherited: false,
@@ -123,71 +132,79 @@ pub fn entry_body_start(
           }
         },
       );
-      { context: { ..o.context, words: held.words.concat(o.context.words) }, st: held.st }
+      {
+        context: { ..o.context, words: entry_evidence.words.concat(o.context.words) },
+        st: entry_evidence.st,
+      }
     },
     _ -> o,
   }
 
-type EntryObject = { op: HandleOp, arg: Arg }
+type EntryObject = { operation: HandleOperation, arg: Arg }
 
-fn entry_object(name: Bytes) -> HandleOp =
+fn entry_object(name: Bytes) -> HandleOperation =
   if name == b"sim" || simulated_effect_names().contains(name) { SchedulerEvidence }
   else { UnhandledEvidence }
 
 pub fn read_evidence_words(
   st: Lowering,
-  carried: List<Var>,
+  carried: List<Variable>,
   own: List<EffectsEvidence>,
   at: Span,
 ) -> { st: Lowering, words: List<EvidenceWord> } = {
-  let read = if own.len() <= max_evidence_params() { { st: st, words: carried.map(VarOperand) } }
-  else {
+  let read = if own.len() <= max_evidence_params() {
+    { st: st, words: carried.map(VariableOperand) }
+  } else {
     match carried.at(0) {
       None -> { st: st, words: [] },
       Some(array) ->
         range(0, own.len()).fold(
           { st: st, words: [] },
-          |acc: { st: Lowering, words: List<Arg> }, i: Int| {
+          |accumulator: { st: Lowering, words: List<Arg> }, i: Int| {
             let w = bound_as(
-              acc.st,
+              accumulator.st,
               evidence_type(),
               AsImmediate,
-              Op({ op: OfHandling(WordAt(i)), args: [VarOperand(array)], uses: reads(1) }),
+              OperationCall({
+                operation: OfHandling(WordAt(i)),
+                args: [VariableOperand(array)],
+                uses: reads(1),
+              }),
               at,
             );
-            { st: w.st, words: acc.words.push(w.arg) }
+            { st: w.st, words: accumulator.words.push(w.arg) }
           },
         ),
     }
   };
   {
     st: read.st,
-    words: range(0, own.len()).fold([], |acc: List<EvidenceWord>, i: Int|
+    words: range(0, own.len()).fold([], |accumulator: List<EvidenceWord>, i: Int|
       match own.at(i) {
         Some(o) ->
-          acc.push({
+          accumulator.push({
             evidence: o.evidence,
             word: match read.words.at(i) { Some(a) -> a, None -> ZeroOperand(AsImmediate) },
             inherited: o.from_variable,
             handled: false,
           }),
-        None -> acc,
+        None -> accumulator,
       }),
   }
 }
 
 pub fn performed_by(codes: List<Code>) -> Effects =
-  codes.fold(no_effects(), |acc: Effects, c: Code|
+  codes.fold(no_effects(), |accumulator: Effects, c: Code|
     match c.node {
       CodeLambda(l) -> {
         let r = l.effects;
         {
-          listed: r.listed.fold(acc.listed, |xs: List<Effect>, a: Effect|
+          listed: r.listed.fold(accumulator.listed, |xs: List<Effect>, a: Effect|
             if xs.contains(a) { xs } else { xs.push(a) }),
-          variable: match acc.variable { Some(t) -> Some(t), None -> r.variable },
+          variable: match accumulator.variable { Some(t) -> Some(t), None -> r.variable },
         }
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 
 pub fn builtin_effects(function: Code) -> Effects =
@@ -206,8 +223,8 @@ fn effects_of(c: Code) -> { effect_arguments: List<Effects>, listed: List<Effect
     CodeHandle(h) ->
       {
         effect_arguments: h.clauses.fold(
-          match h.ret { Some(r) -> [h.effects, r.effects], None -> [h.effects] },
-          |acc: List<Effects>, cl: CodeClause| acc.push(cl.effects),
+          match h.return_clause { Some(r) -> [h.effects, r.effects], None -> [h.effects] },
+          |accumulator: List<Effects>, clause: CodeClause| accumulator.push(clause.effects),
         ),
         listed: [],
       },
@@ -225,19 +242,19 @@ fn static_effects(r: Effects) -> Bool =
   r.variable == None
     && r.listed.all(|a: Effect| match a.resource { ResourceVariable(_) -> false, _ -> true })
 
-pub fn labels_read(context: Context, c: Code, acc: List<Int>) -> List<Int> = {
+pub fn labels_read(context: Context, c: Code, accumulator: List<Int>) -> List<Int> = {
   let places = |ws: List<EffectsEvidence>|
     ws.fold([], |out: List<Int>, o: EffectsEvidence|
       match o.evidence.resource { ResourceVariable(p) -> out.push(p), _ -> out });
   let own = effects_of(c);
-  let held = own.effect_arguments.fold(
+  let argument_labels = own.effect_arguments.fold(
     own.listed.fold([], |out: List<Int>, a: Effect|
       match a.resource { ResourceVariable(p) -> out.push(p), _ -> out }),
     |out: List<Int>, r: Effects|
       out.concat(places(effects_evidence(r, context.effect_evidence, context.labels))),
   );
   let named = match c.node {
-    CodeVar(v) ->
+    CodeVariable(v) ->
       range(0, context.label_names.len()).filter(|i: Int|
         match context.label_names.at(i) {
           Some(n) -> Bytes::concat_all([b"[", n, b"]"]) == v.name,
@@ -246,34 +263,34 @@ pub fn labels_read(context: Context, c: Code, acc: List<Int>) -> List<Int> = {
     _ -> [],
   };
   code_children(c).fold(
-    held.concat(named).fold(acc, |out: List<Int>, p: Int|
+    argument_labels.concat(named).fold(accumulator, |out: List<Int>, p: Int|
       if out.contains(p) { out } else { out.push(p) }),
     |out: List<Int>, x: Code| labels_read(context, x, out),
   )
 }
 
-pub fn words_of(context: Context, effects: Effects) -> List<EffectsEvidence> / {abort.raise} =
+pub fn words_of(context: Context, effects: Effects) -> List<EffectsEvidence> =
   effects_evidence(effects, context.effect_evidence, context.labels)
 
 pub fn evidence_for(context: Context, wanted: List<EffectsEvidence>) -> List<Arg> =
   wanted.fold(
     { out: [], seen: [] },
-    |acc: { out: List<Arg>, seen: List<Evidence> }, w: EffectsEvidence|
+    |accumulator: { out: List<Arg>, seen: List<Evidence> }, w: EffectsEvidence|
       if w.from_variable {
-        let n = acc.seen.filter(|e: Evidence| e == w.evidence).len();
+        let n = accumulator.seen.filter(|e: Evidence| e == w.evidence).len();
         let alike = context.words.filter(|x: EvidenceWord|
           x.inherited && !x.handled && x.evidence == w.evidence);
         {
-          out: acc.out.push(match alike.at(n) {
+          out: accumulator.out.push(match alike.at(n) {
             Some(x) -> x.word,
             None -> ZeroOperand(AsImmediate),
           }),
-          seen: acc.seen.push(w.evidence),
+          seen: accumulator.seen.push(w.evidence),
         }
       } else {
         {
-          ..acc,
-          out: acc.out.push(
+          ..accumulator,
+          out: accumulator.out.push(
             match context.words.find(|x: EvidenceWord|
                 !x.inherited && covers(x.evidence, w.evidence)) {
               Some(x) -> x.word,
@@ -335,19 +352,19 @@ pub fn scheme_evidence_arguments(
 ) -> EvidenceArguments / {abort.raise} =
   match scheme {
     None -> { effect_evidence: [], labels: [], words: [], wanted: [] },
-    Some(sc) -> {
+    Some(known_scheme) -> {
       let given = filled.map(|r: Effects|
         effects_evidence(r, context.effect_evidence, context.labels));
       let k = renumber_labels(
         given.map(|ws: List<EffectsEvidence>| ws.map(|o: EffectsEvidence| o.evidence)),
       );
-      let effects = declared_effects(sc);
-      let own_labels = sc.label_variables.len();
-      let written = effects.listed.fold([], |acc: List<EvidencePair>, a: Effect|
-        if !needs_evidence(a.effect) { acc } else {
+      let effects = declared_effects(known_scheme);
+      let own_labels = known_scheme.label_variables.len();
+      let written = effects.listed.fold([], |accumulator: List<EvidencePair>, a: Effect|
+        if !needs_evidence(a.effect) { accumulator } else {
           let callee = { effect: a.effect, resource: a.resource };
-          if acc.any(|p: EvidencePair| p.callee == callee) { acc } else {
-            acc.push({
+          if accumulator.any(|p: EvidencePair| p.callee == callee) { accumulator } else {
+            accumulator.push({
               callee: callee,
               wanted: {
                 evidence: {
@@ -363,17 +380,17 @@ pub fn scheme_evidence_arguments(
         None -> [],
         Some(t) -> match ((k.effect_evidence.at(t), given.at(t))) {
           (Some(keys), Some(ws)) ->
-            keys.fold([], |acc: List<EvidencePair>, x: KeyedEvidence|
+            keys.fold([], |accumulator: List<EvidencePair>, x: KeyedEvidence|
               match ws.at(x.from) {
                 Some(o) ->
-                  acc.push({
+                  accumulator.push({
                     callee: match offset_labels([x.key], own_labels).at(0) {
                       Some(e) -> e,
                       None -> x.key,
                     },
                     wanted: o,
                   }),
-                None -> acc,
+                None -> accumulator,
               }),
           _ -> [],
         },
@@ -402,7 +419,11 @@ pub fn passed_evidence_arguments(
       words.st,
       evidence_array_type(),
       AsImmediate,
-      Op({ op: OfHandling(WordArray), args: words.args, uses: reads(words.args.len()) }),
+      OperationCall({
+        operation: OfHandling(WordArray),
+        args: words.args,
+        uses: reads(words.args.len()),
+      }),
       at,
     );
     { st: laid.st, args: h.labels.push(laid.arg) }
@@ -418,11 +439,16 @@ pub fn captured_evidence_for(
   let words = fill_missing_evidence(st, evidence_for(context, own), at);
   {
     st: words.st,
-    words: range(0, own.len()).fold([], |acc: List<EvidenceWord>, k: Int|
+    words: range(0, own.len()).fold([], |accumulator: List<EvidenceWord>, k: Int|
       match ((own.at(k), words.args.at(k))) {
         (Some(o), Some(w)) ->
-          acc.push({ evidence: o.evidence, word: w, inherited: o.from_variable, handled: false }),
-        _ -> acc,
+          accumulator.push({
+            evidence: o.evidence,
+            word: w,
+            inherited: o.from_variable,
+            handled: false,
+          }),
+        _ -> accumulator,
       }),
   }
 }
@@ -437,14 +463,14 @@ pub fn fill_missing_evidence(
       st,
       evidence_type(),
       AsImmediate,
-      Op({ op: OfHandling(SchedulerEvidence), args: [], uses: reads(0) }),
+      OperationCall({ operation: OfHandling(SchedulerEvidence), args: [], uses: reads(0) }),
       at,
     );
     { st: b.st, args: words.map(|w: Arg| if w == ZeroOperand(AsImmediate) { b.arg } else { w }) }
   }
 
 pub fn label_codes(d: Definition, codes: List<Code>) -> List<Code> =
-  match d.scheme { Some(sc) -> labels_among(codes, sc.label_variables.len()), None -> [] }
+  match d.scheme { Some(scheme) -> labels_among(codes, scheme.label_variables.len()), None -> [] }
 
 fn resolve_label_resource(
   context: Context,
@@ -462,7 +488,7 @@ fn resolve_label_resource(
 pub fn label_resource(context: Context, c: Code) -> Resource / {abort.raise} =
   match c.node {
     CodeLabel(n) -> NamedResource(n),
-    CodeVar(v) -> if !is_label_binder(v.name) { unknown_resource() } else {
+    CodeVariable(v) -> if !is_label_binder(v.name) { unknown_resource() } else {
       let name = v.name.slice(1, v.name.len() - 1);
       match range(0, context.label_names.len()).find(|i: Int|
           context.label_names.at(i) == Some(name)) {
@@ -495,31 +521,32 @@ pub fn wanted_evidence_arguments(
   at: Span,
 ) -> { st: Lowering, args: List<Arg> } / {abort.raise} = {
   let words = fill_missing_evidence(st, evidence_for(context, wanted), at);
-  let left = wanted.fold([], |acc: List<Arg>, o: EffectsEvidence|
+  let left = wanted.fold([], |accumulator: List<Arg>, o: EffectsEvidence|
     match o.evidence.resource {
-      ResourceVariable(p) -> acc.push(label_value(context, p)),
-      _ -> acc,
+      ResourceVariable(p) -> accumulator.push(label_value(context, p)),
+      _ -> accumulator,
     });
   let d = static_added(words.st, effects_descriptor(wanted.map(|o: EffectsEvidence| o.evidence)));
-  let desc = bound_as(d.st, effects_descriptor_type(), AsImmediate, Static(d.name), at);
+  let descriptor = bound_as(d.st, effects_descriptor_type(), AsImmediate, Static(d.name), at);
   let all = words.args.concat(left);
-  if all.len() == 0 { { st: desc.st, args: [desc.arg, ZeroOperand(AsImmediate)] } } else {
+  if all.len() == 0 { { st: descriptor.st, args: [descriptor.arg, ZeroOperand(AsImmediate)] } }
+  else {
     let laid = bound_as(
-      desc.st,
+      descriptor.st,
       evidence_array_type(),
       AsImmediate,
-      Op({ op: OfHandling(WordArray), args: all, uses: reads(all.len()) }),
+      OperationCall({ operation: OfHandling(WordArray), args: all, uses: reads(all.len()) }),
       at,
     );
-    { st: laid.st, args: [desc.arg, laid.arg] }
+    { st: laid.st, args: [descriptor.arg, laid.arg] }
   }
 }
 
 pub fn effects_descriptor(ws: List<Evidence>) -> StaticLayout =
   StaticWords(
     [RawWord(ws.len())].concat(
-      ws.fold([], |acc: List<StaticWord>, w: Evidence|
-        acc.push(FieldWord(w.effect)).push(match w.resource {
+      ws.fold([], |accumulator: List<StaticWord>, w: Evidence|
+        accumulator.push(FieldWord(w.effect)).push(match w.resource {
           SingletonResource -> RawWord(0 - 1),
           AnyResource -> RawWord(0 - 2),
           ResourceVariable(_) -> RawWord(0 - 3),
@@ -540,8 +567,9 @@ pub fn label_values_at(
     })
 
 pub fn caller_filled_labels(own: List<EffectsEvidence>) -> List<Int> =
-  own.fold([], |acc: List<Int>, o: EffectsEvidence|
+  own.fold([], |accumulator: List<Int>, o: EffectsEvidence|
     match o.evidence.resource {
-      ResourceVariable(p) -> if acc.contains(p) { acc } else { acc.push(p) },
-      _ -> acc,
+      ResourceVariable(p) -> if accumulator.contains(p) { accumulator }
+      else { accumulator.push(p) },
+      _ -> accumulator,
     })

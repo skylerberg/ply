@@ -1,19 +1,6 @@
-//! A multi-route HTTP service that sells parts, over postgres or an in-memory fake of it, whose
-//! types are its documentation — and which can be started, watched, and stopped without losing a
-//! request. How it runs is configuration (`config` below):
-//!
-//!   ply run examples/service.ply --config-schema service.config \
-//!     --set SERVICE_API_KEY=… --set SERVICE_STORE=memory --set SERVICE_ACCEPT=task-per-connection
-//!
-//! and over TLS it is given a credential and told its name: `--tls service=CERT,KEY --set
-//! SERVICE_TLS=service`.
-
 import std.net (net, send_all)
 import std.net
 import std.ip
-// Twice, and both are needed: the selective import binds the effect name, so that effects and a
-// perform can both say `db.query[items]`, and the plain import binds the module, so that a type
-// can say `sql::Answer` and a call can say `db::transaction`.
 import std.db
 import std.sql
 import std.db (db, with_server)
@@ -25,7 +12,6 @@ import std.http
 import std.seq
 import std.seq (Seq)
 import std.router
-// Tracing, configuration and the stop signal, each twice for the reason above.
 import std.trace
 import std.trace (trace)
 import std.config
@@ -34,29 +20,13 @@ import std.signal
 import std.signal (signal)
 import std.process (process)
 
-// --- The store ----------------------------------------------------------------
-
-/// The service used to declare `effect log { write note(line: String) -> Unit }`, a singleton
-/// effect for the one audit trail it had.
 effect set Store = {db.query[items], db.execute[items], db.query[orders], db.execute[orders], db.returning[orders], db.begin, db.commit, db.abort, db.rollback}
 
-/// Placing an order and cancelling one both read the shelf, write the shelf, read the order book,
-/// write the order book, open a transaction, record on the order book's channel and record on the
-/// shelf's.
 effect set Service = {Store, trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items]}
 
-/// What the *serving* layer performs, which is strictly more: the request span on the `http`
-/// channel, the credential the API-key check reads, and the stop flag the readiness route consults.
 effect set Serving = {Service, trace.enter[http], trace.exit[http], trace.event[http], config.secret[credentials], signal.stopping}
 
-/// What the *entry point* performs, which is `Serving` without the database: a run reads where to
-/// reach its database and serves every `db` operation from it, so no effects name `db` and a host
-/// needs no database of its own.
-effect set Running = {trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items], trace.enter[http], trace.exit[http], trace.event[http], config.get[server], config.secret[credentials], signal.stopping, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.write, clock.read, process.out[proc]}  // The driver reaches its server over connections of its own, which is what `with_server` performs.
-// A task per connection, when the settings ask for one.
-// The line that says which port the service landed on.
-
-// --- What the service sells --------------------------------------------------------
+effect set Running = {trace.enter[orders], trace.exit[orders], trace.event[orders], trace.count[orders], trace.event[items], trace.enter[http], trace.exit[http], trace.event[http], config.get[server], config.secret[credentials], signal.stopping, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], net.connect[link], net.start_tls[link], net.peer_certificate[link], net.send_secret[link], net.send[link], net.recv[link], net.close[link], entropy.next, task.write, clock.read, process.out[proc]}
 
 pub type Item = { sku: String, name: String, price: Decimal, on_hand: Int }
 
@@ -66,18 +36,14 @@ pub type State = | Open | Cancelled
 
 pub type Order = { id: Int, customer: String, lines: List<Line>, total: Decimal, state: State }
 
-/// What a client posts to `/orders`.
 pub type Placement = { customer: String, lines: List<Line> }
 
-/// One shape for every error, so a client parses one document whatever went wrong.
 pub type Problem = { error: String, detail: String }
 
 pub type Health = { service: String, route_count: Int }
 
-/// The response to a readiness probe, and it is deliberately not `Health`.
 pub type Readiness = { service: String, store: String, stopping: Bool }
 
-// The whole wire format, and nobody wrote it.
 derive json for Item
 derive json for Line
 derive json for State
@@ -87,16 +53,9 @@ derive json for Problem
 derive json for Health
 derive json for Readiness
 
-// The storage format, which nobody wrote either: a column per field, and a field that is not a
-// scalar is a `jsonb` document read through its own JSON codec, so what the service stores and what
-// it sends are one text.
 derive sql for Item
 derive sql for Order
 
-// --- The schema, which is a value ------------------------------------------------
-
-/// A `const fn` of `std.sql.Schema`, so the check holds every statement the service runs to it: a
-/// column misspelled in one is an error before anything runs.
 pub const fn schema() -> sql::Schema =
   {
     tables: [
@@ -135,34 +94,24 @@ pub const fn schema() -> sql::Schema =
     ],
   }
 
-// --- The configuration, which is also a value -----------------------------------------
-
 pub fn port_key() -> String = "SERVICE_PORT"
 
 pub fn connections_key() -> String = "SERVICE_CONNECTIONS"
 
 pub fn api_key() -> String = "SERVICE_API_KEY"
 
-/// Where the service's database is. Optional because the fake has no database: a service over
-/// postgres will not start without it, which is what `configured_url` below is for.
 pub fn database_key() -> String = "SERVICE_DATABASE"
 
-/// Which store serves the routes: `postgres`, or `memory` for the fake.
 pub fn store_key() -> String = "SERVICE_STORE"
 
-/// The credential to listen with, as `--tls NAME=CERT,KEY` named it; plaintext when unset.
 pub fn tls_key() -> String = "SERVICE_TLS"
 
-/// Which loop serves connections: `sequential`, or `task-per-connection`.
 pub fn accept_key() -> String = "SERVICE_ACCEPT"
 
 pub fn config() -> config::ConfigSpec =
   config::spec([
-    // A default, so a developer runs `ply run --config-schema service.config` and gets a service
-    // on 8137 without a word of configuration.
     config::with_default(port_key(), config::SInt, "8137"),
     config::with_default(connections_key(), config::SInt, "64"),
-    // A secret is readable only through `config.secret`, and never printed where it came from.
     config::required(api_key(), config::SSecret),
     config::optional(database_key(), config::SText),
     config::with_default(store_key(), config::SText, "postgres"),
@@ -170,14 +119,12 @@ pub fn config() -> config::ConfigSpec =
     config::with_default(accept_key(), config::SText, "sequential"),
   ])
 
-/// The port a run was told to listen on, or why it cannot start. Port 0 asks for any free one, and
-/// the service says which it got once it listens.
 pub fn port_of(configured: Option<String>) -> Result<Int, String> / {abort.raise} =
   match configured {
     None ->
       Err(
         port_key() ++ " is unset; pass `--config-schema service.config` so the run "
-          ++ "rejects at start-up, or `--set "
+          ++ "fails at start-up if the setting is missing, or pass `--set "
           ++ port_key()
           ++ "=8137`",
       ),
@@ -189,7 +136,6 @@ pub fn port_of(configured: Option<String>) -> Result<Int, String> / {abort.raise
     },
   }
 
-/// The same shape for the connection budget.
 pub fn connections_of(configured: Option<String>) -> Result<Int, String> / {abort.raise} =
   match configured {
     None -> Ok(64),
@@ -201,11 +147,8 @@ pub fn connections_of(configured: Option<String>) -> Result<Int, String> / {abor
 
 pub type Storage = | Postgres | Memory
 
-/// One connection served at a time, a task for each, or a pool of workers that sheds load past a
-/// bounded queue and drains at a stop.
 pub type Accept = | Sequential | TaskPerConnection | Pooled(http::Shedding)
 
-/// How a run serves the service, read once at start-up.
 pub type Settings = {
   port: Int,
   connections: Int,
@@ -214,7 +157,6 @@ pub type Settings = {
   accept: Accept,
 }
 
-/// Every setting a run was given, or the first reason not to start; an unset one takes its default.
 pub fn settings_of(
   port: Option<String> = None,
   connections: Option<String> = None,
@@ -258,48 +200,38 @@ fn accept_of(configured: Option<String>) -> Result<Accept, String> =
       ),
   }
 
-// --- The statements ---------------------------------------------------------------
-
 fn items_all() -> sql::Statement =
-  sql::stmt("select sku, name, price, on_hand from items order by sku")
+  sql::statement_of("select sku, name, price, on_hand from items order by sku")
 
-/// The readiness probe, and the cheapest statement in the file: one aggregate over one table, no
-/// rows on the wire, no parameters to bind.
-fn count_items_statement() -> sql::Statement = sql::stmt("select count(*) from items")
+fn count_items_statement() -> sql::Statement = sql::statement_of("select count(*) from items")
 
 fn items_in_stock() -> sql::Statement =
-  sql::stmt("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
+  sql::statement_of("select sku, name, price, on_hand from items where on_hand > $1 order by sku")
 
 fn item_by_sku() -> sql::Statement =
-  sql::stmt("select sku, name, price, on_hand from items where sku = $1")
+  sql::statement_of("select sku, name, price, on_hand from items where sku = $1")
 
 fn item_insert() -> sql::Statement =
-  sql::stmt("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
+  sql::statement_of("insert into items (sku, name, price, on_hand) values ($1, $2, $3, $4)")
 
-/// The reservation, and the only interesting statement in the file.
 fn item_reserve() -> sql::Statement =
-  sql::stmt("update items set on_hand = $1 where sku = $2 and on_hand = $3")
+  sql::statement_of("update items set on_hand = $1 where sku = $2 and on_hand = $3")
 
 fn orders_all() -> sql::Statement =
-  sql::stmt("select id, customer, lines, total, state from orders order by id")
+  sql::statement_of("select id, customer, lines, total, state from orders order by id")
 
 fn order_by_id() -> sql::Statement =
-  sql::stmt("select id, customer, lines, total, state from orders where id = $1")
+  sql::statement_of("select id, customer, lines, total, state from orders where id = $1")
 
-/// The id is the database's.
 fn order_insert() -> sql::Statement =
-  sql::stmt(
+  sql::statement_of(
     "insert into orders (customer, lines, total, state) values ($1, $2, $3, $4)"
       ++ " returning id, customer, lines, total, state",
   )
 
-/// No compare-and-set on `state`, and the reason is worth writing down because it is a design
-/// decision the fake forced rather than a shortcut.
-fn order_cancel() -> sql::Statement = sql::stmt("update orders set state = $1 where id = $2")
+fn order_cancel() -> sql::Statement =
+  sql::statement_of("update orders set state = $1 where id = $2")
 
-// --- Reading a result set ----------------------------------------------------------
-
-/// The rows a fetch read, or the problem a client is told of in their place.
 fn listed<a>(
   read: Result<List<a>, sql::FetchError>,
 ) -> Result<List<a>, http::Response<| {}>> / {abort.raise} =
@@ -307,7 +239,7 @@ fn listed<a>(
     Ok(xs) -> Ok(xs),
     Err(sql::Rejected(e)) -> Err(unavailable(e)),
     Err(sql::UnexpectedCount(_)) ->
-      Err(problem(500, "unreadable result", "a query returned a count")),
+      Err(problem(500, "unreadable result", "the query returned a row count instead of rows")),
     Err(sql::InvalidRow(e)) ->
       Err(
         problem(
@@ -320,7 +252,6 @@ fn listed<a>(
 
 fn head_of<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }
 
-/// A SQLSTATE the service has no response for.
 fn unavailable(e: sql::DbError) -> http::Response<| {}> / {abort.raise} =
   problem(503, "the store is unavailable", e.code)
 
@@ -337,8 +268,6 @@ fn order_row_of(
   Ok(head_of(os))
 }
 
-/// `lines` and `state` are `jsonb`, so a parameter for either is a `Json` value built by the codec
-/// this file already derived.
 fn lines_param(lines: List<Line>) -> sql::Param / {abort.raise} = {
   let c = json::list_json(line_json());
   sql::JsonParameter((c.encode)(lines))
@@ -349,27 +278,22 @@ fn state_param(s: State) -> sql::Param / {abort.raise} = {
   sql::JsonParameter((c.encode)(s))
 }
 
-// --- The business, which touches nothing ----------------------------------------
-
 pub fn item_named(shelf: List<Item>, sku: String) -> Option<Item> =
   shelf.fold(None, |found: Option<Item>, i: Item| if i.sku == sku { Some(i) } else { found })
 
 pub fn price_of(shelf: List<Item>, sku: String) -> Decimal =
   match item_named(shelf, sku) { Some(i) -> i.price, None -> 0m }
 
-/// `Decimal`, because money is exact and not binary.
 pub fn total_of(shelf: List<Item>, lines: List<Line>) -> Decimal =
-  lines.fold(0m, |acc: Decimal, l: Line| acc + Decimal::of_int(l.qty) * price_of(shelf, l.sku))
+  lines.fold(0m, |accumulator: Decimal, l: Line|
+    accumulator + Decimal::of_int(l.qty) * price_of(shelf, l.sku))
 
 pub fn unknown_skus(shelf: List<Item>, lines: List<Line>) -> List<String> =
   lines.filter(|l: Line| item_named(shelf, l.sku) == None).map(|l: Line| l.sku)
 
-/// Summed per sku rather than checked per line, and walked over the shelf rather than over the
-/// order, so a sku named twice is one draw on the shelf and is reported once.
 pub fn short_skus(shelf: List<Item>, lines: List<Line>) -> List<String> =
   shelf.filter(|i: Item| i.on_hand < taken(lines, i.sku)).map(|i: Item| i.sku)
 
-/// A quantity that is not positive is rejected rather than clamped.
 pub fn bad_qty(lines: List<Line>) -> Bool =
   lines.fold(false, |seen: Bool, l: Line| seen || l.qty <= 0)
 
@@ -384,14 +308,11 @@ pub fn draw_down(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(she
 
 pub fn put_back(shelf: List<Item>, lines: List<Line>) -> List<Item> = moved(shelf, lines, -1)
 
-/// There is no `next_id` here any more, and its absence is the point.
 pub fn find_order(orders: List<Order>, id: Int) -> Option<Order> =
   orders.fold(None, |found: Option<Order>, o: Order| if o.id == id { Some(o) } else { found })
 
 pub fn cancelled(o: Order) -> Order =
   { id: o.id, customer: o.customer, lines: o.lines, total: o.total, state: Cancelled }
-
-// --- The route table, which is data ---------------------------------------------
 
 pub type Endpoint =
   | Health
@@ -416,8 +337,6 @@ fn route(
 fn get(pattern: String, e: Endpoint) -> router::Route<Endpoint> / {abort.raise} =
   route(http::Get, pattern, e)
 
-/// `/items/featured` and `/items/{sku}` both match `/items/featured`, and the literal wins —
-/// decided segment by segment, left to right, by the matcher and not by the order of this list.
 pub fn table() -> List<router::Route<Endpoint>> / {abort.raise} =
   [
     get("/health", Health),
@@ -433,18 +352,14 @@ pub fn table() -> List<router::Route<Endpoint>> / {abort.raise} =
     get("/orders/{id:Int}/receipt", Receipt),
   ]
 
-/// Pure, and that is the first thing `ply check --types` prints about this service.
 pub fn route_of(
   method: http::Method,
   path: String,
 ) -> router::RouteResult<Endpoint> / {abort.raise} = router::route(table(), method, path)
 
-// --- Responses ------------------------------------------------------------------
-
 fn field(name: String, value: String) -> { key: String, value: List<String> } =
   { key: name, value: [value] }
 
-/// One entry of a `Fields` map.
 fn text_field(name: String, value: String) -> { key: String, value: trace::Field } =
   { key: name, value: trace::StringField(value) }
 
@@ -453,7 +368,6 @@ fn int_field(name: String, value: Int) -> { key: String, value: trace::Field } =
 
 fn json_headers() -> http::Headers = Map::of_entries([field("content-type", "application/json")])
 
-/// The dictionary is an argument.
 fn json_body<a>(
   status: Int,
   x: a,
@@ -472,23 +386,17 @@ fn text(status: Int, body: Bytes) -> http::Response<| {}> =
   }
 
 fn join(xs: List<String>) -> String =
-  xs.fold("", |acc: String, x: String| if acc == "" { x } else { acc ++ ", " ++ x })
-
-// --- The endpoints ---------------------------------------------------------------
-
-// --- Liveness and readiness, which are two different questions --------------------
+  xs.fold("", |accumulator: String, x: String|
+    if accumulator == "" { x } else { accumulator ++ ", " ++ x })
 
 pub fn health() -> http::Response<| {}> / {abort.raise} =
   json_body(200, { service: "parts", route_count: table().len() }, health_json())
 
-/// 503 while draining, 503 while the store is unreachable, 200 otherwise.
 pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abort.raise} =
   if signal.stopping() { unready("draining", true) } else {
     match db.query[items](count_items_statement(), []) {
       sql::Rows(_) ->
         json_body(200, { service: "parts", store: "reachable", stopping: false }, readiness_json()),
-      // The SQLSTATE is the detail rather than the error, exactly as `unavailable` does it: a
-      // client's action is the same whichever code the server sent, and an operator's is not.
       sql::Failed(e) -> unready(e.code, false),
       sql::Count(_) -> unready("unreadable result", false),
     }
@@ -497,7 +405,6 @@ pub fn ready() -> http::Response<| {}> / {db.query[items], signal.stopping, abor
 fn unready(store: String, stopping: Bool) -> http::Response<| {}> / {abort.raise} =
   json_body(503, { service: "parts", store: store, stopping: stopping }, readiness_json())
 
-/// Also pure: the pages are definitions, not rows, so serving one touches nothing.
 fn pages() -> Map<String, String> =
   Map::of_entries([
     { key: "index", value: "GET /items, GET /orders, POST /orders, DELETE /orders/{id}" },
@@ -517,7 +424,6 @@ pub fn docs(params: Map<String, String>) -> http::Response<| {}> / {abort.raise}
 pub fn list_items() -> http::Response<| {}> / {db.query[items], abort.raise} =
   match shelf() { Err(r) -> r, Ok(rows) -> json_body(200, rows, json::list_json(item_json())) }
 
-/// Everything the shelf is short of.
 pub fn featured() -> http::Response<| {}> / {db.query[items], abort.raise} =
   match listed(db::fetch[items](items_in_stock(), item_row(), [sql::IntParameter(0)])) {
     Err(r) -> r,
@@ -528,7 +434,7 @@ pub fn get_item(
   params: Map<String, String>,
 ) -> http::Response<| {}> / {db.query[items], abort.raise} =
   match params.get("sku") {
-    None -> problem(400, "bad request", "no sku was captured"),
+    None -> problem(400, "bad request", "the request path has no `sku` value"),
     Some(sku) -> match listed(
         db::fetch[items](item_by_sku(), item_row(), [sql::TextParameter(sku)]),
       ) {
@@ -557,15 +463,11 @@ pub fn get_order(
     },
   }
 
-/// `Some` for every route whose pattern declared `{id:Int}`, because nothing else could have
-/// matched.
 fn order_wanted(params: Map<String, String>) -> Result<Int, http::Response<| {}>> / {abort.raise} =
   match router::int_param(params, "id") {
     Some(id) -> Ok(id),
     None -> Err(problem(400, "bad order id", "an order id is one or more digits")),
   }
-
-// --- The two that are transactions --------------------------------------------------
 
 pub fn place_order(body: Bytes) -> http::Response<| {}> / {Service, abort.raise} =
   match json::decode_bytes(body, placement_json()) {
@@ -573,8 +475,6 @@ pub fn place_order(body: Bytes) -> http::Response<| {}> / {Service, abort.raise}
     Ok(p) -> placed(p),
   }
 
-/// The two rejections that need no database are sent before one is opened, so a malformed order
-/// costs no connection and no `BEGIN`.
 fn placed(p: Placement) -> http::Response<| {}> / {Service, abort.raise} =
   if p.lines.len() == 0 { problem(422, "empty order", "an order needs at least one line") }
   else if bad_qty(p.lines) {
@@ -583,8 +483,6 @@ fn placed(p: Placement) -> http::Response<| {}> / {Service, abort.raise} =
     resolved(db::transaction(db::ReadCommitted, db::ReadWrite, || placing(p)), "out of stock")
   }
 
-/// The span that shows where a placement's time went, and the one place in this file where a span
-/// is *not* closed by the program.
 fn placing(p: Placement) -> http::Response<| {}> / {Service, abort.raise} = {
   let span = trace.enter[orders](
     "reserving",
@@ -617,9 +515,7 @@ fn recorded(
     Ok(rows) -> match head_of(rows) {
       None -> problem(500, "unreadable result", "an insert returned no row"),
       Some(o) -> {
-        // The order exists in the transaction's view from here on.
         move_stock(stock, p.lines, 1);
-        // Two records rather than one, and they answer different questions.
         trace.event[orders](
           trace::Info,
           "placed",
@@ -636,9 +532,6 @@ fn recorded(
     },
   }
 
-/// One `UPDATE` per sku the order draws on, walked over the shelf rather than over the order, so a
-/// sku named on two lines is one reservation of their sum — which is how a service avoids selling
-/// the same three widgets twice inside one order.
 fn move_stock(
   stock: List<Item>,
   lines: List<Line>,
@@ -646,8 +539,6 @@ fn move_stock(
 ) -> Unit / {db.execute[items], db.rollback, trace.event[items]} = {
   let drawn = stock.filter(|i: Item| taken(lines, i.sku) > 0);
   moving(drawn, lines, sign);
-  // After the reservations and not before, so the record is a claim that the shelf moved rather
-  // than that something tried to move it.
   trace.event[items](
     trace::Info,
     "shelf moved",
@@ -668,7 +559,6 @@ fn moving(
     _ -> (),
   }
 
-/// Three results, and each one is a different thing to have happened.
 fn reserved(i: Item, to: Int) -> Unit / {db.execute[items], db.rollback} =
   match db.execute[items](item_reserve(), [
       sql::IntParameter(to),
@@ -680,7 +570,6 @@ fn reserved(i: Item, to: Int) -> Unit / {db.execute[items], db.rollback} =
     _ -> db.rollback(i.sku),
   }
 
-/// What `db::transaction` hands back, turned into a response.
 fn resolved(
   out: Result<http::Response<| {}>, db::Rollback>,
   error: String,
@@ -690,14 +579,13 @@ fn resolved(
     Err(rb) -> match rb.error { Some(e) -> unavailable(e), None -> problem(409, error, rb.reason) },
   }
 
-/// `Serializable`, and it is the only endpoint that asks for it.
 pub fn cancel_order(params: Map<String, String>) -> http::Response<| {}> / {Service, abort.raise} =
   match order_wanted(params) {
     Err(r) -> r,
     Ok(id) ->
       resolved(
         db::transaction(db::Serializable, db::ReadWrite, || cancelling(id)),
-        "the shelf moved",
+        "another request changed the same data at the same time; try again",
       ),
   }
 
@@ -713,9 +601,6 @@ fn cancelling(id: Int) -> http::Response<| {}> / {Service, abort.raise} =
     },
   }
 
-/// A `DELETE` that raced another one and lost affects no row here, because the order it read is
-/// gone from under it; that responds 409 without a rollback — nothing had been written, so there is
-/// nothing to discard and committing an empty transaction is the honest end of it.
 fn cancelled_now(o: Order) -> http::Response<| {}> / {Service, abort.raise} =
   match db.execute[orders](order_cancel(), [state_param(Cancelled), sql::IntParameter(o.id)]) {
     sql::Count(n) -> if n == 1 { restocked(o) }
@@ -741,8 +626,6 @@ fn restocked(o: Order) -> http::Response<| {}> / {Service, abort.raise} =
       json_body(200, cancelled(o), order_json())
     },
   }
-
-// --- The streamed receipt ---------------------------------------------------------
 
 pub type Phase = | Opening | Lines | Done
 
@@ -786,14 +669,11 @@ pub fn next_chunk(c: Cursor) -> Option<{ chunk: Bytes, next: Cursor }> =
     Done -> None,
   }
 
-/// What a buffered path would have sent.
 pub fn drained(c: Cursor) -> Bytes = Bytes::concat_all(chunks_of(c, []))
 
-/// A cursor writes its opening, a line per item and its close, so the items and three more rounds
-/// see it done.
-fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
+fn chunks_of(c: Cursor, accumulator: List<Bytes>) -> List<Bytes> =
   range(0, c.pending.len() + 3).fold(
-    { at: Some(c), out: acc },
+    { at: Some(c), out: accumulator },
     |s: { at: Option<Cursor>, out: List<Bytes> }, _round: Int|
       match s.at {
         None -> s,
@@ -804,9 +684,6 @@ fn chunks_of(c: Cursor, acc: List<Bytes>) -> List<Bytes> =
       },
   ).out
 
-// --- Dispatch ---------------------------------------------------------------------
-
-/// A buffered response, or a head and a cursor the connection pulls.
 pub type Reply =
   | Buffered(http::Response<| {}>)
   | Stream({ head: http::Response<| {}>, cursor: Cursor })
@@ -825,73 +702,62 @@ pub fn receipt(
     },
   }
 
-/// The shelf is read before the head is written, because a cursor pulls prices out of a list rather
-/// than out of the database: a receipt of ten thousand lines costs one query and holds one line at
-/// a time, and a chunk producer that queried per line would put the database inside `next_chunk`'s
-/// effects and inside the connection's write loop.
 fn streamed(o: Order) -> Reply / {db.query[items], abort.raise} =
   match shelf() {
     Err(r) -> Buffered(r),
     Ok(stock) -> Stream({ head: text(200, b""), cursor: cursor_for(o, stock) }),
   }
 
-// --- The request span, and the credential ----------------------------------------
-
 pub fn dispatch(
   e: Endpoint,
-  req: http::Request,
+  request: http::Request,
   params: Map<String, String>,
 ) -> Reply / {Serving, abort.raise} = {
   let span = trace.enter[http](
     "dispatch",
     Map::of_entries([
-      text_field("method", http::method_name(req.method)),
-      text_field("path", req.path),
+      text_field("method", http::method_name(request.method)),
+      text_field("path", request.path),
       text_field("endpoint", endpoint_name(e)),
     ]),
   );
-  let reply = guarded(e, req, params);
+  let reply = guarded(e, request, params);
   trace.exit[http](span, outcome_of(reply));
   reply
 }
 
-/// What the span records as its outcome.
 fn outcome_of(r: Reply) -> trace::Outcome =
   match r {
     Buffered(response) -> if response.status < 400 { trace::Ok }
     else { trace::Failed(response.status.to_string()) },
-    // A streamed body is written after this span closes, so the only thing the handler decided is
-    // that it had an order to stream.
     Stream(_) -> trace::Ok,
   }
 
-/// The API-key check, and the only place in this repository a `Secret<a>` is used end to end.
 fn guarded(
   e: Endpoint,
-  req: http::Request,
+  request: http::Request,
   params: Map<String, String>,
 ) -> Reply / {Serving, abort.raise} =
   match e {
-    PlaceOrder -> if authorized(config.secret[credentials](api_key()), presented(req)) {
-      dispatched(e, req, params)
+    PlaceOrder -> if authorized(config.secret[credentials](api_key()), presented(request)) {
+      dispatched(e, request, params)
     } else {
       trace.event[http](
         trace::Warn,
         "api key rejected",
         Map::of_entries([
-          text_field("path", req.path),
-          { key: "presented", value: trace::BoolField(presented(req) != "") },
+          text_field("path", request.path),
+          { key: "presented", value: trace::BoolField(presented(request) != "") },
         ]),
       );
       Buffered(problem(401, "unauthorized", "POST /orders needs a matching `x-api-key` header"))
     },
-    _ -> dispatched(e, req, params),
+    _ -> dispatched(e, request, params),
   }
 
-fn presented(req: http::Request) -> String =
-  match req.headers.get("x-api-key") { Some([value, ..]) -> value, _ -> "" }
+fn presented(request: http::Request) -> String =
+  match request.headers.get("x-api-key") { Some([value, ..]) -> value, _ -> "" }
 
-/// `None` is a rejection and not a pass.
 fn authorized(configured: Option<Secret<String>>, offered: String) -> Bool =
   match configured { None -> false, Some(key) -> !key.is_empty() && key.verify(offered) }
 
@@ -910,11 +776,9 @@ fn endpoint_name(e: Endpoint) -> String =
     Receipt -> "receipt",
   }
 
-/// Exhaustive by construction: add a variant to `Endpoint` without a route and the table is one
-/// line short; add one without an arm here and it is `E0205`.
 fn dispatched(
   e: Endpoint,
-  req: http::Request,
+  request: http::Request,
   params: Map<String, String>,
 ) -> Reply / {Service, signal.stopping, abort.raise} =
   match e {
@@ -925,26 +789,21 @@ fn dispatched(
     Featured -> Buffered(featured()),
     GetItem -> Buffered(get_item(params)),
     ListOrders -> Buffered(list_orders()),
-    PlaceOrder -> Buffered(place_order(http::whole_bytes(req.body))),
+    PlaceOrder -> Buffered(place_order(http::whole_bytes(request.body))),
     GetOrder -> Buffered(get_order(params)),
     CancelOrder -> Buffered(cancel_order(params)),
     Receipt -> receipt(params),
   }
 
-pub fn result(req: http::Request) -> Reply / {Serving, abort.raise} =
-  if req.target == "*" {
-    // `OPTIONS *` asks about the server rather than about a path, so it is not routed.
-    Buffered(server_options())
-  } else {
-    match route_of(routed_method(req.method), req.path) {
-      router::NotFound -> Buffered(problem(404, "no such route", req.path)),
+pub fn result(request: http::Request) -> Reply / {Serving, abort.raise} =
+  if request.target == "*" { Buffered(server_options()) } else {
+    match route_of(routed_method(request.method), request.path) {
+      router::NotFound -> Buffered(problem(404, "no such route", request.path)),
       router::MethodNotAllowed(ms) -> Buffered(method_not_allowed(ms)),
-      router::Found(m) -> dispatch(m.endpoint, req, m.params),
+      router::Found(m) -> dispatch(m.endpoint, request, m.params),
     }
   }
 
-/// A `HEAD` is a `GET` whose response carries no body, and `http::encode` is what drops it —
-/// computing the `Content-Length` the same request would have produced under `GET`.
 fn routed_method(m: http::Method) -> http::Method = match m { http::Head -> http::Get, _ -> m }
 
 fn server_options() -> http::Response<| {}> / {abort.raise} =
@@ -959,9 +818,6 @@ fn server_options() -> http::Response<| {}> / {abort.raise} =
     body: http::Whole(b""),
   }
 
-/// RFC 9110 §15.5.6 makes `Allow` a MUST on a 405, and the methods come from the matcher rather
-/// than from a list written here — sorted and deduplicated by `route`, so the field cannot disagree
-/// with the table it was derived from.
 fn method_not_allowed(ms: List<http::Method>) -> http::Response<| {}> / {abort.raise} =
   {
     status: 405,
@@ -980,10 +836,8 @@ fn method_not_allowed(ms: List<http::Method>) -> http::Response<| {}> / {abort.r
     ),
   }
 
-/// Every route, buffered — the shape a test drives and the shape `http::serve` would take as its
-/// `app`.
-pub fn app(req: http::Request) -> http::Response<| {}> / {Serving, abort.raise} =
-  collapse(result(req))
+pub fn app(request: http::Request) -> http::Response<| {}> / {Serving, abort.raise} =
+  collapse(result(request))
 
 pub fn collapse(r: Reply) -> http::Response<| {}> =
   match r {
@@ -992,25 +846,17 @@ pub fn collapse(r: Reply) -> http::Response<| {}> =
       { status: s.head.status, headers: s.head.headers, body: http::Whole(drained(s.cursor)) },
   }
 
-// --- The connection ------------------------------------------------------------------
-
-/// The bounds this service runs under, written down.
 pub fn limits() -> http::Limits =
   {
     max_request_line: 8192,
     max_header_bytes: 16384,
     max_header_count: 64,
-    // A `Placement` is small.
     max_body: 65536,
     max_chunk_size: 65536,
     max_chunk_line: 4096,
     max_trailer_bytes: 4096,
     max_keep_alive: 100,
-    // The receipt route streams a handful of chunks and this is far above it.
     max_stream_chunks: 1024,
-    // Equal on purpose: this loop passes one `Limits` to `read_head` for both the first read of a
-    // connection and the first read of a reused one, so the two bounds are the same number rather
-    // than two numbers that look the same.
     header_timeout_ms: 5000,
     idle_timeout_ms: 5000,
     body_timeout_ms: 15000,
@@ -1022,16 +868,11 @@ pub fn serve_connection(
   c: Int,
   l: http::Limits,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], net.close[conn], abort.raise} = {
-  // A limit that is zero or negative is a configuration nobody meant, and is rejected here rather
-  // than turning into a service that responds 413 to everything.
   http::check_limits(l);
   turn(c, l, b"", l.max_keep_alive, false, || false);
   net.close[conn](c)
 }
 
-/// `serve_connection` until `stop` is closed, and drained after: the request in hand is served
-/// with `Connection: close` unless one is already read behind it, and a connection between requests
-/// is closed rather than waited on.
 pub fn serve_connection_until(
   c: Int,
   l: http::Limits,
@@ -1053,10 +894,7 @@ fn turn<| e>(
   if left <= 0 { () }
   else if reused && carried.len() == 0 && stopping() { () } else {
     match http::read_head[conn](c, carried, l, reused) {
-      // The peer went away. There is nothing to respond to and nothing to say.
       http::HeadClosed(_) -> (),
-      // An idle keep-alive connection is closed with no response: no request had started, so there
-      // is no request to respond to.
       http::HeadIdle -> (),
       http::HeadTimedOut ->
         write_out(
@@ -1067,22 +905,19 @@ fn turn<| e>(
           false,
           http::text_response(408, "the request head did not arrive\n"),
         ),
-      http::HeadBytes(read) -> handle_head(c, l, read.buf, read.complete, left - 1, stopping),
+      http::HeadBytes(read) -> handle_head(c, l, read.head, read.complete, left - 1, stopping),
     }
   }
 
-/// From here on `left` is how many requests the connection may serve after this one.
 fn handle_head<| e>(
   c: Int,
   l: http::Limits,
-  buf: Bytes,
+  buffer: Bytes,
   complete: Bool,
   left: Int,
   stopping: () -> Bool / e,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} =
-  match http::parse_head(buf, l) {
-    // The head stopped mid-way with nothing more coming, or it ran past the bound without a
-    // terminator.
+  match http::parse_head(buffer, l) {
     http::Incomplete -> if complete {
       write_out(
         c,
@@ -1102,33 +937,28 @@ fn handle_head<| e>(
         http::text_response(431, "the request head never ended within the bound\n"),
       )
     },
-    // Every framing error closes the connection: what an error did not establish is exactly
-    // where the next message begins, so there is nothing to resynchronise to.
     http::HeadRejected(reason) ->
       write_out(c, l, http::Get, http::Http11, false, http::error_response(reason)),
-    http::Parsed(h) -> continued(c, l, h, buf, left, stopping),
+    http::Parsed(h) -> continued(c, l, h, buffer, left, stopping),
   }
 
 fn continued<| e>(
   c: Int,
   l: http::Limits,
   h: http::Head,
-  buf: Bytes,
+  buffer: Bytes,
   left: Int,
   stopping: () -> Bool / e,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} = {
-  // A client that waits for a `100` it never gets is a hang, and a hang is the failure shape with
-  // nothing to read.
-  let told = if h.expects_continue {
+  let continue_sent = if h.expects_continue {
     send_all[conn](c, http::continue_response(), l.write_timeout_ms)
   } else { true };
-  if !told { () } else {
-    // The body is read whatever the route does with it.
+  if !continue_sent { () } else {
     with_body(
       c,
       l,
       h,
-      http::read_body[conn](c, h.framing, buf.slice(h.consumed, buf.len()), l),
+      http::read_body[conn](c, h.framing, buffer.slice(h.consumed, buffer.len()), l),
       left,
       stopping,
     )
@@ -1168,8 +998,6 @@ fn handle_request<| e>(
   stopping: () -> Bool / e,
 ) -> Unit / {Serving, net.recv[conn], net.send[conn], abort.raise | e} = {
   let reply = result(whole(h, got.bytes, got.trailers));
-  // A stop seen once the response is ready makes it the connection's last, unless a request is
-  // already read behind it.
   let keep = h.keep_alive && left > 0 && !(got.rest.len() == 0 && stopping());
   let wrote = match buffer_head_reply(h.request.method, reply) {
     Buffered(r) ->
@@ -1178,7 +1006,6 @@ fn handle_request<| e>(
         http::encode(h.request.method, h.request.version, keep, r),
         l.write_timeout_ms,
       ),
-    // The one route that writes as it produces.
     Stream(s) ->
       http::respond[conn](c, l, h.request.method, h.request.version, keep, {
         status: s.head.status,
@@ -1186,20 +1013,12 @@ fn handle_request<| e>(
         body: http::chunked(cursor_chunks(s.cursor)),
       }),
   };
-  if wrote && keep {
-    // Pipelined requests are served in order by construction: one connection, one task, and the
-    // leftover buffer carried into the next turn.
-    turn(c, l, got.rest, left, true, stopping)
-  } else { () }
+  if wrote && keep { turn(c, l, got.rest, left, true, stopping) } else { () }
 }
 
-/// A `HEAD` response carries no body, so there is nothing to stream: the cursor is drained here and
-/// `http::encode` writes the `Content-Length` a `GET` would have produced and no bytes after the
-/// head.
 fn buffer_head_reply(m: http::Method, r: Reply) -> Reply =
   match m { http::Head -> Buffered(collapse(r)), _ -> r }
 
-/// A cursor's chunks as a stream, each made as it is pulled.
 fn cursor_chunks(c: Cursor) -> Seq<Bytes | {}> =
   seq::unfold(c, |at: Cursor|
     match next_chunk(at) {
@@ -1207,7 +1026,6 @@ fn cursor_chunks(c: Cursor) -> Seq<Bytes | {}> =
       Some(step) -> Some({ value: step.chunk, next: step.next }),
     })
 
-/// The head's request with the body and the trailers it was framed with.
 fn whole(h: http::Head, body: Bytes, trailers: http::Headers) -> http::Request =
   {
     method: h.request.method,
@@ -1235,8 +1053,6 @@ fn write_out(
   ()
 }
 
-/// Serve up to `count` connections one at a time, and stop early once the listener is closed under
-/// the loop. A tail call, so a budget is a number rather than a stack depth.
 pub fn serve(
   listener: Int,
   l: http::Limits,
@@ -1258,9 +1074,6 @@ fn one_at_a_time(
     }
   }
 
-/// The same budget with a task for each connection, so a slow client holds up only itself. Every
-/// task is joined before the loop returns: the fake's store lives no longer than the call that
-/// opened it.
 pub fn serve_each(
   listener: Int,
   l: http::Limits,
@@ -1280,9 +1093,6 @@ fn spawned(
     else { spawned(listener, l, left - 1, running.push(task.spawn(|| serve_connection(c, l)))) }
   }
 
-/// The same budget served by `shedding.workers` tasks over a bounded queue: a connection that
-/// finds it full, or that waited in it too long, gets a 503 with `Retry-After`, and when the
-/// listener is closed under the loop every connection already taken is served before it returns.
 pub fn serve_pooled(
   listener: Int,
   l: http::Limits,
@@ -1313,9 +1123,6 @@ pub fn listen_and_serve(
   served
 }
 
-/// The service as a run's settings describe it: over TLS when they name a credential, served by
-/// the loop they choose, and saying on stdout which port it landed on — which is how a run asked
-/// for port 0 is found.
 pub fn listening(
   s: Settings,
 ) -> Int / {task.write, clock.read, Serving, net.listen[listener], net.listen_tls[listener], net.local_port[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], process.out[proc], abort.raise} = {
@@ -1336,9 +1143,6 @@ pub fn listening(
   served
 }
 
-// --- The service, stocked and running ----------------------------------------------------
-
-/// The fake on a plain listener, one connection at a time.
 pub fn run_memory(
   port: Int,
   api: Option<Secret<String>>,
@@ -1346,11 +1150,8 @@ pub fn run_memory(
 ) -> Int / {net.listen[listener], net.accept[listener], net.close[listener], net.recv[conn], net.send[conn], net.close[conn], abort.raise} =
   fake(api, || listen_and_serve(port, count))
 
-/// The API key the *tests* drive the fake with.
 pub fn fake_key() -> String = "fake-key-not-a-credential"
 
-/// The service over a database that is a value and a sink that is a value: every operation
-/// `Serving` names is handled here, and the credential from `api`.
 pub fn fake<a | e>(
   api: Option<Secret<String>>,
   body: () -> a / {Serving | e},
@@ -1358,13 +1159,10 @@ pub fn fake<a | e>(
   handle {
     run_in_memory(stocked(seed_shelf(), seed_orders()), body).out
   } with {
-    // Handled from the argument, and only for the key this service declares.
     config.secret[credentials](key) -> if key == api_key() { api } else { None },
     signal.stopping() -> signal::stopping_step(signal::running()),
   }
 
-/// What `body` returns over the database `d` and an empty sink, beside what it leaves of both:
-/// every `db` and `trace` operation `Serving` names is handled here, and the rest by the caller.
 fn run_in_memory<a | e>(
   d: db::MemDb,
   body: () -> a / {Serving | e},
@@ -1405,7 +1203,6 @@ fn run_in_memory<a | e>(
       o.out
     },
     db.rollback(reason) -> (),
-    // Four clauses that are the whole of "a log is an effect".
     trace.enter[*channel](name, fs) -> {
       let o = trace::enter_step(sink, channel, name, fs);
       sink = o.sink;
@@ -1414,8 +1211,6 @@ fn run_in_memory<a | e>(
     trace.exit[*](span, outcome) -> {
       let o = trace::exit_step(sink, span, outcome);
       sink = o.sink;
-      // `exit_step` returns `ok: false` where the bound driver raises `E0445`, because a fake is a
-      // value and a value does not raise.
       if o.ok { () } else { panic("trace.exit named a span that is not open") }
     },
     trace.event[*channel](level, name, fs) -> {
@@ -1427,8 +1222,6 @@ fn run_in_memory<a | e>(
     return out -> { out: out, db: store, sink: sink },
   }
 
-/// The entry point: the settings, read once, and the store they name. Where to reach the database
-/// is a setting too, and every `db` operation is handled from here rather than by a host.
 fn main() -> Int / {Running, abort.raise, diverges} = {
   let key = config.secret[credentials](api_key());
   let s = configured(
@@ -1457,7 +1250,6 @@ fn postgres(
       Err(reason) -> panic("the service will not start: " ++ reason),
     }
   } with {
-    // Handled from the value read above, once.
     config.secret[credentials](k) -> key,
   }
 
@@ -1479,8 +1271,6 @@ fn configured<a>(resolved: Result<a, String>) -> a / {abort.raise} =
     Err(reason) -> panic("the service will not start: " ++ reason),
   }
 
-// --- What the service is stocked with ------------------------------------------------
-
 pub fn seed_shelf() -> List<Item> =
   [
     { sku: "bolt", name: "hex bolt", price: 0.40m, on_hand: 500 },
@@ -1500,7 +1290,6 @@ pub fn seed_orders() -> List<Order> =
     },
   ]
 
-/// A database with those rows in it, as a value.
 pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb / {abort.raise} =
   orders.fold(
     shelf.fold(db::open(schema()), |d: db::MemDb, i: Item|
@@ -1514,7 +1303,6 @@ pub fn stocked(shelf: List<Item>, orders: List<Order>) -> db::MemDb / {abort.rai
       ]),
   )
 
-/// A step whose result must be a success.
 fn stepped(d: db::MemDb, s: sql::Statement, ps: List<sql::Param>) -> db::MemDb / {abort.raise} = {
   let out = db::step(d, s, ps);
   match out.out {
@@ -1523,9 +1311,6 @@ fn stepped(d: db::MemDb, s: sql::Statement, ps: List<sql::Param>) -> db::MemDb /
   }
 }
 
-/// What the fake stores, read back through the same statements an endpoint uses, so an assertion
-/// about the store is an assertion about what a request would see rather than about the fake's
-/// internals.
 pub fn shelf_of(d: db::MemDb) -> List<Item> / {abort.raise} = read_out(d, items_all(), item_row())
 
 pub fn book_of(d: db::MemDb) -> List<Order> / {abort.raise} = read_out(d, orders_all(), order_row())
@@ -1538,14 +1323,11 @@ fn read_out<a>(d: db::MemDb, s: sql::Statement, c: sql::RowCodec<a>) -> List<a> 
     Err(sql::UnexpectedCount(_)) -> panic("a query returned a count"),
   }
 
-// --- Tests: the business, which needs no handler at all ----------------------------
-
 test "a total is an exact sum of exact products" {
   assert_eq(total_of(seed_shelf(), [{ sku: "bolt", qty: 10 }]), 4.00m);
   assert_eq(total_of(seed_shelf(), []), 0m);
   assert_eq(total_of(seed_shelf(), [{ sku: "gasket", qty: 2 }, { sku: "widget", qty: 1 }]), 17.00m);
 
-  // The sum a Float would have got wrong.
   assert_eq(
     total_of(
       [
@@ -1558,15 +1340,14 @@ test "a total is an exact sum of exact products" {
   )
 }
 
-test "a line naming nothing on the shelf, and one the shelf cannot cover, are named back" {
+test "`unknown_skus` lists order lines whose sku is not in stock, and `short_skus` lists lines asking for more than is in stock" {
   assert_eq(unknown_skus(seed_shelf(), [{ sku: "sprocket", qty: 1 }]), ["sprocket"]);
   assert_eq(unknown_skus(seed_shelf(), [{ sku: "bolt", qty: 1 }]), []);
   assert_eq(short_skus(seed_shelf(), [{ sku: "widget", qty: 4 }]), ["widget"]);
   assert_eq(short_skus(seed_shelf(), [{ sku: "widget", qty: 3 }]), [])
 }
 
-// Two lines for one sku are one draw on the shelf.
-test "two lines naming one sku are checked as one draw on the shelf" {
+test "order lines with the same sku are added together before comparing with stock, and `draw_down` subtracts the sum" {
   let doubled = [{ sku: "widget", qty: 2 }, { sku: "widget", qty: 2 }];
   assert_eq(short_skus(seed_shelf(), doubled), ["widget"]);
   assert_eq(
@@ -1582,9 +1363,7 @@ test "a quantity that is not positive is rejected rather than clamped" {
   assert(!bad_qty([]))
 }
 
-// A typed binder is the difference between a route that matches and one that does not, so these are
-// claims about the table's shape rather than about a parser this file owns.
-test "an order id is a segment that parses as an Int, and nothing else routes" {
+test "`/orders/7` routes to `GetOrder` with id 7, but ids like `seven`, `+7`, `7.0` and `%D9%A7` give `NotFound`" {
   assert_eq(
     route_of(http::Get, "/orders/7"),
     router::Found({ endpoint: GetOrder, params: Map::of_entries([{ key: "id", value: "7" }]) }),
@@ -1595,14 +1374,12 @@ test "an order id is a segment that parses as an Int, and nothing else routes" {
   assert_eq(route_of(http::Get, "/orders/%D9%A7"), router::NotFound)
 }
 
-// --- Tests: the route table, which is a value ---------------------------------------
-
 test "the route table is unambiguous and well formed" {
   assert_eq(router::conflicts(table()), []);
   assert_eq(router::well_formed(table()), [])
 }
 
-test "a literal beats a parameter at the position they differ" {
+test "`/items/featured` routes to the fixed `Featured` route, while `/items/bolt` routes to `GetItem` with sku `bolt`" {
   assert_eq(
     route_of(http::Get, "/items/featured"),
     router::Found({ endpoint: Featured, params: Map::new() }),
@@ -1613,14 +1390,12 @@ test "a literal beats a parameter at the position they differ" {
   )
 }
 
-test "a path no route matches is NotFound, and one under another method names the methods" {
+test "an unknown path returns `NotFound`, and a known path with an unsupported method returns `MethodNotAllowed` listing the allowed methods" {
   assert_eq(route_of(http::Get, "/nowhere"), router::NotFound);
   assert_eq(route_of(http::Put, "/orders"), router::MethodNotAllowed([http::Get, http::Post]));
   assert_eq(route_of(http::Post, "/orders/1"), router::MethodNotAllowed([http::Delete, http::Get]))
 }
 
-// A trailing empty segment is kept rather than normalized away, so `/orders/` is a two-segment path
-// whose second segment is empty and matches neither route.
 test "/orders and /orders/ are different paths" {
   assert_eq(
     route_of(http::Get, "/orders"),
@@ -1630,8 +1405,6 @@ test "/orders and /orders/ are different paths" {
   assert_eq(router::normalize_path("/orders/"), "/orders")
 }
 
-// Percent-decoding happens per segment, after splitting, so `%2F` decodes to a `/` inside one
-// segment and can never introduce a boundary.
 test "a percent-encoded slash stays inside the segment it was written in" {
   assert_eq(
     route_of(http::Get, "/items/a%2Fb"),
@@ -1639,7 +1412,7 @@ test "a percent-encoded slash stays inside the segment it was written in" {
   )
 }
 
-test "a Rest segment captures every remaining segment, joined" {
+test "a route pattern's final wildcard segment captures the rest of the path as one string, and is empty for `/docs`" {
   assert_eq(
     route_of(http::Get, "/docs/orders/placing"),
     router::Found({
@@ -1653,18 +1426,13 @@ test "a Rest segment captures every remaining segment, joined" {
   )
 }
 
-// --- Tests: every route, hermetically -----------------------------------------------
-
 pub type ServiceRun<a> = {
   out: a,
   shelf: List<Item>,
   book: List<Order>,
-  /// Every record the request produced, in `seq` order, with every span the program left open
-  /// closed `Abandoned` by `drain`.
   records: List<trace::Record>,
 }
 
-/// The whole service's world, installed as values.
 fn against<a | e>(
   d: db::MemDb,
   values: config::Values,
@@ -1674,20 +1442,10 @@ fn against<a | e>(
     run_in_memory(d, body)
   } with {
     config.secret[credentials](key) -> config::get_secret(values, key),
-    // And **not** `signal`, which the caller handles.
   };
-  {
-    out: ran.out,
-    shelf: shelf_of(ran.db),
-    book: book_of(ran.db),
-    // `drain` closes every span the program left open as `Abandoned`, so a hermetic test observes
-    // the same records a bound run would write.
-    records: trace::drain(ran.sink),
-  }
+  { out: ran.out, shelf: shelf_of(ran.db), book: book_of(ran.db), records: trace::drain(ran.sink) }
 }
 
-/// The service as `examples/service.sql` seeds it, with a key configured and nobody asking it to
-/// stop.
 fn run_configured<a | e>(
   d: db::MemDb,
   body: () -> a / {Serving | e},
@@ -1698,7 +1456,6 @@ fn run_configured<a | e>(
     signal.stopping() -> false,
   }
 
-/// The service as `examples/service.sql` seeds it.
 fn stock() -> db::MemDb / {abort.raise} = stocked(seed_shelf(), seed_orders())
 
 fn served_by(
@@ -1708,7 +1465,6 @@ fn served_by(
 ) -> ServiceRun<http::Response<| {}>> / {abort.raise} =
   run_configured(stock(), || app(request(m, path, body)))
 
-/// A placement, with the key.
 fn posted(body: String) -> ServiceRun<http::Response<| {}>> / {abort.raise} =
   run_configured(stock(), || app(authorized_request(http::Post, "/orders", Bytes::of_string(body))))
 
@@ -1727,7 +1483,6 @@ fn request(m: http::Method, path: String, body: Bytes) -> http::Request =
     client_certificate: None,
   }
 
-/// A request carrying the key the fake is configured with.
 fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Request =
   {
     method: m,
@@ -1743,7 +1498,6 @@ fn authorized_request(m: http::Method, path: String, body: Bytes) -> http::Reque
     client_certificate: None,
   }
 
-/// The names of the records a run produced, in order.
 fn recorded_names(rs: List<trace::Record>) -> List<String> = rs.map(|r: trace::Record| r.name)
 
 fn outcomes_of(rs: List<trace::Record>) -> List<trace::Outcome> =
@@ -1752,28 +1506,25 @@ fn outcomes_of(rs: List<trace::Record>) -> List<trace::Outcome> =
 fn body_string(r: http::Response<| {}>) -> String / {abort.raise} =
   String::of_bytes(http::whole_bytes(r.body))
 
-test "GET /health is pure and counts the table it is served from" {
+test "GET /health returns 200 with the number of routes, and does not change the item stock or the orders" {
   let r = served_by(http::Get, "/health", b"");
   assert_eq(r.out.status, 200);
   assert_eq(
     json::decode_bytes(http::whole_bytes(r.out.body), health_json()),
     Ok({ service: "parts", route_count: 11 }),
   );
-  // Pure means pure: the store this request was handed is the store it left.
   assert_eq(r.shelf, seed_shelf());
   assert_eq(r.book, seed_orders())
 }
 
-test "GET /docs serves a page, and names the pages when there is none" {
+test "GET /docs returns the requested page with 200, and returns 404 when no such page exists" {
   let ok = served_by(http::Get, "/docs/orders/cancelling", b"");
   assert_eq(ok.out.status, 200);
   assert_eq(body_string(ok.out), "DELETE /orders/{id} puts the lines back on the shelf\n");
   assert_eq(served_by(http::Get, "/docs/nothing", b"").out.status, 404)
 }
 
-// A handler is a capability grant, and this is the one place the grant is a subset: `list_items` is
-// called rather than routed, so it has one effect and one clause discharges it.
-test "list_items reaches one table, and the type is what says so" {
+test "`list_items` returns 200 with the item list when only an items-table query handler is installed" {
   handle {
     let r = list_items();
     assert_eq(r.status, 200);
@@ -1800,9 +1551,6 @@ test "GET /items reads the shelf and responds with it in sku order" {
   )
 }
 
-// The literal route, which shares a resource with `/items/{sku}` and effects with it too: two
-// reads of one resource do not conflict, so the two tests below are placed in the same concurrency
-// group and run side by side.
 test "GET /items/featured is the shelf minus what is out of stock" {
   let flange = { sku: "flange", name: "flange", price: 1.00m, on_hand: 0 };
   let r = run_configured(stocked(seed_shelf().push(flange), []), ||
@@ -1814,7 +1562,7 @@ test "GET /items/featured is the shelf minus what is out of stock" {
   )
 }
 
-test "GET /items/{sku} responds with the item, and 404s the one nobody stocks" {
+test "GET /items/{sku} returns the item, and returns 404 with the sku when no item has that sku" {
   assert_eq(served_by(http::Get, "/items/gasket", b"").out.status, 200);
   let missing = served_by(http::Get, "/items/sprocket", b"");
   assert_eq(missing.out.status, 404);
@@ -1824,8 +1572,7 @@ test "GET /items/{sku} responds with the item, and 404s the one nobody stocks" {
   )
 }
 
-// A `sku` that would end a string literal if a value ever became syntax.
-test "a sku that looks like an injection is a value and nothing else" {
+test "a sku containing SQL text is bound as data and never run as SQL, so it returns 404 and changes nothing" {
   let r = served_by(http::Get, "/items/'; drop table items; --", b"");
   assert_eq(r.out.status, 404);
   assert_eq(r.shelf, seed_shelf())
@@ -1840,11 +1587,9 @@ test "GET /orders reads the order book and responds with it in id order" {
   )
 }
 
-test "GET /orders/{id:Int} responds with one order, and an unparseable id routes nowhere" {
+test "GET /orders/{id:Int} returns one order, and an id that is not an integer matches no route and returns 404" {
   assert_eq(served_by(http::Get, "/orders/1", b"").out.status, 200);
   assert_eq(served_by(http::Get, "/orders/99", b"").out.status, 404);
-  // Not a 400 from inside the endpoint: `seven` never parses, so no route matches and the response
-  // comes from the table rather than from a check the handler had to remember to write.
   let unrouted = served_by(http::Get, "/orders/seven", b"");
   assert_eq(unrouted.out.status, 404);
   assert_eq(
@@ -1853,10 +1598,7 @@ test "GET /orders/{id:Int} responds with one order, and an unparseable id routes
   )
 }
 
-// The id is 3 because the sequence handed out 1 and 2 to the seeds, which is the fixture going in
-// through the same insert a request does rather than through a side door that would have left the
-// sequence at zero.
-test "POST /orders prices the lines, draws the shelf down and records a line" {
+test "POST /orders prices the lines, decreases the item stock, adds the order, and records the trace events" {
   let r = posted("{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"widget\",\"qty\":2}]}");
   assert_eq(r.out.status, 201);
   assert_eq(
@@ -1868,8 +1610,6 @@ test "POST /orders prices the lines, draws the shelf down and records a line" {
     Some({ sku: "widget", name: "left-handed widget", price: 12.50m, on_hand: 1 }),
   );
   assert_eq(r.book.len(), 3);
-  // What the request recorded, in order and on the right channels: the request span opened, the
-  // shelf moved, the order was placed, the counter went up, and the span closed `Ok`.
   assert_eq(recorded_names(r.records), [
     "dispatch",
     "reserving",
@@ -1882,13 +1622,10 @@ test "POST /orders prices the lines, draws the shelf down and records a line" {
   assert_eq(trace::on_channel(r.records, "items").len(), 1);
   assert_eq(trace::on_channel(r.records, "http").len(), 2);
   assert_eq(trace::counter_total(r.records, "orders placed"), 1);
-  // Both spans closed, both `Ok`, innermost first — which is the nesting an operator reads as "the
-  // request spent its time reserving".
   assert_eq(outcomes_of(r.records), [trace::Ok, trace::Ok])
 }
 
-// The rollback, driven by a route rather than by a unit test.
-test "an order the shelf cannot cover writes nothing and says which sku" {
+test "an order for more than the available stock returns 409 naming the sku and changes nothing" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":9}]}");
   assert_eq(r.out.status, 409);
   assert_eq(
@@ -1897,17 +1634,11 @@ test "an order the shelf cannot cover writes nothing and says which sku" {
   );
   assert_eq(r.shelf, seed_shelf());
   assert_eq(r.book, seed_orders());
-  // Nothing was placed, so nothing was recorded about a placement: both the event and the counter
-  // are in the continuation the rollback discarded, and so is the `shelf moved` record — which is
-  // why it says the shelf moved rather than that something tried to.
   assert_eq(recorded_names(r.records), ["dispatch", "reserving", "reserving", "dispatch"]);
-  // The span the rollback discarded is closed `Abandoned` by the enclosing `exit`, and the request
-  // span closes `Failed` carrying the status.
   assert_eq(outcomes_of(r.records), [trace::Abandoned, trace::Failed("409")])
 }
 
-// The one thing a rollback does not undo, pinned so that nobody has to discover it.
-test "a rolled-back placement consumes the order number it was given" {
+test "an order rolled back for lack of stock still uses up its order number, so the next order gets a higher id" {
   let r = run_configured(stock(), || {
     assert_eq(
       app(
@@ -1935,9 +1666,7 @@ test "a rolled-back placement consumes the order number it was given" {
   assert_eq(r.book.len(), 3)
 }
 
-// The same rejection when the quantity is spread over two lines, which is the version a per-line
-// check would have sold.
-test "two lines for one sku are one reservation, and are rejected as one" {
+test "two lines with the same sku are added together, and are rejected if the total exceeds the stock" {
   let r = posted(
     "{\"customer\":\"ada\",\"lines\":[{\"sku\":\"widget\",\"qty\":2},"
       ++ "{\"sku\":\"widget\",\"qty\":2}]}",
@@ -1947,7 +1676,7 @@ test "two lines for one sku are one reservation, and are rejected as one" {
   assert_eq(r.book, seed_orders())
 }
 
-test "an order naming nothing on the shelf is rejected before anything is written" {
+test "an order whose skus are all unknown returns 404 and writes nothing" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"sprocket\",\"qty\":1}]}");
   assert_eq(r.out.status, 404);
   assert_eq(
@@ -1964,8 +1693,6 @@ test "a body that does not fit the type is rejected by field and reason" {
     json::decode_bytes(http::whole_bytes(r.out.body), problem_json()),
     Ok({ error: "malformed body", detail: "$.lines[0].qty: expected a number, found a string" }),
   );
-  // A body that never parsed opened no transaction, so there is nothing to roll back and nothing
-  // was.
   assert_eq(r.book, seed_orders())
 }
 
@@ -1977,7 +1704,7 @@ test "an empty order and a line with no quantity are rejected without a transact
   assert_eq(zero.shelf, seed_shelf())
 }
 
-test "DELETE /orders/{id} puts the lines back and cancels once" {
+test "DELETE /orders/{id} restocks the lines, and cancelling the same order again returns 409 without restocking" {
   let r = run_configured(stock(), || {
     assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 200);
     assert_eq(app(request(http::Delete, "/orders/1", b"")).status, 409);
@@ -1987,8 +1714,6 @@ test "DELETE /orders/{id} puts the lines back and cancels once" {
     item_named(r.shelf, "bolt"),
     Some({ sku: "bolt", name: "hex bolt", price: 0.40m, on_hand: 510 }),
   );
-  // Three requests, three spans, and exactly one cancellation recorded — the two that were rejected
-  // are `Failed` spans with nothing under them.
   assert_eq(trace::named(r.records, "cancelled") != [], true);
   assert_eq(trace::named(r.records, "cancelled").len(), 1);
   assert_eq(outcomes_of(r.records), [trace::Ok, trace::Failed("409"), trace::Failed("404")])
@@ -2002,11 +1727,7 @@ test "a route nobody serves is 404 and a method nobody serves is 405 with Allow"
   assert_eq(wrong.out.headers.get("allow"), Some(["GET, POST"]))
 }
 
-// --- Tests: liveness, readiness, and the difference -----------------------------------
-
-test "GET /health is 200 with no store, no clock and no stop flag in reach" {
-  // Called rather than routed, and handled by nothing at all — which is only possible because
-  // `health` has no effects.
+test "`health` returns 200 when called with no store, clock or stop signal handlers installed" {
   let r = health();
   assert_eq(r.status, 200);
   assert_eq(
@@ -2022,13 +1743,10 @@ test "GET /ready is 200 when the store responds and nobody has asked it to stop"
     json::decode_bytes(http::whole_bytes(r.out.body), readiness_json()),
     Ok({ service: "parts", store: "reachable", stopping: false }),
   );
-  // A readiness poll is one aggregate and leaves nothing behind.
   assert_eq(r.shelf, seed_shelf());
   assert_eq(r.book, seed_orders())
 }
 
-// The case an operator most needs and most services get wrong: the database is gone, and the two
-// probes must respond differently.
 test "GET /ready is 503 when the store is unreachable and /health is still 200" {
   handle {
     let r = ready();
@@ -2037,17 +1755,15 @@ test "GET /ready is 503 when the store is unreachable and /health is still 200" 
       json::decode_bytes(http::whole_bytes(r.body), readiness_json()),
       Ok({ service: "parts", store: "57P01", stopping: false }),
     );
-    // The same process, the same moment, the same outage.
     assert_eq(health().status, 200)
   } with {
-    // Two clauses, because `ready` has two effects.
     db.query[items](q, ps) ->
       sql::Failed({ code: "57P01", constraint: "", detail: "terminating connection" }),
     signal.stopping() -> false,
   }
 }
 
-test "a draining service responds 503 before it stops accepting, and asks no database" {
+test "a draining service returns 503 from `ready` before it stops accepting, and makes no database query" {
   handle {
     let r = ready();
     assert_eq(r.status, 503);
@@ -2058,14 +1774,10 @@ test "a draining service responds 503 before it stops accepting, and asks no dat
     assert_eq(health().status, 200)
   } with {
     signal.stopping() -> true,
-    // The stop flag is read first, so a draining instance responds without spending a connection.
     db.query[items](q, ps) -> panic("a draining service must not ask the database"),
   }
 }
 
-// --- Tests: the credential, which the type system keeps out of everything -------------
-
-// The unit that says a missing key is a rejection.
 test "an unset credential, an empty one and a wrong one each mean rejection" {
   assert(!authorized(None, "anything"));
   assert(!authorized(Some(Secret::of_string("")), ""));
@@ -2097,8 +1809,6 @@ test "POST /orders takes the configured key and rejects every other request" {
     }));
   assert_eq(guessed.out.status, 401);
   assert_eq(guessed.book, seed_orders());
-  // The failure is recorded as a fact — that a key was presented and did not match — and never as a
-  // value.
   assert_eq(recorded_names(guessed.records), ["dispatch", "api key rejected", "dispatch"]);
   assert_eq(outcomes_of(guessed.records), [trace::Failed("401")]);
 
@@ -2108,7 +1818,6 @@ test "POST /orders takes the configured key and rejects every other request" {
   assert_eq(bare.book, seed_orders())
 }
 
-// The failure mode that matters more than a wrong key: no key at all.
 test "a service with no credential configured rejects POST /orders rather than accepting it" {
   let r = handle {
     against(stock(), config::no_values(), ||
@@ -2127,7 +1836,6 @@ test "a service with no credential configured rejects POST /orders rather than a
   assert_eq(r.shelf, seed_shelf())
 }
 
-// The credential's bytes, hunted for in everything a request produced.
 test "the configured credential appears in no response, no field and no record" {
   let r = posted("{\"customer\":\"ada\",\"lines\":[{\"sku\":\"bolt\",\"qty\":1}]}");
   assert_eq(r.out.status, 201);
@@ -2137,10 +1845,9 @@ test "the configured credential appears in no response, no field and no record" 
   assert_eq(Bytes::of_string(rendered_fields(r.records)).index_of(key), None)
 }
 
-/// Every field of every record, rendered.
 fn rendered_fields(rs: List<trace::Record>) -> String =
-  rs.fold("", |acc: String, r: trace::Record|
-    r.fields.keys().fold(acc, |inner: String, k: String|
+  rs.fold("", |accumulator: String, r: trace::Record|
+    r.fields.keys().fold(accumulator, |inner: String, k: String|
       inner ++ k ++ "=" ++ shown_field(r.fields.get(k)) ++ ";"))
 
 fn shown_field(f: Option<trace::Field>) -> String =
@@ -2152,29 +1859,21 @@ fn shown_field(f: Option<trace::Field>) -> String =
     _ -> "",
   }
 
-// --- Tests: the configuration a run will not start without -----------------------------
-
 test "the schema declares the keys the service cannot start without, and defaults the rest" {
   let keys = config().keys;
   assert_eq(keys.len(), 7);
-  // The credential is `SSecret` and required.
   assert_eq(
     key_named(keys, api_key()),
     Some({ name: "SERVICE_API_KEY", shape: config::SSecret, required: true, default: None }),
   );
-  // Where to reach the database is optional in the schema and required by a service over postgres:
-  // the fake has no database, so a run of it supplies no URL.
   assert_eq(
     key_named(keys, database_key()),
     Some({ name: "SERVICE_DATABASE", shape: config::SText, required: false, default: None }),
   );
-  // The port has a default, so `ply run --config-schema service.config` starts a service with no
-  // configuration written anywhere.
   assert_eq(
     key_named(keys, port_key()),
     Some({ name: "SERVICE_PORT", shape: config::SInt, required: false, default: Some("8137") }),
   );
-  // Unset, a service serves postgres in plaintext, one connection at a time.
   assert_eq(
     key_named(keys, store_key()),
     Some({
@@ -2203,8 +1902,6 @@ fn key_named(keys: List<config::Key>, name: String) -> Option<config::Key> =
   keys.fold(None, |found: Option<config::Key>, k: config::Key|
     if k.name == name { Some(k) } else { found })
 
-// What a run that forgot `--config-schema` gets: an error that names the flag, rather than a
-// service listening on a port nobody chose.
 test "a service told nothing about its port will not start, and says which flag to pass" {
   match port_of(None) {
     Ok(port) -> panic("an unset port must not resolve to " ++ port.to_string()),
@@ -2218,13 +1915,11 @@ test "a service told nothing about its port will not start, and says which flag 
     Ok(_) -> panic("`eight` is not a port"),
     Err(reason) -> assert(mentions(reason, b"eight")),
   };
-  // A port past 65535 is a configuration nobody meant, and it is rejected here rather than turning
-  // into a listener that never binds; port 0 is any free one.
   assert(port_of(Some("70000")) != Ok(70000));
   assert_eq(port_of(Some("0")), Ok(0))
 }
 
-test "a connection budget that is absent defaults and one that is zero is rejected" {
+test "`connections_of` defaults a missing connection limit to 64 and rejects a limit of zero" {
   assert_eq(connections_of(None), Ok(64));
   assert_eq(connections_of(Some("8")), Ok(8));
   match connections_of(Some("0")) {
@@ -2233,7 +1928,7 @@ test "a connection budget that is absent defaults and one that is zero is reject
   }
 }
 
-test "a service given only its port serves postgres in plaintext, one connection at a time" {
+test "a service configured with only a port connects to postgres without TLS and accepts one connection at a time" {
   assert_eq(
     settings_of(port: Some("8137")),
     Ok({ port: 8137, connections: 64, store: Postgres, tls: None, accept: Sequential }),
@@ -2269,7 +1964,6 @@ test "each way of running the service is a setting, and a value it does not know
     Ok(_) -> panic("`threads` is not an accept loop the service has"),
     Err(reason) -> assert(mentions(reason, b"SERVICE_ACCEPT")),
   };
-  // An empty credential name would listen over TLS with nothing to present.
   match settings_of(port: Some("8137"), tls: Some("")) {
     Ok(_) -> panic("an empty credential name is not a credential"),
     Err(reason) -> assert(mentions(reason, b"SERVICE_TLS")),
@@ -2278,14 +1972,9 @@ test "each way of running the service is a setting, and a value it does not know
 
 fn mentions(text: String, needle: Bytes) -> Bool = Bytes::of_string(text).index_of(needle) != None
 
-// --- Tests: the drain ------------------------------------------------------------------
-
-// the drain's exit criterion, and it is a claim about what is *absent*: not one line of
-// `serve`, `serve_connection` or the framing changed to make a signal drain this service.
-test "a signal drains the accept loop with no source change" {
+test "a stop signal ends the accept loop and the service shuts down, with no change to the service code" {
   let r = run_configured(stock(), ||
     handle {
-      // Asked for eight connections and given one, because a stop arrived.
       listen_and_serve(8137, 8)
     } with {
       var stop = signal::running(),
@@ -2293,8 +1982,6 @@ test "a signal drains the accept loop with no source change" {
       var sent = [],
       var shut = 0,
       net.listen[listener](port) -> 1,
-      // Phase 2 of the shutdown sequence, as this service sees it: the listening socket is closed,
-      // so `accept` returns `0`.
       net.accept[listener](l) -> if signal::stopping_step(stop) { 0 } else { 7 },
       net.close[listener](l) -> {
         shut = shut + 1;
@@ -2308,37 +1995,29 @@ test "a signal drains the accept loop with no source change" {
         sent = sent.push(payload);
         Some(payload.len())
       },
-      // The signal, arriving.
       net.close[conn](c) -> {
         stop = signal::stopping_within(30000);
       },
-      // The clause that reads the flag, beside the one that sets it.
       signal.stopping() -> signal::stopping_step(stop),
       return served -> { served: served, sent: sent, shut: shut },
     });
-  // One connection served, completely: the request in flight was served rather than cut off.
   assert_eq(r.out.served, 1);
   let wrote = Bytes::concat_all(r.out.sent);
   assert_eq(status_of(wrote), 200);
   assert(wrote.index_of(b"\"service\":\"parts\"") != None);
-  // And the listener was closed on the way out, which is what `serve` returning means.
   assert_eq(r.out.shut, 1);
-  // The drain left nothing open: every span the run produced is closed, so a reader of the
-  // records sees a complete request rather than a dangling one.
   assert_eq(outcomes_of(r.records), [trace::Ok])
 }
 
-/// What `count` clients each asking for `path` once were sent by a pooled service of one worker
-/// and a queue of one, and how the pool counted them.
 fn pooled_run(
   count: Int,
   path: String,
 ) -> net::RunResult<http::PoolStats> / {sim.read, abort.raise} = {
-  let asked = Bytes::of_string(
+  let request = Bytes::of_string(
     "GET " ++ path ++ " HTTP/1.1\r\nHost: service.example\r\nConnection: close\r\n\r\n",
   );
   let callers = range(0, count).fold(net::mem_empty(), |m: net::MemNet, i: Int|
-    net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Sends(asked)]));
+    net::mem_calling(m, ip::socket_at(ip::loopback_v4(), 4000 + i), [net::Sends(request)]));
   fake(Some(Secret::of_string(fake_key())), ||
     net::on_mem(callers, ||
       simulate {
@@ -2347,10 +2026,9 @@ fn pooled_run(
       }))
 }
 
-test "a pooled service sheds what its queue cannot hold, and responds to every connection it took" {
+test "a pooled service returns 503 to connections that arrive when its queue is full, and responds to every connection it accepted" {
   let ran = pooled_run(2, "/health");
   let p = ran.value;
-  // Whether the one worker was free as each arrived is the schedule's to say, in every one of them.
   assert_eq(p.served + p.shed_full + p.shed_timed_out, 2);
   assert(p.served >= 1);
   let wrote = range(2, 4).map(|c: Int| net::mem_sent(ran.net, c));
@@ -2359,11 +2037,10 @@ test "a pooled service sheds what its queue cannot hold, and responds to every c
     wrote.filter(|w: Bytes| status_of(w) == 503 && w.index_of(b"retry-after: 1\r\n") != None).len(),
     p.shed_full,
   );
-  // Each connection taken was served once and closed: the stop drained it.
   assert_eq(ran.net.closed.len(), 2)
 }
 
-test "a kept-alive service connection under a stop gets a response marked as its last, and is not waited on" {
+test "when a stop is signalled, a keep-alive connection gets a response with `Connection: close` and the service does not wait for another request" {
   let ran = fake(Some(Secret::of_string(fake_key())), ||
     net::on_mem(
       net::mem_calling(net::mem_empty(), ip::socket_at(ip::loopback_v4(), 4000), [
@@ -2385,10 +2062,7 @@ test "a kept-alive service connection under a stop gets a response marked as its
   assert_eq(ran.net.closed, [2])
 }
 
-// The other half of the drain, from the client's side: while a stop is pending but the listener is
-// still accepting — the `--drain-lead-ms` window — the service responds to `/ready` with 503 and
-// keeps serving everything else.
-test "during the drain lead a service is unready and still serving" {
+test "once a stop is signalled, `/ready` returns 503 while other requests are still served normally" {
   let r = handle {
     against(stock(), config::one_secret(api_key(), fake_key()), || {
       let ready = app(request(http::Get, "/ready", b""));
@@ -2398,13 +2072,9 @@ test "during the drain lead a service is unready and still serving" {
   } with {
     signal.stopping() -> true,
   };
-  // A load balancer polling `/ready` removes this instance…
   assert_eq(r.out.ready, 503);
-  // …while the requests already in flight are still served properly.
   assert_eq(r.out.items, 200)
 }
-
-// --- Tests: the streamed receipt ------------------------------------------------------
 
 fn ada_order() -> Order =
   { id: 1, customer: "ada", lines: [{ sku: "bolt", qty: 10 }], total: 4.00m, state: Open }
@@ -2420,8 +2090,7 @@ test "a receipt is produced one line at a time and ends" {
   assert_eq(chunks_of(c, []).len(), 3)
 }
 
-// Two clauses, and they are `receipt`'s two effects.
-test "GET /orders/{id}/receipt streams, and a missing order does not" {
+test "GET /orders/{id}/receipt streams the response for an existing order, and returns a buffered 404 for a missing order" {
   handle {
     match receipt(Map::of_entries([{ key: "id", value: "1" }])) {
       Stream(s) -> {
@@ -2448,8 +2117,6 @@ test "GET /orders/{id}/receipt streams, and a missing order does not" {
     },
   }
 }
-
-// --- The whole service, over a simulated socket ---------------------------------------
 
 type Exchange = { wrote: Bytes, sent: Int, close_count: Int, shelf: List<Item>, book: List<Order> }
 
@@ -2481,9 +2148,6 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
     });
   {
     wrote: Bytes::concat_all(ran.out.sent),
-    // How many *responses* were written, counted as the writes that begin with a status line:
-    // `send_all` writes a buffered response in one, and `http::respond` writes a stream's head
-    // and then chunks that begin with a hex size.
     sent: ran.out.sent.filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(),
     close_count: ran.out.close_count,
     shelf: ran.shelf,
@@ -2493,13 +2157,13 @@ fn exchange(inbox: List<Bytes>, shelf: List<Item>, book: List<Order>) -> Exchang
 
 fn served(raw: Bytes) -> Exchange / {abort.raise} = exchange([raw], seed_shelf(), seed_orders())
 
-/// The status of the first response written, or 0 when nothing was.
 fn status_of(raw: Bytes) -> Int / {abort.raise} =
   match raw.index_of(b" ") {
     None -> 0,
-    Some(sp) -> match router::int_of_text(
+    Some(space_position) -> match router::int_of_text(
         String::of_bytes_lossy(
-          raw.slice(sp + 1, if sp + 4 > raw.len() { raw.len() } else { sp + 4 }),
+          raw.slice(space_position + 1, if space_position + 4 > raw.len() { raw.len() }
+          else { space_position + 4 }),
         ),
       ) {
       Some(n) -> n,
@@ -2520,8 +2184,6 @@ test "a request over the simulated socket gets a response and the connection is 
   assert_eq(e.sent, 1)
 }
 
-// Pipelining is served in order by construction: one connection, one task, and the leftover
-// buffer carried into the next turn.
 test "two pipelined requests get responses in order on one connection" {
   let e = served(get_line("/health").concat(get_line("/items")));
   assert_eq(e.sent, 2);
@@ -2530,8 +2192,7 @@ test "two pipelined requests get responses in order on one connection" {
   assert(e.wrote.index_of(b"\"sku\":\"gasket\"") != None)
 }
 
-// A head split across three reads, one of the cuts falling inside the terminator.
-test "a head whose terminator is split across two reads is still found" {
+test "a request whose header-ending blank line is split across two reads is still parsed and answered" {
   let whole = get_line("/health");
   let cut = whole.len() - 2;
   let e = exchange(
@@ -2543,7 +2204,7 @@ test "a head whose terminator is split across two reads is still found" {
   assert_eq(e.sent, 1)
 }
 
-test "a posted order travels the whole connection and moves the store" {
+test "an order sent as raw HTTP bytes over a connection returns 201, reduces the item stock and adds an order" {
   let body = "{\"customer\":\"hedy\",\"lines\":[{\"sku\":\"gasket\",\"qty\":2}]}";
   let e = served(
     Bytes::of_string(
@@ -2565,27 +2226,19 @@ test "a posted order travels the whole connection and moves the store" {
   assert_eq(e.book.len(), 3)
 }
 
-// The streamed route over the socket: the response is chunked, and the bytes between the chunk
-// sizes are exactly what the buffered path would have sent.
 test "a receipt is written as chunks and ends with the terminating chunk" {
   let e = served(get_line("/orders/1/receipt"));
   assert_eq(status_of(e.wrote), 200);
   assert(e.wrote.index_of(b"Transfer-Encoding: chunked\r\n") != None);
   assert(e.wrote.index_of(b"Content-Length") == None);
   assert(e.wrote.ends_with(b"0\r\n\r\n"));
-  // The chunk sizes are the only thing between the streamed bytes and the buffered ones, which is
-  // what the test at the foot of the file says.
   assert(e.wrote.index_of(b"receipt for order 1\ncustomer: ada\n") != None);
   assert(e.wrote.index_of(b"total: 4.00\n") != None)
 }
 
-// A HEAD is routed as the GET it mirrors, and `encode` is what drops the body: the `Content-Length`
-// is the one a GET would have produced, and not a byte of body follows the head.
 test "HEAD gets the response GET would, with the length it would have had and no body" {
   let head = served(Bytes::of_string("HEAD /items HTTP/1.1\r\nHost: d\r\n\r\n"));
   let get = served(get_line("/items"));
-  // Byte for byte the GET's head — the same status, the same fields and the same `Content-Length` —
-  // and then nothing at all.
   assert_eq(head.wrote, get.wrote.slice(0, head_end(get.wrote)));
   assert_eq(status_of(head.wrote), 200);
   assert(
@@ -2603,9 +2256,6 @@ test "HEAD gets the response GET would, with the length it would have had and no
   assert(receipt.wrote.ends_with(b"\r\n\r\n"))
 }
 
-// `OPTIONS *` asks about the server rather than about a path, so it is not routed at all — and its
-// `Allow` is read off the table, so a route added below changes this reply without anybody editing
-// it.
 test "OPTIONS * responds with the methods the table declares anywhere" {
   let e = served(b"OPTIONS * HTTP/1.1\r\nHost: d\r\n\r\n");
   assert_eq(status_of(e.wrote), 204);
@@ -2618,22 +2268,17 @@ test "a peer that opens a connection and says nothing is closed without a respon
   assert_eq(e.close_count, 1)
 }
 
-// --- The service as its settings describe it ----------------------------------------------
-
-/// One connection's worth of the service `listening` runs, over sockets that are values: what it
-/// wrote, how many responses that was, and what it said on stdout.
 fn over_socket(
   inbox: List<Bytes>,
   s: Settings,
-) -> { wrote: Bytes, sent: Int, said: List<String> } / {sim.read, abort.raise} = {
+) -> { wrote: Bytes, sent: Int, messages: List<String> } / {sim.read, abort.raise} = {
   let ran = run_configured(stock(), ||
     handle {
-      // A task per connection needs a scheduler; the sequential loop spawns nothing under it.
       simulate { assert_eq(listening(s), 1) }
     } with {
       var queue = inbox,
       var sent = [],
-      var said = [],
+      var printed_lines = [],
       net.listen[listener](port) -> 1,
       net.listen_tls[listener](port, credential) -> {
         assert_eq(credential, "service");
@@ -2653,18 +2298,17 @@ fn over_socket(
       },
       net.close[conn](c) -> (),
       process.out[proc](line) -> {
-        said = said.push(line);
+        printed_lines = printed_lines.push(line);
       },
-      return u -> { sent: sent, said: said },
+      return u -> { sent: sent, messages: printed_lines },
     });
   {
     wrote: Bytes::concat_all(ran.out.sent),
     sent: ran.out.sent.filter(|p: Bytes| p.starts_with(b"HTTP/1.1 ")).len(),
-    said: ran.out.said,
+    messages: ran.out.messages,
   }
 }
 
-/// One connection, on whatever port is free.
 fn one_connection(tls: Option<String>, accept: Accept) -> Settings =
   { port: 0, connections: 1, store: Memory, tls: tls, accept: accept }
 
@@ -2684,14 +2328,13 @@ test "a listener serves exactly the connections it was asked for" {
   assert_eq(e.sent, 2)
 }
 
-// The line a harness reads to find a service it asked for port 0.
 test "a service says on stdout which port it landed on" {
-  assert_eq(over_socket([get_line("/health")], one_connection(None, Sequential)).said, [
+  assert_eq(over_socket([get_line("/health")], one_connection(None, Sequential)).messages, [
     "listening on 40123",
   ])
 }
 
-test "a task per connection writes the bytes one connection at a time writes" {
+test "a task per connection sends the same bytes as handling the connection sequentially" {
   let spawned = over_socket(
     [get_line("/items").concat(get_line("/orders/1/receipt"))],
     one_connection(None, TaskPerConnection),
@@ -2706,7 +2349,6 @@ test "a task per connection writes the bytes one connection at a time writes" {
   assert_eq(spawned.sent, 2)
 }
 
-// The fake as `main` runs it when the settings name it: nothing granted but sockets and stdout.
 test "the fake serves the service over TLS with a task per connection" {
   let sent = handle {
     fake(Some(Secret::of_string(fake_key())), ||
@@ -2736,8 +2378,7 @@ test "the fake serves the service over TLS with a task per connection" {
   assert(Bytes::concat_all(sent).index_of(b"\"sku\":\"gasket\"") != None)
 }
 
-// The fake entry point, driven end to end with nothing granted but sockets.
-test "run_memory serves the service with no database bound and no host at all" {
+test "`run_memory` serves requests from in-memory data, with no database handler and no network handler other than the simulated connection" {
   let sent = handle {
     assert_eq(run_memory(8137, Some(Secret::of_string(fake_key())), 1), 1)
   } with {
@@ -2764,11 +2405,6 @@ test "run_memory serves the service with no database bound and no host at all" {
   assert(wrote.index_of(b"\"customer\":\"ada\"") != None)
 }
 
-// --- One case per protocol rejection -------------------------------------------------
-
-/// The status the peer was given — and, for every case below rather than for the ones a test author
-/// remembered, three properties every rejection has: exactly one response was written,
-/// the connection was closed, and neither the shelf nor the order book moved.
 fn rejected(raw: Bytes) -> Int / {abort.raise} = {
   let e = served(raw);
   assert_eq(e.sent, 1);
@@ -2864,8 +2500,6 @@ test "a chunk size that is empty, not hex, or unterminated is rejected" {
   )
 }
 
-// A trailer named `content-length` changes no framing decision and a trailer named `authorization`
-// never appears among the headers.
 test "trailers arrive in their own field and are never merged into the headers" {
   let e = served(
     Bytes::of_string(
@@ -2875,17 +2509,15 @@ test "trailers arrive in their own field and are never merged into the headers" 
       b"2\r\n{}\r\n0\r\nContent-Length: 0\r\nAuthorization: root\r\n\r\n",
     ),
   );
-  // The body was framed by the chunks and not by the trailer, so the service saw `{}` and rejected
-  // it as a `Placement` rather than as a framing error.
   assert_eq(status_of(e.wrote), 400);
   assert_eq(e.close_count, 1)
 }
 
-test "a request line longer than this service will hold is 414" {
+test "a request line longer than the service's size limit is rejected with status 414 (URI Too Long)" {
   assert_eq(rejected(b"GET /".concat(filler(9000)).concat(b" HTTP/1.1\r\nHost: d\r\n\r\n")), 414)
 }
 
-test "more header bytes than this service will hold is 431" {
+test "request headers larger than the service's size limit are rejected with status 431 (Request Header Fields Too Large)" {
   assert_eq(
     rejected(b"GET /health HTTP/1.1\r\nHost: d\r\nX: ".concat(filler(20000)).concat(b"\r\n\r\n")),
     431,
@@ -2895,17 +2527,11 @@ test "more header bytes than this service will hold is 431" {
 fn filler(n: Int) -> Bytes =
   Bytes::concat_all(range(0, (n + 31) / 32).map(|_i: Int| b"xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"))
 
-// --- Laws the route table being data makes possible -------------------------------------
-
-/// A route the matcher cannot reach is a line of documentation for something the service does not
-/// do.
 fn sample_segment(s: router::Segment) -> String =
   match s {
     router::Literal(text) -> text,
     router::Param(name) -> ":" ++ name,
     router::Rest(name) -> ":" ++ name,
-    // A typed binder only matches a segment that parses, so the sample has to parse; no literal in
-    // the table is one of these three words.
     router::Typed(binding) -> sample_of_kind(binding.kind),
   }
 
@@ -2913,15 +2539,15 @@ fn sample_of_kind(kind: router::ParamType) -> String =
   match kind { router::IntParam -> "7", router::DecimalParam -> "7.5", router::BoolParam -> "true" }
 
 fn sample_path(path: List<router::Segment>) -> String =
-  path.fold("", |acc: String, s: router::Segment| acc ++ "/" ++ sample_segment(s))
+  path.fold("", |accumulator: String, s: router::Segment| accumulator ++ "/" ++ sample_segment(s))
 
 fn sample_params(path: List<router::Segment>) -> Map<String, String> =
-  path.fold(Map::new(), |acc: Map<String, String>, s: router::Segment|
+  path.fold(Map::new(), |accumulator: Map<String, String>, s: router::Segment|
     match s {
-      router::Literal(_) -> acc,
-      router::Param(name) -> acc.insert(name, ":" ++ name),
-      router::Rest(name) -> acc.insert(name, ":" ++ name),
-      router::Typed(binding) -> acc.insert(binding.name, sample_of_kind(binding.kind)),
+      router::Literal(_) -> accumulator,
+      router::Param(name) -> accumulator.insert(name, ":" ++ name),
+      router::Rest(name) -> accumulator.insert(name, ":" ++ name),
+      router::Typed(binding) -> accumulator.insert(binding.name, sample_of_kind(binding.kind)),
     })
 
 fn route_for(t: List<router::Route<Endpoint>>, e: Endpoint) -> Option<router::Route<Endpoint>> =
@@ -2936,12 +2562,11 @@ pub fn reachable(e: Endpoint) -> Bool / {abort.raise} =
         == router::Found({ endpoint: e, params: sample_params(r.path) }),
   }
 
-law "every endpoint the service can dispatch is reachable through the table"
+law "every endpoint has a route in the table, and routing a sample path for that route finds the same endpoint"
   forall (e: Endpoint) {
     reachable(e)
   }
 
-// The property a framework enforces with a macro is here a value a law asserts.
 law "no two routes overlap ambiguously, and every pattern is well formed" {
   conflicts_and_internal_errors() == 0
 }
@@ -2973,9 +2598,7 @@ fn drawn_orders() -> Gen<Order> =
     |o: Order, state: State| { ..o, state: state },
   )
 
-// What a streaming encoder has to earn and almost never states: the bytes pulled out of the cursor
-// are the bytes a buffered body would have held.
-test "a streamed receipt is byte-for-byte what a buffered one would have been" {
+test "streaming an order's receipt response produces the same bytes as building the whole response in memory" {
   gen::check(drawn_orders(), |o: Order| drained(cursor_for(o, seed_shelf())) == buffered_receipt(o))
 }
 
@@ -2988,15 +2611,10 @@ pub fn buffered_receipt(o: Order) -> Bytes =
     ),
   )
 
-// Drawing a shelf down and putting the same lines back is the identity, which is what makes a
-// cancellation safe to run twice — the second one is rejected by `state`, and this says the first
-// one moved exactly what it should have.
-test "a drawdown is undone exactly by putting the same lines back" {
+test "putting back the order lines that `draw_down` removed restores the original stock" {
   gen::check(drawn_lines(), |lines: List<Line>|
     put_back(draw_down(seed_shelf(), lines), lines) == seed_shelf())
 }
-
-// --- What the store being a value makes checkable ----------------------------------------
 
 pub type Pick = | Bolt | Gasket | Widget
 
@@ -3006,8 +2624,6 @@ pub type LineChoice = { pick: Pick, amount: Amount }
 
 fn sku_of(p: Pick) -> String = match p { Bolt -> "bolt", Gasket -> "gasket", Widget -> "widget" }
 
-/// `Crate` is 40, which the gasket shelf cannot cover and the bolt shelf can, so a drawn order
-/// lands on both sides of the rejection rather than on one.
 fn qty_of(a: Amount) -> Int = match a { One -> 1, Couple -> 2, Handful -> 5, Crate -> 40 }
 
 pub fn lines_of(ws: List<LineChoice>) -> List<Line> =
@@ -3026,8 +2642,6 @@ fn wants() -> Gen<List<LineChoice>> =
 
 fn covered(ws: List<LineChoice>) -> Bool = short_skus(seed_shelf(), lines_of(ws)).len() == 0
 
-/// Through the whole route — the key check, the decode and the span — so the tests cover what a
-/// client actually reaches rather than starting after it.
 pub fn run_place_order(ws: List<LineChoice>) -> ServiceRun<http::Response<| {}>> / {abort.raise} =
   run_configured(stocked(seed_shelf(), []), ||
     app(
@@ -3038,7 +2652,6 @@ pub fn run_place_order(ws: List<LineChoice>) -> ServiceRun<http::Response<| {}>>
       ),
     ))
 
-/// The claim a rollback is for.
 pub fn rejected_without_trace(ws: List<LineChoice>) -> Bool / {abort.raise} = {
   let r = run_place_order(ws);
   r.out.status == 409 && r.shelf == seed_shelf() && r.book == []
@@ -3046,23 +2659,19 @@ pub fn rejected_without_trace(ws: List<LineChoice>) -> Bool / {abort.raise} = {
     && trace::counter_total(r.records, "orders placed") == 0
 }
 
-test "a placement the shelf cannot cover leaves no row behind" {
+test "an order for more than the stock returns 409 and leaves the shelf, the orders and the trace records unchanged" {
   gen::check(wants(), |ws: List<LineChoice>| covered(ws) || rejected_without_trace(ws))
 }
 
-/// And the other half, without which the first is satisfied by a service that rejects everything:
-/// what a placement that succeeds does to the shelf is exactly `draw_down`, the pure function the
-/// tests above check on its own.
 pub fn committed_as_specified(ws: List<LineChoice>) -> Bool / {abort.raise} = {
   let r = run_place_order(ws);
   r.out.status == 201 && r.shelf == draw_down(seed_shelf(), lines_of(ws)) && r.book.len() == 1
 }
 
-test "a placement the shelf can cover moves the shelf by exactly the drawdown" {
+test "placing an order within the stock returns 201, writes one order and reduces stock exactly as `draw_down` does" {
   gen::check(wants(), |ws: List<LineChoice>| !covered(ws) || committed_as_specified(ws))
 }
 
-/// The statement and the predicate it replaced, over every id.
 pub fn one_order_agrees(id: Int) -> Bool / {abort.raise} = {
   let r = run_configured(stock(), || app(request(http::Get, "/orders/" ++ id.to_string(), b"")));
   match find_order(seed_orders(), id) {
@@ -3073,6 +2682,6 @@ pub fn one_order_agrees(id: Int) -> Bool / {abort.raise} = {
   }
 }
 
-test "the route that finds one order finds what `order_by` names" {
+test "`GET /orders/<id>` returns the order that `find_order` finds, or 404 when there is none" {
   gen::check(gen::one_of([gen::elements([1, 2]), gen::any_int()]), one_order_agrees)
 }

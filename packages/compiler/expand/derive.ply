@@ -15,8 +15,8 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     WithScopeExpression, SimulateExpression, ParallelExpression,
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
-                                    AssignmentStatement, HandlerVar, Param, NamedArg, MatchArm,
-                                    HandleClause, ReturnClause, RecordLiteralField,
+                                    AssignmentStatement, HandlerStateVariable, Param, NamedArg,
+                                    MatchArm, HandleClause, ReturnClause, RecordLiteralField,
                                     TaggedLiteralExpression, Hole, expression_span)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, DeriveItem, FnDefinition,
                               TypeDefinition, AliasBody, SumBody, VariantDefinition,
@@ -32,30 +32,38 @@ import std.bin
 import std.derive
 import std.value
 
-fn identifier_at(ident: Identifier, span: Span) -> Identifier = { name: ident.name, span: span }
+fn identifier_at(identifier: Identifier, span: Span) -> Identifier =
+  { name: identifier.name, span: span }
 
-fn qualified_name_at(qname: QName, span: Span) -> QName =
+fn qualified_name_at(qualified_name: QName, span: Span) -> QName =
   {
-    module: match qname.module { Some(m) -> Some(identifier_at(m, span)), None -> None },
-    name: identifier_at(qname.name, span),
+    module: match qualified_name.module { Some(m) -> Some(identifier_at(m, span)), None -> None },
+    name: identifier_at(qualified_name.name, span),
     span: span,
   }
 
 fn optional_identifier_at(o: Option<Identifier>, span: Span) -> Option<Identifier> =
   match o { Some(i) -> Some(identifier_at(i, span)), None -> None }
 
-fn retarget_fn(definition: FnDefinition, span: Span) -> FnDefinition =
+fn retarget_function(definition: FnDefinition, span: Span) -> FnDefinition =
   {
     visibility: definition.visibility,
     name: { name: definition.name.name, span: span },
     generics: {
-      types: definition.generics.types.map(|ident: Identifier| identifier_at(ident, span)),
-      effects: definition.generics.effects.map(|ident: Identifier| identifier_at(ident, span)),
-      labels: definition.generics.labels.map(|ident: Identifier| identifier_at(ident, span)),
-      kept: definition.generics.kept.map(|ident: Identifier| identifier_at(ident, span)),
+      types: definition.generics.types.map(|identifier: Identifier|
+        identifier_at(identifier, span)),
+      effects: definition.generics.effects.map(|identifier: Identifier|
+        identifier_at(identifier, span)),
+      labels: definition.generics.labels.map(|identifier: Identifier|
+        identifier_at(identifier, span)),
+      retained_types: definition.generics.retained_types.map(|identifier: Identifier|
+        identifier_at(identifier, span)),
     },
     params: definition.params.map(|param: Param| retarget_param(param, span)),
-    ret: match definition.ret { Some(t) -> Some(retarget_type(t, span)), None -> None },
+    return_type: match definition.return_type {
+      Some(t) -> Some(retarget_type(t, span)),
+      None -> None,
+    },
     effects: match definition.effects { Some(r) -> Some(retarget_effects(r, span)), None -> None },
     constraints: definition.constraints.map(|c: Constraint|
       { deriver: c.deriver, deriver_span: span, param: identifier_at(c.param, span), span: span }),
@@ -101,7 +109,7 @@ fn retarget_type(t: TypeExpression, span: Span) -> TypeExpression =
         ..f,
         span: span,
         params: f.params.map(|p: TypeExpression| retarget_type(p, span)),
-        ret: retarget_type(f.ret, span),
+        return_type: retarget_type(f.return_type, span),
         effects: match f.effects { Some(r) -> Some(retarget_effects(r, span)), None -> None },
       }),
     RecordTypeExpression(r) ->
@@ -120,13 +128,13 @@ fn retarget_effects(effects: EffectsExpression, span: Span) -> EffectsExpression
       {
         effect_name: qualified_name_at(entry.effect_name, span),
         mode: entry.mode,
-        op: optional_identifier_at(entry.op, span),
+        operation: optional_identifier_at(entry.operation, span),
         resource: optional_identifier_at(entry.resource, span),
         resource_wildcard: entry.resource_wildcard,
         bounded: entry.bounded,
         span: span,
       }),
-    aliases: effects.aliases.map(|qname: QName| qualified_name_at(qname, span)),
+    aliases: effects.aliases.map(|alias: QName| qualified_name_at(alias, span)),
     variable: optional_identifier_at(effects.variable, span),
     variable_bounded: effects.variable_bounded,
     span: span,
@@ -146,18 +154,22 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
     BinaryExpression(b) ->
       BinaryExpression({
         span: span,
-        op: b.op,
-        lhs: retarget_expression(b.lhs, span),
-        rhs: retarget_expression(b.rhs, span),
+        operation: b.operation,
+        left_operand: retarget_expression(b.left_operand, span),
+        right_operand: retarget_expression(b.right_operand, span),
       }),
     UnaryExpression(u) ->
-      UnaryExpression({ span: span, op: u.op, operand: retarget_expression(u.operand, span) }),
+      UnaryExpression({
+        span: span,
+        operation: u.operation,
+        operand: retarget_expression(u.operand, span),
+      }),
     LambdaExpression(l) ->
       LambdaExpression({
         span: span,
         body: retarget_expression(l.body, span),
         params: l.params.map(|p: Param| retarget_param(p, span)),
-        ret: l.ret,
+        return_clause: l.return_clause,
       }),
     CallExpression(a) ->
       CallExpression({
@@ -191,8 +203,8 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
       BlockExpression({
         span: span,
         tail: retarget_optional_expression(b.tail, span),
-        statements: b.statements.map(|stmt: Statement|
-          match stmt {
+        statements: b.statements.map(|statement: Statement|
+          match statement {
             LetStatement(l) ->
               LetStatement({
                 span: span,
@@ -245,7 +257,7 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
       PerformExpression({
         span: span,
         effect_name: qualified_name_at(p.effect_name, span),
-        op: identifier_at(p.op, span),
+        operation: identifier_at(p.operation, span),
         resource: optional_identifier_at(p.resource, span),
         args: p.args.map(|x: Expression| retarget_expression(x, span)),
       }),
@@ -253,11 +265,11 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
       HandleExpression({
         span: span,
         body: retarget_expression(h.body, span),
-        ret: match h.ret {
-          Some(rc) ->
+        return_clause: match h.return_clause {
+          Some(return_clause) ->
             Some({
-              binder: identifier_at(rc.binder, span),
-              body: retarget_expression(rc.body, span),
+              binder: identifier_at(return_clause.binder, span),
+              body: retarget_expression(return_clause.body, span),
               span: span,
             }),
           None -> None,
@@ -265,7 +277,7 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
         clauses: h.clauses.map(|c: HandleClause|
           {
             effect_name: qualified_name_at(c.effect_name, span),
-            op: identifier_at(c.op, span),
+            operation: identifier_at(c.operation, span),
             resource: optional_identifier_at(c.resource, span),
             wildcard_label: c.wildcard_label,
             label_binder: optional_identifier_at(c.label_binder, span),
@@ -274,7 +286,7 @@ fn retarget_expression(e: Expression, span: Span) -> Expression =
             span: span,
             params: c.params.map(|p: Identifier| identifier_at(p, span)),
           }),
-        vars: h.vars.map(|v: HandlerVar|
+        handler_variables: h.handler_variables.map(|v: HandlerStateVariable|
           {
             name: identifier_at(v.name, span),
             ty: match v.ty { Some(t) -> Some(retarget_type(t, span)), None -> None },
@@ -367,7 +379,7 @@ derive bin for DeriverResponse
 pub fn declaration_bytes(declaration: derive::Declaration) -> Bytes / {abort.raise} =
   match value::encode(value::VList([value::reflect(declaration)])) {
     Some(b) -> b,
-    None -> panic("a declaration holds what PLV1 does not write"),
+    None -> panic("internal error: a declaration contains a value that cannot be written as bytes"),
   }
 
 type ItemResponse = { span: Span, result: DeriverResponse }
@@ -390,14 +402,14 @@ fn report(expander: Expander, diagnostic: Diagnostic) -> Expander =
   { ..expander, diagnostics: expander.diagnostics.push(diagnostic) }
 
 fn find_claim(xs: List<NameClaim>, name: Bytes) -> Option<DeriveDefinition> =
-  xs.fold(None, |acc: Option<DeriveDefinition>, claimed: NameClaim|
-    match acc {
-      Some(_) -> acc,
+  xs.fold(None, |accumulator: Option<DeriveDefinition>, claimed: NameClaim|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> if claimed.name == name { Some(claimed.definition) } else { None },
     })
 
 pub fn import_path(declaration: ImportDeclaration) -> Bytes =
-  Bytes::join(declaration.path.map(|ident: Identifier| ident.name), b".")
+  Bytes::join(declaration.path.map(|identifier: Identifier| identifier.name), b".")
 
 fn eq_ignore_case(a: Bytes, b: Bytes) -> Bool / {abort.raise} =
   String::of_bytes(a).eq_ignore_ascii_case(String::of_bytes(b))
@@ -413,10 +425,13 @@ fn new_expander(
     m: m,
     path: path,
     module: module,
-    types: module.items.fold([], |acc: List<TypeDefinition>, item: Item|
+    types: module.items.fold([], |accumulator: List<TypeDefinition>, item: Item|
       match item {
-        TypeItem(d) -> match find_type(acc, d.name.name) { Some(_) -> acc, None -> acc.push(d) },
-        _ -> acc,
+        TypeItem(d) -> match find_type(accumulator, d.name.name) {
+          Some(_) -> accumulator,
+          None -> accumulator.push(d),
+        },
+        _ -> accumulator,
       }),
     previous_derivations: previous,
     results: results,
@@ -426,13 +441,13 @@ fn new_expander(
   }
 
 fn run_expander(expander: Expander) -> Expander / {abort.raise} =
-  expander.module.items.fold(expander, |acc: Expander, item: Item|
-    match item { DeriveItem(definition) -> derive_one(acc, definition), _ -> acc })
+  expander.module.items.fold(expander, |accumulator: Expander, item: Item|
+    match item { DeriveItem(definition) -> derive_one(accumulator, definition), _ -> accumulator })
 
-pub fn deriver_module(module: Module, binder: Bytes) -> Option<Bytes> / {abort.raise} =
-  module.imports.fold(None, |acc: Option<Bytes>, declaration: ImportDeclaration|
-    match acc {
-      Some(_) -> acc,
+pub fn deriver_module(module: Module, binder: Bytes) -> Option<Bytes> =
+  module.imports.fold(None, |accumulator: Option<Bytes>, declaration: ImportDeclaration|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> if import_binder(declaration) == Some(binder) { Some(import_path(declaration)) }
       else { None },
     })
@@ -442,16 +457,16 @@ fn deriver_requests(
   module: Module,
   previous: List<Derivation>,
 ) -> List<{ span: Span, ask: DeriverRequest }> / {abort.raise} =
-  module.items.fold([], |acc: List<{ span: Span, ask: DeriverRequest }>, item: Item|
+  module.items.fold([], |accumulator: List<{ span: Span, ask: DeriverRequest }>, item: Item|
     match item {
       DeriveItem(d) -> if previous.any(|t: Derivation|
-          t.deriver == d.deriver && t.target == d.target.name) { acc } else {
+          t.deriver == d.deriver && t.target == d.target.name) { accumulator } else {
         let declares = module.items.any(|i: Item|
           match i { TypeItem(t) -> t.name.name == d.target.name, _ -> false });
         match if declares { deriver_module(module, d.deriver) } else { None } {
-          None -> acc,
+          None -> accumulator,
           Some(deriver) ->
-            acc.push({
+            accumulator.push({
               span: d.span,
               ask: {
                 module: deriver,
@@ -462,13 +477,13 @@ fn deriver_requests(
             }),
         }
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 
 fn no_runner_failure() -> DeriverResponse =
   Failed({
     code: b"E0155",
-    message: b"a library deriver runs only where a load checks the program",
+    message: b"a library deriver cannot run here; it runs only during a command that checks the program",
     notes: [
       b"`ply check`, `ply test`, `ply run` and `ply build` run each deriver a module names; this read of the module ran none",
     ],
@@ -503,8 +518,11 @@ fn add_generated_source(
   let source = Bytes::join(written, b"\n");
   let r = parse(source);
   let x = expand(r.node, r.parser.diagnostics);
-  let functions = x.module.items.fold([], |acc: List<FnDefinition>, item: Item|
-    match item { FunctionItem(d) -> acc.push(retarget_fn(d, definition.span)), _ -> acc });
+  let functions = x.module.items.fold([], |accumulator: List<FnDefinition>, item: Item|
+    match item {
+      FunctionItem(d) -> accumulator.push(retarget_function(d, definition.span)),
+      _ -> accumulator,
+    });
   if x.diagnostics.len() > 0 || functions.len() != x.module.items.len()
       || r.node.imports.len() > 0 {
     report(
@@ -516,7 +534,7 @@ fn add_generated_source(
         Bytes::concat_all([
           b"the `",
           definition.deriver,
-          b"` deriver returned source that is not functions",
+          b"` deriver must return only function definitions, but it returned other source",
         ]),
         b"this derivation",
         [
@@ -528,16 +546,17 @@ fn add_generated_source(
   } else {
     let named = functions.fold(
       { ex: expander, clash: false },
-      |acc: { ex: Expander, clash: Bool }, f: FnDefinition|
-        match find_claim(acc.ex.claimed, f.name.name) {
-          Some(prev) -> { ex: collision(acc.ex, definition, prev, f.name.name), clash: true },
+      |accumulator: { ex: Expander, clash: Bool }, f: FnDefinition|
+        match find_claim(accumulator.ex.claimed, f.name.name) {
+          Some(earlier) ->
+            { ex: collision(accumulator.ex, definition, earlier, f.name.name), clash: true },
           None ->
             {
               ex: {
-                ..acc.ex,
-                claimed: acc.ex.claimed.push({ name: f.name.name, definition: definition }),
+                ..accumulator.ex,
+                claimed: accumulator.ex.claimed.push({ name: f.name.name, definition: definition }),
               },
-              clash: acc.clash,
+              clash: accumulator.clash,
             },
         },
     );
@@ -559,7 +578,7 @@ fn add_generated_source(
   }
 }
 
-fn derive_error_span(target: TypeDefinition, at: Option<Bytes>) -> Span / {abort.raise} =
+fn derive_error_span(target: TypeDefinition, at: Option<Bytes>) -> Span =
   match at {
     None -> target.name.span,
     Some(name) -> {
@@ -588,7 +607,7 @@ fn report_derive_error(
   definition: DeriveDefinition,
   target: TypeDefinition,
   rejected: Rejection,
-) -> Expander / {abort.raise} =
+) -> Expander =
   report(
     expander,
     error_at_and(
@@ -636,15 +655,18 @@ fn report_undeclared_target(
   expander: Expander,
   definition: DeriveDefinition,
 ) -> Expander / {abort.raise} = {
-  let near = expander.types.fold(None, |acc: Option<Bytes>, type_definition: TypeDefinition|
-    match acc {
-      Some(_) -> acc,
-      None -> if eq_ignore_case(type_definition.name.name, definition.target.name) {
-        Some(type_definition.name.name)
-      } else { None },
-    });
+  let near = expander.types.fold(
+    None,
+    |accumulator: Option<Bytes>, type_definition: TypeDefinition|
+      match accumulator {
+        Some(_) -> accumulator,
+        None -> if eq_ignore_case(type_definition.name.name, definition.target.name) {
+          Some(type_definition.name.name)
+        } else { None },
+      },
+  );
   let notes = [
-    b"a `derive` may only name a type its own module declares, so that one type has one canonical encoding rather than one per module that thought of it",
+    b"a `derive` may only name a type declared in its own module, so each type has a single encoding instead of several conflicting ones from different modules",
   ];
   report(
     expander,
@@ -665,10 +687,10 @@ fn report_undeclared_target(
 fn collision(
   expander: Expander,
   definition: DeriveDefinition,
-  prev: DeriveDefinition,
+  earlier: DeriveDefinition,
   name: Bytes,
 ) -> Expander = {
-  let note = if prev.target.name == definition.target.name {
+  let note = if earlier.target.name == definition.target.name {
     Bytes::concat_all([
       b"`derive ",
       definition.deriver,
@@ -679,7 +701,7 @@ fn collision(
   } else {
     Bytes::concat_all([
       b"`",
-      prev.target.name,
+      earlier.target.name,
       b"` and `",
       definition.target.name,
       b"` both name `",
@@ -696,8 +718,8 @@ fn collision(
       Bytes::concat_all([b"`", name, b"` is generated twice"]),
       b"this derivation generates it",
       expander.m,
-      prev.span,
-      b"and so does this one",
+      earlier.span,
+      b"this `derive` also generates that name",
       [note],
     ),
   )
@@ -725,10 +747,13 @@ pub fn expand_derives<| e>(
       module: {
         doc: module.doc,
         imports: module.imports,
-        items: ex.generated.fold(module.items, |acc: List<Item>, generated: GeneratedFunctions|
-          acc.concat(
-            generated.definitions.map(|definition: FnDefinition| FunctionItem(definition)),
-          )),
+        items: ex.generated.fold(
+          module.items,
+          |accumulator: List<Item>, generated: GeneratedFunctions|
+            accumulator.concat(
+              generated.definitions.map(|definition: FnDefinition| FunctionItem(definition)),
+            ),
+        ),
       },
       derived: ex.generated.map(|generated: GeneratedFunctions| generated.derived),
       diagnostics: ex.diagnostics,
@@ -736,44 +761,44 @@ pub fn expand_derives<| e>(
   }
 
 fn expand_with_response(
-  src: Bytes,
+  source: Bytes,
   result: DeriverResponse,
-) -> { expansion: Expansion, asked: List<DeriverRequest> } / {abort.raise} =
+) -> { expansion: Expansion, requested: List<DeriverRequest> } / {abort.raise} =
   handle {
     let x = expand_derives(
       0,
       b"t",
-      parse(src).node,
+      parse(source).node,
       library: Some(|ask: DeriverRequest| {
         request_log.record(ask);
         result
       }),
     );
-    { expansion: x, asked: [] }
+    { expansion: x, requested: [] }
   } with {
     var seen: List<DeriverRequest> = [],
     request_log.record(ask) -> {
       seen = seen.push(ask);
     },
-    return v -> { ..v, asked: seen },
+    return v -> { ..v, requested: seen },
   }
 
 effect request_log {
   write record(ask: DeriverRequest) -> Unit
 }
 
-test "a library derivation asks its module's deriver with the module's types, and reads in what it wrote" {
-  let src = b"import lib.mapping as mapping\ntype Box<a> = | Box(a, List<a>)\ntype Pair = { left: Int }\nderive mapping for Box\n";
+test "a `derive` item calls the module's deriver function with the module's type declarations, then adds the function definitions it returns" {
+  let source = b"import lib.mapping as mapping\ntype Box<a> = | Box(a, List<a>)\ntype Pair = { left: Int }\nderive mapping for Box\n";
   let x = expand_with_response(
-    src,
+    source,
     Generated(
       b"fn Box::map<a, b | e>(original: Box<a>, a: (a) -> b / e) -> Box<b> / e = match original { Box(x, xs) -> Box(a(x), xs.map(a)) }",
     ),
   );
   assert_eq(x.expansion.diagnostics, []);
-  assert_eq(x.asked.map(|a: DeriverRequest| a.module), [b"lib.mapping"]);
-  let declaration = declaration_of(b"t", parse(src).node, b"Box", b"mapping");
-  assert_eq(x.asked.get(0).declaration, declaration_bytes(declaration));
+  assert_eq(x.requested.map(|a: DeriverRequest| a.module), [b"lib.mapping"]);
+  let declaration = declaration_of(b"t", parse(source).node, b"Box", b"mapping");
+  assert_eq(x.requested.get(0).declaration, declaration_bytes(declaration));
   assert_eq(declaration.target, "Box");
   assert_eq(declaration.binder, "mapping");
   assert_eq(declaration.derived, ["Box"]);
@@ -786,8 +811,8 @@ test "a library derivation asks its module's deriver with the module's types, an
     }),
     "List<a>",
   );
-  let generated = x.expansion.module.items.fold([], |acc: List<Bytes>, item: Item|
-    match item { FunctionItem(d) -> acc.push(d.name.name), _ -> acc });
+  let generated = x.expansion.module.items.fold([], |accumulator: List<Bytes>, item: Item|
+    match item { FunctionItem(d) -> accumulator.push(d.name.name), _ -> accumulator });
   assert_eq(generated, [b"Box::map"]);
   assert_eq(x.expansion.derived.map(|d: DeriveOrigin| d.written), [
     [
@@ -796,23 +821,23 @@ test "a library derivation asks its module's deriver with the module's types, an
   ])
 }
 
-test "a library deriver's rejection, failure, or text that is not functions each report at the derivation" {
-  let src = b"import lib.mapping as mapping\ntype Box<a> = | Box(a) | Empty\nderive mapping for Box\n";
+test "a deriver that returns a rejection, fails, or returns text that is not function definitions reports an error at the `derive` item" {
+  let source = b"import lib.mapping as mapping\ntype Box<a> = | Box(a) | Empty\nderive mapping for Box\n";
   let codes = |result: DeriverResponse|
-    expand_with_response(src, result).expansion.diagnostics.map(|d: Diagnostic| d.code);
+    expand_with_response(source, result).expansion.diagnostics.map(|d: Diagnostic| d.code);
   let report_derive_error = expand_with_response(
-    src,
+    source,
     Declined({ message: b"no", at: Some(b"Empty"), notes: [b"why"] }),
   );
   assert_eq(report_derive_error.expansion.diagnostics.map(|d: Diagnostic| d.code), [b"E0206"]);
   assert_eq(
     Some(report_derive_error.expansion.diagnostics.get(0).labels.get(0).start),
-    src.index_of(b"Empty"),
+    source.index_of(b"Empty"),
   );
   assert_eq(codes(Failed({ code: b"E0155", message: b"raised", notes: [] })), [b"E0155"]);
   assert_eq(codes(Generated(b"type Wrong = Int")), [b"E0155"]);
   assert_eq(codes(Generated(b"fn broken( = 1")), [b"E0155"]);
-  assert_eq(expand_derives(0, b"t", parse(src).node).diagnostics.map(|d: Diagnostic| d.code), [
+  assert_eq(expand_derives(0, b"t", parse(source).node).diagnostics.map(|d: Diagnostic| d.code), [
     b"E0155",
   ]);
   let unknown = expand_with_response(
@@ -820,20 +845,20 @@ test "a library deriver's rejection, failure, or text that is not functions each
     Generated(b""),
   );
   assert_eq(unknown.expansion.diagnostics.map(|d: Diagnostic| d.code), [b"E0207"]);
-  assert_eq(unknown.asked, [])
+  assert_eq(unknown.requested, [])
 }
 
-test "every node of a generated definition stands at the derive item's place, its numbering telling them apart" {
-  let src = b"import lib.naming as naming\ntype Order = {id: Int, name: String}\nderive naming for Order";
+test "every syntax node of a generated definition has the span of the `derive` item, and each node has its own node number" {
+  let source = b"import lib.naming as naming\ntype Order = {id: Int, name: String}\nderive naming for Order";
   let x = expand_with_response(
-    src,
+    source,
     Generated(
       b"fn order_named(o: Order) -> String = if o.id > 0 { o.name } else { \"none\" ++ o.name }",
     ),
   ).expansion;
   assert_eq(x.derived.len(), 1);
   let d = x.derived.get(0);
-  assert_eq(d.span, span_between(src.index_of(b"derive").unwrap_or(0), src.len()));
+  assert_eq(d.span, span_between(source.index_of(b"derive").unwrap_or(0), source.len()));
   match numbered(x.module.items.get(x.module.items.len() - 1)) {
     FunctionItem(f) -> {
       assert_eq(f.span, d.span);

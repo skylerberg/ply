@@ -1,10 +1,6 @@
-//! An adversarial audit of the database design's central claim: that `std.db`'s in-memory fake and postgres
-//! agree.
 import std.db
 import std.sql
 import std.db (db)
-
-// --- The fixture ------------------------------------------------------------
 
 pub fn fixture() -> sql::Schema = { tables: [part(), bin()] }
 
@@ -39,20 +35,16 @@ fn bin() -> sql::Table =
     checks: [{ name: "bin_qty_check", expression: "qty >= 0" }],
   }
 
-// --- Driving the fake -------------------------------------------------------
-
 type Step = { sql: String, ps: List<sql::Param> }
 
 type Run = { db: db::MemDb, out: List<sql::QueryResult> }
 
-/// Every result, in order, for a sequence of statements against a fresh fake.
 fn replay(steps: List<Step>) -> List<sql::QueryResult> / {abort.raise} =
-  steps.fold({ db: db::open(fixture()), out: [] }, |acc: Run, s: Step| {
-    let r = db::step(acc.db, sql::stmt(s.sql), s.ps);
-    { db: r.db, out: acc.out.push(r.out) }
+  steps.fold({ db: db::open(fixture()), out: [] }, |accumulator: Run, s: Step| {
+    let r = db::step(accumulator.db, sql::statement_of(s.sql), s.ps);
+    { db: r.db, out: accumulator.out.push(r.out) }
   }).out
 
-/// The result of the last statement of a sequence, which is what most tests below assert on.
 fn last_result(steps: List<Step>) -> sql::QueryResult / {abort.raise} = last_of(replay(steps))
 
 fn last_of(xs: List<sql::QueryResult>) -> sql::QueryResult =
@@ -70,7 +62,6 @@ fn insert_part(sku: String, n: sql::Param) -> Step =
     ps: [sql::TextParameter(sku), sql::NumericParameter(1m), sql::NullParameter, n],
   }
 
-/// The SQLSTATE, or the shape when there was no failure.
 fn shape(a: sql::QueryResult) -> String =
   match a {
     sql::Failed(e) -> "Failed " ++ e.code,
@@ -85,27 +76,21 @@ fn skus(a: sql::QueryResult) -> List<String> =
     _ -> [],
   }
 
-// --- 1.
 test "an ORDER BY over a column with ties returns an order SQL does not promise" {
-  let twelve = range(0, 12).fold([], |acc: List<Step>, i: Int|
-    acc.push(insert_part(letter(i), sql::IntParameter(1))));
+  let twelve = range(0, 12).fold([], |accumulator: List<Step>, i: Int|
+    accumulator.push(insert_part(letter(i), sql::IntParameter(1))));
   let result = last_result(twelve.push(sql_step("select sku from part order by n limit 3")));
   assert_eq(skus(result), ["a", "b", "c"]);
-  // PostgreSQL 18.3, the same twelve inserts and the same statement.
   assert(skus(result) != ["b", "c", "a"]);
 
-  // The same twelve rows under the order `render` generates, which is what the claim compares: the
-  // tie is broken by the primary key and the two agree.
   let keyed = last_result(twelve.push(sql_step("select sku from part order by n, sku limit 3")));
   assert_eq(skus(keyed), ["a", "b", "c"])
 }
 
-/// `a` through `l`, so the twelve rows differ only in a column nothing orders by.
 fn letter(i: Int) -> String / {abort.raise} = "abcdefghijkl".slice(i, i + 1)
 
-// The same disagreement without a bounded sort, which rules out "it is only the top-N heapsort".
 test "an UPDATE moves a row in postgres and leaves it in place in the fake" {
-  let ops = [
+  let operations = [
     insert_part("a", sql::IntParameter(5)),
     insert_part("b", sql::IntParameter(5)),
     insert_part("c", sql::IntParameter(5)),
@@ -114,15 +99,16 @@ test "an UPDATE moves a row in postgres and leaves it in place in the fake" {
       ps: [sql::IntParameter(5), sql::TextParameter("a")],
     },
   ];
-  let loose = last_result(ops.push(sql_step("select sku from part order by n limit 10")));
+  let loose = last_result(operations.push(sql_step("select sku from part order by n limit 10")));
   assert_eq(skus(loose), ["a", "b", "c"]);
   assert(skus(loose) != ["b", "c", "a"]);
 
-  let keyed = last_result(ops.push(sql_step("select sku from part order by n, sku limit 10")));
+  let keyed = last_result(
+    operations.push(sql_step("select sku from part order by n, sku limit 10")),
+  );
   assert_eq(skus(keyed), ["a", "b", "c"])
 }
 
-// --- 2.
 test "a WHERE naming a column that does not exist is rejected on an empty table" {
   assert_eq(
     shape(last_result([sql_step("select sku from part where nosuch = 1")])),
@@ -143,13 +129,9 @@ test "a WHERE naming a column that does not exist is rejected on an empty table"
     ),
     "Failed 42703",
   );
-  // And a result column the table does not have, which used to be decided in `project_row` and
-  // therefore never on an empty table.
   assert_eq(shape(last_result([sql_step("select nosuch from part")])), "Failed 42703")
 }
 
-// The same hole without an empty table, which is the sharper case because a reader who has read the
-// one above will assume a row is enough to close it.
 test "a literal that will not parse at the column's type is rejected when the statement is planned" {
   let with_null = last_result([
     insert_part("a", sql::NullParameter),
@@ -164,8 +146,6 @@ test "a literal that will not parse at the column's type is rejected when the st
   assert_eq(shape(with_value), "Failed 22P02");
   assert_eq(shape(empty), "Failed 22P02");
 
-  // The literal that *does* parse is coerced rather than rejected, which is the other half of the
-  // same resolution.
   assert_eq(
     shape(
       last_result([
@@ -177,7 +157,6 @@ test "a literal that will not parse at the column's type is rejected when the st
   )
 }
 
-// --- 3.
 test "a numeric is assignment-cast into a bigint column, rounding half away from zero" {
   assert_eq(
     shape(last_result([sql_step("insert into part (sku, price, n) values ('x', 1, 2.6)")])),
@@ -212,9 +191,7 @@ fn n_column_values(a: sql::QueryResult) -> List<Int> =
     _ -> [],
   }
 
-// A string literal in statement text is `unknown`-typed, and postgres coerces it to whatever the
-// column is.
-test "a string literal is coerced to the column's type, and only a bad one is 22P02" {
+test "a string literal is coerced to the column's type, and only an unparseable one fails with SQLSTATE 22P02" {
   assert_eq(
     shape(last_result([sql_step("insert into part (sku, price, n) values ('y', '1', '2')")])),
     "Count 1",
@@ -228,8 +205,6 @@ test "a string literal is coerced to the column's type, and only a bad one is 22
     ),
     "Count 1",
   );
-  // A text the target type cannot read is still `22P02`, and `'2.6'::bigint` is one of them: text
-  // is read at the target type and `bigint` has no fraction.
   assert_eq(
     shape(last_result([sql_step("insert into part (sku, price) values ('y', 'abc')")])),
     "Failed 22P02",
@@ -238,8 +213,6 @@ test "a string literal is coerced to the column's type, and only a bad one is 22
     shape(last_result([sql_step("insert into part (sku, price, n) values ('y', 1, '2.6')")])),
     "Failed 22P02",
   );
-  // A **parameter** is not `unknown`: it crosses the wire with a type, so the wrong one is `42804`
-  // and never a coercion.
   assert_eq(
     shape(
       last_result([
@@ -253,8 +226,7 @@ test "a string literal is coerced to the column's type, and only a bad one is 22
   )
 }
 
-// The column-to-column form, which a real `UPDATE` writes constantly.
-test "an UPDATE assigns one column to another of a different type in both directions" {
+test "an UPDATE can assign an integer column to a numeric column and a numeric column to an integer column" {
   assert_eq(
     shape(
       last_result([insert_part("a", sql::IntParameter(2)), sql_step("update part set n = price")]),
@@ -269,17 +241,14 @@ test "an UPDATE assigns one column to another of a different type in both direct
   )
 }
 
-// --- 4.
-test "a comment and an alias are ordinary SQL; an ordinal ORDER BY is a named error" {
+test "comments and aliases are accepted, but ORDER BY with a column number fails with SQLSTATE 0A000" {
   assert_eq(shape(last_result([sql_step("select sku from part -- trailing comment")])), "Rows 0");
   assert_eq(shape(last_result([sql_step("select /* leading */ sku from part")])), "Rows 0");
   assert_eq(shape(last_result([sql_step("select count(*) as c from part")])), "Rows 1");
   assert_eq(shape(last_result([sql_step("select sku from part order by 1")])), "Failed 0A000")
 }
 
-// A `Row` is a `Map<String, Datum>`, so two result columns of one name have one canonical form and
-// the second would silently win.
-test "a duplicate result column is rejected before a row, as a value in the fake and a diagnostic in the driver" {
+test "a select with a duplicate result column fails with SQLSTATE 0A000 before returning any row" {
   assert_eq(shape(last_result([sql_step("select sku, sku from part")])), "Failed 0A000");
   assert_eq(
     shape(
@@ -287,22 +256,18 @@ test "a duplicate result column is rejected before a row, as a value in the fake
     ),
     "Failed 0A000",
   );
-  // Two targets aliased to one name are the same error.
   assert_eq(shape(last_result([sql_step("select sku as x, tag as x from part")])), "Failed 0A000")
 }
 
-// --- 5.
-test "a commit with no transaction open is 25P01 in both halves" {
+test "a commit or abort with no transaction open fails with SQLSTATE 25P01 in both the in-memory database and the Postgres driver" {
   let d = db::open(fixture());
   assert_eq(shape(db::commit_step(d).out), "Failed 25P01");
   assert_eq(shape(db::abort_step(d).out), "Failed 25P01");
-  // And it poisons nothing: there is no transaction for it to abort, so the next statement is an
-  // ordinary one rather than `25P02`.
   assert_eq(
     shape(
       db::step(
         db::commit_step(d).db,
-        sql::stmt("insert into part (sku, price) values ($1, $2)"),
+        sql::statement_of("insert into part (sku, price) values ($1, $2)"),
         [sql::TextParameter("a"), sql::NumericParameter(1m)],
       ).out,
     ),
@@ -310,17 +275,12 @@ test "a commit with no transaction open is 25P01 in both halves" {
   )
 }
 
-// A nested `begin` that widens the access mode: driver `Failed(25001)` — `ScopeTable::begin`
-// rejects a `ReadWrite` nested inside a `ReadOnly`, because a savepoint cannot widen what the
-// transaction may do. fake accepted.
-test "a nested begin that widens the access mode is 25001 in both halves" {
+test "a nested begin that widens the access mode from read-only to read-write fails with SQLSTATE 25001 in both the in-memory database and the Postgres driver" {
   let d = db::open(fixture());
   let outer = db::begin_step(d, db::ReadCommitted, db::ReadOnly);
   let inner = db::begin_step(outer.db, db::ReadCommitted, db::ReadWrite);
   assert_eq(shape(outer.out), "Count 0");
   assert_eq(shape(inner.out), "Failed 25001");
-  // A narrowing is still accepted, and is documentation rather than enforcement: postgres has no
-  // read-only savepoint.
   assert_eq(
     shape(
       db::begin_step(
@@ -333,10 +293,8 @@ test "a nested begin that widens the access mode is 25001 in both halves" {
   )
 }
 
-// --- What agrees ------------------------------------------------------------
-test "the areas the audit could not break agree with postgres exactly" {
-  // three-valued logic in `WHERE`, including `IN` and `NOT IN` over a NULL
-  let ops = [
+test "NULL handling in WHERE and ORDER BY gives the same results as postgres" {
+  let operations = [
     insert_part("a", sql::IntParameter(1)),
     insert_part("b", sql::NullParameter),
     insert_part("c", sql::IntParameter(3)),
@@ -346,7 +304,7 @@ test "the areas the audit could not break agree with postgres exactly" {
     sql_step("select sku from part where not (n = 1) order by sku"),
     sql_step("select sku from part where n between 1 and 3 order by sku"),
   ];
-  let out = replay(ops);
+  let out = replay(operations);
   assert_eq(drop_first(out, 3).map(|a: sql::QueryResult| skus(a)), [
     ["a"],
     [],
@@ -355,7 +313,6 @@ test "the areas the audit could not break agree with postgres exactly" {
     ["a", "c"],
   ]);
 
-  // `NULLS LAST` under `ASC` and `NULLS FIRST` under `DESC`, and both overrides
   let nulls = replay([
     insert_part("a", sql::IntParameter(1)),
     insert_part("b", sql::NullParameter),
@@ -372,8 +329,6 @@ test "the areas the audit could not break agree with postgres exactly" {
     ["c", "a", "b"],
   ]);
 
-  // `numeric` rescaled to the column's scale, rounding half away from zero, and the overflow that a
-  // rounding produces.
   let money = replay([
     sql_step("insert into part (sku, price) values ('a', 1.00005)"),
     sql_step("insert into part (sku, price) values ('b', 1.00004)"),
@@ -387,7 +342,6 @@ test "the areas the audit could not break agree with postgres exactly" {
     "Rows 2",
   ]);
 
-  // a unique key with a NULL in it never collides, and a `CHECK` passes on unknown.
   assert_eq(
     shape(
       last_result([insert_part("a", sql::NullParameter), insert_part("b", sql::NullParameter)]),
@@ -395,7 +349,6 @@ test "the areas the audit could not break agree with postgres exactly" {
     "Count 1",
   );
 
-  // the failed-transaction state, and a sequence that a rollback does not undo
   let aborted = replay([
     { sql: "insert into part (sku, price) values ('a', 1)", ps: [] },
     { sql: "insert into bin (sku, qty) values ('a', 1) returning id", ps: [] },

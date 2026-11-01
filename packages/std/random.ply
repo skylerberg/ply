@@ -1,27 +1,26 @@
-//! Randomness for a program.
+//! Random values for a program, from three sources.
 //!
-//! `simulate` handles the prelude's `random` with values a seed determines, which makes a
-//! simulation reproducible. That is why the scheduler handles it and not the host. A run that is
-//! not simulated needs the operating system's entropy, which is the `entropy` effect: the host
-//! draws, the program reads, and every real run provides it.
+//! The prelude's `random` effect is normally handled by `simulate`, which produces values
+//! determined by a seed, so a simulation can be repeated exactly. A real run has no simulation and
+//! needs the operating system's randomness, which the host supplies through the `entropy` effect.
 //!
-//! A `Rand` is the third source: a value, drawn by a pure function of its root, for code that
-//! wants a seeded stream without a simulation (a fuzz case, a shuffled order, a scatter).
-//! It is counter-mode BLAKE3, the construction the simulation's own stream uses, so a result
-//! depends only on the root, on every machine and every version. A key selects one stream among
-//! many from a root. No two keys, and no key and the simulation, share a block. `rand` uses the
-//! empty key, which is the simulation's own stream. The counter is a field, so a stream can start
-//! at any draw.
+//! A `Rand` is the third source: a plain value that produces random numbers as a pure function of
+//! its seed (its root), for code that wants repeatable randomness without a simulation, such as a
+//! fuzz case or a shuffled order. It uses BLAKE3 in counter mode, the same construction the
+//! simulation uses, so the same root gives the same results on every machine and version. A key
+//! selects one independent sequence from a root, and no two keys, nor a key and the simulation,
+//! produce the same output. `rand` uses the empty key, which gives the simulation's own sequence.
+//! The counter is a field, so a sequence can start at any position.
 //!
-//! Every distribution is here twice, drawing the same way. One has a plain name and draws from
-//! `entropy` (`uniform`, `shuffle`, `sample`, `choice`, `weighted_choice`, `normal`,
-//! `exponential`). The other has a `rand_` prefix, draws from a `Rand`, and returns the stream
-//! after its draws. `with_rand` handles `entropy` from a `Rand`, so code written against the effect
-//! runs seeded, and under it a plain name draws what its `rand_` version draws.
+//! Every distribution comes in two forms that draw the same way. The plain name (`uniform`,
+//! `shuffle`, `sample`, `choice`, `weighted_choice`, `normal`, `exponential`) draws from `entropy`.
+//! The `rand_` form draws from a `Rand` and returns the `Rand` advanced past its draws. `with_rand`
+//! runs code that uses `entropy` against a `Rand`, so there a plain name returns what its `rand_`
+//! form returns.
 //!
-//! A token (`token_bytes`, `token_hex`, `token_urlsafe`) comes from the operating system's entropy
-//! and nothing else, as a session identifier, a reset link or an API key must. A `Rand` is a
-//! function of its root, so nothing drawn from one is a secret.
+//! A token (`token_bytes`, `token_hex`, `token_urlsafe`) always comes from the operating system's
+//! entropy, as a session identifier, reset link or API key must. Nothing drawn from a `Rand` is
+//! secret, because anyone who knows its root can reproduce it.
 
 import std.bytes (u32_le, u64_le)
 import std.float
@@ -101,9 +100,10 @@ pub fn choice<a>(xs: List<a>) -> Option<a> / {entropy.below bounded} =
 pub fn shuffle<a>(xs: List<a>) -> List<a> / {entropy.below, abort.raise} =
   partial_shuffle(xs, picks(xs.len(), draws_for(xs.len(), xs.len())))
 
-/// `k` of the elements, no position drawn twice, in the order drawn, with every such sample equally
-/// likely. A `k` of zero or less returns none, and a `k` past the length returns all of them,
-/// shuffled. It draws once for each element it returns, except the last of a whole list.
+/// Returns `k` elements of `xs` chosen without repeating a position, in the order chosen, with
+/// every such sample equally likely. Returns an empty list when `k` is zero or less, and all
+/// elements shuffled when `k` is at least the length of `xs`. It draws once per returned element,
+/// except that returning all of `xs` needs one draw fewer, because the last element is then forced.
 pub fn sample<a>(xs: List<a>, k: Int) -> List<a> / {entropy.below, abort.raise} =
   partial_shuffle(xs, picks(xs.len(), draws_for(xs.len(), k))).take(k)
 
@@ -114,11 +114,11 @@ pub fn weighted_choice<a>(w: Weighted<a>) -> a / {entropy.below bounded, abort.r
   if total < 1 { invalid_weighted_table() } else { item_at_point(w, entropy.below(total)) }
 }
 
-/// Runs `body`, handling each `entropy` draw from `r` in turn. Returns `body`'s result and the
-/// stream after those draws. Under it a plain name draws what its `rand_` version draws, so
-/// `shuffle(xs)` matches `rand_shuffle(r, xs)`. An `entropy.below` with a bound below one raises.
-/// `entropy.secret` is not handled, since what a `Rand` draws is no secret from anyone who knows
-/// `r`.
+/// Runs `body`, answering each `entropy.next` and `entropy.below` it performs with a draw from `r`.
+/// Returns `body`'s result and the stream after those draws. A call such as `shuffle(xs)` inside
+/// `body` returns what `rand_shuffle(r, xs)` returns. Panics if `body` performs `entropy.below`
+/// with a bound below one. Does not handle `entropy.secret`, because anyone who knows `r` can
+/// predict a `Rand`'s draws.
 pub fn with_rand<a | e>(
   r: Rand,
   body: () -> a / {entropy.next, entropy.below | e},
@@ -142,52 +142,35 @@ pub fn with_rand<a | e>(
     return value -> { value: value, rand: stream },
   }
 
-// --- What a draw is made into -----------------------------------------------
-//
-// Each distribution is a pure function of the draws it is given, so both families share it, and a
-// law about it holds whatever is drawn.
-
-/// The first `n` bytes taken from the low seven bytes of each draw. A draw is sixty-three bits, so
-/// its eighth byte is not uniform.
 fn bytes_of_draws(draws: List<Int>, n: Int) -> Bytes / {abort.raise} = {
   let all = Bytes::concat_all(draws.map(|d: Int| u64_le(d).slice(0, 7)));
   all.slice(0, min(max(n, 0), all.len()))
 }
 
-/// The top fifty-three bits of a sixty-three-bit draw, as a multiple of `2^-53`.
 fn uniform_of(draw: Int) -> Float =
   Float::of_int(draw >>> 10 & 0x1F_FFFF_FFFF_FFFF) * Float::pow2(0 - 53)
 
-/// The top fifty-two bits of a sixty-three-bit draw, as the midpoint after that multiple of
-/// `2^-52`. A `Float` represents it exactly, so it never rounds to an end.
 fn uniform_open_of(draw: Int) -> Float =
   (Float::of_int(draw >>> 11 & 0xF_FFFF_FFFF_FFFF) + 0.5) * Float::pow2(0 - 52)
 
-/// Box–Muller: a radius from `u` in `(0, 1)` and an angle from `v` in `[0, 1)`.
 fn normal_of(u: Float, v: Float) -> Float =
   Float::sqrt(0.0 - 2.0 * u.ln()) * Float::cos(Float::tau() * v)
 
-/// By inversion, of `u` in `(0, 1)`.
 fn exponential_of(u: Float) -> Float = 0.0 - u.ln()
 
-/// How many draws it takes to deal `k` elements from `n`: one each, except none for the last
-/// element of all `n`.
 fn draws_for(n: Int, k: Int) -> Int = min(max(k, 0), n - 1)
 
-/// The picks for dealing `draws` positions from `n` elements: the `i`th is uniform below `n - i`.
 fn picks(n: Int, draws: Int) -> List<Int> / {entropy.below} =
   range(0, draws).map(|i: Int| entropy.below(n - i))
 
-/// A Fisher–Yates deal. For each pick in order, position `i` swaps with the position `picks[i]`
-/// further on, so the first `picks.len()` positions contain a draw without replacement. A pick
-/// below zero, or one that reaches past the end, moves nothing.
 fn partial_shuffle<a>(xs: List<a>, picks: List<Int>) -> List<a> / {abort.raise}
   cost picks.len()
 =
-  range(0, picks.len()).fold(xs, |acc: List<a>, i: Int|
+  range(0, picks.len()).fold(xs, |accumulator: List<a>, i: Int|
     match picks.at(i) {
-      Some(p) -> if p < 0 || p >= acc.len() - i { acc } else { swapped(acc, i, i + p) },
-      None -> acc,
+      Some(p) -> if p < 0 || p >= accumulator.len() - i { accumulator }
+      else { swapped(accumulator, i, i + p) },
+      None -> accumulator,
     })
 
 fn swapped<a>(xs: List<a>, i: Int, j: Int) -> List<a> / {abort.raise} =
@@ -204,8 +187,8 @@ pub fn weighted<a>(pairs: List<{ item: a, weight: Int }>) -> Option<Weighted<a>>
   cost pairs.len()
 = {
   let start: Option<Weighted<a>> = Some({ items: [], totals: [] });
-  let table = pairs.fold(start, |acc: Option<Weighted<a>>, p: { item: a, weight: Int }|
-    match acc {
+  let table = pairs.fold(start, |accumulator: Option<Weighted<a>>, p: { item: a, weight: Int }|
+    match accumulator {
       None -> None,
       Some(w) -> if p.weight < 0 { None }
       else if p.weight == 0 { Some(w) } else {
@@ -218,26 +201,19 @@ pub fn weighted<a>(pairs: List<{ item: a, weight: Int }>) -> Option<Weighted<a>>
   match table { Some(w) -> if w.items.len() == 0 { None } else { table }, None -> None }
 }
 
-/// The sum of the weights: one past the last point a draw can land on.
 fn total_of<a>(w: Weighted<a>) -> Int = match w.totals.last() { Some(t) -> t, None -> 0 }
 
-/// The item whose share of the total contains `point`, counting from zero.
 fn item_at_point<a>(w: Weighted<a>, point: Int) -> a / {abort.raise} =
   match w.items.at(first_above(w.totals, point)) { Some(x) -> x, None -> invalid_weighted_table() }
 
 fn invalid_weighted_table<a>() -> a / {abort.raise} =
-  panic("std.random: a weighted draw from a table `weighted` did not make")
+  panic("std.random: a weighted draw failed because the table `weighted` is invalid")
 
-/// The index of the first total above `point` in an ascending list, which is the number of totals
-/// at or below it.
 fn first_above(totals: List<Int>, point: Int) -> Int =
   totals.partition_point(|total: Int| total <= point)
 
-// --- The host handler -------------------------------------------------------
-
 host for entropy by from_operating_system
 
-/// Runs `go`, taking every draw from the operating system.
 fn from_operating_system<a | e>(
   go: () -> a / {entropy.read | e},
 ) -> a / {native.read, abort.raise | e} =
@@ -257,12 +233,8 @@ fn from_operating_system<a | e>(
     } else { entropy_secret(n) },
   }
 
-/// The most bytes one `entropy.secret` draws: far more than any key needs, and small enough to
-/// catch a mistaken size.
 fn max_secret_bytes() -> Int = 65536
 
-/// A uniform draw below `n`, which is at least 1. A draw at or past the last whole multiple of `n`
-/// is thrown away and another taken. Each draw is accepted with probability over one half.
 fn host_draw_below(n: Int) -> Int / {native.read, abort.raise} = {
   let limit = max_draw() / n * n;
   iterate(0, 64, |tries: Int| {
@@ -271,18 +243,10 @@ fn host_draw_below(n: Int) -> Int / {native.read, abort.raise} = {
   })
 }
 
-/// Sixty-three bits of the operating system's entropy.
 extern fn entropy_next() -> Int / {native.read}
 
-/// `n` bytes of the operating system's entropy, 0 to 65536 of them, drawn into a secret.
 extern fn entropy_secret(n: Int) -> Secret<Bytes> / {native.read}
 
-// --- Tests ------------------------------------------------------------------
-
-// These tests handle the effect themselves, so they pin the API's shape, not the values a host
-// would draw.
-
-/// Counts the calls to a test's callbacks.
 effect draw_counter {
   write one() -> Unit
   read total() -> Int
@@ -305,8 +269,6 @@ test "a nonce is two draws, so a server cannot predict it from one" {
   assert_eq(out, "5-5")
 }
 
-// --- A pure stream ----------------------------------------------------------
-
 /// A seeded stream: its root, the key that selects it among the root's streams, and how many
 /// blocks it has drawn.
 pub type Rand = { root: Int, key: Bytes, counter: Int }
@@ -314,13 +276,13 @@ pub type Rand = { root: Int, key: Bytes, counter: Int }
 /// The stream of `root` with the empty key, which is the simulation's own stream.
 pub fn rand(root: Int) -> Rand = rand_keyed(root, b"")
 
-/// The stream `key` selects among the streams of `root`.
+/// Returns the stream that `key` names among the streams derived from `root`. Different keys give
+/// independent streams.
 pub fn rand_keyed(root: Int, key: Bytes) -> Rand = { root: root, key: key, counter: 0 }
 
 /// One draw: a non-negative integer, sixty-three bits wide, and the stream that follows it.
 pub fn rand_int(r: Rand) -> { value: Int, rand: Rand } / {abort.raise} = {
   let b = block(r);
-  // Clear the top bit so a draw is sixty-three bits and never negative, like the effect's.
   let eight = Bytes::concat_all([b.slice(0, 7), byte_of_int(b.at(7) & 0x7F)]);
   {
     value: match eight.u64_at(0) { Some(v) -> v, None -> 0 },
@@ -328,7 +290,8 @@ pub fn rand_int(r: Rand) -> { value: Int, rand: Rand } / {abort.raise} = {
   }
 }
 
-/// One draw of all sixty-four bits: the same eight bytes `rand_int` reads, its top bit kept.
+/// Returns one draw of all sixty-four bits and the stream after it. It reads the same eight bytes
+/// as `rand_int`, but keeps the top bit that `rand_int` clears.
 pub fn rand_u64(r: Rand) -> { value: U64, rand: Rand } / {abort.raise} = {
   let b = block(r);
   let low = U64::of_int(Int::of_u32(b.u32_le(0)));
@@ -340,8 +303,8 @@ pub fn rand_u64(r: Rand) -> { value: U64, rand: Rand } / {abort.raise} = {
 pub fn rand_bytes(r: Rand, n: Int) -> { bytes: Bytes, rand: Rand } / {abort.raise} =
   if n <= 0 { { bytes: b"", rand: r } } else {
     let blocks = (n + 31) / 32;
-    let raw = range(0, blocks).fold(b"", |acc: Bytes, i: Int|
-      acc.concat(block({ ..r, counter: r.counter + i })));
+    let raw = range(0, blocks).fold(b"", |accumulator: Bytes, i: Int|
+      accumulator.concat(block({ ..r, counter: r.counter + i })));
     { bytes: raw.slice(0, n), rand: { ..r, counter: r.counter + blocks } }
   }
 
@@ -349,14 +312,8 @@ pub fn rand_bytes(r: Rand, n: Int) -> { bytes: Bytes, rand: Rand } / {abort.rais
 /// away rather than reduced, so no remainder is likelier than another. `None` for a bound of zero
 /// or less, which has no uniform draw.
 pub fn rand_below(r: Rand, n: Int) -> Option<{ value: Int, rand: Rand }> / {abort.raise} =
-  if n <= 0 { None }
-  else {
-    // `max_draw / n * n` is the largest multiple of `n` that a 63-bit draw can reach without bias.
-    Some(below_draw(r, n, max_draw() / n * n))
-  }
+  if n <= 0 { None } else { Some(below_draw(r, n, max_draw() / n * n)) }
 
-/// A draw is accepted with probability over one half, so a 64th rejection in a row, with chance
-/// under one in 2^64, raises rather than drawing again.
 fn below_draw(r: Rand, n: Int, limit: Int) -> { value: Int, rand: Rand } / {abort.raise} =
   iterate(r, 64, |at: Rand| {
     let step = rand_int(at);
@@ -428,7 +385,6 @@ pub fn rand_weighted_choice<a>(
     None -> invalid_weighted_table(),
   }
 
-/// `picks`, drawn from a stream.
 fn rand_picks(r: Rand, n: Int, draws: Int) -> { value: List<Int>, rand: Rand } / {abort.raise} =
   range(0, draws).fold({ value: [], rand: r }, |s: { value: List<Int>, rand: Rand }, i: Int|
     match rand_below(s.rand, n - i) {
@@ -436,10 +392,6 @@ fn rand_picks(r: Rand, n: Int, draws: Int) -> { value: List<Int>, rand: Rand } /
       None -> s,
     })
 
-/// The four words of one block: the domain string `ply-core`'s `sim::Stream` uses, the root, the
-/// random domain's tag, and the counter, each little-endian as that stream writes them. A keyed
-/// stream uses tag 2, which the simulation never writes, followed by its length-prefixed key. So no
-/// two keys, and no key and the simulation, share a block.
 fn block(r: Rand) -> Bytes =
   Bytes::concat_all([
     Bytes::of_string("ply.sim.stream.1"),
@@ -452,9 +404,7 @@ fn block(r: Rand) -> Bytes =
 
 fn max_draw() -> Int = 0x7FFF_FFFF_FFFF_FFFF
 
-// --- Tests ------------------------------------------------------------------
-
-test "a pure stream is a function of its root and not of the world" {
+test "a pure random stream returns the same values for the same seed and different values for different seeds" {
   let first = rand_int(rand(7));
   let again = rand_int(rand(7));
   assert_eq(first.value, again.value);
@@ -466,26 +416,23 @@ test "a pure stream is a function of its root and not of the world" {
 test "a draw is in range, and `below` rejects a bound it cannot honour" {
   let draws = range(0, 200).fold(
     { ok: true, rand: rand(11) },
-    |acc: { ok: Bool, rand: Rand }, _: Int|
-      match rand_below(acc.rand, 6) {
-        None -> acc,
-        Some(step) -> { ok: acc.ok && step.value >= 0 && step.value < 6, rand: step.rand },
+    |accumulator: { ok: Bool, rand: Rand }, _: Int|
+      match rand_below(accumulator.rand, 6) {
+        None -> accumulator,
+        Some(step) -> { ok: accumulator.ok && step.value >= 0 && step.value < 6, rand: step.rand },
       },
   );
   assert(draws.ok);
   assert_eq(rand_below(rand(1), 0), None)
 }
 
-// The simulation uses this block function too, so this pins both to the same bytes.
-test "a block is BLAKE3 over the simulation's own four words" {
-  // `blake3("ply.sim.stream.1" ++ 0u64_le ++ rand_tag ++ 0u64_le)`.
+test "the first block of `rand(0)` is the BLAKE3 hash of the string `ply.sim.stream.1`, seed 0, `rand_tag` and counter 0, in that order" {
   assert_eq(
     block(rand(0)).hex_of(),
     "242257320a1f4f4c9f0b62a52348f099e6f3738dcc4c2a85040607361f7cb92b",
   )
 }
 
-// Computed outside Ply, over `domain ++ 0u64_le ++ 2 ++ 3u32_le ++ "key" ++ 0u64_le`.
 test "a keyed block is BLAKE3 over the domain, the root, tag 2, the key and the counter" {
   assert_eq(
     block(rand_keyed(0, b"key")).hex_of(),
@@ -493,28 +440,25 @@ test "a keyed block is BLAKE3 over the domain, the root, tag 2, the key and the 
   )
 }
 
-test "a key selects its own stream, and the empty key selects the simulation's" {
+test "each key selects its own stream, and the empty key selects the same stream as `rand`" {
   assert_eq(rand_int(rand_keyed(3, b"")).value, rand_int(rand(3)).value);
   assert(rand_int(rand_keyed(3, b"a")).value != rand_int(rand(3)).value);
   assert(rand_int(rand_keyed(3, b"a")).value != rand_int(rand_keyed(3, b"b")).value);
   assert_eq(rand_int(rand_keyed(3, b"a")).value, rand_int(rand_keyed(3, b"a")).value)
 }
 
-test "a sixty-four-bit draw is the eight bytes rand_int reads, with the top bit kept" {
+test "`rand_u64` returns a 64-bit unsigned integer whose low 63 bits equal the result of `rand_int`, and both advance the generator the same way" {
   let r = rand_keyed(9, b"k");
   let wide = rand_u64(r).value;
   assert_eq(Int::of_u64(wide & 0x7FFF_FFFF_FFFF_FFFFu64), rand_int(r).value);
   assert_eq(rand_u64(r).rand, rand_int(r).rand)
 }
 
-test "a stream started at a counter draws what the stream reaches there" {
+test "a stream started at counter 2 returns the same value as the third draw of the stream started at counter 0" {
   let third = rand_int(rand_int(rand_int(rand_keyed(5, b"k")).rand).rand);
   assert_eq(rand_int({ ..rand_keyed(5, b"k"), counter: 2 }).value, third.value)
 }
 
-// --- Tokens -------------------------------------------------------------------
-
-/// A draw whose bytes, least significant first, count up from zero.
 fn counting() -> Int = 0x0706_0504_0302_0100
 
 test "a token is the low seven bytes of each draw, cut to the length requested" {
@@ -526,13 +470,12 @@ test "a token is the low seven bytes of each draw, cut to the length requested" 
   assert_eq(drawn(0 - 4), b"")
 }
 
-test "a token in hex is two characters a byte, and one in base64 has the URL's two letters" {
+test "`token_hex` returns two characters per byte, and `token_urlsafe` uses `-` and `_` as its two non-alphanumeric characters" {
   assert_eq(handle { token_hex(4) } with { entropy.next() -> counting() }, "00010203");
   assert_eq(handle { token_urlsafe(3) } with { entropy.next() -> 0xFE_FFFF }, "___-");
   assert_eq(handle { token_urlsafe(4) } with { entropy.next() -> 0xFE_FFFF }, "___-AA")
 }
 
-/// How many draws `body` requests from `entropy`, each handled with zero.
 fn count_draws<a>(
   body: () -> a / {entropy.next, entropy.below, abort.raise},
 ) -> Int / {abort.raise} =
@@ -566,9 +509,7 @@ test "a token draws once for every seven bytes it contains" {
   assert_eq(count_draws(|| token_urlsafe(32)), 5)
 }
 
-// --- Floats -------------------------------------------------------------------
-
-test "a uniform float is a draw's top bits: zero at the least, and never one" {
+test "a uniform float is built from a draw's top bits and is at least zero and always less than one" {
   assert_eq(uniform_of(0), 0.0);
   assert_eq(uniform_of(max_draw()), 0.9999999999999999);
   assert_eq(uniform_of(1 << 62), 0.5);
@@ -578,18 +519,10 @@ test "a uniform float is a draw's top bits: zero at the least, and never one" {
   assert_eq(handle { uniform_open() } with { entropy.next() -> 0 }, Float::pow2(0 - 53))
 }
 
-// --- Uniformity ---------------------------------------------------------------
-//
-// Each test draws a fixed number of values from one root and checks that the chi-square statistic
-// is below the value a uniform source stays under 999 times in 1000. The root is fixed, so the
-// result is the same on every run.
-
-/// How many of `draws` equal each of `0..kinds`.
 fn tally(kinds: Int, draws: List<Int>) -> List<Int> =
   draws.fold(range(0, kinds).map(|_k: Int| 0), |counts: List<Int>, d: Int|
     match counts.at(d) { Some(c) -> counts.set(d, c + 1), None -> counts })
 
-/// The chi-square statistic of `counts` against `expected` for each, times `expected`.
 fn squared_error(counts: List<Int>, expected: Int) -> Int =
   counts.fold(0, |sum: Int, c: Int| sum + (c - expected) * (c - expected))
 
@@ -600,7 +533,6 @@ test "six thousand draws below six pass chi-square at five degrees of freedom (2
   assert(squared_error(counts, 1000) < 20520)
 }
 
-/// Which of the six orders of `[0, 1, 2]` this is.
 fn order_of(p: List<Int>) -> Int =
   match p {
     [0, 1, 2] -> 0,
@@ -638,17 +570,15 @@ test "six thousand draws weighted one, two and three pass chi-square at two degr
     match counts.at(i) { Some(c) -> (c - expected) * (c - expected), None -> 0 };
   let counts = tally(3, draws);
   assert_eq(counts.fold(0, |n: Int, c: Int| n + c), 6000);
-  // Each term is divided by its expected count, and the whole is scaled by six thousand.
   assert(6 * off(counts, 0, 1000) + 3 * off(counts, 1, 2000) + 2 * off(counts, 2, 3000) < 82900)
 }
 
-test "four thousand normal draws have a mean near zero and a deviation near one" {
+test "four thousand normal draws have a mean near zero and a standard deviation near one" {
   let mean = |xs: List<Float>| xs.fold(0.0, |sum: Float, x: Float| sum + x) / 4000.0;
   let zs = with_rand(rand(15), || range(0, 4000).map(|_i: Int| normal())).value;
   let m = mean(zs);
   let variance = mean(zs.map(|z: Float| (z - m) * (z - m)));
   let within_one = zs.filter(|z: Float| z > 0.0 - 1.0 && z < 1.0).len();
-  // Five standard errors each way: 0.016 for the mean, 0.022 for the variance, 29 for the count.
   assert(m > 0.0 - 0.08 && m < 0.08);
   assert(variance > 0.89 && variance < 1.11);
   assert(within_one > 2731 - 150 && within_one < 2731 + 150)
@@ -661,9 +591,7 @@ test "four thousand exponential draws are above zero with a mean near one" {
   assert(m > 0.92 && m < 1.08)
 }
 
-// --- Shuffling and sampling ---------------------------------------------------
-
-test "a shuffle, a sample and a choice of little or nothing are total" {
+test "`shuffle`, `sample` and `choice` return normally for empty and single-element lists" {
   let none: List<Int> = [];
   assert_eq(count_draws(|| assert_eq(shuffle(none), [])), 0);
   assert_eq(count_draws(|| assert_eq(shuffle([7]), [7])), 0);
@@ -685,7 +613,7 @@ test "a sample draws once for each element it returns, and a shuffle once for al
   assert_eq(count_draws(|| assert_eq(shuffle(five), five)), 4)
 }
 
-test "a deal swaps each position with the one its pick names" {
+test "`partial_shuffle` swaps position i with the position given by the i-th index, and skips indexes that are out of range" {
   assert_eq(partial_shuffle([1, 2, 3, 4], [3, 0, 1]), [4, 2, 1, 3]);
   assert_eq(partial_shuffle([1, 2, 3, 4], [0, 0, 0]), [1, 2, 3, 4]);
   assert_eq(partial_shuffle([1, 2, 3, 4], [9, 0 - 5, max_draw()]), [1, 2, 3, 4])
@@ -712,16 +640,14 @@ test "a sample has the length requested and no position twice" {
   )
 }
 
-// --- Bounds -------------------------------------------------------------------
-
-test "a draw below one is zero, and one below the largest Int is in range" {
+test "`rand_below` returns 0 for a bound of 1, a value from 0 up to below `max_draw()` for that largest bound, and `None` for a negative bound" {
   assert_eq(rand_below(rand(3), 1), Some({ value: 0, rand: { ..rand(3), counter: 1 } }));
   let wide = rand_below(rand(3), max_draw());
   assert(match wide { Some(step) -> step.value >= 0 && step.value < max_draw(), None -> false });
   assert_eq(rand_below(rand(3), 0 - 1), None)
 }
 
-test "a draw below a bound is in range, and no bound at or below zero has one" {
+test "`rand_below` returns a value in range for a positive bound, and `None` for a bound of zero or less" {
   gen::check2(gen::any_int(), gen::any_int(), |root: Int, n: Int| {
     match rand_below(rand(root), n) {
       Some(step) -> n > 0 && step.value >= 0 && step.value < n,
@@ -730,9 +656,7 @@ test "a draw below a bound is in range, and no bound at or below zero has one" {
   })
 }
 
-// --- Weights ------------------------------------------------------------------
-
-test "a table is made of weights that are a distribution, and of no others" {
+test "`weighted` accepts a non-empty list of non-negative weights with a positive sum that fits in an Int, and rejects any other" {
   let none: List<{ item: String, weight: Int }> = [];
   assert_eq(weighted(none), None);
   assert_eq(weighted([{ item: "a", weight: 0 }]), None);
@@ -744,7 +668,7 @@ test "a table is made of weights that are a distribution, and of no others" {
   )
 }
 
-test "a point of the total lands on the item whose share contains it" {
+test "`item_at_point` maps each integer below the total weight to the item whose weight range contains it" {
   let table: Weighted<String> = { items: ["a", "c"], totals: [2, 5] };
   assert_eq(range(0, 5).map(|point: Int| item_at_point(table, point)), ["a", "a", "c", "c", "c"]);
   assert_eq(handle { weighted_choice(table) } with { entropy.below(n) -> n - 1 }, "c");
@@ -752,7 +676,6 @@ test "a point of the total lands on the item whose share contains it" {
   assert_eq(first_above([], 0), 0)
 }
 
-/// Each index as an item, weighted by the low two bits of the value of `ws` there.
 fn small_weights(ws: List<Int>) -> List<{ item: Int, weight: Int }> =
   range(0, ws.len()).map(|i: Int|
     { item: i, weight: match ws.at(i) { Some(w) -> w & 3, None -> 0 } })
@@ -761,7 +684,7 @@ test "an item takes as many points of the total as its weight" {
   gen::check(gen::list(gen::any_int()), |ws: List<Int>| {
     let pairs = small_weights(ws);
     let spread = pairs.fold([], |out: List<Int>, p: { item: Int, weight: Int }|
-      range(0, p.weight).fold(out, |acc: List<Int>, _k: Int| acc.push(p.item)));
+      range(0, p.weight).fold(out, |accumulator: List<Int>, _k: Int| accumulator.push(p.item)));
     match weighted(pairs) {
       Some(w) -> range(0, total_of(w)).map(|point: Int| item_at_point(w, point)) == spread,
       None -> spread == [],
@@ -769,9 +692,7 @@ test "an item takes as many points of the total as its weight" {
   })
 }
 
-// --- One distribution, two sources --------------------------------------------
-
-test "a seeded handler handles entropy from the stream, and returns the stream" {
+test "`with_rand` runs a program with entropy drawn from a seeded stream, and returns the result with the advanced stream" {
   let first = rand_int(rand_keyed(7, b"k"));
   let second = rand_int(first.rand);
   let under = with_rand(rand_keyed(7, b"k"), || nonce());

@@ -4,22 +4,24 @@
 //! `dns.lookup` queries the system's resolver, which returns addresses and nothing else. This
 //! module queries the records that mail and service discovery need (MX, TXT, SRV), and those behind
 //! an address (CNAME, PTR, NS). `resolve` sends a question to each of the servers it is given in
-//! turn, going round the list `attempts` times, with each exchange under a deadline of `timeout_ms`
-//! on the clock. It returns the records of the requested kind, each with its time to live.
-//! `resolve_system` queries the servers `dns.servers` lists. A question's id is drawn from
-//! `entropy`. A response is accepted only when it comes from the server queried, carries that id,
-//! and repeats the question, so a datagram from anywhere else is ignored and does not extend the
-//! wait. A response too long for a datagram is marked truncated, and is requested again over TCP.
+//! turn, going round the list `attempts` times. Each exchange must finish within `timeout_ms`
+//! milliseconds, measured by the `clock` effect. It returns the records of the requested kind, each
+//! with its time to live. `resolve_system` queries the servers `dns.servers` lists. A question's id
+//! is drawn from `entropy`. A response is accepted only when it comes from the server queried,
+//! carries that id, and repeats the question, so a datagram from anywhere else is ignored and does
+//! not extend the wait. A response too long for a datagram is marked truncated, and is requested
+//! again over TCP.
 //!
 //! A failure is `std.dns`'s `Failure`: `NoSuchName` when the server reports that the name does not
 //! exist, `NoData` when it exists but has no records of the kind, `ServerFailure` when every server
-//! that responded refused the query or failed, and `TimedOut` when none responded.
+//! that responded rejected the query or failed, and `TimedOut` when none responded.
 //!
 //! This module also has the message format, `encode` and `decode`, and neither raises. A message
-//! that does not parse is `None`, a name follows at most as many compression pointers as it could
-//! have labels, and nothing past the answer section is read. With them, a test's server is a
-//! function from a question to a response, which `std.udp`'s fake runs under any loss, duplication
-//! and reordering a network causes.
+//! that does not parse decodes to `None`. A name that uses compression pointers follows at most as
+//! many pointers as the name could have labels, so a loop of pointers ends. Nothing past the answer
+//! section is read. With these, a test's server is a function from a question to a response, and
+//! `std.udp`'s fake runs that function under the loss, duplication and reordering that a network
+//! can cause.
 
 import std.bytes (u16_be, u32_be)
 import std.dns
@@ -49,12 +51,15 @@ pub type Kind =
   | Txt
   /// Where a service of the name is: `_service._proto.name`.
   | Srv
-  /// The name of an address, queried at its `in-addr.arpa` or `ip6.arpa` name.
+  /// A reverse lookup of an IP address: the name queried is the address written under
+  /// `in-addr.arpa` (IPv4) or `ip6.arpa` (IPv6), and the data is a host name.
   | Ptr
   /// The servers authoritative for the name.
   | Ns
 
-/// Where a service is: lower `priority` first, `weight` shares load among equals.
+/// The data of an SRV record, which says where a service runs. Clients try the lowest `priority`
+/// first. Among targets with equal priority, a client picks one at random, with probability
+/// proportional to `weight`.
 pub type Service = { priority: Int, weight: Int, port: Int, target: String }
 
 /// The data of one record.
@@ -65,7 +70,8 @@ pub type Data =
   | Alias(String)
   /// An MX record's preference, lower first, and its host.
   | Exchange(Int, String)
-  /// A TXT record's strings, each at most 255 bytes, as stored.
+  /// The strings of a TXT record, each at most 255 bytes, exactly as they appear in the record.
+  /// They are not joined or decoded.
   | Text(List<Bytes>)
   /// An SRV record.
   | ServiceLocation(Service)
@@ -73,17 +79,17 @@ pub type Data =
   | Pointer(String)
   /// The server an NS record names.
   | NameServer(String)
-  /// A record of a type not read here: its type's number, and its data as sent.
+  /// A record of a type this module does not decode: its type number, and its data bytes unchanged.
   | Opaque(Int, Bytes)
 
 /// One record: the name it is for, its time to live, and its data.
 pub type Record = { name: String, ttl: Duration, data: Data }
 
-/// What a message asks.
+/// The question a message asks: the name to look up and the kind of record wanted.
 pub type Question = { name: String, kind: Kind }
 
-/// A DNS message, as far as a stub resolver reads one: its id, whether it is a response, whether
-/// it was truncated to fit a datagram, whether recursion is requested, its response code, its
+/// A DNS message with the fields a stub resolver uses: its id, whether it is a response, whether it
+/// was truncated to fit a datagram, whether recursion is requested, its response code, its
 /// question, and its answer section.
 pub type Message = {
   id: Int,
@@ -109,7 +115,6 @@ fn kind_of_code(code: Int) -> Option<Kind> =
   else if code == 33 { Some(Srv) }
   else { None }
 
-/// The type number a record of this data is sent under.
 fn data_code(data: Data) -> Int =
   match data {
     Address(V4(_)) -> 1,
@@ -123,10 +128,6 @@ fn data_code(data: Data) -> Int =
     Opaque(code, _) -> code,
   }
 
-// --- Writing ----------------------------------------------------------------
-
-/// A name as its labels, each under its length, ended by the root's empty one. `None` for a
-/// label that is empty or over 63 bytes, and for a name over 253.
 fn name_bytes(name: String) -> Option<Bytes> / {abort.raise} = {
   let bare = if name.ends_with(".") { name.slice(0, name.len() - 1) } else { name };
   if bare == "" { Some(b"\x00") } else {
@@ -195,8 +196,9 @@ fn flags_of(m: Message) -> Int =
     | (if m.recursion_desired { 0x0100 } else { 0 })
     | m.code & 15
 
-/// The message as it is sent, names written whole. `None` for one that cannot be sent: an id or
-/// a count past sixteen bits, a name or a string longer than the format allows.
+/// Returns the message in DNS wire format, writing every name in full without compression pointers.
+/// Returns `None` when the message cannot be sent: the id or a count does not fit in sixteen bits,
+/// or a name or string is longer than the format allows.
 pub fn encode(m: Message) -> Option<Bytes> / {abort.raise} = {
   let request = question_bytes(m.question)?;
   let answers = m.answers.fold(Some([]), |so_far: Option<List<Bytes>>, r: Record|
@@ -232,21 +234,15 @@ pub fn question(id: Int, name: String, kind: Kind) -> Message =
     answers: [],
   }
 
-/// The response to `request` containing `results`, with response code `code`: what a server sends
-/// back.
+/// Returns the response to `request` with response code `code` and the records `answers`, as a
+/// server would send it.
 pub fn response(request: Message, code: Int, answers: List<Record>) -> Message =
   { ..request, response: true, code: code, answers: answers }
 
-// --- Reading ----------------------------------------------------------------
-
-/// The most labels and pointers one name may follow: a name has at most 127 labels, so one that
-/// needs more is a loop.
 fn name_steps() -> Int = 128
 
 type ParsedName = { name: String, next: Int }
 
-/// The name at `at` in the message `b`, with its compression pointers followed, and the offset just
-/// past the name.
 fn name_at(b: Bytes, at: Int) -> Option<ParsedName> = labels_from(b, at, [], None, name_steps())
 
 fn labels_from(
@@ -284,7 +280,6 @@ fn labels_from(
     }
   }
 
-/// A TXT record's strings between `start` and `end`, each under its length.
 fn strings_between(b: Bytes, start: Int, end: Int) -> Option<List<Bytes>> / {abort.raise} =
   iterate({ at: start, found: [] }, max(end - start, 0) + 2, |s: { at: Int, found: List<Bytes> }|
     if s.at == end { Stop(Some(s.found)) }
@@ -294,8 +289,6 @@ fn strings_between(b: Bytes, start: Int, end: Int) -> Option<List<Bytes>> / {abo
       else { Continue({ at: s.at + 1 + n, found: s.found.push(b.slice(s.at + 1, s.at + 1 + n)) }) }
     })
 
-/// The data of a record of type `code` in the message's bytes from `start` to `end`. A name in it
-/// may point anywhere in the message, and must end where the record does.
 fn data_between(b: Bytes, code: Int, start: Int, end: Int) -> Option<Data> / {abort.raise} =
   if code == 1 || code == 28 {
     if end - start != (if code == 1 { 4 } else { 16 }) { None }
@@ -315,7 +308,6 @@ fn data_between(b: Bytes, code: Int, start: Int, end: Int) -> Option<Data> / {ab
     )
   } else { Some(Opaque(code, b.slice(start, end))) }
 
-/// The name at `from`, which must end where its record does.
 fn name_ending(b: Bytes, from: Int, end: Int) -> Option<String> = {
   let read = name_at(b, from)?;
   if from < end && read.next == end { Some(read.name) } else { None }
@@ -360,9 +352,9 @@ fn question_at(b: Bytes, count: Int) -> Option<ParsedQuestion> =
     Some({ question: Some({ name: named.name, kind: kind }), next: named.next + 4 })
   }
 
-/// The message in `b`: its header, its one question, and its answer section. `None` for bytes
-/// that are not a message, a message with more than one question, and one whose question requests
-/// a kind not read here.
+/// Parses the message in `b`: its header, its one question, and its answer section. Returns `None`
+/// if the bytes are not a message, the message has more than one question, or the question asks for
+/// a kind of record this module does not support.
 pub fn decode(b: Bytes) -> Option<Message> / {abort.raise} = {
   let id = b.u16_be_at(0)?;
   let flags = b.u16_be_at(2)?;
@@ -380,12 +372,8 @@ pub fn decode(b: Bytes) -> Option<Message> / {abort.raise} = {
   })
 }
 
-// --- Querying ---------------------------------------------------------------
-
-/// Whether a record's data is of the kind a question asks for.
 fn of_kind(data: Data, kind: Kind) -> Bool = kind_of_code(data_code(data)) == Some(kind)
 
-/// Whether `m` responds to `request`: a response with its id, to its question.
 fn responds_to(m: Message, request: Message) -> Bool / {abort.raise} =
   m.response && m.id == request.id
     && (match m.question {
@@ -402,10 +390,8 @@ fn same_name(a: String, b: String) -> Bool / {abort.raise} =
 fn without_trailing_dot(name: String) -> String / {abort.raise} =
   if name.ends_with(".") { name.slice(0, name.len() - 1) } else { name }
 
-/// The most datagrams one exchange skips: responses to other questions, late or forged.
 fn max_stray_datagrams() -> Int = 8
 
-/// The response to `request` among the datagrams `socket` receives from `server` before `end`.
 fn receive_result<[l]>(
   socket: Int,
   server: SocketAddress,
@@ -428,8 +414,6 @@ fn receive_result<[l]>(
       }
     })
 
-/// One question sent to one server over its own datagram socket, which is closed however the
-/// exchange ends, and its response if one arrives before `end`.
 fn exchange_over_udp<[l]>(
   server: SocketAddress,
   request: Message,
@@ -452,9 +436,8 @@ fn exchange_over_udp<[l]>(
       },
   )
 
-/// The next `n` bytes of a connection, or `None` if the connection ends, or `end` passes, first.
 fn read_exactly<[k]>(
-  conn: Int,
+  connection: Int,
   n: Int,
   end: Instant,
 ) -> Option<Bytes> / {net.recv[k], clock.read, abort.raise} =
@@ -462,15 +445,13 @@ fn read_exactly<[k]>(
     if got.len() >= n { Stop(Some(got)) } else {
       match ms_left(end) {
         None -> Stop(None),
-        Some(left) -> match net.recv[k](conn, n - got.len(), left) {
+        Some(left) -> match net.recv[k](connection, n - got.len(), left) {
           None -> Stop(None),
           Some(more) -> if more.len() == 0 { Stop(None) } else { Continue(got.concat(more)) },
         },
       }
     })
 
-/// The same question over a connection, where each message is prefixed with its length, and its
-/// response if all of it arrives before `end`.
 fn exchange_over_tcp<[k]>(
   server: SocketAddress,
   request: Message,
@@ -482,41 +463,39 @@ fn exchange_over_tcp<[k]>(
     Some(left) ->
       bracket(
         || net.connect_to[k](server, [], left),
-        |opened: Result<Int, Error>| match opened { Ok(conn) -> net.close[k](conn), Err(_) -> () },
+        |opened: Result<Int, Error>|
+          match opened { Ok(connection) -> net.close[k](connection), Err(_) -> () },
         |opened: Result<Int, Error>|
           match opened {
-            Ok(conn) -> exchange_on_connection[k](conn, request, query, end),
+            Ok(connection) -> exchange_on_connection[k](connection, request, query, end),
             Err(_) -> None,
           },
       ),
   }
 
-/// A question sent with its length prefix on an open connection, and the response read by its own
-/// length prefix.
 fn exchange_on_connection<[k]>(
-  conn: Int,
+  connection: Int,
   request: Message,
   query: Bytes,
   end: Instant,
 ) -> Option<Message> / {net.send[k], net.recv[k], clock.read, abort.raise} = {
   let left = ms_left(end)?;
-  if !send_all[k](conn, u16_be(query.len()).concat(query), left) { None } else {
-    let size = read_exactly[k](conn, 2, end)?.u16_be_at(0)?;
-    let m = decode(read_exactly[k](conn, size, end)?)?;
+  if !send_all[k](connection, u16_be(query.len()).concat(query), left) { None } else {
+    let size = read_exactly[k](connection, 2, end)?.u16_be_at(0)?;
+    let m = decode(read_exactly[k](connection, size, end)?)?;
     if responds_to(m, request) { Some(m) } else { None }
   }
 }
 
-/// The instant an exchange begun now must end by.
 fn deadline_after(timeout_ms: Int) -> Instant / {clock.read} =
   after(clock.now(), millis(timeout_ms))
 
-/// The records of `kind` at `name`, queried from `servers` in turn, going through the whole list
-/// `attempts` times. `timeout_ms` is a deadline on the clock for each exchange, over a datagram or
-/// a connection alike: whatever else a socket receives in that time, the wait is no longer.
-/// Datagrams use the label `l`, and the connection that retries a truncated response uses `k`.
-/// A name that is not ASCII is rejected as `dns.lookup` rejects one, and `timeout_ms <= 0` is a
-/// runtime error.
+/// Returns the records of `kind` at `name`, querying `servers` in turn and going through the whole
+/// list `attempts` times. `timeout_ms` is the time limit of each exchange, over a datagram or a
+/// connection; datagrams that do not answer the question do not extend it. `l` is the effect label
+/// of the datagram sockets, and `k` is the label of the TCP connection used to retry a truncated
+/// response. Returns the same failure as `dns.lookup` for a name that is not ASCII. Panics if
+/// `timeout_ms <= 0`.
 pub fn resolve<[l], [k]>(
   servers: List<SocketAddress>,
   name: String,
@@ -530,7 +509,12 @@ pub fn resolve<[l], [k]>(
       "`resolver::resolve` was given a timeout of " ++ timeout_ms.to_string() ++ " milliseconds",
     )
   } else if !name.is_ascii() { Err(dns::not_ascii()) } else if name_bytes(name) == None {
-    Err(dns::Other(0, "a name's labels are 1 to 63 bytes each and the name at most 253"))
+    Err(
+      dns::Other(
+        0,
+        "each label of a name must be 1 to 63 bytes, and the whole name at most 253 bytes",
+      ),
+    )
   } else if servers.len() == 0 { Err(dns::Other(0, "there is no server to ask")) } else {
     iterate({ tried: 0, worst: TimedOut }, tries + 1, |s: { tried: Int, worst: Failure }|
       if s.tried >= tries { Stop(Err(s.worst)) } else {
@@ -566,7 +550,7 @@ pub fn resolve<[l], [k]>(
   }
 }
 
-/// `resolve` of the servers the system's resolver is configured with.
+/// Calls `resolve` with the servers the system's resolver is configured to use.
 pub fn resolve_system<[l], [k]>(
   name: String,
   kind: Kind,
@@ -592,8 +576,9 @@ pub fn mail_exchanges(records: List<Record>) -> List<{ preference: Int, host: St
     }).sort_by(|a: { preference: Int, host: String }, b: { preference: Int, host: String }|
     a.preference < b.preference)
 
-/// The text of each TXT record among `records`: its strings joined, as a reader of SPF or a
-/// verification token wants them.
+/// Returns the text of each TXT record among `records`, with its strings joined into one value.
+/// Long values, such as SPF policies and verification tokens, are split into several strings of at
+/// most 255 bytes, and a reader of them wants them joined.
 pub fn texts(records: List<Record>) -> List<Bytes> =
   records.fold([], |found: List<Bytes>, r: Record|
     match r.data { Text(strings) -> found.push(Bytes::concat_all(strings)), _ -> found })
@@ -605,28 +590,23 @@ pub fn services(records: List<Record>) -> List<Service> =
     |a: Service, b: Service| a.priority < b.priority,
   )
 
-// --- Tests ------------------------------------------------------------------
-
 fn encode_or_panic(m: Message) -> Bytes / {abort.raise} =
-  match encode(m) { Some(bytes) -> bytes, None -> panic("a message that cannot be sent") }
+  match encode(m) { Some(bytes) -> bytes, None -> panic("the test message cannot be encoded") }
 
 fn test_record(name: String, seconds: Int, data: Data) -> Record =
   { name: name, ttl: Duration(seconds * 1000000000), data: data }
 
-test "a question is written as the format writes it" {
+test "`encode` writes a DNS question as the DNS wire format, and fails for an invalid name or an id above 65535" {
   assert_eq(
     encode(question(0x1234, "example.com", A)),
     Some(b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01"),
   );
-  // A final dot is the root the name already ends at.
   assert_eq(encode(question(7, "example.com.", Mx)), encode(question(7, "example.com", Mx)));
   assert_eq(encode(question(7, "a..b", A)), None);
   assert_eq(encode(question(65536, "example.com", A)), None)
 }
 
-test "a response is read with its names' pointers followed" {
-  // `example.com MX 10 mail.example.com`, the owner and the host's ending both pointing back
-  // at the question's name.
+test "`decode` parses a DNS response whose names use compression pointers back to earlier names" {
   let b = Bytes::concat_all([
     b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00",
     b"\x07example\x03com\x00\x00\x0f\x00\x01",
@@ -646,7 +626,7 @@ test "a response is read with its names' pointers followed" {
   )
 }
 
-test "every kind of record is read back as it was written" {
+test "`decode` of an encoded response returns every kind of record unchanged" {
   let m = response(question(9, "example.org", Txt), 0, [
     test_record("example.org", 60, Address(ip::read("192.0.2.1"))),
     test_record("example.org", 60, Address(ip::read("2001:db8::1"))),
@@ -667,24 +647,27 @@ test "every kind of record is read back as it was written" {
   assert_eq(decode(encode_or_panic(cut)), Some(cut))
 }
 
-fn asking_one() -> Bytes = b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
+fn single_question_header() -> Bytes = b"\x00\x01\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00"
 
 fn returning_one() -> Bytes = b"\x00\x01\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
 
-test "{c.what} is no message" for c: { what: String, bytes: Bytes } in [
+test "`decode` returns `None` for a malformed DNS message: {c.what}" for c: { what: String, bytes: Bytes } in [
     { what: "a header cut short", bytes: b"\x12\x34\x01\x00\x00\x01" },
     {
       what: "a name that points at itself",
-      bytes: asking_one().concat(b"\xc0\x0c\x00\x01\x00\x01"),
+      bytes: single_question_header().concat(b"\xc0\x0c\x00\x01\x00\x01"),
     },
-    { what: "a label that runs past the end", bytes: asking_one().concat(b"\x3fexample") },
+    {
+      what: "a label that runs past the end",
+      bytes: single_question_header().concat(b"\x3fexample"),
+    },
     {
       what: "two questions",
       bytes: b"\x00\x01\x01\x00\x00\x02\x00\x00\x00\x00\x00\x00\x01a\x00\x00\x01\x00\x01\x01b\x00\x00\x01\x00\x01",
     },
     {
       what: "a question of a kind not read here",
-      bytes: asking_one().concat(b"\x01a\x00\x00\xff\x00\x01"),
+      bytes: single_question_header().concat(b"\x01a\x00\x00\xff\x00\x01"),
     },
     {
       what: "a result counted and not there",
@@ -720,22 +703,18 @@ fn mail() -> List<Record> =
     test_record("example.org", 300, Exchange(10, "mail.example.org")),
   ]
 
-/// What a server that responds to every question with `code` and `records` sends back for `query`.
 fn replies(query: Bytes, code: Int, records: List<Record>) -> List<Bytes> / {abort.raise} =
   match decode(query) {
     Some(request) -> [encode_or_panic(response(request, code, records))],
     None -> [],
   }
 
-/// A server that responds to every question with `mail`.
 fn mail_server(query: Bytes) -> List<Bytes> / {abort.raise} = replies(query, 0, mail())
 
-/// A server that fails every question.
 fn failing_server(query: Bytes) -> List<Bytes> / {abort.raise} = replies(query, 2, [])
 
 type RunResult = { result: Result<List<Record>, Failure>, udp: MemUdp, net: MemNet }
 
-/// `resolve` for `kind` at `example.org` over the two fakes, its ids drawn from `seed`.
 fn resolve_over(
   datagrams: MemUdp,
   streams: MemNet,
@@ -760,7 +739,6 @@ test "a name's mail exchanges are queried and come back with their time to live"
       { preference: 10, host: "mail.example.org" },
       { preference: 20, host: "backup.example.org" },
     ]);
-    // One question and its response were exchanged, and the socket that sent it is closed.
     assert_eq(ran.udp.applied_fates.len(), 2);
     assert_eq(ran.udp.closed, [1])
   }
@@ -777,8 +755,6 @@ test "a question that is lost is sent again, as often as allowed and no more" {
   }
 }
 
-/// The replies from a server that sends `max_stray_datagrams` responses to other questions before
-/// the real one.
 fn stray_replies(max_stray_datagrams: Int, query: Bytes) -> List<Bytes> / {abort.raise} =
   match decode(query) {
     Some(request) -> {
@@ -798,7 +774,7 @@ fn stray_replies(max_stray_datagrams: Int, query: Bytes) -> List<Bytes> / {abort
     None -> [],
   }
 
-test "a response with another id is ignored in favor of the one that answers the question" {
+test "a response with a different id is ignored, and the response that matches the question is used" {
   simulate {
     let world = udp::mem_with_responder(udp::mem_empty(), server(), |query: Bytes|
       stray_replies(2, query));
@@ -806,7 +782,6 @@ test "a response with another id is ignored in favor of the one that answers the
   }
 }
 
-/// `go` over sockets each of whose datagrams takes `each` to arrive.
 fn arriving<a | e>(
   each: Duration,
   go: () -> a / {udp.recv_from[lookup] | e},
@@ -837,16 +812,15 @@ test "datagrams that are not the response do not extend the wait for it" {
                 timeout_ms,
               ))).value).value).value;
     let began = clock.now();
-    // The response is the fourth datagram, 800 ms in: past one deadline, inside the other.
     assert_eq(request(500), Err(TimedOut));
     assert_eq(clock.now(), after(began, millis(600)));
     assert_eq(request(1000), Ok(mail()))
   }
 }
 
-test "a server's reply about a name is told apart: missing, no records of the kind, a failure" {
+test "a server's reply gives `NoSuchName` for a missing name, `NoData` for no records of the kind, and `ServerFailure` for a failure" {
   simulate {
-    let told = |code: Int, records: List<Record>| {
+    let resolve_with_reply = |code: Int, records: List<Record>| {
       resolve_over(
         udp::mem_with_responder(udp::mem_empty(), server(), |query: Bytes|
           replies(query, code, records)),
@@ -857,13 +831,15 @@ test "a server's reply about a name is told apart: missing, no records of the ki
         7,
       )
     };
-    let absent = told(3, []);
+    let absent = resolve_with_reply(3, []);
     assert_eq(absent.result, Err(NoSuchName));
-    // A server's report that a name does not exist is final: the question is not sent again.
     assert_eq(absent.udp.applied_fates.len(), 2);
-    assert_eq(told(0, []).result, Err(NoData));
-    assert_eq(told(0, [test_record("example.org", 60, Alias("example.net"))]).result, Err(NoData));
-    let failing = told(2, []);
+    assert_eq(resolve_with_reply(0, []).result, Err(NoData));
+    assert_eq(
+      resolve_with_reply(0, [test_record("example.org", 60, Alias("example.net"))]).result,
+      Err(NoData),
+    );
+    let failing = resolve_with_reply(2, []);
     assert_eq(failing.result, Err(ServerFailure));
     assert_eq(failing.udp.applied_fates.len(), 6)
   }
@@ -903,7 +879,6 @@ test "a response truncated to fit a datagram is requested again over a connectio
       },
       None -> [],
     };
-  // The first id the resolver draws from this seed, which the connection must receive.
   let id = match rand_below(rand(7), 65536) { Some(drawn) -> drawn.value, None -> 0 };
   let request = question(id, "example.org", Txt);
   let exchange_on_connection = |message: Bytes| u16_be(message.len()).concat(message);
@@ -923,7 +898,6 @@ test "a response truncated to fit a datagram is requested again over a connectio
     assert_eq(texts(long), [b"v=spf1 include:_spf.example.net ~all"]);
     assert_eq(net::mem_remaining_script(ran.net, 1), []);
     assert_eq(ran.net.closed, [1]);
-    // With nobody responding on the connection, the truncated response counts as no response.
     assert_eq(resolve_over(world, net::mem_empty(), [server()], Txt, 1, 7).result, Err(TimedOut))
   }
 }
@@ -931,7 +905,10 @@ test "a response truncated to fit a datagram is requested again over a connectio
 test "an invalid question is rejected before anything is sent: {c.name}" for c: { name: String, reason: Failure } in [
     {
       name: "a..b",
-      reason: dns::Other(0, "a name's labels are 1 to 63 bytes each and the name at most 253"),
+      reason: dns::Other(
+        0,
+        "each label of a name must be 1 to 63 bytes, and the whole name at most 253 bytes",
+      ),
     },
     { name: "b\u{fc}cher.example", reason: dns::not_ascii() },
   ] {
@@ -982,7 +959,7 @@ test "the addresses of a response carry their time to live" {
   ])
 }
 
-test "a question is answered whatever a network that drops, doubles and reorders does" {
+test "a question still gets its answer on a network that drops, duplicates and reorders messages" {
   simulate {
     let world = udp::mem_lossy(
       udp::mem_with_responder(udp::mem_empty(), server(), mail_server),

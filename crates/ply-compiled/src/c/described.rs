@@ -1,29 +1,21 @@
-//! What this runtime says of itself to a compiler that emits code for it, in the form
-//! `compiler.emit.abi.runtime_of` reads: what a unit emitted against it is a function of, each
-//! native and helper it binds with what its function's type takes and returns, where it lays out
-//! what emitted code reads in place, each as a named integer, and the diagnostic codes it raises.
-
-use super::prelude::{machine_natives, own_helpers};
-use crate::blocks::{self, Filling, Page, Segment};
+use super::prelude::{runtime_helpers, runtime_natives};
+use crate::blocks::{self, ActivePages, Page, Segment};
 use crate::emitted::{PlyFnDesc, PlyKept, PlyOp, PlyType};
 use crate::frames::PlyFrame;
 use crate::heap::{self, Alloc, Obj};
-use crate::native::{Machine, Signature};
+use crate::native::{MachineType, Signature};
 use crate::rt::Ctx;
 use std::fmt::Write;
 use std::mem::{offset_of, size_of};
 
-/// Each native compiled code calls, under the name the compiler declares it by.
 pub fn natives() -> impl Iterator<Item = (&'static str, Signature)> {
-    machine_natives().iter().map(|n| (n.name, n.signature))
+    runtime_natives().iter().map(|n| (n.name, n.signature))
 }
 
-/// The size of the field `field` borrows out of an `S`.
 fn field_bytes<S, F>(_field: fn(&S) -> &F) -> usize {
     size_of::<F>()
 }
 
-/// Each named field of `$s` as `$name.field.at` and `$name.field.bytes`, then `$name.bytes`.
 macro_rules! laid {
     ($out:ident, $s:ty as $name:literal: $($f:ident),* $(,)?) => {
         $(
@@ -37,9 +29,6 @@ macro_rules! laid {
     };
 }
 
-/// Where this runtime lays out what emitted code reads and writes in place, and the constants both
-/// read, each under the name `compiler.emit.abi.facts` gives it. Of the context, only the fields
-/// emitted code reads: a field it reads anew is named here.
 fn facts() -> Vec<(&'static str, usize)> {
     let mut out = Vec::new();
     laid!(out, Ctx as "PlyCtx": failed, stack_floor, site_root, site_start, site_end,
@@ -49,7 +38,7 @@ fn facts() -> Vec<(&'static str, usize)> {
     laid!(out, Obj as "PlyObj": rc, made_by_scheduler);
     laid!(out, Page as "PlyPage": free, fresh, end, owner, handing, next, prev, block, live, class,
         listed, spare);
-    laid!(out, Filling as "PlyFilling": pages, name, reused);
+    laid!(out, ActivePages as "PlyFilling": pages, name, reused);
     laid!(out, Alloc as "PlyAlloc": blocks, count, slow);
     laid!(out, PlyFrame as "PlyFrame": prev, each);
     laid!(out, PlyType as "PlyType": identity, spelled, spelled_len, inc, dec, lower, lift);
@@ -60,8 +49,8 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("alloc.segment", blocks::SEGMENT),
         ("alloc.page", blocks::PAGE),
         ("alloc.pages_at", offset_of!(Segment, pages)),
-        ("alloc.word_classes", blocks::WORD_CLASSES),
-        ("alloc.link_at", blocks::LINK_AT),
+        ("alloc.word_classes", blocks::WORD_STEP_SIZE_CLASSES),
+        ("alloc.link_at", blocks::LINK_OFFSET),
         ("count.frame", heap::FRAME as usize),
         ("count.immortal", heap::IMMORTAL as usize),
         ("count.shared", heap::SHARED as usize),
@@ -69,12 +58,15 @@ fn facts() -> Vec<(&'static str, usize)> {
         ("release_depth", crate::rt::RELEASE_DEPTH as usize),
         ("hold.held", crate::rt::SCOPED_VALUE),
         ("closure.descriptor", heap::CLOSURE_CODE),
-        ("failed.target", crate::rt::FAILED_TARGET as usize),
+        (
+            "failed.target",
+            crate::rt::FAILED_UNWOUND_TO_HANDLER as usize,
+        ),
         ("evidence.one_slot", crate::rt::EVIDENCE_ONE_SLOT as usize),
         ("evidence.shared", crate::rt::EVIDENCE_SHARED as usize),
-        ("failed.pending", crate::rt::FAILED_PENDING as usize),
+        ("failed.pending", crate::rt::FAILED_PENDING_RAISE as usize),
         ("unwinding.words", crate::rt::UNWINDING_WORDS),
-        ("instance.head", crate::detached::INSTANCE_HEAD),
+        ("instance.head", crate::detached::INSTANCE_HEADER_WORDS),
         ("instance.detached", crate::detached::INSTANCE_DETACHED),
         ("instance.vars", crate::detached::INSTANCE_VARS),
         ("record.closure", crate::detached::RECORD_CLOSURE),
@@ -85,8 +77,7 @@ fn facts() -> Vec<(&'static str, usize)> {
 }
 
 fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
-    let result = s.result.map_or("-", Machine::name);
-    // The 0 is the column a release's compiler reads for a native that raises, which none does.
+    let result = s.result.map_or("-", MachineType::name);
     let _ = write!(out, "{kind} {name} 0 {result}");
     for p in s.params {
         let _ = write!(out, " {}", p.name());
@@ -94,9 +85,6 @@ fn function_line(out: &mut String, kind: &str, name: &str, s: Signature) {
     out.push('\n');
 }
 
-/// This runtime, described: a line naming the form, then its identity, each native, each helper
-/// of its own, each fact and each diagnostic code it raises, a line each, its words apart by one
-/// space.
 pub fn described() -> &'static str {
     static TEXT: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     TEXT.get_or_init(|| {
@@ -105,7 +93,7 @@ pub fn described() -> &'static str {
         for (name, s) in natives() {
             function_line(&mut out, "native", name, s);
         }
-        for h in own_helpers() {
+        for h in runtime_helpers() {
             function_line(&mut out, "helper", h.name, h.signature);
         }
         for (name, value) in facts() {

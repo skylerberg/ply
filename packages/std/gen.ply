@@ -1,19 +1,20 @@
 //! Generators: how a test produces the values it checks a property against.
 //!
-//! A `Gen<a>` builds a value from a sequence of draws. A draw is a whole number below a bound the
-//! generator chooses. Normally the draws come from a pseudorandom stream selected by a root and a
-//! key, so a value depends only on its root, its key and its size, on every machine. A generator
-//! records every draw it takes. Given a record in place of the stream, it replays the record: the
-//! same record makes the same value. A record made shorter or lower makes a smaller value that the
-//! same generator could have drawn. That is how `check` shrinks a failing value while staying
-//! within what the generator can produce, whatever `map`, `and_then` and `such_that` it is built
-//! from. Past the end of a record every draw is `0`, so a generator's lowest draws should make its
-//! simplest value.
+//! A `Gen<a>` builds a value from a sequence of draws. A draw is a whole number below a bound that
+//! the generator chooses. Normally the draws come from a pseudorandom stream selected by a root and
+//! a key, so a value depends only on its root, its key and its size, on every machine.
 //!
-//! `check` asserts a property over drawn values. It is evidence for a test, not a proof: a property
-//! that must hold for every value is a `law`, which `ply prove` checks. A generator may give up,
-//! when `such_that` has used up its budget or there was nothing to choose from. It then returns no
-//! value, and `check` moves on to its next case.
+//! A generator records every draw it takes. Given a record instead of the stream, it replays the
+//! record and makes the same value. A shorter record, or one with lower numbers, makes a smaller
+//! value that the generator could also have drawn. This is how `check` shrinks a failing value: it
+//! shrinks the record, not the value, so shrinking works for any generator, including one built
+//! with `map`, `and_then` or `such_that`. Past the end of a record every draw is `0`, so a
+//! generator's lowest draws should make its simplest value.
+//!
+//! `check` asserts a property over drawn values. This is evidence for a test, not a proof. A
+//! property that must hold for every value is a `law`, which `ply prove` checks. A generator may
+//! give up, when `such_that` has used up its budget or there was nothing to choose from. It then
+//! returns no value, and `check` moves on to its next case.
 //!
 //! This module imports no other module, so any module may import it to test itself.
 
@@ -25,7 +26,7 @@ pub type Draws = new {
   replay: Option<List<Int>>,
   /// How large a value may grow. `check` passes a size that rises over its run, up to 63.
   size: Int,
-  /// Every draw taken, in order.
+  /// The draws taken so far, oldest first. Replaying them makes the same value.
   taken: List<Int>,
   /// How many values `such_that` rejected.
   rejections: Int,
@@ -41,8 +42,10 @@ pub type Gen<a> = | Gen((Draws) -> DrawResult<a> / {abort.raise})
 /// value again when replayed; and how many values `such_that` rejected along the way.
 pub type Sample<a> = { value: Option<a>, record: List<Int>, rejections: Int }
 
-/// Runs `g` at `size` on the stream that `root` and `key` select. When `replay` is given, `g`
-/// draws from it instead and the stream is not read.
+/// Runs `g` at `size` and returns the value, the list of draws it took, and the rejection count.
+/// The draws come from a pseudo-random sequence that is fixed by `root` and `key`, so the same
+/// arguments give the same result. When `replay` is given, `g` takes its draws from that list
+/// instead.
 pub fn sample<a>(
   g: Gen<a>,
   root: Int,
@@ -72,11 +75,8 @@ pub fn run<a>(g: Gen<a>, draws: Draws) -> DrawResult<a> / {abort.raise} =
 
 fn gave_up<a>(draws: Draws) -> DrawResult<a> = { value: None, draws: draws }
 
-/// The draw at `i` of a record, or zero past its end.
 fn draw_at(record: List<Int>, i: Int) -> Int = match record.at(i) { Some(v) -> v, None -> 0 }
 
-/// One draw below `bound`, which must be at least one. From the stream, it is the low sixty-three
-/// bits of the next digest, modulo the bound.
 fn next(draws: Draws, bound: Int) -> { value: Int, draws: Draws } / {abort.raise} =
   match draws.replay {
     Some(record) -> {
@@ -115,11 +115,8 @@ pub fn int_between(low: Int, high: Int) -> Gen<Int> =
     }
   }
 
-/// The largest bound a single draw accepts, since a stream's draw is sixty-three bits.
 fn max_bound() -> Int = 0x7FFF_FFFF_FFFF_FFFF
 
-/// A whole number from `low` to `high`, for a span wider than one draw covers. It combines two
-/// draws into sixty-four bits, modulo the span.
 fn wide_between(low: Int, high: Int) -> Gen<Int> =
   map2(below(4294967296), below(4294967296), |hi: Int, lo: Int| {
     let span = I128::of_int(high) - I128::of_int(low) + 1i128;
@@ -144,10 +141,9 @@ pub fn elements<a>(xs: List<a>) -> Gen<a> =
       { value: xs.at(step.value), draws: step.draws }
     })
 
-/// The first `n` elements of `xs`, or all of them when it has fewer.
 fn leading<a>(xs: List<a>, n: Int) -> List<a> =
-  range(0, min(n, xs.len())).fold([], |acc: List<a>, i: Int|
-    match xs.at(i) { Some(x) -> acc.push(x), None -> acc })
+  range(0, min(n, xs.len())).fold([], |accumulator: List<a>, i: Int|
+    match xs.at(i) { Some(x) -> accumulator.push(x), None -> accumulator })
 
 /// A value from one of `gs`, shrinking toward the first. Gives up for an empty list.
 pub fn one_of<a>(gs: List<Gen<a>>) -> Gen<a> =
@@ -169,16 +165,16 @@ pub fn list_of<a>(g: Gen<a>, most: Int) -> Gen<List<a>> =
     draw_many(g, length.value, length.draws)
   })
 
-/// A list of exactly `n` values `g` draws.
+/// Draws `n` values with `g` and returns them as a list. Gives up if `g` gives up.
 pub fn list_of_length<a>(g: Gen<a>, n: Int) -> Gen<List<a>> = Gen(|d: Draws| draw_many(g, n, d))
 
 fn draw_many<a>(g: Gen<a>, n: Int, draws: Draws) -> DrawResult<List<a>> / {abort.raise} = {
   let start: DrawResult<List<a>> = { value: Some([]), draws: draws };
-  range(0, n).fold(start, |acc: DrawResult<List<a>>, _i: Int|
-    match acc.value {
-      None -> acc,
+  range(0, n).fold(start, |accumulator: DrawResult<List<a>>, _i: Int|
+    match accumulator.value {
+      None -> accumulator,
       Some(xs) -> {
-        let x = run(g, acc.draws);
+        let x = run(g, accumulator.draws);
         { value: match x.value { Some(v) -> Some(xs.push(v)), None -> None }, draws: x.draws }
       },
     })
@@ -187,20 +183,21 @@ fn draw_many<a>(g: Gen<a>, n: Int, draws: Draws) -> DrawResult<List<a>> / {abort
 /// Exactly `n` bytes, each shrinking toward zero.
 pub fn bytes_of(n: Int) -> Gen<Bytes> =
   map(list_of_length(below(256), n), |octets: List<Int>|
-    octets.fold(b"", |acc: Bytes, b: Int| acc.concat(byte_of_int(b))))
+    octets.fold(b"", |accumulator: Bytes, b: Int| accumulator.concat(byte_of_int(b))))
 
-/// What `g` draws, through `f`.
+/// Returns a generator that draws a value with `g` and passes it to `f`.
 pub fn map<a, b>(g: Gen<a>, f: keep (a) -> b / {abort.raise}) -> Gen<b> =
   Gen(|d: Draws| {
     let x = run(g, d);
     { value: match x.value { Some(v) -> Some(f(v)), None -> None }, draws: x.draws }
   })
 
-/// What `ga` and then `gb` draw, through `f`.
+/// Returns a generator that draws a value with `ga`, then one with `gb`, and passes both to `f`.
 pub fn map2<a, b, c>(ga: Gen<a>, gb: Gen<b>, f: keep (a, b) -> c / {abort.raise}) -> Gen<c> =
   and_then(ga, |x: a| map(gb, |y: b| f(x, y)))
 
-/// What `ga`, `gb` and then `gc` draw, through `f`.
+/// Returns a generator that draws a value with each of `ga`, `gb` and `gc` in that order, and
+/// passes all three to `f`.
 pub fn map3<a, b, c, d>(
   ga: Gen<a>,
   gb: Gen<b>,
@@ -208,7 +205,8 @@ pub fn map3<a, b, c, d>(
   f: keep (a, b, c) -> d / {abort.raise},
 ) -> Gen<d> = and_then(ga, |x: a| map2(gb, gc, |y: b, z: c| f(x, y, z)))
 
-/// What `ga`, `gb`, `gc` and then `gd` draw, through `f`.
+/// Returns a generator that draws a value with each of `ga`, `gb`, `gc` and `gd` in that order, and
+/// passes all four to `f`.
 pub fn map4<a, b, c, d, r>(
   ga: Gen<a>,
   gb: Gen<b>,
@@ -245,18 +243,14 @@ pub fn such_that<a>(g: Gen<a>, keep: keep (a) -> Bool / {abort.raise}, budget: I
         }
       }))
 
-// --- A value of each built-in type -------------------------------------------
-
 fn edge_ints() -> List<Int> = [0, 1, 0 - 1, 0 - 9223372036854775807 - 1, 9223372036854775807]
 
-/// Any whole number. About one value in six is an edge case where checked arithmetic overflows:
-/// zero, one, minus one, or the least or greatest `Int`. The rest are drawn as `int` draws them.
-/// Shrinks toward `0`.
+/// Returns any whole number. About one value in six is an edge case: zero, one, minus one, or the
+/// least or greatest `Int`, which make checked arithmetic overflow. The other values are drawn by
+/// `int`, which draws a number whose range grows with the generator's size. Shrinks toward `0`.
 pub fn any_int() -> Gen<Int> =
   and_then(below(32), |k: Int| if k < 27 { int() } else { constant(draw_at(edge_ints(), k - 27)) })
 
-/// How many elements a collection has: the lesser of two draws, so most collections are short. At
-/// most sixteen, and fewer at a small size.
 fn length() -> Gen<Int> =
   sized(|size: Int| {
     let most = min(16, 1 + max(size, 0) / 4);
@@ -280,15 +274,15 @@ pub fn map_of<k, v>(gk: Gen<k>, gv: Gen<v>) -> Gen<Map<k, v>>
 /// A string of at most sixteen letters from `a` to `p`, shrinking toward the empty string.
 pub fn text() -> Gen<String> =
   map(list(below(16)), |letters: List<Int>|
-    letters.fold("", |acc: String, i: Int| acc ++ "abcdefghijklmnop".slice(i, i + 1)))
+    letters.fold("", |accumulator: String, i: Int|
+      accumulator ++ "abcdefghijklmnop".slice(i, i + 1)))
 
-/// At most sixteen bytes, each shrinking toward zero and the whole toward empty.
+/// Returns a byte string of at most sixteen bytes. Each byte shrinks toward zero, and the string
+/// shrinks toward the empty string.
 pub fn bytes() -> Gen<Bytes> =
   map(list(below(256)), |octets: List<Int>|
-    octets.fold(b"", |acc: Bytes, b: Int| acc.concat(byte_of_int(b))))
+    octets.fold(b"", |accumulator: Bytes, b: Int| accumulator.concat(byte_of_int(b))))
 
-/// Characters that often break text handling: NUL, a line break, a space, a quote, one outside
-/// ASCII, one outside the Basic Multilingual Plane, and the last code point.
 fn edge_chars() -> List<Char> = ['\0', '\n', ' ', '\'', '\u{e9}', '\u{1F600}', '\u{10FFFF}']
 
 /// A character: mostly one of the letters `text` draws, and one time in eight a character that
@@ -298,8 +292,6 @@ pub fn char() -> Gen<Char> =
     if k < 7 { map(below(16), |i: Int| match Char::of_int(97 + i) { Some(c) -> c, None -> 'a' }) }
     else { elements(edge_chars()) })
 
-/// NaN, minus zero, one, minus one, both infinities and the greatest finite float, built from their
-/// bits.
 fn edge_floats() -> List<Float> =
   [
     Float::of_bits(0x7FF8_0000_0000_0000),
@@ -323,7 +315,6 @@ pub fn float() -> Gen<Float> =
           below(1 + min(max(size, 0), 60)),
           below(2),
           |mantissa: Int, exponent: Int, sign: Int| {
-            // Two to the power `exponent - 30`, built from its bits.
             let scale = Float::of_bits(exponent - 30 + 1023 << 52);
             let magnitude = Float::of_int(mantissa) * scale;
             if sign == 1 { 0.0 - magnitude } else { magnitude }
@@ -331,7 +322,6 @@ pub fn float() -> Gen<Float> =
         ))
     })
 
-/// One, minus one, a zero of scale two, the greatest and the least.
 fn edge_decimals() -> List<Decimal> / {abort.raise} = {
   let greatest = match Decimal::of_string("79228162514264337593543950335") {
     Some(d) -> d,
@@ -364,19 +354,18 @@ pub fn u64() -> Gen<U64> =
 pub fn result_of<a, b>(ok: Gen<a>, err: Gen<b>) -> Gen<Result<a, b>> =
   and_then(below(2), |k: Int| if k == 0 { map(ok, |x: a| Ok(x)) } else { map(err, |x: b| Err(x)) })
 
-// --- Checking a property -----------------------------------------------------
-
-/// How many records shrinking a failing value may replay.
 fn shrink_budget() -> Int = 2000
 
-/// The result of checking a property at one value.
 type Outcome = | Passed | Failed | Raised(String)
 
-/// A value where a property failed, with the draws that made it and the size it was drawn at.
 type Counterexample<a> = { value: a, record: List<Int>, size: Int, reason: Outcome }
 
-fn property_outcome<a | e>(holds: (a) -> Bool / {abort.raise | e}, x: a) -> Outcome / e =
-  handle { if holds(x) { Passed } else { Failed } } with { abort.raise(message) -> Raised(message) }
+fn property_outcome<a | e>(property: (a) -> Bool / {abort.raise | e}, x: a) -> Outcome / e =
+  handle {
+    if property(x) { Passed } else { Failed }
+  } with {
+    abort.raise(message) -> Raised(message),
+  }
 
 /// The result of checking a property over the values a generator drew.
 pub type CheckResult<a> =
@@ -388,31 +377,31 @@ pub type CheckResult<a> =
   /// No case drew a value: the generator gave up every time.
   | NothingDrawn
 
-/// Checks `holds` over `cases` values drawn by `g`. Each case uses its own stream, and the size
+/// Checks `property` over `cases` values drawn by `g`. Each case uses its own stream, and the size
 /// rises from 0 at the first case to 63 at the last, so a run of few cases still draws large
-/// values. The first value for which `holds` returns `false` or raises is shrunk to a smaller value
+/// values. The first value for which `property` returns `false` or raises is shrunk to a smaller value
 /// that `g` could have drawn and that fails the same way.
 pub fn checked<a | e>(
   g: Gen<a>,
-  holds: (a) -> Bool / {abort.raise | e},
+  property: (a) -> Bool / {abort.raise | e},
   cases: Int = 25,
 ) -> CheckResult<a> / {abort.raise | e} = {
   let start: { drawn: Int, found: Option<Counterexample<a>> } = { drawn: 0, found: None };
   let ran = range(0, cases).fold(
     start,
-    |acc: { drawn: Int, found: Option<Counterexample<a>> }, case: Int|
-      match acc.found {
-        Some(_) -> acc,
+    |accumulator: { drawn: Int, found: Option<Counterexample<a>> }, case: Int|
+      match accumulator.found {
+        Some(_) -> accumulator,
         None -> {
           let size = if cases <= 1 { 0 } else { case * 63 / (cases - 1) };
           let drew = sample(g, case, b"check", size, None);
           match drew.value {
-            None -> acc,
-            Some(x) -> match property_outcome(holds, x) {
-              Passed -> { ..acc, drawn: acc.drawn + 1 },
+            None -> accumulator,
+            Some(x) -> match property_outcome(property, x) {
+              Passed -> { ..accumulator, drawn: accumulator.drawn + 1 },
               reason ->
                 {
-                  drawn: acc.drawn + 1,
+                  drawn: accumulator.drawn + 1,
                   found: Some({ value: x, record: drew.record, size: size, reason: reason }),
                 },
             },
@@ -423,7 +412,7 @@ pub fn checked<a | e>(
   match ran.found {
     None -> if ran.drawn > 0 { Holds } else { NothingDrawn },
     Some(first) -> {
-      let least = shrink(g, holds, first);
+      let least = shrink(g, property, first);
       match least.reason {
         Raised(message) -> RaisesAt(least.value, message),
         _ -> FailsAt(least.value),
@@ -432,35 +421,35 @@ pub fn checked<a | e>(
   }
 }
 
-/// Asserts `holds` for every value `g` draws, drawn as `checked` draws them. The test fails when
-/// `holds` returns `false` or raises, naming the smallest such value found. It also fails when `g`
+/// Asserts `property` for every value `g` draws, drawn as `checked` draws them. The test fails when
+/// `property` returns `false` or raises, naming the smallest such value found. It also fails when `g`
 /// drew no value.
 pub fn check<a | e>(
   g: Gen<a>,
-  holds: (a) -> Bool / {abort.raise | e},
+  property: (a) -> Bool / {abort.raise | e},
   cases: Int = 25,
-) -> Unit / {abort.raise | e} = assert_eq(checked(g, holds, cases: cases), Holds)
+) -> Unit / {abort.raise | e} = assert_eq(checked(g, property, cases: cases), Holds)
 
 /// `check` of a property of two values, drawn one after the other.
 pub fn check2<a, b | e>(
   ga: Gen<a>,
   gb: Gen<b>,
-  holds: (a, b) -> Bool / {abort.raise | e},
+  property: (a, b) -> Bool / {abort.raise | e},
   cases: Int = 25,
 ) -> Unit / {abort.raise | e} =
-  check(map2(ga, gb, |x: a, y: b| (x, y)), |p: (a, b)| holds(p._0, p._1), cases: cases)
+  check(map2(ga, gb, |x: a, y: b| (x, y)), |p: (a, b)| property(p._0, p._1), cases: cases)
 
 /// `check` of a property of three values.
 pub fn check3<a, b, c | e>(
   ga: Gen<a>,
   gb: Gen<b>,
   gc: Gen<c>,
-  holds: (a, b, c) -> Bool / {abort.raise | e},
+  property: (a, b, c) -> Bool / {abort.raise | e},
   cases: Int = 25,
 ) -> Unit / {abort.raise | e} =
   check(
     map3(ga, gb, gc, |x: a, y: b, z: c| (x, y, z)),
-    |p: (a, b, c)| holds(p._0, p._1, p._2),
+    |p: (a, b, c)| property(p._0, p._1, p._2),
     cases: cases,
   )
 
@@ -470,18 +459,15 @@ pub fn check4<a, b, c, d | e>(
   gb: Gen<b>,
   gc: Gen<c>,
   gd: Gen<d>,
-  holds: (a, b, c, d) -> Bool / {abort.raise | e},
+  property: (a, b, c, d) -> Bool / {abort.raise | e},
   cases: Int = 25,
 ) -> Unit / {abort.raise | e} =
   check(
     map4(ga, gb, gc, gd, |x: a, y: b, z: c, w: d| (x, y, z, w)),
-    |p: (a, b, c, d)| holds(p._0, p._1, p._2, p._3),
+    |p: (a, b, c, d)| property(p._0, p._1, p._2, p._3),
     cases: cases,
   )
 
-/// The `k`th way to make `record` smaller. In order, the ways are: its first half, all but its last
-/// draw, then each draw in turn set to zero, halved, and reduced by one. `None` once `k` is past
-/// the last way.
 fn shrink_candidate(record: List<Int>, k: Int) -> Option<List<Int>> =
   if k == 0 { Some(leading(record, record.len() / 2)) }
   else if k == 1 { Some(leading(record, record.len() - 1)) } else {
@@ -492,15 +478,13 @@ fn shrink_candidate(record: List<Int>, k: Int) -> Option<List<Int>> =
         let way = (k - 2) % 3;
         let to = if way == 0 { 0 } else if way == 1 { v / 2 } else { max(v - 1, 0) };
         Some(
-          range(0, record.len()).fold([], |acc: List<Int>, j: Int|
-            acc.push(if j == i { to } else { draw_at(record, j) })),
+          range(0, record.len()).fold([], |accumulator: List<Int>, j: Int|
+            accumulator.push(if j == i { to } else { draw_at(record, j) })),
         )
       },
     }
   }
 
-/// Whether `one` is smaller than `other`: it is shorter, or the same length and lower at the first
-/// draw where they differ.
 fn before(one: List<Int>, other: List<Int>) -> Bool =
   if one.len() != other.len() { one.len() < other.len() } else {
     range(0, one.len()).fold(None, |decided: Option<Bool>, i: Int|
@@ -518,11 +502,9 @@ fn before(one: List<Int>, other: List<Int>) -> Bool =
 fn ends_alike(one: Outcome, other: Outcome) -> Bool =
   match ((one, other)) { (Failed, Failed) -> true, (Raised(_), Raised(_)) -> true, _ -> false }
 
-/// The smallest value found below `first` that fails the same way. It replays smaller records
-/// until no way of making the record smaller still fails, or the budget is used up.
 fn shrink<a | e>(
   g: Gen<a>,
-  holds: (a) -> Bool / {abort.raise | e},
+  property: (a) -> Bool / {abort.raise | e},
   first: Counterexample<a>,
 ) -> Counterexample<a> / {abort.raise | e} =
   range(0, shrink_budget()).fold(
@@ -535,7 +517,7 @@ fn shrink<a | e>(
           match again.value {
             None -> { ..s, way: s.way + 1 },
             Some(x) -> {
-              let reason = property_outcome(holds, x);
+              let reason = property_outcome(property, x);
               if ends_alike(reason, s.found.reason) && before(again.record, s.found.record) {
                 {
                   found: { value: x, record: again.record, size: s.found.size, reason: reason },
@@ -548,8 +530,6 @@ fn shrink<a | e>(
       },
   ).found
 
-// --- Tests ------------------------------------------------------------------
-
 fn drawn<a>(g: Gen<a>, root: Int, size: Int) -> Sample<a> / {abort.raise} =
   sample(g, root, b"test", size, None)
 
@@ -560,7 +540,7 @@ fn pairs() -> Gen<{ small: Int, items: List<Int> }> =
   and_then(int_between(1, 6), |n: Int|
     map(list_of_length(int_between(0 - n, n), n), |items: List<Int>| { small: n, items: items }))
 
-test "a sample's record replayed makes its value again, from the same draws" {
+test "`replayed` on the record of a generated sample returns the same value and the same record" {
   check2(any_int(), any_int(), |root: Int, size: Int| {
     let first = sample(pairs(), root, b"law", size, None);
     let again = replayed(pairs(), first.record);
@@ -577,7 +557,7 @@ test "a whole number drawn between two bounds is within them" {
       }))
 }
 
-test "a list is no longer than its bound or its size" {
+test "a sampled `list_of` is no longer than its maximum length or the sample size, whichever is smaller" {
   check3(
     int_between(0 - 8, 63),
     int_between(0 - 8, 63),
@@ -590,7 +570,7 @@ test "a list is no longer than its bound or its size" {
   )
 }
 
-test "a property that holds of every value drawn holds, and one that fails names the least value it fails at" {
+test "`checked` passes a property true of every drawn value, and for a failing one reports the smallest failing value" {
   assert_eq(checked(any_int(), |n: Int| n == n), Holds);
   assert_eq(checked(int_between(0, 1000), |n: Int| n < 10), FailsAt(10));
   let pair = map2(list(int()), int_between(0, 9), |xs: List<Int>, n: Int| (xs, n));
@@ -612,7 +592,7 @@ test "a check whose generator draws no value reports that nothing was drawn" {
   assert_eq(checked(none, |n: Int| true), NothingDrawn)
 }
 
-test "a check that does not hold fails its test, and one that holds does not" {
+test "`check` fails its test when the property is false for some value, and passes when it is always true" {
   let failed = |run: () -> Unit / {abort.raise}|
     handle { run() } with { abort.raise(_) -> true, return _done -> false };
   assert(!failed(|| check(bool(), |b: Bool| b || !b)));
@@ -625,7 +605,7 @@ test "a check that does not hold fails its test, and one that holds does not" {
   )
 }
 
-test "the built-in generators' least draws make each type's simplest value" {
+test "`replayed` with an empty record returns each built-in generator's simplest value, such as 0, an empty list or an empty string" {
   assert_eq(replayed(any_int(), []).value, Some(0));
   assert_eq(replayed(list(any_int()), []).value, Some([]));
   assert_eq(replayed(text(), []).value, Some(""));
@@ -639,7 +619,7 @@ test "the built-in generators' least draws make each type's simplest value" {
   assert_eq(replayed(map_of(int(), bool()), []).value, Some(Map::new()))
 }
 
-test "any whole number is sometimes an edge, and a collection is never longer than sixteen" {
+test "`any_int` sometimes draws the largest integer, and text and lists never exceed sixteen items at large sizes" {
   let greatest = range(0, 200).fold(false, |seen: Bool, root: Int|
     seen || drawn(any_int(), root, 63).value == Some(9223372036854775807));
   assert(greatest);
@@ -650,7 +630,7 @@ test "any whole number is sometimes an edge, and a collection is never longer th
   )
 }
 
-test "a draw is a function of its root, its key and its size" {
+test "`drawn` and `sample` return the same result for the same seed, label and size, and differ when any of them changes" {
   assert_eq(drawn(pairs(), 7, 20), drawn(pairs(), 7, 20));
   assert(
     range(0, 20).fold(false, |differs: Bool, root: Int|
@@ -659,7 +639,7 @@ test "a draw is a function of its root, its key and its size" {
   assert(sample(int(), 3, b"a", 30, None) != sample(int(), 3, b"b", 30, None))
 }
 
-test "a record replayed makes the value again, and takes the same draws" {
+test "`replayed` on the record of a generated value returns the same value and the same record" {
   let all = range(0, 50).fold(true, |ok: Bool, root: Int| {
     let first = drawn(pairs(), root, root);
     let again = replayed(pairs(), first.record);
@@ -668,7 +648,7 @@ test "a record replayed makes the value again, and takes the same draws" {
   assert(all)
 }
 
-test "past the end of a record every draw is zero, and a draw past its bound is clamped" {
+test "`replayed` reads a missing record entry as zero and clamps an entry outside the generator's range" {
   assert_eq(replayed(pairs(), []).value, Some({ small: 1, items: [0 - 1] }));
   assert_eq(replayed(int_between(10, 20), [99]), { value: Some(20), record: [10], rejections: 0 });
   assert_eq(replayed(int_between(10, 20), [0 - 5]).value, Some(10));
@@ -693,7 +673,7 @@ test "a bounded draw stays in its bounds, the widest span included" {
   assert_eq(drawn(below(0), 0, 10).value, None)
 }
 
-test "a list is no longer than its bound or the size" {
+test "a generated `list_of` list is never longer than its maximum length or the size, and is empty at size zero" {
   assert(
     range(0, 100).fold(true, |ok: Bool, root: Int|
       ok
@@ -710,10 +690,11 @@ test "a list is no longer than its bound or the size" {
 }
 
 test "a choice draws each of its options, and none from an empty list" {
-  let seen = range(0, 60).fold([], |acc: List<Int>, root: Int|
+  let seen = range(0, 60).fold([], |accumulator: List<Int>, root: Int|
     match drawn(one_of([constant(1), constant(2), elements([3, 4])]), root, 0).value {
-      Some(n) -> if acc.fold(false, |hit: Bool, x: Int| hit || x == n) { acc } else { acc.push(n) },
-      None -> acc,
+      Some(n) -> if accumulator.fold(false, |hit: Bool, x: Int| hit || x == n) { accumulator }
+      else { accumulator.push(n) },
+      None -> accumulator,
     });
   assert_eq(seen.len(), 4);
   let nothing: List<Int> = [];
@@ -726,11 +707,11 @@ test "such_that returns what its predicate accepts, counts what it rejected, and
   let even = such_that(int_between(0, 99), |n: Int| n % 2 == 0, 50);
   let run = range(0, 40).fold(
     { ok: true, rejections: 0 },
-    |acc: { ok: Bool, rejections: Int }, root: Int| {
+    |accumulator: { ok: Bool, rejections: Int }, root: Int| {
       let s = drawn(even, root, 0);
       {
-        ok: acc.ok && (match s.value { Some(n) -> n % 2 == 0, None -> false }),
-        rejections: acc.rejections + s.rejections,
+        ok: accumulator.ok && (match s.value { Some(n) -> n % 2 == 0, None -> false }),
+        rejections: accumulator.rejections + s.rejections,
       }
     },
   );
@@ -739,7 +720,6 @@ test "such_that returns what its predicate accepts, counts what it rejected, and
   let never = drawn(such_that(int_between(0, 99), |n: Int| n > 100, 7), 0, 0);
   assert_eq(never.value, None);
   assert_eq(never.rejections, 7);
-  // Rejected draws are in the record, so a replay rejects the same values.
   let odd = such_that(int_between(0, 9), |n: Int| n % 2 == 1, 20);
   assert_eq(replayed(odd, [4, 2, 7]), { value: Some(7), record: [4, 2, 7], rejections: 2 })
 }

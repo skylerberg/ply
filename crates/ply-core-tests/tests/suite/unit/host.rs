@@ -1,8 +1,7 @@
 use ply_core::host::*;
 
-/// A run's binding keeps what the run is granted, which the natives of the host handlers read.
 #[test]
-fn a_granted_binding_keeps_what_its_run_is_granted() {
+fn a_host_binding_created_with_grants_is_granted_and_allows_only_the_grants_it_was_given() {
     let binding = HostBinding::granted(Grants::default().with("allow", &["toolchain"]));
     assert!(binding.is_granted());
     assert!(binding.grants().allows("toolchain"));
@@ -10,23 +9,24 @@ fn a_granted_binding_keeps_what_its_run_is_granted() {
 }
 
 #[test]
-fn an_unbound_binding_is_granted_nothing() {
+fn an_unbound_host_binding_is_not_granted_and_its_set_of_grants_is_empty() {
     let binding = HostBinding::unbound();
     assert!(!binding.is_granted());
     assert_eq!(binding.grants(), &Grants::default());
 }
 
 #[test]
-fn host_use_records_what_actually_happened() {
+fn host_use_counts_every_recorded_operation_and_reports_it_acted_only_after_a_nondeterministic_operation()
+ {
     let mut use_ = HostUse::default();
     assert!(use_.is_empty());
     use_.record(Determinism::Deterministic);
     assert!(
-        !use_.acted(),
+        !use_.used_nondeterminism(),
         "a deterministic handler returns the same on a re-run"
     );
     use_.record(Determinism::Nondeterministic);
     assert_eq!(use_.operations, 2);
     assert!(!use_.is_empty());
-    assert!(use_.acted());
+    assert!(use_.used_nondeterminism());
 }

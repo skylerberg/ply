@@ -1,32 +1,35 @@
-//! CBOR (RFC 8949): JSON's data in binary, with integers of any size, byte strings, tags and maps
-//! keyed by any value.
+//! Reads and writes CBOR (RFC 8949): JSON's data in binary, with integers of any size, byte
+//! strings, tags and maps keyed by any value.
 //!
-//! `write` emits the core deterministic encoding (§4.2.1) and nothing else: every integer, length
-//! and tag number in its fewest bytes, a float in the narrowest of the three widths that stores
-//! its bits exactly, a map's fields ordered by their keys' encodings, no indefinite lengths, and
-//! an integer as a bignum only when 64 bits cannot store it. Each value has one encoding, so a
-//! signature or a digest over what `write` returns covers the value.
+//! `write` emits only the core deterministic encoding. Every integer, length and tag number uses
+//! the fewest bytes. A float uses the narrowest of the three widths that stores its bits exactly. A
+//! map's fields are ordered by their keys' encodings. Indefinite lengths are never used. An integer
+//! is a bignum only when 64 bits cannot store it. Each value has one encoding, so a signature or
+//! digest over what `write` returns covers the value.
 //!
-//! `read` takes the `Form` the bytes must follow. `Any` reads all of CBOR: indefinite lengths, the
-//! three float widths, arguments longer than they need to be, and fields in any order.
-//! `Deterministic` reads only what `write` emits, so `decode` under it and `encode` are inverses.
-//! `LengthFirst` requires a map's keys in the order RFC 7049 called canonical. Every form rejects,
-//! reporting why and at which byte: a truncated input, bytes after the item, text that is not
-//! UTF-8, a reserved initial byte, a break with nothing to end, and a map with a repeated key,
-//! which two readers could resolve in two ways. A reader takes its `Limits` as an argument: how
-//! deep an item may nest, how many items it may contain, and how long a string may be. Every
-//! length is checked against the remaining bytes before the reader visits its contents. `decode`
-//! returns an error as an `Err`, `read` raises it, and `read_at` reads one item of several.
+//! `read` takes the `Form` the bytes must follow. `Any` accepts all of CBOR: indefinite lengths,
+//! the three float widths, arguments longer than they need to be, and fields in any order.
+//! `Deterministic` accepts only what `write` emits, so `decode` under it and `encode` are inverses.
+//! `LengthFirst` requires a map's keys sorted by encoded length first, as older CBOR specifications
+//! defined canonical order.
+//!
+//! Every form rejects a truncated input, bytes after the item, text that is not UTF-8, a reserved
+//! initial byte, a break with nothing to end, and a map with a repeated key, which two readers
+//! could resolve differently. The error says why and at which byte. A reader takes `Limits` as an
+//! argument: how deep an item may nest, how many items it may contain, and how long a string may
+//! be. It checks every length against the remaining bytes before reading the contents. `decode`
+//! returns an error as an `Err` and `read` raises it. `read_at` reads one item from a given offset,
+//! so it can read a sequence of items.
 //!
 //! An integer is an `Int` when it fits. CBOR's integers range from `-2^64` to `2^64 - 1`, and its
-//! bignums go beyond that. Integers outside an `Int` are `Unsigned` and `Negative`, holding the
-//! number's octets as a bignum carries them. `to_big_int` and `of_big_int` convert to and from
+//! bignums go beyond that. Integers outside an `Int` are `Unsigned` and `Negative`, which contain
+//! the number's octets as a bignum encodes them. `to_big_int` and `of_big_int` convert to and from
 //! `std.bigint`. Tags 2 and 3 are read as the integers they represent. Every other tag stays a
 //! `Tagged`, and `to_instant` reads a tag 1 time.
 //!
-//! A `Value` is compared as the item it represents rather than as it was built: a map regardless
-//! of the order of its fields, a float by its bits, so a `NaN` equals itself and `0.0` is not
-//! `-0.0`, and an integer by its number. `show` writes the diagnostic notation of §8.
+//! Two `Value`s are compared by the item they represent, not by how it was encoded. Maps are equal
+//! regardless of field order. Floats are compared by their bits, so a `NaN` equals itself and `0.0`
+//! is not `-0.0`. Integers are compared by number. `show` writes the CBOR diagnostic notation.
 
 import std.bigint
 import std.bigint (BigInt)
@@ -39,33 +42,29 @@ import std.result
 import std.string
 import std.gen
 
-// --- Values ---------------------------------------------------------------------
-
 /// A CBOR data item.
 ///
-/// `==`, `compare`, `digest` and a `Map`'s keys treat two values as one when they are the same
-/// item: a map with its fields in another order, an integer written in more octets than it needs
-/// or as the bignum tag over a byte string, and `Simple(20)` to `Simple(23)` alongside `Boolean`,
-/// `Null` and `Undefined`. A float is compared by its bits, so a `NaN` equals itself and `0.0` is
-/// not `-0.0`.
+/// `==`, `compare`, `digest` and a `Map`'s keys treat two values as equal when they represent the
+/// same item. This covers a map with its fields in another order, and an integer written in more
+/// octets than it needs or as a bignum tag over a byte string. It also covers `Simple(20)` to
+/// `Simple(23)`, which equal `Boolean(false)`, `Boolean(true)`, `Null` and `Undefined`. A float is
+/// compared by its bits, so a `NaN` equals itself and `0.0` is not `-0.0`.
 pub type Value =
   /// An integer that fits an `Int`.
   | Int(Int)
-  /// An integer above the largest `Int`: the big-endian octets of the number. A reader returns one
-  /// in its fewest octets, and only for such a number. Octets that fit an `Int` equal that `Int`.
+  /// An integer above the largest `Int`: the big-endian octets of the number. A reader returns this
+  /// constructor only for such a number, with the octets in their fewest. Octets whose number fits
+  /// an `Int` are equal to that `Int`.
   | Unsigned(Bytes)
   /// An integer below the smallest `Int`: the big-endian octets of `-1 - n` for the number `n`, as
   /// a negative bignum carries it.
   | Negative(Bytes)
-  /// A byte string.
   | ByteString(Bytes)
   | Text(String)
-  /// An array.
   | Items(List<Value>)
   /// A map: its fields in the order they were read or built. A key may be any value, and appears
   /// at most once.
   | Fields(List<Field>)
-  /// A tag's number and what it tags.
   | Tagged(Int, Value)
   | Boolean(Bool)
   | Null
@@ -84,7 +83,6 @@ key for Value by comparison_key
 
 show for Value by shown
 
-/// What two values are compared by: the item, however the value writes it.
 type ComparisonKey =
   | SameInt(Int)
   | SameBig(Bool, Bytes)
@@ -103,9 +101,9 @@ fn comparison_key(v: Value) -> ComparisonKey =
     Negative(octets) | Tagged(3, ByteString(octets)) -> same_integer(true, octets),
     ByteString(b) -> SameBits(b),
     Text(s) -> SameText(s),
-    Items(held) -> SameItems(held.map(comparison_key)),
-    Fields(held) ->
-      SameFields(held.map(|f: Field| (comparison_key(f.key), comparison_key(f.value))).sort()),
+    Items(items) -> SameItems(items.map(comparison_key)),
+    Fields(fields) ->
+      SameFields(fields.map(|f: Field| (comparison_key(f.key), comparison_key(f.value))).sort()),
     Tagged(number, inner) -> SameTagged(number, comparison_key(inner)),
     Boolean(b) -> SameSimple(if b { 21 } else { 20 }),
     Null -> SameSimple(22),
@@ -121,20 +119,18 @@ fn same_integer(negative: Bool, octets: Bytes) -> ComparisonKey =
     _ -> SameBig(negative, octets),
   }
 
-/// The integer whose octets a bignum carries, as a reader returns it: an `Int` when it fits.
 fn integer_of(negative: Bool, octets: Bytes) -> Value / {abort.raise} = {
   let fewest = octets.strip_leading_zeros();
   if fewest.len() > 8 || (fewest.len() == 8 && fewest.at(0) >= 0x80) {
     if negative { Negative(fewest) } else { Unsigned(fewest) }
   } else {
-    let n = range(0, fewest.len()).fold(0, |acc: Int, i: Int| acc << 8 | fewest.at(i));
+    let n = range(0, fewest.len()).fold(0, |accumulator: Int, i: Int|
+      accumulator << 8 | fewest.at(i));
     Int(if negative { -1 - n } else { n })
   }
 }
 
-// --- Errors ---------------------------------------------------------------------
-
-/// Why a reader rejected bytes, or a writer a value.
+/// Why a reader rejected bytes, or why a writer rejected a value.
 pub type ErrorKind =
   /// The input ends before the item does.
   | Truncated
@@ -148,17 +144,17 @@ pub type ErrorKind =
   | TooLong
   /// A length or a tag number too large for an `Int`.
   | TooWide
-  /// An initial byte that no item begins with, which it carries: additional information 28 to 30,
-  /// or 31 on an integer or a tag.
+  /// An initial byte that no item begins with. The constructor's argument is that byte. The
+  /// additional information is 28 to 30, or 31 on an integer or a tag.
   | Reserved(Int)
   /// A break that ends nothing: outside an indefinite length, or where a map's value is expected.
   | UnexpectedBreak
-  /// A piece of an indefinite-length string that is not a string of its type with a length.
+  /// A piece of an indefinite-length string that is not a definite-length string of the same type.
   | BadChunk
   /// Text that is not UTF-8.
   | NotUtf8
-  /// A simple value below 32 in two bytes, or one a writer has no encoding for: 24 to 31, or
-  /// outside 0 to 255.
+  /// A simple value below 32 written in two bytes, or a simple value a writer cannot encode because
+  /// it is 24 to 31 or outside 0 to 255.
   | BadSimple
   /// A map with a repeated key.
   | DuplicateKey
@@ -188,10 +184,6 @@ pub effect cbor {
 
 fn fail<a>(at: Int, reason: ErrorKind) -> a / {cbor.fail} = cbor.fail({ at: at, reason: reason })
 
-// --- Floats ---------------------------------------------------------------------
-
-/// The double a narrower float's `bits` widen to. `exponent` and `fraction` are the widths of the
-/// narrow format's fields: 5 and 10 for a half, 8 and 23 for a single.
 fn widen_float_bits(bits: Int, exponent: Int, fraction: Int) -> Int = {
   let sign = (bits >> exponent + fraction & 1) << 63;
   let top = (1 << exponent) - 1;
@@ -201,13 +193,11 @@ fn widen_float_bits(bits: Int, exponent: Int, fraction: Int) -> Int = {
   if e == top { sign | 0x7FF0_0000_0000_0000 | f << 52 - fraction }
   else if e > 0 { sign | e - bias + 1023 << 52 | f << 52 - fraction }
   else if f == 0 { sign } else {
-    // A subnormal is `f * 2^(1 - bias - fraction)`, which a double stores as a normal number.
     let high = ilog2(f);
     sign | high + 1 - bias - fraction + 1023 << 52 | f << 52 - high & 0xF_FFFF_FFFF_FFFF
   }
 }
 
-/// The narrower float that widens to exactly the double `bits`, or `None` if there is none.
 fn narrowed(bits: Int, exponent: Int, fraction: Int) -> Option<Int> = {
   let sign = bits >>> 63 << exponent + fraction;
   let top = (1 << exponent) - 1;
@@ -224,7 +214,6 @@ fn narrowed(bits: Int, exponent: Int, fraction: Int) -> Option<Int> = {
   } else { None }
 }
 
-/// `high` combined with `f` shifted right by `drop` bits, or `None` if any dropped bit is set.
 fn exact_shift(high: Int, f: Int, drop: Int) -> Option<Int> =
   if f & (1 << drop) - 1 == 0 { Some(high | f >> drop) } else { None }
 
@@ -239,9 +228,6 @@ fn float_bytes(f: Float) -> Bytes = {
   }
 }
 
-// --- Writing --------------------------------------------------------------------
-
-/// An initial byte of `major` and the argument `n`, which is not negative, in the fewest bytes.
 fn head_bytes(major: Int, n: Int) -> Bytes / {abort.raise} =
   if n < 24 { byte_of_int(major << 5 | n) }
   else if n < 0x100 { byte_of_int(major << 5 | 24) ++ byte_of_int(n) }
@@ -249,13 +235,14 @@ fn head_bytes(major: Int, n: Int) -> Bytes / {abort.raise} =
   else if n < 0x1_0000_0000 { byte_of_int(major << 5 | 26) ++ u32_be(n) }
   else { byte_of_int(major << 5 | 27) ++ u64_be(n) }
 
-/// Writes an integer of `major` 0 or 1 whose argument is `octets`: in the head when it fits in 64
-/// bits, and as a bignum otherwise.
 fn integer_bytes(major: Int, octets: Bytes) -> Bytes / {abort.raise} = {
   let fewest = octets.strip_leading_zeros();
   if fewest.len() > 8 { byte_of_int(0xC2 + major) ++ head_bytes(2, fewest.len()) ++ fewest }
   else if fewest.len() == 8 { byte_of_int(major << 5 | 27) ++ fewest } else {
-    head_bytes(major, range(0, fewest.len()).fold(0, |acc: Int, i: Int| acc << 8 | fewest.at(i)))
+    head_bytes(
+      major,
+      range(0, fewest.len()).fold(0, |accumulator: Int, i: Int| accumulator << 8 | fewest.at(i)),
+    )
   }
 }
 
@@ -269,9 +256,9 @@ pub fn write(v: Value) -> Bytes / {cbor.unwritable, abort.raise} =
     Negative(octets) | Tagged(3, ByteString(octets)) -> integer_bytes(1, octets),
     ByteString(b) -> head_bytes(2, b.len()) ++ b,
     Text(s) -> head_bytes(3, Bytes::of_string(s).len()) ++ Bytes::of_string(s),
-    Items(held) -> head_bytes(4, held.len()) ++ Bytes::concat_all(held.map(write)),
-    Fields(held) -> {
-      let sorted = held.fold(Map::new(), |written_hex: Map<Bytes, Bytes>, f: Field| {
+    Items(items) -> head_bytes(4, items.len()) ++ Bytes::concat_all(items.map(write)),
+    Fields(fields) -> {
+      let sorted = fields.fold(Map::new(), |written_hex: Map<Bytes, Bytes>, f: Field| {
         let key = write(f.key);
         if written_hex.contains(key) { cbor.unwritable(DuplicateKey) }
         else { written_hex.insert(key, write(f.value)) }
@@ -296,20 +283,20 @@ pub fn write(v: Value) -> Bytes / {cbor.unwritable, abort.raise} =
 /// The deterministic encoding of `v`, or why it has none.
 pub fn encode(v: Value) -> Result<Bytes, ErrorKind> / {abort.raise} = try { write(v) }
 
-// --- Reading --------------------------------------------------------------------
-
 /// The form a reader requires the bytes to follow.
 pub type Form =
   /// Any well-formed item with no repeated map key.
   | Any
   /// The core deterministic encoding of RFC 8949 §4.2.1, which is what `write` emits.
   | Deterministic
-  /// `Deterministic` with a map's keys ordered as RFC 7049's canonical form ordered them, a
-  /// shorter encoding first (RFC 8949 §4.2.3).
+  /// Deterministic form that sorts a map's keys by encoded length first, and keys of equal length
+  /// by their bytes. This is the key order of the canonical form in RFC 7049 (see RFC 8949 section
+  /// 4.2.3).
   | LengthFirst
 
-/// What a reader accepts: `depth` levels of arrays, maps and tags inside one another, `items` items
-/// in all, with each key, value and tagged item counting as one, and `string` bytes in one string.
+/// The limits a reader enforces. `depth` is how many arrays, maps and tags may be nested inside one
+/// another. `items` is the total number of items, where each key, value and tagged item counts as
+/// one. `string` is the most bytes a single byte string or text string may have.
 pub type Limits = new { depth: Int, items: Int, string: Int }
 
 /// A value read, and the offset after it.
@@ -343,14 +330,10 @@ pub fn read_at(
 pub fn is_deterministic(data: Bytes, limits: Limits) -> Bool / {abort.raise} =
   decode(data, Deterministic, limits).is_ok()
 
-/// The input, and the rules that apply for a whole read.
 type Input = { data: Bytes, form: Form, string: Int }
 
-/// An item read, the offset after it, and how many more items the read may take.
 type ItemResult = { value: Value, at: Int, left: Int }
 
-/// An initial byte and its argument: the major type, the additional information, the argument's
-/// bits, whether an eight-byte argument is too large for an `Int`, and the offset after it.
 type Head = { major: Int, info: Int, arg: Int, wide: Bool, at: Int }
 
 fn head(c: Input, at: Int) -> Head / {cbor.fail} =
@@ -362,7 +345,8 @@ fn head(c: Input, at: Int) -> Head / {cbor.fail} =
     } else if info > 27 { fail(at, Reserved(first)) } else {
       let width = 1 << info - 24;
       if width > c.data.len() - at - 1 { fail(at, Truncated) } else {
-        let arg = range(at + 1, at + 1 + width).fold(0, |acc: Int, i: Int| acc << 8 | c.data.at(i));
+        let arg = range(at + 1, at + 1 + width).fold(0, |accumulator: Int, i: Int|
+          accumulator << 8 | c.data.at(i));
         { major: first >> 5, info: info, arg: arg, wide: arg < 0, at: at + 1 + width }
       }
     }
@@ -370,15 +354,12 @@ fn head(c: Input, at: Int) -> Head / {cbor.fail} =
 
 fn strict(c: Input) -> Bool = c.form != Any
 
-/// Whether fewer bytes could have stored the argument.
 fn is_overlong(h: Head) -> Bool =
   !h.wide
     && ((h.info == 24 && h.arg < 24) || (h.info == 25 && h.arg < 0x100)
     || (h.info == 26 && h.arg < 0x1_0000)
     || (h.info == 27 && h.arg < 0x1_0000_0000))
 
-/// Reads the item at `at`. `depth_left` is how many more levels it may nest, and `left` how many
-/// items the read may still accept, including this one.
 fn item(c: Input, at: Int, depth_left: Int, left: Int) -> ItemResult / {cbor.fail, abort.raise} =
   if left <= 0 { fail(at, TooMany) } else {
     let h = head(c, at);
@@ -417,7 +398,6 @@ fn special(c: Input, h: Head, at: Int) -> Value / {cbor.fail} =
     if strict(c) && narrower { fail(at, OverlongFloat) } else { Float(Float::of_bits(double)) }
   }
 
-/// The integer that a tag 2 or 3 makes of a byte string. Any other tagged item stays as it is.
 fn tagged(c: Input, at: Int, number: Int, inner: Value) -> Value / {cbor.fail, abort.raise} =
   match inner {
     ByteString(octets) -> if number != 2 && number != 3 { Tagged(number, inner) }
@@ -426,11 +406,9 @@ fn tagged(c: Input, at: Int, number: Int, inner: Value) -> Value / {cbor.fail, a
     _ -> Tagged(number, inner),
   }
 
-/// The bytes of the string piece that `h` heads. `held` is the total length of the pieces before
-/// it.
-fn piece(c: Input, h: Head, at: Int, held: Int) -> Bytes / {cbor.fail, abort.raise} =
+fn piece(c: Input, h: Head, at: Int, total_length: Int) -> Bytes / {cbor.fail, abort.raise} =
   if h.wide { fail(at, TooWide) }
-  else if h.arg > c.string - held { fail(at, TooLong) }
+  else if h.arg > c.string - total_length { fail(at, TooLong) }
   else if h.arg > c.data.len() - h.at { fail(h.at, Truncated) } else {
     let bytes = c.data.slice(h.at, h.at + h.arg);
     if h.major == 3 && !bytes.is_utf8() { fail(h.at, NotUtf8) } else { bytes }
@@ -446,29 +424,32 @@ fn string(c: Input, h: Head, at: Int, left: Int) -> ItemResult / {cbor.fail, abo
   }
 }
 
-/// Reads the pieces of an indefinite-length string up to its break, and joins them. Each piece
-/// takes at least a byte, so `span`, the number of bytes left, bounds how many there can be.
 fn read_string_chunks(
   c: Input,
   major: Int,
   at: Int,
-  acc: List<Bytes>,
-  held: Int,
+  accumulator: List<Bytes>,
+  total_length: Int,
   span: Int,
 ) -> { bytes: Bytes, at: Int } / {cbor.fail, abort.raise} =
   if span <= 0 { fail(at, Truncated) } else {
     let h = head(c, at);
-    if h.major == 7 && h.info == 31 { { bytes: Bytes::concat_all(acc), at: h.at } }
+    if h.major == 7 && h.info == 31 { { bytes: Bytes::concat_all(accumulator), at: h.at } }
     else if h.major != major || h.info == 31 { fail(at, BadChunk) } else {
-      let bytes = piece(c, h, at, held);
-      read_string_chunks(c, major, h.at + h.arg, acc.push(bytes), held + h.arg, span - 1)
+      let bytes = piece(c, h, at, total_length);
+      read_string_chunks(
+        c,
+        major,
+        h.at + h.arg,
+        accumulator.push(bytes),
+        total_length + h.arg,
+        span - 1,
+      )
     }
   }
 
 fn at_break(c: Input, at: Int) -> Bool = at >= 0 && at < c.data.len() && c.data.at(at) == 0xFF
 
-/// How many members the array or map that `h` heads may contain: its count, or for an indefinite
-/// length, a bound from the bytes left. `each` is the fewest bytes a member takes.
 fn members(c: Input, h: Head, each: Int) -> Int / {cbor.fail, abort.raise} = {
   let depth_left = (c.data.len() - h.at) / each;
   if h.info == 31 { depth_left + 1 }
@@ -488,13 +469,13 @@ fn values(
   open: Bool,
   depth_left: Int,
   left: Int,
-  acc: List<Value>,
+  accumulator: List<Value>,
 ) -> { held: List<Value>, at: Int, left: Int } / {cbor.fail, abort.raise} =
-  if open && at_break(c, at) { { held: acc, at: at + 1, left: left } }
-  else if count <= 0 { if open { fail(at, Truncated) } else { { held: acc, at: at, left: left } } }
-  else {
+  if open && at_break(c, at) { { held: accumulator, at: at + 1, left: left } } else if count <= 0 {
+    if open { fail(at, Truncated) } else { { held: accumulator, at: at, left: left } }
+  } else {
     let got = item(c, at, depth_left, left);
-    values(c, got.at, count - 1, open, depth_left, got.left, acc.push(got.value))
+    values(c, got.at, count - 1, open, depth_left, got.left, accumulator.push(got.value))
   }
 
 fn fields(c: Input, h: Head, depth_left: Int, left: Int) -> ItemResult / {cbor.fail, abort.raise} = {
@@ -502,9 +483,6 @@ fn fields(c: Input, h: Head, depth_left: Int, left: Int) -> ItemResult / {cbor.f
   { value: Fields(read.held), at: read.at, left: read.left }
 }
 
-/// `last` is the previous key as it was written, which a deterministic form requires the next
-/// key to sort after. `seen` is every key so far in its one encoding, which is how `Any` finds a
-/// repeated key.
 fn pairs(
   c: Input,
   at: Int,
@@ -512,13 +490,13 @@ fn pairs(
   open: Bool,
   depth_left: Int,
   left: Int,
-  acc: List<Field>,
+  accumulator: List<Field>,
   last: Bytes,
   seen: Map<Bytes, Unit>,
 ) -> { held: List<Field>, at: Int, left: Int } / {cbor.fail, abort.raise} =
-  if open && at_break(c, at) { { held: acc, at: at + 1, left: left } }
-  else if count <= 0 { if open { fail(at, Truncated) } else { { held: acc, at: at, left: left } } }
-  else {
+  if open && at_break(c, at) { { held: accumulator, at: at + 1, left: left } } else if count <= 0 {
+    if open { fail(at, Truncated) } else { { held: accumulator, at: at, left: left } }
+  } else {
     let key = item(c, at, depth_left, left);
     let written_hex = c.data.slice(at, key.at);
     let known = if strict(c) { seen } else {
@@ -538,18 +516,15 @@ fn pairs(
         open,
         depth_left,
         value.left,
-        acc.push({ key: key.value, value: value.value }),
+        accumulator.push({ key: key.value, value: value.value }),
         written_hex,
         known,
       )
     }
   }
 
-/// The one encoding of a key that was read, or `written_hex` when the key has no encoding.
 fn key_encoding(key: Value, written_hex: Bytes) -> Bytes / {abort.raise} =
   match try[cbor.unwritable] { write(key) } { Ok(one) -> one, Err(_) -> written_hex }
-
-// --- Tags -----------------------------------------------------------------------
 
 /// The number an integer value represents, of any size, or `None` for a value that is not an
 /// integer.
@@ -591,8 +566,6 @@ pub fn to_instant(v: Value) -> Option<Instant> =
     _ -> None,
   }
 
-// --- Diagnostic notation --------------------------------------------------------
-
 /// `v` in the diagnostic notation of RFC 8949 §8. A value does not record an indefinite length or
 /// a float's width, so neither is marked, and a float is written as `Float::to_string` writes it.
 pub fn diagnostic(v: Value) -> String / {abort.raise} =
@@ -604,10 +577,13 @@ pub fn diagnostic(v: Value) -> String / {abort.raise} =
     },
     ByteString(b) -> "h'" ++ b.hex_of() ++ "'",
     Text(s) -> json::to_string(json::Str(s)),
-    Items(held) -> "[" ++ String::join(held.map(diagnostic), ", ") ++ "]",
-    Fields(held) ->
+    Items(items) -> "[" ++ String::join(items.map(diagnostic), ", ") ++ "]",
+    Fields(fields) ->
       "{"
-        ++ String::join(held.map(|f: Field| diagnostic(f.key) ++ ": " ++ diagnostic(f.value)), ", ")
+        ++ String::join(
+          fields.map(|f: Field| diagnostic(f.key) ++ ": " ++ diagnostic(f.value)),
+          ", ",
+        )
         ++ "}",
     Tagged(number, inner) -> number.to_string() ++ "(" ++ diagnostic(inner) ++ ")",
     Boolean(b) -> if b { "true" } else { "false" },
@@ -620,8 +596,6 @@ pub fn diagnostic(v: Value) -> String / {abort.raise} =
 fn shown(v: Value) -> String =
   match try[abort.raise] { diagnostic(v) } { Ok(text) -> text, Err(_) -> "" }
 
-// --- Properties -----------------------------------------------------------------
-
 fn large_limits() -> Limits = limits_of(64, 1000000, 1000000)
 
 fn limits_of(depth: Int, items: Int, string: Int) -> Limits =
@@ -629,7 +603,6 @@ fn limits_of(depth: Int, items: Int, string: Int) -> Limits =
 
 fn writable(v: Value) -> Bool / {abort.raise} = encode(v).is_ok()
 
-/// Generates any `Value`, nested at most `depth` levels.
 fn arbitrary_values_at(depth: Int) -> gen::Gen<Value> =
   if depth <= 0 {
     gen::one_of([
@@ -681,7 +654,7 @@ test "a value that can be written reads back as itself" {
     if writable(v) { decode(write(v), Any, large_limits()) == Ok(v) } else { true })
 }
 
-test "what is written, cut short anywhere, is truncated" {
+test "decoding any shorter prefix of a written value fails with a `Truncated` rejection" {
   gen::check2(arbitrary_values(), gen::any_int(), |v: Value, cut: Int|
     if writable(v) {
       let whole = write(v);
@@ -693,10 +666,6 @@ test "what is written, cut short anywhere, is truncated" {
     } else { true })
 }
 
-// --- Tests ----------------------------------------------------------------------
-
-/// One row of RFC 8949's Appendix A: an item's bytes, the diagnostic notation `diagnostic` writes
-/// of it, and whether the bytes are the item's deterministic encoding.
 type Example = { hex: String, diagnostic: String, deterministic: Bool }
 
 fn same(hex: String, diagnostic: String) -> Example =
@@ -799,7 +768,8 @@ fn examples() -> List<Example> =
     alternate_encoding("bf6346756ef563416d7421ff", "{\"Fun\": true, \"Amt\": -2}"),
   ]
 
-test "RFC 8949 Appendix A: {c.hex} is {c.diagnostic}" for c: Example in examples() {
+test "RFC 8949 Appendix A: bytes {c.hex} read as {c.diagnostic}, and `write` returns the same bytes only if they are deterministic" for c: Example in examples(
+  ) {
   let bytes = Bytes::of_hex(c.hex);
   let v = read(bytes, Any, large_limits());
   assert_eq(diagnostic(v), c.diagnostic);
@@ -849,7 +819,7 @@ test "an integer is written in the fewest bytes, and past 64 bits as a bignum" {
   assert_eq(written_hex(Tagged(3, ByteString(Bytes::of_hex("ff")))), "38ff")
 }
 
-test "strings, arrays, tags and the simple values are written under their shortest heads" {
+test "byte strings, text, arrays, tags and simple values are written with the shortest possible header bytes" {
   assert_eq(written_hex(ByteString(b"")), "40");
   assert_eq(written_hex(ByteString(Bytes::of_hex("01020304"))), "4401020304");
   assert_eq(written_hex(Text("IETF")), "6449455446");
@@ -880,7 +850,6 @@ test "a float is written in the narrowest width that stores its bits exactly" {
     ["f90000", "f98000", "f93e00", "f97bff", "f90001", "fa47c35000", "fa00000001"],
   );
   assert_eq(written_hex(Float(1.1)), "fb3ff199999999999a");
-  // A program sees one NaN, whatever bits made it, and it is written in a half.
   assert_eq(written_hex(Float(Float::of_bits(0x7FF8_0000_0000_0000))), "f97e00");
   assert_eq(written_hex(Float(Float::of_bits(0x7FF8_0000_2000_0000))), "f97e00");
   assert_eq(written_hex(Float(Float::of_bits(0xFFF8_0000_0000_0001))), "f97e00");
@@ -926,7 +895,7 @@ test "a map is written in the order of its keys' encodings, however it was built
   )
 }
 
-test "a value with no encoding reports why" {
+test "`encode` returns an error naming the problem for an invalid simple value, an invalid tag or a duplicate map key" {
   assert_eq([Simple(24), Simple(31), Simple(256), Simple(-1)].map(encode), [
     Err(BadSimple),
     Err(BadSimple),
@@ -942,7 +911,7 @@ test "a value with no encoding reports why" {
   assert_eq(encode(Simple(20)), Ok(b"\xf4"))
 }
 
-test "a value equals the item it represents, however it was built" {
+test "two CBOR values are equal when they represent the same data item, however each was constructed" {
   assert_eq(
     Fields([field(Text("b"), Int(2)), field(Text("a"), Int(1))]),
     Fields([field(Text("a"), Int(1)), field(Text("b"), Int(2))]),
@@ -974,7 +943,7 @@ test "a value equals the item it represents, however it was built" {
   assert_eq(f"{Items([Int(1), Text("a"), ByteString(b"\x01")])}", "[1, \"a\", h'01']")
 }
 
-test "any form rejects bytes that are not an item, and reports where" {
+test "decoding with `Any` rejects malformed bytes and reports the byte offset and the reason" {
   let lax = |hex: String| error_of(hex, Any, large_limits());
   assert_eq(lax(""), Some({ at: 0, reason: Truncated }));
   assert_eq(lax("18"), Some({ at: 0, reason: Truncated }));
@@ -1039,12 +1008,11 @@ test "a reader enforces the depth, the item count and the string length it was g
     error_of("5f42010243030405ff", Any, limits_of(0, 1, 4)),
     Some({ at: 4, reason: TooLong }),
   );
-  // A length that claims more bytes than remain is truncation, whatever it claims.
   assert_eq(error_of("5a7fffffff", Any, large_limits()), Some({ at: 0, reason: TooLong }));
   assert_eq(error_of("5a000f0000", Any, large_limits()), Some({ at: 5, reason: Truncated }))
 }
 
-test "a deterministic form reads what write emits and rejects every other encoding" {
+test "decoding with `Deterministic` accepts what `write` produces and rejects every other encoding of the same value" {
   let exact = |hex: String| error_of(hex, Deterministic, large_limits());
   let any = |hex: String| decode(Bytes::of_hex(hex), Any, large_limits()).ok();
   assert_eq(["1817", "1900ff", "1a0000ffff", "1b00000000ffffffff"].map(exact), [
@@ -1076,7 +1044,6 @@ test "a deterministic form reads what write emits and rejects every other encodi
   assert_eq(exact("fa3fc00000"), Some({ at: 0, reason: OverlongFloat }));
   assert_eq(exact("fb3ff8000000000000"), Some({ at: 0, reason: OverlongFloat }));
   assert_eq(exact("fb40f86a0000000000"), Some({ at: 0, reason: OverlongFloat }));
-  // Each of these is one bit of exponent or of fraction past what the narrower width can store.
   assert_eq(["fa47800000", "fa3f801000", "fb47f0000000000000", "fb3ff0000010000000"].map(exact), [
     None,
     None,
@@ -1101,7 +1068,7 @@ test "a deterministic form reads what write emits and rejects every other encodi
   assert(!is_deterministic(Bytes::of_hex("a202000100"), large_limits()))
 }
 
-test "the two deterministic forms order a map's keys their own ways" {
+test "`Deterministic` sorts map keys by their encoded bytes and `LengthFirst` sorts them by encoded length first, and each rejects the other's order" {
   let bytewise = "a80a011864022003617a046261610581186406812007f408";
   let length_first = "a80a012003f408186402617a048120076261610581186406";
   assert_eq(error_of(bytewise, Deterministic, large_limits()), None);

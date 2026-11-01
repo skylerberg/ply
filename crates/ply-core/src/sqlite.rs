@@ -1,13 +1,3 @@
-//! SQLite as `std.sqlite` runs it: one statement at a time, on a connection opened with settings no
-//! statement can loosen and an authorizer that keeps it inside its own database.
-//!
-//! One [`Engine`] serves both forms. Over a file it is a connection a host handler opened and
-//! holds; over an image it is [`run_over`], which opens the bytes it is handed, runs one
-//! statement and returns the bytes that leaves, so its result is a function of its arguments: no
-//! clock, no entropy, no file and no state kept between calls. The engine holds a generator of its
-//! own, and nothing a statement may do reads it: the functions that draw from it are rejected,
-//! and so is a row at the largest row id, past which it would choose the next.
-
 use rusqlite::config::DbConfig;
 use rusqlite::functions::{Context, FunctionFlags};
 use rusqlite::hooks::{Action, AuthAction, AuthContext, Authorization};
@@ -18,20 +8,14 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 
-/// The most bytes one text or blob holds, as one `fs` read returns.
 pub const MAX_VALUE_BYTES: i32 = 64 * 1024 * 1024;
 
-/// How many transactions and savepoints one connection nests: deeper is a program that recursed.
 pub const MAX_DEPTH: u32 = 32;
 
-/// The virtual-machine steps between two looks at the step budget.
-const STEP_GRAIN: i32 = 1000;
+const PROGRESS_CHECK_INTERVAL: i32 = 1000;
 
-/// What opens a rejection a guarded function raises, so it is told from the engine's own errors.
 const REJECTED: &str = "refused: ";
 
-/// The scalar, aggregate and window functions a statement may call. The list is closed: the
-/// authorizer rejects any other name wherever it is written, a view or a trigger included.
 pub const FUNCTIONS: &[&str] = &[
     "->",
     "->>",
@@ -128,8 +112,6 @@ pub const FUNCTIONS: &[&str] = &[
     "zeroblob",
 ];
 
-/// The functions the engine runs to carry out `ALTER TABLE` and `ANALYZE`. No statement can call
-/// one, and the authorizer is asked about each as the engine reaches for it.
 const INTERNAL_FUNCTIONS: &[&str] = &[
     "sqlite_rename_column",
     "sqlite_rename_table",
@@ -141,9 +123,7 @@ const INTERNAL_FUNCTIONS: &[&str] = &[
     "stat_get",
 ];
 
-/// The date and time functions, each replaced by a guard that rejects the calls that read the
-/// clock or the machine's zone and hands every other to the engine's own.
-const CLOCKED: &[&str] = &[
+const CLOCK_READING_FUNCTIONS: &[&str] = &[
     "date",
     "time",
     "datetime",
@@ -153,7 +133,6 @@ const CLOCKED: &[&str] = &[
     "timediff",
 ];
 
-/// The pragmas a statement may run, and whether each may be given a value.
 const PRAGMAS: &[(&str, bool)] = &[
     ("application_id", true),
     ("collation_list", false),
@@ -175,7 +154,6 @@ const PRAGMAS: &[(&str, bool)] = &[
     ("user_version", true),
 ];
 
-/// One value bound to a statement or read from a column.
 #[derive(Clone, Debug, PartialEq)]
 pub enum Scalar {
     Null,
@@ -208,22 +186,15 @@ impl rusqlite::ToSql for Scalar {
     }
 }
 
-/// What one statement may take and return, each a bound its caller chose.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Limits {
-    /// The statement's text, in bytes.
     pub sql_bytes: i64,
     pub params: i64,
     pub rows: i64,
-    /// The values returned, in bytes: a text's or a blob's length, eight for a number.
     pub bytes: i64,
-    /// Steps of the engine's virtual machine, counted in thousands.
     pub steps: i64,
 }
 
-/// Why a statement, a transaction step or an open did not happen. `kind` is the word
-/// `std.sqlite` reads; `name` is the constraint a violation names, the limit a `too_large` passed,
-/// or the engine's own code.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Failure {
     pub kind: &'static str,
@@ -253,19 +224,14 @@ impl Failure {
     }
 }
 
-/// What a statement returned.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Reply {
     pub columns: Vec<String>,
     pub rows: Vec<Vec<Scalar>>,
-    /// Rows the statement itself inserted, updated or deleted; a trigger's are not counted.
     pub changed: i64,
-    /// The row id of the last row the statement itself inserted, and 0 when it inserted none.
     pub last_row_id: i64,
     pub failure: Option<Failure>,
-    /// Whether the statement could have changed the database.
     pub wrote: bool,
-    /// Whether the statement is over, so no page follows this one.
     pub ended: bool,
 }
 
@@ -279,7 +245,6 @@ impl Reply {
     }
 }
 
-/// How a database file is opened.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     ReadOnly,
@@ -287,52 +252,37 @@ pub enum Mode {
     Create,
 }
 
-/// What a connection is opened with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Options {
-    /// Whether every table the connection makes must be `STRICT`.
     pub strict: bool,
-    /// How long a statement waits on another connection's lock before it returns `busy`.
     pub busy_ms: i64,
-    /// How many prepared statements the connection keeps.
     pub statements: i64,
 }
 
-/// One step of a connection's transaction.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Control {
-    /// Opens a transaction that takes the write lock at once, or a savepoint inside one.
     Begin,
-    /// Opens a transaction that reads one snapshot, or a savepoint inside one.
     BeginRead,
     Commit,
     Rollback,
 }
 
-/// What the authorizer, the progress handler and the update hook share with the engine that
-/// installed them.
 #[derive(Default)]
-struct Guard {
-    /// Set while the engine runs a statement of its own, which the authorizer lets through.
+struct SandboxState {
     internal: AtomicBool,
-    /// Why the authorizer last rejected a statement, for the failure that statement returns.
     rejected: Mutex<Option<String>>,
-    /// The steps the running statement has left.
     steps: AtomicI64,
-    /// Whether the progress handler stopped the running statement.
     spent: AtomicBool,
-    /// Whether the running statement left a row at the largest row id, past which the engine
-    /// draws row ids at random.
-    last_row_id_taken: AtomicBool,
+    left_row_at_max_row_id: AtomicBool,
 }
 
-impl Guard {
+impl SandboxState {
     fn refuse(&self, reason: String) -> Authorization {
         *self.rejected.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason);
         Authorization::Deny
     }
 
-    fn take_rejection(&self) -> Option<String> {
+    fn take_rejection_reason(&self) -> Option<String> {
         self.rejected
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -340,19 +290,15 @@ impl Guard {
     }
 }
 
-/// One open database.
 pub struct Engine {
     conn: Connection,
-    guard: Arc<Guard>,
-    /// Open transactions and savepoints, outermost first.
+    guard: Arc<SandboxState>,
     depth: u32,
     strict: bool,
-    /// Whether the file was opened to be read alone.
     read_only: bool,
 }
 
 impl Engine {
-    /// The database `image` holds, or an empty one for no bytes.
     pub fn memory(image: &[u8], strict: bool) -> Result<Engine, Failure> {
         let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
             | OpenFlags::SQLITE_OPEN_CREATE
@@ -363,7 +309,7 @@ impl Engine {
             conn.deserialize_read_exact(MAIN_DB, image, image.len(), false)
                 .map_err(unopened)?;
         }
-        let guard = Arc::new(Guard::default());
+        let guard = Arc::new(SandboxState::default());
         configure(&conn, &guard, 0).map_err(unopened)?;
         Ok(Engine {
             conn,
@@ -374,10 +320,8 @@ impl Engine {
         })
     }
 
-    /// The database a file's connection holds. The host opens the file and says how long the
-    /// connection waits on a lock, which are its to do: nothing here reads a path or a clock.
     pub fn file(conn: Connection, mode: Mode, options: Options) -> Result<Engine, Failure> {
-        let guard = Arc::new(Guard::default());
+        let guard = Arc::new(SandboxState::default());
         let statements = usize::try_from(options.statements).unwrap_or(0);
         configure(&conn, &guard, statements).map_err(unopened)?;
         let engine = Engine {
@@ -390,19 +334,15 @@ impl Engine {
         engine
             .internal(|conn| {
                 if mode != Mode::ReadOnly {
-                    // Rejected where the file cannot be written or the filesystem cannot share
-                    // memory, which leaves a rollback journal: as safe, and one writer at a time.
                     let _ = conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(()));
                 }
                 conn.execute_batch("PRAGMA cell_size_check=ON")?;
-                // The first read of the file, so one that is no database is rejected at its open.
                 conn.query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
             })
             .map_err(unopened)?;
         Ok(engine)
     }
 
-    /// The bytes of an in-memory database as a file would hold them, and none for an empty one.
     pub fn image(&self) -> Result<Vec<u8>, Failure> {
         let pages: i64 = self
             .internal(|conn| conn.query_row("PRAGMA page_count", [], |row| row.get(0)))
@@ -410,17 +350,14 @@ impl Engine {
         if pages == 0 {
             return Ok(Vec::new());
         }
-        // The engine asks the database its size through a pragma of its own.
         self.internal(|conn| conn.serialize(MAIN_DB).map(|data| data.to_vec()))
             .map_err(|e| self.failure_of(e))
     }
 
-    /// Runs one statement of the program's. `reads_only` rejects one that could write.
     pub fn run(&mut self, sql: &str, params: &[Scalar], limits: Limits, reads_only: bool) -> Reply {
         let mut pages = Vec::new();
-        self.paged(sql, params, limits, reads_only, |page| {
+        self.run_in_pages(sql, params, limits, reads_only, |page| {
             pages.push(page);
-            // One page holding every row the limits allow, then the statement's end.
             (pages.len() == 1).then_some(i64::MAX)
         });
         let mut pages = pages.into_iter();
@@ -434,11 +371,7 @@ impl Engine {
         }
     }
 
-    /// Runs one statement a page at a time. `pager` is handed what opening it returned, the
-    /// columns or a failure, and then each page; it returns how many rows the next page may hold,
-    /// or `None` to end the statement. A page shorter than was asked for is the last with rows.
-    /// `limits.rows` bounds the rows of every page together and `limits.bytes` each page.
-    pub fn paged(
+    pub fn run_in_pages(
         &mut self,
         sql: &str,
         params: &[Scalar],
@@ -450,7 +383,7 @@ impl Engine {
             pager(Reply::failed(failure));
             return;
         }
-        self.guard.take_rejection();
+        self.guard.take_rejection_reason();
         let mut stmt = match self.conn.prepare_cached(sql) {
             Ok(stmt) => stmt,
             Err(e) => {
@@ -496,8 +429,6 @@ impl Engine {
             .into_iter()
             .map(str::to_string)
             .collect();
-        // A statement that writes runs inside a savepoint, so one rejected after it ran, for what
-        // it returned or what it left, leaves nothing behind.
         let guarded = wrote;
         if guarded
             && let Err(e) = self.internal(|conn| conn.execute_batch("SAVEPOINT ply_statement"))
@@ -517,14 +448,14 @@ impl Engine {
         stmt.reset_status(StatementStatus::VmStep);
         self.guard.steps.store(limits.steps, Ordering::Relaxed);
         self.guard.spent.store(false, Ordering::Relaxed);
-        self.guard.last_row_id_taken.store(false, Ordering::Relaxed);
-        // SAFETY: the handle is this connection's, open for as long as `self.conn` is.
+        self.guard
+            .left_row_at_max_row_id
+            .store(false, Ordering::Relaxed);
         unsafe { ffi::sqlite3_set_last_insert_rowid(self.conn.handle(), 0) };
         let changes_before = self.conn.total_changes();
         let width = stmt.column_count();
         let mut rows = stmt.raw_query();
         let mut seen = 0i64;
-        // The page the statement ends in: its rows, or why it stopped.
         let last = loop {
             let mut page = Vec::new();
             let mut bytes = 0i64;
@@ -580,7 +511,7 @@ impl Engine {
         match last {
             Ok(page) => {
                 reply.rows = page;
-                reply.failure = self.left_behind(sql);
+                reply.failure = self.check_schema_and_row_ids(sql);
             }
             Err(failure) => reply.failure = Some(failure),
         }
@@ -600,11 +531,8 @@ impl Engine {
         pager(reply);
     }
 
-    /// One step of the connection's transaction. A `Begin` inside a transaction is a savepoint,
-    /// and a `Commit` or `Rollback` closes the innermost scope whatever the engine returns.
     pub fn control(&mut self, step: Control) -> Reply {
         if self.depth > 0 && self.conn.is_autocommit() {
-            // The engine rolled the whole transaction back under a failed statement.
             let scope = self.depth;
             self.depth = match step {
                 Control::Begin | Control::BeginRead => self.depth,
@@ -643,8 +571,6 @@ impl Engine {
             }
             Control::Commit | Control::Rollback => {
                 self.depth -= 1;
-                // A commit the engine rejected leaves its transaction open, and this scope is
-                // closed whatever it returned.
                 if done.is_err() && self.depth == 0 && !self.conn.is_autocommit() {
                     let _ = self.internal(|conn| conn.execute_batch("ROLLBACK"));
                 }
@@ -656,14 +582,11 @@ impl Engine {
         }
     }
 
-    /// A compacted copy of the database written to `to`, which its caller has confined and
-    /// which holds nothing yet.
     pub fn backup(&mut self, to: &Path) -> Reply {
         let Some(to) = to.to_str() else {
             return Reply::failed(Failure::rejected("the path is not UTF-8"));
         };
         let done = self.internal(|conn| {
-            // `VACUUM INTO` attaches the file it writes, and a connection attaches none otherwise.
             conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 1)?;
             let done = conn.execute("VACUUM INTO ?1", [to]);
             conn.set_limit(Limit::SQLITE_LIMIT_ATTACHED, 0)?;
@@ -685,7 +608,6 @@ impl Engine {
         if params.len() as i64 > limits.params {
             return Err(Failure::too_large("params", limits.params));
         }
-        // The one statement that writes another file and asks the authorizer nothing first.
         if first_word_is(sql, "vacuum") {
             return Err(Failure::rejected(
                 "a connection reaches its own database and no other file: `VACUUM` is rejected, and a backup is how a copy is made",
@@ -694,10 +616,8 @@ impl Engine {
         Ok(())
     }
 
-    /// What a statement that ran may not leave: a table that is not `STRICT` where the
-    /// connection requires it, or a row at the largest row id.
-    fn left_behind(&self, sql: &str) -> Option<Failure> {
-        if self.guard.last_row_id_taken.load(Ordering::Relaxed) {
+    fn check_schema_and_row_ids(&self, sql: &str) -> Option<Failure> {
+        if self.guard.left_row_at_max_row_id.load(Ordering::Relaxed) {
             return Some(Failure::rejected(format!(
                 "a row id of {} is rejected: past it the engine draws row ids at random",
                 i64::MAX
@@ -726,7 +646,6 @@ impl Engine {
         }
     }
 
-    /// Closes the savepoint a statement ran in: kept, or rolled back to.
     fn close_savepoint(&self, guarded: bool, kept: bool) -> Option<Failure> {
         if !guarded || self.conn.is_autocommit() {
             return None;
@@ -740,7 +659,6 @@ impl Engine {
             Ok(()) => None,
             Err(e) => {
                 let failure = self.failure_of(e);
-                // A release the engine rejected is a commit that did not happen.
                 if self.depth == 0 && !self.conn.is_autocommit() {
                     let _ = self.internal(|conn| conn.execute_batch("ROLLBACK"));
                 }
@@ -760,7 +678,7 @@ impl Engine {
     }
 
     fn failure_of(&self, e: rusqlite::Error) -> Failure {
-        if let Some(reason) = self.guard.take_rejection() {
+        if let Some(reason) = self.guard.take_rejection_reason() {
             return Failure::rejected(reason);
         }
         let spent = self.guard.spent.swap(false, Ordering::Relaxed);
@@ -779,10 +697,10 @@ impl Engine {
                 } else {
                     String::new()
                 };
-                by_code(error, format!("{msg}{at}"), spent)
+                failure_from_sqlite_code(error, format!("{msg}{at}"), spent)
             }
             rusqlite::Error::SqliteFailure(error, msg) => {
-                by_code(error, msg.unwrap_or_default(), spent)
+                failure_from_sqlite_code(error, msg.unwrap_or_default(), spent)
             }
             other => Failure::new("engine", "", other.to_string()),
         }
@@ -799,7 +717,6 @@ fn aborted(depth: u32) -> Failure {
     )
 }
 
-/// Why a database did not open, in the engine's own words.
 pub fn unopened(e: rusqlite::Error) -> Failure {
     let detail = match &e {
         rusqlite::Error::SqliteFailure(_, Some(msg)) => msg.clone(),
@@ -808,8 +725,7 @@ pub fn unopened(e: rusqlite::Error) -> Failure {
     Failure::new("unopened", "", detail)
 }
 
-/// The engine's result code as a failure `std.sqlite` types.
-fn by_code(error: ffi::Error, msg: String, spent: bool) -> Failure {
+fn failure_from_sqlite_code(error: ffi::Error, msg: String, spent: bool) -> Failure {
     let extended = error.extended_code;
     match extended & 0xff {
         ffi::SQLITE_BUSY | ffi::SQLITE_LOCKED => Failure::new("busy", "", msg),
@@ -858,8 +774,6 @@ fn code_name(code: i32) -> String {
     }
 }
 
-/// What a constraint failure names: `t.a, t.b` of `UNIQUE constraint failed: t.a, t.b`, a check's
-/// name or text, a strict column, and nothing for a foreign key, which the engine does not name.
 fn constraint_named(msg: &str) -> String {
     msg.split_once("failed: ")
         .or_else(|| msg.split_once(" column "))
@@ -867,7 +781,6 @@ fn constraint_named(msg: &str) -> String {
         .unwrap_or_default()
 }
 
-/// Whether `sql` opens with the keyword `word`, past its leading blanks and comments.
 fn first_word_is(sql: &str, word: &str) -> bool {
     let mut rest = sql;
     loop {
@@ -915,9 +828,11 @@ fn unreadable(e: rusqlite::Error) -> Failure {
     Failure::new("engine", "", e.to_string())
 }
 
-/// The settings every connection holds, which no statement changes: the authorizer rejects the
-/// pragmas that would.
-fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqlite::Result<()> {
+fn configure(
+    conn: &Connection,
+    guard: &Arc<SandboxState>,
+    statements: usize,
+) -> rusqlite::Result<()> {
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_DEFENSIVE, true)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_TRUSTED_SCHEMA, false)?;
     conn.set_db_config(DbConfig::SQLITE_DBCONFIG_ENABLE_FKEY, true)?;
@@ -936,9 +851,7 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
     conn.set_limit(Limit::SQLITE_LIMIT_TRIGGER_DEPTH, 32)?;
     conn.set_limit(Limit::SQLITE_LIMIT_WORKER_THREADS, 0)?;
     conn.set_prepared_statement_cache_capacity(statements);
-    for &name in CLOCKED {
-        // Innocuous, as the functions they stand in for are: a view or a trigger may call one
-        // though the schema is not trusted.
+    for &name in CLOCK_READING_FUNCTIONS {
         conn.create_scalar_function(
             name,
             -1,
@@ -960,7 +873,7 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
     }))?;
     let counting = Arc::clone(guard);
     conn.progress_handler(
-        STEP_GRAIN,
+        PROGRESS_CHECK_INTERVAL,
         Some(move || {
             if counting.internal.load(Ordering::Relaxed) {
                 return false;
@@ -976,14 +889,15 @@ fn configure(conn: &Connection, guard: &Arc<Guard>, statements: usize) -> rusqli
     conn.update_hook(Some(
         move |action: Action, _: &str, _: &str, row_id: i64| {
             if row_id == i64::MAX && action != Action::SQLITE_DELETE {
-                watching.last_row_id_taken.store(true, Ordering::Relaxed);
+                watching
+                    .left_row_at_max_row_id
+                    .store(true, Ordering::Relaxed);
             }
         },
     ))?;
     Ok(())
 }
 
-/// Why the authorizer rejects `action`, or `None` for one a statement may take.
 fn rejection(action: AuthAction<'_>) -> Option<String> {
     match action {
         AuthAction::Attach { .. } | AuthAction::Detach { .. } => Some(
@@ -1040,14 +954,9 @@ fn rejection(action: AuthAction<'_>) -> Option<String> {
 }
 
 thread_local! {
-    /// The engine's own date and time functions, on a connection that holds nothing: where a
-    /// guard sends the calls it lets through.
-    static UNGUARDED: Option<Connection> = Connection::open_in_memory().ok();
+    static EMPTY_DATE_FUNCTION_CONNECTION: Option<Connection> = Connection::open_in_memory().ok();
 }
 
-/// A date or time function, rejected where it would read the clock or the machine's zone: with no
-/// time given, with the time `now`, or with the modifier `localtime` or `utc`. Which of those a
-/// call does is decided by its values, so it is judged as it runs.
 fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::types::Value> {
     let times = match name {
         "strftime" => 1..2,
@@ -1084,7 +993,7 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
             }
         }
     }
-    UNGUARDED.with(|unguarded| {
+    EMPTY_DATE_FUNCTION_CONNECTION.with(|unguarded| {
         let Some(conn) = unguarded else {
             return refuse(format!("{REJECTED}`{name}` could not be evaluated"));
         };
@@ -1094,10 +1003,7 @@ fn clocked(name: &'static str, ctx: &Context<'_>) -> rusqlite::Result<rusqlite::
     })
 }
 
-/// One statement over the database `image` holds, a database file's bytes or none for an empty
-/// one: what it returned, and the image it left where it wrote and kept what it wrote. A function
-/// of its arguments.
-pub fn run_over(
+pub fn run_on_image(
     image: &[u8],
     sql: &str,
     params: &[Scalar],

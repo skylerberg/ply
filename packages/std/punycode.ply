@@ -1,23 +1,19 @@
-//! Punycode (RFC 3492): any text written with ASCII letters, digits and hyphens, the form the
-//! labels of an internationalized domain name take on the wire.
+//! Encodes and decodes Punycode (RFC 3492), which represents any text as only ASCII letters, digits
+//! and hyphens. Internationalized domain name labels use this form on the wire.
 //!
-//! The encoding writes the text's ASCII characters first, unchanged, then a hyphen if there were
-//! any. A run of letters and digits follows that encodes each other character and its position.
-//! `encode` writes this form in lowercase, without the `xn--` prefix a domain name label adds.
-//! `decode` reads it in either case. This module knows nothing of domain names: `std.idna` maps,
-//! checks and converts them.
+//! The encoding starts with the text's ASCII characters, unchanged, followed by a hyphen if there
+//! were any. After that come letters and digits that encode each remaining character and its
+//! position in the text. `encode` writes lowercase output, without the `xn--` prefix that a domain
+//! name label adds. `decode` accepts either case. This module knows nothing about domain names:
+//! `std.idna` maps, checks and converts them.
 
 import std.laws (round_trip)
 import std.list
 import std.gen
 
-/// The threshold for the digit at position `k`, which advances in steps of 36. A digit whose value
-/// is below it ends the number.
 fn threshold(k: Int, bias: Int) -> Int =
   if k <= bias { 1 } else if k >= bias + 26 { 26 } else { k - bias }
 
-/// The bias for the next number, adapted after a delta of `delta` with `points` characters handled
-/// (RFC 3492 section 6.1).
 fn adapt_bias(delta: Int, points: Int, first: Bool) -> Int / {abort.raise} = {
   let scaled = if first { delta / 700 } else { delta / 2 };
   bias_for_delta(scaled + scaled / points, 0)
@@ -26,12 +22,9 @@ fn adapt_bias(delta: Int, points: Int, first: Bool) -> Int / {abort.raise} = {
 fn bias_for_delta(delta: Int, k: Int) -> Int / {abort.raise} =
   if delta > 455 { bias_for_delta(delta / 35, k + 36) } else { k + 36 * delta / (delta + 38) }
 
-/// The digit whose value is `d`: `a` to `z` for 0 to 25, then `0` to `9`.
 fn digit(d: Int) -> Char =
   match Char::of_int(if d < 26 { 97 + d } else { 22 + d }) { Some(c) -> c, None -> '0' }
 
-/// `out` followed by `q`, written as a variable-length number (RFC 3492 section 3.3) whose next
-/// digit is at position `k`. `digits_left` limits the digits; a 63-bit number never reaches it.
 fn write_number(
   out: List<Char>,
   q: Int,
@@ -51,17 +44,17 @@ fn write_number(
   }
 }
 
-/// What is written so far, the smallest code point not yet handled, the delta since the last
-/// number written, the bias, and how many characters are handled.
 type EncoderState = { out: List<Char>, n: Int, delta: Int, bias: Int, handled_count: Int }
 
-/// `text` in Punycode: ASCII letters, digits and hyphens, plus any other ASCII characters `text`
-/// contains, unchanged. A nonempty all-ASCII text encodes as itself followed by a hyphen.
+/// Returns `text` encoded as Punycode. Every ASCII character of `text` is copied unchanged to the
+/// start of the result, followed by a hyphen if there is at least one. The other characters are
+/// then encoded as letters and digits. A nonempty all-ASCII `text` therefore becomes itself plus a
+/// trailing hyphen.
 pub fn encode(text: String) -> String / {abort.raise} = {
   let points = text.chars().map(Int::of_char);
   let basic = text.chars().filter(|c: Char| c < '\u{80}');
-  let others = points.fold(Map::new(), |seen: Map<Int, Unit>, cp: Int|
-    if cp < 128 { seen } else { seen.insert(cp, ()) }).keys(
+  let others = points.fold(Map::new(), |seen: Map<Int, Unit>, code_point: Int|
+    if code_point < 128 { seen } else { seen.insert(code_point, ()) }).keys(
   );
   let start = {
     out: if basic.len() > 0 { basic.push('-') } else { basic },
@@ -78,10 +71,10 @@ pub fn encode(text: String) -> String / {abort.raise} = {
       bias: e.bias,
       handled_count: e.handled_count,
     };
-    let passed = points.fold(risen, |s: EncoderState, cp: Int|
-      if cp < m {
+    let passed = points.fold(risen, |s: EncoderState, code_point: Int|
+      if code_point < m {
         { out: s.out, n: s.n, delta: s.delta + 1, bias: s.bias, handled_count: s.handled_count }
-      } else if cp == m {
+      } else if code_point == m {
         {
           out: write_number(s.out, s.delta, 36, s.bias, 20),
           n: s.n,
@@ -101,18 +94,14 @@ pub fn encode(text: String) -> String / {abort.raise} = {
   String::of_chars(done.out)
 }
 
-/// The value of a digit in either case, or `-1`.
 fn digit_value(c: Int) -> Int =
   if c >= 97 && c <= 122 { c - 97 }
   else if c >= 65 && c <= 90 { c - 65 }
   else if c >= 48 && c <= 57 { c - 22 }
   else { -1 }
 
-/// A number read: `i` plus its value, and the position just past its last digit.
 type Number = { i: Int, next: Int }
 
-/// The number whose digits start at `at`, added to `i` with weight `w`. `None` if the digits run
-/// out, a character is not a digit, or the number overflows an `Int`.
 fn read_number(digits: Array<Int>, at: Int, i: Int, w: Int, k: Int, bias: Int) -> Option<Number> =
   match digits.at(at) {
     None -> None,
@@ -136,8 +125,6 @@ fn read_number(digits: Array<Int>, at: Int, i: Int, w: Int, k: Int, bias: Int) -
     },
   }
 
-/// The text read so far as code points, the code point and place the next number counts from,
-/// the bias, and where the next number's digits start.
 type DecoderState = { out: List<Int>, n: Int, i: Int, bias: Int, next: Int }
 
 /// The text whose Punycode is `encoded`. `None` if `encoded` is not valid Punycode: it contains a
@@ -155,7 +142,8 @@ pub fn decode(encoded: String, max_length: Int) -> Option<String> / {abort.raise
         Stop(
           Some(
             String::of_chars(
-              d.out.map(|cp: Int| match Char::of_int(cp) { Some(c) -> c, None -> '\u{FFFD}' }),
+              d.out.map(|code_point: Int|
+                match Char::of_int(code_point) { Some(c) -> c, None -> '\u{FFFD}' }),
             ),
           ),
         )
@@ -183,14 +171,12 @@ pub fn decode(encoded: String, max_length: Int) -> Option<String> / {abort.raise
   }
 }
 
-// --- Properties -------------------------------------------------------------------
-
 test "a text's Punycode reads back as the text" {
   gen::check(gen::text(), |x: String|
     round_trip(encode, |encoded: String| decode(encoded, encoded.len()), x))
 }
 
-test "decoding any text returns, and its result encodes and decodes back to itself" {
+test "`decode` of any text returns `None` or a string no longer than that text, and encoding then decoding that string returns the same string" {
   gen::check(gen::text(), |text: String| {
     match decode(text, text.len()) {
       None -> true,
@@ -199,11 +185,8 @@ test "decoding any text returns, and its result encodes and decodes back to itse
   })
 }
 
-// --- Tests ------------------------------------------------------------------------
-
 type Sample = { text: String, encoded: String }
 
-/// The sample strings of RFC 3492 section 7.1 whose Punycode is in one case, and a few more.
 fn samples() -> List<Sample> =
   [
     {

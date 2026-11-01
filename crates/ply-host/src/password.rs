@@ -1,42 +1,23 @@
-//! The functions a password is hashed with, which `std.password`'s natives run.
-//!
-//! Argon2, scrypt, bcrypt and PBKDF2 are each a function of what they are handed, and each is
-//! built to take a long time, so it runs as a job of the process's computing pool while the task
-//! that asked waits. A password is copied once, for that job, into a buffer that is wiped when the
-//! hash is made.
-//!
-//! Every number that multiplies the work is bounded before a job is started: a program may perform
-//! these directly, and the parameters of a stored hash are whatever its writer chose.
-
 use ply_core::{Diagnostic, Span, codes};
 use std::num::NonZeroU32;
 use zeroize::Zeroizing;
 
-/// The most memory one Argon2 hash fills, in KiB: 2 GiB, RFC 9106's first recommended option.
 pub const MAX_MEMORY_KIB: i64 = 1 << 21;
 
-/// The most KiB one Argon2 hash fills over all its passes: 1 GiB four times.
 pub const MAX_ARGON2_WORK: i64 = 1 << 22;
 
-/// The lanes a PHC string can name.
 pub const MAX_LANES: i64 = 255;
 
-/// The most `N * r * p` of one scrypt hash, which bounds its memory at `128 * r * N` bytes too:
-/// 1 GiB filled once.
 pub const MAX_SCRYPT_WORK: i64 = 1 << 23;
 
-/// The highest bcrypt cost, each one more doubling the work.
 pub const MAX_BCRYPT_COST: i64 = 16;
 
 pub const MAX_PBKDF2_ITERATIONS: i64 = 10_000_000;
 
-/// The longest hash any of these returns, in bytes.
 pub const MAX_LENGTH: i64 = 64;
 
-/// The bytes of a password bcrypt reads, its terminating zero among them.
 pub const BCRYPT_KEY_BYTES: usize = 72;
 
-/// One hash to make, checked against the bounds, holding its own copy of everything it reads.
 pub struct Work(Kind);
 
 enum Kind {
@@ -68,12 +49,6 @@ enum Kind {
     },
 }
 
-/// Argon2 version 1.3 as RFC 9106 defines it: `variant` is `argon2d`, `argon2i` or `argon2id`,
-/// `key` and `data` its optional secret and associated data, `memory` in KiB.
-///
-/// # Errors
-/// What was asked that the algorithm does not define or that is past a bound of this module,
-/// before anything is computed.
 #[allow(clippy::too_many_arguments)]
 pub fn argon2(
     variant: &str,
@@ -92,10 +67,6 @@ pub fn argon2(
     .run()
 }
 
-/// scrypt as RFC 7914 defines it, with `N = 2^log_n`.
-///
-/// # Errors
-/// As [`argon2`].
 pub fn scrypt(
     password: &[u8],
     salt: &[u8],
@@ -107,19 +78,10 @@ pub fn scrypt(
     Work::scrypt(password, salt, log_n, r, p, length)?.run()
 }
 
-/// The twenty-three bytes a bcrypt hash string carries, for a sixteen-byte salt. The key is the
-/// password and a terminating zero, cut to [`BCRYPT_KEY_BYTES`], which is how `$2b$` reads one.
-///
-/// # Errors
-/// As [`argon2`].
 pub fn bcrypt(password: &[u8], salt: &[u8], cost: i64) -> Result<Vec<u8>, String> {
     Work::bcrypt(password, salt, cost)?.run()
 }
 
-/// PBKDF2 under HMAC with the hash FIPS 180 names `hash`.
-///
-/// # Errors
-/// As [`argon2`].
 pub fn pbkdf2(
     hash: &str,
     password: &[u8],
@@ -131,10 +93,6 @@ pub fn pbkdf2(
 }
 
 impl Work {
-    /// What [`argon2`] would compute, checked and not yet computed.
-    ///
-    /// # Errors
-    /// As [`argon2`].
     #[allow(clippy::too_many_arguments)]
     pub fn argon2(
         variant: &str,
@@ -179,7 +137,7 @@ impl Work {
                 "{passes} passes over {memory} KiB, and one hash fills at most {MAX_ARGON2_WORK} KiB over all its passes"
             ));
         }
-        let length = length_in(length, argon2::Params::MIN_OUTPUT_LEN)?;
+        let length = checked_length(length, argon2::Params::MIN_OUTPUT_LEN)?;
         if salt.len() < argon2::MIN_SALT_LEN {
             return Err(format!(
                 "a salt of {} bytes, and Argon2 takes at least {}",
@@ -211,10 +169,6 @@ impl Work {
         }))
     }
 
-    /// What [`scrypt`] would compute, checked and not yet computed.
-    ///
-    /// # Errors
-    /// As [`argon2`].
     pub fn scrypt(
         password: &[u8],
         salt: &[u8],
@@ -236,7 +190,7 @@ impl Work {
                 "N = 2^{log_n}, r = {r} and p = {p}, and their product is at most {MAX_SCRYPT_WORK}"
             ));
         }
-        let length = length_in(length, 1)?;
+        let length = checked_length(length, 1)?;
         let log_n = u8::try_from(log_n).map_err(|e| e.to_string())?;
         let params = scrypt::Params::new(log_n, narrow(r)?, narrow(p)?)
             .map_err(|_| "parameters scrypt does not define".to_string())?;
@@ -248,10 +202,6 @@ impl Work {
         }))
     }
 
-    /// What [`bcrypt`] would compute, checked and not yet computed.
-    ///
-    /// # Errors
-    /// As [`argon2`].
     pub fn bcrypt(password: &[u8], salt: &[u8], cost: i64) -> Result<Work, String> {
         if !(4..=MAX_BCRYPT_COST).contains(&cost) {
             return Err(format!(
@@ -276,10 +226,6 @@ impl Work {
         }))
     }
 
-    /// What [`pbkdf2`] would compute, checked and not yet computed.
-    ///
-    /// # Errors
-    /// As [`argon2`].
     pub fn pbkdf2(
         hash: &str,
         password: &[u8],
@@ -311,14 +257,10 @@ impl Work {
             iterations,
             password: Zeroizing::new(password.to_vec()),
             salt: salt.to_vec(),
-            length: length_in(length, 1)?,
+            length: checked_length(length, 1)?,
         }))
     }
 
-    /// The hash, on the thread that calls this.
-    ///
-    /// # Errors
-    /// The memory the hash fills could not be had.
     pub fn run(self) -> Result<Vec<u8>, String> {
         match self.0 {
             Kind::Argon2 {
@@ -359,7 +301,6 @@ impl Work {
                     state.bc_expand_key(&key);
                     state.bc_expand_key(&salt);
                 }
-                // "OrpheanBeholderScryDoubt", which bcrypt encrypts sixty-four times.
                 let mut text: [u32; 6] = [
                     0x4f72_7068,
                     0x6561_6e42,
@@ -376,7 +317,6 @@ impl Work {
                     }
                 }
                 let mut tag: Vec<u8> = text.iter().flat_map(|word| word.to_be_bytes()).collect();
-                // The hash string has room for twenty-three of the twenty-four.
                 tag.truncate(23);
                 Ok(tag)
             }
@@ -395,7 +335,7 @@ impl Work {
     }
 }
 
-fn length_in(length: i64, least: usize) -> Result<usize, String> {
+fn checked_length(length: i64, least: usize) -> Result<usize, String> {
     usize::try_from(length)
         .ok()
         .filter(|n| *n >= least && length <= MAX_LENGTH)
@@ -406,7 +346,6 @@ fn narrow(n: i64) -> Result<u32, String> {
     u32::try_from(n).map_err(|_| format!("{n}, which no parameter of a hash reaches"))
 }
 
-/// The rejection of `what` (`kdf.argon2`, ..) for `reason`, which ends the run where it was asked.
 #[cold]
 pub fn rejected(what: &str, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(

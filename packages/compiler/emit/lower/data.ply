@@ -5,11 +5,11 @@ import compiler.emit.representations (Constructors, SumConstructor, open_variabl
 import compiler.emit.c (sorted_names)
 import compiler.emit.output (Layout)
 import compiler.emit.layout (SumLayout, Boxed, words, tag_bits)
-import compiler.emit.typed_ir (Representation, AsWord, AsFlattened, AsSum, AsUnit, Leaf, Var, Arg,
-                               VarOperand, IntOperand, ZeroOperand, Allocate, CaseAllocation,
-                               RecordAllocation, FromArgument, Get, Aggregate, Update, FieldWrite,
-                               LeafPath, FieldPath, InlineRecordPath, operand_representation,
-                               read_only, takes_except_records)
+import compiler.emit.typed_ir (Representation, AsWord, AsFlattened, AsSum, AsUnit, Leaf, Variable,
+                               Arg, VariableOperand, IntOperand, ZeroOperand, Allocate,
+                               CaseAllocation, RecordAllocation, FromArgument, Get, Aggregate,
+                               Update, FieldWrite, LeafPath, FieldPath, InlineRecordPath,
+                               operand_representation, read_only, takes_except_records)
 import compiler.emit.lower.module_context (constructor_sum)
 import compiler.emit.lower.representation (representation_of, leaf_spans, leaves_within, field_type,
                                            field_offsets, case_index, leaf_type, layout_leaves,
@@ -35,18 +35,25 @@ pub fn constructed_as(
   ty: Type,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
-  let ctor = name;
+  let constructor = name;
   {
     let r = representation_of(context.setting, ty);
     match r {
-      AsSum(s) -> match case_index(r, ctor) {
+      AsSum(s) -> match case_index(r, constructor) {
         Some(i) -> case_value(context, st, ty, s, i, args, at),
-        None -> unreachable(b"a constructor its sum's cases do not contain: ".concat(ctor)),
+        None ->
+          unreachable(
+            b"a constructor is not one of the cases of its sum type: ".concat(constructor),
+          ),
       },
       AsUnit -> { st: st, arg: ZeroOperand(AsUnit) },
       _ -> if open_variables(context.setting.constructors, ty) == [] {
-        unreachable(b"a constructor at a type no declared sum or variable lays out: ".concat(ctor))
-      } else { open_layout_constructed(context, st, ty, ctor, args, at) },
+        unreachable(
+          b"a constructor is used at a type that is neither a declared sum type nor a type variable: ".concat(
+            constructor,
+          ),
+        )
+      } else { open_layout_constructed(context, st, ty, constructor, args, at) },
     }
   }
 }
@@ -55,13 +62,13 @@ fn open_layout_constructed(
   context: Context,
   st: Lowering,
   ty: Type,
-  ctor: Bytes,
+  constructor: Bytes,
   args: List<Arg>,
   at: Span,
 ) -> LoweredValue = {
-  let sum = constructor_sum(context.setting, ctor);
+  let sum = constructor_sum(context.setting, constructor);
   let i = match sum { Some(x) -> x.index, None -> 0 };
-  let held = all_represented_as(
+  let converted = all_represented_as(
     note_open_layouts(context, st, ty),
     args.map(|a: Arg| { arg: a, to: AsWord }),
     at,
@@ -73,13 +80,13 @@ fn open_layout_constructed(
       _ -> false,
     });
   bound_as(
-    held.st,
+    converted.st,
     ty,
     AsWord,
-    if inline { Aggregate({ parts: [IntOperand(i)].concat(held.args) }) } else {
+    if inline { Aggregate({ parts: [IntOperand(i)].concat(converted.args) }) } else {
       Allocate({
         made: CaseAllocation({ case: i, skip: 0, words: args.len() }),
-        args: held.args,
+        args: converted.args,
         reuse: None,
       })
     },
@@ -113,15 +120,19 @@ fn case_value(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let cps = case_parts(context.setting.constructors, ty, i);
-  if cps.len() != args.len() { unreachable(b"a constructor applied to other than its arguments") }
-  else {
-    let held = all_represented_as(
+  if cps.len() != args.len() {
+    unreachable(b"a constructor is applied to a different number of arguments than it takes")
+  } else {
+    let converted = all_represented_as(
       st,
-      range(0, args.len()).fold([], |acc: List<{ arg: Arg, to: Representation }>, k: Int|
-        match ((args.at(k), cps.at(k))) {
-          (Some(a), Some(cp)) -> acc.push({ arg: a, to: cp.representation }),
-          _ -> acc,
-        }),
+      range(0, args.len()).fold(
+        [],
+        |accumulator: List<{ arg: Arg, to: Representation }>, k: Int|
+          match ((args.at(k), cps.at(k))) {
+            (Some(a), Some(part)) -> accumulator.push({ arg: a, to: part.representation }),
+            _ -> accumulator,
+          },
+      ),
       at,
     );
     let r = AsSum(s);
@@ -129,21 +140,28 @@ fn case_value(
       Some(c) -> match c.payload {
         Boxed(b) -> {
           let boxed = bound_as(
-            held.st,
+            converted.st,
             ty,
             AsWord,
             Allocate({
               made: CaseAllocation({ case: i, skip: b.skip, words: words(b.layout) }),
-              args: held.args,
+              args: converted.args,
               reuse: None,
             }),
             at,
           );
           bound_as(boxed.st, ty, r, Aggregate({ parts: [IntOperand(i), boxed.arg] }), at)
         },
-        _ -> bound_as(held.st, ty, r, Aggregate({ parts: [IntOperand(i)].concat(held.args) }), at),
+        _ ->
+          bound_as(
+            converted.st,
+            ty,
+            r,
+            Aggregate({ parts: [IntOperand(i)].concat(converted.args) }),
+            at,
+          ),
       },
-      None -> unreachable(b"a case its sum's layout does not contain"),
+      None -> unreachable(b"a case is missing from the memory layout of its sum type"),
     }
   }
 }
@@ -155,9 +173,9 @@ fn all_represented_as(
 ) -> { st: Lowering, args: List<Arg> } =
   xs.fold(
     { st: st, args: [] },
-    |acc: { st: Lowering, args: List<Arg> }, x: { arg: Arg, to: Representation }| {
-      let h = represented_as({ st: acc.st, arg: x.arg }, x.to, at);
-      { st: h.st, args: acc.args.push(h.arg) }
+    |accumulator: { st: Lowering, args: List<Arg> }, x: { arg: Arg, to: Representation }| {
+      let h = represented_as({ st: accumulator.st, arg: x.arg }, x.to, at);
+      { st: h.st, args: accumulator.args.push(h.arg) }
     },
   )
 
@@ -177,31 +195,33 @@ pub fn record_literal_as(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let value = |name: Bytes|
-    fields.fold(None, |acc: Option<Arg>, f: { name: Bytes, arg: Arg }|
-      if f.name == name { Some(f.arg) } else { acc });
+    fields.fold(None, |accumulator: Option<Arg>, f: { name: Bytes, arg: Arg }|
+      if f.name == name { Some(f.arg) } else { accumulator });
   let rep = representation_of(context.setting, ty);
   if rep == AsUnit { { st: st, arg: ZeroOperand(AsUnit) } } else {
     match layout_leaves(context.setting.constructors, ty) {
       Some(ls) -> {
         let given = record_parts(context.setting.constructors, ty).fold(
           { xs: [], missing: false },
-          |acc: { xs: List<{ arg: Arg, to: Representation }>, missing: Bool }, p: RecordPart|
+          |accumulator: { xs: List<{ arg: Arg, to: Representation }>, missing: Bool }, p: RecordPart|
             match value(p.name) {
-              Some(a) -> { ..acc, xs: acc.xs.push({ arg: a, to: p.representation }) },
-              None -> { ..acc, missing: true },
+              Some(a) ->
+                { ..accumulator, xs: accumulator.xs.push({ arg: a, to: p.representation }) },
+              None -> { ..accumulator, missing: true },
             },
         );
-        if given.missing { unreachable(b"a record literal missing a field its type holds") } else {
+        if given.missing { unreachable(b"a record literal omits a field that its type declares") }
+        else {
           let parts = all_represented_as(st, given.xs, at);
           record_built(parts.st, ty, ls, rep, parts.args, at)
         }
       },
       None -> {
         let names = names_of(ty, fields.map(|f: { name: Bytes, arg: Arg }| f.name));
-        let given = names.fold([], |acc: List<Arg>, n: Bytes|
-          match value(n) { Some(a) -> acc.push(a), None -> acc });
+        let given = names.fold([], |accumulator: List<Arg>, n: Bytes|
+          match value(n) { Some(a) -> accumulator.push(a), None -> accumulator });
         if given.len() != names.len() {
-          unreachable(b"a record literal missing a field its type holds")
+          unreachable(b"a record literal omits a field that its type declares")
         } else {
           deferred_to_specialisation(
             note_open_layouts(context, st, ty),
@@ -263,9 +283,12 @@ pub fn field(
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let lies = match base.arg {
-    VarOperand(b) -> match ((b.representation, layout_leaves(context.setting.constructors, b.ty))) {
+    VariableOperand(b) -> match ((
+        b.representation,
+        layout_leaves(context.setting.constructors, b.ty),
+      )) {
       (AsWord, Some(ls)) -> match packed_from(base.st, b, AsFlattened(ls)) {
-        Some(s) -> { st: base.st, arg: VarOperand(s) },
+        Some(s) -> { st: base.st, arg: VariableOperand(s) },
         None -> base,
       },
       _ -> base,
@@ -273,7 +296,7 @@ pub fn field(
     _ -> base,
   };
   match lies.arg {
-    VarOperand(b) -> {
+    VariableOperand(b) -> {
       let fty = match field_type(b.ty, name) { Some(t) -> t, None -> unknown_type() };
       match read_field(
           context,
@@ -285,12 +308,13 @@ pub fn field(
           representation_of(context.setting, fty),
           at,
         ) {
-        None -> unreachable(b"a field its record does not contain: ".concat(name)),
+        None ->
+          unreachable(b"a field access names a field that the record does not have: ".concat(name)),
         Some(r) -> r,
       }
     },
     ZeroOperand(AsUnit) -> { st: lies.st, arg: ZeroOperand(AsUnit) },
-    _ -> unreachable(b"a field of a value that is no record: ".concat(name)),
+    _ -> unreachable(b"a field access on a value that is not a record: ".concat(name)),
   }
 }
 
@@ -300,7 +324,7 @@ type FieldLayout =
   | Empty
   | Open
 
-fn field_layout(context: Context, b: Var) -> FieldLayout =
+fn field_layout(context: Context, b: Variable) -> FieldLayout =
   match b.representation {
     AsFlattened(ls) -> Spans({ leaves: ls, of: leaf_spans(ls) }),
     AsUnit -> Empty,
@@ -313,7 +337,7 @@ fn field_layout(context: Context, b: Var) -> FieldLayout =
 fn read_field(
   context: Context,
   st: Lowering,
-  b: Var,
+  b: Variable,
   lay: FieldLayout,
   name: Bytes,
   fty: Type,
@@ -327,7 +351,8 @@ fn read_field(
     match lay {
       Spans(s) -> match s.of.get(name) {
         None -> None,
-        Some(sp) -> Some(as_wanted(leaves_read(st, b, s.leaves, sp, fty, nested != None, at))),
+        Some(leaf_range) ->
+          Some(as_wanted(leaves_read(st, b, s.leaves, leaf_range, fty, nested != None, at))),
       },
       Offsets(offsets) -> match offsets.get(name) {
         None -> None,
@@ -348,7 +373,7 @@ fn read_field(
             note_open_layouts(context, st, b.ty),
             fty,
             want,
-            read_only([VarOperand(b)]),
+            read_only([VariableOperand(b)]),
             at,
           ),
         ),
@@ -357,26 +382,29 @@ fn read_field(
 
 fn leaves_read(
   st: Lowering,
-  b: Var,
+  b: Variable,
   ls: List<Leaf>,
-  sp: { at: Int, n: Int },
+  leaf_range: { at: Int, n: Int },
   fty: Type,
   record: Bool,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let one = |s: Lowering, k: Int, ty: Type|
     bound_as(s, ty, leaf_representation(ls, k), Get({ of: b, path: LeafPath(k) }), at);
-  if !record { one(st, sp.at, fty) } else {
-    let inner = leaves_within(ls, sp);
+  if !record { one(st, leaf_range.at, fty) } else {
+    let inner = leaves_within(ls, leaf_range);
     let read = range(0, inner.len()).fold(
       { st: st, parts: [] },
-      |acc: { st: Lowering, parts: List<Arg> }, j: Int| {
+      |accumulator: { st: Lowering, parts: List<Arg> }, j: Int| {
         let name = match inner.at(j) { Some(l) -> l.name, None -> b"" };
         let g = match leaf_type(fty, name) {
-          Some(t) -> one(acc.st, sp.at + j, t),
-          None -> unreachable(b"a leaf its record's type does not contain: ".concat(name)),
+          Some(t) -> one(accumulator.st, leaf_range.at + j, t),
+          None ->
+            unreachable(
+              b"a field access names a field that the record type does not have: ".concat(name),
+            ),
         };
-        { st: g.st, parts: acc.parts.push(g.arg) }
+        { st: g.st, parts: accumulator.parts.push(g.arg) }
       },
     );
     bound_as(read.st, fty, AsFlattened(inner), Aggregate({ parts: read.parts }), at)
@@ -396,32 +424,35 @@ pub fn record_update(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match base {
-    VarOperand(b) -> {
+    VariableOperand(b) -> {
       let rep = representation_of(context.setting, ty);
       if rep == AsUnit { { st: st, arg: ZeroOperand(AsUnit) } } else {
         match layout_leaves(context.setting.constructors, ty) {
           Some(ls) -> {
             let given = sets.fold(Map::new(), |m: Map<Bytes, Arg>, f: { name: Bytes, arg: Arg }|
               m.insert(f.name, f.arg));
-            let kept = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true));
+            let copied_names = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes|
+              m.insert(n, true));
             let lay = field_layout(context, b);
             let parts_of_type = record_parts(context.setting.constructors, ty);
             let in_place = rep == AsWord && b.representation == AsWord
               && record_fields(b.ty) == record_fields(ty)
-              && parts_of_type.all(|p: RecordPart| given.contains(p.name) || kept.contains(p.name));
+              && parts_of_type.all(|p: RecordPart|
+                given.contains(p.name) || copied_names.contains(p.name));
             if in_place { box_fields_written(context, st, b, ty, sets, at) } else {
               let parts = parts_of_type.fold(
                 { st: st, parts: [], missing: false },
-                |acc: { st: Lowering, parts: List<Arg>, missing: Bool }, p: RecordPart| {
+                |accumulator: { st: Lowering, parts: List<Arg>, missing: Bool }, p: RecordPart| {
                   match given.get(p.name) {
                     Some(a) -> {
-                      let h = represented_as({ st: acc.st, arg: a }, p.representation, at);
-                      { ..acc, st: h.st, parts: acc.parts.push(h.arg) }
+                      let h = represented_as({ st: accumulator.st, arg: a }, p.representation, at);
+                      { ..accumulator, st: h.st, parts: accumulator.parts.push(h.arg) }
                     },
-                    None -> if !kept.contains(p.name) { { ..acc, missing: true } } else {
+                    None -> if !copied_names.contains(p.name) { { ..accumulator, missing: true } }
+                    else {
                       match read_field(
                           context,
-                          acc.st,
+                          accumulator.st,
                           b,
                           lay,
                           p.name,
@@ -429,8 +460,9 @@ pub fn record_update(
                           p.representation,
                           at,
                         ) {
-                        None -> { ..acc, missing: true },
-                        Some(r) -> { ..acc, st: r.st, parts: acc.parts.push(r.arg) },
+                        None -> { ..accumulator, missing: true },
+                        Some(r) ->
+                          { ..accumulator, st: r.st, parts: accumulator.parts.push(r.arg) },
                       }
                     },
                   }
@@ -438,7 +470,7 @@ pub fn record_update(
               );
               if parts.missing {
                 unreachable(
-                  b"an update of a field its base does not contain where its type lays it",
+                  b"a record update sets a field that the base record does not have in its memory layout",
                 )
               } else { record_built(parts.st, ty, ls, rep, parts.parts, at) }
             }
@@ -448,7 +480,7 @@ pub fn record_update(
               note_open_layouts(context, note_open_layouts(context, st, b.ty), ty),
               ty,
               AsWord,
-              [{ arg: VarOperand(b), takes: true }].concat(
+              [{ arg: VariableOperand(b), takes: true }].concat(
                 takes_except_records(sets.map(|f: { name: Bytes, arg: Arg }| f.arg)),
               ),
               at,
@@ -456,13 +488,13 @@ pub fn record_update(
         }
       }
     },
-    _ -> unreachable(b"an update of a value that is no record"),
+    _ -> unreachable(b"a record update on a value that is not a record"),
   }
 
 fn box_fields_written(
   context: Context,
   st: Lowering,
-  b: Var,
+  b: Variable,
   ty: Type,
   sets: List<{ name: Bytes, arg: Arg }>,
   at: Span,
@@ -470,15 +502,15 @@ fn box_fields_written(
   let offsets = field_offsets(context.setting, ty);
   let written = sets.fold(
     { st: st, sets: [] },
-    |acc: { st: Lowering, sets: List<FieldWrite> }, f: { name: Bytes, arg: Arg }| {
+    |accumulator: { st: Lowering, sets: List<FieldWrite> }, f: { name: Bytes, arg: Arg }| {
       let fty = match field_type(ty, f.name) { Some(t) -> t, None -> unknown_type() };
       let laid = representation_of(context.setting, fty);
       match offsets.get(f.name) {
-        Some(o) -> if laid == AsUnit { acc } else {
-          let h = represented_as({ st: acc.st, arg: f.arg }, laid, at);
-          { st: h.st, sets: acc.sets.push({ at: o, ty: fty, arg: h.arg }) }
+        Some(o) -> if laid == AsUnit { accumulator } else {
+          let h = represented_as({ st: accumulator.st, arg: f.arg }, laid, at);
+          { st: h.st, sets: accumulator.sets.push({ at: o, ty: fty, arg: h.arg }) }
         },
-        None -> acc,
+        None -> accumulator,
       }
     },
   );

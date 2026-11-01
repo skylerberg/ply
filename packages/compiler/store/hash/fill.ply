@@ -111,7 +111,8 @@ fn level_of(runs: Runs, spot: BinderPosition) -> Int / {abort.raise} =
   if spot.run < 0 { spot.within } else {
     match runs.get(spot.run) {
       Some(placed) -> placed.base + placed.offsets.get(spot.member) + spot.within,
-      None -> panic("a level names a run not written"),
+      None ->
+        panic("a binder refers to a group of unordered statements that has no recorded offsets"),
     }
   }
 
@@ -132,7 +133,10 @@ effect resolution_log {
 fn record_resolution(note: Note) -> Unit / {resolution_log.record, abort.raise} =
   match note {
     CallNote(chosen) -> resolution_log.record(chosen),
-    RunNote(_) -> panic("a call on a value noted as a run"),
+    RunNote(_) ->
+      panic(
+        "cannot record a call's resolution: the note marks a group of unordered statements, not a call",
+      ),
   }
 
 fn without_resolutions<a>(
@@ -170,12 +174,12 @@ fn sort_effects_in(
     Applied(name, written, arguments) -> Applied(name, written, arguments.map(sort_effects_in)),
     AppliedOver(name, written, arguments, labels, rows) ->
       AppliedOver(name, written, arguments.map(sort_effects_in), labels, rows.map(sort_effects)),
-    Function(parameters, returned, effects, kept, once) ->
+    Function(parameters, returned, effects, retention, once) ->
       Function(
         parameters.map(sort_effects_in),
         sort_effects_in(returned),
         effects.map(sort_effects),
-        kept,
+        retention,
         once,
       ),
     Fields(fields) ->
@@ -194,12 +198,12 @@ fn sort_effects(effects: Effects<Reference, Int>) -> Effects<Reference, Int> / {
     { key: bin::encode(entry, codec), entry: entry });
   let sorted = keyed.sort_by(|first: KeyedEffect, second: KeyedEffect|
     match compare_values(first.key, second.key) { Greater -> false, _ -> true });
-  let kept = sorted.fold([], |acc: List<KeyedEffect>, next: KeyedEffect|
-    match acc.last() {
-      Some(previous) -> if previous.key == next.key { acc } else { acc.push(next) },
-      None -> acc.push(next),
+  let distinct = sorted.fold([], |accumulator: List<KeyedEffect>, next: KeyedEffect|
+    match accumulator.last() {
+      Some(previous) -> if previous.key == next.key { accumulator } else { accumulator.push(next) },
+      None -> accumulator.push(next),
     });
-  { ..effects, listed: kept.map(|each: KeyedEffect| each.entry) }
+  { ..effects, listed: distinct.map(|each: KeyedEffect| each.entry) }
 }
 
 type Scope = { filling: Substitution, runs: Runs }
@@ -364,18 +368,23 @@ fn expression(
     Block(entries, tail) -> {
       let written = entries.fold(
         { runs: scope.runs, entries: [] },
-        |acc: { runs: Runs, entries: List<stored::Entry<Reference, Int, Int, Unit>> }, entry: stored::Entry<Int, EffectSlot, BinderPosition, Note>|
+        |accumulator: { runs: Runs, entries: List<stored::Entry<Reference, Int, Int, Unit>> }, entry: stored::Entry<Int, EffectSlot, BinderPosition, Note>|
           match entry {
             One(alone) ->
               {
-                runs: acc.runs,
-                entries: acc.entries.push(One(statement({ ..scope, runs: acc.runs }, alone))),
+                runs: accumulator.runs,
+                entries: accumulator.entries.push(
+                  One(statement({ ..scope, runs: accumulator.runs }, alone)),
+                ),
               },
             Commuting(RunNote(at), members) -> {
-              let placed = run({ ..scope, runs: acc.runs }, at, members);
-              { runs: placed.runs, entries: acc.entries.push(placed.entry) }
+              let placed = run({ ..scope, runs: accumulator.runs }, at, members);
+              { runs: placed.runs, entries: accumulator.entries.push(placed.entry) }
             },
-            Commuting(CallNote(_), _) -> panic("a run noted as a pick"),
+            Commuting(CallNote(_), _) ->
+              panic(
+                "a group of unordered statements has a call's note where the note for a group is required",
+              ),
           },
       );
       Block(written.entries, optional_expression({ ..scope, runs: written.runs }, tail))
@@ -405,8 +414,11 @@ fn run(
     });
   let offsets = order.fold(
     { next: 0, offsets: range(0, count).map(|_: Int| 0) },
-    |acc: { next: Int, offsets: List<Int> }, member: Int|
-      { next: acc.next + at.binders.get(member), offsets: acc.offsets.set(member, acc.next) },
+    |accumulator: { next: Int, offsets: List<Int> }, member: Int|
+      {
+        next: accumulator.next + at.binders.get(member),
+        offsets: accumulator.offsets.set(member, accumulator.next),
+      },
   ).offsets;
   let runs = scope.runs.insert(at.id, { base: base, offsets: offsets });
   {
@@ -449,7 +461,7 @@ fn form(
         parameters: function.parameters.map(
           |parameter: stored::Parameter<Int, EffectSlot, BinderPosition, Note>|
             {
-              kept: parameter.kept,
+              retained: parameter.retained,
               spaced: parameter.spaced,
               annotation: optional_type(scope, parameter.annotation),
               default: optional_expression(scope, parameter.default),
@@ -498,7 +510,7 @@ fn form(
             resource: operation.resource,
             types: operation.types,
             parameters: operation.parameters.map(type_filled),
-            kept: operation.kept,
+            retained_parameters: operation.retained_parameters,
             returned: type_filled(operation.returned),
           }),
         host_function: declared.host_function.map(|by: Value<Int, BinderPosition>|

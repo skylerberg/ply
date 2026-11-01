@@ -1,6 +1,3 @@
-//! What emitted code asks of the runtime to read a constant: keep a copy for good, and end the run
-//! on a raise that left a constant's value. The scheduler's own blocks are here too.
-
 use crate::bare::{context_of, helper};
 use ply_compiled::heap::{HEADER, IMMORTAL, Word};
 use ply_compiled::rt::{Ctx, FAILED};
@@ -12,7 +9,6 @@ type Keep = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type ConstFailed = unsafe extern "C" fn(*mut Ctx);
 type Definition = unsafe extern "C" fn(*mut Ctx, *const Word) -> Word;
 
-/// A value of `m.Box`: a block of one word, the number it holds.
 const BOX: Word = HEADER as Word + 8;
 
 fn boxed(ctx: *mut Ctx, n: Word) -> Word {
@@ -25,14 +21,12 @@ fn count(w: Word) -> u32 {
     unsafe { *(w as *const u32) }
 }
 
-/// Lets go of a box the caller holds the last count of; a kept one is immortal, and nothing frees it.
 fn let_go(ctx: *mut Ctx, w: Word) {
     if count(w) != IMMORTAL {
         unsafe { helper::<Free>("rt_free")(ctx, w, BOX) };
     }
 }
 
-/// A context over a unit of the one definition `f`.
 fn defining(f: Definition) -> Ctx {
     let mut ctx = context_of(&[], vec![f as usize]);
     ctx.begin();
@@ -73,7 +67,7 @@ type Entered = unsafe extern "C" fn(*mut Ctx) -> Word;
 type Left = unsafe extern "C" fn(*mut Ctx, Word);
 
 #[test]
-fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
+fn the_scheduler_blocks_stay_separate_from_the_program_blocks_at_any_nesting_depth() {
     let mut ctx = context_of(&[], Vec::new());
     ctx.begin();
     let c: *mut Ctx = &mut ctx;
@@ -101,7 +95,6 @@ fn the_schedulers_own_blocks_are_not_the_programs_however_it_nests() {
     ctx.end();
 }
 
-/// A failure compiled code wrote, left pending as a raise of `abort.raise`.
 unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
     let raised: unsafe extern "C" fn(*mut Ctx, Word, *const Word, Word, Word) = helper("rt_failed");
     let texts = [b"E0502".as_slice(), b"it failed", b"here"];
@@ -114,7 +107,7 @@ unsafe extern "C" fn failing(ctx: *mut Ctx, _args: *const Word) -> Word {
 }
 
 #[test]
-fn a_raise_that_leaves_a_constant_fails_the_entry_with_nothing_left_for_a_handler() {
+fn an_effect_raised_inside_a_constant_fails_the_run_with_an_error_that_no_handler_can_catch() {
     let mut ctx = defining(nothing);
     let c: *mut Ctx = &mut ctx;
     assert_eq!(unsafe { failing(c, std::ptr::null()) }, 0);

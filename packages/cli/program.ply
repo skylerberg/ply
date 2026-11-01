@@ -13,7 +13,7 @@ import compiler.front.facts (Analysis, ShippedModuleSummary, CheckedProgram, Fra
 import compiler.front (PulledAnalysis, ShippedInputs, analyse_pulling_std_with, locked_packages,
                        resolved_with_shipped)
 import compiler.check.resolve.defaults (ResolvedProgram)
-import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FnOutline,
+import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, FunctionOutline,
                             KnownDefinitionRow, KnownTestRow, ModuleDerivations)
 import compiler.front.published (dump_of, no_rows)
 import compiler.front.pkg (PackageSources, LockedPackage, SuppliedPackage, closure)
@@ -69,7 +69,7 @@ pub type Program = {
   shipped_views: List<ShippedModuleSummary>,
   tallies: List<QueryStats>,
   missing_results: Int,
-  asked: List<Dependency>,
+  requested_dependencies: List<Dependency>,
   looked_up: List<Dependency>,
 }
 
@@ -92,8 +92,8 @@ pub type TimedLoad = {
 }
 
 fn without_first(segments: List<String>) -> List<String> =
-  range(1, segments.len()).fold([], |acc: List<String>, i: Int|
-    match segments.at(i) { Some(s) -> acc.push(s), None -> acc })
+  range(1, segments.len()).fold([], |accumulator: List<String>, i: Int|
+    match segments.at(i) { Some(s) -> accumulator.push(s), None -> accumulator })
 
 pub fn pseudo_path(name: String) -> String = {
   let segments = name.split(".");
@@ -131,7 +131,7 @@ fn failed_program(
     shipped_views: [],
     tallies: [],
     missing_results: 0,
-    asked: [],
+    requested_dependencies: [],
     looked_up: [],
   }
 
@@ -150,12 +150,12 @@ pub fn no_program() -> Program =
     packages: { root: b"", manifest: None, supplied: [] },
     embeds: [],
     inputs: Map::new(),
-    shipping: { sources: [], unread: [], data: [], asked: [], dependencies: [] },
+    shipping: { sources: [], unread: [], data: [], required_modules: [], dependencies: [] },
     prune_unreached: true,
     shipped_views: [],
     tallies: [],
     missing_results: 0,
-    asked: [],
+    requested_dependencies: [],
     looked_up: [],
   }
 
@@ -175,34 +175,35 @@ fn supplied(project: Project) -> List<SuppliedPackage> =
       root: Bytes::of_string(package.root),
       manifest: package.manifest,
       modules: package.files.map(|file: File|
-        { name: Bytes::of_string(file.module), src: file.text }),
+        { name: Bytes::of_string(file.module), source_text: file.text }),
     })
 
 fn read_paths(project: Project) -> List<paths::RootedPath> =
   project.files.map(|file: File| file.at).concat(
-    project.packages.fold([], |acc: List<paths::RootedPath>, package: DependencyPackage|
-      acc.concat(package.files.map(|file: File| file.at))),
+    project.packages.fold([], |accumulator: List<paths::RootedPath>, package: DependencyPackage|
+      accumulator.concat(package.files.map(|file: File| file.at))),
   )
 
 fn dependency_places(project: Project) -> List<SourceText> =
-  project.packages.fold([], |acc: List<SourceText>, package: DependencyPackage|
-    package.files.fold(acc, |places: List<SourceText>, file: File|
+  project.packages.fold([], |accumulator: List<SourceText>, package: DependencyPackage|
+    package.files.fold(accumulator, |places: List<SourceText>, file: File|
       places.push({ path: file.path, text: file.text })))
 
 fn manifest_places(project: Project) -> List<SourceText> = {
   let dependencies = project.packages.fold(
     [],
-    |acc: List<SourceText>, package: DependencyPackage|
+    |accumulator: List<SourceText>, package: DependencyPackage|
       match package.manifest {
-        None -> acc,
-        Some(text) -> acc.push({ path: package.root ++ "/ply.pkg", text: text }),
+        None -> accumulator,
+        Some(text) -> accumulator.push({ path: package.root ++ "/ply.pkg", text: text }),
       },
   );
   match project.manifest {
     None -> dependencies,
     Some(f) -> {
       let root: List<SourceText> = [{ path: f.path, text: f.text }];
-      dependencies.fold(root, |acc: List<SourceText>, place: SourceText| acc.push(place))
+      dependencies.fold(root, |accumulator: List<SourceText>, place: SourceText|
+        accumulator.push(place))
     },
   }
 }
@@ -221,7 +222,7 @@ pub fn front_end(
   rows: Rows,
   packages: PackageSources,
   embeds: List<Embed>,
-  reached: Bool,
+  prune_unreached: Bool,
   fixed: CachedHashes,
   derived: List<ModuleDerivations>,
 ) -> PulledAnalysis / {abort.raise} =
@@ -232,9 +233,9 @@ pub fn front_end(
     packages,
     embeds: embeds.map(|embed: Embed| embed.embedded),
     unread: shipping.unread,
-    reached: reached,
+    cut_unused: prune_unreached,
     data: shipping.data,
-    required: shipping.asked,
+    required: shipping.required_modules,
     pulls: shipping.dependencies,
     fixed: fixed,
     derived: derived,
@@ -247,7 +248,7 @@ pub fn reanalysed(
   moved: Bytes,
 ) -> PulledAnalysis / {abort.raise} = {
   let rows = published_rows(program);
-  let stale = forms::keys_reaching(frame.hashes, Map::new().insert(moved, true));
+  let stale = forms::keys_referring_to(frame.hashes, Map::new().insert(moved, true));
   front_end(
     sources,
     program.shipping,
@@ -271,25 +272,28 @@ fn analysed(
   pulled: List<Bytes>,
   embeds: List<Embed>,
   inputs: Map<Bytes, Bytes>,
-  reached: Bool,
+  prune_unreached: Bool,
   modules: List<ModuleHashes>,
 ) -> Program / {abort.raise} = {
-  let texts = shipping.sources.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
-    acc.insert(String::of_bytes_lossy(source.name), source.src));
+  let texts = shipping.sources.fold(
+    Map::new(),
+    |accumulator: Map<String, Bytes>, source: Source|
+      accumulator.insert(String::of_bytes_lossy(source.name), source.source_text),
+  );
   let packages: PackageSources = packages_of(project);
   let warnings = root_warnings(results, project.sources.len());
   let loaded = assembled_load(
     project.sources.map(|s: Source| s.name),
     packages,
-    results.fold(Map::new(), |acc: Map<Bytes, ModuleShape>, a: CheckedModule|
-      acc.insert(a.module, a.result.shape)),
+    results.fold(Map::new(), |accumulator: Map<Bytes, ModuleShape>, a: CheckedModule|
+      accumulator.insert(a.module, a.result.shape)),
     joined_cached_hashes(modules),
     pulled,
     all_shipped_names(shipping),
-    shipping.sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, source: Source|
-      acc.insert(source.name, source.src)),
+    shipping.sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, source: Source|
+      accumulator.insert(source.name, source.source_text)),
     true,
-    reached,
+    prune_unreached,
     warnings,
   );
   let own = project_sources(project);
@@ -303,8 +307,8 @@ fn analysed(
     ),
     diagnostics: warnings,
     frame: Some(loaded.frame),
-    returned: results.fold(Map::new(), |acc: Map<Bytes, ModuleResult>, a: CheckedModule|
-      acc.insert(a.module, a.result)),
+    returned: results.fold(Map::new(), |accumulator: Map<Bytes, ModuleResult>, a: CheckedModule|
+      accumulator.insert(a.module, a.result)),
     reads: loaded.reads,
     whole: None,
     sources: project.sources,
@@ -313,24 +317,24 @@ fn analysed(
     embeds: embeds,
     inputs: inputs,
     shipping: shipping,
-    prune_unreached: reached,
+    prune_unreached: prune_unreached,
     shipped_views: loaded.views,
     tallies: [],
     missing_results: 0,
-    asked: [],
+    requested_dependencies: [],
     looked_up: [],
   };
-  let owned = project.sources.fold(Map::new(), |acc: Map<Bytes, Bool>, source: Source|
-    acc.insert(source.name, true));
+  let owned = project.sources.fold(Map::new(), |accumulator: Map<Bytes, Bool>, source: Source|
+    accumulator.insert(source.name, true));
   let mine = |m: Bytes| owned.contains(m);
   let own = loaded.frame.outlines.take(project.files.len());
-  let held = |pick: (FnOutline) -> Bool|
+  let any_function = |pick: (FunctionOutline) -> Bool|
     own.fold(false, |b: Bool, o: Outline|
       b
         || o.items.fold(false, |m: Bool, item: OutlineItem|
           m || (match item { OutlinedFunction(f) -> pick(f), _ -> false })));
-  let measured = held(|f: FnOutline| f.measured);
-  if !measured && !held(|f: FnOutline| f.reuse || f.returns) { program } else {
+  let measured = any_function(|f: FunctionOutline| f.measured);
+  if !measured && !any_function(|f: FunctionOutline| f.reuse || f.returns) { program } else {
     let rejected = |ds: List<Diagnostic>| { ..program, diagnostics: ds, frame: None };
     match whole_of(program) {
       Err(ds) -> rejected(ds),
@@ -352,19 +356,19 @@ pub fn runs_statements(program: Program, frame: Frame) -> Bool =
   uses_statement_modules(frame.outlines.take(program.files.len()))
 
 pub fn module_derivations(program: Program) -> List<ModuleDerivations> =
-  program.returned.fold([], |acc: List<ModuleDerivations>, _: Bytes, a: ModuleResult| {
+  program.returned.fold([], |accumulator: List<ModuleDerivations>, _: Bytes, a: ModuleResult| {
     let outline = a.shape.outline;
-    if outline.derived.len() == 0 { acc }
-    else { acc.push({ module: outline.name, derivations: outline.derived }) }
+    if outline.derived.len() == 0 { accumulator }
+    else { accumulator.push({ module: outline.name, derivations: outline.derived }) }
   })
 
 fn published_rows(program: Program) -> Rows / {abort.raise} =
-  program.returned.fold(no_rows(), |acc: Rows, _: Bytes, a: ModuleResult| {
+  program.returned.fold(no_rows(), |accumulator: Rows, _: Bytes, a: ModuleResult| {
     let rows = rows_of_result(a);
     {
-      definitions: acc.definitions.concat(rows.definitions),
-      tests: acc.tests.concat(rows.tests),
-      types: tables_joined(acc.types, rows.types),
+      definitions: accumulator.definitions.concat(rows.definitions),
+      tests: accumulator.tests.concat(rows.tests),
+      types: tables_joined(accumulator.types, rows.types),
     }
   })
 
@@ -407,10 +411,11 @@ fn parsed_into<| e>(
   sources: List<Source>,
   parsing: (Source) -> ParsedSource / {abort.raise | e},
 ) -> ParsedSources / {abort.raise | e} =
-  sources.fold(parses, |acc: ParsedSources, s: Source|
-    match acc.get(s.name) {
-      Some(p) -> if p.src == s.src { acc } else { acc.insert(s.name, parsing(s)) },
-      None -> acc.insert(s.name, parsing(s)),
+  sources.fold(parses, |accumulator: ParsedSources, s: Source|
+    match accumulator.get(s.name) {
+      Some(p) -> if p.text == s.source_text { accumulator }
+      else { accumulator.insert(s.name, parsing(s)) },
+      None -> accumulator.insert(s.name, parsing(s)),
     })
 
 fn resolved_from(
@@ -427,7 +432,7 @@ fn resolved_from(
     embeds.map(|embed: Embed| embed.embedded),
     shipping.unread,
     shipping.data,
-    shipping.asked,
+    shipping.required_modules,
     shipping.dependencies,
     parses.values(),
   )
@@ -436,8 +441,9 @@ fn supplied_sources(
   sources: List<Source>,
   packages: PackageSources,
 ) -> List<Source> / {abort.raise} =
-  closure(packages, sources.map(|s: Source| s.name)).modules.map(|m: { pkg: Int, src: Source }|
-    m.src)
+  closure(packages, sources.map(|s: Source| s.name)).modules.map(
+    |m: { pkg: Int, source: Source }| m.source,
+  )
 
 pub fn resolution_of(
   program: Program,
@@ -456,7 +462,7 @@ pub fn resolution_of(
           parse_from(
             0,
             s,
-            parse(s.src),
+            parse(s.source_text),
             derivations: match derived.find(|m: ModuleDerivations| m.module == s.name) {
               Some(m) -> m.derivations,
               None -> [],
@@ -490,9 +496,10 @@ pub fn renamed_resolution(
   } else {
     let packages = packages_of(project);
     let own = project.sources.concat(supplied_sources(project.sources, packages));
-    let names = own.fold(Map::new(), |acc: Map<Bytes, Bool>, s: Source| acc.insert(s.name, true));
-    let texts = project.sources.fold(Map::new(), |acc: Map<Bytes, Bytes>, s: Source|
-      acc.insert(s.name, s.src));
+    let names = own.fold(Map::new(), |accumulator: Map<Bytes, Bool>, s: Source|
+      accumulator.insert(s.name, true));
+    let texts = project.sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
+      accumulator.insert(s.name, s.source_text));
     let shipped = {
       ..shipping,
       sources: shipping.sources.filter(|s: Source| !names.contains(s.name)),
@@ -504,7 +511,7 @@ pub fn renamed_resolution(
       parse_from(
         0,
         s,
-        parse(s.src),
+        parse(s.source_text),
         library: Some(|ask: DeriverRequest| derivation_result(ask, texts)),
       ));
     {
@@ -520,12 +527,12 @@ fn unproved_measure(u: UnprovedMeasure) -> Diagnostic =
     u.measure.at.module,
     span_between(u.measure.at.start, u.measure.at.end),
     Bytes::of_string(
-      "no proof shows `" ++ u.measure.owner
-        ++ "`'s measure descends at every call its group makes back into itself",
+      "the measure of `" ++ u.measure.owner
+        ++ "` is not proved to decrease at every recursive call, including calls between definitions that call each other",
     ),
-    b"this measure is not shown",
+    b"the checker cannot prove that this `measure` decreases",
     u.reason.map(Bytes::of_string).push(if u.descends {
-      b"the checker sees it end without the measure, which can be deleted"
+      b"the checker can see that the definition ends without the measure, so remove the `measure` clause"
     } else {
       b"a definition is read as ending on its measure only once a proof shows it; restructure it so the checker sees it descend, or state a measure a proof can follow"
     }),
@@ -544,7 +551,7 @@ fn assembled(
     ..assembled_from(project, shipping, paths, q, true),
     tallies: q.tallies,
     missing_results: q.missing_results,
-    asked: q.asked,
+    requested_dependencies: q.requested_dependencies,
     looked_up: q.looked_up,
   }
 
@@ -553,7 +560,7 @@ fn assembled_from(
   shipping: ShippedInputs,
   paths: List<paths::ResolvedPath>,
   q: QueryResults,
-  reached: Bool,
+  prune_unreached: Bool,
 ) -> Program / {abort.raise} = {
   let results = q.results;
   if project.diagnostics.len() > 0 {
@@ -565,7 +572,7 @@ fn assembled_from(
   } else {
     let first = rejected_first(results).fold(
       Map::new(),
-      |acc: Map<Bytes, Bool>, a: CheckedModule| acc.insert(a.module, true),
+      |accumulator: Map<Bytes, Bool>, a: CheckedModule| accumulator.insert(a.module, true),
     );
     let own = project_sources(project);
     let packaged = packages_rejected(
@@ -577,14 +584,17 @@ fn assembled_from(
     if packaged.len() > 0 {
       failed_program(project, shipping, own.modules.concat(own.manifests), packaged)
     } else if first.len() > 0 {
-      let texts = shipping.sources.fold(Map::new(), |acc: Map<String, Bytes>, source: Source|
-        acc.insert(String::of_bytes_lossy(source.name), source.src));
+      let texts = shipping.sources.fold(
+        Map::new(),
+        |accumulator: Map<String, Bytes>, source: Source|
+          accumulator.insert(String::of_bytes_lossy(source.name), source.source_text),
+      );
       let pulled = results.drop(own.modules.len()).map(|a: CheckedModule|
         shipped_place(texts, String::of_bytes_lossy(a.module)));
-      let diagnostics = range(0, results.len()).fold([], |acc: List<Diagnostic>, i: Int| {
+      let diagnostics = range(0, results.len()).fold([], |accumulator: List<Diagnostic>, i: Int| {
         let a = results.get(i);
-        if !first.contains(a.module) { acc } else {
-          acc.concat(
+        if !first.contains(a.module) { accumulator } else {
+          accumulator.concat(
             a.result.rejected.map(|d: Diagnostic|
               { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
           )
@@ -600,7 +610,16 @@ fn assembled_from(
       match q.inputs {
         Err(moved) -> failed_program(project, shipping, own.modules.concat(own.manifests), moved),
         Ok(inputs) ->
-          analysed(project, shipping, results, q.pulled, q.embeds, inputs, reached, q.modules),
+          analysed(
+            project,
+            shipping,
+            results,
+            q.pulled,
+            q.embeds,
+            inputs,
+            prune_unreached,
+            q.modules,
+          ),
       }
     }
   }
@@ -709,7 +728,7 @@ pub fn cache_command(
           project,
           key,
           made,
-          program.asked,
+          program.requested_dependencies,
           program.looked_up,
           output,
         )
@@ -719,7 +738,7 @@ pub fn cache_command(
           project,
           key,
           made,
-          program.asked,
+          program.requested_dependencies,
           program.looked_up,
           output,
         )
@@ -731,13 +750,13 @@ pub fn cache_command(
 pub fn doc_pages(
   paths: List<paths::ResolvedPath>,
   project: Project,
-  asked: List<ModuleKey>,
+  selected_modules: List<ModuleKey>,
 ) -> List<Pages> / {fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} =
   match ((usable(project), paths.at(0))) {
     (true, Some(r)) -> {
       let dir = paths::in_root(r, ".ply-cache/memo").path;
-      if r.label == "cwd" { module_queries::doc_pages[cwd](dir, project, asked) }
-      else { module_queries::doc_pages[abs](dir, project, asked) }
+      if r.label == "cwd" { module_queries::doc_pages[cwd](dir, project, selected_modules) }
+      else { module_queries::doc_pages[abs](dir, project, selected_modules) }
     },
     _ -> [],
   }
@@ -762,6 +781,14 @@ pub fn load_program(
   );
   report_viewed(p.shipped_views, true);
   p
+}
+
+pub fn unchecked_program(
+  paths: List<paths::ResolvedPath>,
+  shipping: ShippedInputs,
+) -> Program / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} = {
+  let project: Project = load_resolved(paths);
+  failed_program(project, shipping, own_places(project), project.diagnostics)
 }
 
 pub fn pins_for(
@@ -913,17 +940,18 @@ pub fn sources_of(program: Program, frame: Frame) -> List<Source> / {abort.raise
   range(0, frame.outlines.len()).map(|i: Int|
     {
       name: frame.outlines.get(i).name,
-      src: match program.source_texts.at(i) { Some(place) -> place.text, None -> b"" },
+      source_text: match program.source_texts.at(i) { Some(place) -> place.text, None -> b"" },
     })
 
 pub fn in_root_package(frame: Frame) -> (Bytes) -> Bool = {
   let roots = frame.outlines.fold(
     { i: 0, roots: Map::new() },
-    |acc: { i: Int, roots: Map<Bytes, Bool> }, o: Outline|
+    |accumulator: { i: Int, roots: Map<Bytes, Bool> }, o: Outline|
       {
-        i: acc.i + 1,
-        roots: if frame.module_packages.at(acc.i) == Some(0) { acc.roots.insert(o.name, true) }
-        else { acc.roots },
+        i: accumulator.i + 1,
+        roots: if frame.module_packages.at(accumulator.i) == Some(0) {
+          accumulator.roots.insert(o.name, true)
+        } else { accumulator.roots },
       },
   ).roots;
   |m: Bytes| roots.contains(m)
@@ -932,12 +960,12 @@ pub fn in_root_package(frame: Frame) -> (Bytes) -> Bool = {
 pub fn pulled_modules(frame: Frame) -> Map<Bytes, Bool> =
   frame.outlines.fold(
     { i: 0, pulled: Map::new() },
-    |acc: { i: Int, pulled: Map<Bytes, Bool> }, o: Outline|
+    |accumulator: { i: Int, pulled: Map<Bytes, Bool> }, o: Outline|
       {
-        i: acc.i + 1,
-        pulled: if is_shipped_module(frame.packages, frame.module_packages, acc.i) {
-          acc.pulled.insert(o.name, true)
-        } else { acc.pulled },
+        i: accumulator.i + 1,
+        pulled: if is_shipped_module(frame.packages, frame.module_packages, accumulator.i) {
+          accumulator.pulled.insert(o.name, true)
+        } else { accumulator.pulled },
       },
   ).pulled
 
@@ -962,37 +990,37 @@ pub fn location_of(program: Program, location: Location) -> Option<String> / {ab
 type DefinitionSelection = { seen: Map<Bytes, Bool>, out: List<DefinitionInfo> }
 
 fn pick(
-  acc: DefinitionSelection,
+  accumulator: DefinitionSelection,
   by_name: Map<Bytes, DefinitionInfo>,
   name: Bytes,
 ) -> DefinitionSelection =
-  match acc.seen.get(name) {
-    Some(_) -> acc,
+  match accumulator.seen.get(name) {
+    Some(_) -> accumulator,
     None -> match by_name.get(name) {
-      None -> acc,
-      Some(d) -> { seen: acc.seen.insert(name, true), out: acc.out.push(d) },
+      None -> accumulator,
+      Some(d) -> { seen: accumulator.seen.insert(name, true), out: accumulator.out.push(d) },
     },
   }
 
-fn module_functions(acc: List<Bytes>, o: Outline) -> List<Bytes> =
-  o.items.fold(acc, |a: List<Bytes>, it: OutlineItem|
+fn module_functions(accumulator: List<Bytes>, o: Outline) -> List<Bytes> =
+  o.items.fold(accumulator, |a: List<Bytes>, it: OutlineItem|
     match it { OutlinedFunction(f) -> a.push(qualify(o.name, f.name)), _ -> a })
 
 pub fn definitions_in_order(view: CheckedProgram) -> List<DefinitionInfo> = {
   let by_name = view.checked.definitions.fold(
     Map::new(),
-    |acc: Map<Bytes, DefinitionInfo>, definition_info: DefinitionInfo|
-      acc.insert(definition_info.name, definition_info),
+    |accumulator: Map<Bytes, DefinitionInfo>, definition_info: DefinitionInfo|
+      accumulator.insert(definition_info.name, definition_info),
   );
   let a_definition = view.frame.outlines.fold([], module_functions);
   let first: DefinitionSelection = a_definition.fold(
     { seen: Map::new(), out: [] },
-    |acc: DefinitionSelection, name: Bytes| pick(acc, by_name, name),
+    |accumulator: DefinitionSelection, name: Bytes| pick(accumulator, by_name, name),
   );
   let all: DefinitionSelection = view.checked.definitions.fold(
     first,
-    |acc: DefinitionSelection, definition_info: DefinitionInfo|
-      pick(acc, by_name, definition_info.name),
+    |accumulator: DefinitionSelection, definition_info: DefinitionInfo|
+      pick(accumulator, by_name, definition_info.name),
   );
   all.out
 }
@@ -1001,9 +1029,9 @@ pub fn resolve_definition(
   definitions: List<DefinitionInfo>,
   query: String,
 ) -> Result<DefinitionInfo, List<String>> = {
-  let exact = definitions.fold(None, |acc: Option<DefinitionInfo>, d: DefinitionInfo|
-    match acc {
-      Some(_) -> acc,
+  let exact = definitions.fold(None, |accumulator: Option<DefinitionInfo>, d: DefinitionInfo|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> if String::of_bytes_lossy(d.name) == query { Some(d) } else { None },
     });
   match exact {
@@ -1057,14 +1085,18 @@ pub fn tables_of(h: HashOutput) -> Tables =
   {
     definitions: h.definitions.fold(
       Map::new(),
-      |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| acc.insert(x.name, x.hash),
+      |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+        accumulator.insert(x.name, x.hash),
     ),
-    own: h.own.fold(Map::new(), |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-      acc.insert(x.name, x.hash)),
+    own: h.own.fold(
+      Map::new(),
+      |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+        accumulator.insert(x.name, x.hash),
+    ),
     specs: h.specs.fold(
       Map::new(),
-      |acc: Map<Bytes, Int>, x: { name: Bytes, hashes: List<Bytes> }|
-        acc.insert(x.name, x.hashes.len()),
+      |accumulator: Map<Bytes, Int>, x: { name: Bytes, hashes: List<Bytes> }|
+        accumulator.insert(x.name, x.hashes.len()),
     ),
     hashes: h,
   }
@@ -1079,8 +1111,8 @@ pub fn own_hash_of(tables: Tables, name: Bytes) -> Option<String> / {abort.raise
   match tables.own.get(name) { Some(h) -> Some(String::of_bytes_lossy(hex(h))), None -> None }
 
 pub fn dependencies_of(tables: Tables, which: Subject) -> List<String> / {abort.raise} =
-  forms::references_in(tables.hashes, which).fold([], |acc: List<Bytes>, r: NodeRef|
-    acc.push_unique(r.name)).map(|n: Bytes| String::of_bytes_lossy(n))
+  forms::references_in(tables.hashes, which).fold([], |accumulator: List<Bytes>, r: NodeRef|
+    accumulator.push_unique(r.name)).map(|n: Bytes| String::of_bytes_lossy(n))
 
 pub fn closure_of(tables: Tables, which: Subject) -> List<String> / {abort.raise} = {
   let reached = forms::reach(tables.hashes, [which]);
@@ -1102,7 +1134,7 @@ pub fn specialization_count(tables: Tables, name: Bytes) -> Int =
 
 pub fn short_of(hex_text: String) -> String / {abort.raise} = hex_text.slice(0, 12)
 
-test "a shipped module's text is said to live under its root, outside the identifier space" {
+test "`pseudo_path` gives a built-in module a placeholder file path such as `<std>/json.ply`, which no user file can have" {
   assert_eq(pseudo_path("std.json"), "<std>/json.ply");
   assert_eq(pseudo_path("std.http.server"), "<std>/http/server.ply");
   assert_eq(pseudo_path("compiler.fmt"), "<compiler>/fmt.ply")
@@ -1113,18 +1145,18 @@ test "a proof covers the root package's claims and never a shipped module's" {
       [
         {
           name: b"m",
-          src: b"import std.y\nimport compiler.x\nfn own() -> Int = y::one() + x::one()\n",
+          source_text: b"import std.y\nimport compiler.x\nfn own() -> Int = y::one() + x::one()\n",
         },
       ],
       [
-        { name: b"std.y", src: b"pub fn one() -> Int = 1\n" },
-        { name: b"compiler.x", src: b"pub fn one() -> Int = 1\n" },
+        { name: b"std.y", source_text: b"pub fn one() -> Int = 1\n" },
+        { name: b"compiler.x", source_text: b"pub fn one() -> Int = 1\n" },
       ],
       no_rows(),
-      reached: false,
+      cut_unused: false,
     ).out {
     Analysed(w) -> w,
-    Rejected(_) -> panic("the fixture checks"),
+    Rejected(_) -> panic("the fixture program was rejected by the checker"),
   };
   let owned = in_root_package(checked_program_of(w).frame);
   assert(owned(b"m") && !owned(b"std.y") && !owned(b"compiler.x"))
@@ -1141,10 +1173,10 @@ fn a_definition(name: Bytes, simple: Bytes) -> DefinitionInfo =
       keep_variables: [],
       label_variables: [],
       ty: FunctionType({
-        kept: [],
+        keep_parameters: [],
         once: false,
         params: [],
-        ret: NamedType({ name: b"Int", args: [] }),
+        return_type: NamedType({ name: b"Int", args: [] }),
         effects: { listed: [], variable: None },
       }),
     },
@@ -1163,7 +1195,7 @@ fn a_definition(name: Bytes, simple: Bytes) -> DefinitionInfo =
     at: { module: 0, span: dummy_span() },
   }
 
-test "a query is a program-wide name, or a simple name that names exactly one definition" {
+test "`resolve_definition` accepts a fully qualified name, or a short name that matches exactly one definition" {
   let definitions = [
     a_definition(b"a.total", b"total"),
     a_definition(b"b.total", b"total"),
@@ -1187,7 +1219,7 @@ test "a query is a program-wide name, or a simple name that names exactly one de
   )
 }
 
-test "a name nothing declares is `E0101`, and an ambiguous one says which" {
+test "an unknown definition name gives `E0101`, and a short name matching several definitions lists the candidates" {
   assert_eq(unknown_definition("absent", []).code, b"E0101");
   assert_eq(unknown_definition("absent", []).message, b"no definition is named `absent`");
   let many = unknown_definition("total", ["a.total", "b.total"]);
@@ -1196,7 +1228,7 @@ test "a name nothing declares is `E0101`, and an ambiguous one says which" {
   assert_eq(with_note(many, b"and one more").notes, 2)
 }
 
-test "a span outside every module has no place and no location" {
+test "`location_of` returns `None` for a span that belongs to no module, and a file, line and column for a real span" {
   let p: Program = {
     ..no_program(),
     source_texts: [{ path: "m.ply", text: b"fn f() -> Int = 1\n" }],

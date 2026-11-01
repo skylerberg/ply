@@ -12,7 +12,7 @@ import compiler.check.infer.walked (WalkedExpression, WalkedLiteral, WalkedRead,
                                     WalkedPerform, WalkedLambda, WalkedSimulate, WalkedParallel,
                                     WalkedHandle, WalkedDefault, WalkedArm, WalkedStatement,
                                     WalkedLet, WalkedLetElse, WalkedDo, WalkedAssign, WalkedField,
-                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVar)
+                                    WalkedThunk, WalkedClause, WalkedReturn, WalkedHandlerVariable)
 import std.list
 
 pub type ParameterMode = { name: Bytes, borrowed: Bool, keep: Bool }
@@ -68,12 +68,13 @@ pub fn escape_diagnostics(
     );
     let s = definition.params.fold(
       { locals: Map::new(), callees: callees, room: borrowed.len() + 1 },
-      |sc: Scope, p: Param|
-        bind(sc, p.name.span.site, if borrowed.contains(p.name.name) { [p.name.name] } else { [] }),
+      |scope: Scope, p: Param|
+        bind(scope, p.name.span.site, if borrowed.contains(p.name.name) { [p.name.name] }
+        else { [] }),
     );
     walk_escaping(s, no_findings(), body, Returned).escapes.fold(
       { diagnostics: [], fixed: [] },
-      |acc: EscapeReport, e: Escape| report_escape(module, definition, e, acc),
+      |accumulator: EscapeReport, e: Escape| report_escape(module, definition, e, accumulator),
     ).diagnostics
   }
 
@@ -83,10 +84,10 @@ fn report_escape(
   module: Int,
   definition: FnDefinition,
   e: Escape,
-  acc: EscapeReport,
+  accumulator: EscapeReport,
 ) -> EscapeReport / {abort.raise} =
   e.borrowed.fold([], |spans: List<Span>, l: Borrow| spans.push_unique(l.span)).fold(
-    acc,
+    accumulator,
     |r: EscapeReport, span: Span| {
       let params = e.borrowed.fold([], |ps: List<Bytes>, l: Borrow|
         if l.span == span { ps.push_unique(l.param) } else { ps });
@@ -123,12 +124,12 @@ fn escape_diagnostic(
       if params.len() == 1 { b" is" } else { b" are" },
       b" borrowed by `",
       definition.name.name,
-      b"`, and would be kept past its call",
+      b"`, but the function stores a borrowed parameter after the call returns",
     ]),
     escape_kind_text(place),
     [
-      b"a parameter of a function type is borrowed unless written `keep`: the function may call it, pass it to a parameter that borrows it in turn, or capture it in a lambda, which is then borrowed too",
-      b"write `keep` before its type to keep it, and each caller passes a function that may be kept",
+      b"a function parameter only borrows its argument unless written `keep`, so the argument cannot be stored; the function body can call the argument, pass it to another borrowing parameter, or use it in a lambda, and that lambda cannot be stored either",
+      b"write `keep` before the parameter's type to allow storing the function; every caller must then pass a function that can be stored",
     ],
   );
   if unfixed.len() == 0 { d } else {
@@ -168,7 +169,7 @@ fn escape_kind_text(place: EscapeKind) -> Bytes =
         r.param,
         b"` of `",
         r.callee,
-        b"`, which may return what a call of it returns",
+        b"`, which may return the result of calling the passed function",
       ]),
   }
 
@@ -179,7 +180,7 @@ fn bind_local(s: Scope, binder: Int, l: Local) -> Scope =
   { ..s, locals: s.locals.insert(binder, l) }
 
 fn bind_pattern(s: Scope, p: TypedPattern<Type>, l: Local) -> Scope =
-  pattern_binders(p).fold(s, |sc: Scope, b: TypedParam<Type>| bind_local(sc, b.span.site, l))
+  pattern_binders(p).fold(s, |scope: Scope, b: TypedParam<Type>| bind_local(scope, b.span.site, l))
 
 fn borrowed_parameters(borrowed: List<Borrow>) -> List<Bytes> =
   borrowed.fold([], |ps: List<Bytes>, l: Borrow| ps.push_unique(l.param))
@@ -188,7 +189,7 @@ fn local_of(v: ValueSummary) -> Local =
   { borrowed: borrowed_parameters(v.borrowed), results: v.results }
 
 fn union(a: List<Bytes>, b: List<Bytes>) -> List<Bytes> =
-  b.fold(a, |acc: List<Bytes>, p: Bytes| acc.push_unique(p))
+  b.fold(a, |accumulator: List<Bytes>, p: Bytes| accumulator.push_unique(p))
 
 fn with_reads(seen: Findings, params: List<Bytes>) -> Findings =
   { ..seen, read_parameters: union(seen.read_parameters, params) }
@@ -221,7 +222,8 @@ fn walk_all_escaping(
   xs: List<WalkedExpression>,
   place: EscapeKind,
 ) -> Findings / {abort.raise} =
-  xs.fold(seen, |acc: Findings, x: WalkedExpression| walk_escaping(s, acc, x, place))
+  xs.fold(seen, |accumulator: Findings, x: WalkedExpression|
+    walk_escaping(s, accumulator, x, place))
 
 fn walk(s: Scope, seen: Findings, e: WalkedExpression) -> ValueSummary / {abort.raise} =
   match e.node {
@@ -237,7 +239,8 @@ fn walk(s: Scope, seen: Findings, e: WalkedExpression) -> ValueSummary / {abort.
       None -> no_borrows(seen),
     },
     WalkedRead(_) -> no_borrows(seen),
-    WalkedBinary(b) -> no_borrows(walk_discarded(s, walk_discarded(s, seen, b.lhs), b.rhs)),
+    WalkedBinary(b) ->
+      no_borrows(walk_discarded(s, walk_discarded(s, seen, b.left_operand), b.right_operand)),
     WalkedUnary(u) -> no_borrows(walk_discarded(s, seen, u.operand)),
     WalkedLambda(l) -> {
       let body = walk_escaping(s, { ..seen, read_parameters: [] }, l.body, Returned);
@@ -254,13 +257,13 @@ fn walk(s: Scope, seen: Findings, e: WalkedExpression) -> ValueSummary / {abort.
     },
     WalkedMatch(m) -> {
       let on = walk(s, seen, m.scrutinee);
-      m.arms.fold(no_borrows(on.seen), |acc: ValueSummary, arm: WalkedArm| {
+      m.arms.fold(no_borrows(on.seen), |accumulator: ValueSummary, arm: WalkedArm| {
         let inner = bind_pattern(s, arm.pattern, local_of(on));
         let guarded = match arm.guard {
-          Some(g) -> walk_discarded(inner, acc.seen, g),
-          None -> acc.seen,
+          Some(g) -> walk_discarded(inner, accumulator.seen, g),
+          None -> accumulator.seen,
         };
-        merge(acc, walk(inner, guarded, arm.body))
+        merge(accumulator, walk(inner, guarded, arm.body))
       })
     },
     WalkedBlock(b) -> {
@@ -281,7 +284,7 @@ fn walk(s: Scope, seen: Findings, e: WalkedExpression) -> ValueSummary / {abort.
     WalkedFieldRead(x) -> no_borrows(walk_discarded(s, seen, x.base)),
     WalkedList(xs) -> no_borrows(walk_all_escaping(s, seen, xs, Stored)),
     WalkedPerform(p) -> no_borrows(walk_all_escaping(s, seen, p.args, PassedToOperation)),
-    WalkedHandle(h) -> walk_handle(s, seen, h.body, h.ret, h.clauses, h.vars),
+    WalkedHandle(h) -> walk_handle(s, seen, h.body, h.return_clause, h.clauses, h.variables),
     WalkedSimulate(t) -> walk(s, seen, t.body),
     WalkedParallel(ts) ->
       no_borrows(walk_all_escaping(s, seen, ts.map(|t: WalkedThunk| t.body), Stored)),
@@ -309,7 +312,9 @@ fn walk_call(
     WalkedRead(WalkedBuiltin(b)) ->
       no_borrows(match s.callees.takes(b.name) {
         Some(t) -> walk_arguments(s, seen, Some(t), args),
-        None -> args.fold(seen, |acc: Findings, x: WalkedExpression| walk_discarded(s, acc, x)),
+        None ->
+          args.fold(seen, |accumulator: Findings, x: WalkedExpression|
+            walk_discarded(s, accumulator, x)),
       }),
     WalkedRead(WalkedConstructor(_)) -> no_borrows(walk_all_escaping(s, seen, args, Stored)),
     _ ->
@@ -329,8 +334,11 @@ fn walk_arguments(
     Some(t) ->
       args.fold(
         { seen: seen, at: 0 },
-        |acc: { seen: Findings, at: Int }, x: WalkedExpression|
-          { seen: walk_argument(s, acc.seen, t, acc.at, x), at: acc.at + 1 },
+        |accumulator: { seen: Findings, at: Int }, x: WalkedExpression|
+          {
+            seen: walk_argument(s, accumulator.seen, t, accumulator.at, x),
+            at: accumulator.at + 1,
+          },
       ).seen,
   }
 
@@ -382,27 +390,27 @@ fn walk_handle(
   s: Scope,
   seen: Findings,
   body: WalkedExpression,
-  ret: Option<WalkedReturn>,
+  return_clause: Option<WalkedReturn>,
   clauses: List<WalkedClause>,
-  vars: List<WalkedHandlerVar>,
+  handler_variables: List<WalkedHandlerVariable>,
 ) -> ValueSummary / {abort.raise} = {
-  let inits = vars.fold(seen, |acc: Findings, v: WalkedHandlerVar|
-    walk_escaping(s, acc, v.init, Stored));
+  let inits = handler_variables.fold(seen, |accumulator: Findings, v: WalkedHandlerVariable|
+    walk_escaping(s, accumulator, v.init, Stored));
   let b = walk(s, { ..inits, read_parameters: [] }, body);
-  let returning = match ret {
+  let returning = match return_clause {
     Some(r) -> bind_local(s, r.binder.span.site, local_of(b)),
     None -> s,
   };
   let caught = clauses.fold(
-    union(b.seen.read_parameters, match ret {
+    union(b.seen.read_parameters, match return_clause {
       Some(r) -> walk(returning, no_findings(), r.body).seen.read_parameters,
       None -> [],
     }),
-    |acc: List<Bytes>, c: WalkedClause|
-      union(acc, walk(s, no_findings(), c.body).seen.read_parameters),
+    |accumulator: List<Bytes>, c: WalkedClause|
+      union(accumulator, walk(s, no_findings(), c.body).seen.read_parameters),
   );
   let after = with_reads({ ..b.seen, read_parameters: inits.read_parameters }, caught);
-  let returned: ValueSummary = match ret {
+  let returned: ValueSummary = match return_clause {
     Some(r) -> walk(returning, after, r.body),
     None -> { seen: after, borrowed: b.borrowed, results: b.results },
   };
@@ -414,10 +422,10 @@ fn walk_handle(
     union(borrowed_parameters(returned.borrowed), returned.results),
     s.room,
   );
-  clauses.fold(returned, |acc: ValueSummary, c: WalkedClause|
+  clauses.fold(returned, |accumulator: ValueSummary, c: WalkedClause|
     match c.continuation {
-      Some(k) -> merge(acc, walk(resumed(c, k, results), acc.seen, c.body)),
-      None -> { ..acc, seen: walk_escaping(s, acc.seen, c.body, Returned) },
+      Some(k) -> merge(accumulator, walk(resumed(c, k, results), accumulator.seen, c.body)),
+      None -> { ..accumulator, seen: walk_escaping(s, accumulator.seen, c.body, Returned) },
     })
 }
 
@@ -428,13 +436,13 @@ fn handle_returns(
   room: Int,
 ) -> List<Bytes> / {abort.raise} =
   if room <= 0 { known } else {
-    let next = clauses.fold(known, |acc: List<Bytes>, c: WalkedClause|
+    let next = clauses.fold(known, |accumulator: List<Bytes>, c: WalkedClause|
       match c.continuation {
         Some(k) -> {
           let v = walk(resumed(c, k, known), no_findings(), c.body);
-          union(acc, union(borrowed_parameters(v.borrowed), v.results))
+          union(accumulator, union(borrowed_parameters(v.borrowed), v.results))
         },
-        None -> acc,
+        None -> accumulator,
       });
     if next.len() == known.len() { known } else { handle_returns(clauses, resumed, next, room - 1) }
   }

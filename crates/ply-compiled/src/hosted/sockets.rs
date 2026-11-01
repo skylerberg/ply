@@ -1,9 +1,5 @@
-//! `std.net`'s and `std.udp`'s natives: the run's socket table, each socket named by its handle and
-//! the label the clause that asks binds. What they are handed and return is flat as
-//! `ply_host::tcp::wire` reads and writes it; an operation that waits returns a ticket.
-
-use super::{Nondeterministic, asked, done, from_host, given, handed, waited};
-use crate::c::{MachineNative, machine_native};
+use super::{Nondeterministic, asked, done, given, handed, waited, with_host_facilities};
+use crate::c::{MachineNative, runtime_native};
 use crate::emitted::SecretHandle;
 use crate::native::{Addr, I64, TakenBytes};
 use crate::rt::{Ctx, borrowed};
@@ -16,150 +12,148 @@ use std::time::Duration;
 
 pub(super) fn natives() -> Vec<MachineNative> {
     vec![
-        machine_native(
+        runtime_native(
             "net_listen",
             rt_net_listen as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_listen_tls",
             rt_net_listen_tls as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_listen_on",
             rt_net_listen_on as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_listen_unix",
             rt_net_listen_unix as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect",
             rt_net_connect as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect_tls",
             rt_net_connect_tls as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect_to",
             rt_net_connect_to as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_connect_unix",
             rt_net_connect_unix as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_handshake",
             rt_net_handshake as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_start_tls",
             rt_net_start_tls as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_serve_tls",
             rt_net_serve_tls as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_accept",
             rt_net_accept as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_recv",
             rt_net_recv as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_send",
             rt_net_send as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_send_secret",
             rt_net_send_secret as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_close_write",
             rt_net_close_write as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "net_close",
             rt_net_close as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "net_set_option",
             rt_net_set_option as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_local_port",
             rt_net_local_port as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_local_address",
             rt_net_local_address as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_peer_address",
             rt_net_peer_address as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_peer_credentials",
             rt_net_peer_credentials as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_peer_certificate",
             rt_net_peer_certificate as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_protocol",
             rt_net_protocol as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "net_options",
             rt_net_options as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_bind",
             rt_udp_bind as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_connect",
             rt_udp_connect as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_send_to",
             rt_udp_send_to as unsafe extern "C" fn(_, _, _, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_send",
             rt_udp_send as unsafe extern "C" fn(_, _, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_recv_from",
             rt_udp_recv_from as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_set_option",
             rt_udp_set_option as unsafe extern "C" fn(_, _, _, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_close",
             rt_udp_close as unsafe extern "C" fn(_, _, _, _),
         ),
-        machine_native(
+        runtime_native(
             "udp_local_address",
             rt_udp_local_address as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
-        machine_native(
+        runtime_native(
             "udp_options",
             rt_udp_options as unsafe extern "C" fn(_, _, _, _) -> _,
         ),
     ]
 }
 
-/// The run's socket table, and the label at `label` the clause bound; `None`, with the run failed,
-/// for a runtime no host made or a label that is not UTF-8.
 fn labelled<'a>(c: &mut Ctx, label: &'a [u8]) -> Option<(Arc<TcpHost>, &'a str)> {
     let label = c.text(label)?;
-    let net = from_host(c, |facilities| Arc::clone(facilities.sockets()))?;
+    let net = with_host_facilities(c, |facilities| Arc::clone(facilities.sockets()))?;
     Some((net, label))
 }
 
@@ -185,7 +179,6 @@ fn texts(flat: &[u8]) -> Option<Vec<String>> {
         .collect()
 }
 
-/// A listener on `port` of the loopback address, as its handle.
 pub unsafe extern "C" fn rt_net_listen(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -215,8 +208,6 @@ pub unsafe extern "C" fn rt_net_listen(
     )
 }
 
-/// A listener on `port` of the loopback address that serves TLS with the credential at
-/// `credential_at`, as its handle.
 pub unsafe extern "C" fn rt_net_listen_tls(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -251,14 +242,12 @@ pub unsafe extern "C" fn rt_net_listen_tls(
     )
 }
 
-/// A listener at exactly the address at `to_at`, with the options at `options_at` set before the
-/// bind: its handle, or why not.
 pub unsafe extern "C" fn rt_net_listen_on(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     options_at: Addr,
     options_n: I64,
 ) -> TakenBytes {
@@ -271,7 +260,7 @@ pub unsafe extern "C" fn rt_net_listen_on(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
                 handed(c, "net_listen_on", "an address", to),
@@ -284,8 +273,6 @@ pub unsafe extern "C" fn rt_net_listen_on(
     )
 }
 
-/// A listener on the Unix socket at the path at `path_at` under the root named at `root_at`: its
-/// handle, or why not.
 pub unsafe extern "C" fn rt_net_listen_unix(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -316,7 +303,6 @@ pub unsafe extern "C" fn rt_net_listen_unix(
     )
 }
 
-/// The ticket of a connection to the host named at `host_at`: its handle found, or none.
 pub unsafe extern "C" fn rt_net_connect(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -350,8 +336,6 @@ pub unsafe extern "C" fn rt_net_connect(
     )
 }
 
-/// The ticket of a TLS connection to the host named at `host_at`, verified as that name: its
-/// handle found, or none.
 pub unsafe extern "C" fn rt_net_connect_tls(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -385,14 +369,13 @@ pub unsafe extern "C" fn rt_net_connect_tls(
     )
 }
 
-/// The ticket of a connection to exactly the address at `to_at`: its handle, or why not.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_connect_to(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     options_at: Addr,
     options_n: I64,
     timeout_ms: I64,
@@ -406,7 +389,7 @@ pub unsafe extern "C" fn rt_net_connect_to(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options), Some(timeout)) = (
                 handed(c, "net_connect_to", "an address", to),
@@ -421,8 +404,6 @@ pub unsafe extern "C" fn rt_net_connect_to(
     )
 }
 
-/// The ticket of a connection to the Unix socket at the path at `path_at` under the root named at
-/// `root_at`: its handle, or why not.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_connect_unix(
     ctx: *mut Ctx,
@@ -459,7 +440,6 @@ pub unsafe extern "C" fn rt_net_connect_unix(
     )
 }
 
-/// The ticket of a connection's TLS handshake: the microseconds it took found, or none.
 pub unsafe extern "C" fn rt_net_handshake(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -481,8 +461,6 @@ pub unsafe extern "C" fn rt_net_handshake(
     )
 }
 
-/// The ticket of a plaintext connection secured as its client, verifying the server as the name
-/// at `name_at`: the protocol agreed found, or why not.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_start_tls(
     ctx: *mut Ctx,
@@ -518,8 +496,6 @@ pub unsafe extern "C" fn rt_net_start_tls(
     )
 }
 
-/// The ticket of a plaintext connection secured as its server, with the credential named at
-/// `credential_at`: the protocol agreed found, or why not.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_net_serve_tls(
     ctx: *mut Ctx,
@@ -555,8 +531,6 @@ pub unsafe extern "C" fn rt_net_serve_tls(
     )
 }
 
-/// What an upgrade is asked with: the protocols at `alpn_at` as parts, the count of plaintext
-/// unread and the deadline.
 fn upgrade(
     c: &mut Ctx,
     native: &str,
@@ -585,8 +559,6 @@ fn upgrade(
     })
 }
 
-/// The ticket of the next connection a listener takes, as its handle; `0` once the run has
-/// stopped accepting.
 pub unsafe extern "C" fn rt_net_accept(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -608,7 +580,6 @@ pub unsafe extern "C" fn rt_net_accept(
     )
 }
 
-/// The ticket of at most `max` bytes of a connection found, none for the deadline.
 pub unsafe extern "C" fn rt_net_recv(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -632,15 +603,13 @@ pub unsafe extern "C" fn rt_net_recv(
     })
 }
 
-/// The ticket of a write of some prefix of the payload at `payload_at`: how many bytes it took
-/// found, none for the deadline.
 pub unsafe extern "C" fn rt_net_send(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
     conn: I64,
     payload_at: Addr,
-    payload_n: I64,
+    payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
     asked(ctx, "net_send", Nondeterministic, I64(0), |c: &mut Ctx| {
@@ -650,13 +619,12 @@ pub unsafe extern "C" fn rt_net_send(
         let Some(timeout) = handed(c, "net_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
-        let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
+        let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
         let job = net.send(label, conn.0, payload, timeout, c.site());
         waited(c, "net_send", "`net.send`", job)
     })
 }
 
-/// The ticket of a write of every byte of the credential `framed`, byte 1 where they all went.
 pub unsafe extern "C" fn rt_net_send_secret(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -687,7 +655,6 @@ pub unsafe extern "C" fn rt_net_send_secret(
     )
 }
 
-/// Ends a connection's sending.
 pub unsafe extern "C" fn rt_net_close_write(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -709,7 +676,6 @@ pub unsafe extern "C" fn rt_net_close_write(
     );
 }
 
-/// Closes a socket of any kind.
 pub unsafe extern "C" fn rt_net_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
     asked(ctx, "net_close", Nondeterministic, (), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
@@ -720,14 +686,13 @@ pub unsafe extern "C" fn rt_net_close(ctx: *mut Ctx, label_at: Addr, label_n: I6
     });
 }
 
-/// Sets the option at `option_at` on a socket: nothing, or why not.
 pub unsafe extern "C" fn rt_net_set_option(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    option_at: Addr,
-    option_n: I64,
+    option_addr: Addr,
+    option_len: I64,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -741,15 +706,14 @@ pub unsafe extern "C" fn rt_net_set_option(
                 label_at,
                 label_n,
                 socket,
-                option_at,
-                option_n,
+                option_addr,
+                option_len,
                 false,
             )
         },
     )
 }
 
-/// The option at `option_at` set on a socket, a datagram one where `datagram` says it must be.
 #[allow(clippy::too_many_arguments)]
 fn set_option(
     c: &mut Ctx,
@@ -757,25 +721,24 @@ fn set_option(
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    option_at: Addr,
-    option_n: I64,
+    option_addr: Addr,
+    option_len: I64,
     datagram: bool,
 ) -> TakenBytes {
     let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
         return TakenBytes(0);
     };
-    let option = SocketOption::read(unsafe { borrowed(option_at, option_n) });
+    let option = SocketOption::read(unsafe { borrowed(option_addr, option_len) });
     let Some(option) = handed(c, native, "a socket option", option) else {
         return TakenBytes(0);
     };
     let span = c.site();
-    let result = held_datagram(&net, label, socket, datagram, span)
+    let result = register_datagram_when_requested(&net, label, socket, datagram, span)
         .and_then(|()| net.set_option(label, socket.0, option, span));
     given(c, result)
 }
 
-/// Holds `socket` to a datagram socket where `datagram` says it must be one.
-fn held_datagram(
+fn register_datagram_when_requested(
     net: &TcpHost,
     label: &str,
     socket: I64,
@@ -788,7 +751,6 @@ fn held_datagram(
     Ok(())
 }
 
-/// The port this end of a socket is bound to, or -1 for a listener the drain has closed.
 pub unsafe extern "C" fn rt_net_local_port(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -815,11 +777,8 @@ pub unsafe extern "C" fn rt_net_local_port(
     )
 }
 
-/// What a native that reads what a socket is returns, under `label` and of `socket`.
-type Described = fn(&TcpHost, &str, i64, ply_core::Span) -> Result<Vec<u8>, Diagnostic>;
+type SocketInfoReader = fn(&TcpHost, &str, i64, ply_core::Span) -> Result<Vec<u8>, Diagnostic>;
 
-/// What `read` returns of a socket, a datagram one where `datagram` says it must be: what a socket
-/// is, read as it stands.
 fn described(
     ctx: *mut Ctx,
     native: &'static str,
@@ -827,7 +786,7 @@ fn described(
     label_n: I64,
     socket: I64,
     datagram: bool,
-    read: Described,
+    read: SocketInfoReader,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -839,14 +798,13 @@ fn described(
                 return TakenBytes(0);
             };
             let span = c.site();
-            let result = held_datagram(&net, label, socket, datagram, span)
+            let result = register_datagram_when_requested(&net, label, socket, datagram, span)
                 .and_then(|()| read(&net, label, socket.0, span));
             given(c, result)
         },
     )
 }
 
-/// The address this end of a socket is bound to, found.
 pub unsafe extern "C" fn rt_net_local_address(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -864,7 +822,6 @@ pub unsafe extern "C" fn rt_net_local_address(
     )
 }
 
-/// The address of a connection's far end, found.
 pub unsafe extern "C" fn rt_net_peer_address(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -882,7 +839,6 @@ pub unsafe extern "C" fn rt_net_peer_address(
     )
 }
 
-/// Who holds the far end of a Unix socket, found.
 pub unsafe extern "C" fn rt_net_peer_credentials(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -900,7 +856,6 @@ pub unsafe extern "C" fn rt_net_peer_credentials(
     )
 }
 
-/// The far end's certificate on a secured connection, found.
 pub unsafe extern "C" fn rt_net_peer_certificate(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -918,7 +873,6 @@ pub unsafe extern "C" fn rt_net_peer_certificate(
     )
 }
 
-/// The application protocol a secured connection's handshake agreed, found.
 pub unsafe extern "C" fn rt_net_protocol(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -936,7 +890,6 @@ pub unsafe extern "C" fn rt_net_protocol(
     )
 }
 
-/// Each option a socket has, as parts.
 pub unsafe extern "C" fn rt_net_options(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -954,13 +907,12 @@ pub unsafe extern "C" fn rt_net_options(
     )
 }
 
-/// A datagram socket bound at the address at `to_at`: its handle, or why not.
 pub unsafe extern "C" fn rt_udp_bind(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     options_at: Addr,
     options_n: I64,
 ) -> TakenBytes {
@@ -973,7 +925,7 @@ pub unsafe extern "C" fn rt_udp_bind(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let options = SocketOption::list(unsafe { borrowed(options_at, options_n) });
             let (Some(to), Some(options)) = (
                 handed(c, "udp_bind", "an address", to),
@@ -986,14 +938,13 @@ pub unsafe extern "C" fn rt_udp_bind(
     )
 }
 
-/// A datagram socket's far end fixed at the address at `to_at`: nothing, or why not.
 pub unsafe extern "C" fn rt_udp_connect(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -1004,7 +955,7 @@ pub unsafe extern "C" fn rt_udp_connect(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return TakenBytes(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let Some(to) = handed(c, "udp_connect", "an address", to) else {
                 return TakenBytes(0);
             };
@@ -1014,18 +965,16 @@ pub unsafe extern "C" fn rt_udp_connect(
     )
 }
 
-/// The ticket of the payload at `payload_at` sent as one datagram to the address at `to_at`: its
-/// length, or why not.
 #[allow(clippy::too_many_arguments)]
 pub unsafe extern "C" fn rt_udp_send_to(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    to_at: Addr,
-    to_n: I64,
+    endpoint_at: Addr,
+    endpoint_n: I64,
     payload_at: Addr,
-    payload_n: I64,
+    payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
     asked(
@@ -1037,29 +986,27 @@ pub unsafe extern "C" fn rt_udp_send_to(
             let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
                 return I64(0);
             };
-            let to = Endpoint::read(unsafe { borrowed(to_at, to_n) });
+            let to = Endpoint::read(unsafe { borrowed(endpoint_at, endpoint_n) });
             let (Some(to), Some(timeout)) = (
                 handed(c, "udp_send_to", "an address", to),
                 handed(c, "udp_send_to", "a deadline", deadline(timeout_ms)),
             ) else {
                 return I64(0);
             };
-            let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
+            let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
             let job = ply_host::udp::send_to(&net, label, socket.0, to, payload, timeout, c.site());
             waited(c, "udp_send_to", "`udp.send_to`", job)
         },
     )
 }
 
-/// The ticket of the payload at `payload_at` sent as one datagram to the far end `connect` fixed:
-/// its length, or why not.
 pub unsafe extern "C" fn rt_udp_send(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
     socket: I64,
     payload_at: Addr,
-    payload_n: I64,
+    payload_len: I64,
     timeout_ms: I64,
 ) -> I64 {
     asked(ctx, "udp_send", Nondeterministic, I64(0), |c: &mut Ctx| {
@@ -1069,13 +1016,12 @@ pub unsafe extern "C" fn rt_udp_send(
         let Some(timeout) = handed(c, "udp_send", "a deadline", deadline(timeout_ms)) else {
             return I64(0);
         };
-        let payload = unsafe { borrowed(payload_at, payload_n) }.to_vec();
+        let payload = unsafe { borrowed(payload_at, payload_len) }.to_vec();
         let job = ply_host::udp::send(&net, label, socket.0, payload, timeout, c.site());
         waited(c, "udp_send", "`udp.send`", job)
     })
 }
 
-/// The ticket of the next datagram, at most `max` bytes of it: the datagram, or why not.
 pub unsafe extern "C" fn rt_udp_recv_from(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -1105,14 +1051,13 @@ pub unsafe extern "C" fn rt_udp_recv_from(
     )
 }
 
-/// Sets the option at `option_at` on a datagram socket: nothing, or why not.
 pub unsafe extern "C" fn rt_udp_set_option(
     ctx: *mut Ctx,
     label_at: Addr,
     label_n: I64,
     socket: I64,
-    option_at: Addr,
-    option_n: I64,
+    option_addr: Addr,
+    option_len: I64,
 ) -> TakenBytes {
     asked(
         ctx,
@@ -1126,28 +1071,26 @@ pub unsafe extern "C" fn rt_udp_set_option(
                 label_at,
                 label_n,
                 socket,
-                option_at,
-                option_n,
+                option_addr,
+                option_len,
                 true,
             )
         },
     )
 }
 
-/// Closes a datagram socket.
 pub unsafe extern "C" fn rt_udp_close(ctx: *mut Ctx, label_at: Addr, label_n: I64, socket: I64) {
     asked(ctx, "udp_close", Nondeterministic, (), |c: &mut Ctx| {
         let Some((net, label)) = labelled(c, unsafe { borrowed(label_at, label_n) }) else {
             return;
         };
         let span = c.site();
-        let closed = held_datagram(&net, label, socket, true, span)
+        let closed = register_datagram_when_requested(&net, label, socket, true, span)
             .and_then(|()| net.close(label, socket.0, span));
         done(c, closed);
     });
 }
 
-/// The address a datagram socket is bound to, found.
 pub unsafe extern "C" fn rt_udp_local_address(
     ctx: *mut Ctx,
     label_at: Addr,
@@ -1165,7 +1108,6 @@ pub unsafe extern "C" fn rt_udp_local_address(
     )
 }
 
-/// Each option a datagram socket has, as parts.
 pub unsafe extern "C" fn rt_udp_options(
     ctx: *mut Ctx,
     label_at: Addr,

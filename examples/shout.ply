@@ -1,5 +1,3 @@
-//! A command-line tool whose line is declared once, with `std.cli`.
-
 import std.cli
 import std.cli (Arg, Bash, Codec, Fish, Flag, Outcome, Parsed, Positive, Failed, Rejected, Run,
                 Shell, Spec, Text, Zsh)
@@ -8,11 +6,9 @@ import std.process (process, FakeProcess, args_step, captured, err_step, exit_st
 import std.string
 import std.unicode
 
-// --- What the line asks for -------------------------------------------------
-
 type Voice = | Plain | Upper | Lower
 
-type Saying = {
+type ShoutRequest = {
   words: List<String>,
   times: Int,
   voice: Voice,
@@ -20,11 +16,8 @@ type Saying = {
   marks: List<String>,
 }
 
-type Asked = | Say(Saying) | Completions(Shell) | Manual(List<String>)
+type Command = | Say(ShoutRequest) | Completions(Shell) | Manual(List<String>)
 
-// --- The line ---------------------------------------------------------------
-
-/// Declared once, so the command that lists it and the decoder that reads it cannot disagree.
 fn times() -> Arg<Int> =
   cli::arg(
     cli::with_setting(
@@ -38,7 +31,7 @@ fn times() -> Arg<Int> =
   )
 
 fn between() -> Arg<String> =
-  cli::arg(cli::valued("between", "TEXT", Text, "What stands between two words."), cli::text())
+  cli::arg(cli::valued("between", "TEXT", Text, "The text to put between two words."), cli::text())
 
 fn mark() -> Arg<String> =
   cli::arg(
@@ -93,10 +86,9 @@ fn line() -> Spec = {
   }
 }
 
-/// The decoder: a line that parsed, as what it asks for.
-fn asked_from_parsed(p: Parsed) -> Result<Asked, String> / {abort.raise} =
+fn command_from_parsed(p: Parsed) -> Result<Command, String> / {abort.raise} =
   match p.path.at_or(0, "") {
-    "say" -> said_of(p),
+    "say" -> say_command_of(p),
     "completions" -> match shells().decode(p.positionals.at_or(0, "")) {
       Ok(shell) -> Ok(Completions(shell)),
       Err(reason) -> Err("`" ++ p.positionals.at_or(0, "") ++ "` is no shell: " ++ reason),
@@ -104,7 +96,7 @@ fn asked_from_parsed(p: Parsed) -> Result<Asked, String> / {abort.raise} =
     _ -> Ok(Manual(p.positionals)),
   }
 
-fn said_of(p: Parsed) -> Result<Asked, String> / {abort.raise} = {
+fn say_command_of(p: Parsed) -> Result<Command, String> / {abort.raise} = {
   let times = cli::required(p, times())?;
   Ok(
     Say({
@@ -119,88 +111,93 @@ fn said_of(p: Parsed) -> Result<Asked, String> / {abort.raise} = {
   )
 }
 
-fn asked(
+fn parse_command(
   argv: List<String>,
   settings: List<{ key: String, value: String }>,
-) -> Outcome<Asked> / {abort.raise} = cli::parse_with(line(), argv, asked_from_parsed, settings)
+) -> Outcome<Command> / {abort.raise} = cli::parse_with(line(), argv, command_from_parsed, settings)
 
-// --- What it prints ---------------------------------------------------------
-
-fn spoken(s: Saying) -> List<String> / {abort.raise} = {
-  let said = String::join(s.words, s.separator) ++ String::join(s.marks, "");
+fn spoken(s: ShoutRequest) -> List<String> = {
+  let joined_words = String::join(s.words, s.separator) ++ String::join(s.marks, "");
   let voiced = match s.voice {
-    Plain -> said,
-    Upper -> unicode::uppercase(said),
-    Lower -> unicode::lowercase(said),
+    Plain -> joined_words,
+    Upper -> unicode::uppercase(joined_words),
+    Lower -> unicode::lowercase(joined_words),
   };
   range(0, s.times).map(|_: Int| voiced)
 }
 
-fn result(a: Asked) -> List<String> / {abort.raise} =
+fn result(a: Command) -> List<String> / {abort.raise} =
   match a {
     Say(s) -> spoken(s),
     Completions(shell) -> [cli::completion(line(), shell)],
     Manual(path) -> [cli::man_page(line(), path)],
   }
 
-/// Run as `ply run examples/shout.ply -- say -u hello world`. Help and the version go to
-/// the output stream; a rejection goes to the error stream and exits 2.
 fn main() -> Unit / {process.args[proc], process.out[proc], process.err[proc], process.exit[proc], abort.raise} =
-  match cli::reply(line(), asked(process.args[proc](), []), Some(80)) {
+  match cli::reply(line(), parse_command(process.args[proc](), []), Some(80)) {
     Ok(a) -> {
-      result(a).fold((), |_: Unit, said: String| process.out[proc](said));
+      result(a).fold((), |_: Unit, output_line: String| process.out[proc](output_line));
       process.exit[proc](0)
     },
-    Err(said) -> {
-      if said.code == 0 { process.out[proc](said.text) } else { process.err[proc](said.text) };
-      process.exit[proc](said.code)
+    Err(reply) -> {
+      if reply.code == 0 { process.out[proc](reply.text) } else { process.err[proc](reply.text) };
+      process.exit[proc](reply.code)
     },
   }
 
-// --- Tests ------------------------------------------------------------------
-
-fn plainly(words: List<String>) -> Saying =
+fn plainly(words: List<String>) -> ShoutRequest =
   { words: words, times: 1, voice: Plain, separator: " ", marks: [] }
 
-type Line = { argv: List<String>, asks: Asked }
+type Line = { argv: List<String>, command: Command }
 
 fn lines() -> List<Line> =
   [
-    { argv: ["say", "hello", "world"], asks: Say(plainly(["hello", "world"])) },
+    { argv: ["say", "hello", "world"], command: Say(plainly(["hello", "world"])) },
     {
       argv: ["say", "-un3", "hello", "--between=, ", "-m!", "--mark", "?"],
-      asks: Say({ words: ["hello"], times: 3, voice: Upper, separator: ", ", marks: ["!", "?"] }),
+      command: Say({
+        words: ["hello"],
+        times: 3,
+        voice: Upper,
+        separator: ", ",
+        marks: ["!", "?"],
+      }),
     },
     {
       argv: ["say", "--lower", "--", "-HELLO-"],
-      asks: Say({ ..plainly(["-HELLO-"]), voice: Lower }),
+      command: Say({ ..plainly(["-HELLO-"]), voice: Lower }),
     },
-    { argv: ["completions", "fish"], asks: Completions(Fish) },
-    { argv: ["manual"], asks: Manual([]) },
-    { argv: ["manual", "say"], asks: Manual(["say"]) },
+    { argv: ["completions", "fish"], command: Completions(Fish) },
+    { argv: ["manual"], command: Manual([]) },
+    { argv: ["manual", "say"], command: Manual(["say"]) },
   ]
 
 test "shout {String::join(c.argv, " ")} asks for what it writes" for c: Line in lines() {
-  assert_eq(asked(c.argv, []), Run(c.asks))
+  assert_eq(parse_command(c.argv, []), Run(c.command))
 }
 
-test "the declaration has no fault" { assert_eq(cli::faults(line()), []) }
+test "`cli::faults` reports no errors in the command-line declaration" {
+  assert_eq(cli::faults(line()), [])
+}
 
-test "a line that breaks a rule is rejected with the rule" {
+test "a command line that breaks a rule fails with an error that names that rule" {
   assert_eq(
-    asked(["say", "-ul", "hello"], []),
+    parse_command(["say", "-ul", "hello"], []),
     Failed({ path: ["say"], reason: cli::Conflict("lower", "upper") }),
   );
   assert_eq(
-    asked(["say", "--times", "0", "hello"], []),
-    Failed({ path: ["say"], reason: cli::InvalidValue("times", "0", "0 is not in 1..") }),
+    parse_command(["say", "--times", "0", "hello"], []),
+    Failed({
+      path: ["say"],
+      reason: cli::InvalidValue("times", "0", "a number of 1 or more is required"),
+    }),
   );
   assert_eq(
-    asked(["say"], []),
+    parse_command(["say"], []),
     Failed({ path: ["say"], reason: cli::MissingPositionals(["WORDS"]) }),
   );
   assert_eq(
-    asked(["completions", "tcsh"], []),
+    parse_command(["completions", "tcsh"], []),
     Failed({
       path: ["completions"],
       reason: Rejected("`tcsh` is no shell: not one of bash, zsh, fish"),
@@ -208,13 +205,16 @@ test "a line that breaks a rule is rejected with the rule" {
   )
 }
 
-test "a flag left off the line stands at its setting" {
-  let held = [{ key: "SHOUT_TIMES", value: "2" }];
-  assert_eq(asked(["say", "hi"], held), Run(Say({ ..plainly(["hi"]), times: 2 })));
-  assert_eq(asked(["say", "hi", "-n4"], held), Run(Say({ ..plainly(["hi"]), times: 4 })))
+test "a flag omitted from the command line takes its value from the settings, and a given flag overrides it" {
+  let settings = [{ key: "SHOUT_TIMES", value: "2" }];
+  assert_eq(parse_command(["say", "hi"], settings), Run(Say({ ..plainly(["hi"]), times: 2 })));
+  assert_eq(
+    parse_command(["say", "hi", "-n4"], settings),
+    Run(Say({ ..plainly(["hi"]), times: 4 })),
+  )
 }
 
-test "the words are said as the line asks" {
+test "`spoken` joins the words with the separator, appends the punctuation marks, converts the case for the voice and repeats that text `times` times" {
   assert_eq(spoken(plainly(["hello", "world"])), ["hello world"]);
   assert_eq(
     spoken({ words: ["a", "b"], times: 2, voice: Upper, separator: "-", marks: ["!", "?"] }),
@@ -222,7 +222,6 @@ test "the words are said as the line asks" {
   )
 }
 
-/// What a run with these arguments wrote, and the code it asked to exit with.
 fn ran(argv: List<String>) -> FakeProcess / {abort.raise} =
   handle {
     main()
@@ -239,7 +238,7 @@ fn ran(argv: List<String>) -> FakeProcess / {abort.raise} =
     return u -> io,
   }
 
-test "the program says its words and exits clean" {
+test "the program prints the words to standard output, prints nothing to standard error and exits with code 0" {
   let run = ran(["say", "-n2", "hello", "world", "-m", "!"]);
   assert_eq(run.out, ["hello world!", "hello world!"]);
   assert_eq(run.err, []);

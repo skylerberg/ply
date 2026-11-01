@@ -1,37 +1,39 @@
-//! ASN.1 in its distinguished encoding (DER): builders that write it, a cursor that reads it, and
-//! a tree for a document whose shape is not known.
+//! ASN.1 in its distinguished encoding (DER): builders that write it, a cursor that reads it, and a
+//! tree for a document whose shape is not known.
 //!
-//! DER gives each value exactly one encoding, which is what lets a signature be checked over
-//! bytes. Certificates, keys and signatures are DER. Every rule that makes the encoding unique is
-//! enforced here, on both sides. A builder computes its own length and writes the shortest form of
-//! everything, so its output is always canonical. A reader rejects, stating why and at which byte,
-//! a length or a tag number not in its shortest form, an indefinite length, a `BOOLEAN` that is
-//! not `00` or `FF`, an `INTEGER` with an octet its sign makes redundant, a `BIT STRING` whose
-//! unused bits are set, an identifier arc with a leading `80`, a `SET OF` out of order, a character
-//! outside its string type's set, a time not written `YYMMDDHHMMSSZ` or `YYYYMMDDHHMMSS[.f]Z` or
-//! naming no real date, a string or a time in constructed form, a default written out, and
-//! anything after the value. Every length is checked against the remaining input before it is
-//! read, and nesting is limited by the depth a reader is given.
+//! DER gives each value exactly one encoding, so a signature can be checked over bytes.
+//! Certificates, keys and signatures are DER. This module enforces every rule that makes the
+//! encoding unique, on both sides. A builder computes its own lengths and writes the shortest form
+//! of everything, so its output is always canonical. A reader rejects, with the reason and the byte
+//! offset, any of these: - a length or tag number not in its shortest form, or an indefinite
+//! length; - a `BOOLEAN` that is not `00` or `FF`; - an `INTEGER` with a redundant leading octet; -
+//! a `BIT STRING` whose unused bits are set; - an identifier arc with a leading `80`; - a `SET OF`
+//! that is out of order; - a character outside its string type's character set; - a time not
+//! written `YYMMDDHHMMSSZ` or `YYYYMMDDHHMMSS[.f]Z`, or naming no real date; - a string or a time
+//! in constructed form; - a field that equals its default but is written out anyway; - any bytes
+//! after the value. Every length is checked against the remaining input before it is read, and
+//! nesting is limited by the depth the reader is given.
 //!
-//! BER, the looser encoding DER is a subset of, is rejected, and some files called DER are BER: a
-//! PKCS #7 or PKCS #12 bundle from an older tool uses indefinite lengths.
+//! BER, the looser encoding that DER is a subset of, is rejected. Some files called DER are really
+//! BER: a PKCS #7 or PKCS #12 bundle from an older tool uses indefinite lengths.
 //!
 //! A time is an instant, `std.date`'s `OffsetDateTime`. DER writes a time only in UTC, so a reader
 //! returns it at UTC, and a builder writes the instant it is given, whatever its offset. A
-//! `UTCTime`'s two-digit year is one of 1950 to 2049.
+//! `UTCTime`'s two-digit year means a year from 1950 to 2049.
 //!
-//! The cursor is a `Reader`, a window onto the bytes. A read takes the element at its front and
-//! returns its value with the reader after it, so a parser passes one reader through a
-//! `SEQUENCE`'s fields. `read_sequence` returns a reader over the content, and `within` runs a
-//! parser on one and rejects anything it left unread. `read_explicit` and `read_implicit` read a
-//! field a schema tags, and `read_optional` and `read_default` one that may be absent. A read
-//! raises `asn1.fail`, and `decode_with` returns the error as an `Err`.
+//! The cursor is a `Reader`, a window onto the bytes. A read takes the element at the front of the
+//! reader and returns its value together with the reader positioned after it, so a parser passes
+//! one reader through a `SEQUENCE`'s fields. `read_sequence` returns a reader over the content, and
+//! `within` runs a parser on a reader and rejects anything the parser left unread. `read_explicit`
+//! and `read_implicit` read a field that a schema tags, and `read_optional` and `read_default` read
+//! a field that may be absent. A read raises `asn1.fail`, and `decode_with` returns the error as an
+//! `Err`.
 //!
-//! `Value` is a whole document. `decode` and `encode` are each other's inverse and return an error
-//! as an `Err`, and `read` and `write` raise it. The tree names the universal types this module
-//! checks, and any other element is a `Primitive` or a `Constructed` under its tag. A `SET` must be
-//! in `SET OF`'s order, the order of its members' encodings. One whose schema orders it by tag is
-//! read with `read_constructed`.
+//! `Value` is a whole document. `decode` and `encode` are inverses of each other and return an
+//! error as an `Err`, while `read` and `write` raise it. The tree names the universal types this
+//! module checks, and any other element is a `Primitive` or a `Constructed` under its tag. A `SET`
+//! must be in `SET OF` order, the order of its members' encodings. A `SET` whose schema orders its
+//! members by tag is read with `read_constructed`.
 
 import std.bigint
 import std.bigint (BigInt)
@@ -47,8 +49,6 @@ import std.result
 import std.string
 import std.timestamp
 
-// --- Tags -----------------------------------------------------------------------
-
 /// The four namespaces of tag numbers.
 pub type Class =
   /// The types ASN.1 itself defines: `INTEGER` is universal 2.
@@ -57,7 +57,7 @@ pub type Class =
   | Application
   /// Numbers whose meaning the enclosing type defines, as for `[0]`.
   | Context
-  /// Numbers one organisation defines.
+  /// Tag numbers whose meaning an individual organisation defines.
   | Private
 
 /// The type an element declares: a class, and a number in it.
@@ -84,8 +84,6 @@ fn class_of(bits: Int) -> Class =
 fn class_bits(class: Class) -> Int =
   match class { Universal -> 0, Application -> 0x40, Context -> 0x80, Private -> 0xC0 }
 
-// --- Values ---------------------------------------------------------------------
-
 /// The string types whose characters this module checks.
 pub type StringKind =
   /// Any text, in UTF-8.
@@ -98,13 +96,14 @@ pub type StringKind =
   | Ia5String
   /// ASCII from the space to `~`.
   | VisibleString
-  /// Any text, four octets a character.
+  /// Any text, with each character taking four octets.
   | UniversalString
-  /// Text of the Basic Multilingual Plane, two octets a character.
+  /// Text from the Basic Multilingual Plane, with each character taking two octets.
   | BmpString
 
-/// A `BIT STRING`: the bits of `bytes`, most significant first, less the last `unused` of them.
-/// `unused` is 0 to 7, zero where there are no octets, and the bits it leaves out are zero.
+/// A `BIT STRING`: the bits of `bytes`, most significant first, except the last `unused` bits,
+/// which are padding. `unused` is from 0 to 7, and is 0 when `bytes` is empty. The padding bits
+/// must be zero.
 pub type Bits = new { unused: Int, bytes: Bytes }
 
 /// A document, or one element of it.
@@ -134,9 +133,7 @@ pub type Value =
   /// A primitive element of any other tag, such as an implicitly tagged field, with its content.
   | Primitive(Tag, Bytes)
 
-// --- Errors ---------------------------------------------------------------------
-
-/// Why a reader rejected bytes, or a writer a value.
+/// Why a reader rejected some bytes, or a writer rejected a value.
 pub type ErrorKind =
   /// The input ends before the element does.
   | Truncated
@@ -157,7 +154,8 @@ pub type ErrorKind =
   | EndOfContents
   /// An element with a tag other than the one requested. It carries the tag found.
   | WrongTag(Tag)
-  /// A constructed element where its type is primitive, as a string in pieces is, or the reverse.
+  /// An element that is constructed where its type must be primitive (for example a string split
+  /// into pieces), or primitive where its type must be constructed.
   | WrongForm
   /// A `BOOLEAN` that is not the one octet `00` or `FF`.
   | BadBoolean
@@ -174,14 +172,17 @@ pub type ErrorKind =
   | TrailingZeroBits
   /// A `NULL` with content.
   | BadNull
-  /// An identifier with no octets, one that ends inside an arc, or arcs no identifier can have.
+  /// An identifier with no octets, or one that ends in the middle of an arc. A writer also uses it
+  /// for an `Oid` that is not valid.
   | BadOid
   /// An identifier arc with a leading `80`.
   | OverlongArc
-  /// A string with a character its type does not allow. A reader's error is at that octet.
+  /// A string containing a character its type does not allow. When a reader reports it, `Error.at`
+  /// is the octet of that character.
   | BadText(StringKind)
-  /// A time not in DER's one form, or not a real date or time of day, an instant its type cannot
-  /// represent, or in a tree, a time that is not at UTC.
+  /// A time that is not in the single form DER allows, is not a real date or time of day, or that
+  /// its type cannot represent. When a `Value` is written, a time that is not at UTC also causes
+  /// it.
   | BadTime
   /// A `GeneralizedTime` where X.509 writes a `UTCTime`: a year from 1950 to 2049.
   | WrongTimeType
@@ -189,8 +190,9 @@ pub type ErrorKind =
   | Unsorted
   /// A field written out with its schema's default value, which DER requires be left out.
   | DefaultEncoded
-  /// A tag with a negative number or universal 0, or in a tree, a tag the tree reads as another
-  /// kind of value.
+  /// A tag with a negative number or universal number 0. Writing a `Value` also rejects a
+  /// `Primitive` or `Constructed` tag that `Value` has its own variant for, such as `universal(2)`,
+  /// because reading would return that variant instead.
   | BadTag
 
 /// Why a reader rejected its input, and the offset in the input of the problem.
@@ -205,8 +207,6 @@ pub effect asn1 {
 }
 
 fn fail<a>(at: Int, reason: ErrorKind) -> a / {asn1.fail} = asn1.fail({ at: at, reason: reason })
-
-// --- Integers -------------------------------------------------------------------
 
 /// The content of the `INTEGER` `n`: its two's complement in the fewest octets.
 pub fn integer_of_int(n: Int) -> Bytes / {abort.raise} = minimal(u64_be(n))
@@ -235,13 +235,11 @@ pub fn big_int_of_integer(content: Bytes) -> BigInt / {abort.raise} =
     bigint::sub(bigint::neg(bigint::of_bytes(content.xor_byte(0xFF))), bigint::one())
   } else { bigint::of_bytes(content) }
 
-/// Whether the octet at `i` only repeats the sign of the one after it.
 fn redundant(content: Bytes, i: Int) -> Bool / {abort.raise} =
   i + 1 < content.len()
     && ((content.at(i) == 0 && content.at(i + 1) < 0x80)
     || (content.at(i) == 0xFF && content.at(i + 1) >= 0x80))
 
-/// The two's complement `content` in the fewest octets. No octets means zero.
 fn minimal(content: Bytes) -> Bytes / {abort.raise} =
   if content.len() == 0 { b"\x00" }
   else { content.slice(first_significant(content, 0), content.len()) }
@@ -251,15 +249,12 @@ fn first_significant(content: Bytes, i: Int) -> Int / {abort.raise} =
   else if redundant(content, i) { first_significant(content, i + 1) }
   else { i }
 
-/// A magnitude with a zero octet prepended when its first octet would read as a sign, or when it
-/// has no octets.
 fn integer_content(magnitude: Bytes) -> Bytes =
   if magnitude.len() == 0 || magnitude.at(0) >= 0x80 { b"\x00".concat(magnitude) }
   else { magnitude }
 
-// --- Bits and times -------------------------------------------------------------
-
-/// Whether `b` is a valid DER bit string, as `Bits` describes its fields.
+/// Returns whether `b` is a valid DER bit string: `unused` is 0 to 7, `unused` is 0 when there are
+/// no octets, and the unused bits of the last octet are zero.
 pub fn bits_valid(b: Bits) -> Bool / {abort.raise} =
   b.unused >= 0 && b.unused <= 7 && (b.unused == 0 || b.bytes.len() > 0)
     && (b.unused == 0 || b.bytes.at(b.bytes.len() - 1) & (1 << b.unused) - 1 == 0)
@@ -269,13 +264,10 @@ pub fn bits_valid(b: Bits) -> Bool / {abort.raise} =
 pub fn bit_at(b: Bits, i: Int) -> Bool / {abort.raise} =
   i >= 0 && i < 8 * b.bytes.len() - b.unused && b.bytes.at(i / 8) & 0x80 >> i % 8 != 0
 
-/// The UTC date and time of the instant `t`, which is what DER writes.
 fn at_utc(t: OffsetDateTime) -> DateTime = date::local(date::in_utc(t))
 
-/// The UTC year of `t`.
 fn year_of(t: OffsetDateTime) -> Int = date::year(date::date_of(at_utc(t)))
 
-/// The fraction of a second of `t`, in nanoseconds.
 fn nanosecond_of(t: OffsetDateTime) -> Int = date::nanosecond(date::time_of(at_utc(t)))
 
 /// The text of the `UTCTime` of the instant `t`, `YYMMDDHHMMSSZ` in UTC. `None` when `t` has no
@@ -302,22 +294,16 @@ fn clock_text(at: DateTime) -> String = {
     ++ two_digits(date::second(time))
 }
 
-/// `n` in `digits` digits, without its trailing zeros.
 fn fraction_digits(n: Int, digits: Int) -> String =
   if digits > 1 && n % 10 == 0 { fraction_digits(n / 10, digits - 1) }
   else { n.to_string().pad_left(digits, "0") }
 
-// --- Writing --------------------------------------------------------------------
-
-/// A length in the fewest octets: the length itself below 128, and otherwise its octets after
-/// their count.
 fn length_octets(n: Int) -> Bytes / {abort.raise} =
   if n < 0x80 { byte_of_int(n) } else {
     let octets = u64_be(n).strip_leading_zeros();
     byte_of_int(0x80 | octets.len()).concat(octets)
   }
 
-/// `n` in base 128, most significant first, the high bit set on every octet but the last.
 fn septets(n: Int) -> Bytes = septets_before(n / 128, byte_of_int(n & 0x7F))
 
 fn septets_before(n: Int, low: Bytes) -> Bytes =
@@ -330,7 +316,6 @@ fn identifier(tag: Tag, constructed: Bool) -> Bytes / {asn1.unwritable, abort.ra
   else { byte_of_int(first_significant | 0x1F).concat(septets(tag.number)) }
 }
 
-/// An element whose identifier is the one octet `first_significant`.
 fn element(first_significant: Int, content: Bytes) -> Bytes / {abort.raise} =
   Bytes::concat_all([byte_of_int(first_significant), length_octets(content.len()), content])
 
@@ -468,13 +453,8 @@ pub fn implicit(tag: Tag, inner: Bytes) -> Bytes / {asn1.unwritable, abort.raise
     }
   }
 
-// --- Reading: one element's header ----------------------------------------------
-
-/// One element's header: its tag, its form, and where its content lies in the input.
 type Header = { tag: Tag, constructed: Bool, from: Int, to: Int }
 
-/// A base-128 number in a tag or an arc: its value and where it ends, or that the input ended
-/// inside it, that it has a leading `80`, or that it is wider than 63 bits.
 type Septets = | Number(Int, Int) | Ended | Padded | Overflow
 
 fn septets_at(data: Bytes, at: Int, end: Int) -> Septets / {abort.raise} =
@@ -491,7 +471,6 @@ fn septets_from(data: Bytes, at: Int, end: Int, value: Int, left: Int) -> Septet
     else { septets_from(data, at + 1, end, more, left - 1) }
   }
 
-/// The header of the element at `at`, whose content must lie before `end`.
 fn header_at(data: Bytes, at: Int, end: Int) -> Header / {asn1.fail, abort.raise} =
   if at >= end { fail(at, Truncated) } else {
     let first = data.at(at);
@@ -517,7 +496,6 @@ fn header_at(data: Bytes, at: Int, end: Int) -> Header / {asn1.fail, abort.raise
     }
   }
 
-/// The length at `at`, and where the content it measures starts.
 fn length_at(
   data: Bytes,
   at: Int,
@@ -536,8 +514,6 @@ fn length_at(
       else { { length: length, from: at + 1 + octets } }
     }
   }
-
-// --- Reading: what each type's content must be ----------------------------------
 
 fn boolean_of(content: Bytes, at: Int) -> Bool / {asn1.fail} =
   if content == b"\x00" { false } else if content == b"\xff" { true } else { fail(at, BadBoolean) }
@@ -587,18 +563,16 @@ fn oid_of(content: Bytes, at: Int) -> Oid / {asn1.fail, abort.raise} =
       ),
   }
 
-/// The numbers in an identifier's content, the first of which combines its first two arcs. An arc
-/// takes at least one octet, so `left`, the content's length, bounds the recursion.
 fn arcs_of(
   content: Bytes,
   i: Int,
   at: Int,
-  acc: List<Int>,
+  accumulator: List<Int>,
   left: Int,
 ) -> List<Int> / {asn1.fail, abort.raise} =
-  if i >= content.len() || left <= 0 { acc } else {
+  if i >= content.len() || left <= 0 { accumulator } else {
     match septets_at(content, i, content.len()) {
-      Number(arc, next) -> arcs_of(content, next, at, acc.push(arc), left - 1),
+      Number(arc, next) -> arcs_of(content, next, at, accumulator.push(arc), left - 1),
       Ended -> fail(at + i, BadOid),
       Padded -> fail(at + i, OverlongArc),
       Overflow -> fail(at + i, TooWide),
@@ -628,7 +602,6 @@ fn string_kind(number: Int) -> Option<StringKind> =
     _ -> None,
   }
 
-/// The offset of the first octet that a string of an ASCII kind does not allow.
 fn first_invalid_octet(kind: StringKind, content: Bytes) -> Option<Int> =
   content.position(0, |b: Int|
     !(match kind {
@@ -652,7 +625,6 @@ fn text_of(kind: StringKind, content: Bytes, at: Int) -> String / {asn1.fail, ab
     },
   }
 
-/// Text of `width` octets a character, most significant first.
 fn wide_text(
   kind: StringKind,
   content: Bytes,
@@ -672,8 +644,6 @@ fn wide_text(
     )
   }
 
-/// The `n` decimal digits at `from` as a number, or `None` if anything else is there. `content`
-/// must reach that far.
 fn digits_at(content: Bytes, from: Int, n: Int) -> Option<Int> / {abort.raise} =
   range(from, from + n).fold(Some(0), |so_far: Option<Int>, i: Int|
     match so_far {
@@ -681,8 +651,6 @@ fn digits_at(content: Bytes, from: Int, n: Int) -> Option<Int> / {abort.raise} =
       _ -> None,
     })
 
-/// The instant whose UTC time is `year` and the five two-digit fields at `from`, if they form a
-/// real date and time of day. No second is a leap second.
 fn date_time_at(
   year: Int,
   content: Bytes,
@@ -700,7 +668,6 @@ fn date_time_at(
     _ -> None,
   }
 
-/// A two-digit year means 1950 to 2049, as RFC 5280 reads one.
 fn utc_time_of(content: Bytes, at: Int) -> OffsetDateTime / {asn1.fail, abort.raise} = {
   let read = if content.len() != 13 || content.at(12) != 0x5A { None } else {
     match digits_at(content, 0, 2) {
@@ -723,16 +690,12 @@ fn generalized_time_of(content: Bytes, at: Int) -> OffsetDateTime / {asn1.fail, 
   }
 }
 
-/// The nanoseconds of the fraction between the seconds and the `Z` at `z`: a `.`, then at most
-/// nine digits that do not end in a zero.
 fn fraction_of(content: Bytes, at: Int, z: Int) -> Int / {asn1.fail, abort.raise} =
   if content.at(14) != 0x2E || z < 16 || content.skip(15, b"0123456789") < z
       || content.at(z - 1) == 0x30 { fail(at, BadTime) }
   else if z > 24 { fail(at, TooWide) } else {
     range(15, 24).fold(0, |n: Int, i: Int| n * 10 + (if i < z { content.at(i) - 48 } else { 0 }))
   }
-
-// --- Reading: the cursor --------------------------------------------------------
 
 /// A window onto DER: the elements from `at` up to `end` in `data`, and how many more levels a
 /// read may enter. `implicit` is the tag the next typed read expects in place of its type's own.
@@ -757,7 +720,6 @@ pub fn peek(r: Reader) -> Option<Tag> / {asn1.fail, abort.raise} =
 
 fn after(r: Reader, h: Header) -> Reader = { ..r, at: h.to, implicit: None }
 
-/// The next element's header, which must have `tag` and the requested form.
 fn expect(r: Reader, tag: Tag, constructed: Bool) -> Header / {asn1.fail, abort.raise} = {
   let h = header_at(r.data, r.at, r.end);
   if h.tag != tag { fail(r.at, WrongTag(h.tag)) }
@@ -765,8 +727,6 @@ fn expect(r: Reader, tag: Tag, constructed: Bool) -> Header / {asn1.fail, abort.
   else { h }
 }
 
-/// The next element's header for a read of the universal type `number`, or of the tag an
-/// enclosing `read_implicit` gave it.
 fn expect_universal(
   r: Reader,
   number: Int,
@@ -774,7 +734,6 @@ fn expect_universal(
 ) -> Header / {asn1.fail, abort.raise} =
   expect(r, match r.implicit { Some(tag) -> tag, None -> universal(number) }, constructed)
 
-/// A primitive element of the universal type `number`, its content read by `of`.
 fn leaf<a>(
   r: Reader,
   number: Int,
@@ -872,8 +831,9 @@ pub fn read_constructed(r: Reader, tag: Tag) -> ReadResult<Reader> / {asn1.fail,
 pub fn read_sequence(r: Reader) -> ReadResult<Reader> / {asn1.fail, abort.raise} =
   enter(r, expect_universal(r, 16, true))
 
-/// Runs `item` on the reader `inner` returns, which it must leave empty, or fails with `Trailing`.
-/// Returns what `item` read, and the reader after the element `inner` was read from.
+/// Reads the element in `inner` with `item` and returns its value together with the reader that
+/// followed that element in the original input. Fails with `Trailing` if `item` leaves unread
+/// content in the element.
 pub fn within<a | e>(
   inner: ReadResult<Reader>,
   item: (Reader) -> ReadResult<a> / {asn1.fail, abort.raise | e},
@@ -891,9 +851,10 @@ pub fn read_explicit<a | e>(
   item: (Reader) -> ReadResult<a> / {asn1.fail, abort.raise | e},
 ) -> ReadResult<a> / {asn1.fail, abort.raise | e} = within(read_constructed(r, tag), item)
 
-/// A field tagged implicitly, `[n] IMPLICIT`: `item` reads the next element, expecting `tag` in
-/// place of its type's own. `item` is one of this module's typed reads, or `read_sequence_of` or
-/// `read_set_of`. A read that names a tag itself is not changed.
+/// Reads a field tagged implicitly, `[n] IMPLICIT`: `item` reads the next element, expecting `tag`
+/// in place of its type's own. `item` is one of this module's typed reads, or `read_sequence_of` or
+/// `read_set_of`. A read that names its own tag, such as `read_primitive`, ignores the implicit
+/// tag.
 pub fn read_implicit<a | e>(
   r: Reader,
   tag: Tag,
@@ -930,24 +891,21 @@ pub fn read_default<a | e>(
   }
 }
 
-/// The members of the constructed element `inner` covers, each one element read whole by `item`.
-/// `sorted` requires them in the order of their encodings, `last` being the one before. An element
-/// takes at least two octets, so `left`, the number of octets, bounds the recursion.
 fn members<a | e>(
   inner: Reader,
   item: (Reader) -> ReadResult<a> / {asn1.fail, abort.raise | e},
   sorted: Bool,
   last: Bytes,
-  acc: List<a>,
+  accumulator: List<a>,
   left: Int,
 ) -> List<a> / {asn1.fail, abort.raise | e} =
-  if is_empty(inner) || left <= 0 { acc } else {
+  if is_empty(inner) || left <= 0 { accumulator } else {
     let h = header_at(inner.data, inner.at, inner.end);
     let whole = if sorted { inner.data.slice(inner.at, h.to) } else { b"" };
     if compare(last, whole) == Greater { fail(inner.at, Unsorted) } else {
       let read = item({ ..inner, end: h.to });
       finish(read.rest);
-      members({ ..inner, at: h.to }, item, sorted, whole, acc.push(read.value), left - 1)
+      members({ ..inner, at: h.to }, item, sorted, whole, accumulator.push(read.value), left - 1)
     }
   }
 
@@ -1000,22 +958,16 @@ pub fn read_with<a | e>(
   read.value
 }
 
-/// `read_with`, returning an error as an `Err`.
+/// Reads with `read_with` and returns a failure as an `Err` instead of raising `asn1.fail`.
 pub fn decode_with<a | e>(
   data: Bytes,
   depth: Int,
   item: (Reader) -> ReadResult<a> / {asn1.fail, abort.raise | e},
 ) -> Result<a, Error> / {abort.raise | e} = try { read_with(data, depth, item) }
 
-// --- The tree -------------------------------------------------------------------
-
-/// The universal types that are constructed: `EXTERNAL`, `EMBEDDED PDV`, `SEQUENCE`, `SET` and
-/// `CHARACTER STRING`. Every other is primitive in DER.
 fn is_constructed_type(number: Int) -> Bool =
   number == 8 || number == 11 || number == 16 || number == 17 || number == 29
 
-/// Whether the tree reads an element of this tag and form as a `Primitive` or a `Constructed`,
-/// since it has no other kind of value for it.
 fn untyped(tag: Tag, constructed: Bool) -> Bool =
   if tag.class != Universal { true }
   else if constructed { tag.number == 8 || tag.number == 11 || tag.number == 29 } else {
@@ -1047,8 +999,6 @@ fn leaf_value(tag: Tag, content: Bytes, at: Int) -> Value / {asn1.fail, abort.ra
     }
   }
 
-/// The element at `at` as a tree, and where it ends. `room` is how many levels deeper it may
-/// nest, and each constructed element uses one.
 fn tree_at(
   data: Bytes,
   at: Int,
@@ -1072,7 +1022,6 @@ fn tree_at(
   }
 }
 
-/// The elements from `at` to `end`, as `members` reads a constructed element's.
 fn trees(
   data: Bytes,
   at: Int,
@@ -1080,14 +1029,15 @@ fn trees(
   depth_left: Int,
   sorted: Bool,
   last: Bytes,
-  acc: List<Value>,
+  accumulator: List<Value>,
   left: Int,
 ) -> List<Value> / {asn1.fail, abort.raise} =
-  if at >= end || left <= 0 { acc } else {
+  if at >= end || left <= 0 { accumulator } else {
     let tree = tree_at(data, at, end, depth_left);
     let whole = if sorted { data.slice(at, tree.at) } else { b"" };
-    if compare(last, whole) == Greater { fail(at, Unsorted) }
-    else { trees(data, tree.at, end, depth_left, sorted, whole, acc.push(tree.value), left - 1) }
+    if compare(last, whole) == Greater { fail(at, Unsorted) } else {
+      trees(data, tree.at, end, depth_left, sorted, whole, accumulator.push(tree.value), left - 1)
+    }
   }
 
 /// The document `data` encodes, nested at most `depth` deep. Raises `asn1.fail` where `decode`
@@ -1100,15 +1050,15 @@ pub fn read(data: Bytes, depth: Int) -> Value / {asn1.fail, abort.raise} =
 pub fn decode(data: Bytes, depth: Int) -> Result<Value, Error> / {abort.raise} =
   try { read(data, depth) }
 
-/// An `INTEGER`'s content as a tree stores it, which is as a reader returns it.
 fn exact_integer(content: Bytes) -> Bytes / {asn1.unwritable, abort.raise} =
   if content.len() == 0 { asn1.unwritable(EmptyInteger) }
   else if redundant(content, 0) { asn1.unwritable(OverlongInteger) }
   else { content }
 
-/// The encoding of `v`. Raises `asn1.unwritable` where `encode` returns `Err`. A tree is written
-/// only in the form `read` would have returned it: an `Integer` in its fewest octets, a `Set` in
-/// order, and a `Primitive` or a `Constructed` only under a tag the tree has no other reading of.
+/// Returns the encoding of `v`. Raises `asn1.unwritable` where `encode` returns `Err`. It writes
+/// only trees that `read` could have returned: an `Integer` uses the fewest octets, a `Set` is in
+/// order, and a `Primitive` or `Constructed` has a tag that `read` would not turn into another kind
+/// of value.
 pub fn write(v: Value) -> Bytes / {asn1.unwritable, abort.raise} =
   match v {
     Boolean(b) -> boolean(b),
@@ -1137,9 +1087,6 @@ pub fn write(v: Value) -> Bytes / {asn1.unwritable, abort.raise} =
 /// The encoding of `v`, or why it has none.
 pub fn encode(v: Value) -> Result<Bytes, ErrorKind> / {abort.raise} = try { write(v) }
 
-// --- Laws -----------------------------------------------------------------------
-
-/// How deep `v` nests: the depth a reader needs for it.
 fn height(v: Value) -> Int =
   match v {
     Sequence(children) | Set(children) | Constructed(_, children) ->
@@ -1147,8 +1094,6 @@ fn height(v: Value) -> Int =
     _ -> 0,
   }
 
-/// Whether `t` is a real date and time of day as `std.date` makes them, which a test that draws
-/// its constructors directly may not produce.
 fn in_calendar(t: OffsetDateTime) -> Bool =
   match t {
     OffsetDateTime(DateTime(on, clock), _) ->
@@ -1156,7 +1101,6 @@ fn in_calendar(t: OffsetDateTime) -> Bool =
         && date::time_of_nanos(date::nanos_of_day(clock)) == Some(clock),
   }
 
-/// Whether every time in `v` is in the calendar.
 fn all_times_valid(v: Value) -> Bool =
   match v {
     UtcTime(t) | GeneralizedTime(t) -> in_calendar(t),
@@ -1167,21 +1111,17 @@ fn all_times_valid(v: Value) -> Bool =
 fn can_encode(v: Value) -> Bool / {abort.raise} =
   all_times_valid(v) && (match encode(v) { Ok(_) -> true, Err(_) -> false })
 
-/// Whether `data` is rejected, or read as a value that writes back as exactly `data`.
 fn rewritten(data: Bytes) -> Bool / {abort.raise} =
   match decode(data, 64) { Err(_) -> true, Ok(v) -> encode(v) == Ok(data) }
 
-/// `data` with one octet, at `at` wrapped into its range, replaced by `octet`'s low eight bits.
 fn altered(data: Bytes, at: Int, octet: Int) -> Bytes / {abort.raise} =
   if data.len() == 0 { data } else {
     let i = (at & 9223372036854775807) % data.len();
     Bytes::concat_all([data.slice(0, i), byte_of_int(octet & 0xFF), data.slice(i + 1, data.len())])
   }
 
-/// An object identifier of any arcs, whether or not it can be written.
 fn oids() -> gen::Gen<Oid> = gen::map(gen::list(gen::any_int()), |arcs: List<Int>| Oid(arcs))
 
-/// A `Value` as a test draws one.
 fn values_at(depth: Int) -> gen::Gen<Value> =
   if depth <= 0 {
     gen::one_of([
@@ -1219,12 +1159,10 @@ fn values_at(depth: Int) -> gen::Gen<Value> =
 
 fn values() -> gen::Gen<Value> = gen::sized(|size: Int| values_at(min(max(size / 16, 0), 3)))
 
-/// A `Bits` as a test draws one.
 fn arbitrary_bits() -> gen::Gen<Bits> =
   gen::map2(gen::any_int(), gen::bytes(), |unused: Int, bytes: Bytes|
     { unused: unused, bytes: bytes })
 
-/// A `StringKind` as a test draws one.
 fn string_kinds() -> gen::Gen<StringKind> =
   gen::elements([
     Utf8String,
@@ -1236,14 +1174,12 @@ fn string_kinds() -> gen::Gen<StringKind> =
     BmpString,
   ])
 
-/// A `Tag` as a test draws one.
 fn tags() -> gen::Gen<Tag> =
   gen::map2(classes(), gen::any_int(), |class: Class, number: Int| { class: class, number: number })
 
-/// A `Class` as a test draws one.
 fn classes() -> gen::Gen<Class> = gen::elements([Universal, Application, Context, Private])
 
-test "a value that writes reads back as itself" {
+test "`decode` of the bytes `write` produces for an encodable value returns that same value" {
   gen::check(values(), |v: Value|
     if can_encode(v) { decode(write(v), height(v)) == Ok(v) } else { true })
 }
@@ -1255,8 +1191,6 @@ test "a written value with one octet changed is rejected or is another value's e
 
 law "a Bool reads back from the BOOLEAN written for it" =
   round_trip(boolean, |der: Bytes| decode_with(der, 0, read_boolean).ok())
-
-// --- Tests ----------------------------------------------------------------------
 
 type Vector = { name: String, der: Bytes, value: Value }
 
@@ -1370,7 +1304,7 @@ fn vectors() -> List<Vector> / {abort.raise} =
       Primitive(context(9223372036854775807), b""),
     ),
     vector(
-      "a universal type the tree does not check",
+      "a universal type the tree is not valid",
       b"\x14\x03abc",
       Primitive(universal(20), b"abc"),
     ),
@@ -1393,7 +1327,8 @@ fn vectors() -> List<Vector> / {abort.raise} =
     ),
   ]
 
-test "{c.name} reads as its value and writes back" for c: Vector in vectors() {
+test "`decode` returns the expected value for the DER bytes of {c.name}, and `encode` returns those bytes for the value" for c: Vector in vectors(
+  ) {
   assert_eq(decode(c.der, 1), Ok(c.value));
   assert_eq(encode(c.value), Ok(c.der))
 }
@@ -1591,11 +1526,9 @@ fn rejected_inputs() -> List<RejectedInput> / {abort.raise} =
     ),
   ]
 
-test "the tree rejects {c.name}" for c: RejectedInput in rejected_inputs() {
-  assert_eq(decode(c.der, 4), Err({ at: c.at, reason: c.reason }))
-}
+test "`decode` fails on the malformed DER bytes {c.name}, reporting the byte offset and the reason for the error" for c: RejectedInput in rejected_inputs(
+  ) { assert_eq(decode(c.der, 4), Err({ at: c.at, reason: c.reason })) }
 
-/// A cursor read, for a test table to name.
 type CursorRead =
   | AnInt
   | AMagnitude
@@ -1778,14 +1711,15 @@ fn rejected_reads() -> List<RejectedRead> / {abort.raise} =
     ),
   ]
 
-test "the cursor rejects {c.name}" for c: RejectedRead in rejected_reads() {
+test "`decode_with` fails when its reader function reads the malformed DER bytes {c.name}, reporting the byte offset and reason" for c: RejectedRead in rejected_reads(
+  ) {
   assert_eq(
     decode_with(c.der, 2, |r: Reader| run_read(c.read, r)),
     Err({ at: c.at, reason: c.reason }),
   )
 }
 
-test "an INTEGER is the fewest octets of its two's complement, as an Int, a BigInt or octets" {
+test "an INTEGER is written as the fewest octets of its two's complement, whether built from an Int, a BigInt or octets" {
   let ints = [
     { n: 0, der: "020100" },
     { n: 127, der: "02017f" },
@@ -1848,7 +1782,7 @@ test "an INTEGER is the fewest octets of its two's complement, as an Int, a BigI
   assert_eq(decode_with(Bytes::of_hex("0a0103"), 0, read_enumerated), Ok(3))
 }
 
-test "a builder writes the shortest length and tag, and a tag takes another's place or wraps it" {
+test "`octet_string`, `primitive` and `constructed` write the shortest length and tag bytes, and `explicit` and `implicit` wrap or replace a tag" {
   let header_at = |der: Bytes, n: Int| der.slice(0, n).hex_of();
   assert_eq(header_at(octet_string(zeros(127)), 2), "047f");
   assert_eq(header_at(octet_string(zeros(128)), 3), "048180");
@@ -1888,7 +1822,7 @@ test "a builder writes the shortest length and tag, and a tag takes another's pl
   )
 }
 
-test "a string contains only its type's characters, and a writer rejects any other" {
+test "each string type accepts only its own characters, and writing a string with any other character fails" {
   let kinds = [
     Utf8String,
     NumericString,
@@ -1927,7 +1861,7 @@ test "a string contains only its type's characters, and a writer rejects any oth
   assert_eq(try { string(BmpString, "\u{ffff}") }, Ok(Bytes::of_hex("1e02ffff")))
 }
 
-test "a time is written in the one form DER has, and a certificate's by its year" {
+test "a time is written in the single text form DER allows, and a certificate time uses UTC time or generalized time depending on its year" {
   let t = timestamp"2019-12-16T03:02:10Z";
   assert_eq(utc_time_text(t), Some("191216030210Z"));
   assert_eq(generalized_time_text(t), "20191216030210Z");
@@ -1975,12 +1909,11 @@ test "a two-digit year is read as 1950 to 2049" {
   assert_eq(["50", "51", "99", "00", "01", "49"].map(year), [1950, 1951, 1999, 2000, 2001, 2049])
 }
 
-test "a time is written as its instant in UTC, and a tree contains one only at UTC" {
+test "a time with an offset is written as its UTC instant, and a `Value` accepts a time only in UTC" {
   let children = timestamp"2019-12-16T05:02:10+02:00";
   assert_eq(utc_time_text(children), Some("191216030210Z"));
   assert_eq(generalized_time_text(children), "20191216030210Z");
   assert_eq(try { utc_time(children) }, Ok(b"\x17\x0d191216030210Z"));
-  // The year is the UTC year: 2049 at this offset is 2050 in UTC, and 1950 at that one is 1949.
   let late = timestamp"2049-12-31T23:30:00-01:00";
   assert_eq(utc_time_text(late), None);
   assert_eq(try { time(late) }, Ok(b"\x18\x0f20500101003000Z"));
@@ -2006,7 +1939,7 @@ test "a time is read only when its date is a real calendar date" {
   assert(reads(0, 1, 1) && reads(9999, 12, 31) && !reads(2023, 0, 1) && !reads(2023, 13, 1))
 }
 
-test "bits are counted from the first octet's top, and named bits end at the last one set" {
+test "`bit_at` counts bits from the high bit of the first byte, and `bits_valid` rejects unused-bit counts the bytes do not allow" {
   let bits: Bits = { unused: 6, bytes: Bytes::of_hex("6e5dc0") };
   assert_eq(range(0, 20).map(|i: Int| bit_at(bits, i)), [
     false,
@@ -2099,7 +2032,7 @@ fn card(r: Reader) -> ReadResult<Certificate> / {asn1.fail, abort.raise} =
     }
   })
 
-test "a cursor reads a schema's fields: tagged, optional, defaulted, repeated and raw" {
+test "a `Reader` reads a schema's fields: tagged, optional, defaulted to a given value, repeated, and raw bytes" {
   let algorithm = try { sequence([oid(oid::sha256_with_rsa_encryption()), null()]) };
   let full = try {
     sequence([
@@ -2162,7 +2095,7 @@ test "a cursor reads a schema's fields: tagged, optional, defaulted, repeated an
   assert_eq(decode_with(b"\x14\x02hi", 0, |r: Reader| read_primitive(r, universal(20))), Ok(b"hi"))
 }
 
-test "a tree is written only as it would have been read, and nests as deep as it is given" {
+test "`encode` fails on any value that `decode` could not have returned, such as an empty INTEGER or an unsorted SET" {
   assert_eq(encode(Integer(b"")), Err(EmptyInteger));
   assert_eq(encode(Integer(b"\x00\x01")), Err(OverlongInteger));
   assert_eq(encode(Enumerated(b"\xff\xff")), Err(OverlongInteger));

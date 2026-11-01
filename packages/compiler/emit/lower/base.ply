@@ -12,14 +12,14 @@ import compiler.emit.output (Need)
 import compiler.emit.keys (RootKey, Evidence)
 import compiler.emit.evidence (EffectsEvidence)
 import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsFixed, AsFloat, AsDecimal,
-                               AsWideFixed, Var, Arg, VarOperand, IntOperand, BoolOperand,
+                               AsWideFixed, Variable, Arg, VariableOperand, IntOperand, BoolOperand,
                                FloatOperand, FixedOperand, CharOperand, ZeroOperand, Rvalue,
-                               Convert, Native, Inst, Let, Do, Declaration, Assign, If, Case, Match,
-                               Miss, Loop, Next, Done, Return, Restart, Jump, Fail, Handle,
-                               SiteScope, Inc, Dec, Reset, Free, Destructure, Block, Lambda, Links,
-                               AsWord, AsUnit, AsListView, Aggregate, Primitive, OperandsOnly,
-                               operand_representation, falls_through, is_refcounted, operands,
-                               parts_of, no_links, CleanupScope, Unwinding, LoopVariable)
+                               Convert, Native, Instruction, Let, Do, Declaration, Assign, If, Case,
+                               Match, Miss, Loop, Next, Done, Return, Restart, Jump, Fail, Handle,
+                               SiteScope, Increment, Decrement, Reset, Free, Destructure, Block,
+                               Lambda, Links, AsWord, AsUnit, AsListView, Aggregate, Primitive,
+                               OperandsOnly, operand_representation, falls_through, is_refcounted,
+                               operands, parts_of, no_links, CleanupScope, Unwinding, LoopVariable)
 import compiler.emit.lower.module_context (ModuleContext)
 import compiler.emit.lower.representation (representation_of)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticLayout, StaticWords, AddressWord,
@@ -52,44 +52,45 @@ pub type Context = {
   label_values: List<Option<Arg>>,
   evidence_arguments: List<Arg>,
   instance: Option<HandlerInstance>,
-  kept: List<Arg>,
+  retained_arguments: List<Arg>,
   performs: Effects,
 }
 
-pub type HandlerInstance = { word: Arg, vars: Int }
+pub type HandlerInstance = { word: Arg, variable_count: Int }
 
 pub type CapturedEvidence = {
   words: List<EvidenceWord>,
   instance: Option<HandlerInstance>,
-  kept: List<Arg>,
+  retained_values: List<Arg>,
 }
 
-pub fn no_captured_evidence() -> CapturedEvidence = { words: [], instance: None, kept: [] }
+pub fn no_captured_evidence() -> CapturedEvidence =
+  { words: [], instance: None, retained_values: [] }
 
-pub type EvidenceValues<a> = { words: List<a>, instance: Option<a>, kept: List<a> }
+pub type EvidenceValues<a> = { words: List<a>, instance: Option<a>, retained_values: List<a> }
 
 pub fn listed_evidence_values<a>(h: EvidenceValues<a>) -> List<a> =
-  h.words.concat(match h.instance { Some(i) -> [i], None -> [] }).concat(h.kept)
+  h.words.concat(match h.instance { Some(i) -> [i], None -> [] }).concat(h.retained_values)
 
 pub fn evidence_values_of(h: CapturedEvidence) -> EvidenceValues<Arg> =
   {
     words: h.words.map(|w: EvidenceWord| w.word),
     instance: match h.instance { Some(i) -> Some(i.word), None -> None },
-    kept: h.kept,
+    retained_values: h.retained_values,
   }
 
-pub fn substitute_evidence_vars(
+pub fn substitute_evidence_variables(
   h: CapturedEvidence,
-  vars: EvidenceValues<Var>,
+  variables: EvidenceValues<Variable>,
 ) -> CapturedEvidence =
   {
-    words: zip(h.words, vars.words).map(|p: { first: EvidenceWord, second: Var }|
-      { ..p.first, word: VarOperand(p.second) }),
-    instance: match ((h.instance, vars.instance)) {
-      (Some(i), Some(v)) -> Some({ ..i, word: VarOperand(v) }),
+    words: zip(h.words, variables.words).map(|p: { first: EvidenceWord, second: Variable }|
+      { ..p.first, word: VariableOperand(p.second) }),
+    instance: match ((h.instance, variables.instance)) {
+      (Some(i), Some(v)) -> Some({ ..i, word: VariableOperand(v) }),
       _ -> None,
     },
-    kept: vars.kept.map(VarOperand),
+    retained_values: variables.retained_values.map(VariableOperand),
   }
 
 pub type EvidenceWord = { evidence: Evidence, word: Arg, inherited: Bool, handled: Bool }
@@ -99,7 +100,7 @@ pub type TailCalls = | Restarts(List<Representation>) | Enters(List<RootKey>) | 
 pub type Lowering = {
   next: Int,
   env: Map<Int, Arg>,
-  insts: List<Inst>,
+  instructions: List<Instruction>,
   lambdas: List<Lambda>,
   statics: List<StaticDefinition>,
   links: Links,
@@ -139,12 +140,12 @@ pub type LoweredArm = { arm: CodeArm, guard: Option<LoweredValue>, body: Lowered
 
 pub type GroupMember = { context: Context, body: Code }
 
-pub fn initial_lowering(params: List<Var>) -> Lowering =
+pub fn initial_lowering(params: List<Variable>) -> Lowering =
   {
-    next: params.fold(0, |n: Int, p: Var| if p.id >= n { p.id + 1 } else { n }),
+    next: params.fold(0, |n: Int, p: Variable| if p.id >= n { p.id + 1 } else { n }),
     env: range(0, params.len()).fold(Map::new(), |m: Map<Int, Arg>, i: Int|
-      match params.at(i) { Some(p) -> m.insert(i, VarOperand(p)), None -> m }),
-    insts: [],
+      match params.at(i) { Some(p) -> m.insert(i, VariableOperand(p)), None -> m }),
+    instructions: [],
     lambdas: [],
     statics: [],
     links: no_links(),
@@ -153,9 +154,13 @@ pub fn initial_lowering(params: List<Var>) -> Lowering =
   }
 
 pub fn unreachable<a>(reason: Bytes) -> a / {abort.raise} =
-  panic(String::of_bytes_lossy(b"the lowering met what no checked program holds: ".concat(reason)))
+  panic(
+    String::of_bytes_lossy(
+      b"internal compiler error, impossible in a checked program: ".concat(reason),
+    ),
+  )
 
-pub fn fresh(st: Lowering, ty: Type, rep: Representation) -> { st: Lowering, var: Var } =
+pub fn fresh(st: Lowering, ty: Type, rep: Representation) -> { st: Lowering, var: Variable } =
   { st: { ..st, next: st.next + 1 }, var: { id: st.next, ty: ty, representation: rep } }
 
 pub fn bound(context: Context, st: Lowering, ty: Type, value: Rvalue, at: Span) -> LoweredValue =
@@ -171,7 +176,7 @@ pub fn bound_as(
   let v = fresh(st, ty, rep);
   {
     st: emitted(v.st, Let({ var: v.var, value: value, at: at, unwind: [] })),
-    arg: VarOperand(v.var),
+    arg: VariableOperand(v.var),
   }
 }
 
@@ -179,14 +184,15 @@ pub fn deferred_to_specialisation(
   st: Lowering,
   ty: Type,
   rep: Representation,
-  ops: List<{ arg: Arg, takes: Bool }>,
+  operands: List<{ arg: Arg, takes: Bool }>,
   at: Span,
-) -> LoweredValue = bound_as(st, ty, rep, OperandsOnly(ops), at)
+) -> LoweredValue = bound_as(st, ty, rep, OperandsOnly(operands), at)
 
 pub fn run_for_effect(st: Lowering, value: Rvalue, at: Span) -> Lowering =
   emitted(st, Do({ value: value, at: at, unwind: [] }))
 
-pub fn emitted(st: Lowering, i: Inst) -> Lowering = { ..st, insts: st.insts.push(i) }
+pub fn emitted(st: Lowering, i: Instruction) -> Lowering =
+  { ..st, instructions: st.instructions.push(i) }
 
 pub fn read_note() -> Bytes = b"#read"
 
@@ -219,12 +225,12 @@ fn with_note(st: Lowering, note: Bytes, args: List<Arg>, at: Span) -> Lowering =
     at,
   )
 
-pub fn enter_block(st: Lowering) -> Lowering = { ..st, insts: [] }
+pub fn enter_block(st: Lowering) -> Lowering = { ..st, instructions: [] }
 
 pub fn exit_block(outer: Lowering, inner: Lowering) -> Lowering =
   { ..outer, next: inner.next, lambdas: inner.lambdas, statics: inner.statics, links: inner.links }
 
-pub fn enter_function(st: Lowering, params: List<Var>, env: Map<Int, Arg>) -> Lowering =
+pub fn enter_function(st: Lowering, params: List<Variable>, env: Map<Int, Arg>) -> Lowering =
   {
     ..initial_lowering(params),
     env: env,
@@ -273,13 +279,13 @@ pub fn typed_slot_read(
   slot: Int,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue =
   if !context.captured.contains(slot) && operand_representation(l.arg) != AsWord { l }
   else { retyped(context, l, ty, at) }
 
 pub fn type_of(a: Arg) -> Type =
   match a {
-    VarOperand(v) -> v.ty,
+    VariableOperand(v) -> v.ty,
     IntOperand(_) -> int_type(),
     BoolOperand(_) -> bool_type(),
     FloatOperand(_) -> float_type(),
@@ -310,8 +316,20 @@ pub fn pair_words(
   at: Span,
 ) -> { st: Lowering, lo: Arg, hi: Arg } = {
   let d = represented_as({ st: st, arg: a }, two, at);
-  let lo = bound_as(d.st, int_type(), AsInt, Primitive({ op: b"lo", on: two, args: [d.arg] }), at);
-  let hi = bound_as(lo.st, int_type(), AsInt, Primitive({ op: b"hi", on: two, args: [d.arg] }), at);
+  let lo = bound_as(
+    d.st,
+    int_type(),
+    AsInt,
+    Primitive({ operation: b"lo", on: two, args: [d.arg] }),
+    at,
+  );
+  let hi = bound_as(
+    lo.st,
+    int_type(),
+    AsInt,
+    Primitive({ operation: b"hi", on: two, args: [d.arg] }),
+    at,
+  );
   { st: hi.st, lo: lo.arg, hi: hi.arg }
 }
 
@@ -329,8 +347,8 @@ pub fn represented_as(l: LoweredValue, to: Representation, at: Span) -> LoweredV
       ZeroOperand(r) -> if !is_refcounted(r) && !is_refcounted(to) {
         { st: l.st, arg: ZeroOperand(to) }
       } else { packed },
-      VarOperand(v) -> match packed_from(l.st, v, to) {
-        Some(s) -> { st: l.st, arg: VarOperand(s) },
+      VariableOperand(v) -> match packed_from(l.st, v, to) {
+        Some(s) -> { st: l.st, arg: VariableOperand(s) },
         None -> if is_refcounted(to) && counts_in(to) <= counts_in(v.representation)
             && !slot_named(l.st, v) { packed_after(l.st, v, to, at) }
         else { packed },
@@ -344,36 +362,41 @@ pub fn list_of_view(l: LoweredValue, at: Span) -> LoweredValue =
 
 fn counts_in(r: Representation) -> Int = parts_of(r).filter(is_refcounted).len()
 
-fn slot_named(st: Lowering, v: Var) -> Bool =
-  st.env.fold(false, |named: Bool, _: Int, a: Arg| named || a == VarOperand(v))
+fn slot_named(st: Lowering, v: Variable) -> Bool =
+  st.env.fold(false, |named: Bool, _: Int, a: Arg| named || a == VariableOperand(v))
 
-fn packed_after(st: Lowering, v: Var, to: Representation, at: Span) -> LoweredValue = {
+fn packed_after(st: Lowering, v: Variable, to: Representation, at: Span) -> LoweredValue = {
   let w = fresh(st, v.ty, to);
-  let named = after_last_reference(st.insts, v.id);
-  let k = if named == 0 { st.insts.len() } else { named };
+  let named = after_last_reference(st.instructions, v.id);
+  let k = if named == 0 { st.instructions.len() } else { named };
   {
     st: {
       ..w.st,
-      insts: st.insts.take(k).push(
-        Let({ var: w.var, value: Convert({ arg: VarOperand(v), to: to }), at: at, unwind: [] }),
+      instructions: st.instructions.take(k).push(
+        Let({
+          var: w.var,
+          value: Convert({ arg: VariableOperand(v), to: to }),
+          at: at,
+          unwind: [],
+        }),
       ).concat(
-        st.insts.drop(k),
+        st.instructions.drop(k),
       ),
     },
-    arg: VarOperand(w.var),
+    arg: VariableOperand(w.var),
   }
 }
 
 fn after_last_reference(b: Block, id: Int) -> Int =
-  b.fold_right({ at: b.len(), found: false }, |i: Inst, s: { at: Int, found: Bool }|
+  b.fold_right({ at: b.len(), found: false }, |i: Instruction, s: { at: Int, found: Bool }|
     if s.found { s } else if references(i, id) || (match i { SiteScope(_) -> true, _ -> false }) {
       { ..s, found: true }
     } else { { at: s.at - 1, found: false } }).at
 
-fn references(i: Inst, id: Int) -> Bool = references_variable(i, id, true)
+fn references(i: Instruction, id: Int) -> Bool = references_variable(i, id, true)
 
-fn references_variable(i: Inst, id: Int, binding: Bool) -> Bool = {
-  let within = |b: Block| b.any(|x: Inst| references_variable(x, id, binding));
+fn references_variable(i: Instruction, id: Int, binding: Bool) -> Bool = {
+  let within = |b: Block| b.any(|x: Instruction| references_variable(x, id, binding));
   match i {
     Let(l) ->
       (binding && l.var.id == id)
@@ -396,11 +419,11 @@ fn references_variable(i: Inst, id: Int, binding: Bool) -> Bool = {
     Jump(e) -> e.args.any(|a: Arg| argument_references(a, id)),
     Handle(h) ->
       h.result.id == id || h.args.any(|a: Arg| argument_references(a, id)) || within(h.body),
-    Inc(n) -> n.var.id == id,
-    Dec(v) -> v.id == id,
+    Increment(n) -> n.var.id == id,
+    Decrement(v) -> v.id == id,
     Reset(r) -> r.token.id == id || r.of.id == id,
     Free(f) -> f.of.id == id || argument_references(f.bytes, id),
-    Destructure(o) -> o.of.id == id || o.words.any(|w: Var| w.id == id),
+    Destructure(o) -> o.of.id == id || o.words.any(|w: Variable| w.id == id),
     Fail(_) -> false,
     Miss -> false,
     SiteScope(_) -> false,
@@ -411,13 +434,13 @@ fn references_variable(i: Inst, id: Int, binding: Bool) -> Bool = {
   }
 }
 
-pub fn packed_from(st: Lowering, v: Var, to: Representation) -> Option<Var> = {
-  let declared = |s: Var| st.insts.any(|i: Inst| i == Declaration(s));
-  st.insts.fold(None, |found: Option<Var>, i: Inst|
+pub fn packed_from(st: Lowering, v: Variable, to: Representation) -> Option<Variable> = {
+  let declared = |s: Variable| st.instructions.any(|i: Instruction| i == Declaration(s));
+  st.instructions.fold(None, |found: Option<Variable>, i: Instruction|
     match i {
       Let(l) -> match l.value {
         Convert(p) -> match p.arg {
-          VarOperand(s) -> if l.var == v && s.representation == to && !declared(s) { Some(s) }
+          VariableOperand(s) -> if l.var == v && s.representation == to && !declared(s) { Some(s) }
           else if s == v && l.var.representation == to && !declared(v) { Some(l.var) }
           else if l.var == v { None }
           else { found },
@@ -430,17 +453,17 @@ pub fn packed_from(st: Lowering, v: Var, to: Representation) -> Option<Var> = {
 }
 
 pub fn drop_unread_conversions(b: Block) -> Block =
-  unread_dropped_in(b, |id: Int| b.any(|i: Inst| references_variable(i, id, false)))
+  unread_dropped_in(b, |id: Int| b.any(|i: Instruction| references_variable(i, id, false)))
 
 fn unread_dropped_in(b: Block, read: (Int) -> Bool) -> Block =
-  b.fold([], |acc: List<Inst>, i: Inst|
+  b.fold([], |accumulator: List<Instruction>, i: Instruction|
     match i {
       Let(l) -> match l.value {
-        Convert(_) -> if read(l.var.id) { acc.push(i) } else { acc },
-        _ -> acc.push(i),
+        Convert(_) -> if read(l.var.id) { accumulator.push(i) } else { accumulator },
+        _ -> accumulator.push(i),
       },
       If(x) ->
-        acc.push(
+        accumulator.push(
           If({
             ..x,
             then: unread_dropped_in(x.then, read),
@@ -448,7 +471,7 @@ fn unread_dropped_in(b: Block, read: (Int) -> Bool) -> Block =
           }),
         ),
       Case(c) ->
-        acc.push(
+        accumulator.push(
           Case({
             ..c,
             arms: c.arms.map(|a: { when: Int, body: Block }|
@@ -457,32 +480,33 @@ fn unread_dropped_in(b: Block, read: (Int) -> Bool) -> Block =
           }),
         ),
       Match(m) ->
-        acc.push(
+        accumulator.push(
           Match({
             arms: m.arms.map(|a: Block| unread_dropped_in(a, read)),
             rest: unread_dropped_in(m.rest, read),
           }),
         ),
-      Loop(l) -> acc.push(Loop({ ..l, body: unread_dropped_in(l.body, read) })),
-      Handle(h) -> acc.push(Handle({ ..h, body: unread_dropped_in(h.body, read) })),
-      _ -> acc.push(i),
+      Loop(l) -> accumulator.push(Loop({ ..l, body: unread_dropped_in(l.body, read) })),
+      Handle(h) -> accumulator.push(Handle({ ..h, body: unread_dropped_in(h.body, read) })),
+      _ -> accumulator.push(i),
     })
 
 fn argument_references(a: Arg, id: Int) -> Bool =
-  match a { VarOperand(v) -> v.id == id, _ -> false }
+  match a { VariableOperand(v) -> v.id == id, _ -> false }
 
 pub fn retyped(context: Context, l: LoweredValue, t: Type, at: Span) -> LoweredValue =
   match l.arg {
-    VarOperand(v) -> {
-      let said = refined_type(v.ty, t);
-      let rep = representation_of(context.setting, said);
+    VariableOperand(v) -> {
+      let refined = refined_type(v.ty, t);
+      let rep = representation_of(context.setting, refined);
       if rep == v.representation {
-        if said == v.ty { l } else { { st: l.st, arg: VarOperand({ ..v, ty: said }) } }
-      } else if said == v.ty && v.representation != AsWord { l } else {
+        if refined == v.ty { l } else { { st: l.st, arg: VariableOperand({ ..v, ty: refined }) } }
+      } else if refined == v.ty && v.representation != AsWord { l } else {
         let word = represented_as(l, AsWord, at);
         match word.arg {
-          VarOperand(w) -> if rep == AsWord { { st: word.st, arg: VarOperand({ ..w, ty: said }) } }
-          else { bound_as(word.st, said, rep, Convert({ arg: word.arg, to: rep }), at) },
+          VariableOperand(w) -> if rep == AsWord {
+            { st: word.st, arg: VariableOperand({ ..w, ty: refined }) }
+          } else { bound_as(word.st, refined, rep, Convert({ arg: word.arg, to: rep }), at) },
           _ -> l,
         }
       }
@@ -509,7 +533,7 @@ fn refined_type(s: Type, t: Type) -> Type =
           FunctionType({
             ..f,
             params: refined_types(f.params, g.params),
-            ret: refined_type(f.ret, g.ret),
+            return_type: refined_type(f.return_type, g.return_type),
           })
         },
         _ -> s,
@@ -519,16 +543,16 @@ fn refined_type(s: Type, t: Type) -> Type =
   }
 
 fn refined_types(ss: List<Type>, ts: List<Type>) -> List<Type> =
-  range(0, ss.len()).fold([], |acc: List<Type>, i: Int|
+  range(0, ss.len()).fold([], |accumulator: List<Type>, i: Int|
     match ss.at(i) {
-      Some(x) -> acc.push(match ts.at(i) { Some(y) -> refined_type(x, y), None -> x }),
-      None -> acc,
+      Some(x) -> accumulator.push(match ts.at(i) { Some(y) -> refined_type(x, y), None -> x }),
+      None -> accumulator,
     })
 
 fn refined_fields(fs: List<Field>, gs: List<Field>) -> List<Field> =
   fs.map(|f: Field|
-    match gs.fold(None, |acc: Option<Type>, g: Field|
-        if g.name == f.name { Some(g.ty) } else { acc }) {
+    match gs.fold(None, |accumulator: Option<Type>, g: Field|
+        if g.name == f.name { Some(g.ty) } else { accumulator }) {
       Some(gt) -> { name: f.name, ty: refined_type(f.ty, gt) },
       None -> f,
     })
@@ -543,7 +567,7 @@ fn type_variables_erased(t: Type) -> Type =
       FunctionType({
         ..f,
         params: f.params.map(type_variables_erased),
-        ret: type_variables_erased(f.ret),
+        return_type: type_variables_erased(f.return_type),
       }),
     RecordType(fs) ->
       RecordType(fs.map(|f: Field| { name: f.name, ty: type_variables_erased(f.ty) })),
@@ -559,23 +583,23 @@ pub fn has_unknown_part(t: Type) -> Bool =
   match t {
     VariableType(_) -> true,
     NamedType(c) -> t == word_type() || c.args.any(has_unknown_part),
-    FunctionType(f) -> f.params.push(f.ret).any(has_unknown_part),
+    FunctionType(f) -> f.params.push(f.return_type).any(has_unknown_part),
     RecordType(fs) -> fs.any(|f: Field| has_unknown_part(f.ty)),
     NominalType(x) -> x.fields.any(|f: Field| has_unknown_part(f.ty)),
   }
 
 pub fn as_words(st: Lowering, args: List<Arg>, at: Span) -> { st: Lowering, args: List<Arg> } =
-  args.fold({ st: st, args: [] }, |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
-    let h = represented_as({ st: acc.st, arg: a }, AsWord, at);
-    { st: h.st, args: acc.args.push(h.arg) }
+  args.fold({ st: st, args: [] }, |accumulator: { st: Lowering, args: List<Arg> }, a: Arg| {
+    let h = represented_as({ st: accumulator.st, arg: a }, AsWord, at);
+    { st: h.st, args: accumulator.args.push(h.arg) }
   })
 
 pub fn join_type(context: Context, arms: List<LoweredValue>) -> Type = {
-  let live = arms.filter(|a: LoweredValue| falls_through(a.st.insts));
-  match live.fold(None, |acc: Option<Type>, a: LoweredValue|
-      match acc {
-        Some(_) -> acc,
-        None -> match a.arg { VarOperand(v) -> Some(v.ty), _ -> None },
+  let live = arms.filter(|a: LoweredValue| falls_through(a.st.instructions));
+  match live.fold(None, |accumulator: Option<Type>, a: LoweredValue|
+      match accumulator {
+        Some(_) -> accumulator,
+        None -> match a.arg { VariableOperand(v) -> Some(v.ty), _ -> None },
       }) {
     Some(t) -> t,
     None -> match live.at(0) { Some(a) -> type_of(a.arg), None -> context.result_type },
@@ -585,16 +609,19 @@ pub fn join_type(context: Context, arms: List<LoweredValue>) -> Type = {
 pub fn set_join(
   st: Lowering,
   arm: LoweredValue,
-  j: Var,
+  j: Variable,
   at: Span,
 ) -> { st: Lowering, block: Block } =
-  if !falls_through(arm.st.insts) { { st: st, block: arm.st.insts } } else {
+  if !falls_through(arm.st.instructions) { { st: st, block: arm.st.instructions } } else {
     let h = represented_as(
-      { st: { ..st, insts: arm.st.insts }, arg: arm.arg },
+      { st: { ..st, instructions: arm.st.instructions }, arg: arm.arg },
       j.representation,
       at,
     );
-    { st: { ..h.st, insts: st.insts }, block: h.st.insts.push(Assign({ var: j, arg: h.arg })) }
+    {
+      st: { ..h.st, instructions: st.instructions },
+      block: h.st.instructions.push(Assign({ var: j, arg: h.arg })),
+    }
   }
 
 pub fn join_representation(context: Context, ty: Type, tail: Bool) -> Representation =
@@ -615,11 +642,11 @@ pub fn joined(
   {
     st: {
       ..e.st,
-      insts: cond.st.insts.push(Declaration(j.var)).push(
+      instructions: cond.st.instructions.push(Declaration(j.var)).push(
         If({ cond: cond.arg, then: t.block, otherwise: e.block }),
       ),
     },
-    arg: VarOperand(j.var),
+    arg: VariableOperand(j.var),
   }
 }
 
@@ -636,7 +663,7 @@ pub fn short_circuit(
   {
     st: {
       ..right.st,
-      insts: l.st.insts.push(Declaration(j.var)).push(
+      instructions: l.st.instructions.push(Declaration(j.var)).push(
         If({
           cond: l.arg,
           then: if both { right.block } else { decided },
@@ -644,11 +671,11 @@ pub fn short_circuit(
         }),
       ),
     },
-    arg: VarOperand(j.var),
+    arg: VariableOperand(j.var),
   }
 }
 
-test "a zero is handed as another representation's zero only where neither holds a count" {
+test "a zero converts directly to another representation's zero, except when either representation may be a counted reference" {
   let st = initial_lowering([]);
   let byte = AsFixed({ bits: 8, signed: false });
   assert_eq(
@@ -656,42 +683,46 @@ test "a zero is handed as another representation's zero only where neither holds
     ZeroOperand(byte),
   );
   assert_eq(
-    match represented_as({ st: st, arg: ZeroOperand(AsUnit) }, AsWord, dummy_span()).st.insts {
+    match represented_as(
+        { st: st, arg: ZeroOperand(AsUnit) },
+        AsWord,
+        dummy_span(),
+      ).st.instructions {
       [Let(x)] -> Some({ value: x.value, ty: x.var.ty }),
       _ -> None,
     },
     Some({ value: Convert({ arg: ZeroOperand(AsUnit), to: AsWord }), ty: unit_type() }),
   );
   assert(
-    represented_as({ st: st, arg: ZeroOperand(AsWord) }, AsInt, dummy_span()).st.insts != [],
+    represented_as({ st: st, arg: ZeroOperand(AsWord) }, AsInt, dummy_span()).st.instructions != [],
     None,
   )
 }
 
-test "a word just opened to its type and handed straight back as a word is the word itself" {
+test "converting a word to its typed form and straight back to a word returns the original word, and drops the unused conversion" {
   let int = int_type();
   let w = { id: 0, ty: int, representation: AsWord };
   let enter_block = bound_as(
     initial_lowering([w]),
     int,
     AsInt,
-    Convert({ arg: VarOperand(w), to: AsInt }),
+    Convert({ arg: VariableOperand(w), to: AsInt }),
     dummy_span(),
   );
   let back = represented_as(enter_block, AsWord, dummy_span());
-  assert_eq(back.arg, VarOperand(w));
-  assert_eq(back.st.insts, enter_block.st.insts);
-  assert_eq(drop_unread_conversions(back.st.insts), []);
+  assert_eq(back.arg, VariableOperand(w));
+  assert_eq(back.st.instructions, enter_block.st.instructions);
+  assert_eq(drop_unread_conversions(back.st.instructions), []);
   let named = {
     ..enter_block,
     st: { ..enter_block.st, env: enter_block.st.env.insert(1, enter_block.arg) },
   };
-  assert_eq(represented_as(named, AsWord, dummy_span()).arg, VarOperand(w));
+  assert_eq(represented_as(named, AsWord, dummy_span()).arg, VariableOperand(w));
   let byte = AsFixed({ bits: 8, signed: false });
-  assert(represented_as(enter_block, byte, dummy_span()).arg != VarOperand(w), None)
+  assert(represented_as(enter_block, byte, dummy_span()).arg != VariableOperand(w), None)
 }
 
-test "a static is held once however often it is added, after the static it addresses, and a lambda's are the root's" {
+test "a static data block is stored once however often it is added, after any block it points to, and a lambda's blocks go to the enclosing function" {
   let spelling = StaticWords([BytesWord(b"m.T")]);
   let child = static_added(initial_lowering([]), spelling);
   let parent = static_added(child.st, StaticWords([AddressWord({ name: child.name, tag: 0 })]));

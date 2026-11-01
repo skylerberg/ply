@@ -1,6 +1,3 @@
-//! What `std.password`'s operations compute, against each algorithm's published vectors, and what
-//! they reject before computing anything.
-
 use ply_host::password::{
     self, MAX_ARGON2_WORK, MAX_BCRYPT_COST, MAX_LANES, MAX_LENGTH, MAX_MEMORY_KIB,
     MAX_PBKDF2_ITERATIONS, MAX_SCRYPT_WORK, Work,
@@ -18,7 +15,6 @@ fn hex(text: &str) -> Vec<u8> {
         .collect()
 }
 
-/// RFC 9106 section 5: one password, salt, secret and associated data under each variant.
 #[test]
 fn argon2_returns_rfc_9106s_vectors() {
     let vectors = [
@@ -42,8 +38,6 @@ fn argon2_returns_rfc_9106s_vectors() {
     }
 }
 
-/// The reference implementation's own vector, with neither a secret nor associated data: the
-/// tag of `$argon2id$v=19$m=65536,t=2,p=1$c29tZXNhbHQ$CTFhFdXPJO1aFaMaO6Mm5c8y7cJHAph8ArZWb2GRPPc`.
 #[test]
 fn argon2id_without_a_key_is_what_the_reference_implementation_returns() {
     let made = password::argon2(
@@ -64,7 +58,6 @@ fn argon2id_without_a_key_is_what_the_reference_implementation_returns() {
     );
 }
 
-/// RFC 7914 section 12, without its last vector, which fills a gigabyte.
 #[test]
 fn scrypt_returns_rfc_7914s_vectors() {
     let vectors: [(&str, &str, i64, i64, i64, &str); 3] = [
@@ -103,9 +96,6 @@ fn scrypt_returns_rfc_7914s_vectors() {
     }
 }
 
-/// jBCrypt's vectors, as bytes: `$2a$06$DCq7YPn5Rq63x1Lad4cll.TV4S6ytwfsfvkgY8jIucDrjc8deX1s.`,
-/// `$2a$06$m0CrhHm10qJ3lXRY.5zDGO3rS2KdeeWLuGmsfGlMfOxih58VYVfxe` and
-/// `$2a$08$aTsUwsyowQuzRrDqFflhgekJ8d9/7Z3GV3UcgvzQW3J5zMyrTvlz.`.
 #[test]
 fn bcrypt_returns_jbcrypts_vectors() {
     let vectors: [(&str, i64, &str, &str); 3] = [
@@ -135,10 +125,8 @@ fn bcrypt_returns_jbcrypts_vectors() {
     }
 }
 
-/// The key is the password and its terminating zero, cut to seventy-two bytes: the seventy-second
-/// byte of a password is read, and nothing after it.
 #[test]
-fn bcrypt_reads_seventy_two_bytes_of_a_password() {
+fn bcrypt_uses_only_the_first_seventy_two_bytes_of_a_password() {
     let salt = [7u8; 16];
     let hashed = |secret: &[u8]| password::bcrypt(secret, &salt, 4).expect("within the bounds");
     let long = [b'x'; 80];
@@ -153,7 +141,6 @@ fn bcrypt_reads_seventy_two_bytes_of_a_password() {
     assert_eq!(hashed(&long), hashed(&differs_at_73));
 }
 
-/// RFC 6070's second vector under SHA-1 and RFC 7914 section 11's first under SHA-256.
 #[test]
 fn pbkdf2_returns_the_rfcs_vectors() {
     assert_eq!(
@@ -171,7 +158,6 @@ fn pbkdf2_returns_the_rfcs_vectors() {
 
 const PASSWORD: &[u8] = b"correct horse battery staple";
 
-/// What was asked, rejected, with no `Work` made of it and so nothing computed.
 fn rejected(asked: Result<Work, String>, names: &str) {
     let reason = match asked {
         Ok(_) => panic!("nothing rejected what should say `{names}`"),
@@ -193,7 +179,6 @@ fn argon2id(memory: i64, passes: i64, lanes: i64, length: i64) -> Result<Work, S
     )
 }
 
-/// Each bound is met by a hash that is never run here: the largest fills two gigabytes.
 #[test]
 fn argon2_is_checked_against_its_bounds_before_anything_is_computed() {
     assert!(argon2id(MAX_MEMORY_KIB, 1, 4, 32).is_ok());

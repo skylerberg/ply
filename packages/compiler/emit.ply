@@ -3,8 +3,8 @@ import compiler.emit.code (Code)
 import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, TypeItem, parse,
                               with_prelude, SpecClause, RequiresClause, EnsuresClause, CostClause,
                               SpaceClause, FnDefinition, InstanceItem, VariantDefinition, SumBody,
-                              NumericItem, NumericOp, KeyInstance, InvariantInstance, HostInstance,
-                              TestDefinition)
+                              NumericItem, NumericOperation, KeyInstance, InvariantInstance,
+                              HostInstance, TestDefinition)
 import compiler.check.resolve.tables (ParsedModule, Source, Diagnostic, Resolution, qualify,
                                       default_binder)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_packaged)
@@ -14,8 +14,8 @@ import compiler.check.infer.checker (MemberSite, listing_type)
 import compiler.check.infer (BodyFacts, item_owner, facts_by_owner)
 import compiler.check.infer.definitions (Extern, MachineCall, parsed_natives, machine_calls)
 import compiler.check.types (Type, NamedType, VariableType, FunctionType, Scheme, Effect, int_type,
-                             bool_type, bytes_type, unit_type, fn_type, monomorphic, no_effects,
-                             read_effects)
+                             bool_type, bytes_type, unit_type, function_type, monomorphic,
+                             no_effects, read_effects)
 import compiler.emit.lower.module_context (ModuleContext, declared_schemes, decode_inferred_facts,
                                            definitions_in, resolved_imports, declared_effects,
                                            recorded_annotations, param_type, scheduler_imported,
@@ -38,22 +38,22 @@ import compiler.expand.embed (ModuleEmbed, embed_tables, inline_embeds_by_name)
 import compiler.emit.c (BoxedKind, IntKind, bytes_join)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Specialisation, Generated, TestCases, Clause, EntryPoint,
-                           InlinedLambda, TypeOp, Order, NumericFunction, Reflect, Show, Digest,
-                           ContainerWalk, LawPart, LawGuard, LawBody, ClauseKind, Requires, Ensures,
-                           RootName, root_name, root_text, site_owner_text, key_types,
-                           inlined_lambdas, op_name, module_of, modules_lowered, test_key, law_key,
-                           law_owner, claims_key)
+                           InlinedLambda, TypeOperation, Order, NumericFunction, Reflect, Show,
+                           Digest, ContainerWalk, LawPart, LawGuard, LawBody, ClauseKind, Requires,
+                           Ensures, RootName, root_name, root_text, site_owner_text, key_types,
+                           inlined_lambdas, operation_name, module_of, modules_lowered, test_key,
+                           law_key, law_owner, claims_key)
 import compiler.emit.output (EmittedRoot, RootOutput, PublishedSignature)
 import compiler.emit.typed_ir
-import compiler.emit.typed_ir (Fn)
+import compiler.emit.typed_ir (Function)
 import compiler.emit.borrow_inference (OwnershipSignature, InferenceResult, infer_signatures,
                                        inference_targets_of, declared_borrows, signatures_from,
-                                       inferred_fn)
+                                       inferred_function)
 import compiler.emit.representations (Constructors, SumConstructor, BytesShape, OpenShape,
                                       Definition, Imported, EffectName, EmitParam, BoundLambda,
                                       kind_of, boxed, at_args, substituted)
 import compiler.emit.generated (GeneratedRoot, MarshalledSums, container_code,
-                                container_op_generated, marshal_root, is_marshal_op,
+                                container_operation_generated, marshal_root, is_marshal_operation,
                                 runtime_entry_code, is_marshallable, equality_code, compared_code,
                                 ordering_code, ordered_code, key_instance, key_comparison_code,
                                 numeric_instance, instance_code, digest_code, reflection_code,
@@ -85,20 +85,25 @@ fn wants_root(wanted: Map<RootName, Bool>, k: RootKey) -> Bool = wanted.contains
 
 fn written_wanted(
   wanted: List<RootKey>,
-) -> List<{ key: RootKey, op: TypeOp, ty: Type, module: Bytes }> / {abort.raise} =
+) -> List<{ key: RootKey, operation: TypeOperation, ty: Type, module: Bytes }> =
   wanted.fold(
     Map::new(),
-    |m: Map<RootName, { key: RootKey, op: TypeOp, ty: Type, module: Bytes }>, k: RootKey|
+    |m: Map<RootName, { key: RootKey, operation: TypeOperation, ty: Type, module: Bytes }>, k: RootKey|
       match k {
         Generated(w, _) ->
-          m.insert(root_name(k), { key: k, op: w.op, ty: w.ty, module: module_of(k) }),
+          m.insert(root_name(k), {
+            key: k,
+            operation: w.operation,
+            ty: w.ty,
+            module: module_of(k),
+          }),
         _ -> m,
       },
   ).values(
   )
 
 pub type LoweredProgram = {
-  roots: List<Fn>,
+  roots: List<Function>,
   stated: Map<Bytes, List<Bytes>>,
   constructors: Constructors,
   borrowed: Map<RootName, List<Int>>,
@@ -144,7 +149,7 @@ pub fn emitted_program(w: LoweredProgram) -> List<EmittedRoot> / {abort.raise} =
 }
 
 fn roots_emitted(
-  roots: List<Fn>,
+  roots: List<Function>,
   resolved: InferenceResult,
   stated: Map<Bytes, List<Bytes>>,
   constructors: Constructors,
@@ -154,7 +159,11 @@ fn roots_emitted(
 ) -> List<EmittedRoot> / {abort.raise} =
   if hi - lo <= 1 {
     match roots.at(lo) { Some(r) -> [root_emitted(r, resolved, stated, constructors)], None -> [] }
-  } else if depth_left <= 0 { panic("more halvings than a length has") } else {
+  } else if depth_left <= 0 {
+    panic(
+      "internal compiler error: dividing the list of roots in two for parallel work recursed too deep",
+    )
+  } else {
     let mid = lo + (hi - lo) / 2;
     let both = parallel {
       roots_emitted(roots, resolved, stated, constructors, lo, mid, depth_left - 1),
@@ -164,12 +173,12 @@ fn roots_emitted(
   }
 
 fn root_emitted(
-  f: Fn,
+  f: Function,
   resolved: InferenceResult,
   stated: Map<Bytes, List<Bytes>>,
   constructors: Constructors,
 ) -> EmittedRoot / {abort.raise} = {
-  let l = inferred_fn(f, resolved);
+  let l = inferred_function(f, resolved);
   let e = with_instance_calls(stated, tags_in(l.form), emitted_of(l.form, constructors));
   { ..e, tables: { ..e.tables, handings: l.own_signatures, assumed: l.assumed, group: l.group } }
 }
@@ -223,8 +232,8 @@ pub type ModuleScope = {
 pub fn root_outputs(
   s: Scope,
   roots: List<RootKey>,
-  handed: Map<RootName, OwnershipSignature>,
-) -> List<RootOutput> / {abort.raise} = results_of(lowered_in(s, roots, handed))
+  ownership_signatures: Map<RootName, OwnershipSignature>,
+) -> List<RootOutput> / {abort.raise} = results_of(lowered_in(s, roots, ownership_signatures))
 
 pub fn scope_of(
   given: List<Source>,
@@ -244,12 +253,12 @@ pub fn scope_of(
   else { placed.push(packages.len()) };
   let tables = embed_tables(embeds);
   let parsed = range(0, sources.len()).map(|i: Int| {
-    let s = match sources.at(i) { Some(x) -> x, None -> { name: b"", src: b"" } };
+    let s = match sources.at(i) { Some(x) -> x, None -> { name: b"", source_text: b"" } };
     let taken = match derived.find(|m: ModuleDerivations| m.module == s.name) {
       Some(m) -> m.derivations,
       None -> [],
     };
-    let p = parse_from(i, s, parse(s.src), derivations: taken);
+    let p = parse_from(i, s, parse(s.source_text), derivations: taken);
     let e = inline_embeds_by_name(tables, s.name, p.module.module);
     if p.diagnostics.len() > 0 { unread(diagnostics_text(p.diagnostics)) }
     else if e.diagnostics.len() > 0 { unread(parse_diagnostics_text(e.diagnostics)) }
@@ -277,33 +286,47 @@ pub fn scope_of(
   };
   let schemes = rows.definitions.fold(
     Map::new(),
-    |acc: Map<Bytes, Scheme>, row: KnownDefinitionRow| acc.insert(row.name, row.scheme),
+    |accumulator: Map<Bytes, Scheme>, row: KnownDefinitionRow|
+      accumulator.insert(row.name, row.scheme),
   );
   let w = match decode_inferred_facts(walked) {
     Some(w) -> w,
-    None -> unread(b"its result carries nothing its check read"),
+    None ->
+      unread(
+        b"the check result could not be decoded, so the inferred types and effects are missing",
+      ),
   };
-  let pure = w.pure.fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes| acc.insert(n, true));
+  let pure = w.pure.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
+    accumulator.insert(n, true));
   let reading = owners_to_read(rows, roots);
-  let every = x.modules.fold(Map::new(), |acc: Map<Bytes, Bool>, m: ParsedModule|
-    acc.insert(m.name, true));
+  let every = x.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
+    accumulator.insert(m.name, true));
   let facts = match facts_read(rows, w, Some({ roots: reading, modules: every }), x.modules) {
     Ok(f) -> f,
     Err(reason) -> unread(reason),
   };
   let modules = x.modules;
   let values = constant_values(rows);
-  let program = modules.fold(Map::new(), |acc: Map<Bytes, List<Definition>>, m: ParsedModule|
-    acc.insert(m.name, definitions_in(m.name, m.module, pure, schemes, values)));
+  let program = modules.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, List<Definition>>, m: ParsedModule|
+      accumulator.insert(m.name, definitions_in(m.name, m.module, pure, schemes, values)),
+  );
   let definitions_of = |path: Bytes| match program.get(path) { Some(ds) -> ds, None -> [] };
-  let members = facts.members.fold(Map::new(), |acc: Map<Int, List<MemberSite>>, s: MemberSite|
-    acc.insert(s.module, List::push(match acc.get(s.module) { Some(xs) -> xs, None -> [] }, s)));
+  let members = facts.members.fold(
+    Map::new(),
+    |accumulator: Map<Int, List<MemberSite>>, s: MemberSite|
+      accumulator.insert(
+        s.module,
+        List::push(match accumulator.get(s.module) { Some(xs) -> xs, None -> [] }, s),
+      ),
+  );
   let natives = parsed_natives(modules);
   let declared = declared_effects(x.resolution, published_operations(effects));
   {
     modules: modules,
-    places: range(0, modules.len()).fold(Map::new(), |acc: Map<Bytes, Int>, i: Int|
-      acc.insert(modules.get(i).name, i)),
+    places: range(0, modules.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
+      accumulator.insert(modules.get(i).name, i)),
     module_scopes: range(0, modules.len()).map(|i: Int| {
       let m = modules.get(i);
       {
@@ -328,8 +351,8 @@ pub fn scope_of(
     declared_operations: stated_by_tag(modules),
     constructors: {
       ..constructors,
-      keyed: keyed_tags(modules).fold(constructors.keyed, |acc: List<Bytes>, k: Bytes|
-        if acc.contains(k) { acc } else { acc.push(k) }),
+      keyed: keyed_tags(modules).fold(constructors.keyed, |accumulator: List<Bytes>, k: Bytes|
+        if accumulator.contains(k) { accumulator } else { accumulator.push(k) }),
     },
     builtins: natives.map(|e: Extern| e.name),
     machine: machine_calls(natives),
@@ -357,10 +380,10 @@ fn host_handlers(
   modules: List<ParsedModule>,
   definitions_of: (Bytes) -> List<Definition>,
 ) -> Map<Bytes, HostHandler> / {abort.raise} =
-  modules.fold(Map::new(), |acc: Map<Bytes, HostHandler>, m: ParsedModule|
-    m.module.items.fold(acc, |held: Map<Bytes, HostHandler>, item: Item|
+  modules.fold(Map::new(), |accumulator: Map<Bytes, HostHandler>, m: ParsedModule|
+    m.module.items.fold(accumulator, |handlers: Map<Bytes, HostHandler>, item: Item|
       match item {
-        InstanceItem(d) -> if d.kind != HostInstance { held } else {
+        InstanceItem(d) -> if d.kind != HostInstance { handlers } else {
           let served = qualify(m.name, d.target.name);
           match definitions_of(m.name).find(|definition: Definition|
               definition.name == d.function.name) {
@@ -375,26 +398,26 @@ fn host_handlers(
                 ]),
               ),
             Some(definition) ->
-              held.insert(served, {
+              handlers.insert(served, {
                 call: qualify(m.name, d.function.name),
                 import: { name: served, module: m.name, definitions: [definition], whole: true },
               }),
           }
         },
-        _ -> held,
+        _ -> handlers,
       }))
 
 fn with_prelude_handlers(
   hosts: Map<Bytes, HostHandler>,
   definitions_of: (Bytes) -> List<Definition>,
-) -> Map<Bytes, HostHandler> / {abort.raise} =
+) -> Map<Bytes, HostHandler> =
   prelude_hosts().fold(
     hosts,
-    |acc: Map<Bytes, HostHandler>, h: { effect: Bytes, module: Bytes, by: Bytes }|
+    |accumulator: Map<Bytes, HostHandler>, h: { effect: Bytes, module: Bytes, by: Bytes }|
       match definitions_of(h.module).find(|d: Definition| d.name == h.by) {
-        None -> acc,
+        None -> accumulator,
         Some(definition) ->
-          acc.insert(h.effect, {
+          accumulator.insert(h.effect, {
             call: qualify(h.module, h.by),
             import: {
               name: qualify(h.module, h.effect),
@@ -409,34 +432,43 @@ fn with_prelude_handlers(
 fn handlers_for(
   hosts: Map<Bytes, HostHandler>,
   effects: List<Bytes>,
-) -> List<{ effect: Bytes, hosting: HostHandler }> / {abort.raise} =
-  effects.fold([], |acc: List<Bytes>, e: Bytes|
-    if acc.contains(e) || !hosts.contains(e) { acc } else { acc.push(e) }).sort_by(
-    |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true },
-  ).fold([], |acc: List<{ effect: Bytes, hosting: HostHandler }>, e: Bytes|
-    match hosts.get(e) { Some(h) -> acc.push({ effect: e, hosting: h }), None -> acc })
+) -> List<{ effect: Bytes, hosting: HostHandler }> =
+  effects.fold([], |accumulator: List<Bytes>, e: Bytes|
+    if accumulator.contains(e) || !hosts.contains(e) { accumulator }
+    else { accumulator.push(e) }).sort_by(|a: Bytes, b: Bytes|
+    match compare_values(a, b) { Greater -> false, _ -> true }).fold(
+    [],
+    |accumulator: List<{ effect: Bytes, hosting: HostHandler }>, e: Bytes|
+      match hosts.get(e) {
+        Some(h) -> accumulator.push({ effect: e, hosting: h }),
+        None -> accumulator,
+      },
+  )
 
 pub fn lowered_in(
   s: Scope,
   roots: List<RootKey>,
-  handed: Map<RootName, OwnershipSignature>,
+  ownership_signatures: Map<RootName, OwnershipSignature>,
 ) -> LoweredProgram / {abort.raise} = {
   let wanted = wanted_names(roots);
-  let touched = roots.fold(Map::new(), |acc: Map<Bytes, Bool>, k: RootKey|
-    match definition_root(k) { Some(d) -> acc.insert(d, true), None -> acc });
+  let touched = roots.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: RootKey|
+    match definition_root(k) { Some(d) -> accumulator.insert(d, true), None -> accumulator });
   let lowered = modules_lowered(roots);
   let specialised = specialisations_wanted(roots);
   let borrowed_by = specialised.fold(
     Map::new(),
-    |acc: Map<RootName, Option<BoundLambda>>, _: Bytes, sps: List<RootKey>|
-      sps.fold(acc, |held: Map<RootName, Option<BoundLambda>>, sp: RootKey|
-        inlined_lambdas(sp).fold(
-          held,
-          |h: Map<RootName, Option<BoundLambda>>, f: InlinedLambda| {
-            let name = root_name(f.owner);
-            if h.contains(name) { h } else { h.insert(name, owner_lambdas(s, f.owner)) }
-          },
-        )),
+    |accumulator: Map<RootName, Option<BoundLambda>>, _: Bytes, sps: List<RootKey>|
+      sps.fold(
+        accumulator,
+        |borrowed_lambdas: Map<RootName, Option<BoundLambda>>, specialisation: RootKey|
+          inlined_lambdas(specialisation).fold(
+            borrowed_lambdas,
+            |h: Map<RootName, Option<BoundLambda>>, f: InlinedLambda| {
+              let name = root_name(f.owner);
+              if h.contains(name) { h } else { h.insert(name, owner_lambdas(s, f.owner)) }
+            },
+          ),
+      ),
   );
   let forming = {
     scope: s,
@@ -453,7 +485,7 @@ pub fn lowered_in(
     stated: s.declared_operations,
     constructors: s.constructors,
     borrowed: s.borrowed,
-    ownership_signatures: handed,
+    ownership_signatures: ownership_signatures,
   }
 }
 
@@ -462,7 +494,7 @@ type FormInputs = {
   wanted: Map<RootName, Bool>,
   touched: Map<Bytes, Bool>,
   specialised: Map<Bytes, List<RootKey>>,
-  written: List<{ key: RootKey, op: TypeOp, ty: Type, module: Bytes }>,
+  written: List<{ key: RootKey, operation: TypeOperation, ty: Type, module: Bytes }>,
   borrowed_by: Map<RootName, Option<BoundLambda>>,
 }
 
@@ -472,9 +504,13 @@ fn modules_formed(
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<Fn> / {abort.raise} =
+) -> List<Function> / {abort.raise} =
   if hi - lo <= 1 { match lowering.at(lo) { Some(i) -> module_at_formed(f, i), None -> [] } }
-  else if depth_left <= 0 { panic("more halvings than a length has") } else {
+  else if depth_left <= 0 {
+    panic(
+      "internal compiler error: dividing the list of modules in two for parallel work recursed too deep",
+    )
+  } else {
     let mid = lo + (hi - lo) / 2;
     let both = parallel {
       modules_formed(f, lowering, lo, mid, depth_left - 1),
@@ -483,7 +519,7 @@ fn modules_formed(
     both._0.concat(both._1)
   }
 
-fn module_at_formed(f: FormInputs, i: Int) -> List<Fn> / {abort.raise} =
+fn module_at_formed(f: FormInputs, i: Int) -> List<Function> / {abort.raise} =
   match f.scope.modules.at(i) {
     None -> [],
     Some(m) -> {
@@ -502,9 +538,11 @@ fn module_at_formed(f: FormInputs, i: Int) -> List<Fn> / {abort.raise} =
           release_build: f.scope.release_build,
         },
         f,
-        f.written.filter(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
-          w.module == m.name).map(|w: { key: RootKey, op: TypeOp, ty: Type, module: Bytes }|
-          { key: w.key, op: w.op, ty: w.ty }),
+        f.written.filter(
+          |w: { key: RootKey, operation: TypeOperation, ty: Type, module: Bytes }|
+            w.module == m.name,
+        ).map(|w: { key: RootKey, operation: TypeOperation, ty: Type, module: Bytes }|
+          { key: w.key, operation: w.operation, ty: w.ty }),
       )
     },
   }
@@ -562,17 +600,21 @@ fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise
     None -> None,
     Some(i) -> {
       let m = modules.get(i);
-      match m.module.items.fold(None, |acc: Option<FnDefinition>, item: Item|
+      match m.module.items.fold(None, |accumulator: Option<FnDefinition>, item: Item|
           match item {
             FunctionItem(d) -> if d.name.name == short && of.allows_lambda_inlining { Some(d) }
-            else { acc },
-            _ -> acc,
+            else { accumulator },
+            _ -> accumulator,
           }) {
-        None -> match m.module.items.fold(None, |acc: Option<TestDefinition>, item: Item|
-            match item {
-              TestItem(t) -> if test_key(m.name, t.name) == owner { Some(t) } else { acc },
-              _ -> acc,
-            }) {
+        None -> match m.module.items.fold(
+            None,
+            |accumulator: Option<TestDefinition>, item: Item|
+              match item {
+                TestItem(t) -> if test_key(m.name, t.name) == owner { Some(t) }
+                else { accumulator },
+                _ -> accumulator,
+              },
+          ) {
           None -> None,
           Some(t) -> {
             let recorded = recorded_of(site_owner_text(owner));
@@ -595,11 +637,11 @@ fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise
 
 fn owners_to_read(rows: Rows, roots: List<RootKey>) -> Map<Bytes, Bool> =
   roots.fold(
-    rows.definitions.fold(Map::new(), |acc: Map<Bytes, Bool>, row: KnownDefinitionRow|
-      if row.facts.len() == 0 { acc } else { acc.insert(row.name, true) }),
-    |acc: Map<Bytes, Bool>, k: RootKey|
+    rows.definitions.fold(Map::new(), |accumulator: Map<Bytes, Bool>, row: KnownDefinitionRow|
+      if row.facts.len() == 0 { accumulator } else { accumulator.insert(row.name, true) }),
+    |accumulator: Map<Bytes, Bool>, k: RootKey|
       inlined_lambdas(k).fold(
-        acc.insert(site_owner_text(k), true).insert(site_owner_text(parent_root(k)), true),
+        accumulator.insert(site_owner_text(k), true).insert(site_owner_text(parent_root(k)), true),
         |r: Map<Bytes, Bool>, f: InlinedLambda| r.insert(site_owner_text(f.owner), true),
       ),
   )
@@ -617,8 +659,8 @@ fn definition_root(k: RootKey) -> Option<Bytes> =
   }
 
 fn keyed_tags(modules: List<ParsedModule>) -> List<Bytes> =
-  modules.fold([], |acc: List<Bytes>, m: ParsedModule|
-    m.module.items.fold(acc, |a: List<Bytes>, item: Item|
+  modules.fold([], |accumulator: List<Bytes>, m: ParsedModule|
+    m.module.items.fold(accumulator, |a: List<Bytes>, item: Item|
       match item {
         InstanceItem(d) -> if d.kind != KeyInstance { a }
         else { a.concat(with_stated(m, Map::new(), d.target.name, [d.function.name]).keys()) },
@@ -626,13 +668,13 @@ fn keyed_tags(modules: List<ParsedModule>) -> List<Bytes> =
       }))
 
 fn stated_by_tag(modules: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
-  modules.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, m: ParsedModule|
-    m.module.items.fold(acc, |a: Map<Bytes, List<Bytes>>, item: Item|
+  modules.fold(Map::new(), |accumulator: Map<Bytes, List<Bytes>>, m: ParsedModule|
+    m.module.items.fold(accumulator, |a: Map<Bytes, List<Bytes>>, item: Item|
       match item {
         InstanceItem(d) -> if d.kind == InvariantInstance || d.kind == HostInstance { a }
         else { with_stated(m, a, d.target.name, [d.function.name]) },
         NumericItem(d) ->
-          with_stated(m, a, d.target.name, d.operations.map(|x: NumericOp| x.by.name)),
+          with_stated(m, a, d.target.name, d.operations.map(|x: NumericOperation| x.by.name)),
         _ -> a,
       }))
 
@@ -663,16 +705,16 @@ fn with_stated(
       _ -> b,
     })
 
-fn tags_in(f: Fn) -> List<Bytes> =
-  f.lambdas.fold(block_tags([], f.body), |acc: List<Bytes>, l: typed_ir::Lambda|
+fn tags_in(f: Function) -> List<Bytes> =
+  f.lambdas.fold(block_tags([], f.body), |accumulator: List<Bytes>, l: typed_ir::Lambda|
     match l {
       typed_ir::Closure(c) ->
-        tags_in(c.body).fold(acc, |a: List<Bytes>, t: Bytes|
+        tags_in(c.body).fold(accumulator, |a: List<Bytes>, t: Bytes|
           if a.contains(t) { a } else { a.push(t) }),
     })
 
-fn block_tags(acc: List<Bytes>, b: typed_ir::Block) -> List<Bytes> =
-  b.fold(acc, |a: List<Bytes>, i: typed_ir::Inst|
+fn block_tags(accumulator: List<Bytes>, b: typed_ir::Block) -> List<Bytes> =
+  b.fold(accumulator, |a: List<Bytes>, i: typed_ir::Instruction|
     match i {
       typed_ir::Let(l) -> match l.value {
         typed_ir::Tag(name) -> if a.contains(name) { a } else { a.push(name) },
@@ -700,11 +742,11 @@ fn with_instance_calls(
       ..e,
       tables: {
         ..e.tables,
-        calls: tags.fold(e.tables.calls, |acc: List<RootKey>, tag: Bytes|
+        calls: tags.fold(e.tables.calls, |accumulator: List<RootKey>, tag: Bytes|
           match stated.get(tag) {
-            None -> acc,
+            None -> accumulator,
             Some(fs) ->
-              fs.fold(acc, |calls: List<RootKey>, f: Bytes|
+              fs.fold(accumulator, |calls: List<RootKey>, f: Bytes|
                 if calls.contains(Named(f)) { calls } else { calls.push(Named(f)) }),
           }),
       },
@@ -715,8 +757,8 @@ fn module_formed(
   module_tree: Module,
   s: ModuleContext,
   f: FormInputs,
-  written_roots: List<{ key: RootKey, op: TypeOp, ty: Type }>,
-) -> List<Fn> / {abort.raise} = {
+  written_roots: List<{ key: RootKey, operation: TypeOperation, ty: Type }>,
+) -> List<Function> / {abort.raise} = {
   let module = s.module;
   let here = s.definitions;
   let definitions = module_tree.items.fold(Map::new(), |m: Map<Bytes, FnDefinition>, item: Item|
@@ -753,13 +795,17 @@ type WrittenFormInputs = { module_context: ModuleContext, items: List<Item> }
 
 fn written_at_once(
   x: WrittenFormInputs,
-  roots: List<{ key: RootKey, op: TypeOp, ty: Type }>,
+  roots: List<{ key: RootKey, operation: TypeOperation, ty: Type }>,
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<Fn> / {abort.raise} =
+) -> List<Function> / {abort.raise} =
   if hi - lo <= 1 { match roots.at(lo) { Some(w) -> written_formed(x, w), None -> [] } }
-  else if depth_left <= 0 { panic("more halvings than a length has") } else {
+  else if depth_left <= 0 {
+    panic(
+      "internal compiler error: dividing the list of written roots in two for parallel work recursed too deep",
+    )
+  } else {
     let mid = lo + (hi - lo) / 2;
     let both = parallel {
       written_at_once(x, roots, lo, mid, depth_left - 1),
@@ -770,20 +816,20 @@ fn written_at_once(
 
 fn written_formed(
   x: WrittenFormInputs,
-  w: { key: RootKey, op: TypeOp, ty: Type },
-) -> List<Fn> / {abort.raise} =
+  w: { key: RootKey, operation: TypeOperation, ty: Type },
+) -> List<Function> / {abort.raise} =
   naming(root_text(root_name(w.key)), || {
     let s = x.module_context;
     let module = s.module;
     let here = s.definitions;
     let module_tree = { items: x.items };
-    let reached = || {
+    let check_calls_loaded = || {
       let unreached = emitted_code().calls.filter(|n: Bytes|
         match definition_in(module, here, s.imports, n) { Some(_) -> false, None -> true });
       if unreached.len() > 0 {
         panic(
           String::of_bytes_lossy(
-            b"a container's root calls what the load did not reach of `std.prelude`: ".concat(
+            b"generated code for a container calls `std.prelude` definitions that were not loaded: ".concat(
               Bytes::join(unreached, b", "),
             ),
           ),
@@ -799,54 +845,75 @@ fn written_formed(
         e.code,
         e.performs,
       );
-    let r = { key: w.key, op: op_name(w.op), ty: w.ty };
-    let reflective = match w.op { Reflect -> true, Show -> true, Digest -> true, _ -> false };
-    let contained = match w.op {
-      ContainerWalk(c) -> container_op_generated(c),
+    let r = { key: w.key, operation: operation_name(w.operation), ty: w.ty };
+    let reflective = match w.operation {
+      Reflect -> true,
+      Show -> true,
+      Digest -> true,
+      _ -> false,
+    };
+    let contained = match w.operation {
+      ContainerWalk(c) -> container_operation_generated(c),
       _ -> reflective && (is_walked_container(r.ty) || is_columns_type(r.ty)),
     };
-    if is_plain_written(w.op) {
+    if is_plain_written(w.operation) {
       [
-        match w.op {
+        match w.operation {
           keys::OnWordForm(_) -> serialization_function(s.constructors, w.key),
           _ -> generated(s.constructors, w.key),
         },
       ]
-    } else if is_marshal_op(w.op) {
-      if is_walked_container(r.ty) { reached() };
+    } else if is_marshal_operation(w.operation) {
+      if is_walked_container(r.ty) { check_calls_loaded() };
       [written_root(r.key, marshal_root(module, s.constructors, r.key))]
     } else if contained {
-      reached();
-      [written_root(r.key, container_code(module, s.constructors, r.op, r.ty))]
-    } else if w.op == keys::ReleaseResource {
+      check_calls_loaded();
+      [written_root(r.key, container_code(module, s.constructors, r.operation, r.ty))]
+    } else if w.operation == keys::ReleaseResource {
       [written_root(r.key, release_resource_code(module, s.constructors, here, r.key, r.ty))]
-    } else if w.op == ContainerWalk(b"let_go_items") {
+    } else if w.operation == ContainerWalk(b"let_go_items") {
       [written_root(r.key, release_items_code(module, s.constructors, r.key, r.ty))]
-    } else if w.op == keys::Equal || w.op == Order {
-      let held = kind_of(w.ty);
+    } else if w.operation == keys::Equal || w.operation == Order {
+      let representation = kind_of(w.ty);
       let param = |n: Bytes|
-        { name: n, kind: held.kind, ty: held.ty, of: Some(w.ty), lambda: None };
+        { name: n, kind: representation.kind, ty: representation.ty, of: Some(w.ty), lambda: None };
       let formed = |code: Code| [root_from_code(s, 0, w.key, [param(b"a"), param(b"b")], code)];
       match built_in_cases(s.constructors, w.ty) {
-        None -> if is_sum(s.constructors, w.ty) { [] }
-        else { formed(if w.op == keys::Equal { compared_code(w.ty) } else { ordered_code(w.ty) }) },
+        None -> if is_sum(s.constructors, w.ty) { [] } else {
+          formed(if w.operation == keys::Equal { compared_code(w.ty) } else { ordered_code(w.ty) })
+        },
         Some(cs) ->
-          formed(if w.op == keys::Equal { equality_code(w.ty, cs) }
+          formed(if w.operation == keys::Equal { equality_code(w.ty, cs) }
           else { ordering_code(w.ty, cs) }),
       }
     } else if !reflective { [] } else {
-      let code = if r.op == b"digest" {
+      let code = if r.operation == b"digest" {
         digest_code(module, s.constructors, here, module_tree.items, r.ty)
       } else {
-        reflection_code(module, s.constructors, here, module_tree.items, r.op == b"shown", r.ty)
+        reflection_code(
+          module,
+          s.constructors,
+          here,
+          module_tree.items,
+          r.operation == b"shown",
+          r.ty,
+        )
       };
-      let held = kind_of(r.ty);
+      let representation = kind_of(r.ty);
       [
         root_from_code(
           s,
           0,
           r.key,
-          [{ name: b"a", kind: held.kind, ty: held.ty, of: Some(r.ty), lambda: None }],
+          [
+            {
+              name: b"a",
+              kind: representation.kind,
+              ty: representation.ty,
+              of: Some(r.ty),
+              lambda: None,
+            },
+          ],
           code,
         ),
       ]
@@ -871,8 +938,8 @@ fn built_in_cases(constructors: Constructors, ty: Type) -> Option<List<SumConstr
     _ -> None,
   }
 
-fn is_plain_written(op: TypeOp) -> Bool =
-  match op {
+fn is_plain_written(operation: TypeOperation) -> Bool =
+  match operation {
     keys::Drop -> true,
     keys::Dup -> true,
     keys::Release -> true,
@@ -885,7 +952,7 @@ fn is_plain_written(op: TypeOp) -> Bool =
     _ -> false,
   }
 
-type RootForms = { out: List<Fn> }
+type RootForms = { out: List<Function> }
 
 type ItemFormInputs = {
   module_tree: Module,
@@ -893,22 +960,35 @@ type ItemFormInputs = {
   f: FormInputs,
   definitions: Map<Bytes, FnDefinition>,
   order: Map<Bytes, Int>,
-  written_roots: List<{ key: RootKey, op: TypeOp, ty: Type }>,
+  written_roots: List<{ key: RootKey, operation: TypeOperation, ty: Type }>,
 }
 
-fn distinct_forms(forms: List<Fn>) -> List<Fn> =
+fn distinct_forms(forms: List<Function>) -> List<Function> =
   forms.fold(
     { seen: Map::new(), out: [] },
-    |acc: { seen: Map<RootName, Bool>, out: List<Fn> }, r: Fn|
-      if acc.seen.contains(root_name(r.key)) { acc }
-      else { { seen: acc.seen.insert(root_name(r.key), true), out: acc.out.push(r) } },
+    |accumulator: { seen: Map<RootName, Bool>, out: List<Function> }, r: Function|
+      if accumulator.seen.contains(root_name(r.key)) { accumulator } else {
+        { seen: accumulator.seen.insert(root_name(r.key), true), out: accumulator.out.push(r) }
+      },
   ).out
 
-fn items_formed(x: ItemFormInputs, lo: Int, hi: Int, depth_left: Int) -> List<Fn> / {abort.raise} =
+fn items_formed(
+  x: ItemFormInputs,
+  lo: Int,
+  hi: Int,
+  depth_left: Int,
+) -> List<Function> / {abort.raise} =
   if hi - lo <= 4 {
-    range(lo, hi).fold({ out: [] }, |acc: RootForms, i: Int|
-      match x.module_tree.items.at(i) { Some(item) -> item_formed(x, acc, item), None -> acc }).out
-  } else if depth_left <= 0 { panic("more halvings than a length has") } else {
+    range(lo, hi).fold({ out: [] }, |accumulator: RootForms, i: Int|
+      match x.module_tree.items.at(i) {
+        Some(item) -> item_formed(x, accumulator, item),
+        None -> accumulator,
+      }).out
+  } else if depth_left <= 0 {
+    panic(
+      "internal compiler error: dividing the list of items in two for parallel work recursed too deep",
+    )
+  } else {
     let mid = lo + (hi - lo) / 2;
     let both = parallel {
       items_formed(x, lo, mid, depth_left - 1),
@@ -917,10 +997,14 @@ fn items_formed(x: ItemFormInputs, lo: Int, hi: Int, depth_left: Int) -> List<Fn
     both._0.concat(both._1)
   }
 
-fn item_formed(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {abort.raise} =
-  naming(item_owner(x.s.module, item), || add_item_forms(x, acc, item))
+fn item_formed(x: ItemFormInputs, accumulator: RootForms, item: Item) -> RootForms / {abort.raise} =
+  naming(item_owner(x.s.module, item), || add_item_forms(x, accumulator, item))
 
-fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / {abort.raise} = {
+fn add_item_forms(
+  x: ItemFormInputs,
+  accumulator: RootForms,
+  item: Item,
+) -> RootForms / {abort.raise} = {
   let s = x.s;
   let f = x.f;
   let module = s.module;
@@ -947,22 +1031,23 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
         })
       },
     };
-  let looped = |out: List<Fn>, key: RootKey| {
+  let looped = |out: List<Function>, key: RootKey| {
     let keys = tail_loop_of(s, order, read_of, key);
     if keys.len() < 2 { None }
-    else if out.any(|r: Fn| root_name(r.key) == root_name(keys.get(0))) { Some(out) }
+    else if out.any(|r: Function| root_name(r.key) == root_name(keys.get(0))) { Some(out) }
     else { Some(out.concat(tail_loop_lowered(s, schemes, definitions, read_of, keys))) }
   };
   match item {
-    FunctionItem(d) -> if !touched.contains(qualify(module, d.name.name)) { acc } else {
+    FunctionItem(d) -> if !touched.contains(qualify(module, d.name.name)) { accumulator } else {
       let full = qualify(module, d.name.name);
       let p = { full: full, base: d.span.start, recorded: recorded_of(full) };
       let specialisations = (match specialised.get(p.full) { Some(l) -> l, None -> [] }).fold(
-        acc.out,
-        |a: List<Fn>, sp: RootKey|
-          match if inlined_lambdas(sp).len() > 0 { None } else { looped(a, sp) } {
+        accumulator.out,
+        |a: List<Function>, specialisation: RootKey|
+          match if inlined_lambdas(specialisation).len() > 0 { None }
+            else { looped(a, specialisation) } {
             Some(out) -> out,
-            None -> a.push(specialised_lowered(s, d, sp, lambda_at, p.recorded)),
+            None -> a.push(specialised_lowered(s, d, specialisation, lambda_at, p.recorded)),
           },
       );
       let out = if !wants_root(wanted, Named(p.full)) { specialisations } else {
@@ -1027,9 +1112,9 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
         wanted,
         f.scope.hosts,
         tested,
-        Some(monomorphic(fn_type(ps.map(param_type), unit_type(), performs))),
-        if !wants_root(wanted, tested) { acc.out }
-        else { acc.out.push(rooted(ran, tested, TestRun)) },
+        Some(monomorphic(function_type(ps.map(param_type), unit_type(), performs))),
+        if !wants_root(wanted, tested) { accumulator.out }
+        else { accumulator.out.push(rooted(ran, tested, TestRun)) },
       );
       let listing = TestCases(tested);
       let out = match t.cases {
@@ -1040,7 +1125,7 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
             wanted,
             f.scope.hosts,
             listing,
-            Some(monomorphic(fn_type([], listing_type(), no_effects()))),
+            Some(monomorphic(function_type([], listing_type(), no_effects()))),
             if !wants_root(wanted, listing) { run }
             else { run.push(rooted(s, listing, CaseListing)) },
           )
@@ -1050,11 +1135,11 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
     },
     LawItem(d) -> {
       let part = |which: LawPart| law_key(module, d.name, which);
-      let asked = |which: LawPart|
+      let is_wanted = |which: LawPart|
         wants_root(wanted, part(which)) || wants_root(wanted, EntryPoint(part(which)));
-      if !asked(LawGuard) && !asked(LawBody) { acc } else {
+      if !is_wanted(LawGuard) && !is_wanted(LawBody) { accumulator } else {
         let recorded = recorded_of(law_owner(module, d.name));
-        let rooted = |out: List<Fn>, which: LawPart, body: BodyPart| {
+        let rooted = |out: List<Function>, which: LawPart, body: BodyPart| {
           let b = resolved_at(recorded, body, d.span.start, []);
           let ps = root_params(b, []);
           with_claim_entry(s, wanted, part(which), ps, [], if !wants_root(wanted, part(which)) {
@@ -1064,23 +1149,25 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
           })
         };
         let with_guard = match d.guard {
-          None -> acc.out,
-          Some(_) -> rooted(acc.out, LawGuard, typed::LawGuard),
+          None -> accumulator.out,
+          Some(_) -> rooted(accumulator.out, LawGuard, typed::LawGuard),
         };
         { out: rooted(with_guard, LawBody, typed::LawBody) }
       }
     },
     TypeItem(t) -> {
       let named = qualify(module, t.name.name);
-      let asked = written_roots.fold(
+      let type_forms = written_roots.fold(
         [],
-        |accumulator2: List<{ key: RootKey, op: TypeOp, args: List<Type> }>, w: { key: RootKey, op: TypeOp, ty: Type }|
+        |accumulator2: List<{ key: RootKey, operation: TypeOperation, args: List<Type> }>, w: { key: RootKey, operation: TypeOperation, ty: Type }|
           match w.ty {
             NamedType(c) -> if c.name != named { accumulator2 } else {
-              match w.op {
-                keys::Equal -> accumulator2.push({ key: w.key, op: w.op, args: c.args }),
-                Order -> accumulator2.push({ key: w.key, op: w.op, args: c.args }),
-                NumericFunction(_) -> accumulator2.push({ key: w.key, op: w.op, args: c.args }),
+              match w.operation {
+                keys::Equal ->
+                  accumulator2.push({ key: w.key, operation: w.operation, args: c.args }),
+                Order -> accumulator2.push({ key: w.key, operation: w.operation, args: c.args }),
+                NumericFunction(_) ->
+                  accumulator2.push({ key: w.key, operation: w.operation, args: c.args }),
                 _ -> accumulator2,
               }
             },
@@ -1088,79 +1175,102 @@ fn add_item_forms(x: ItemFormInputs, acc: RootForms, item: Item) -> RootForms / 
           },
       );
       match s.constructors.sums.get(named) {
-        None -> acc,
+        None -> accumulator,
         Some(declared) ->
-          asked.fold(acc, |a2: RootForms, d: { key: RootKey, op: TypeOp, args: List<Type> }| {
-            let cs = if d.args.len() == 0 { declared } else {
-              declared.map(|c: SumConstructor|
-                { ..c, fields: c.fields.map(|f: Type| at_args(f, c.params, d.args)) })
-            };
-            let compared = NamedType({
-              name: named,
-              args: if d.args.len() > 0 { d.args } else {
-                match declared.at(0) {
-                  Some(c) -> c.params.map(|v: Int| VariableType(v)),
-                  None -> [],
+          type_forms.fold(
+            accumulator,
+            |a2: RootForms, d: { key: RootKey, operation: TypeOperation, args: List<Type> }| {
+              let cs = if d.args.len() == 0 { declared } else {
+                declared.map(|c: SumConstructor|
+                  { ..c, fields: c.fields.map(|f: Type| at_args(f, c.params, d.args)) })
+              };
+              let compared = NamedType({
+                name: named,
+                args: if d.args.len() > 0 { d.args } else {
+                  match declared.at(0) {
+                    Some(c) -> c.params.map(|v: Int| VariableType(v)),
+                    None -> [],
+                  }
+                },
+              });
+              let param = |n: Bytes, ty: Type| {
+                let representation = kind_of(ty);
+                {
+                  name: n,
+                  kind: representation.kind,
+                  ty: representation.ty,
+                  of: Some(ty),
+                  lambda: None,
                 }
-              },
-            });
-            let param = |n: Bytes, ty: Type| {
-              let held = kind_of(ty);
-              { name: n, kind: held.kind, ty: held.ty, of: Some(ty), lambda: None }
-            };
-            let formed = |ps: List<EmitParam>, code: Code|
-              root_from_code(s, t.span.start, d.key, ps, code);
-            let made = match d.op {
-              NumericFunction(op) -> {
-                let ps = if op == b"of_int" { [param(b"a", int_type())] }
-                else if op == b"neg" { [param(b"a", compared)] }
-                else { [param(b"a", compared), param(b"b", compared)] };
-                formed(ps, match numeric_instance(module, here, module_tree.items, compared, op) {
-                  Some(f) -> instance_code(f, ps.map(param_type)),
-                  None -> panic(String::of_bytes_lossy(b"no function stated for ".concat(op))),
-                })
-              },
-              _ -> {
-                let eq = d.op == keys::Equal;
-                formed(
-                  [param(b"a", compared), param(b"b", compared)],
-                  match key_instance(module, here, module_tree.items, compared) {
-                    Some(k) -> key_comparison_code(k, eq, compared),
-                    None -> if eq { equality_code(compared, cs) }
-                    else { ordering_code(compared, cs) },
-                  },
-                )
-              },
-            };
-            { ..a2, out: a2.out.push(made) }
-          }),
+              };
+              let formed = |ps: List<EmitParam>, code: Code|
+                root_from_code(s, t.span.start, d.key, ps, code);
+              let made = match d.operation {
+                NumericFunction(function_name) -> {
+                  let ps = if function_name == b"of_int" { [param(b"a", int_type())] }
+                  else if function_name == b"neg" { [param(b"a", compared)] }
+                  else { [param(b"a", compared), param(b"b", compared)] };
+                  formed(
+                    ps,
+                    match numeric_instance(
+                        module,
+                        here,
+                        module_tree.items,
+                        compared,
+                        function_name,
+                      ) {
+                      Some(f) -> instance_code(f, ps.map(param_type)),
+                      None ->
+                        panic(
+                          String::of_bytes_lossy(b"no function stated for ".concat(function_name)),
+                        ),
+                    },
+                  )
+                },
+                _ -> {
+                  let eq = d.operation == keys::Equal;
+                  formed(
+                    [param(b"a", compared), param(b"b", compared)],
+                    match key_instance(module, here, module_tree.items, compared) {
+                      Some(k) -> key_comparison_code(k, eq, compared),
+                      None -> if eq { equality_code(compared, cs) }
+                      else { ordering_code(compared, cs) },
+                    },
+                  )
+                },
+              };
+              { ..a2, out: a2.out.push(made) }
+            },
+          ),
       }
     },
-    _ -> acc,
+    _ -> accumulator,
   }
 }
 
-pub fn enterable(c: MarshalledSums, sc: Scheme) -> Bool =
-  sc.label_variables.len() == 0
-    && (match judged_type(sc) {
+pub fn enterable(c: MarshalledSums, scheme: Scheme) -> Bool =
+  scheme.label_variables.len() == 0
+    && (match int_instance_type(scheme) {
       FunctionType(f) ->
-        f.params.all(|t: Type| is_marshallable(c, t, true)) && is_marshallable(c, f.ret, false),
+        f.params.all(|t: Type| is_marshallable(c, t, true))
+          && is_marshallable(c, f.return_type, false),
       _ -> false,
     })
 
-pub fn judgeable(c: MarshalledSums, sc: Scheme) -> Bool =
-  sc.label_variables.len() == 0
-    && (match judged_type(sc) {
-      FunctionType(f) -> f.params.push(f.ret).all(|t: Type| liftable(c, t)),
+pub fn judgeable(c: MarshalledSums, scheme: Scheme) -> Bool =
+  scheme.label_variables.len() == 0
+    && (match int_instance_type(scheme) {
+      FunctionType(f) -> f.params.push(f.return_type).all(|t: Type| liftable(c, t)),
       _ -> false,
     })
 
 pub fn liftable(c: MarshalledSums, t: Type) -> Bool = is_marshallable(c, t, true)
 
-fn judged_type(sc: Scheme) -> Type = substituted(sc.ty, int_arguments(sc.type_variables))
+fn int_instance_type(scheme: Scheme) -> Type =
+  substituted(scheme.ty, int_arguments(scheme.type_variables))
 
-fn int_arguments(vars: List<Int>) -> List<Type> =
-  range(0, vars.fold(0, |w: Int, v: Int| max(w, v + 1))).map(|_: Int| int_type())
+fn int_arguments(type_variables: List<Int>) -> List<Type> =
+  range(0, type_variables.fold(0, |w: Int, v: Int| max(w, v + 1))).map(|_: Int| int_type())
 
 fn with_entry(
   s: ModuleContext,
@@ -1168,22 +1278,23 @@ fn with_entry(
   hosts: Map<Bytes, HostHandler>,
   root: RootKey,
   scheme: Option<Scheme>,
-  out: List<Fn>,
-) -> List<Fn> / {abort.raise} = {
+  out: List<Function>,
+) -> List<Function> / {abort.raise} = {
   let key = EntryPoint(root);
   if !wants_root(wanted, key) { out } else {
     match scheme {
-      Some(sc) -> match sc.ty {
+      Some(scheme) -> match scheme.ty {
         FunctionType(f) -> {
-          let ints = int_arguments(sc.type_variables);
+          let ints = int_arguments(scheme.type_variables);
           let called = match root {
             Named(_) ->
               {
                 callee: root,
-                at: sc.type_variables.map(|_: Int| int_type()),
-                rows: sc.effect_variables.map(|_: Int| no_effects()),
+                at: scheme.type_variables.map(|_: Int| int_type()),
+                rows: scheme.effect_variables.map(|_: Int| no_effects()),
               },
-            _ -> { callee: judged_callee(root, sc.type_variables.len()), at: [], rows: [] },
+            _ ->
+              { callee: instantiated_callee(root, scheme.type_variables.len()), at: [], rows: [] },
           };
           let hosted = handlers_for(hosts, f.effects.listed.map(|a: Effect| a.effect));
           let e = runtime_entry_code(
@@ -1193,7 +1304,7 @@ fn with_entry(
             called.at,
             called.rows,
             f.params.map(|t: Type| substituted(t, ints)),
-            substituted(f.ret, ints),
+            substituted(f.return_type, ints),
             f.effects,
             hosted.map(|h: { effect: Bytes, hosting: HostHandler }|
               { call: h.hosting.call, effect: h.effect, adds: added_by(h.hosting) }),
@@ -1216,25 +1327,28 @@ fn with_entry(
             ),
           )
         },
-        _ -> panic("an entry of no function"),
+        _ -> panic("internal compiler error: the program entry is not a function"),
       },
-      None -> panic("an entry of a root no scheme types"),
+      None -> panic("internal compiler error: the program entry has no inferred type"),
     }
   }
 }
 
 fn added_by(h: HostHandler) -> List<Effect> =
-  h.import.definitions.fold([], |acc: List<Effect>, d: Definition|
+  h.import.definitions.fold([], |accumulator: List<Effect>, d: Definition|
     match d.scheme {
-      Some(sc) -> match sc.ty { FunctionType(f) -> acc.concat(f.effects.listed), _ -> acc },
-      None -> acc,
+      Some(scheme) -> match scheme.ty {
+        FunctionType(f) -> accumulator.concat(f.effects.listed),
+        _ -> accumulator,
+      },
+      None -> accumulator,
     })
 
-fn judged_callee(root: RootKey, vars: Int) -> RootKey =
-  if vars == 0 { root } else {
+fn instantiated_callee(root: RootKey, type_variable_count: Int) -> RootKey =
+  if type_variable_count == 0 { root } else {
     match root {
       Clause(c) -> match c.definition {
-        Named(d) -> Clause({ ..c, definition: claims_key(d, vars) }),
+        Named(d) -> Clause({ ..c, definition: claims_key(d, type_variable_count) }),
         _ -> root,
       },
       _ -> root,
@@ -1246,17 +1360,17 @@ fn with_claim_entry(
   wanted: Map<RootName, Bool>,
   root: RootKey,
   params: List<EmitParam>,
-  vars: List<Int>,
-  out: List<Fn>,
-) -> List<Fn> / {abort.raise} =
+  type_variables: List<Int>,
+  out: List<Function>,
+) -> List<Function> / {abort.raise} =
   with_entry(
     s,
     wanted,
     Map::new(),
     root,
     Some({
-      ..monomorphic(fn_type(params.map(param_type), bool_type(), no_effects())),
-      type_variables: vars,
+      ..monomorphic(function_type(params.map(param_type), bool_type(), no_effects())),
+      type_variables: type_variables,
     }),
     out,
   )
@@ -1264,7 +1378,7 @@ fn with_claim_entry(
 fn labels_of(d: FnDefinition) -> List<Bytes> = d.generics.labels.map(|i: Identifier| i.name)
 
 fn clause_roots(
-  acc: RootForms,
+  accumulator: RootForms,
   definition: FnDefinition,
   s: ModuleContext,
   wanted: Map<RootName, Bool>,
@@ -1272,25 +1386,28 @@ fn clause_roots(
   schemes: Map<Bytes, Scheme>,
 ) -> RootForms / {abort.raise} = {
   let full = qualify(s.module, definition.name.name);
-  let vars = match schemes.get(full) { Some(sc) -> sc.type_variables, None -> [] };
-  let ints = int_arguments(vars);
+  let type_variables = match schemes.get(full) {
+    Some(scheme) -> scheme.type_variables,
+    None -> [],
+  };
+  let ints = int_arguments(type_variables);
   let base = definition.span.start;
   let clause = |kind: ClauseKind, k: Int| Clause({ definition: Named(full), kind: kind, n: k });
-  let rooted = |out: List<Fn>, key: RootKey, at: Int| {
+  let rooted = |out: List<Function>, key: RootKey, at: Int| {
     let b = resolved_at(recorded, ClauseBody(at), base, []);
     let ps = root_params(b, []);
     let own = if !wants_root(wanted, key) { out }
     else { out.push(root_from_code(s, base, key, ps, body_code(b, [], recorded))) };
-    let callee = judged_callee(key, vars.len());
+    let callee = instantiated_callee(key, type_variables.len());
     let specialised = if callee == key || !wants_root(wanted, callee) { own } else {
-      let sp = root_body(recorded, ClauseBody(at), base, [], ints);
-      own.push(root_from_code(s, base, callee, sp.params, sp.code))
+      let specialisation = root_body(recorded, ClauseBody(at), base, [], ints);
+      own.push(root_from_code(s, base, callee, specialisation.params, specialisation.code))
     };
-    with_claim_entry(s, wanted, key, ps, vars, specialised)
+    with_claim_entry(s, wanted, key, ps, type_variables, specialised)
   };
   let walked = definition.spec.fold(
-    { out: acc.out, requires: 0, ensures: 0, at: 0 },
-    |w: { out: List<Fn>, requires: Int, ensures: Int, at: Int }, c: SpecClause| {
+    { out: accumulator.out, requires: 0, ensures: 0, at: 0 },
+    |w: { out: List<Function>, requires: Int, ensures: Int, at: Int }, c: SpecClause| {
       let next = { ..w, at: w.at + 1 };
       match c.kind {
         RequiresClause ->
@@ -1299,7 +1416,7 @@ fn clause_roots(
             out: rooted(w.out, clause(Requires, w.requires), w.at),
             requires: w.requires + 1,
           },
-        EnsuresClause -> match definition.ret {
+        EnsuresClause -> match definition.return_type {
           None -> { ..next, ensures: w.ensures + 1 },
           Some(_) ->
             {
@@ -1382,10 +1499,10 @@ pub fn zip_sources(names: List<Bytes>, sources: List<Bytes>) -> List<Source> =
   range(0, names.len()).map(|i: Int|
     {
       name: match names.at(i) { Some(n) -> n, None -> b"" },
-      src: match sources.at(i) { Some(t) -> t, None -> b"" },
+      source_text: match sources.at(i) { Some(t) -> t, None -> b"" },
     })
 
-test "an effect whose host handler the emitter holds no definition of stops the emitter, not left unhosted" {
+test "`host_handlers` aborts with a diagnostic when an effect's host handler function is not defined" {
   let fact = {
     name: b"std.fact",
     module: parse(b"pub effect fact {\n  read get() -> Int\n}\nhost for fact by served\n").node,

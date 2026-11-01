@@ -40,8 +40,6 @@ fn emoji_presentation_mask() -> Int = 8
 
 fn modifier_mask() -> Int = 16
 
-/// The table word for one line of `ucd/width.txt`, `columns;flags`. Its low two bits are `1` for
-/// no columns, `2` for two and `3` for ambiguous, and each flag takes one bit above them.
 fn width_table_entry(fields: List<Bytes>) -> Int / {abort.raise} = {
   let field = |i: Int| match fields.at(i) { Some(text) -> text, None -> b"" };
   let columns = match field(0) {
@@ -49,7 +47,10 @@ fn width_table_entry(fields: List<Bytes>) -> Int / {abort.raise} = {
     b"0" -> 1,
     b"2" -> 2,
     b"A" -> 3,
-    _ -> panic("a width is 0, 2 or A"),
+    _ ->
+      panic(
+        "the columns field of `ucd/width.txt` must be empty, `0` (no columns), `2` (two columns) or `A` (ambiguous)",
+      ),
   };
   range(0, field(1).len()).fold(columns, |bits: Int, i: Int|
     bits
@@ -57,50 +58,52 @@ fn width_table_entry(fields: List<Bytes>) -> Int / {abort.raise} = {
         b'e' -> emoji_mask(),
         b'p' -> emoji_presentation_mask(),
         b'm' -> modifier_mask(),
-        _ -> panic("a width flag is e, p or m"),
+        _ ->
+          panic(
+            "a flag in the flags field of `ucd/width.txt` must be `e` (emoji), `p` (emoji presentation) or `m` (modifier)",
+          ),
       }))
 }
 
 const fn widths() -> Table = ucd::table(embed("ucd/width.txt"), 0, width_table_entry)
 
-/// The columns a table word gives its character on its own.
 fn columns_of(word: Int, ambiguous: AmbiguousWidth) -> Int =
   match word & 3 { 0 -> 1, 1 -> 0, 2 -> 2, _ -> if ambiguous == Wide { 2 } else { 1 } }
 
-/// The columns `c` takes on its own: zero, one or two. Summing these over a text counts a joined
-/// emoji as its parts and a modifier apart from its base, so use `columns` to measure a text.
+/// Returns the columns `c` takes when measured alone: zero, one or two. Summing these over a text
+/// overcounts, because a joined emoji counts as its separate parts and a modifier counts as its own
+/// character instead of joining its base. Use `columns` to measure a text.
 pub fn char_columns(c: Char, ambiguous: AmbiguousWidth = Narrow) -> Int =
   if c >= ' ' && c <= '~' { 1 }
   else { columns_of(ucd::lookup(widths(), Int::of_char(c)), ambiguous) }
 
-/// The columns counted so far, the word of the last character and the columns it was counted
-/// for, and whether it was the joiner `U+200D`.
 type ClusterState = { total: Int, last: Int, counted: Int, joined: Bool }
 
 fn empty_cluster() -> ClusterState = { total: 0, last: 0, counted: 0, joined: false }
 
-/// Adds the code point `cp` of the same cluster to `so_far`.
 fn add_code_point(
   width_table: Table,
   so_far: ClusterState,
-  cp: Int,
+  code_point: Int,
   first: Bool,
   ambiguous: AmbiguousWidth,
 ) -> ClusterState =
-  if cp == 0xFE0F && so_far.last & emoji_mask() != 0 && so_far.counted < 2 {
+  if code_point == 0xFE0F && so_far.last & emoji_mask() != 0 && so_far.counted < 2 {
     { total: so_far.total + 2 - so_far.counted, last: so_far.last, counted: 2, joined: false }
-  } else if cp == 0xFE0E && so_far.last & emoji_presentation_mask() != 0 && so_far.counted == 2 {
+  } else if code_point == 0xFE0E && so_far.last & emoji_presentation_mask() != 0
+      && so_far.counted == 2 {
     { total: so_far.total - 1, last: so_far.last, counted: 1, joined: false }
   } else {
-    let word = ucd::lookup(width_table, cp);
+    let word = ucd::lookup(width_table, code_point);
     let own = if !first && (so_far.joined || word & modifier_mask() != 0) { 0 }
     else { columns_of(word, ambiguous) };
-    { total: so_far.total + own, last: word, counted: own, joined: cp == 0x200D }
+    { total: so_far.total + own, last: word, counted: own, joined: code_point == 0x200D }
   }
 
-/// The columns `cluster` takes as one grapheme cluster, whatever it contains. This is the sum of
-/// its characters' columns, except for characters that add nothing in their position and for the
-/// changes the two variation selectors make.
+/// Returns the columns `cluster` takes as one grapheme cluster, whatever it contains. This is the
+/// sum of its characters' columns, except that modifiers and characters after a joiner add no
+/// columns, a variation selector `U+FE0F` widens a preceding emoji to two columns, and `U+FE0E`
+/// narrows it to one.
 pub fn cluster_columns(cluster: String, ambiguous: AmbiguousWidth = Narrow) -> Int = {
   let width_table = widths();
   cluster.chars().fold(
@@ -113,17 +116,12 @@ pub fn cluster_columns(cluster: String, ambiguous: AmbiguousWidth = Narrow) -> I
   ).so_far.total
 }
 
-/// Whether `text` is only printable ASCII, which takes one column a character.
 fn is_plain(text: String) -> Bool =
   text.len() == Bytes::of_string(text).len()
     && text.chars().fold(true, |plain: Bool, c: Char| plain && c >= ' ' && c <= '~')
 
-/// The columns counted, the state of the cluster being read, the position of the next character
-/// and the boundaries still ahead.
 type TextState = { total: Int, cluster: ClusterState, place: Int, boundaries: List<Int> }
 
-/// Advances `walk` past the character `c`, which starts a cluster when the next boundary is at
-/// its position.
 fn add_char(width_table: Table, walk: TextState, c: Char, ambiguous: AmbiguousWidth) -> TextState =
   match walk.boundaries {
     [next, ..rest] -> if next == walk.place {
@@ -166,16 +164,14 @@ pub fn columns(text: String, ambiguous: AmbiguousWidth = Narrow) -> Int =
 /// Zero-width clusters that follow the prefix are included.
 pub fn truncate(text: String, max_columns: Int, ambiguous: AmbiguousWidth = Narrow) -> String =
   segment::graphemes(text).fold(
-    { kept: "", left: max_columns, open: true },
-    |so_far: { kept: String, left: Int, open: Bool }, cluster: String| {
+    { retained: "", left: max_columns, open: true },
+    |so_far: { retained: String, left: Int, open: Bool }, cluster: String| {
       let wide = cluster_columns(cluster, ambiguous);
       if so_far.open && wide <= so_far.left {
-        { kept: so_far.kept ++ cluster, left: so_far.left - wide, open: true }
-      } else { { kept: so_far.kept, left: so_far.left, open: false } }
+        { retained: so_far.retained ++ cluster, left: so_far.left - wide, open: true }
+      } else { { retained: so_far.retained, left: so_far.left, open: false } }
     },
-  ).kept
-
-// --- Properties -------------------------------------------------------------------
+  ).retained
 
 test "a random text's columns are the sum of its clusters' columns" {
   gen::check(gen::any_int(), |x: Int|
@@ -196,8 +192,6 @@ test "a truncated text is a prefix that fits in the given columns" {
       && (prefix != text || columns(text) <= max_columns & 31)
   })
 }
-
-// --- Tests ------------------------------------------------------------------------
 
 type WidthCase = { text: String, columns: Int }
 
@@ -267,7 +261,7 @@ test "a character alone takes none, one or two columns" {
   )
 }
 
-test "truncating keeps whole clusters, and zero-width marks stay with what they follow" {
+test "`truncate` cuts only between whole grapheme clusters, and zero-width marks stay with the character before them" {
   assert_eq(truncate("a\u{4E2D}b", 3), "a\u{4E2D}");
   assert_eq(truncate("a\u{4E2D}b", 2), "a");
   assert_eq(truncate("\u{4E2D}", 1), "");

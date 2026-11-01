@@ -1,30 +1,34 @@
-//! HTTP/2 (RFC 9113) and its header compression, HPACK (RFC 7541), as a state machine with no I/O:
-//! bytes in, events and bytes out.
+//! Implements HTTP/2 (RFC 9113) and its header compression, HPACK (RFC 7541), as a state machine
+//! that does no I/O: it takes bytes in and produces events and bytes out.
 //!
-//! The frame codec reads and writes every frame type. `read_frame` rejects what the standard calls
-//! a connection or a stream error by raising `http2.violated`. HPACK is an `Encoder` and a
-//! `Decoder`, each with the static table, the Huffman code and its own dynamic table.
+//! The frame codec reads and writes every frame type. `read_frame` raises `http2.violated` for what
+//! the standard calls a connection error or a stream error. HPACK is an `Encoder` and a `Decoder`,
+//! each with the static table, the Huffman code and its own dynamic table.
 //!
-//! A `Connection` is one end of a connection, a server's or a client's. `receive` passes it bytes
-//! read from the peer and returns the `Event`s they produce. `respond` and `request` pass it
-//! messages to send, and `take_output` returns the bytes to write. A `Response` has the same shape
-//! as `std.http`'s, so either converts to the other, and `std.http` reads a `Request` as its own.
-//! `std.http` serves and fetches over this machine, so an application does not know which
-//! protocol carried a message. Time is what the caller passes as `now`. `tick` acts on what depends
-//! only on the clock, and `deadline` reports when it next needs to run. The machine reads no socket
-//! and no clock, so an exchange is data, and two machines given each other's bytes test each other.
+//! A `Connection` is one end of a connection, either a server or a client. `receive` takes bytes
+//! read from the peer and returns the `Event`s they produce. `respond` and `request` take messages
+//! to send, and `take_output` returns the bytes to write. A `Response` has the same shape as in
+//! `std.http`, so a value of one type converts to the other. `std.http` also uses the `Request`
+//! type from this module as its own. `std.http` serves and fetches through this state machine, so
+//! an application cannot tell which protocol carried a message.
 //!
-//! `Limits` sets the cost a peer can impose on one connection, and each known attack on HTTP/2 has
-//! a field: rapid reset (CVE-2023-44487) is `max_resets`; the CONTINUATION flood is
+//! The caller passes the current time as `now`. `tick` does the work that depends only on the
+//! clock, and `deadline` reports when `tick` next needs to run. The machine reads no socket and no
+//! clock, so an exchange is plain data, and two machines can be tested against each other by
+//! passing each one's output bytes to the other.
+//!
+//! `Limits` sets how much a peer can cost one connection, and each known attack on HTTP/2 has a
+//! field: rapid reset (CVE-2023-44487) is `max_resets`; the CONTINUATION flood is
 //! `max_continuations` and `max_header_block`; an HPACK bomb is `max_header_list_size`,
 //! `max_table_size` and `max_table_size_updates`; SETTINGS and PING floods are `max_settings` and
-//! `max_pings`; frames that carry nothing are `max_empty_frames`; and a reader that never opens its
-//! window is `stall_ms` and `max_buffered`. Past a limit, the stream or the connection is rejected,
-//! and a rejected connection gets a `GOAWAY`. `drain` closes a connection gracefully: the streams
-//! it accepted get responses, and the peer is told which streams it did not accept.
+//! `max_pings`; frames that carry nothing are `max_empty_frames`; and a peer that never opens its
+//! flow-control window is `stall_ms` and `max_buffered`. When a peer passes a limit, the stream or
+//! the connection is rejected, and a rejected connection is sent a `GOAWAY`. `drain` closes a
+//! connection gracefully: streams it already accepted get their responses, and the peer is told
+//! which streams it did not accept.
 //!
-//! Server push and the priority tree are not supported: a server pushes nothing, and both ends
-//! read priorities and ignore them, as RFC 9113 allows. A `CONNECT` request gets a 501 response.
+//! Server push and the priority tree are not supported: a server pushes nothing, and both ends read
+//! priorities and ignore them, as RFC 9113 allows. A `CONNECT` request gets a 501 response.
 
 import std.bytes (is_blank, u32_be)
 import std.gen
@@ -34,10 +38,8 @@ import std.list
 import std.string
 import std.time (at_millis)
 
-// --- Errors -------------------------------------------------------------------
-
-/// What a `RST_STREAM` or a `GOAWAY` reports went wrong (RFC 9113 §7). A code the standard does
-/// not assign keeps its number, and is treated as `InternalError`.
+/// Names the reason a `RST_STREAM` or a `GOAWAY` frame reports (RFC 9113 §7). `Unassigned` stores a
+/// code the standard does not assign, and the code is treated as `InternalError`.
 pub type ErrorCode =
   | NoError
   | ProtocolError
@@ -131,14 +133,12 @@ pub type Violation = new { code: ErrorCode, stream: Int, reason: String }
 
 /// What this module raises when it rejects bytes.
 pub effect http2 {
-  /// The bytes break the protocol, as the violation describes.
+  /// Raises a `Violation` when the bytes received break the HTTP/2 protocol.
   raise violated(v: Violation)
 }
 
 fn violation<a>(code: ErrorCode, stream: Int, reason: String) -> a / {http2.violated} =
   http2.violated({ code: code, stream: stream, reason: reason })
-
-// --- Frames -------------------------------------------------------------------
 
 /// The connection preface a client opens with, before its first `SETTINGS` (RFC 9113 §3.4).
 pub fn preface() -> Bytes = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
@@ -159,8 +159,9 @@ pub fn default_window() -> Int = 65535
 /// The dynamic table size HPACK starts with on each side.
 pub fn default_table_size() -> Int = 4096
 
-/// A stream's place in the priority tree RFC 7540 had clients build, which RFC 9113 says to parse
-/// and ignore: the stream it depends on, whether exclusively, and its weight from 1 to 256.
+/// The priority of a stream: the stream it depends on, whether the dependency is exclusive, and its
+/// weight from 1 to 256. RFC 7540 had clients build a priority tree from these. RFC 9113 says to
+/// parse them and ignore them.
 pub type Priority = { depends_on: Int, exclusive: Bool, weight: Int }
 
 /// One parameter of a `SETTINGS` frame (RFC 9113 §6.5.2). A reader stores one the standard does not
@@ -174,9 +175,10 @@ pub type Setting =
   | MaxHeaderListSize(Int)
   | Unknown(Int, Int)
 
-/// A frame (RFC 9113 §6). `padding` is how many octets of padding a padded frame carries, `None` for
-/// a frame without the flag. A `block` is a piece of a field block HPACK wrote, which a `HEADERS` or
-/// `PUSH_PROMISE` frame and the `CONTINUATION` frames after it carry between them.
+/// A frame (RFC 9113 §6). `padding` is the number of padding octets in a padded frame, and `None`
+/// when the frame has no padding flag. A `block` is a piece of a field block, the HPACK-encoded
+/// header fields of a message. A `HEADERS` or `PUSH_PROMISE` frame and the `CONTINUATION` frames
+/// after it each carry one piece.
 pub type Frame =
   | DataFrame({ stream: Int, data: Bytes, end_stream: Bool, padding: Option<Int> })
   | HeadersFrame({ stream: Int, block: Bytes, end_stream: Bool, end_headers: Bool, priority: Option<Priority>, padding: Option<Int> })
@@ -205,9 +207,9 @@ fn is_set(flags: Int, bit: Int) -> Bool = flags & bit != 0
 
 fn word(b: Bytes, at: Int) -> Int = match b.u32_be_at(at) { Some(n) -> n, None -> 0 }
 
-/// The bytes of a frame. Panics on one no peer may be sent: a payload past 2^24-1 octets, padding
-/// past 255, a stream, a promised stream or an increment past 31 bits, or a ping that is not eight
-/// octets.
+/// Returns the bytes of a frame. Panics when the frame is one no peer may send: a payload longer
+/// than 2^24-1 octets, padding longer than 255 octets, a stream, promised stream or window
+/// increment that needs more than 31 bits, or a ping whose data is not eight octets.
 pub fn encode_frame(f: Frame) -> Bytes / {abort.raise} =
   match f {
     DataFrame(d) ->
@@ -311,25 +313,27 @@ fn setting_pair(s: Setting) -> { id: Int, value: Int } =
     Unknown(id, value) -> { id: id, value: value },
   }
 
-/// A frame read, and where the bytes after it start.
+/// A frame read from a buffer, and `next`, the index in that buffer where the bytes after the frame
+/// start.
 pub type ReadResult = { frame: Frame, next: Int }
 
-/// The length of the frame whose header starts at `at`, or `None` where `buf` ends before its
+/// The length of the frame whose header starts at `at`, or `None` where `bytes` ends before its
 /// header does.
-pub fn frame_length(buf: Bytes, at: Int) -> Option<Int> =
-  if at < 0 || buf.len() - at < 9 { None }
-  else { Some(buf.at(at) << 16 | buf.at(at + 1) << 8 | buf.at(at + 2)) }
+pub fn frame_length(bytes: Bytes, at: Int) -> Option<Int> =
+  if at < 0 || bytes.len() - at < 9 { None }
+  else { Some(bytes.at(at) << 16 | bytes.at(at + 1) << 8 | bytes.at(at + 2)) }
 
-/// The frame at `at`, or `None` when `buf` ends before the frame does. A frame longer than
-/// `max_size` is rejected as soon as its header arrives, without waiting for its payload. A
-/// violation limited to a stream is raised only when reading the frame changed nothing else, so a
-/// reader can reset the stream and continue after the frame, whose length its header gives.
+/// Returns the frame at index `at` of `bytes`, or `None` when `bytes` ends before the frame does.
+/// Rejects a frame longer than `max_size` as soon as its header arrives, without waiting for its
+/// payload. A violation that affects only one stream is raised only if the frame has no other
+/// fault. The caller can then reset that stream and continue reading at the next frame, because the
+/// length in the frame header still locates it.
 pub fn read_frame(
-  buf: Bytes,
+  bytes: Bytes,
   at: Int,
   max_size: Int,
 ) -> Option<ReadResult> / {http2.violated, abort.raise} =
-  match frame_length(buf, at) {
+  match frame_length(bytes, at) {
     None -> None,
     Some(length) -> if length > max_size {
       violation(
@@ -338,13 +342,13 @@ pub fn read_frame(
         "a frame of " ++ length.to_string() ++ " octets, past the " ++ max_size.to_string()
           ++ " allowed",
       )
-    } else if buf.len() - at - 9 < length { None } else {
+    } else if bytes.len() - at - 9 < length { None } else {
       Some({
         frame: frame_of(
-          buf.at(at + 3),
-          buf.at(at + 4),
-          word(buf, at + 5) & 0x7FFF_FFFF,
-          buf.slice(at + 9, at + 9 + length),
+          bytes.at(at + 3),
+          bytes.at(at + 4),
+          word(bytes, at + 5) & 0x7FFF_FFFF,
+          bytes.slice(at + 9, at + 9 + length),
         ),
         next: at + 9 + length,
       })
@@ -377,14 +381,17 @@ fn on_connection(stream: Int, name: String) -> Unit / {http2.violated} =
 
 type Unpadded = { body: Bytes, padding: Option<Int> }
 
-/// A padded payload without its padding. Padding as long as the payload is rejected (§6.1).
 fn unpadded(flags: Int, payload: Bytes) -> Unpadded / {http2.violated} =
   if !is_set(flags, 0x8) { { body: payload, padding: None } } else if payload.len() == 0 {
     violation(FrameSizeError, 0, "a padded frame without its pad length")
   } else {
     let pad = payload.at(0);
     if pad >= payload.len() {
-      violation(ProtocolError, 0, "padding as long as the frame that carries it")
+      violation(
+        ProtocolError,
+        0,
+        "the padding length must be less than the length of the frame payload",
+      )
     } else { { body: payload.slice(1, payload.len() - pad), padding: Some(pad) } }
   }
 
@@ -399,8 +406,6 @@ fn data_of(flags: Int, stream: Int, payload: Bytes) -> Frame / {http2.violated} 
   DataFrame({ stream: stream, data: p.body, end_stream: is_set(flags, 0x1), padding: p.padding })
 }
 
-/// A `HEADERS` frame that makes its stream depend on itself is read unchanged: its block must
-/// still be decoded, so the reader raises the stream error after decoding it.
 fn headers_of(flags: Int, stream: Int, payload: Bytes) -> Frame / {http2.violated, abort.raise} = {
   on_stream(stream, "HEADERS");
   let p = unpadded(flags, payload);
@@ -524,16 +529,12 @@ fn continuation_of(flags: Int, stream: Int, payload: Bytes) -> Frame / {http2.vi
   ContinuationFrame({ stream: stream, block: payload, end_headers: is_set(flags, 0x4) })
 }
 
-// --- HPACK: integers and strings ------------------------------------------------
-
 /// A header field as HPACK carries it: a name and a value, both octets.
 pub type Field = { name: Bytes, value: Bytes }
 
 fn compression_error<a>(reason: String) -> a / {http2.violated} =
   violation(CompressionError, 0, reason)
 
-/// `n` encoded as an integer whose first octet gives it the low `prefix` bits and contains `bits`
-/// above them (RFC 7541 §5.1).
 fn integer(n: Int, prefix: Int, bits: Int) -> Bytes / {abort.raise} = {
   let top = (1 << prefix) - 1;
   if n < top { byte_of_int(bits | n) }
@@ -546,8 +547,6 @@ fn continuation_octets(n: Int, out: List<Bytes>, fuel: Int) -> Bytes =
 
 type DecodedInteger = { value: Int, next: Int }
 
-/// The integer at `at` whose first octet gives it `prefix` bits. An integer with more than five
-/// continuation octets, above 2^32, or running past the block is rejected.
 fn integer_at(b: Bytes, at: Int, prefix: Int) -> DecodedInteger / {http2.violated, abort.raise} = {
   let top = (1 << prefix) - 1;
   let first = b.at(at) & top;
@@ -561,9 +560,10 @@ fn integer_rest(
   shift: Int,
   fuel: Int,
 ) -> DecodedInteger / {http2.violated, abort.raise} =
-  if fuel <= 0 { compression_error("an integer of more than five continuation octets") }
-  else if at >= b.len() { compression_error("an integer that runs past the end of its block") }
-  else {
+  if fuel <= 0 { compression_error("an integer that is longer than six bytes") }
+  else if at >= b.len() {
+    compression_error("an integer that continues past the end of the header block")
+  } else {
     let octet = b.at(at);
     let v = value + ((octet & 127) << shift);
     if v > 0xFFFF_FFFF { compression_error("an integer past 2^32") }
@@ -573,7 +573,6 @@ fn integer_rest(
 
 type Literal = { value: Bytes, next: Int }
 
-/// The string literal at `at`, Huffman-decoded when its first bit marks it as coded (§5.2).
 fn string_at(b: Bytes, at: Int) -> Literal / {http2.violated, abort.raise} =
   if at >= b.len() { compression_error("a block that ends where a string should start") } else {
     let coded = b.at(at) & 0x80 != 0;
@@ -586,18 +585,12 @@ fn string_at(b: Bytes, at: Int) -> Literal / {http2.violated, abort.raise} =
     }
   }
 
-/// `s` as a string literal, Huffman-coded where that is shorter.
 fn string_literal(s: Bytes) -> Bytes / {abort.raise} = {
   let coded = huffman_length(s);
   if coded < s.len() { integer(coded, 7, 0x80).concat(huffman_encode(s)) }
   else { integer(s.len(), 7, 0).concat(s) }
 }
 
-// --- HPACK: the Huffman code ----------------------------------------------------
-
-/// How many bits each symbol's code takes, octets 0 to 255 and then EOS, as RFC 7541 Appendix B
-/// gives them. The code is canonical, each length's codes in the order of their symbols, so these
-/// lengths are the whole of it.
 fn code_lengths() -> List<Int> =
   [
     13,
@@ -859,9 +852,6 @@ fn code_lengths() -> List<Int> =
     30,
   ]
 
-/// The code built from its lengths. By length from 0 to 30: the first code of that length, where
-/// its symbols start in `symbols`, and `limits`, the bound that every code of that length or
-/// shorter is below once shifted to the left of a 30-bit window.
 type Huffman = {
   codes: Array<Int>,
   lengths: Array<Int>,
@@ -919,28 +909,32 @@ fn huffman_of(lengths: Array<Int>) -> Huffman / {abort.raise} = {
   }
 }
 
-/// The octets `s` takes Huffman-coded.
 fn huffman_length(s: Bytes) -> Int / {abort.raise} = {
   let h = huffman();
   (range(0, s.len()).fold(0, |bits: Int, i: Int| bits + h.lengths.get(s.at(i))) + 7) / 8
 }
 
-type Coding = { acc: Int, count: Int, out: List<Bytes> }
+type Coding = { accumulator: Int, count: Int, out: List<Bytes> }
 
-/// `s` Huffman-coded, its last octet padded with the first bits of EOS.
 fn huffman_encode(s: Bytes) -> Bytes / {abort.raise} = {
   let h = huffman();
-  let coded = range(0, s.len()).fold({ acc: 0, count: 0, out: [] }, |c: Coding, i: Int| {
+  let coded = range(0, s.len()).fold({ accumulator: 0, count: 0, out: [] }, |c: Coding, i: Int| {
     let symbol = s.at(i);
     let length = h.lengths.get(symbol);
     flush_bytes(
-      { acc: c.acc << length | h.codes.get(symbol), count: c.count + length, out: c.out },
+      {
+        accumulator: c.accumulator << length | h.codes.get(symbol),
+        count: c.count + length,
+        out: c.out,
+      },
       5,
     )
   });
   if coded.count == 0 { Bytes::concat_all(coded.out) } else {
     let pad = 8 - coded.count;
-    Bytes::concat_all(coded.out.push(byte_of_int((coded.acc << pad | (1 << pad) - 1) & 0xFF)))
+    Bytes::concat_all(
+      coded.out.push(byte_of_int((coded.accumulator << pad | (1 << pad) - 1) & 0xFF)),
+    )
   }
 }
 
@@ -949,36 +943,34 @@ fn flush_bytes(c: Coding, fuel: Int) -> Coding =
     let rest = c.count - 8;
     flush_bytes(
       {
-        acc: c.acc & (1 << rest) - 1,
+        accumulator: c.accumulator & (1 << rest) - 1,
         count: rest,
-        out: c.out.push(byte_of_int(c.acc >>> rest & 0xFF)),
+        out: c.out.push(byte_of_int(c.accumulator >>> rest & 0xFF)),
       },
       fuel - 1,
     )
   }
 
-type Decoding = { acc: Int, count: Int, at: Int, out: List<Bytes> }
+type Decoding = { accumulator: Int, count: Int, at: Int, out: List<Bytes> }
 
-/// The octets a Huffman-coded string represents. A string that contains EOS, or that ends in more
-/// than seven bits or in bits that are not the first of EOS, is rejected (§5.2).
 fn huffman_decode(raw: Bytes) -> Bytes / {http2.violated, abort.raise} = {
   let h = huffman();
-  iterate({ acc: 0, count: 0, at: 0, out: [] }, 2 * raw.len() + 2, |d: Decoding| {
+  iterate({ accumulator: 0, count: 0, at: 0, out: [] }, 2 * raw.len() + 2, |d: Decoding| {
     let s = refill_bits(raw, d, 5);
     if s.count == 0 { Stop(Bytes::concat_all(s.out)) } else {
-      let w = if s.count >= 30 { s.acc >>> s.count - 30 & 0x3FFF_FFFF }
-      else { (s.acc << 30 - s.count | (1 << 30 - s.count) - 1) & 0x3FFF_FFFF };
+      let w = if s.count >= 30 { s.accumulator >>> s.count - 30 & 0x3FFF_FFFF }
+      else { (s.accumulator << 30 - s.count | (1 << 30 - s.count) - 1) & 0x3FFF_FFFF };
       let l = code_length(h.limits, w, 25);
       if l > s.count {
         if s.count > 7 { compression_error("a Huffman string padded with more than seven bits") }
-        else if s.acc & (1 << s.count) - 1 != (1 << s.count) - 1 {
+        else if s.accumulator & (1 << s.count) - 1 != (1 << s.count) - 1 {
           compression_error("a Huffman string padded with other than the first bits of EOS")
         } else { Stop(Bytes::concat_all(s.out)) }
       } else {
         let symbol = h.symbols.get(h.offsets.get(l) + (w >>> 30 - l) - h.first.get(l));
         if symbol == 256 { compression_error("a Huffman string that holds EOS") } else {
           Continue({
-            acc: s.acc & (1 << s.count - l) - 1,
+            accumulator: s.accumulator & (1 << s.count - l) - 1,
             count: s.count - l,
             at: s.at,
             out: s.out.push(byte_of_int(symbol)),
@@ -989,26 +981,20 @@ fn huffman_decode(raw: Bytes) -> Bytes / {http2.violated, abort.raise} = {
   })
 }
 
-/// Refills to at least 30 bits, or every bit left.
 fn refill_bits(raw: Bytes, d: Decoding, fuel: Int) -> Decoding / {abort.raise} =
   if d.count >= 30 || d.at >= raw.len() || fuel <= 0 { d } else {
     refill_bits(
       raw,
-      { ..d, acc: d.acc << 8 | raw.at(d.at), count: d.count + 8, at: d.at + 1 },
+      { ..d, accumulator: d.accumulator << 8 | raw.at(d.at), count: d.count + 8, at: d.at + 1 },
       fuel - 1,
     )
   }
 
-/// The length of the code a 30-bit window starts with: the shortest whose limit the window is
-/// below.
 fn code_length(limits: Array<Int>, w: Int, left: Int) -> Int / {abort.raise} = {
   let l = 30 - left;
   if left <= 0 || w < limits.get(l) { l } else { code_length(limits, w, left - 1) }
 }
 
-// --- HPACK: the tables ------------------------------------------------------------
-
-/// The static table, RFC 7541 Appendix A: index 1 is the first.
 fn static_fields() -> List<Field> =
   [
     { name: b":authority", value: b"" },
@@ -1074,8 +1060,6 @@ fn static_fields() -> List<Field> =
     { name: b"www-authenticate", value: b"" },
   ]
 
-/// The static table to read by index, and to look up by field and by name, each at its first
-/// index.
 type StaticTable = { fields: Array<Field>, exact: Map<Field, Int>, names: Map<Bytes, Int> }
 
 const fn static_table() -> StaticTable = {
@@ -1095,11 +1079,8 @@ const fn static_table() -> StaticTable = {
 
 fn static_count() -> Int = 61
 
-/// The octets an entry takes in a table: its name, its value and 32 (§4.1).
 fn entry_size(f: Field) -> Int = f.name.len() + f.value.len() + 32
 
-/// A dynamic table: its entries by the order they were inserted in, the newest's number, how many
-/// there are, the octets they take and the most they may take.
 type Table = { entries: Map<Int, Field>, newest: Int, count: Int, size: Int, capacity: Int }
 
 type Eviction = { table: Table, gone: List<{ key: Int, value: Field }> }
@@ -1107,8 +1088,6 @@ type Eviction = { table: Table, gone: List<{ key: Int, value: Field }> }
 fn table_of(capacity: Int) -> Table =
   { entries: Map::new(), newest: 0, count: 0, size: 0, capacity: capacity }
 
-/// The table with its oldest entries evicted until it contains at most `capacity - space_needed`
-/// octets.
 fn evict(t: Table, space_needed: Int) -> Eviction / {abort.raise} =
   iterate({ table: t, gone: [] }, t.count + 1, |e: Eviction|
     if e.table.size + space_needed <= e.table.capacity || e.table.count == 0 { Stop(e) } else {
@@ -1128,7 +1107,6 @@ fn evict(t: Table, space_needed: Int) -> Eviction / {abort.raise} =
       }
     })
 
-/// The table after `f` is inserted; an entry larger than the table empties it and is not stored.
 fn insert_entry(t: Table, f: Field) -> Eviction / {abort.raise} = {
   let size = entry_size(f);
   if size > t.capacity { evict(t, t.capacity + 1) } else {
@@ -1149,36 +1127,54 @@ fn insert_entry(t: Table, f: Field) -> Eviction / {abort.raise} = {
 fn resize_table(t: Table, capacity: Int) -> Eviction / {abort.raise} =
   evict({ ..t, capacity: capacity }, 0)
 
-/// The field at an index of the two tables together: the static table's 61 and then the dynamic
-/// table's, newest first.
 fn field_at(t: Table, index: Int) -> Field / {http2.violated, abort.raise} =
   if index <= 0 { compression_error("index 0") }
   else if index <= static_count() { static_table().fields.get(index - 1) } else {
     match t.entries.get(t.newest - (index - static_count() - 1)) {
-      Some(f) -> if index - static_count() <= t.count { f }
-      else { compression_error("index " ++ index.to_string() ++ " past the tables") },
-      None -> compression_error("index " ++ index.to_string() ++ " past the tables"),
+      Some(f) -> if index - static_count() <= t.count { f } else {
+        compression_error(
+          "index " ++ index.to_string() ++ " is larger than the static and dynamic tables together",
+        )
+      },
+      None ->
+        compression_error(
+          "index " ++ index.to_string() ++ " is larger than the static and dynamic tables together",
+        ),
     }
   }
 
-// --- HPACK: decoding --------------------------------------------------------------
-
 /// One end's decoder for the field blocks its peer writes: the dynamic table the two share, the
 /// most it may be made to contain, and how many size updates one block may start with.
-pub opaque type Decoder = new { table: Table, ceiling: Int, max_updates: Int, owed: Bool }
+pub opaque type Decoder = new {
+  table: Table,
+  ceiling: Int,
+  max_updates: Int,
+  size_update_required: Bool,
+}
 
-/// A decoder whose table may hold `ceiling` octets, the `SETTINGS_HEADER_TABLE_SIZE` its end sent,
-/// and that accepts at most `max_updates` size updates at the start of a block.
+/// Returns a decoder whose table may contain at most `ceiling` octets, the
+/// `SETTINGS_HEADER_TABLE_SIZE` that this endpoint sent, and which accepts at most `max_updates`
+/// table size updates at the start of a block.
 pub fn decoder(ceiling: Int, max_updates: Int) -> Decoder =
-  { table: table_of(ceiling), ceiling: ceiling, max_updates: max_updates, owed: false }
+  {
+    table: table_of(ceiling),
+    ceiling: ceiling,
+    max_updates: max_updates,
+    size_update_required: false,
+  }
 
 /// The decoder after its end allows a table of `ceiling` octets. When that is less than the table
 /// contains now, the next block must start with a size update to at most `ceiling`.
 pub fn with_ceiling(d: Decoder, ceiling: Int) -> Decoder =
-  { ..d, ceiling: ceiling, owed: d.owed || d.table.capacity > ceiling }
+  {
+    ..d,
+    ceiling: ceiling,
+    size_update_required: d.size_update_required || d.table.capacity > ceiling,
+  }
 
-/// What a field block decodes to: the decoder after it, the fields in order, and the size the list
-/// takes as `SETTINGS_MAX_HEADER_LIST_SIZE` counts it, each field's octets and 32.
+/// The result of decoding a field block: the decoder after the block, the fields in order, and
+/// `size`, the header list size as `SETTINGS_MAX_HEADER_LIST_SIZE` counts it. That size is the sum
+/// over the fields of the field's octets plus 32.
 pub type DecodeResult = { decoder: Decoder, fields: List<Field>, size: Int }
 
 type Reading = {
@@ -1204,13 +1200,19 @@ pub fn decode(d: Decoder, block: Bytes) -> DecodeResult / {http2.violated, abort
       if r.at >= n { Stop(r) } else {
         let first = block.at(r.at);
         if first & 0xE0 == 0x20 { Continue(size_update(d, block, r)) }
-        else if d.owed && !r.started && r.updates == 0 {
-          compression_error("a block that does not open with the table size update it owes")
+        else if d.size_update_required && !r.started && r.updates == 0 {
+          compression_error(
+            "a header block must start with a dynamic table size update, and this one does not",
+          )
         } else { Continue(read_representation(block, r, first)) }
       },
   );
   {
-    decoder: { ..d, table: read.table, owed: d.owed && read.updates == 0 },
+    decoder: {
+      ..d,
+      table: read.table,
+      size_update_required: d.size_update_required && read.updates == 0,
+    },
     fields: read.fields,
     size: read.size,
   }
@@ -1253,7 +1255,6 @@ fn with_field(r: Reading, f: Field) -> Reading =
 
 type LiteralField = { field: Field, next: Int }
 
-/// A literal field: its name by index or as a string, then its value.
 fn literal_at(
   block: Bytes,
   r: Reading,
@@ -1270,8 +1271,6 @@ fn literal_at(
   }
 }
 
-// --- HPACK: encoding --------------------------------------------------------------
-
 /// One end's encoder for field blocks: the dynamic table it shares with its peer's decoder, the
 /// index of each field and name in it, the most the peer allows it, and the size updates the next
 /// block must start with.
@@ -1282,13 +1281,16 @@ pub opaque type Encoder = new {
   updates: List<Int>,
 }
 
-/// An encoder whose table may hold `capacity` octets; HPACK starts both ends at 4096.
+/// Returns an encoder whose dynamic table holds at most `capacity` octets. Both ends of a
+/// connection start with a 4096-octet table, so use 4096 until a size update changes it.
 pub fn encoder(capacity: Int) -> Encoder =
   { table: table_of(capacity), fields: Map::new(), names: Map::new(), updates: [] }
 
-/// The encoder with a table of `capacity` octets, at most what the peer's decoder allows. The next
-/// block starts with the size update, preceded by one to the smallest size the table passed
-/// through, so the peer's decoder evicts what this one did.
+/// Returns the encoder with its table resized to `capacity` octets, which must be at most what the
+/// peer's decoder allows. The next block starts with a table size update to `capacity`. If the
+/// table was resized earlier and no block has been encoded since, that update is preceded by an
+/// update to the smallest size the table has had, so the peer's decoder evicts the same entries
+/// this encoder did.
 pub fn with_capacity(e: Encoder, capacity: Int) -> Encoder / {abort.raise} =
   if capacity == e.table.capacity && e.updates == [] { e } else {
     let low = match e.updates { [] -> capacity, [l, ..] -> min(l, capacity) };
@@ -1297,23 +1299,27 @@ pub fn with_capacity(e: Encoder, capacity: Int) -> Encoder / {abort.raise} =
   }
 
 fn forget_evicted(e: Encoder, ev: Eviction) -> Encoder =
-  ev.gone.fold({ ..e, table: ev.table }, |acc: Encoder, g: { key: Int, value: Field }|
+  ev.gone.fold({ ..e, table: ev.table }, |accumulator: Encoder, g: { key: Int, value: Field }|
     {
-      ..acc,
-      fields: if acc.fields.get(g.value) == Some(g.key) { acc.fields.remove(g.value) }
-      else { acc.fields },
-      names: if acc.names.get(g.value.name) == Some(g.key) { acc.names.remove(g.value.name) }
-      else { acc.names },
+      ..accumulator,
+      fields: if accumulator.fields.get(g.value) == Some(g.key) {
+        accumulator.fields.remove(g.value)
+      } else { accumulator.fields },
+      names: if accumulator.names.get(g.value.name) == Some(g.key) {
+        accumulator.names.remove(g.value.name)
+      } else { accumulator.names },
     })
 
 /// What `encode` returns: the encoder after the block, and the block.
 pub type EncodeResult = { encoder: Encoder, block: Bytes }
 
-/// The fields as one field block. A field in either table is written as its index; one whose value
-/// varies from message to message, or that would take most of the table, is written without being
-/// inserted; and an `authorization`, a `proxy-authorization` and a short `cookie` are never
-/// indexed, so no intermediary inserts them either (§7.1.3). A string is Huffman-coded where that
-/// is shorter.
+/// Encodes `fields` as one HPACK field block and returns it with the updated encoder. A field
+/// already in the static or dynamic table is written as its table index. A field whose value
+/// changes from message to message, or that would take up most of the dynamic table, is written
+/// without being added to the table. `authorization`, `proxy-authorization` and short `cookie`
+/// fields are never added to the table, and are written as never-indexed literals, which tells
+/// intermediaries not to add them to their tables either. A string is Huffman-coded when that is
+/// shorter.
 pub fn encode(e: Encoder, fields: List<Field>) -> EncodeResult / {abort.raise} = {
   let opening = e.updates.map(|size: Int| integer(size, 5, 0x20));
   let written = fields.fold(
@@ -1353,12 +1359,12 @@ fn write_literal(e: Encoder, f: Field) -> EncodeResult / {abort.raise} = {
     { encoder: e, block: Bytes::concat_all([integer(index, 4, 0), name, value]) }
   } else {
     let ev = insert_entry(e.table, f);
-    let kept = forget_evicted(e, ev);
+    let pruned_encoder = forget_evicted(e, ev);
     {
       encoder: {
-        ..kept,
-        fields: kept.fields.insert(f, ev.table.newest),
-        names: kept.names.insert(f.name, ev.table.newest),
+        ..pruned_encoder,
+        fields: pruned_encoder.fields.insert(f, ev.table.newest),
+        names: pruned_encoder.names.insert(f.name, ev.table.newest),
       },
       block: Bytes::concat_all([integer(index, 6, 0x40), name, value]),
     }
@@ -1369,8 +1375,6 @@ fn never_indexed(f: Field) -> Bool =
   f.name == b"authorization" || f.name == b"proxy-authorization"
     || (f.name == b"cookie" && f.value.len() < 20)
 
-/// Whether to insert a field into the table. A field whose value is rarely sent twice would fill
-/// the table for nothing.
 fn worth_indexing(f: Field) -> Bool =
   f.name != b":path" && f.name != b"content-length" && f.name != b"etag"
     && f.name != b"if-modified-since"
@@ -1380,19 +1384,18 @@ fn worth_indexing(f: Field) -> Bool =
     && f.name != b"date"
     && f.name != b"last-modified"
 
-// --- The connection: limits -----------------------------------------------------
-
 /// Which end of a connection a machine is.
 pub type Role = | Server | Client
 
-/// The most a peer can make one connection cost, each field limiting one way to raise the cost.
-/// The counts described as "within `window_ms`" are tracked over windows of that length. Every
-/// limit must be positive (`check_limits`).
+/// Limits on how much load a peer can put on one connection. Each field bounds one way of
+/// increasing that load. Counts described as "within `window_ms`" are tracked over windows of that
+/// length. Every limit must be positive (`check_limits`).
 pub type Limits = new {
-  /// Streams the peer may have open at once, advertised as `SETTINGS_MAX_CONCURRENT_STREAMS`; one
-  /// past it is refused with `REFUSED_STREAM`.
+  /// Streams the peer may have open at once, advertised as `SETTINGS_MAX_CONCURRENT_STREAMS`. The
+  /// connection resets any further stream with `REFUSED_STREAM`.
   max_concurrent_streams: Int,
-  /// Streams the peer may open on one connection in total; at the last one, a server drains.
+  /// Streams the peer may open on one connection in total. When the peer opens the last permitted
+  /// stream, a server sends a `GOAWAY` naming that stream and accepts no later ones.
   max_requests: Int,
   /// Octets the peer may send on one stream before this end has read them, advertised as
   /// `SETTINGS_INITIAL_WINDOW_SIZE`.
@@ -1406,9 +1409,9 @@ pub type Limits = new {
   max_table_size: Int,
   /// Table size updates one field block may start with.
   max_table_size_updates: Int,
-  /// The largest field list, measured as `SETTINGS_MAX_HEADER_LIST_SIZE` measures it and
-  /// advertised: each field's octets and 32. A request past it gets a 431 response, however few
-  /// octets its block took.
+  /// The largest field list size, advertised as `SETTINGS_MAX_HEADER_LIST_SIZE`. The size is
+  /// counted as that setting defines it: for each field, the octets of its name and value plus 32.
+  /// A request over the limit gets a 431 response, even if its compressed block was small.
   max_header_list_size: Int,
   /// Octets of one field block across its `HEADERS` and `CONTINUATION` frames.
   max_header_block: Int,
@@ -1428,11 +1431,12 @@ pub type Limits = new {
   /// of a type RFC 9113 does not define.
   max_empty_frames: Int,
   window_ms: Int,
-  /// Octets of messages waiting on the peer's windows, over every stream; a stream the peer opens
-  /// past it is refused with `REFUSED_STREAM`.
+  /// Octets of messages waiting for the peer's flow-control windows to open, summed over all
+  /// streams. While the total is at this limit, the connection resets each new stream the peer
+  /// opens with `REFUSED_STREAM`.
   max_buffered: Int,
-  /// How long a stream's output may wait on a window the peer keeps closed before the stream is
-  /// reset: a reader that never reads.
+  /// How long a stream's output may wait because the peer's flow-control window stays closed before
+  /// the stream is reset. This stops a peer that never reads.
   stall_ms: Int,
   /// How long this end's `SETTINGS` may go unacknowledged before the connection is closed.
   settings_timeout_ms: Int,
@@ -1441,8 +1445,8 @@ pub type Limits = new {
   request_timeout_ms: Int,
   /// How long a connection with no stream open waits for one before it closes.
   idle_timeout_ms: Int,
-  /// How long a server's drain waits for its `PING` to return before it names the last stream it
-  /// accepted.
+  /// How long a draining server waits for the reply to its `PING` before it sends the second
+  /// `GOAWAY`, which names the last stream the server accepted.
   drain_ms: Int,
 }
 
@@ -1518,8 +1522,6 @@ pub fn check_limits(l: Limits) -> Unit / {abort.raise} = {
   }
 }
 
-// --- The connection: its state ------------------------------------------------------
-
 /// A message's fields after its pseudo-header fields: each name lowercase, with its values in the
 /// order they came. It is the shape `std.http`'s `Headers` has.
 pub type Headers = Map<String, List<String>>
@@ -1547,8 +1549,9 @@ pub type Event =
   | Requested({ stream: Int, request: Request })
   /// The complete response to the request a client sent on a stream arrived.
   | Responded({ stream: Int, response: Response })
-  /// The peer reset a stream, or a client's stream was refused, so what it carried will not be
-  /// finished. `RefusedStream` means the server did nothing with it, so it may be sent again.
+  /// The peer reset a stream, or the server rejected a stream a client opened, so the message on
+  /// that stream will not complete. With code `RefusedStream`, the server did not process the
+  /// request, so the client may send it again.
   | Reset({ stream: Int, code: ErrorCode })
   /// A client rejected the response on its stream and reset the stream; the reason explains why.
   | Failed({ stream: Int, reason: String })
@@ -1559,8 +1562,6 @@ pub type Event =
   /// stream still open on it is lost.
   | Closed({ code: ErrorCode, reason: String })
 
-/// The state of a stream that both ends have not closed (RFC 9113 §5.1): open, finished sending by
-/// this end, or finished sending by the peer.
 type Phase = | Open | LocalClosed | RemoteClosed
 
 type Stream = {
@@ -1568,34 +1569,25 @@ type Stream = {
   phase: Phase,
   send_window: Int,
   recv_window: Int,
-  /// Octets read and not yet given back to the peer's window.
   unacked: Int,
-  /// A server's request as read so far, or the request a client sent.
   request: Request,
-  /// A client's response head: its status, 0 until it arrives, and its fields.
   status: Int,
   headers: Headers,
-  /// The `content-length` the message's head gave.
   expected: Option<Int>,
   body: List<Bytes>,
   received: Int,
   trailers: Headers,
-  /// The body this end sends, how much of it has been sent, the trailers that follow it, whether
-  /// the stream has anything left to send, and whether more of the body is still to come.
   out: Bytes,
   sent: Int,
   trailers_out: List<Field>,
   sending: Bool,
   more: Bool,
-  /// A server responded before the request ended, so the stream is reset once the response is sent.
   reset_after: Bool,
   returned: Bool,
   since: Int,
-  /// When its output began to wait on a closed window, or -1.
   stalled: Int,
 }
 
-/// A field block whose `CONTINUATION` frames are still coming.
 type Block = {
   stream: Int,
   pieces: List<Bytes>,
@@ -1609,32 +1601,22 @@ type Block = {
 type ConnectionState = {
   role: Role,
   limits: Limits,
-  /// A server has read the client's preface.
   started: Bool,
-  /// The peer's first `SETTINGS` has been read.
   greeted: Bool,
-  /// The connection is closed: input is ignored, and only output is left.
   over: Bool,
-  /// Input not yet read, in the pieces it arrived in, how many octets they contain, and how many
-  /// the next frame needs. The pieces are joined only once the frame can be read, so a frame that
-  /// arrives an octet at a time is not copied again for each octet.
-  held: List<Bytes>,
+  pending_chunks: List<Bytes>,
   pending_size: Int,
   needed: Int,
   out: List<Bytes>,
   decoder: Decoder,
   encoder: Encoder,
-  /// This end's `SETTINGS` have been acknowledged, and when they were sent.
   acked: Bool,
   settings_at: Int,
   peer_window: Int,
   peer_frame: Int,
   peer_streams: Int,
   streams: Map<Int, Stream>,
-  /// Recently closed streams, `true` when this end reset them, whose late frames are discarded.
   closed: Map<Int, Bool>,
-  /// The highest stream the peer opened, the stream this end opens next, and how many the peer
-  /// opened in total.
   highest: Int,
   next_stream: Int,
   opened: Int,
@@ -1647,15 +1629,11 @@ type ConnectionState = {
   settings: Int,
   pings: Int,
   empty_frames: Int,
-  /// The last stream named in a final `GOAWAY` sent and in one received, or -1.
   goaway_sent: Int,
   goaway_received: Int,
-  /// When a server's drain sent its first `GOAWAY`, or -1.
   draining: Int,
   buffered: Int,
-  /// The time since which no stream has been open.
   quiet_since: Int,
-  /// The stream the last round of `DATA` ended at, so the next starts after it.
   turn: Int,
   events: List<Event>,
 }
@@ -1707,7 +1685,7 @@ fn new_connection(role: Role, limits: Limits, now: Instant) -> Connection / {abo
     started: role == Client,
     greeted: false,
     over: false,
-    held: [],
+    pending_chunks: [],
     pending_size: 0,
     needed: 0,
     out: List::concat(if role == Client { [preface(), greeting] } else { [greeting] }, window),
@@ -1777,7 +1755,8 @@ pub fn finished(c: Connection) -> Bool = {
 /// Streams open on the connection, in either direction.
 pub fn open_streams(c: Connection) -> Int = state_of(c).streams.len()
 
-/// Octets of messages waiting on the peer's windows.
+/// Returns the number of octets of response messages that cannot be sent yet because the peer's
+/// flow-control windows are full.
 pub fn buffered_octets(c: Connection) -> Int = state_of(c).buffered
 
 fn emit_frame(k: ConnectionState, f: Frame) -> ConnectionState / {abort.raise} =
@@ -1794,7 +1773,6 @@ fn enhance_your_calm<a>(reason: String) -> a / {http2.violated} =
 fn rate_text(n: Int, l: Limits) -> String =
   n.to_string() ++ " within " ++ l.window_ms.to_string() ++ " ms"
 
-/// The connection with its counts reset where their window has passed.
 fn roll_window(k: ConnectionState, t: Int) -> ConnectionState =
   if t - k.window_start >= k.limits.window_ms {
     { ..k, window_start: t, resets: 0, settings: 0, pings: 0, empty_frames: 0 }
@@ -1810,25 +1788,21 @@ fn count_empty_frame(k: ConnectionState, t: Int) -> ConnectionState / {http2.vio
   } else { { ..r, empty_frames: r.empty_frames + 1 } }
 }
 
-/// Whether the peer opens a stream of this number: clients open the odd ones.
 fn peer_opens(k: ConnectionState, s: Int) -> Bool =
   match k.role { Server -> s % 2 == 1, Client -> s % 2 == 0 }
 
-/// Whether a stream has not been opened yet.
 fn idle(k: ConnectionState, s: Int) -> Bool =
   if peer_opens(k, s) { s > k.highest } else { s >= k.next_stream }
 
-/// The window a stream starts with on this end. Until the peer acknowledges this end's
-/// `SETTINGS`, it may still send as the protocol's default allows.
 fn recv_target(k: ConnectionState) -> Int =
   if k.acked { k.limits.initial_window } else { max(default_window(), k.limits.initial_window) }
 
 fn remember_closed(closed: Map<Int, Bool>, s: Int, by_us: Bool, most: Int) -> Map<Int, Bool> = {
-  let kept = closed.insert(s, by_us);
-  if kept.len() <= most { kept } else { match kept.pop_first() { Some(p) -> p.rest, None -> kept } }
+  let updated_closed = closed.insert(s, by_us);
+  if updated_closed.len() <= most { updated_closed }
+  else { match updated_closed.pop_first() { Some(p) -> p.rest, None -> updated_closed } }
 }
 
-/// The connection without a stream, which is remembered as closed.
 fn drop_stream(k: ConnectionState, st: Stream, by_us: Bool, t: Int) -> ConnectionState = {
   let streams = k.streams.remove(st.id);
   {
@@ -1840,7 +1814,6 @@ fn drop_stream(k: ConnectionState, st: Stream, by_us: Bool, t: Int) -> Connectio
   }
 }
 
-/// A stream reset by this end, which counts towards `max_resets` as one the peer resets does.
 fn reset_stream(
   k: ConnectionState,
   s: Int,
@@ -1872,7 +1845,6 @@ fn reset_stream(
   }
 }
 
-/// The connection closed on an error: a `GOAWAY` naming it, and nothing read after it.
 fn close_with_error(
   k: ConnectionState,
   code: ErrorCode,
@@ -1884,7 +1856,14 @@ fn close_with_error(
       GoAwayFrame({ last_stream: k.highest, code: code, debug: Bytes::of_string(reason) }),
     );
     event(
-      { ..sent, over: true, held: [], pending_size: 0, block: None, goaway_sent: k.highest },
+      {
+        ..sent,
+        over: true,
+        pending_chunks: [],
+        pending_size: 0,
+        block: None,
+        goaway_sent: k.highest,
+      },
       Closed({ code: code, reason: reason }),
     )
   }
@@ -1894,32 +1873,28 @@ fn goaway(k: ConnectionState, last: Int) -> ConnectionState / {abort.raise} = {
   { ..sent, goaway_sent: last }
 }
 
-// --- The connection: reading -------------------------------------------------------
-
-/// Reads `data`, the next bytes from the peer, and returns the events they cause, after the events
-/// from calls since the last `receive` or `tick`. A breach of the protocol closes the stream it is
-/// limited to, or the connection. Either way the output contains the frame that reports it, and a
-/// closed connection reads nothing more.
+/// Reads `data`, the next bytes from the peer, and returns the resulting events. The returned
+/// events also include events produced by other calls since the last `receive` or `tick`. A
+/// protocol violation resets the stream if it affects only one stream, and otherwise closes the
+/// connection. In both cases the connection sends a frame that reports the violation. A closed
+/// connection ignores any further data.
 pub fn receive(c: Connection, data: Bytes, now: Instant) -> ReceiveResult / {abort.raise} = {
   let k = state_of(c);
   let size = k.pending_size + data.len();
   if k.over { report(k) } else if k.started && size < k.needed {
-    report({ ..k, held: k.held.push(data), pending_size: size })
+    report({ ..k, pending_chunks: k.pending_chunks.push(data), pending_size: size })
   } else {
     let t = ms(now);
-    let buf = Bytes::concat_all(k.held.push(data));
+    let bytes = Bytes::concat_all(k.pending_chunks.push(data));
     report(
       send_pending_data(
-        if k.started { framed_input(k, buf, t) } else { read_preface(k, buf, t) },
+        if k.started { framed_input(k, bytes, t) } else { read_preface(k, bytes, t) },
         t,
       ),
     )
   }
 }
 
-/// The events the calls produced, with the requests still waiting for a response. A request whose
-/// stream the peer reset in the same bytes, or on a connection now closed, is not passed to the
-/// application.
 fn report(k: ConnectionState) -> ReceiveResult =
   {
     connection: Connection({ ..k, events: [] }),
@@ -1931,21 +1906,20 @@ fn report(k: ConnectionState) -> ReceiveResult =
       }),
   }
 
-fn read_preface(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
-  let n = min(buf.len(), preface().len());
-  if buf.slice(0, n) != preface().slice(0, n) {
+fn read_preface(k: ConnectionState, bytes: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
+  let n = min(bytes.len(), preface().len());
+  if bytes.slice(0, n) != preface().slice(0, n) {
     close_with_error(k, ProtocolError, "the connection does not open with the HTTP/2 preface")
-  } else if n < preface().len() { { ..k, held: [buf], pending_size: buf.len() } }
-  else { framed_input({ ..k, started: true }, buf.slice(n, buf.len()), t) }
+  } else if n < preface().len() { { ..k, pending_chunks: [bytes], pending_size: bytes.len() } }
+  else { framed_input({ ..k, started: true }, bytes.slice(n, bytes.len()), t) }
 }
 
 type Scan = { k: ConnectionState, at: Int }
 
-/// Every whole frame in `buf`, which contains all input not yet read.
-fn framed_input(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
-  let done = iterate({ k: k, at: 0 }, buf.len() / 9 + 2, |r: Scan|
+fn framed_input(k: ConnectionState, bytes: Bytes, t: Int) -> ConnectionState / {abort.raise} = {
+  let done = iterate({ k: k, at: 0 }, bytes.len() / 9 + 2, |r: Scan|
     if r.k.over { Stop(r) } else {
-      match frame_length(buf, r.at) {
+      match frame_length(bytes, r.at) {
         None -> Stop(r),
         Some(length) -> if length > r.k.limits.max_frame_size {
           Stop({
@@ -1958,50 +1932,47 @@ fn framed_input(k: ConnectionState, buf: Bytes, t: Int) -> ConnectionState / {ab
                 ++ " allowed",
             ),
           })
-        } else if buf.len() - r.at - 9 < length { Stop(r) }
-        else { Continue({ k: one_frame(r.k, buf, r.at, t), at: r.at + 9 + length }) },
+        } else if bytes.len() - r.at - 9 < length { Stop(r) }
+        else { Continue({ k: one_frame(r.k, bytes, r.at, t), at: r.at + 9 + length }) },
       }
     });
   if done.k.over { done.k } else {
-    let rest = buf.slice(done.at, buf.len());
+    let rest = bytes.slice(done.at, bytes.len());
     {
       ..done.k,
-      held: [rest],
+      pending_chunks: [rest],
       pending_size: rest.len(),
       needed: match frame_length(rest, 0) { Some(length) -> 9 + length, None -> 9 },
     }
   }
 }
 
-/// One whole frame, whose header is at `at`. A violation limited to a stream resets it; any other
-/// closes the connection, from the state before the frame.
-fn one_frame(k: ConnectionState, buf: Bytes, at: Int, t: Int) -> ConnectionState / {abort.raise} = {
-  let kind = buf.at(at + 3);
-  let stream = word(buf, at + 5) & 0x7FFF_FFFF;
+fn one_frame(k: ConnectionState, bytes: Bytes, at: Int, t: Int) -> ConnectionState / {abort.raise} = {
+  let kind = bytes.at(at + 3);
+  let stream = word(bytes, at + 5) & 0x7FFF_FFFF;
   match k.block {
     Some(b) -> if kind != 9 || stream != b.stream {
       close_with_error(k, ProtocolError, "a field block interrupted before its END_HEADERS")
-    } else { handle_frame(k, buf, at, t) },
-    None -> if !k.greeted && (kind != 4 || buf.at(at + 4) & 0x1 != 0) {
+    } else { handle_frame(k, bytes, at, t) },
+    None -> if !k.greeted && (kind != 4 || bytes.at(at + 4) & 0x1 != 0) {
       close_with_error(k, ProtocolError, "a connection whose first frame is not SETTINGS")
-    } else { handle_frame(k, buf, at, t) },
+    } else { handle_frame(k, bytes, at, t) },
   }
 }
 
 fn handle_frame(
   k: ConnectionState,
-  buf: Bytes,
+  bytes: Bytes,
   at: Int,
   t: Int,
 ) -> ConnectionState / {abort.raise} =
   match try {
-      match read_frame(buf, at, k.limits.max_frame_size) {
+      match read_frame(bytes, at, k.limits.max_frame_size) {
         None -> k,
         Some(r) -> on_frame(k, r.frame, t),
       }
     } {
     Ok(next) -> next,
-    // No RST_STREAM goes to an idle stream (§6.4), so an error confined to one ends the connection.
     Err(v) -> if v.stream == 0 || idle(k, v.stream) { close_with_error(k, v.code, v.reason) }
     else { reset_stream(k, v.stream, v.code, t) },
   }
@@ -2018,7 +1989,7 @@ fn on_frame(
     ResetFrame(r) -> on_reset(k, r.stream, r.code, t),
     SettingsFrame(s) -> if s.ack { on_settings_ack(k) } else { on_settings(k, s.settings, t) },
     PushPromiseFrame(_) ->
-      violation(ProtocolError, 0, "a PUSH_PROMISE, which this end does not take"),
+      violation(ProtocolError, 0, "a PUSH_PROMISE frame, which this endpoint does not accept"),
     PingFrame(p) -> on_ping(k, p.ack, p.data, t),
     GoAwayFrame(g) -> on_goaway(k, g.last_stream, g.code, g.debug, t),
     WindowUpdateFrame(w) -> on_window_update(k, w.stream, w.increment, t),
@@ -2026,8 +1997,6 @@ fn on_frame(
     UnknownFrame(_) -> count_empty_frame(k, t),
   }
 
-/// The octets a `DATA` frame took from the connection's window, given back to the peer once half
-/// the window is used: a stream buffers what it reads, so the window never waits on another stream.
 fn credit_window(k: ConnectionState, flow: Int) -> ConnectionState / {abort.raise} = {
   let unacked = k.unacked + flow;
   if unacked > 0 && unacked >= max(default_window(), k.limits.connection_window) / 2 {
@@ -2058,7 +2027,7 @@ fn on_data(
       Some(st) -> if st.phase == RemoteClosed { reset_stream(counted, s, StreamClosed, t) }
       else if flow > st.recv_window { reset_stream(counted, s, FlowControlError, t) }
       else if counted.role == Client && st.status == 0 {
-        fail_stream(counted, st, "DATA before the response's head", t)
+        fail_stream(counted, st, "DATA arrived before the response headers", t)
       } else if counted.role == Server && st.returned { discard_data(counted, st, end, flow, t) }
       else { accept_data(counted, st, data, end, flow, t) },
     }
@@ -2106,13 +2075,11 @@ fn accept_data(
 fn has_no_body(st: Stream) -> Bool =
   st.status == 204 || st.status == 304 || st.request.method == "HEAD"
 
-/// The peer ended its side of a stream: the message is whole.
 fn remote_ended(k: ConnectionState, st: Stream, t: Int) -> ConnectionState / {abort.raise} =
   match st.expected {
-    // The response to HEAD, a 204 and a 304 carry the length another response's body would have.
     Some(n) if n != st.received && !(k.role == Client && has_no_body(st)) -> match k.role {
       Server -> reset_stream(k, st.id, ProtocolError, t),
-      Client -> fail_stream(k, st, "a body of other than its content-length", t),
+      Client -> fail_stream(k, st, "the body length differs from the content-length", t),
     },
     _ -> match k.role {
       Server -> {
@@ -2198,7 +2165,6 @@ fn on_continuation(
     },
   }
 
-/// A whole field block: decoded whatever becomes of its stream, so the two ends' tables agree.
 fn field_block(
   k: ConnectionState,
   s: Int,
@@ -2219,7 +2185,12 @@ fn field_block(
           match read.closed.get(s) {
             Some(true) -> read,
             Some(false) -> violation(StreamClosed, 0, "HEADERS on a closed stream"),
-            None -> violation(ProtocolError, 0, "a new stream numbered below one already opened"),
+            None ->
+              violation(
+                ProtocolError,
+                0,
+                "a new stream has a lower number than a stream that was already opened",
+              ),
           }
         },
       }
@@ -2248,7 +2219,6 @@ fn new_stream(
 ) -> ConnectionState / {abort.raise} = {
   let seen = { ..k, highest: s };
   if seen.goaway_sent >= 0 && s > seen.goaway_sent {
-    // Past the last stream a GOAWAY named: ignored, and its late frames with it.
     {
       ..seen,
       closed: remember_closed(seen.closed, s, true, 2 * seen.limits.max_concurrent_streams + 16),
@@ -2287,10 +2257,8 @@ fn new_stream(
           else if match request.headers.get("expect") {
               Some([v]) -> v.ascii_lower() == "100-continue",
               _ -> false,
-            } {
-            // The client waits for the 100 before it sends its body.
-            store_stream(emit_headers(taken, s, [status_field(100)], false), read)
-          } else { store_stream(taken, read) }
+            } { store_stream(emit_headers(taken, s, [status_field(100)], false), read) }
+          else { store_stream(taken, read) }
         },
       }
     }
@@ -2322,7 +2290,6 @@ fn fresh_stream(k: ConnectionState, s: Int, phase: Phase, request: Request, t: I
     stalled: -1,
   }
 
-/// Fields after a message's body: they end the stream and contain no pseudo-header.
 fn trailers_in(
   k: ConnectionState,
   st: Stream,
@@ -2376,7 +2343,6 @@ fn response_head(
     }
   }
 
-/// A client rejecting the malformed response on one of its streams.
 fn fail_stream(
   k: ConnectionState,
   st: Stream,
@@ -2393,7 +2359,6 @@ fn failed_with(
 ) -> ConnectionState / {abort.raise} =
   event(reset_stream(k, st.id, code, t), Failed({ stream: st.id, reason: reason }))
 
-/// What the peer sends on a stream a server has already responded to: read and dropped.
 fn discard_data(k: ConnectionState, st: Stream, end: Bool, flow: Int, t: Int) -> ConnectionState = {
   let read = { ..st, recv_window: st.recv_window - flow };
   if !end { store_stream(k, read) }
@@ -2401,7 +2366,6 @@ fn discard_data(k: ConnectionState, st: Stream, end: Bool, flow: Int, t: Int) ->
   else { store_stream(k, { ..read, phase: RemoteClosed, reset_after: false }) }
 }
 
-/// A server responding to a request it does not pass on, with the status that gives the reason.
 fn reject_request(
   k: ConnectionState,
   st: Stream,
@@ -2415,7 +2379,6 @@ fn reject_request(
     None -> k,
   }
 
-/// A `text/plain` response, as a server sends for what it rejects.
 fn plain_text(status: Int, text: String) -> Response =
   {
     status: status,
@@ -2468,19 +2431,22 @@ fn setting_applied(
     HeaderTableSize(n) ->
       { ..k, encoder: with_capacity(k.encoder, min(n, k.limits.max_table_size)) },
     EnablePush(on) -> if on && k.role == Client {
-      violation(ProtocolError, 0, "a server's SETTINGS_ENABLE_PUSH of 1")
+      violation(ProtocolError, 0, "the server sent SETTINGS_ENABLE_PUSH with the value 1")
     } else { k },
     MaxConcurrentStreams(n) -> { ..k, peer_streams: n },
     InitialWindowSize(n) -> {
       let delta = n - k.peer_window;
-      let moved = k.streams.fold(Map::new(), |acc: Map<Int, Stream>, id: Int, st: Stream|
-        if st.send_window + delta > largest_window() {
-          violation(
-            FlowControlError,
-            0,
-            "SETTINGS_INITIAL_WINDOW_SIZE that takes a window past 2^31-1",
-          )
-        } else { acc.insert(id, { ..st, send_window: st.send_window + delta }) });
+      let moved = k.streams.fold(
+        Map::new(),
+        |accumulator: Map<Int, Stream>, id: Int, st: Stream|
+          if st.send_window + delta > largest_window() {
+            violation(
+              FlowControlError,
+              0,
+              "SETTINGS_INITIAL_WINDOW_SIZE would raise a stream's window above 2^31-1",
+            )
+          } else { accumulator.insert(id, { ..st, send_window: st.send_window + delta }) },
+      );
       { ..k, peer_window: n, streams: moved }
     },
     MaxFrameSize(n) -> { ..k, peer_frame: n },
@@ -2488,8 +2454,6 @@ fn setting_applied(
     Unknown(_, _) -> k,
   }
 
-/// The peer has acknowledged this end's `SETTINGS`: its windows and its table now take the values
-/// they set.
 fn on_settings_ack(k: ConnectionState) -> ConnectionState =
   if k.acked { k } else {
     let delta = k.limits.initial_window - max(default_window(), k.limits.initial_window);
@@ -2498,8 +2462,8 @@ fn on_settings_ack(k: ConnectionState) -> ConnectionState =
       acked: true,
       decoder: with_ceiling(k.decoder, k.limits.max_table_size),
       streams: if delta == 0 { k.streams } else {
-        k.streams.fold(Map::new(), |acc: Map<Int, Stream>, id: Int, st: Stream|
-          acc.insert(id, { ..st, recv_window: st.recv_window + delta }))
+        k.streams.fold(Map::new(), |accumulator: Map<Int, Stream>, id: Int, st: Stream|
+          accumulator.insert(id, { ..st, recv_window: st.recv_window + delta }))
       },
     }
   }
@@ -2533,13 +2497,13 @@ fn on_goaway(
   let untaken = k.streams.values().filter(|st: Stream| !peer_opens(k, st.id) && st.id > bound);
   let refused_ones = untaken.fold(
     { ..k, goaway_received: bound },
-    |acc: ConnectionState, st: Stream|
-      event(drop_stream(acc, st, false, t), Reset({ stream: st.id, code: RefusedStream })),
+    |accumulator: ConnectionState, st: Stream|
+      event(drop_stream(accumulator, st, false, t), Reset({ stream: st.id, code: RefusedStream })),
   );
-  let told = event(refused_ones, GoingAway({ last_stream: bound, code: code, debug: debug }));
-  if code == NoError { told } else {
+  let going_away = event(refused_ones, GoingAway({ last_stream: bound, code: code, debug: debug }));
+  if code == NoError { going_away } else {
     event(
-      { ..told, over: true, held: [], pending_size: 0, block: None },
+      { ..going_away, over: true, pending_chunks: [], pending_size: 0, block: None },
       Closed({ code: code, reason: "the peer's GOAWAY: " ++ String::of_bytes_lossy(debug) }),
     )
   }
@@ -2565,10 +2529,6 @@ fn on_window_update(
     }
   }
 
-// --- Messages: fields as a request or a response -----------------------------------
-
-/// What a request's head is: a request and the `content-length` it gave, malformed (RFC 9113
-/// §8.1.1), or well formed and not served, with the status that reports why.
 type Head = | WellFormed(Request, Option<Int>) | Malformed(String) | Rejected(Int, String)
 
 type CollectedHeaders = {
@@ -2580,11 +2540,8 @@ type CollectedHeaders = {
   malformed_reason: Option<String>,
 }
 
-/// A field name's octets after its colon, if any: lowercase, and a token's (RFC 9113 §8.2.1).
 fn name_chars() -> Bytes = b"!#$%&'*+-.^_`|~0123456789abcdefghijklmnopqrstuvwxyz"
 
-/// What is wrong with a field as RFC 9113 §8.2.1 has one, and a value that is not UTF-8, which
-/// `std.http` rejects too.
 fn field_flaw(f: Field) -> Option<String> / {abort.raise} = {
   let n = f.name.len();
   let from = if n > 0 && f.name.at(0) == b':' { 1 } else { 0 };
@@ -2602,7 +2559,6 @@ fn field_flaw(f: Field) -> Option<String> / {abort.raise} = {
   else { None }
 }
 
-/// Fields that describe a connection, which HTTP/2 does not carry (§8.2.2).
 fn connection_specific(name: String) -> Bool =
   name == "connection" || name == "keep-alive" || name == "proxy-connection"
     || name == "transfer-encoding"
@@ -2639,10 +2595,15 @@ fn field_gathered(
     Some(reason) -> wrong(g, reason),
     None -> if f.name.at(0) == b':' {
       let name = String::of_bytes(f.name);
-      if trailing { wrong(g, "the pseudo-header `" ++ name ++ "` among trailers") }
-      else if g.regular { wrong(g, "the pseudo-header `" ++ name ++ "` after a regular field") }
-      else if !allowed.contains(f.name) {
-        wrong(g, "the pseudo-header `" ++ name ++ "`, which this message does not take")
+      if trailing { wrong(g, "the pseudo-header `" ++ name ++ "` is not allowed in trailers") }
+      else if g.regular {
+        wrong(
+          g,
+          "the pseudo-header `" ++ name
+            ++ "` comes after a regular field, but pseudo-headers must come first",
+        )
+      } else if !allowed.contains(f.name) {
+        wrong(g, "the pseudo-header `" ++ name ++ "` is not allowed in this kind of message")
       } else if g.pseudo.contains(f.name) { wrong(g, "`" ++ name ++ "` twice") }
       else { { ..g, pseudo: g.pseudo.insert(f.name, f.value) } }
     } else {
@@ -2655,8 +2616,9 @@ fn regular_gathered(
   name: String,
   value: String,
 ) -> CollectedHeaders / {abort.raise} =
-  if connection_specific(name) { wrong(g, "the connection-specific field `" ++ name ++ "`") }
-  else if name == "te" && value != "trailers" { wrong(g, "`te` other than `trailers`") }
+  if connection_specific(name) {
+    wrong(g, "the field `" ++ name ++ "` is connection-specific, which HTTP/2 does not allow")
+  } else if name == "te" && value != "trailers" { wrong(g, "`te` other than `trailers`") }
   else if name == "cookie" { { ..g, cookies: g.cookies.push(value) } }
   else if name == "content-length" {
     match Bytes::of_string(value).int_of_ascii() {
@@ -2670,7 +2632,6 @@ fn regular_gathered(
 fn field_added(h: Headers, name: String, value: String) -> Headers =
   h.insert(name, List::push(match h.get(name) { Some(earlier) -> earlier, None -> [] }, value))
 
-/// The fields with the cookie's pieces joined into one, as an HTTP/1.1 message has it (§8.2.3).
 fn with_cookies(g: CollectedHeaders) -> Headers =
   if g.cookies == [] { g.headers }
   else { g.headers.insert("cookie", [String::join(g.cookies, "; ")]) }
@@ -2710,7 +2671,7 @@ fn request_head(
     None -> match hosts { [h] -> h, _ -> "" },
   };
   if path == "" { Malformed("an empty `:path`") } else if path == "*" && method != "OPTIONS" {
-    Malformed("a `:path` of `*` with other than OPTIONS")
+    Malformed("a `:path` of `*` in a request whose method is not OPTIONS")
   } else if path != "*" && !path.starts_with("/") { Malformed("a `:path` that is not a path") }
   else if path.contains("#") { Malformed("a `:path` with a fragment") }
   else if authority.contains("@") { Malformed("an `:authority` with userinfo") }
@@ -2754,11 +2715,8 @@ fn trailers_of(fields: List<Field>) -> Result<Headers, String> / {abort.raise} =
   match g.malformed_reason { Some(reason) -> Err(reason), None -> Ok(with_cookies(g)) }
 }
 
-/// The fields a message's header map is sent as. A field the protocol computes or the connection
-/// carries itself panics, as in `std.http`'s `encode`. A field that only means something to an
-/// HTTP/1.1 connection is left out, and each value has the whitespace at its ends removed.
 fn sent_fields(headers: Headers, request: Bool) -> List<Field> / {abort.raise} =
-  headers.entries().fold([], |acc: List<Field>, e: { key: String, value: List<String> }| {
+  headers.entries().fold([], |accumulator: List<Field>, e: { key: String, value: List<String> }| {
     let name = e.key.ascii_lower();
     let raw = Bytes::of_string(name);
     if raw.len() == 0 || raw.scan(0, name_chars(), raw.len()) < raw.len() {
@@ -2767,10 +2725,14 @@ fn sent_fields(headers: Headers, request: Bool) -> List<Field> / {abort.raise} =
       panic("`" ++ e.key ++ "` is computed by HTTP/2 and may not be set by the program")
     } else if request && name == "host" {
       panic("`Host` is computed from `Request.authority` and may not be set by the program")
-    } else if name == "keep-alive" || name == "proxy-connection" || name == "upgrade" { acc } else {
-      e.value.fold(acc, |fs: List<Field>, v: String|
+    } else if name == "keep-alive" || name == "proxy-connection" || name == "upgrade" {
+      accumulator
+    } else {
+      e.value.fold(accumulator, |fs: List<Field>, v: String|
         if v.contains("\r") || v.contains("\n") || v.contains("\0") {
-          panic("the value of `" ++ e.key ++ "` holds CR, LF or NUL, which would split the message")
+          panic(
+            "the value of `" ++ e.key ++ "` contains CR, LF or NUL, which would split the message",
+          )
         } else if name == "te" && (!request || v.ascii_trim() != "trailers") { fs }
         else { fs.push({ name: raw, value: Bytes::of_string(v.ascii_trim()) }) })
     }
@@ -2800,18 +2762,12 @@ fn request_fields(r: Request) -> List<Field> / {abort.raise} = {
   else { [] })
 }
 
-// --- The connection: writing --------------------------------------------------------
-
-/// `block` in pieces of at most `size` octets; an empty block is one empty piece.
 fn split_block(block: Bytes, size: Int) -> List<Bytes> / {abort.raise} =
   if block.len() <= size { [block] } else {
     range(0, (block.len() + size - 1) / size).map(|i: Int|
       block.slice(i * size, min(block.len(), (i + 1) * size)))
   }
 
-/// A field block on a stream, as one `HEADERS` frame and as many `CONTINUATION` frames as the
-/// peer's frame size requires. It is encoded as it is sent, so blocks reach the peer's table in the
-/// order they changed this one.
 fn emit_headers(
   k: ConnectionState,
   s: Int,
@@ -2821,8 +2777,8 @@ fn emit_headers(
   let e = encode(k.encoder, fields);
   let pieces = split_block(e.block, k.peer_frame);
   let last = pieces.len() - 1;
-  range(0, pieces.len()).fold({ ..k, encoder: e.encoder }, |acc: ConnectionState, i: Int|
-    emit_frame(acc, if i == 0 {
+  range(0, pieces.len()).fold({ ..k, encoder: e.encoder }, |accumulator: ConnectionState, i: Int|
+    emit_frame(accumulator, if i == 0 {
       HeadersFrame({
         stream: s,
         block: pieces.at_or(0, b""),
@@ -2836,7 +2792,6 @@ fn emit_headers(
     }))
 }
 
-/// A stream whose last frame has been sent.
 fn sending_finished(k: ConnectionState, st: Stream, t: Int) -> ConnectionState / {abort.raise} = {
   let done = { ..st, sending: false };
   if done.reset_after { reset_stream(store_stream(k, done), st.id, NoError, t) } else {
@@ -2847,7 +2802,6 @@ fn sending_finished(k: ConnectionState, st: Stream, t: Int) -> ConnectionState /
   }
 }
 
-/// A server's response on a stream: its head is sent now, and its body as the windows allow.
 fn send_response(
   k: ConnectionState,
   st: Stream,
@@ -2877,8 +2831,6 @@ fn send_response(
 
 type PumpRound = { connection: ConnectionState, sent_data: Bool }
 
-/// Sends `DATA` for every stream with data to send, one frame for each in turn, starting after the
-/// stream the last round ended at, until no window allows more.
 fn send_pending_data(k: ConnectionState, t: Int) -> ConnectionState / {abort.raise} =
   if k.over { k } else {
     let done = iterate(k, k.buffered + k.streams.len() + 2, |p: ConnectionState| {
@@ -2933,15 +2885,14 @@ fn stream_step(p: PumpRound, st: Stream, t: Int) -> PumpRound / {abort.raise} = 
   }
 }
 
-/// Marks each stream whose output is waiting on a closed window with the time it started waiting.
 fn mark_stalls(k: ConnectionState, t: Int) -> ConnectionState =
   {
     ..k,
-    streams: k.streams.fold(k.streams, |acc: Map<Int, Stream>, id: Int, st: Stream| {
+    streams: k.streams.fold(k.streams, |accumulator: Map<Int, Stream>, id: Int, st: Stream| {
       let waits = st.sending && st.out.len() > st.sent;
-      if waits && st.stalled < 0 { acc.insert(id, { ..st, stalled: t }) }
-      else if !waits && st.stalled >= 0 { acc.insert(id, { ..st, stalled: -1 }) }
-      else { acc }
+      if waits && st.stalled < 0 { accumulator.insert(id, { ..st, stalled: t }) }
+      else if !waits && st.stalled >= 0 { accumulator.insert(id, { ..st, stalled: -1 }) }
+      else { accumulator }
     }),
   }
 
@@ -3030,8 +2981,8 @@ pub fn give(
   let k = state_of(c);
   match k.streams.get(stream) {
     Some(st) -> if !st.more || k.over { c } else {
-      let held = if st.sent == 0 { st.out } else { st.out.slice(st.sent, st.out.len()) };
-      let fed = { ..st, out: held.concat(piece), sent: 0, more: !last };
+      let unsent = if st.sent == 0 { st.out } else { st.out.slice(st.sent, st.out.len()) };
+      let fed = { ..st, out: unsent.concat(piece), sent: 0, more: !last };
       Connection(
         send_pending_data(store_stream({ ..k, buffered: k.buffered + piece.len() }, fed), ms(now)),
       )
@@ -3062,11 +3013,12 @@ pub fn backlog(c: Connection, stream: Int) -> Option<Int> =
 /// What `request` returns: the connection with the request queued, and the stream it is sent on.
 pub type RequestResult = { connection: Connection, stream: Int }
 
-/// Queues `request` on a new stream. Its head is sent at once, and its body and trailers as the
-/// server's windows allow. `None` when no stream can be opened now: the server's
-/// `SETTINGS_MAX_CONCURRENT_STREAMS` are open, a `GOAWAY` was sent or received, or the stream
-/// numbers have run out. Panics, as `std.http`'s `encode_request` does, on a field the program may
-/// not set, including `host`: the `:authority` is `request.authority`.
+/// Queues `request` on a new stream. Sends its head at once, and its body and trailers as the
+/// server's flow-control windows allow. Returns `None` when no stream can be opened now: the number
+/// of open streams has reached the server's `SETTINGS_MAX_CONCURRENT_STREAMS`, a `GOAWAY` was sent
+/// or received, or the stream numbers have run out. Panics, as `std.http`'s `encode_request` does,
+/// on a field the program may not set, including `host`, because the `:authority` comes from
+/// `request.authority`.
 pub fn request(
   c: Connection,
   request: Request,
@@ -3094,8 +3046,6 @@ pub fn request(
   }
 }
 
-// --- The connection: time -----------------------------------------------------------
-
 /// Acts on what depends only on the time `now`. `SETTINGS` unacknowledged too long, or a field
 /// block left open too long, close the connection. A request not complete in time gets a 408
 /// response, and a response not complete in time fails. A stream whose output waited too long on
@@ -3118,11 +3068,12 @@ pub fn tick(c: Connection, now: Instant) -> ReceiveResult / {abort.raise} = {
       close_with_error(
         k,
         ProtocolError,
-        "a field block not ended within " ++ l.request_timeout_ms.to_string() ++ " ms",
+        "the headers were not completed within " ++ l.request_timeout_ms.to_string() ++ " ms",
       ),
     )
   } else {
-    let timed = k.streams.keys().fold(k, |acc: ConnectionState, s: Int| timed_out(acc, s, t));
+    let timed = k.streams.keys().fold(k, |accumulator: ConnectionState, s: Int|
+      timed_out(accumulator, s, t));
     let drained = if timed.draining >= 0 && timed.goaway_sent < 0
         && t - timed.draining >= l.drain_ms { goaway(timed, timed.highest) }
     else { timed };
@@ -3144,7 +3095,8 @@ fn timed_out(k: ConnectionState, s: Int, t: Int) -> ConnectionState / {abort.rai
             k,
             st,
             Cancel,
-            "the server's window stayed shut for " ++ k.limits.stall_ms.to_string() ++ " ms",
+            "the server accepted no more request data for " ++ k.limits.stall_ms.to_string()
+              ++ " ms",
             t,
           ),
       }
@@ -3165,7 +3117,8 @@ fn timed_out(k: ConnectionState, s: Int, t: Int) -> ConnectionState / {abort.rai
             k,
             st,
             Cancel,
-            "no whole response within " ++ k.limits.request_timeout_ms.to_string() ++ " ms",
+            "no complete response arrived within " ++ k.limits.request_timeout_ms.to_string()
+              ++ " ms",
             t,
           )
         } else { k },
@@ -3210,9 +3163,10 @@ pub fn deadline(c: Connection) -> Option<Instant> = {
 }
 
 /// Starts closing the connection gracefully. A server sends a `GOAWAY` naming the highest possible
-/// stream, and a `PING`. When the `PING` returns, or `drain_ms` later, a second `GOAWAY` names the
-/// last stream it accepted. A client sends one `GOAWAY` and opens no more streams. Either way the
-/// accepted streams are completed, and then `finished` is true.
+/// stream, and a `PING`. When the peer acknowledges the `PING`, or `drain_ms` later, the server
+/// sends a second `GOAWAY` naming the last stream it accepted. A client sends one `GOAWAY` and
+/// opens no more streams. Either way, the accepted streams are completed, and then `finished` is
+/// true.
 pub fn drain(c: Connection, now: Instant) -> Connection / {abort.raise} = {
   let k = state_of(c);
   if k.over || k.goaway_sent >= 0 || k.draining >= 0 { c } else {
@@ -3237,14 +3191,12 @@ pub fn peer_closed(c: Connection) -> ReceiveResult = {
   if k.over { report(k) } else {
     report(
       event(
-        { ..k, over: true, held: [], pending_size: 0 },
+        { ..k, over: true, pending_chunks: [], pending_size: 0 },
         Closed({ code: Cancel, reason: "the peer closed the connection" }),
       ),
     )
   }
 }
-
-// --- Tests: frames ----------------------------------------------------------------
 
 fn read_back(b: Bytes) -> Option<Frame> / {abort.raise} =
   match try { read_frame(b, 0, largest_frame_size()) } {
@@ -3252,14 +3204,12 @@ fn read_back(b: Bytes) -> Option<Frame> / {abort.raise} =
     _ -> None,
   }
 
-/// The violation reading `b` raises, as its code and stream; `None` when it reads without error.
 fn frame_error(b: Bytes) -> Option<(ErrorCode, Int)> / {abort.raise} =
   match try { read_frame(b, 0, default_frame_size()) } {
     Ok(_) -> None,
     Err(v) -> Some((v.code, v.stream)),
   }
 
-/// Frames a peer may be sent, generated so that each type, flag and padding appears.
 type Sendable = | Sendable(Frame)
 
 fn sendable() -> Gen<Sendable> =
@@ -3323,7 +3273,7 @@ fn sendable() -> Gen<Sendable> =
     |f: Frame| Sendable(f),
   )
 
-test "every frame reads back from its bytes" {
+test "encoding any frame to bytes and reading the bytes back gives the same frame" {
   gen::check(sendable(), |x: Sendable|
     round_trip(
       |s: Sendable| match s { Sendable(f) -> encode_frame(f) },
@@ -3362,7 +3312,6 @@ test "frames are read and written as RFC 9113 lays them out" {
     read_back(Bytes::of_hex("000000ff0500000007")),
     Some(UnknownFrame({ kind: 255, flags: 5, stream: 7, payload: b"" })),
   );
-  // The reserved bit of a stream identifier is ignored on receipt.
   assert_eq(
     read_back(Bytes::of_hex("000000000180000001")),
     Some(DataFrame({ stream: 1, data: b"", end_stream: true, padding: None })),
@@ -3380,14 +3329,10 @@ test "a frame is not read until all of it has arrived" {
 
 type RejectedFrame = { hex: String, code: ErrorCode, stream: Int }
 
-/// Frames RFC 9113 §6 says a receiver must reject, the code it rejects each with, and the stream
-/// the error is limited to.
 fn rejected_frame_cases() -> List<RejectedFrame> =
   [
-    // Past SETTINGS_MAX_FRAME_SIZE, rejected from its header alone.
     { hex: "004001000000000001", code: FrameSizeError, stream: 0 },
     { hex: "000000000000000000", code: ProtocolError, stream: 0 },
-    // DATA whose padding is as long as its payload.
     { hex: "000002000800000001" ++ "0200", code: ProtocolError, stream: 0 },
     { hex: "000000000800000001", code: FrameSizeError, stream: 0 },
     { hex: "000000010400000000", code: ProtocolError, stream: 0 },
@@ -3419,8 +3364,6 @@ fn rejected_frame_cases() -> List<RejectedFrame> =
 test "frame {r.hex} is rejected as RFC 9113 requires" for r: RejectedFrame in rejected_frame_cases(
   ) { assert_eq(frame_error(Bytes::of_hex(r.hex)), Some((r.code, r.stream))) }
 
-// --- Tests: HPACK -------------------------------------------------------------------
-
 fn decoded(d: Decoder, block: Bytes) -> DecodeResult / {abort.raise} =
   match try { decode(d, block) } { Ok(got) -> got, Err(v) -> panic(v.reason) }
 
@@ -3439,8 +3382,6 @@ type Example = {
 
 type Scenario = { name: String, capacity: Int, examples: List<Example> }
 
-/// RFC 7541 Appendix C, each section's blocks in order: the requests decoded with a table of 4096
-/// octets and the responses with one of 256, as the RFC has them.
 fn stories() -> List<Scenario> =
   [
     {
@@ -3663,7 +3604,7 @@ fn stories() -> List<Scenario> =
     },
   ]
 
-test "RFC 7541's example {s.name} decodes block by block to its fields and its table" for s: Scenario in stories(
+test "decoding each header block of RFC 7541's example {s.name} in turn returns its header fields and leaves the dynamic table at the listed size" for s: Scenario in stories(
   ) {
   s.examples.fold(decoder(s.capacity, 2), |d: Decoder, e: Example| {
     let got = decoded(d, Bytes::of_hex(e.wire));
@@ -3677,14 +3618,14 @@ test "RFC 7541's example {s.name} decodes block by block to its fields and its t
   ()
 }
 
-test "integers are written as RFC 7541 C.1 has them" {
+test "integers are encoded and decoded as the examples in RFC 7541 section C.1 show" {
   assert_eq(integer(10, 5, 0).hex_of(), "0a");
   assert_eq(integer(1337, 5, 0).hex_of(), "1f9a0a");
   assert_eq(integer(42, 8, 0).hex_of(), "2a");
   assert_eq(integer_at(Bytes::of_hex("1f9a0a"), 0, 5), { value: 1337, next: 3 })
 }
 
-test "strings are Huffman-coded as RFC 7541 C.4 has them" {
+test "strings are Huffman-coded as the examples in RFC 7541 section C.4 show" {
   assert_eq(huffman_encode(b"www.example.com").hex_of(), "f1e3c2e5f23a6ba0ab90f4ff");
   assert_eq(huffman_encode(b"no-cache").hex_of(), "a8eb10649cbf");
   assert_eq(huffman_length(b"custom-key"), 8);
@@ -3693,7 +3634,7 @@ test "strings are Huffman-coded as RFC 7541 C.4 has them" {
   assert_eq(huffman().codes.get(47), 0x18)
 }
 
-test "a Huffman-coded string decodes to itself" {
+test "encoding a string with Huffman coding and decoding it gives back the original string" {
   gen::check(gen::bytes(), |x: Bytes|
     round_trip(
       huffman_encode,
@@ -3703,7 +3644,6 @@ test "a Huffman-coded string decodes to itself" {
 }
 
 test "a Huffman string that contains EOS, or is padded wrong, is rejected" {
-  // EOS whole, then a padding of eight ones, then a padding of zeros.
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("0084ffffffff" ++ "8178")),
     "a Huffman string that holds EOS",
@@ -3718,20 +3658,23 @@ test "a Huffman string that contains EOS, or is padded wrong, is rejected" {
   )
 }
 
-test "a block that names what no table contains, or runs past its end, is rejected" {
+test "decoding a header block fails on index 0, an index past the static and dynamic tables, or a truncated or oversized string or integer" {
   assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("80")), "index 0");
-  assert_eq(decode_result_text(decoder(4096, 2), Bytes::of_hex("be")), "index 62 past the tables");
+  assert_eq(
+    decode_result_text(decoder(4096, 2), Bytes::of_hex("be")),
+    "index 62 is larger than the static and dynamic tables together",
+  );
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("400a6375")),
     "a string that runs past the end of its block",
   );
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("ff")),
-    "an integer that runs past the end of its block",
+    "an integer that continues past the end of the header block",
   );
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("ff8080808080")),
-    "an integer of more than five continuation octets",
+    "an integer that is longer than six bytes",
   );
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("ffffffffff0f")),
@@ -3739,7 +3682,7 @@ test "a block that names what no table contains, or runs past its end, is reject
   )
 }
 
-test "table size updates come first, at most as many as allowed, and within the ceiling" {
+test "decoding fails when a dynamic table size update follows a field, repeats too often, or exceeds the table's maximum size" {
   assert_eq(
     decode_result_text(decoder(4096, 2), Bytes::of_hex("8220")),
     "a table size update after a field",
@@ -3753,17 +3696,14 @@ test "table size updates come first, at most as many as allowed, and within the 
     "a table size update to 4097 past the 4096 allowed",
   );
   assert_eq(decoded(decoder(4096, 2), Bytes::of_hex("203fe11f82")).decoder.table.capacity, 4096);
-  // After the ceiling drops below the table's size, the next block must start with an update.
   let lowered = with_ceiling(decoded(decoder(4096, 2), Bytes::of_hex("82")).decoder, 100);
   assert_eq(
     decode_result_text(lowered, Bytes::of_hex("82")),
-    "a block that does not open with the table size update it owes",
+    "a header block must start with a dynamic table size update, and this one does not",
   );
   assert_eq(decoded(lowered, Bytes::of_hex("3f4582")).decoder.table.capacity, 100)
 }
 
-/// Fields that resemble real headers: the static table's names and fields, names it lacks, values
-/// that repeat, and fields larger than a small table.
 fn vocabulary() -> List<Field> =
   [
     { name: b":method", value: b"GET" },
@@ -3831,15 +3771,11 @@ test "a field in a table is written as its index, and a sensitive one is never i
   assert_eq(second.block.hex_of(), "be");
   let fields = decoded(decoder(4096, 2), first.block).fields;
   assert_eq(fields.map(text_field), [":method: GET", "x-custom: one", "authorization: secret"]);
-  // `0001` starts a never-indexed field, named here by the static table's index 23.
   assert(first.block.index_of(Bytes::of_hex("1f08")) != None, None)
 }
 
-// --- Tests: exchanges ---------------------------------------------------------------
-
 fn at(t: Int) -> Instant = at_millis(t)
 
-/// A frame as a line: its type, its stream and what matters of the rest.
 fn shown(f: Frame) -> String / {abort.raise} =
   match f {
     DataFrame(d) ->
@@ -3863,7 +3799,6 @@ fn shown(f: Frame) -> String / {abort.raise} =
 
 type Parsing = { at: Int, frames: List<Frame> }
 
-/// The frames in the bytes a machine wrote.
 fn frames_in(b: Bytes) -> List<Frame> / {abort.raise} =
   iterate({ at: 0, frames: [] }, b.len() + 1, |p: Parsing|
     match try { read_frame(b, p.at, largest_frame_size()) } {
@@ -3873,8 +3808,6 @@ fn frames_in(b: Bytes) -> List<Frame> / {abort.raise} =
 
 fn wire(fs: List<Frame>) -> Bytes / {abort.raise} = Bytes::concat_all(fs.map(encode_frame))
 
-/// What a client opens with: the preface, its `SETTINGS`, and the acknowledgement of the
-/// server's.
 fn opening(settings: List<Setting>) -> Bytes / {abort.raise} =
   preface().concat(
     wire([
@@ -3912,8 +3845,7 @@ fn data(s: Int, b: Bytes, end: Bool) -> Bytes / {abort.raise} =
 fn echo(r: Request) -> Response =
   plain_text(200, r.method ++ " " ++ r.target ++ " " ++ String::of_bytes_lossy(r.body))
 
-/// A request to example.com over `https`, with no field of its own.
-fn asking(method: String, target: String, body: Bytes) -> Request =
+fn client_request(method: String, target: String, body: Bytes) -> Request =
   {
     method: method,
     scheme: "https",
@@ -3935,12 +3867,12 @@ fn returned_all(
   app: (Request) -> Response / {abort.raise},
   t: Int,
 ) -> Connection / {abort.raise} =
-  events.fold(c, |acc: Connection, e: Event|
-    match e { Requested(q) -> respond(acc, q.stream, app(q.request), at(t)), _ -> acc })
+  events.fold(c, |accumulator: Connection, e: Event|
+    match e {
+      Requested(q) -> respond(accumulator, q.stream, app(q.request), at(t)),
+      _ -> accumulator,
+    })
 
-/// Runs a server with these limits, passing it `chunks` in turn at time 1, with `app` responding to
-/// each request as it arrives. Returns what the server wrote after its own `SETTINGS`, frame by
-/// frame.
 fn served(
   limits: Limits,
   chunks: List<Bytes>,
@@ -3984,7 +3916,7 @@ test "a GET is a request the application responds to with HEADERS and then DATA"
   assert_eq(open_streams(s.connection), 0)
 }
 
-test "the server's first output is its SETTINGS and the window it adds to the connection's" {
+test "the server's first output is a SETTINGS frame and a WINDOW_UPDATE that enlarges the connection's flow-control window" {
   let start = take_output(server(default_limits(), at(0)));
   assert_eq(frames_in(start.bytes).map(shown), ["SETTINGS", "WINDOW_UPDATE 0 983041"])
 }
@@ -4031,8 +3963,6 @@ test "bytes that arrive an octet at a time are read as the frames they form" {
 
 type Exchange = { name: String, input: List<Bytes>, output: List<String> }
 
-/// Exchanges based on h2spec's cases for RFC 9113: what a client sends after its opening, and how
-/// the server must respond.
 fn exchanges() -> List<Exchange> / {abort.raise} =
   [
     {
@@ -4302,18 +4232,17 @@ fn exchanges() -> List<Exchange> / {abort.raise} =
     },
   ]
 
-/// `:method` comes first; this removes it so a test can give its own.
 fn drop_method(fields: List<(String, String)>) -> List<(String, String)> =
   fields.filter(|f: (String, String)| match f { (n, _) -> n != ":method" })
 
-test "after h2spec: {e.name}" for e: Exchange in exchanges() {
+test "for the h2spec case {e.name}, the server sends the frames that h2spec expects in reply" for e: Exchange in exchanges(
+  ) {
   let s = served(default_limits(), [opening([])].concat(e.input), echo);
   assert_eq(s.frames.drop(1), e.output)
 }
 
 type Bad = { name: String, fields: List<(String, String)> }
 
-/// Requests RFC 9113 §8 calls malformed, which a server resets with `PROTOCOL_ERROR`.
 fn malformed_requests() -> List<Bad> =
   [
     { name: "an uppercase field name", fields: get_fields("/").push(("X-Upper", "1")) },
@@ -4355,13 +4284,14 @@ fn malformed_requests() -> List<Bad> =
     },
   ]
 
-test "a request with {b.name} is reset as malformed" for b: Bad in malformed_requests() {
+test "a request with {b.name} is reset with PROTOCOL_ERROR as malformed and never reaches the application" for b: Bad in malformed_requests(
+  ) {
   let s = served(default_limits(), [opening([]), encode_frame(headers(1, b.fields, true))], echo);
   assert_eq(s.frames, ["SETTINGS ACK", "RST_STREAM 1 PROTOCOL_ERROR"]);
   assert_eq(s.events, [])
 }
 
-test "cookies sent as several fields are one field to the application" {
+test "cookie fields sent separately are joined with `; ` into one cookie field for the application" {
   let s = served(
     default_limits(),
     [
@@ -4425,7 +4355,7 @@ test "a response to HEAD, and a 204, carry no body" {
   assert_eq(none.frames, ["SETTINGS ACK", "HEADERS 1 END_STREAM"])
 }
 
-test "a stream past max_concurrent_streams is refused, and a later one is accepted" {
+test "a stream beyond `max_concurrent_streams` is reset with REFUSED_STREAM, and a later stream is accepted" {
   let l = { ..default_limits(), max_concurrent_streams: 1 };
   let s = served(
     l,
@@ -4447,8 +4377,6 @@ test "a stream past max_concurrent_streams is refused, and a later one is accept
   ])
 }
 
-// --- Tests: the attacks ---------------------------------------------------------------
-
 test "rapid reset: streams opened and reset past max_resets close the connection" {
   let l = { ..default_limits(), max_resets: 3 };
   let pairs = Bytes::concat_all(
@@ -4457,12 +4385,11 @@ test "rapid reset: streams opened and reset past max_resets close the connection
   );
   let s = served(l, [opening([]), pairs], echo);
   assert_eq(s.frames, ["SETTINGS ACK", "GOAWAY 7 ENHANCE_YOUR_CALM"]);
-  // No request reset in the same bytes reaches the application.
   assert_eq(s.events.filter(|e: Event| match e { Requested(_) -> true, _ -> false }), []);
   assert(finished(s.connection), None)
 }
 
-test "streams reset within the window count, and the count restarts after it" {
+test "the connection closes when stream resets exceed `max_resets` within `window_ms`, and resets in a later window count from zero" {
   let l = { ..default_limits(), max_resets: 2, window_ms: 100 };
   let start = take_output(server(l, at(0)));
   let one = receive(
@@ -4545,9 +4472,6 @@ test "CONTINUATION flood: a field block past max_header_block closes the connect
   assert_eq(s.frames, ["SETTINGS ACK", "GOAWAY 0 ENHANCE_YOUR_CALM"])
 }
 
-/// A first request that leaves a 4 KiB field in the server's table, and a second whose block of
-/// a few dozen octets names it twenty times: its `:authority` is inserted first, so the field is
-/// index 63.
 fn table_amplification_input() -> List<Bytes> / {abort.raise} = {
   let planted = block_of(get_fields("/")).concat(
     Bytes::concat_all([
@@ -4581,7 +4505,7 @@ fn table_amplification_input() -> List<Bytes> / {abort.raise} = {
   ]
 }
 
-test "HPACK bomb: fields past max_header_list_size get a 431 response, however short their block" {
+test "a small compressed header block that expands past `max_header_list_size` gets a 431 response" {
   let s = served(default_limits(), [opening([])].concat(table_amplification_input()), echo);
   let reason = "the fields are larger than 65536 octets\n";
   assert_eq(s.frames, [
@@ -4594,7 +4518,7 @@ test "HPACK bomb: fields past max_header_list_size get a 431 response, however s
   assert_eq(s.events.len(), 1)
 }
 
-test "HPACK bomb: table size updates past max_table_size_updates, or past the table, close the connection" {
+test "HPACK bomb: more table size updates than `max_table_size_updates`, or an update above the maximum table size, close the connection" {
   let updates = HeadersFrame({
     stream: 1,
     block: Bytes::of_hex("202020").concat(block_of(get_fields("/"))),
@@ -4669,7 +4593,7 @@ test "slow reader: a stream whose window stays closed past stall_ms is reset, an
   assert_eq(buffered_octets(late.connection), 0)
 }
 
-test "slow reader: a stream opened while max_buffered octets wait is refused" {
+test "slow reader: a stream opened while `max_buffered` bytes are waiting to be sent is reset with REFUSED_STREAM" {
   let l = { ..default_limits(), max_buffered: 10 };
   let s = served(
     l,
@@ -4728,7 +4652,7 @@ test "an idle connection closes after idle_timeout_ms" {
   assert(finished(idle.connection), None)
 }
 
-test "after max_requests streams the server names the last it accepts and ignores the rest" {
+test "after `max_requests` streams the server sends GOAWAY naming the last stream it will process, and ignores later streams" {
   let l = { ..default_limits(), max_requests: 2 };
   let s = served(
     l,
@@ -4788,9 +4712,6 @@ test "a drain whose PING never returns names the last stream after drain_ms" {
   assert(finished(done.connection), None)
 }
 
-// --- Tests: a client and a server ------------------------------------------------------
-
-/// A client and a server joined by the bytes each has sent and the other not yet read.
 type ConnectedPair = {
   client: Connection,
   server: Connection,
@@ -4810,8 +4731,6 @@ fn connected_pair(l: Limits) -> ConnectedPair / {abort.raise} =
     step: 0,
   }
 
-/// How many of the `n` waiting octets the delivery at step `i` carries: the next value from `cuts`,
-/// as 1 to 200, or all of them when `cuts` has no value.
 fn piece(cuts: List<Int>, i: Int, n: Int) -> Int / {abort.raise} =
   if cuts == [] { n } else { min(n, 1 + (cuts.at_or(i % cuts.len(), 0) % 200 + 200) % 200) }
 
@@ -4822,9 +4741,6 @@ fn send_requests(e: ConnectedPair, reqs: List<Request>) -> ConnectedPair / {abor
       None -> x,
     })
 
-/// Runs the two ends until neither has a byte to send, or for `budget` steps. Each step carries
-/// part of what is waiting each way, as `cuts` decides, and `app` responds to each request as it
-/// arrives.
 fn carried(
   e: ConnectedPair,
   app: (Request) -> Response / {abort.raise},
@@ -4840,12 +4756,12 @@ fn carried(
       Stop({ ..x, client: c.connection, server: s.connection, to_server: up, to_client: down })
     } else {
       let n = piece(cuts, x.step, up.len());
-      let heard = receive(s.connection, up.slice(0, n), at(x.step + 1));
+      let server_result = receive(s.connection, up.slice(0, n), at(x.step + 1));
       let m = piece(cuts, x.step + 1, down.len());
       let back = receive(c.connection, down.slice(0, m), at(x.step + 1));
       Continue({
         client: back.connection,
-        server: returned_all(heard.connection, heard.events, app, x.step + 1),
+        server: returned_all(server_result.connection, server_result.events, app, x.step + 1),
         to_server: up.slice(n, up.len()),
         to_client: down.slice(m, down.len()),
         events: x.events.concat(back.events),
@@ -4855,22 +4771,25 @@ fn carried(
   })
 
 fn results(events: List<Event>) -> List<(Int, Int, String)> / {abort.raise} =
-  events.fold([], |acc: List<(Int, Int, String)>, e: Event|
+  events.fold([], |accumulator: List<(Int, Int, String)>, e: Event|
     match e {
       Responded(a) ->
-        acc.push((a.stream, a.response.status, String::of_bytes_lossy(a.response.body))),
-      Failed(f) -> acc.push((f.stream, 0, f.reason)),
-      Reset(r) -> acc.push((r.stream, 0 - 1, code_name(r.code))),
-      _ -> acc,
+        accumulator.push((a.stream, a.response.status, String::of_bytes_lossy(a.response.body))),
+      Failed(f) -> accumulator.push((f.stream, 0, f.reason)),
+      Reset(r) -> accumulator.push((r.stream, 0 - 1, code_name(r.code))),
+      _ -> accumulator,
     })
 
-test "a client's requests reach a server, and the responses come back on their streams" {
-  let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
+test "a client's requests arrive at a server, and each response comes back on its request's stream" {
+  let posted = {
+    ..client_request("POST", "/b", b"xyz"),
+    trailers: Map::new().insert("x-sum", ["3"]),
+  };
   let e = carried(
     send_requests(connected_pair(default_limits()), [
-      asking("GET", "/a", b""),
+      client_request("GET", "/a", b""),
       posted,
-      asking("HEAD", "/c", b""),
+      client_request("HEAD", "/c", b""),
     ]),
     echo,
     [],
@@ -4885,8 +4804,11 @@ test "a client's requests reach a server, and the responses come back on their s
   assert_eq(open_streams(e.server), 0)
 }
 
-test "a request's trailers reach the server's application" {
-  let posted = { ..asking("POST", "/b", b"xyz"), trailers: Map::new().insert("x-sum", ["3"]) };
+test "a request's trailers are passed to the server's application" {
+  let posted = {
+    ..client_request("POST", "/b", b"xyz"),
+    trailers: Map::new().insert("x-sum", ["3"]),
+  };
   let e = carried(
     send_requests(connected_pair(default_limits()), [posted]),
     |r: Request|
@@ -4897,9 +4819,9 @@ test "a request's trailers reach the server's application" {
   assert_eq(results(e.events), [(1, 200, "3")])
 }
 
-test "a client rejects a response whose head is malformed, and a server's PUSH_PROMISE" {
+test "a client rejects a response whose status and headers are malformed, and closes the connection when the server sends PUSH_PROMISE" {
   let start = take_output(client(default_limits(), at(0)));
-  let sent = match request(start.connection, asking("GET", "/", b""), at(0)) {
+  let sent = match request(start.connection, client_request("GET", "/", b""), at(0)) {
     Some(s) -> s.connection,
     None -> panic("a stream"),
   };
@@ -4909,7 +4831,7 @@ test "a client rejects a response whose head is malformed, and a server's PUSH_P
   ]);
   let r = receive(sent, reply, at(1));
   assert_eq(results(r.events), [
-    (1, 0, "the pseudo-header `:path`, which this message does not take"),
+    (1, 0, "the pseudo-header `:path` is not allowed in this kind of message"),
   ]);
   let pushed = receive(
     sent,
@@ -4924,11 +4846,11 @@ test "a client rejects a response whose head is malformed, and a server's PUSH_P
 
 test "a client learns which of its streams a GOAWAY left unprocessed, and opens no more" {
   let opened_two = send_requests(connected_pair(default_limits()), [
-    asking("GET", "/a", b""),
-    asking("GET", "/b", b""),
+    client_request("GET", "/a", b""),
+    client_request("GET", "/b", b""),
   ]);
   let c = take_output(opened_two.client);
-  let told = receive(
+  let received = receive(
     c.connection,
     wire([
       SettingsFrame({ ack: false, settings: [] }),
@@ -4936,11 +4858,10 @@ test "a client learns which of its streams a GOAWAY left unprocessed, and opens 
     ]),
     at(1),
   );
-  assert_eq(results(told.events), [(3, 0 - 1, "REFUSED_STREAM")]);
-  assert_eq(request(told.connection, asking("GET", "/c", b""), at(2)) == None, true)
+  assert_eq(results(received.events), [(3, 0 - 1, "REFUSED_STREAM")]);
+  assert_eq(request(received.connection, client_request("GET", "/c", b""), at(2)) == None, true)
 }
 
-/// A response with as many octets as the target names, such as `/50`.
 fn response_of_size(r: Request) -> Response / {abort.raise} =
   {
     status: 200,
@@ -4951,7 +4872,6 @@ fn response_of_size(r: Request) -> Response / {abort.raise} =
     }),
   }
 
-/// `n` reduced to the range `0` to `below`, to pick with a generated number.
 fn non_negative(n: Int, below: Int) -> Int / {abort.raise} =
   if n < 0 { 0 - n % below } else { n % below }
 
@@ -5039,10 +4959,6 @@ fn spawned(
     [_, ..rest] -> spawned(rest, inbox),
   }
 
-/// A connection on the one-core task model. Each request is handled by its own task. The
-/// connection's task carries a step of bytes each way, then takes whatever response is ready
-/// without waiting, and waits for one only when no bytes are left to carry. The schedule decides
-/// where among the steps each response lands.
 fn multiplexed(
   e: ConnectedPair,
   inbox: Chan<(Int, Response)>,
@@ -5051,8 +4967,8 @@ fn multiplexed(
   if fuel <= 0 || results(e.events).len() >= 2 { e } else {
     let c = take_output(e.client);
     let s = take_output(e.server);
-    let heard = receive(s.connection, c.bytes, at(1));
-    spawned(heard.events, inbox);
+    let server_result = receive(s.connection, c.bytes, at(1));
+    spawned(server_result.events, inbox);
     let back = receive(c.connection, s.bytes, at(1));
     let quiet = c.bytes.len() == 0 && s.bytes.len() == 0;
     let ready = match task.select([(inbox, None)], quiet) {
@@ -5060,8 +4976,8 @@ fn multiplexed(
       _ -> None,
     };
     let server_now = match ready {
-      Some((stream, r)) -> respond(heard.connection, stream, r, at(1)),
-      None -> heard.connection,
+      Some((stream, r)) -> respond(server_result.connection, stream, r, at(1)),
+      None -> server_result.connection,
     };
     multiplexed(
       { ..e, client: back.connection, server: server_now, events: e.events.concat(back.events) },
@@ -5075,7 +4991,10 @@ test "two responses larger than their windows finish under every interleaving of
     let inbox = task.channel(4);
     let l = { ..default_limits(), initial_window: 40 };
     let e = multiplexed(
-      send_requests(connected_pair(l), [asking("GET", "/50", b""), asking("GET", "/45", b"")]),
+      send_requests(connected_pair(l), [
+        client_request("GET", "/50", b""),
+        client_request("GET", "/45", b""),
+      ]),
       inbox,
       40,
     );

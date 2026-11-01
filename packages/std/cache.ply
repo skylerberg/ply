@@ -1,27 +1,29 @@
-//! Caches a program manages as values: a bound enforced by evicting the least recently used
-//! entry, and entries that expire.
+//! Caches that a program manages as values, with a size bound enforced by evicting the least
+//! recently used entry, and with entries that expire.
 //!
-//! A `Cache` is a persistent value. Every operation returns the resulting cache and leaves the one
-//! it was given unchanged, so the caller keeps the returned cache. `get` returns the value and a
-//! cache whose order of use the read changed. A caller that drops that cache reads the same values
-//! from the old one, in the order of use it had before the read. No operation reads a clock. One
-//! that depends on time takes the current time as an `Instant`.
+//! A `Cache` is a persistent value. Every operation returns a new cache and leaves the cache it was
+//! given unchanged, so the caller must use the returned cache. `get` returns the value together
+//! with a new cache in which that entry counts as the most recently used. If the caller ignores
+//! that new cache and keeps using the old one, the old cache still returns the same values, and its
+//! order of use is as it was before the `get`. No operation reads a clock. An operation that
+//! depends on time takes the current time as an `Instant`.
 //!
 //! The bound is a total weight. `put` gives every entry a weight of one, which makes the bound a
-//! count, and `insert` takes a weight of at least one. An entry that raises the total past the
-//! capacity evicts the least recently used entries, oldest first, until the rest fit. An entry
-//! heavier than the whole capacity is not stored. A use is a `put`, an `insert` or a `get` that
-//! returns a value. `peek` and `contains` read without counting as a use.
+//! count, and `insert` takes a weight of at least one. When an entry raises the total weight above
+//! the capacity, the least recently used entries are evicted, oldest first, until the rest fit. An
+//! entry heavier than the whole capacity is not stored. A `put`, an `insert` and a `get` that
+//! returns a value each count as a use. `peek` and `contains` read without counting as a use.
 //!
-//! An entry may have a deadline: its cache's lifetime from the time it was put, or the lifetime
-//! given to `insert`. From its deadline on, it is never returned. It is dropped when a `get`
-//! requests it, when `sweep` runs or when eviction reaches it. Until then it counts toward the
-//! bound: eviction does not drop the entry nearest its deadline first.
+//! An entry may have a deadline: the cache's lifetime after the time it was put, or the lifetime
+//! given to `insert`. At or after its deadline, an entry is never returned. It is removed when
+//! `get` requests it, when `sweep` runs or when eviction reaches it. Until then it counts toward
+//! the bound, and eviction does not remove the entry nearest its deadline first.
 //!
 //! `get`, `put`, `insert` and `remove` each read and write a fixed number of map entries, plus a
-//! fixed number more for each entry evicted, so each is logarithmic in the number of entries. Two
-//! caches with the same capacity and lifetime that contain the same entries in the same order of
-//! use are equal, whatever operations built them: neither carries a timestamp or a counter.
+//! fixed number more for each entry evicted, so each takes time logarithmic in the number of
+//! entries. Two caches with the same capacity and lifetime that contain the same entries in the
+//! same order of use are equal, whatever operations built them, because a cache stores no timestamp
+//! or counter.
 
 import std.laws (refines)
 import std.math (ilog2)
@@ -41,7 +43,6 @@ pub type Entry<k, v> = {
 /// How `insert` stores an entry: its weight, and how long it lives, where `None` means forever.
 pub type InsertOptions = { weight: Int, lifetime: Option<Duration> }
 
-/// An entry in the order of use, linked to the keys used just before and just after it.
 type Node<k, v> = {
   value: v,
   weight: Int,
@@ -119,8 +120,6 @@ pub fn size<k, v>(c: Cache<k, v>) -> Int
   where derivable(ord, k)
 = c.entries.len()
 
-// --- Reading ----------------------------------------------------------------
-
 /// Looks up `key` at time `now`, and returns the value and the cache after the read. A returned
 /// value makes its entry the most recently used. An entry at or past its deadline returns `None`
 /// and is dropped. A missing key returns `None` and the cache unchanged.
@@ -174,8 +173,6 @@ fn entry_of<k, v>(key: k, e: Node<k, v>) -> Entry<k, v> =
 fn is_expired(expires: Option<Instant>, now: Instant) -> Bool =
   match expires { None -> false, Some(deadline) -> nanos_at(now) >= nanos_at(deadline) }
 
-// --- Writing ----------------------------------------------------------------
-
 /// Stores `value` under `key` as the most recently used entry, with weight one and the cache's
 /// lifetime from `now`. It replaces any value already under `key`, and evicts the least recently
 /// used entries until the rest fit.
@@ -211,10 +208,10 @@ pub fn remove<k, v>(c: Cache<k, v>, key: k) -> Cache<k, v>
 pub fn sweep<k, v>(c: Cache<k, v>, now: Instant) -> Cache<k, v>
   where derivable(ord, k)
 =
-  entries_by_use(c).fold(c, |kept: Cache<k, v>, h: Entry<k, v>|
-    if is_expired(h.expires, now) { remove(kept, h.key) } else { kept })
+  entries_by_use(c).fold(c, |remaining: Cache<k, v>, h: Entry<k, v>|
+    if is_expired(h.expires, now) { remove(remaining, h.key) } else { remaining })
 
-/// Removes every entry, and keeps the capacity and lifetime.
+/// Returns an empty cache with the same capacity and lifetime as `c`.
 pub fn clear<k, v>(c: Cache<k, v>) -> Cache<k, v>
   where derivable(ord, k)
 = empty(c.capacity, c.lifetime)
@@ -237,7 +234,6 @@ fn insert_entry<k, v>(c: Cache<k, v>, h: Entry<k, v>) -> InsertResult<k, v> / {a
   }
 }
 
-/// Evicts the least recently used entries until the rest fit within the capacity.
 fn evict_to_fit<k, v>(c: Cache<k, v>) -> InsertResult<k, v> / {abort.raise}
   where derivable(ord, k)
 =
@@ -256,7 +252,6 @@ fn evict_to_fit<k, v>(c: Cache<k, v>) -> InsertResult<k, v> / {abort.raise}
       }
     })
 
-/// Removes the entry `e` stored under `key`, and links its neighbours to each other.
 fn unlinked<k, v>(c: Cache<k, v>, key: k, e: Node<k, v>) -> Cache<k, v>
   where derivable(ord, k)
 = {
@@ -277,7 +272,6 @@ fn unlinked<k, v>(c: Cache<k, v>, key: k, e: Node<k, v>) -> Cache<k, v>
   }
 }
 
-/// Stores `e` under `key` as the most recently used entry. `c` must not contain `key`.
 fn linked<k, v>(c: Cache<k, v>, key: k, e: Node<k, v>) -> Cache<k, v>
   where derivable(ord, k)
 =
@@ -295,8 +289,6 @@ fn linked<k, v>(c: Cache<k, v>, key: k, e: Node<k, v>) -> Cache<k, v>
     newest: Some(key),
     weight: c.weight + e.weight,
   }
-
-// --- Tests ------------------------------------------------------------------
 
 fn filled(capacity: Int, keys: List<String>) -> Cache<String, Int> / {abort.raise} =
   keys.fold(lru(capacity), |c: Cache<String, Int>, key: String|
@@ -316,7 +308,7 @@ test "a full cache evicts the entry used longest ago, and a read is a use" {
   assert_eq(size(written), 2)
 }
 
-test "the cache from before a read still returns values, in the order of use it had" {
+test "`get` returns the value, and the cache passed to it keeps its original eviction order" {
   let c = filled(2, ["a", "bb"]);
   assert_eq(get(c, "a", at_millis(0)).value, Some(1));
   assert_eq(get(c, "a", at_millis(0)).value, Some(1));
@@ -347,7 +339,7 @@ test "caches with the same entries in the same order are equal, however each was
   assert(one != get(filled(4, ["a", "bb"]), "a", at_millis(0)).cache)
 }
 
-test "a bound by weight evicts as many of the oldest as the newest needs" {
+test "a cache with a weight limit evicts the oldest entries until a new entry fits" {
   let weighing = |c: Cache<String, Int>, key: String, weight: Int|
     insert(c, key, weight, { weight: weight, lifetime: None }, at_millis(0));
   let c = weighing(weighing(weighing(lru(10), "a", 4).cache, "b", 3).cache, "c", 3).cache;
@@ -407,7 +399,7 @@ effect directory {
 
 fn greeting(id: Int) -> String / {directory.name_of} = "hello " ++ directory.name_of(id)
 
-test "a handler that stores a cache in its variable handles a repeated lookup from it" {
+test "a handler that stores a `Cache` in a `var` looks up each repeated id only once" {
   let none: Cache<Int, String> = lru(2);
   let run_script = handle {
     [1, 2, 1, 3, 2].map(greeting)
@@ -430,9 +422,9 @@ test "a handler that stores a cache in its variable handles a repeated lookup fr
         },
       }
     },
-    return said -> { said: said, state: state },
+    return greetings -> { messages: greetings, state: state },
   };
-  assert_eq(run_script.said, [
+  assert_eq(run_script.messages, [
     "hello user 1",
     "hello user 2",
     "hello user 1",
@@ -443,7 +435,6 @@ test "a handler that stores a cache in its variable handles a repeated lookup fr
   assert_eq(keys(run_script.state.cache), [3, 2])
 }
 
-/// Generates any `Operation`.
 fn acts() -> gen::Gen<Operation> =
   gen::one_of([
     gen::map2(gen::any_int(), gen::any_int(), |f0: Int, f1: Int| Put(f0, f1)),
@@ -460,8 +451,6 @@ fn acts() -> gen::Gen<Operation> =
     gen::constant(Sweep),
   ])
 
-/// One operation of a script a test runs on a cache. Keys, weights, lifetimes and waits are any
-/// integers, reduced to a few values so that scripts collide, overflow and expire.
 type Operation =
   | Put(Int, Int)
   | Insert(Int, Int, Int, Int)
@@ -470,8 +459,6 @@ type Operation =
   | Wait(Int)
   | Sweep
 
-/// The model of the cache of capacity three that the scripts run on: the clock in milliseconds,
-/// the entries as a list in order of use, and what each `Get` returned.
 type Model = { now: Int, entries: List<Entry<Int, Int>>, results: List<Option<Int>> }
 
 type RunResult = { cache: Cache<Int, Int>, now: Int, results: List<Option<Int>> }
@@ -577,7 +564,7 @@ fn model_step(lifetime: Option<Int>, m: Model, a: Operation) -> Model =
     Sweep -> { ..m, entries: m.entries.filter(|h: Entry<Int, Int>| !is_expired_at(h, m.now)) },
   }
 
-test "an operation does to a cache what it does to a list in order of use" {
+test "applying a sequence of cache operations gives the same result as applying them to a list ordered by recent use" {
   gen::check2(gen::list(acts()), acts(), |x: List<Operation>, y: Operation|
     refines(
       |script: List<Operation>| observed(None, script),
@@ -588,7 +575,7 @@ test "an operation does to a cache what it does to a list in order of use" {
     ))
 }
 
-test "a cache's entries weigh no more than its capacity, each at least one" {
+test "after any operations, a cache's total entry weight is at most its capacity, and every entry weighs at least one" {
   gen::check2(gen::list(acts()), gen::any_int(), |script: List<Operation>, lived: Int| {
     let c = run_script(a_lifetime_millis(lived), script).cache;
     weight(c) <= capacity(c) && size(c) <= weight(c) && weight(c) == total_weight(entries_by_use(c))

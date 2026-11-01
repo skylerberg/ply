@@ -8,9 +8,9 @@ import compiler.check.borrowing (ParameterMode, parameter_mode)
 import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, EffectSetItem, ExternItem,
                               ExternDefinition, FnDefinition, TypeDefinition, AliasBody, SumBody,
                               NominalBody, ExternBody, VariantDefinition, EffectDefinition,
-                              OpDefinition, EffectSetDefinition, FieldDoc, SpecClause, ReturnsFresh,
-                              ReturnsParam, Visibility, Public, Private, SchemaDefinition,
-                              schema_of, member_of)
+                              OperationDefinition, EffectSetDefinition, FieldDoc, SpecClause,
+                              ReturnsFresh, ReturnsParam, Visibility, Public, Private,
+                              SchemaDefinition, schema_of, member_of)
 import compiler.syntax.parsing (Doc, Identifier, Span)
 import compiler.check.resolve.tables (ParsedModule, qualify)
 import compiler.syntax.type_syntax (TypeExpression, RecordTypeExpression, type_span, generics_text)
@@ -79,21 +79,21 @@ fn printed_params(
   ts: List<Type>,
   params: List<ParameterMode>,
 ) -> Printing / {abort.raise} =
-  range(0, ts.len()).fold({ printer: printer, pairs: [] }, |acc: Printing, i: Int|
+  range(0, ts.len()).fold({ printer: printer, pairs: [] }, |accumulator: Printing, i: Int|
     match ts.at(i) {
-      None -> acc,
+      None -> accumulator,
       Some(t) -> {
-        let out = print_type(acc.printer, t);
+        let out = print_type(accumulator.printer, t);
         let written = match params.at(i) {
           Some(p) -> String::of_bytes_lossy(p.name),
           None -> "_" ++ i.to_string(),
         };
-        let kept = match params.at(i) { Some(p) -> p.keep, None -> false };
+        let has_keep = match params.at(i) { Some(p) -> p.keep, None -> false };
         {
           printer: out.printer,
-          pairs: acc.pairs.push({
+          pairs: accumulator.pairs.push({
             name: written,
-            ty: (if kept { "keep " } else { "" }) ++ String::of_bytes_lossy(out.text),
+            ty: (if has_keep { "keep " } else { "" }) ++ String::of_bytes_lossy(out.text),
           }),
         }
       },
@@ -114,7 +114,7 @@ pub fn signature(
       let ps: Printing = printed_params(full.printer, f.params, params);
       let row = print_effects(ps.printer, f.effects);
       let effects = if row.text == b"{}" { "" } else { " / " ++ String::of_bytes_lossy(row.text) };
-      let ret = print_type(row.printer, f.ret);
+      let return_type = print_type(row.printer, f.return_type);
       {
         text: prefix ++ name ++ generics_of(full.text) ++ "("
           ++ String::join(
@@ -122,7 +122,7 @@ pub fn signature(
             ", ",
           )
           ++ ") -> "
-          ++ String::of_bytes_lossy(ret.text)
+          ++ String::of_bytes_lossy(return_type.text)
           ++ effects,
         params: ps.pairs,
       }
@@ -135,9 +135,9 @@ pub fn lines_of(doc: Option<Doc>) -> List<String> =
   match doc { Some(d) -> d.lines.map(|l: Bytes| String::of_bytes_lossy(l)), None -> [] }
 
 pub fn one_line(text: String) -> String = {
-  let kept = text.split("\n").map(|l: String| l.ascii_trim()).filter(|l: String|
+  let content_lines = text.split("\n").map(|l: String| l.ascii_trim()).filter(|l: String|
     l != "" && !l.starts_with("//"));
-  let joined = String::join(kept, " ");
+  let joined = String::join(content_lines, " ");
   let closed = joined.replace(", )", ")").replace(", ]", "]").replace(", }", " }");
   closed.replace("( ", "(").replace("[ ", "[").replace(" )", ")")
 }
@@ -155,17 +155,17 @@ fn sliced(reading: PageSource, span: Span) -> String / {abort.raise} =
 
 fn visibility(v: Visibility) -> String = match v { Public -> "pub ", Private -> "" }
 
-fn fn_named(parsed: ParsedModule, name: Bytes) -> Option<FnDefinition> =
-  parsed.module.items.fold(None, |acc: Option<FnDefinition>, it: Item|
-    match acc {
-      Some(_) -> acc,
+fn function_named(parsed: ParsedModule, name: Bytes) -> Option<FnDefinition> =
+  parsed.module.items.fold(None, |accumulator: Option<FnDefinition>, it: Item|
+    match accumulator {
+      Some(_) -> accumulator,
       None -> match it {
         FunctionItem(d) -> if qualify(parsed.name, d.name.name) == name { Some(d) } else { None },
         _ -> None,
       },
     })
 
-fn fn_signature(
+fn function_signature(
   definition_info: DefinitionInfo,
   found: Option<FnDefinition>,
 ) -> PrintedSignature / {abort.raise} = {
@@ -176,7 +176,12 @@ fn fn_signature(
   let name = String::of_bytes_lossy(definition_info.simple_name);
   match ((found, definition_info.scheme.ty)) {
     (Some({ constant: Some(_), visibility: v, .. }), FunctionType(f)) ->
-      signature(visibility(v) ++ "const ", name, { ..definition_info.scheme, ty: f.ret }, []),
+      signature(
+        visibility(v) ++ "const ",
+        name,
+        { ..definition_info.scheme, ty: f.return_type },
+        [],
+      ),
     _ ->
       signature(prefix, name, definition_info.scheme, match found {
         Some(d) -> d.params.map(parameter_mode),
@@ -191,16 +196,17 @@ fn clauses_of(reading: PageSource, d: FnDefinition) -> List<String> / {abort.rai
     Some(ReturnsParam(p)) -> ["returns " ++ String::of_bytes_lossy(p.name)],
     None -> [],
   };
-  d.spec.fold(returns, |acc: List<String>, c: SpecClause| acc.push(sliced(reading, c.span)))
+  d.spec.fold(returns, |accumulator: List<String>, c: SpecClause|
+    accumulator.push(sliced(reading, c.span)))
 }
 
 fn schema_signature(reading: PageSource, d: SchemaDefinition) -> String / {abort.raise} =
   visibility(d.visibility) ++ sliced(reading, d.span)
 
 fn definition_page(reading: PageSource, definition_info: DefinitionInfo) -> Page / {abort.raise} = {
-  let found = fn_named(reading.parsed, definition_info.name);
+  let found = function_named(reading.parsed, definition_info.name);
   let schema = match found { Some(d) -> schema_of(reading.parsed.module, d), None -> None };
-  let signed: PrintedSignature = fn_signature(definition_info, found);
+  let signed: PrintedSignature = function_signature(definition_info, found);
   {
     kind: match schema { Some(_) -> "law schema", None -> "definition" },
     name: String::of_bytes_lossy(definition_info.name),
@@ -285,12 +291,12 @@ fn effect_head(d: EffectDefinition) -> String =
   visibility(d.visibility) ++ (if d.is_nondet { "nondet " } else { "" }) ++ "effect "
     ++ String::of_bytes_lossy(d.name.name)
 
-fn op_member(reading: PageSource, op: OpDefinition) -> Member / {abort.raise} =
+fn operation_member(reading: PageSource, operation: OperationDefinition) -> Member / {abort.raise} =
   {
     kind: "operation",
-    name: String::of_bytes_lossy(op.name.name),
-    signature: sliced(reading, op.span),
-    doc: lines_of(op.doc),
+    name: String::of_bytes_lossy(operation.name.name),
+    signature: sliced(reading, operation.span),
+    doc: lines_of(operation.doc),
   }
 
 fn set_signature(reading: PageSource, d: EffectSetDefinition) -> String / {abort.raise} =
@@ -298,27 +304,30 @@ fn set_signature(reading: PageSource, d: EffectSetDefinition) -> String / {abort
 
 fn type_functions(reading: PageSource, d: TypeDefinition) -> List<Member> / {abort.raise} = {
   let parsed = reading.parsed;
-  parsed.module.items.fold([], |acc: List<Member>, it: Item|
+  parsed.module.items.fold([], |accumulator: List<Member>, it: Item|
     match it {
       FunctionItem(f) -> match member_of(f.name.name) {
-        None -> acc,
+        None -> accumulator,
         Some(m) -> {
-          let kept = match ((d.visibility, f.visibility)) { (Public, Private) -> true, _ -> false };
-          if m.of != d.name.name || kept { acc } else {
+          let is_hidden = match ((d.visibility, f.visibility)) {
+            (Public, Private) -> true,
+            _ -> false,
+          };
+          if m.of != d.name.name || is_hidden { accumulator } else {
             match reading.definitions.get(qualify(parsed.name, f.name.name)) {
-              None -> acc,
+              None -> accumulator,
               Some(definition_info) ->
-                acc.push({
+                accumulator.push({
                   kind: "function",
                   name: String::of_bytes_lossy(m.member),
-                  signature: fn_signature(definition_info, Some(f)).text,
+                  signature: function_signature(definition_info, Some(f)).text,
                   doc: lines_of(f.doc),
                 }),
             }
           }
         },
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 }
 
@@ -361,14 +370,15 @@ fn item_pages(reading: PageSource, it: Item) -> List<Page> / {abort.raise} =
             ..declaration_page(reading, "effect", d.name.name, d.span),
             signature: effect_head(d),
             doc: lines_of(d.doc),
-            members: d.operations.map(|op: OpDefinition| op_member(reading, op)),
+            members: d.operations.map(|operation: OperationDefinition|
+              operation_member(reading, operation)),
           },
         ],
-        |acc: List<Page>, op: OpDefinition|
-          acc.push({
-            ..declaration_page(reading, "operation", Bytes::concat_all([d.name.name, b".", op.name.name]), op.span),
-            signature: sliced(reading, op.span),
-            doc: lines_of(op.doc),
+        |accumulator: List<Page>, operation: OperationDefinition|
+          accumulator.push({
+            ..declaration_page(reading, "operation", Bytes::concat_all([d.name.name, b".", operation.name.name]), operation.span),
+            signature: sliced(reading, operation.span),
+            doc: lines_of(operation.doc),
           }),
       ),
     EffectSetItem(d) ->
@@ -398,37 +408,37 @@ fn native_of(reading: PageSource, d: ExternDefinition) -> Option<Native> / {abor
 
 fn module_members(reading: PageSource) -> List<Member> / {abort.raise} = {
   let parsed = reading.parsed;
-  parsed.module.items.fold([], |acc: List<Member>, it: Item|
+  parsed.module.items.fold([], |accumulator: List<Member>, it: Item|
     match it {
       ExternItem(d) -> match d.visibility {
-        Private -> acc,
+        Private -> accumulator,
         Public -> match native_of(reading, d) {
           Some(n) ->
-            acc.push({
+            accumulator.push({
               kind: "builtin",
               name: String::of_bytes_lossy(d.name.name),
               signature: n.signature.text,
               doc: n.builtin.doc.map(|l: Bytes| String::of_bytes_lossy(l)),
             }),
-          None -> acc,
+          None -> accumulator,
         },
       },
       FunctionItem(d) -> match d.visibility {
-        Private -> acc,
+        Private -> accumulator,
         Public -> match ((
             reading.definitions.get(qualify(parsed.name, d.name.name)),
             schema_of(parsed.module, d),
           )) {
-          (None, _) -> acc,
+          (None, _) -> accumulator,
           (Some(definition_info), None) ->
-            acc.push({
+            accumulator.push({
               kind: "definition",
               name: String::of_bytes_lossy(d.name.name),
-              signature: fn_signature(definition_info, Some(d)).text,
+              signature: function_signature(definition_info, Some(d)).text,
               doc: lines_of(d.doc),
             }),
-          (Some(_), Some(schema)) -> if schema.name.name != d.name.name { acc } else {
-            acc.push({
+          (Some(_), Some(schema)) -> if schema.name.name != d.name.name { accumulator } else {
+            accumulator.push({
               kind: "law schema",
               name: String::of_bytes_lossy(d.name.name),
               signature: schema_signature(reading, schema),
@@ -438,9 +448,9 @@ fn module_members(reading: PageSource) -> List<Member> / {abort.raise} = {
         },
       },
       TypeItem(d) -> match d.visibility {
-        Private -> acc,
+        Private -> accumulator,
         Public ->
-          acc.push({
+          accumulator.push({
             kind: "type",
             name: String::of_bytes_lossy(d.name.name),
             signature: type_signature(reading, d),
@@ -448,9 +458,9 @@ fn module_members(reading: PageSource) -> List<Member> / {abort.raise} = {
           }),
       },
       EffectItem(d) -> match d.visibility {
-        Private -> acc,
+        Private -> accumulator,
         Public ->
-          acc.push({
+          accumulator.push({
             kind: "effect",
             name: String::of_bytes_lossy(d.name.name),
             signature: effect_head(d),
@@ -458,16 +468,16 @@ fn module_members(reading: PageSource) -> List<Member> / {abort.raise} = {
           }),
       },
       EffectSetItem(d) -> match d.visibility {
-        Private -> acc,
+        Private -> accumulator,
         Public ->
-          acc.push({
+          accumulator.push({
             kind: "effect set",
             name: String::of_bytes_lossy(d.name.name),
             signature: set_signature(reading, d),
             doc: lines_of(d.doc),
           }),
       },
-      _ -> acc,
+      _ -> accumulator,
     })
 }
 
@@ -481,7 +491,7 @@ pub fn module_pages(
     text: text,
     definitions: decided.definitions.fold(
       Map::new(),
-      |acc: Map<Bytes, DefinitionInfo>, d: DefinitionInfo| acc.insert(d.name, d),
+      |accumulator: Map<Bytes, DefinitionInfo>, d: DefinitionInfo| accumulator.insert(d.name, d),
     ),
     decided: decided,
   };
@@ -491,15 +501,15 @@ pub fn module_pages(
     doc: lines_of(parsed.module.doc),
     members: module_members(reading),
   };
-  let defined = decided.definitions.fold([own], |acc: List<Page>, d: DefinitionInfo|
-    acc.push(definition_page(reading, d)));
+  let defined = decided.definitions.fold([own], |accumulator: List<Page>, d: DefinitionInfo|
+    accumulator.push(definition_page(reading, d)));
   {
-    pages: parsed.module.items.fold(defined, |acc: List<Page>, it: Item|
-      item_pages(reading, it).fold(acc, |a: List<Page>, page: Page| a.push(page))),
+    pages: parsed.module.items.fold(defined, |accumulator: List<Page>, it: Item|
+      item_pages(reading, it).fold(accumulator, |a: List<Page>, page: Page| a.push(page))),
   }
 }
 
-test "written text reads on one line, without a comment or a closing comma" {
+test "a signature printed on one line drops comments and the trailing comma" {
   assert_eq(
     one_line("read walk[r](\n    path: String,\n  ) -> Option<List<Entry>>"),
     "read walk[r](path: String) -> Option<List<Entry>>",
@@ -510,21 +520,22 @@ test "written text reads on one line, without a comment or a closing comma" {
   )
 }
 
-fn pages_of(src: Bytes, named: Bytes, law: Bytes) -> List<Page> / {abort.raise} =
-  match parse_all([{ name: b"m", src: src }]) {
+fn pages_of(source: Bytes, named: Bytes, law: Bytes) -> List<Page> / {abort.raise} =
+  match parse_all([{ name: b"m", source_text: source }]) {
     [p] -> match analyse([p]) {
-      Rejected(_) -> panic("the fixture checks"),
+      Rejected(_) -> panic("the test source fails to check"),
       Analysed(w) ->
-        module_pages(p.module, src, {
+        module_pages(p.module, source, {
           definitions: w.checked.definitions,
           hashes: w.hashes.definitions.fold(
             Map::new(),
-            |acc: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }| acc.insert(x.name, x.hash),
+            |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
+              accumulator.insert(x.name, x.hash),
           ),
           laws_by_definition: Map::new().insert(named, [law]),
         }).pages,
     },
-    _ -> panic("one module parses to one"),
+    _ -> panic("parsing one module must return exactly one module"),
   }
 
 test "a `const` is documented as it is written" {
@@ -535,9 +546,9 @@ test "a `const` is documented as it is written" {
   )
 }
 
-test "a module documents itself, each definition its check published and each name it declares" {
-  let src = b"//! Counting.\n\n/// One more.\npub fn more(x: Int) -> Int\n  ensures result > x\n= x + 1\n\n/// A shape.\npub type Shape = | Dot | Line(Int)\n\npub effect ledger {\n  /// Writes it down.\n  write record(n: Int) -> Unit\n}\n";
-  let pages = pages_of(src, b"m.more", b"more grows");
+test "a module's documentation has a page for the module and for each definition, type, effect and effect operation it declares" {
+  let source = b"//! Counting.\n\n/// One more.\npub fn more(x: Int) -> Int\n  ensures result > x\n= x + 1\n\n/// A shape.\npub type Shape = | Dot | Line(Int)\n\npub effect ledger {\n  /// Writes it down.\n  write record(n: Int) -> Unit\n}\n";
+  let pages = pages_of(source, b"m.more", b"more grows");
   assert_eq(pages.map(|p: Page| p.kind ++ " " ++ p.name ++ " as " ++ p.simple), [
     "module m as ",
     "definition m.more as more",
@@ -564,7 +575,7 @@ test "a module documents itself, each definition its check published and each na
   assert_eq(more.effects, Some([]));
   assert_eq(more.laws, ["more grows"]);
   assert(more.hash != None);
-  assert_eq(src.slice(more.at, more.at + 7), b"fn more");
+  assert_eq(source.slice(more.at, more.at + 7), b"fn more");
   assert_eq(page("m.Shape").members.map(|m: Member| m.signature), ["Dot", "Line(Int)"]);
   assert_eq(page("m.Shape").laws, []);
   assert_eq(page("m.ledger").members, [
@@ -578,11 +589,11 @@ test "a module documents itself, each definition its check published and each na
   assert_eq(page("m.ledger.record").signature, "write record(n: Int) -> Unit")
 }
 
-test "a shipped module's extern is a builtin of its module, listed among its members where it is `pub`" {
-  let src = b"//! Natives.\n\n/// Twice the number.\npub extern fn doubled(x: Int) -> Int\n\n/// Kept inside.\nextern fn hidden(x: Int) -> Int\n";
-  match parse_all([{ name: b"std.native", src: src }]) {
+test "an `extern fn` in a standard library module gets a builtin page, and only a `pub` one is listed as a member of the module" {
+  let source = b"//! Natives.\n\n/// Twice the number.\npub extern fn doubled(x: Int) -> Int\n\n/// Kept inside.\nextern fn hidden(x: Int) -> Int\n";
+  match parse_all([{ name: b"std.native", source_text: source }]) {
     [p] -> {
-      let pages = module_pages(p.module, src, {
+      let pages = module_pages(p.module, source, {
         definitions: [],
         hashes: Map::new(),
         laws_by_definition: Map::new(),
@@ -601,9 +612,9 @@ test "a shipped module's extern is a builtin of its module, listed among its mem
   }
 }
 
-test "a type's page lists its functions after what it is made of, those it publishes where it is published" {
-  let src = b"pub type Shape = | Dot | Line(Int)\n\n/// How long.\npub fn Shape::length(s: Shape) -> Int = match s { Dot -> 0, Line(n) -> n }\n\nfn Shape::kept(s: Shape) -> Int = 0\n\ntype Inner = | Inner\n\nfn Inner::made() -> Inner = Inner\n";
-  let pages = pages_of(src, b"none", b"none");
+test "a type's page lists its variants, then its functions: all of a private type's functions but only the `pub` ones of a `pub` type" {
+  let source = b"pub type Shape = | Dot | Line(Int)\n\n/// How long.\npub fn Shape::length(s: Shape) -> Int = match s { Dot -> 0, Line(n) -> n }\n\nfn Shape::kept(s: Shape) -> Int = 0\n\ntype Inner = | Inner\n\nfn Inner::made() -> Inner = Inner\n";
+  let pages = pages_of(source, b"none", b"none");
   let members = |name: String|
     match pages.find(|p: Page| p.name == name) {
       Some(p) -> p.members.map(|m: Member| m.kind ++ " " ++ m.name ++ ": " ++ m.signature),

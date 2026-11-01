@@ -1,10 +1,11 @@
 //! Support for tests that run once for each case of a table.
 //!
 //! `test "{c.name}" for c: T in table() { .. }` runs one test for each element of its table. Each
-//! element is a *case*. A test run identifies a case by its value as it was built, so a case keeps
-//! its recorded pass when the table moves it. Two cases that a test body can tell apart never share
-//! an identity: `1.5m` and `1.50m` are two cases, as are two values whose type's `key` returns the
-//! same for both. A run calls `listed` to learn the cases and `chosen` to start the test for one. A
+//! element is a *case*. A test run identifies a case by a hash of its value, so a case is still
+//! recognized as the same case after the table moves it to another position, and its earlier
+//! passing result still applies. Cases that a test body can tell apart never share an identity:
+//! `1.5m` and `1.50m` are two cases. So are two different values that the type's `key` treats as
+//! equal. A run calls `listed` to find the cases and `chosen` to start the test for one case. A
 //! module with such a test imports this module, so this module cannot contain one.
 
 import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VStr, VBytes, VList,
@@ -14,19 +15,20 @@ import std.value (Value, VUnit, VBool, VInt, VFloat, VDecimal, VFixed, VChar, VS
 /// The cases a test runs over, in the order a report lists them.
 pub type Table<a> = List<a>
 
-/// A case as a test run identifies it.
+/// A test case: the label it is reported under and an identity that selects it.
 pub type Case = {
   /// The name its test is reported under, which `--filter` matches.
   label: String,
-  /// The BLAKE3 hash of its value as built. Two cases built the same way share an identity. Two
-  /// that `==` calls equal but that are built differently do not.
+  /// The BLAKE3 hash of the case's value. Two cases built the same way have the same identity. Two
+  /// values that `==` calls equal but that are represented differently, such as `1.5m` and `1.50m`,
+  /// have different identities.
   identity: Bytes,
 }
 
-/// Lists each case of `table` in the table's order, with the label `label` gives it.
+/// Lists each case of `table` in the table's order, labeled by `label`.
 ///
-/// The hash ignores any `key` the type declares, since cases are told apart by what they contain.
-/// Raises on a value that contains a function, a handle or a credential.
+/// The identity ignores any `key` the type declares: it covers all of a value's fields. Raises on a
+/// value that contains a function, a handle or a credential.
 pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Case> / {abort.raise | e}
   where derivable(hash, a)
 = table.map(|c: a| { label: label(c), identity: content_hash(c) })
@@ -48,18 +50,11 @@ fn find_by_identity<a>(table: List<a>, wanted: Bytes) -> a / {abort.raise}
 =
   match table.filter(|c: a| content_hash(c) == wanted) {
     [c, ..] -> c,
-    [] -> panic("the table no longer holds this case"),
+    [] -> panic("no value in the table has the content hash being looked up"),
   }
 
-/// The BLAKE3 hash of `c` as it was built. `digest` is coarser, because it agrees with `==`.
 fn content_hash<a>(c: a) -> Bytes / {abort.raise} = encode_value(reflect(c)).blake3()
 
-/// Encodes `v` as bytes that no other value encodes to, with two exceptions that never merge two
-/// cases of one type. An integer narrower than 64 bits is written as the `Int` of its value, which
-/// is how compiled code stores one. A constructor is written under its name without the module
-/// path, so cases keep their identity when their module moves. A `Decimal` keeps its scale, and a
-/// value whose type declares a `key` keeps all its fields. Raises on a function, a handle or a
-/// credential, which have no data to write.
 fn encode_value(v: Value) -> Bytes / {abort.raise} =
   match v {
     VUnit -> b"u",
@@ -85,17 +80,16 @@ fn encode_value(v: Value) -> Bytes / {abort.raise} =
     VMap(entries) ->
       counted(b"m", entries.map(|e: Entry| encode_value(e.key).concat(encode_value(e.value)))),
     _ ->
-      panic("a case holds a function, a handle or a credential, which no run tells from another"),
+      panic(
+        "a value that contains a function, a handle or a credential cannot be encoded, because they have no data to write",
+      ),
   }
 
-/// Writes `tag`, the length of `payload`, `:`, then `payload`, so a reader learns where it ends
-/// before reading it.
 fn framed(tag: Bytes, payload: Bytes) -> Bytes =
   Bytes::concat_all([tag, Bytes::of_string(payload.len().to_string()), b":", payload])
 
 fn text(tag: Bytes, s: String) -> Bytes = framed(tag, Bytes::of_string(s))
 
-/// Writes `tag`, the number of `parts`, `:`, then each part, which marks its own end.
 fn counted(tag: Bytes, parts: List<Bytes>) -> Bytes =
   Bytes::concat_all([
     tag,
@@ -104,7 +98,6 @@ fn counted(tag: Bytes, parts: List<Bytes>) -> Bytes =
     Bytes::concat_all(parts),
   ])
 
-/// The `Int` value of an integer narrower than 64 bits, or `None` for a wider one.
 fn narrow(ty: String, bits: U128) -> Option<Int> / {abort.raise} =
   if ty == "U8" || ty == "U16" || ty == "U32" { Some(Int::of_u128(bits)) }
   else if ty == "I8" { Some(signed_from_bits(Int::of_u128(bits), 128)) }
@@ -112,11 +105,10 @@ fn narrow(ty: String, bits: U128) -> Option<Int> / {abort.raise} =
   else if ty == "I32" { Some(signed_from_bits(Int::of_u128(bits), 2147483648)) }
   else { None }
 
-/// Reads a bit pattern as signed: a pattern at or above `half` its width's range is negative.
 fn signed_from_bits(pattern: Int, half: Int) -> Int =
   if pattern >= half { pattern - 2 * half } else { pattern }
 
-test "a listing labels each case and identifies it as it was built, in the table's order" {
+test "`listed` returns a label and a content hash for each value, in the order of the input list" {
   assert_eq(listed([3, 4], |n: Int| n.to_string()), [
     { label: "3", identity: content_hash(3) },
     { label: "4", identity: content_hash(4) },
@@ -124,7 +116,7 @@ test "a listing labels each case and identifies it as it was built, in the table
   assert_eq(listed([], |n: Int| n.to_string()), [])
 }
 
-test "a case is found by its identity, at its index or wherever it now is in the table" {
+test "`chosen` returns the case whose content hash matches, whether it is at the given index, at a later index, or before it" {
   assert_eq(chosen(["a", "b"], 1, content_hash("b")), "b");
   assert_eq(chosen(["new", "a", "b"], 1, content_hash("b")), "b");
   assert_eq(chosen(["b"], 4, content_hash("b")), "b")
@@ -134,16 +126,15 @@ fn missing() -> Result<String, String> =
   handle { Ok(chosen(["a"], 0, content_hash("b"))) } with { abort.raise(reason) -> Err(reason) }
 
 test "choosing a case the table no longer contains raises" {
-  assert_eq(missing(), Err("the table no longer holds this case"))
+  assert_eq(missing(), Err("no value in the table has the content hash being looked up"))
 }
 
-test "two values that `==` calls equal are two cases when they are built differently" {
+test "decimals that are equal under `==` but have different scales get different content hashes" {
   assert(1.5m == 1.50m);
   assert(content_hash(1.5m) != content_hash(1.50m));
   assert(content_hash([{ price: 2.0m }]) != content_hash([{ price: 2.00m }]));
   assert_eq(chosen([1.5m, 1.50m], 0, content_hash(1.50m)).to_string(), "1.50");
   assert_eq(content_hash([1.50m]), content_hash([1.50m]));
-  // A `Map` stores a key at the scale it was given, so these build one map in two ways.
   assert(
     content_hash(Map::of_entries([{ key: 1.50m, value: 0 }]))
       != content_hash(Map::of_entries([{ key: 1.5m, value: 0 }])),
@@ -195,7 +186,7 @@ test "no two values encode to the same bytes" {
   )
 }
 
-test "a narrow integer encodes as the Int of its value, and a constructor by its bare name" {
+test "`encode_value` encodes a `VFixed` integer as the `VInt` it wraps to, and a `VCtor` ignores the module path in its name" {
   assert_eq(encode_value(VFixed("U8", 255u128)), encode_value(VInt(255)));
   assert_eq(encode_value(VFixed("I8", 255u128)), encode_value(VInt(-1)));
   assert_eq(encode_value(VFixed("I16", 65535u128)), encode_value(VInt(-1)));
@@ -214,6 +205,8 @@ fn unwritten() -> Result<Bytes, String> =
 test "encoding a value that contains a function raises" {
   assert_eq(
     unwritten(),
-    Err("a case holds a function, a handle or a credential, which no run tells from another"),
+    Err(
+      "a value that contains a function, a handle or a credential cannot be encoded, because they have no data to write",
+    ),
   )
 }

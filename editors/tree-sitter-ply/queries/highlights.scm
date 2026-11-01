@@ -1,8 +1,3 @@
-; Highlights for Ply. Scopes follow the common tree-sitter naming so every editor that reads a
-; `highlights.scm` picks them up: Neovim, Helix, Zed, and Emacs.
-
-; --- Comments ---------------------------------------------------------------
-
 [
   (line_comment)
   (plain_comment)
@@ -12,8 +7,6 @@
   (item_doc_comment)
   (module_doc_comment)
 ] @comment.documentation
-
-; --- Keywords ---------------------------------------------------------------
 
 [
   "import"
@@ -84,8 +77,6 @@
   (boolean)
 ] @boolean
 
-; --- Items ------------------------------------------------------------------
-
 (function_definition name: (identifier) @function)
 (const_declaration name: (identifier) @constant)
 (extern_function name: (identifier) @function)
@@ -101,18 +92,13 @@
 
 (module_path (identifier) @module)
 
-; --- Types ------------------------------------------------------------------
-
 (type_application name: (identifier) @type)
 (type_application module: (identifier) @module)
 (type_arguments (identifier) @type)
 (record_type_field name: (identifier) @property)
 (sum_variant name: (identifier) @constructor)
-; A bare name in a type position is a type; an uppercase one anywhere is a type constructor.
 ((identifier) @type
   (#match? @type "^[A-Z]"))
-
-; --- Expressions ------------------------------------------------------------
 
 (function_definition parameters: (parameter_list (parameter . (identifier) @parameter)))
 (lambda_parameter name: (identifier) @parameter)
@@ -120,7 +106,6 @@
 (operation_parameter name: (identifier) @parameter)
 (clause_parameters (identifier) @parameter)
 
-; A claim's leading `identity(a)` constrains `a`; it is no call.
 (law_declaration condition: (call_expression function: (identifier) @keyword (#eq? @keyword "identity")))
 (law_schema_declaration condition: (call_expression function: (identifier) @keyword (#eq? @keyword "identity")))
 (call_expression function: (identifier) @function.call)
@@ -148,8 +133,6 @@
 
 (wildcard) @variable.builtin
 
-; --- Literals ---------------------------------------------------------------
-
 (number) @number
 (char_literal) @character
 (byte_literal) @character
@@ -165,8 +148,6 @@
 (tagged_string tag: (identifier) @function.macro)
 
 (label) @label
-
-; --- Operators --------------------------------------------------------------
 
 [
   "||"
@@ -206,8 +187,6 @@
   "::"
   "."
 ] @operator
-
-; --- Punctuation ------------------------------------------------------------
 
 [
   "("

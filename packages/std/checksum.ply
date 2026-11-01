@@ -26,15 +26,6 @@ import std.random (entropy)
 import std.show (show)
 import std.gen
 
-// --- Words ------------------------------------------------------------------
-
-// A 64-bit word is an `Int` treated as its bits. `wrap_add`, `wrap_mul`, `^` and `>>>` are its
-// unsigned operations, a left rotation by `n` is `rotr` by `64 - n`, and a word becomes a `U64`
-// only when a sum leaves the module.
-//
-// Byte reads and narrowing conversions may raise by their types, but never do here: every index is
-// below a length and every value is masked to its width. So no `handle` clause in this module runs.
-
 fn u32_of(x: Int) -> U32 = handle { U32::of_int(x & 0xFFFF_FFFF) } with { abort.raise(_) -> 0u32 }
 
 fn u64_of(x: Int) -> U64 =
@@ -51,15 +42,13 @@ fn int_of(x: U64) -> Int =
     abort.raise(_) -> 0,
   }
 
-/// `pending` and then `chunk`, without a copy where nothing is pending.
 fn joined(pending: Bytes, chunk: Bytes) -> Bytes =
   if pending.len() == 0 { chunk } else { pending.concat(chunk) }
 
-// --- CRC --------------------------------------------------------------------
-
-/// A CRC as the Rocksoft model describes one: a register of `width` bits, from 1 to 64, that
-/// starts at `init`; the generator polynomial `poly` without its top term; whether each input
-/// byte and the final register are bit-reversed; and what the result is xored with.
+/// Describes a CRC by the standard parameters of the Rocksoft model. `width` is the register size
+/// in bits, from 1 to 64. `poly` is the generator polynomial without its top term. `init` is the
+/// starting register. `reflect_in` says whether each input byte is bit-reversed, and `reflect_out`
+/// whether the final register is. `xor_out` is xored into the result.
 pub type Model = new {
   width: Int,
   poly: U64,
@@ -69,18 +58,19 @@ pub type Model = new {
   xor_out: U64,
 }
 
-/// A model with its tables built, ready to compute. Build one with `crc_of`: a `Crc` put together
-/// any other way computes no CRC that a model describes.
+/// A `Model` with its tables built, ready to compute. Build one with `crc_of`: a `Crc` built any
+/// other way may not match any model.
 pub type Crc = new {
   model: Model,
-  /// The polynomial bit-reversed in the width. The register is kept bit-reversed whatever the
-  /// model specifies, so one loop serves every model.
+  /// The polynomial with its `width` bits in reverse order. Every model stores its register in
+  /// reverse bit order, so one loop computes all of them.
   poly: Int,
   /// The register before any byte.
   start: Int,
   /// What the last register is xored with.
   last: Int,
-  /// What a register is multiplied by, modulo the polynomial, for each byte that follows it.
+  /// The multiplier that moves a register past one byte: `x` raised to the eighth power, modulo the
+  /// polynomial, in reverse bit order.
   byte: Int,
   /// Eight tables of 256 entries: entry `256 * k + b` is the register that byte `b` produces `k`
   /// bytes later.
@@ -114,7 +104,6 @@ fn all_bits_reversed(x: Int) -> Int = {
   quads >>> 32 | quads << 32
 }
 
-/// `x` with the bits of each byte reversed, and the bytes left in place.
 fn bits_reversed(x: Int) -> Int = {
   let ones = x >>> 1 & 0x5555_5555_5555_5555 | (x & 0x5555_5555_5555_5555) << 1;
   let twos = ones >>> 2 & 0x3333_3333_3333_3333 | (ones & 0x3333_3333_3333_3333) << 2;
@@ -123,19 +112,19 @@ fn bits_reversed(x: Int) -> Int = {
 
 fn reflected(x: Int, width: Int) -> Int = all_bits_reversed(x) >>> 64 - width
 
-/// The register `reg` eight zero bits later.
 fn crc_entry(poly: Int, reg: Int) -> Int =
-  range(0, 8).fold(reg, |acc: Int, _: Int| if acc & 1 == 1 { poly ^ acc >>> 1 } else { acc >>> 1 })
+  range(0, 8).fold(reg, |accumulator: Int, _: Int|
+    if accumulator & 1 == 1 { poly ^ accumulator >>> 1 } else { accumulator >>> 1 })
 
 fn crc_table(poly: Int) -> Array<Int> = {
   let first = range(0, 256).map(|n: Int| crc_entry(poly, n));
   Array::of_list(
-    range(256, 2048).fold(first, |acc: List<Int>, i: Int|
-      match acc.at(i - 256) {
-        None -> acc,
+    range(256, 2048).fold(first, |accumulator: List<Int>, i: Int|
+      match accumulator.at(i - 256) {
+        None -> accumulator,
         Some(before) -> match first.at(before & 0xFF) {
-          None -> acc,
-          Some(next) -> acc.push(next ^ before >>> 8),
+          None -> accumulator,
+          Some(next) -> accumulator.push(next ^ before >>> 8),
         },
       }),
   )
@@ -180,37 +169,31 @@ fn crc_tail(
 
 fn crc_mask(width: Int) -> Int = if width >= 64 { 0 - 1 } else { (1 << width) - 1 }
 
-/// Converts a register to the sum the model outputs.
 fn crc_out(c: Crc, reg: Int) -> Int =
   (if c.model.reflect_out { reg } else { reflected(reg, c.model.width) }) ^ c.last
 
-/// Converts an output sum back to its register.
 fn crc_in(c: Crc, sum: Int) -> Int = {
   let reg = (sum ^ c.last) & crc_mask(c.model.width);
   if c.model.reflect_out { reg } else { reflected(reg, c.model.width) }
 }
 
-/// The product of two polynomials modulo the generator, each bit-reversed in the width.
-/// `bit` is the position in `a` of the coefficient for the power of `x` that `b` has been raised
-/// by.
-fn crc_product(poly: Int, a: Int, b: Int, bit: Int, acc: Int) -> Int =
-  if bit < 0 { acc } else {
+fn crc_product(poly: Int, a: Int, b: Int, bit: Int, accumulator: Int) -> Int =
+  if bit < 0 { accumulator } else {
     crc_product(
       poly,
       a,
       if b & 1 == 1 { poly ^ b >>> 1 } else { b >>> 1 },
       bit - 1,
-      if a >>> bit & 1 == 1 { acc ^ b } else { acc },
+      if a >>> bit & 1 == 1 { accumulator ^ b } else { accumulator },
     )
   }
 
 fn crc_times(c: Crc, a: Int, b: Int) -> Int = crc_product(c.poly, a, b, c.model.width - 1, 0)
 
-/// What a register is multiplied by for `n` bytes that follow it.
-fn crc_shift(c: Crc, n: Int, base: Int, acc: Int) -> Int =
-  if n <= 0 { acc } else {
-    crc_shift(c, n / 2, crc_times(c, base, base), if n % 2 == 1 { crc_times(c, acc, base) }
-    else { acc })
+fn crc_shift(c: Crc, n: Int, base: Int, accumulator: Int) -> Int =
+  if n <= 0 { accumulator } else {
+    crc_shift(c, n / 2, crc_times(c, base, base), if n % 2 == 1 { crc_times(c, accumulator, base) }
+    else { accumulator })
   }
 
 fn crc_one(c: Crc) -> Int = 1 << c.model.width - 1
@@ -221,9 +204,9 @@ fn crc_over(c: Crc, reg: Int, data: Bytes) -> Int =
 /// The CRC of `data` under `c`, in the low `width` bits.
 pub fn crc(c: Crc, data: Bytes) -> U64 = u64_of(crc_out(c, crc_over(c, c.start, data)))
 
-/// The CRC of some bytes, with the effect that appending them has on a CRC: `shift` is `x` raised
-/// to eight times their length, modulo the polynomial. Under a 64-bit model every pair of values
-/// is a valid part.
+/// Summarizes a run of bytes so that runs can be joined. `sum` is the CRC of the bytes, and `shift`
+/// is `x` raised to eight times their length, modulo the polynomial. Values wider than the model's
+/// width are invalid; under a 64-bit model every pair of values is allowed.
 pub type Part = new { sum: U64, shift: U64 }
 
 /// The part for `chunk`.
@@ -331,10 +314,6 @@ pub fn crc32_combine(a: U32, b: U32, len_b: Int) -> U32 = {
   u32_of(int_of(crc_combine(crc32_iso_hdlc(), wide(a), wide(b), len_b)))
 }
 
-// --- Adler-32 ---------------------------------------------------------------
-
-/// Processes eight bytes per step. The sum of the eight is added to `a`, and `b` gains `a` eight
-/// times, plus each byte once for itself and once for every byte after it.
 fn adler_words(data: Bytes, i: Int, a: Int, b: Int) -> Int / {abort.raise} =
   if i + 8 > data.len() { adler_tail(data, i, a, b) } else {
     let x = Int::of_u32(data.u32_le(i));
@@ -368,14 +347,11 @@ pub fn adler32(data: Bytes) -> U32 = u32_of(state_sum(update(init(Adler32), data
 pub fn adler32_combine(a: U32, b: U32, len_b: Int) -> U32 = {
   let first = Int::of_u32(a);
   let second = Int::of_u32(b);
-  // Both low halves start at one, but the joined sum starts at one only once, so subtract one.
   let low = ((first & 0xFFFF) + 65520) % 65521;
   let sum = (low + (second & 0xFFFF)) % 65521;
   let weighted = ((first >>> 16) + (second >>> 16) + max(len_b, 0) % 65521 * low) % 65521;
   u32_of(weighted << 16 | sum)
 }
-
-// --- FNV-1a -----------------------------------------------------------------
 
 fn fnv32_bytes(data: Bytes, i: Int, h: Int) -> Int / {abort.raise} =
   if i >= data.len() { h }
@@ -385,13 +361,11 @@ fn fnv64_bytes(data: Bytes, i: Int, h: Int) -> Int / {abort.raise} =
   if i >= data.len() { h }
   else { fnv64_bytes(data, i + 1, wrap_mul(h ^ data.at(i), 0x0000_0100_0000_01B3)) }
 
-/// FNV-1a, 32 bits.
+/// Returns the 32-bit FNV-1a hash of `data`.
 pub fn fnv1a_32(data: Bytes) -> U32 = u32_of(state_sum(update(init(Fnv1a32), data)))
 
-/// FNV-1a, 64 bits.
+/// Returns the 64-bit FNV-1a hash of `data`.
 pub fn fnv1a_64(data: Bytes) -> U64 = finish(update(init(Fnv1a64), data))
-
-// --- xxHash -----------------------------------------------------------------
 
 fn prime32_1() -> Int = 0x9E37_79B1
 
@@ -409,8 +383,9 @@ fn prime64_4() -> Int = 0x85EB_CA77_C2B2_AE63
 
 fn prime64_5() -> Int = 0x27D4_EB2F_1656_67C5
 
-/// XXH64 state between chunks: four lanes, the bytes left over from an incomplete 32-byte stripe,
-/// and the number of bytes consumed.
+/// Holds the state of an XXH64 hash between chunks: the seed, the four accumulators `v1` to `v4`,
+/// the bytes of the current incomplete 32-byte block in `pending`, and the number of bytes consumed
+/// in `total`.
 pub type Xxh64Run = new {
   seed: Int,
   v1: Int,
@@ -421,8 +396,8 @@ pub type Xxh64Run = new {
   total: Int,
 }
 
-fn xxh64_round(acc: Int, input: Int) -> Int =
-  wrap_mul(rotr(wrap_add(acc, wrap_mul(input, prime64_2())), 64 - 31), prime64_1())
+fn xxh64_round(accumulator: Int, input: Int) -> Int =
+  wrap_mul(rotr(wrap_add(accumulator, wrap_mul(input, prime64_2())), 64 - 31), prime64_1())
 
 fn xxh64_avalanche(h: Int) -> Int = {
   let a = wrap_mul(h ^ h >>> 33, prime64_2());
@@ -458,7 +433,6 @@ fn xxh64_fed(r: Xxh64Run, chunk: Bytes) -> Xxh64Run / {abort.raise} =
 fn xxh64_merged(h: Int, v: Int) -> Int =
   wrap_add(wrap_mul(h ^ xxh64_round(0, v), prime64_1()), prime64_4())
 
-/// Hashes the bytes after the last full stripe: eight at a time, then four, then one.
 fn xxh64_rest(b: Bytes, i: Int, h: Int) -> Int / {abort.raise} =
   if i + 8 <= b.len() {
     xxh64_rest(
@@ -495,26 +469,25 @@ fn xxh64_done(r: Xxh64Run) -> Int / {abort.raise} = {
 /// XXH64 of `data` under `seed`.
 pub fn xxh64(data: Bytes, seed: U64) -> U64 = finish(update(init(Xxh64(seed)), data))
 
-/// XXH3 state between chunks. Up to 240 bytes nothing is hashed yet, since a short input has its
-/// own formula. Past that, `acc` has absorbed every 64-byte stripe except the bytes in `pending`,
-/// which is never empty. `stripes` counts the stripes since the last scramble. `tail` is the last
-/// stripe absorbed, because the final stripe is the input's last 64 bytes wherever they fall.
+/// Holds the state of an XXH3 hash between chunks. While `total` is at most 240 bytes, the input is
+/// only buffered in `pending`, because short inputs use a separate formula at the end. Beyond that,
+/// `accumulator` has mixed in every 64-byte block except the bytes in `pending`, which is never empty.
+/// `stripes` counts the blocks mixed in since `accumulator` was last scrambled. `tail` is the last block
+/// mixed in, because the final step also needs the input's last 64 bytes, which can overlap
+/// `pending`.
 pub type Xxh3Run = new {
   seed: Int,
   secret: Bytes,
-  acc: List<Int>,
+  accumulator: List<Int>,
   stripes: Int,
   tail: Bytes,
   pending: Bytes,
   total: Int,
 }
 
-/// The 192-byte default secret XXH3 uses when the caller gives none.
 fn xxh3_secret() -> Bytes =
   b"\xb8\xfe\x6c\x39\x23\xa4\x4b\xbe\x7c\x01\x81\x2c\xf7\x21\xad\x1c\xde\xd4\x6d\xe9\x83\x90\x97\xdb\x72\x40\xa4\xa4\xb7\xb3\x67\x1f\xcb\x79\xe6\x4e\xcc\xc0\xe5\x78\x82\x5a\xd0\x7d\xcc\xff\x72\x21\xb8\x08\x46\x74\xf7\x43\x24\x8e\xe0\x35\x90\xe6\x81\x3a\x26\x4c\x3c\x28\x52\xbb\x91\xc3\x00\xcb\x88\xd0\x65\x8b\x1b\x53\x2e\xa3\x71\x64\x48\x97\xa2\x0d\xf9\x4e\x38\x19\xef\x46\xa9\xde\xac\xd8\xa8\xfa\x76\x3f\xe3\x9c\x34\x3f\xf9\xdc\xbb\xc7\xc7\x0b\x4f\x1d\x8a\x51\xe0\x4b\xcd\xb4\x59\x31\xc8\x9f\x7e\xc9\xd9\x78\x73\x64\xea\xc5\xac\x83\x34\xd3\xeb\xc3\xc5\x81\xa0\xff\xfa\x13\x63\xeb\x17\x0d\xdd\x51\xb7\xf0\xda\x49\xd3\x16\x55\x26\x29\xd4\x68\x9e\x2b\x16\xbe\x58\x7d\x47\xa1\xfc\x8f\xf8\xb8\xd1\x7a\xd0\x31\xce\x45\xcb\x3a\x8f\x95\x16\x04\x28\xaf\xd7\xfb\xca\xbb\x4b\x40\x7e"
 
-/// The secret for hashing a long input: the default with `seed` added to its even words and
-/// subtracted from its odd ones.
 fn xxh3_seeded(seed: Int) -> Bytes =
   if seed == 0 { xxh3_secret() } else {
     handle {
@@ -533,7 +506,7 @@ fn xxh3_start(seed: Int) -> Xxh3Run =
   {
     seed: seed,
     secret: xxh3_seeded(seed),
-    acc: [
+    accumulator: [
       prime32_3(),
       prime64_1(),
       prime64_2(),
@@ -549,7 +522,6 @@ fn xxh3_start(seed: Int) -> Xxh3Run =
     total: 0,
   }
 
-/// The low 64 bits of a 128-bit product xored with its high 64.
 fn xxh3_folded(a: Int, b: Int) -> Int = {
   let al = a & 0xFFFF_FFFF;
   let ah = a >>> 32;
@@ -578,7 +550,6 @@ fn swapped32(x: Int) -> Int =
 
 fn swapped64(x: Int) -> Int = swapped32(x & 0xFFFF_FFFF) << 32 | swapped32(x >>> 32)
 
-/// Hashes a whole input of at most 240 bytes. Each range of lengths has its own formula.
 fn xxh3_short(b: Bytes, seed: Int) -> Int / {abort.raise} = {
   let n = b.len();
   let s = xxh3_secret();
@@ -599,9 +570,9 @@ fn xxh3_short(b: Bytes, seed: Int) -> Int / {abort.raise} = {
     xxh3_avalanche(wrap_add(wrap_add(n, swapped64(low)), wrap_add(high, xxh3_folded(low, high))))
   } else if n <= 128 {
     xxh3_avalanche(
-      range(0, (n - 1) / 32 + 1).fold(wrap_mul(n, prime64_1()), |acc: Int, k: Int|
+      range(0, (n - 1) / 32 + 1).fold(wrap_mul(n, prime64_1()), |accumulator: Int, k: Int|
         wrap_add(
-          acc,
+          accumulator,
           wrap_add(
             xxh3_mix16(b, 16 * k, s, 32 * k, seed),
             xxh3_mix16(b, n - 16 * (k + 1), s, 32 * k + 16, seed),
@@ -609,18 +580,16 @@ fn xxh3_short(b: Bytes, seed: Int) -> Int / {abort.raise} = {
         )),
     )
   } else {
-    let first = range(0, 8).fold(wrap_mul(n, prime64_1()), |acc: Int, i: Int|
-      wrap_add(acc, xxh3_mix16(b, 16 * i, s, 16 * i, seed)));
-    let rest = range(8, n / 16).fold(xxh3_avalanche(first), |acc: Int, i: Int|
-      wrap_add(acc, xxh3_mix16(b, 16 * i, s, 16 * (i - 8) + 3, seed)));
+    let first = range(0, 8).fold(wrap_mul(n, prime64_1()), |accumulator: Int, i: Int|
+      wrap_add(accumulator, xxh3_mix16(b, 16 * i, s, 16 * i, seed)));
+    let rest = range(8, n / 16).fold(xxh3_avalanche(first), |accumulator: Int, i: Int|
+      wrap_add(accumulator, xxh3_mix16(b, 16 * i, s, 16 * (i - 8) + 3, seed)));
     xxh3_avalanche(wrap_add(rest, xxh3_mix16(b, n - 16, s, 119, seed)))
   }
 }
 
-/// Absorbs the 64-byte stripe at `at` into the eight lanes, keyed by the secret at `s`. Each lane
-/// adds its neighbour's word, and the product of the two halves of its own word xored with its key.
 fn xxh3_stripe(
-  acc: List<Int>,
+  accumulator: List<Int>,
   b: Bytes,
   at: Int,
   secret: Bytes,
@@ -629,47 +598,45 @@ fn xxh3_stripe(
   range(0, 8).map(|i: Int| {
     let key = b.word_at(at + 8 * i) ^ secret.word_at(s + 8 * i);
     wrap_add(
-      wrap_add(acc.at_or(i, 0), b.word_at(at + 8 * (i ^ 1))),
+      wrap_add(accumulator.at_or(i, 0), b.word_at(at + 8 * (i ^ 1))),
       wrap_mul(key & 0xFFFF_FFFF, key >>> 32),
     )
   })
 
-fn xxh3_scrambled(acc: List<Int>, secret: Bytes) -> List<Int> / {abort.raise} =
+fn xxh3_scrambled(accumulator: List<Int>, secret: Bytes) -> List<Int> / {abort.raise} =
   range(0, 8).map(|i: Int| {
-    let lane = acc.at_or(i, 0);
+    let lane = accumulator.at_or(i, 0);
     wrap_mul(lane ^ lane >>> 47 ^ secret.word_at(128 + 8 * i), prime32_1())
   })
 
-/// Absorbs every stripe of `b` from `i` that at least one more byte follows, scrambling after
-/// every sixteen.
 fn xxh3_stripes(b: Bytes, i: Int, r: Xxh3Run) -> Xxh3Run / {abort.raise} =
   if i + 64 >= b.len() {
     { ..r, tail: if i == 0 { r.tail } else { b.slice(i - 64, i) }, pending: b.slice(i, b.len()) }
   } else {
-    let acc = xxh3_stripe(r.acc, b, i, r.secret, 8 * r.stripes);
+    let accumulator = xxh3_stripe(r.accumulator, b, i, r.secret, 8 * r.stripes);
     xxh3_stripes(b, i + 64, if r.stripes == 15 {
-      { ..r, acc: xxh3_scrambled(acc, r.secret), stripes: 0 }
-    } else { { ..r, acc: acc, stripes: r.stripes + 1 } })
+      { ..r, accumulator: xxh3_scrambled(accumulator, r.secret), stripes: 0 }
+    } else { { ..r, accumulator: accumulator, stripes: r.stripes + 1 } })
   }
 
 fn xxh3_fed(r: Xxh3Run, chunk: Bytes) -> Xxh3Run / {abort.raise} = {
   let total = r.total + chunk.len();
-  let held = joined(r.pending, chunk);
-  if total <= 240 { { ..r, pending: held, total: total } }
-  else { xxh3_stripes(held, 0, { ..r, total: total }) }
+  let buffered = joined(r.pending, chunk);
+  if total <= 240 { { ..r, pending: buffered, total: total } }
+  else { xxh3_stripes(buffered, 0, { ..r, total: total }) }
 }
 
 fn xxh3_done(r: Xxh3Run) -> Int / {abort.raise} =
   if r.total <= 240 { xxh3_short(r.pending, r.seed) } else {
     let end = r.tail.concat(r.pending);
-    let acc = xxh3_stripe(r.acc, end, end.len() - 64, r.secret, 121);
+    let accumulator = xxh3_stripe(r.accumulator, end, end.len() - 64, r.secret, 121);
     xxh3_avalanche(
       range(0, 4).fold(wrap_mul(r.total, prime64_1()), |sum: Int, i: Int|
         wrap_add(
           sum,
           xxh3_folded(
-            acc.at_or(2 * i, 0) ^ r.secret.word_at(11 + 16 * i),
-            acc.at_or(2 * i + 1, 0) ^ r.secret.word_at(19 + 16 * i),
+            accumulator.at_or(2 * i, 0) ^ r.secret.word_at(11 + 16 * i),
+            accumulator.at_or(2 * i + 1, 0) ^ r.secret.word_at(19 + 16 * i),
           ),
         )),
     )
@@ -677,8 +644,6 @@ fn xxh3_done(r: Xxh3Run) -> Int / {abort.raise} =
 
 /// XXH3, 64 bits, of `data` under `seed`; a seed of zero is the unseeded hash.
 pub fn xxh3_64(data: Bytes, seed: U64) -> U64 = finish(update(init(Xxh3(seed)), data))
-
-// --- SipHash ----------------------------------------------------------------
 
 /// A SipHash key: its sixteen bytes as two words, each least significant byte first.
 pub type SipKey = | SipKey(Int, Int)
@@ -693,8 +658,9 @@ pub fn sip_key(bytes: Bytes) -> Option<SipKey> =
     handle { Some(SipKey(bytes.word_at(0), bytes.word_at(8))) } with { abort.raise(_) -> None }
   }
 
-/// A random key from three draws of the host's entropy. A hash under it differs from run to run,
-/// so it may protect a hash table but must not decide an order a program shows.
+/// Returns a random key built from three draws of the host's entropy. Hashes under this key differ
+/// from run to run, so the key suits a hash table, but a program's output order must not depend on
+/// the hash.
 pub fn random_sip_key() -> SipKey / {entropy.next bounded} = {
   let spare = entropy.next();
   SipKey(entropy.next() | (spare & 1) << 63, entropy.next() | (spare >>> 1 & 1) << 63)
@@ -749,24 +715,22 @@ fn sip_fed(r: SipRun, chunk: Bytes) -> SipRun / {abort.raise} =
   sip_words(joined(r.pending, chunk), 0, { ..r, total: r.total + chunk.len() })
 
 fn sip_done(r: SipRun) -> Int = {
-  let end = range(0, r.pending.len()).fold((r.total & 0xFF) << 56, |acc: Int, i: Int|
-    acc | r.pending.at(i) << 8 * i);
+  let end = range(0, r.pending.len()).fold((r.total & 0xFF) << 56, |accumulator: Int, i: Int|
+    accumulator | r.pending.at(i) << 8 * i);
   let mixed = sip_word(r.v, end, r.each);
   let s = sip_rounds({ ..mixed, v2: mixed.v2 ^ 0xFF }, r.last);
   s.v0 ^ s.v1 ^ s.v2 ^ s.v3
 }
 
-/// SipHash-1-3 of `data` under `key`: the faster of the two, and the right choice for a hash
-/// table.
+/// Returns the SipHash-1-3 hash of `data` under `key`. It is faster than SipHash-2-4 and is the
+/// right choice for a hash table.
 pub fn siphash13(key: SipKey, data: Bytes) -> U64 = finish(update(init(SipHash13(key)), data))
 
 /// SipHash-2-4 of `data` under `key`: the one the SipHash paper recommends.
 pub fn siphash24(key: SipKey, data: Bytes) -> U64 = finish(update(init(SipHash24(key)), data))
 
-// --- One interface for every algorithm --------------------------------------
-
-/// Which sum to compute: a CRC by the `Crc` that computes it, xxHash with its seed, SipHash with
-/// its key.
+/// Selects the checksum to compute. `Crc` carries the CRC definition, `Xxh64` and `Xxh3` carry a
+/// seed, and the SipHash variants carry a key.
 pub type Algorithm =
   | Crc(Crc)
   | Adler32
@@ -816,8 +780,9 @@ fn advanced(s: State, chunk: Bytes) -> State / {abort.raise} =
     SipState(r) -> SipState(sip_fed(r, chunk)),
   }
 
-/// The sum of all input the state has consumed, with a narrower sum in the low bits. The state
-/// stays usable: it may consume more input afterward.
+/// Returns the sum of all input the state has consumed. A sum narrower than 64 bits, such as a
+/// CRC-16, occupies the low bits of the result. The state stays usable and may consume more input
+/// afterward.
 pub fn finish(s: State) -> U64 = u64_of(state_sum(s))
 
 fn state_sum(s: State) -> Int =
@@ -835,11 +800,8 @@ fn state_sum(s: State) -> Int =
     abort.raise(_) -> 0,
   }
 
-// --- Tests ------------------------------------------------------------------
-
 type Check = { name: String, crc: Crc, check: U64 }
 
-/// Each preset with the sum the catalogue of parametrised CRC algorithms gives for `123456789`.
 fn catalogue() -> List<Check> =
   [
     { name: "CRC-8/SMBUS", crc: crc8_smbus(), check: 0xF4u64 },
@@ -871,8 +833,7 @@ fn check_of(model: Model) -> Option<U64> =
 fn crc12_umts() -> Model =
   { width: 12, poly: 0x80Fu64, init: 0u64, reflect_in: false, reflect_out: true, xor_out: 0u64 }
 
-test "a model of an odd width, or one that reflects one end only, matches the catalogue" {
-  // CRC-12/UMTS, CRC-5/USB and CRC-7/MMC.
+test "CRC models with an odd width, or that reflect only the input or only the output, produce the catalogue's check values" {
   assert_eq(check_of(crc12_umts()), Some(0xDAFu64));
   assert_eq(
     check_of({
@@ -909,7 +870,6 @@ test "a model with an invalid width, or a parameter wider than the width, makes 
   assert(crc_of(plain(64, 0xFFFF_FFFF_FFFF_FFFFu64)) != None)
 }
 
-/// `n` bytes counting up from zero, wrapping at 256.
 fn counted(n: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all(range(0, 256).map(byte_of_int)).repeat(n / 256 + 1).slice(0, n)
 
@@ -937,7 +897,7 @@ test "Adler-32 as zlib computes it, past where a 32-bit sum would have overflowe
   assert_eq(adler32(counted(10240)), 0xF475_ED1Eu32)
 }
 
-test "FNV-1a over its authors' vectors" {
+test "`fnv1a_32` and `fnv1a_64` return the test values published by the FNV authors" {
   assert_eq(fnv1a_32(b""), 0x811C_9DC5u32);
   assert_eq(fnv1a_32(b"a"), 0xE40C_292Cu32);
   assert_eq(fnv1a_32(b"b"), 0xE70C_2DE5u32);
@@ -950,7 +910,6 @@ test "FNV-1a over its authors' vectors" {
   assert_eq(fnv1a_64(b"chongo was here!\n"), 0x4681_0940_EFF5_F915u64)
 }
 
-/// The buffer xxHash's own sanity checks hash a prefix of.
 fn sanity(n: Int) -> Bytes =
   Bytes::concat_all(
     range(0, n).fold(
@@ -976,11 +935,9 @@ fn xxh64_sanity() -> List<Sanity> =
     { size: 222, seed: 2654435761u64, sum: 0x20CB_8AB7_AE10_C14Au64 },
   ]
 
-test "XXH64 of {c.size} sanity bytes under seed {c.seed}" for c: Sanity in xxh64_sanity() {
-  assert_eq(xxh64(sanity(c.size), c.seed), c.sum)
-}
+test "`xxh64` of a generated {c.size}-byte input with seed {c.seed} matches the reference hash" for c: Sanity in xxh64_sanity(
+  ) { assert_eq(xxh64(sanity(c.size), c.seed), c.sum) }
 
-/// One size from each of XXH3's ranges of lengths, and on both sides of a stripe and a scramble.
 fn xxh3_sanity() -> List<Sanity> =
   [
     { size: 0, seed: 0u64, sum: 0x2D06_8005_38D3_94C2u64 },
@@ -1011,9 +968,8 @@ fn xxh3_sanity() -> List<Sanity> =
     { size: 2367, seed: 0x9E37_79B1_85EB_CA8Du64, sum: 0xD2DB_3415_B942_B42Au64 },
   ]
 
-test "XXH3 of {c.size} sanity bytes under seed {c.seed}" for c: Sanity in xxh3_sanity() {
-  assert_eq(xxh3_64(sanity(c.size), c.seed), c.sum)
-}
+test "`xxh3_64` of a generated {c.size}-byte input with seed {c.seed} matches the reference hash" for c: Sanity in xxh3_sanity(
+  ) { assert_eq(xxh3_64(sanity(c.size), c.seed), c.sum) }
 
 test "xxHash of text, unseeded" {
   assert_eq(xxh64(b"abc", 0u64), 0x44BC_2CF5_AD77_0999u64);
@@ -1022,13 +978,10 @@ test "xxHash of text, unseeded" {
   assert_eq(xxh3_64(b"Nobody inspects the spammish repetition", 0u64), 0x6CB0_0603_B5CC_47E9u64)
 }
 
-/// The key 00 to 0f the SipHash paper's vectors are under.
 fn sixteen() -> SipKey = SipKey(0x0706_0504_0302_0100, 0x0F0E_0D0C_0B0A_0908)
 
 type SipVector = { size: Int, siphash24: U64, siphash13: U64 }
 
-/// Inputs of 00 upward, on both sides of a word: SipHash-2-4 as the paper's reference code lists
-/// it, and SipHash-1-3 as that code computes it.
 fn sip_vectors() -> List<SipVector> =
   [
     { size: 0, siphash24: 0x726F_DB47_DD0E_0E31u64, siphash13: 0xABAC_0158_050F_C4DCu64 },
@@ -1041,12 +994,13 @@ fn sip_vectors() -> List<SipVector> =
     { size: 63, siphash24: 0x958A_324C_EB06_4572u64, siphash13: 0x9D19_9062_B7BB_B3A8u64 },
   ]
 
-test "SipHash of {c.size} bytes under the paper's key" for c: SipVector in sip_vectors() {
+test "`siphash24` and `siphash13` of {c.size} bytes with the reference 16-byte key match the published test vectors" for c: SipVector in sip_vectors(
+  ) {
   assert_eq(siphash24(sixteen(), counted(c.size)), c.siphash24);
   assert_eq(siphash13(sixteen(), counted(c.size)), c.siphash13)
 }
 
-test "a key is sixteen bytes, shows as hidden, and a random one takes three draws" {
+test "`sip_key` accepts only 16 bytes, printing a key shows `SipKey(****)` instead of its bytes, and `random_sip_key` draws random numbers" {
   assert_eq(sip_key(counted(16)), Some(sixteen()));
   assert_eq(sip_key(counted(15)), None);
   assert_eq(sip_key(counted(17)), None);
@@ -1056,7 +1010,6 @@ test "a key is sixteen bytes, shows as hidden, and a random one takes three draw
   assert_eq(drawn, SipKey(5 | 1 << 63, 5))
 }
 
-/// One of each, with a CRC of each width and reflection.
 fn every() -> List<Algorithm> =
   [
     Crc(crc8_smbus()),
@@ -1079,12 +1032,11 @@ fn every() -> List<Algorithm> =
 
 fn whole(a: Algorithm, data: Bytes) -> U64 = finish(update(init(a), data))
 
-/// `data` fed in pieces of `size` bytes.
 fn pieces(a: Algorithm, data: Bytes, size: Int) -> State / {abort.raise} =
   range(0, (data.len() + size - 1) / size).fold(init(a), |s: State, k: Int|
     update(s, data.slice(k * size, min((k + 1) * size, data.len()))))
 
-test "an input cut in two anywhere, or fed in pieces of any size, sums as it does whole" {
+test "the checksum of an input fed in pieces, split at any position or into any piece size, equals the checksum of the whole input" {
   let data = sanity(1500);
   let cuts = [
     0,
@@ -1131,7 +1083,7 @@ test "a state stays usable after finishing: it accepts more input" {
   })
 }
 
-test "a sum over an input cut in two is the sum over it whole" {
+test "for any two inputs, updating a checksum with each in turn equals the checksum of the two joined" {
   gen::check2(gen::bytes(), gen::bytes(), |a: Bytes, b: Bytes| {
     every().fold(true, |ok: Bool, alg: Algorithm|
       ok && finish(update(update(init(alg), a), b)) == whole(alg, a.concat(b)))
@@ -1173,20 +1125,19 @@ test "a CRC combines under every kind of model, over lengths short and long" {
       assert_eq(crc_combine(c, crc(c, head), crc(c, tail), 3000 - at), crc(c, data));
       assert_eq(crc_join(c, crc_part(c, head), crc_part(c, tail)), crc_part(c, data))
     }));
-  // A length of zero or less appends nothing.
   assert_eq(crc32_combine(crc32(b"abc"), crc32(b""), 0), crc32(b"abc"));
   assert_eq(crc32_combine(crc32(b"abc"), crc32(b""), 0 - 5), crc32(b"abc"));
   assert_eq(adler32_combine(adler32(b"abc"), adler32(b""), 0 - 5), adler32(b"abc"))
 }
 
-test "a CRC over chunks folded in parallel is the CRC of them joined" {
+test "a CRC computed over chunks with `par_fold` equals the CRC of the chunks joined into one input" {
   let chunks = range(0, 3 * grain_size() + 5).map(|i: Int| sanity(i % 41));
   let all = Bytes::concat_all(chunks);
   [crc32_iso_hdlc(), crc16_xmodem(), crc64_xz()].fold((), |_: Unit, c: Crc| {
     let folded = par_fold(
       chunks,
       crc_empty(c),
-      |acc: Part, chunk: Bytes| crc_join(c, acc, crc_part(c, chunk)),
+      |accumulator: Part, chunk: Bytes| crc_join(c, accumulator, crc_part(c, chunk)),
       |a: Part, b: Part| crc_join(c, a, b),
     );
     assert_eq(folded.sum, crc(c, all))

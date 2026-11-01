@@ -1,9 +1,6 @@
-//! `decide` — the static proof tier: a decision procedure for the decidable fragment, and the
-//! certificate a proof becomes.
-
 import compiler.emit.code (Code)
 import compiler.syntax.parsing (Span)
-import context (Context, Global, ctor, globals_of, set_of)
+import context (Context, Global, constructor, globals_of, set_of)
 import goal (Goal, Binder, Limits, UnknownReason, Open, BudgetSpent, Proof, Assertion,
              run_refutation, conjunction, domain_inhabited, uninterpreted_sorts, int_ranges,
              true_assertions)
@@ -23,7 +20,6 @@ pub type Decision =
 pub fn steps_of(d: Decision) -> Int =
   match d { Proved(p) -> p.steps, GuardUnsatisfiable(s) -> s, Unknown(u) -> u.steps }
 
-/// The word a report prints for it.
 pub fn decision_word(d: Decision) -> String =
   match d {
     Proved(_) -> "proved",
@@ -45,8 +41,6 @@ pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnos
     { ..g, tainted: match g.builds { Some(b) -> g.tainted.push(b.type_name), None -> g.tainted } },
     limits,
   );
-  // A value made here of a type stating an invariant may break it, so the claim is read again,
-  // standing on no such type's invariant but at its binders, until a reading makes none it stood on.
   let reading = iterate(first, context.invariants.keys().len() + 1, |r: LoweredGoal|
     match r.lowering.constructed.filter(|t: String| !r.goal.tainted.contains(t)) {
       [] -> Stop(r),
@@ -56,8 +50,6 @@ pub fn decide_and_diagnose(context: Context, g: Goal, limits: Limits) -> Diagnos
   decide_lowered(context, reading, limits)
 }
 
-/// A goal read once into terms: its binders, guards, what its definition returns, and its claim,
-/// standing on no invariant of the goal's `tainted` types but at its binders.
 type LoweredGoal = {
   goal: Goal,
   lowering: Lowering,
@@ -80,9 +72,9 @@ fn lower_goal(context: Context, g: Goal, limits: Limits) -> LoweredGoal / {abort
   };
   let symbols = g.binders.fold(
     { lowering: start, ids: [] },
-    |acc: { lowering: Lowering, ids: List<Int> }, b: Binder| {
-      let r = bind_symbolic(acc.lowering, b.ty);
-      { lowering: r.lowering, ids: acc.ids.push(r.id) }
+    |accumulator: { lowering: Lowering, ids: List<Int> }, b: Binder| {
+      let r = bind_symbolic(accumulator.lowering, b.ty);
+      { lowering: r.lowering, ids: accumulator.ids.push(r.id) }
     },
   );
   let bound = {
@@ -94,34 +86,31 @@ fn lower_goal(context: Context, g: Goal, limits: Limits) -> LoweredGoal / {abort
       call_depth_limit(),
     ),
   };
-  // The evaluator stops at the first false `requires`, so a later one may assume the earlier.
   let guarded = g.guards.fold(
     { lowering: bound.lowering, ids: [] },
-    |acc: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
-      let r = lower_root(acc.lowering, context, guard, bound.ids);
-      { lowering: assume(r.lowering, r.id), ids: acc.ids.push(r.id) }
+    |accumulator: { lowering: Lowering, ids: List<Int> }, guard: Option<Code>| {
+      let r = lower_root(accumulator.lowering, context, guard, bound.ids);
+      { lowering: assume(r.lowering, r.id), ids: accumulator.ids.push(r.id) }
     },
   );
-  // Requirements before this mark decide the guard, so they may not assume it.
   let guard_mark = guarded.lowering.requirements.len();
   let defined = match g.result {
     Some(result_body) -> if bound.ids.len() == 0 {
       { lowering: guarded.lowering, definition: None }
     } else {
-      // The clause holds at the calls the body makes back into its definition, and no others.
       let r = lower_root(
         {
           ..guarded.lowering,
           induction_hypothesis: g.induction_hypothesis,
           building: g.builds,
-          return_owed: false,
+          must_return: false,
         },
         context,
         result_body,
         bound.ids.take(bound.ids.len() - 1),
       );
       {
-        lowering: { ..r.lowering, induction_hypothesis: None, building: None, return_owed: true },
+        lowering: { ..r.lowering, induction_hypothesis: None, building: None, must_return: true },
         definition: Some({
           symbol: match bound.ids.at(bound.ids.len() - 1) { Some(t) -> t, None -> 0 },
           value: r.id,
@@ -130,8 +119,6 @@ fn lower_goal(context: Context, g: Goal, limits: Limits) -> LoweredGoal / {abort
     },
     None -> { lowering: guarded.lowering, definition: None },
   };
-  // The values a body builds of a type with an invariant satisfy it, or what it returns satisfies
-  // the clause. A constructor the reading did not count a value of leaves what it builds unshown.
   let body = match g.builds {
     Some(b) -> if builds_unseen(context, b.type_name, g.result, defined.lowering.seen) {
       {
@@ -160,8 +147,6 @@ fn lower_goal(context: Context, g: Goal, limits: Limits) -> LoweredGoal / {abort
   }
 }
 
-/// Whether the body of a definition owed `builds` for `type_name` applies one of its constructors
-/// where the reading counted no value: a constructor handed on as a function, or code it passed over.
 fn builds_unseen(
   context: Context,
   type_name: String,
@@ -171,7 +156,7 @@ fn builds_unseen(
   match result {
     Some(Some(code)) ->
       globals_of(code, []).any(|x: Global|
-        match ctor(context, x.name) {
+        match constructor(context, x.name) {
           Some(k) -> k.declaration.name == type_name && !seen.contains(x.at),
           None -> false,
         }),
@@ -198,7 +183,6 @@ fn decide_lowered(
     let ranges = int_ranges(definition.terms, definition.symbol, Map::new());
     let guard_needs = lowering.requirements.take(reading.guard_mark);
     let body_needs = if g.partial { [] } else { lowering.requirements.drop(reading.guard_mark) };
-    // A guard that can raise has no domain, so the obligation is not decided at any tier.
     let needed = conjunction(ranges.terms, guard_needs);
     let checked = match needed.id {
       None ->
@@ -275,7 +259,6 @@ fn decide_lowered(
                   {
                     decision: Unknown({ reason: reason, steps: spent }),
                     blockers: {
-                      // A call taken to return is no place the proof stopped.
                       let stopped = tried.blockers.filter(|b: Blocker| b != ResultAssumed);
                       if reason == Open && stopped.len() == 0 { [UnprovedCase] } else { stopped }
                     },
@@ -288,7 +271,6 @@ fn decide_lowered(
                 let all = conjunction(r.terms, reading.guards);
                 match all.id {
                   None -> { ok: true, spent: spent },
-                  // A valid guard over a non-empty domain admits a value.
                   Some(a) -> {
                     let v = run_refutation(all.terms, context, no_rules(), r.left, limits, [
                       { term: a, polarity: false },
@@ -317,8 +299,6 @@ fn decide_lowered(
   }
 }
 
-/// `p` as a decision, which raises where `p` is no certificate the decider issues: one names a rule,
-/// inlines no definition past `limits`, and unrolls each definition it inducts over.
 fn certified(p: Proof, limits: Limits) -> Decision / {abort.raise} = {
   let unrolled = p.rules.fold([], |definitions: List<String>, r: Rule|
     match r {
@@ -335,13 +315,11 @@ fn certified(p: Proof, limits: Limits) -> Decision / {abort.raise} = {
     });
   match unproved {
     Some(definition) ->
-      panic("a certificate inducts over `" ++ definition ++ "` without unrolling it"),
-    None -> if p.rules == [] { panic("a certificate names no rule") } else { Proved(p) },
+      panic("a proof uses induction on `" ++ definition ++ "` without expanding its definition"),
+    None -> if p.rules == [] { panic("a proof contains no proof steps") } else { Proved(p) },
   }
 }
 
-/// What a decision leaves a discharge to carry out: a certificate; one that stands once a value its
-/// guard admits is found; a guard nothing satisfies; or nothing settled.
 pub type StaticResult =
   | Certified(StaticProof)
   | Unwitnessed(StaticProof)
@@ -350,11 +328,8 @@ pub type StaticResult =
 
 pub type StaticProof = { rules: List<Rule>, steps: Int, sorts: List<String> }
 
-/// Where an attempt that closed no proof stopped: whether its budget ran out, and each place it
-/// left the fragment the prover decides.
 pub type FailedAttempt = { budget_exhausted: Bool, blockers: List<Blocker> }
 
-/// What a claim the static prover is never asked about is left as.
 pub fn not_attempted() -> StaticResult = Undecided({ budget_exhausted: false, blockers: [] })
 
 pub fn to_static_result(d: Diagnosis, variables: List<String>) -> StaticResult =

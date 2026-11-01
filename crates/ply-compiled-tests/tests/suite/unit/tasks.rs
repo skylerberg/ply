@@ -2,11 +2,13 @@ use crate::bare::context;
 use ply_compiled::emitted::{Block, Handed, Handle, PlyFnDesc, PlyType};
 use ply_compiled::heap::{self, IMMORTAL, Word};
 use ply_compiled::native::{Addr, I64, Returned};
-use ply_compiled::rt::{Ctx, FAILED_CANCELLED, FAILED_PENDING, FAILED_TARGET, rt_taken};
+use ply_compiled::rt::{
+    Ctx, FAILED_CANCELLED, FAILED_PENDING_RAISE, FAILED_UNWOUND_TO_HANDLER, rt_taken,
+};
 use ply_compiled::tasks::{
-    self, Body, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, RETURNED, Scheduler, Shield,
-    Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
-    rt_tickets_park, ticket_taken,
+    self, Body, BracketPhase, FAILED, FINISHED, Message, RAISED, RESUME_UNWIND, RETURNED,
+    Scheduler, Shields, UNWOUND, failure_of, rt_host_now, rt_ticket_watch, rt_tickets_answered,
+    rt_tickets_park, take_ticket_bytes,
 };
 use ply_core::{Span, codes};
 use ply_host::jobs::{self, Work};
@@ -30,11 +32,10 @@ fn asking(code: i64, n: i64) -> Message {
     }
 }
 
-/// Asks its loop twice, the second time one more than it heard, then keeps what it heard last.
 unsafe fn asks_twice(_ctx: *mut Ctx, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
-    let first = unsafe { tasks::to_loop(scheduler, asking(1, 10)) };
-    let second = unsafe { tasks::to_loop(scheduler, asking(2, first.numbers[0] + 1)) };
+    let first = unsafe { tasks::switch_to_loop(scheduler, asking(1, 10)) };
+    let second = unsafe { tasks::switch_to_loop(scheduler, asking(2, first.numbers[0] + 1)) };
     HEARD.with(|h| h.borrow_mut().push(second.numbers[0]));
 }
 
@@ -51,7 +52,7 @@ fn body(run: unsafe fn(*mut Ctx, usize), scheduler: *mut Scheduler) -> Body {
 }
 
 #[test]
-fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
+fn a_task_runs_on_its_own_stack_until_it_pauses_and_continues_from_there_when_resumed() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, true);
     let r: *mut Scheduler = &mut *scheduler;
@@ -73,7 +74,7 @@ fn a_task_runs_on_its_own_stack_until_it_asks_and_on_from_there_when_resumed() {
 }
 
 #[test]
-fn tasks_interleave_through_their_loop_each_where_it_stopped() {
+fn tasks_take_turns_in_the_scheduler_loop_and_each_continues_where_it_paused() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, false);
     let r: *mut Scheduler = &mut *scheduler;
@@ -96,17 +97,16 @@ unsafe fn unwinds(ctx: *mut Ctx, _: usize) {
 }
 
 unsafe fn raises(ctx: *mut Ctx, _: usize) {
-    unsafe { (*ctx).failed = FAILED_TARGET };
+    unsafe { (*ctx).failed = FAILED_UNWOUND_TO_HANDLER };
 }
 
 unsafe fn breaks(ctx: *mut Ctx, _: usize) {
     unsafe { (*ctx).failed = 1 };
 }
 
-/// A body that did not return leaves the context clear for the loop, and how it ended is put back
-/// where the loop asks.
 #[test]
-fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
+fn a_task_body_that_unwinds_raises_or_fails_reports_which_of_the_three_and_restore_recreates_the_failure()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let mut scheduler = Scheduler::open(c, true);
@@ -126,7 +126,7 @@ fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
         "an unwound task leaves nothing"
     );
     assert!(scheduler.restore(2, None));
-    assert_eq!(unsafe { (*c).failed }, FAILED_TARGET);
+    assert_eq!(unsafe { (*c).failed }, FAILED_UNWOUND_TO_HANDLER);
     unsafe { (*c).failed = 0 };
     assert!(scheduler.restore(3, Some("noted".to_string())));
     assert_eq!(unsafe { (*c).failed }, 1);
@@ -134,13 +134,13 @@ fn a_body_that_unwinds_raises_or_fails_says_so_and_what_it_left_is_put_back() {
     drop(scheduler);
 }
 
-/// Asks its loop once, then ends.
 unsafe fn asks_once(_ctx: *mut Ctx, scheduler: usize) {
-    unsafe { tasks::to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
+    unsafe { tasks::switch_to_loop(scheduler as *mut Scheduler, asking(1, 0)) };
 }
 
 #[test]
-fn a_scheduler_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
+fn a_scheduler_reuses_stacks_of_finished_tasks_so_the_stack_count_equals_the_most_tasks_that_ran_at_once()
+ {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, false);
     let r: *mut Scheduler = &mut *scheduler;
@@ -178,7 +178,8 @@ fn a_scheduler_keeps_the_stacks_its_tasks_gave_back_as_many_as_ran_at_once() {
 }
 
 #[test]
-fn a_task_the_scheduler_never_ran_lets_go_of_its_body() {
+fn freeing_a_task_that_never_ran_releases_its_closure_and_dropping_the_scheduler_releases_the_rest()
+{
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, true);
     let r: *mut Scheduler = &mut *scheduler;
@@ -191,17 +192,16 @@ fn a_task_the_scheduler_never_ran_lets_go_of_its_body() {
     assert_eq!(RELEASED.with(Cell::get), before + 2);
 }
 
-/// Stands in an `acquire`, asks its loop, and leaves it, keeping whether a cancel landed there.
 unsafe fn acquires(_ctx: *mut Ctx, scheduler: usize) {
     let scheduler = scheduler as *mut Scheduler;
-    let id = unsafe { (*scheduler).shield(Shield::Acquire) }.expect("a task runs");
-    unsafe { tasks::to_loop(scheduler, asking(1, 0)) };
-    let lands = unsafe { (*scheduler).unshield(id, Shield::Acquire) };
+    let id = unsafe { (*scheduler).shield(BracketPhase::Acquire) }.expect("a task runs");
+    unsafe { tasks::switch_to_loop(scheduler, asking(1, 0)) };
+    let lands = unsafe { (*scheduler).leave_phase(id, BracketPhase::Acquire) };
     HEARD.with(|h| h.borrow_mut().push(i64::from(lands)));
 }
 
 #[test]
-fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
+fn a_cancel_requested_while_a_task_is_acquiring_a_resource_stops_the_task_when_the_acquire_ends() {
     let mut ctx = context();
     let mut scheduler = Scheduler::open(&mut ctx, true);
     let r: *mut Scheduler = &mut *scheduler;
@@ -214,7 +214,7 @@ fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
     };
     assert_eq!(scheduler.shields(1), inside);
     assert_eq!(scheduler.shielded(), [(1, inside)]);
-    scheduler.hold_back(1, true);
+    scheduler.set_stopping(1, true);
     assert_eq!(
         unsafe { tasks::resume(r, 1, Message::default()) }.code,
         FINISHED
@@ -225,9 +225,9 @@ fn a_cancel_held_back_for_a_bracket_lands_as_the_task_leaves_it() {
 }
 
 #[test]
-fn a_schedulers_failure_reads_as_the_scheduler_writes_it() {
+fn failure_bytes_from_the_scheduler_decode_into_a_diagnostic_and_an_unknown_code_or_truncated_bytes_fail()
+ {
     let ctx = context();
-    // What `std.internal.schedule`'s `failure_bytes` writes, pinned there.
     let bytes = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
     let d = failure_of(&ctx, bytes).expect("it reads");
     assert_eq!(d.code, codes::DEADLOCK);
@@ -241,7 +241,6 @@ fn a_schedulers_failure_reads_as_the_scheduler_writes_it() {
     assert!(failure_of(&ctx, &bytes[..5]).is_err());
 }
 
-/// The bytes a native left taken, `n` of them, copied out as emitted code copies them.
 fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
     let mut out = vec![0u8; usize::try_from(n).expect("a count")];
     unsafe { rt_taken(ctx, Addr(out.as_mut_ptr()), I64(n)) };
@@ -249,7 +248,7 @@ fn taken(ctx: &mut Ctx, n: i64) -> Vec<u8> {
 }
 
 #[test]
-fn a_watched_ticket_wakes_the_park_and_its_result_is_taken_in_bytes() {
+fn waiting_on_watched_jobs_returns_when_one_finishes_and_reports_that_job_s_id_as_bytes() {
     let mut ctx = context();
     let runtime = ply_host::Host::new().runtime();
     let run = Arc::clone(ply_host::registry::run_of(&*runtime).expect("a host made it"));
@@ -279,7 +278,7 @@ fn a_watched_ticket_wakes_the_park_and_its_result_is_taken_in_bytes() {
     assert_eq!(unsafe { rt_tickets_park(&mut ctx, I64(-1)) }.0, 1);
     let n = unsafe { rt_tickets_answered(&mut ctx) };
     assert_eq!(taken(&mut ctx, n.0), watched.to_le_bytes());
-    let n = ticket_taken(&mut ctx, I64(watched as i64));
+    let n = take_ticket_bytes(&mut ctx, I64(watched as i64));
     assert_eq!(taken(&mut ctx, n.0), b"watched");
     let n = unsafe { rt_tickets_answered(&mut ctx) };
     assert_eq!(taken(&mut ctx, n.0), b"", "a ticket taken is resolved once");
@@ -291,7 +290,7 @@ fn a_watched_ticket_wakes_the_park_and_its_result_is_taken_in_bytes() {
 }
 
 #[test]
-fn a_ticket_another_run_handed_out_is_rejected() {
+fn watching_a_job_id_from_another_run_returns_0_and_sets_a_failure_on_the_context() {
     let mut ctx = context();
     ctx.set_host(
         Arc::new(ply_core::HostBinding::unbound()),
@@ -304,8 +303,6 @@ fn a_ticket_another_run_handed_out_is_rejected() {
     );
     assert!(ctx.take_failure().is_some());
 }
-
-// --- The scheduler's objects ---------------------------------------------------------------
 
 unsafe extern "C" fn untouched(_ctx: *mut Ctx, _w: Word) -> Word {
     0
@@ -330,7 +327,6 @@ const fn scalar(identity: u64, spelled: &'static [u8]) -> PlyType {
 static INTS: PlyType = scalar(7, b"Int");
 static TEXTS: PlyType = scalar(8, b"String");
 
-/// The word a native's result is, each of one word.
 fn word_of<T>(x: T) -> Word {
     assert_eq!(std::mem::size_of::<T>(), std::mem::size_of::<Word>());
     let w = unsafe { std::mem::transmute_copy(&x) };
@@ -350,12 +346,11 @@ fn let_go(ctx: &mut Ctx, w: Word) {
     heap::release_object(ctx, w);
 }
 
-/// What `std.internal.trail`'s `touches_of` reads, pinned there too.
 #[test]
-fn a_steps_effects_are_written_as_the_trail_reads_them_and_taken_once() {
+fn the_effects_a_step_accessed_are_returned_encoded_as_bytes_and_then_cleared() {
     let mut ctx = context();
     ctx.accesses.push((
-        tasks::Touched::Effect {
+        tasks::Access::Effect {
             effect: ply_core::Symbol::new("log"),
             resource: Some(ply_core::Symbol::new("x")),
             write: true,
@@ -363,7 +358,7 @@ fn a_steps_effects_are_written_as_the_trail_reads_them_and_taken_once() {
         [3, 1, 2],
     ));
     ctx.accesses.push((
-        tasks::Touched::ScopedValue {
+        tasks::Access::ScopedValue {
             id: 9,
             write: false,
         },
@@ -381,7 +376,8 @@ fn a_steps_effects_are_written_as_the_trail_reads_them_and_taken_once() {
 }
 
 #[test]
-fn a_kept_value_opens_at_the_type_it_was_kept_at_and_fails_the_run_at_another() {
+fn a_value_saved_with_rt_keep_opens_as_its_saved_type_and_opening_it_as_another_type_sets_a_failure()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let k = word_of(unsafe { tasks::rt_keep(c, handed(42), &INTS) });
@@ -405,9 +401,8 @@ thread_local! {
     static ENTERED: RefCell<Vec<Word>> = const { RefCell::new(Vec::new()) };
 }
 
-/// A closure block no count is kept of, as emitted code lays out one that captures nothing.
 #[repr(C, align(8))]
-struct Immortal {
+struct ImmortalClosure {
     rc: u32,
     desc: &'static PlyFnDesc,
 }
@@ -427,7 +422,6 @@ const fn function(uniform: unsafe extern "C" fn(*mut Ctx, Word, *const Word) -> 
     }
 }
 
-/// Keeps the descriptor and the first word it was entered with, and returns 5 kept.
 unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let c = unsafe { &mut *ctx };
     let first = if c.entering_words == 0 {
@@ -441,7 +435,6 @@ unsafe extern "C" fn results_five(ctx: *mut Ctx, _f: Word, _args: *const Word) -
     word_of(unsafe { tasks::rt_keep(ctx, handed(5), &INTS) })
 }
 
-/// Asks its loop code 3 with 4 and 5, and returns nothing once it hears back.
 unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> Word {
     let s = STACKS.with(Cell::get);
     unsafe { tasks::rt_task_yielded(ctx, handle(s), I64(3), I64(4), I64(5)) };
@@ -450,24 +443,22 @@ unsafe extern "C" fn asks_three(ctx: *mut Ctx, _f: Word, _args: *const Word) -> 
 
 static FIVE: PlyFnDesc = function(results_five);
 static THREE: PlyFnDesc = function(asks_three);
-static RESULTS_FIVE: Immortal = Immortal {
+static RESULTS_FIVE: ImmortalClosure = ImmortalClosure {
     rc: IMMORTAL,
     desc: &FIVE,
 };
-static ASKS_THREE: Immortal = Immortal {
+static YIELDS_CODE_THREE_CLOSURE: ImmortalClosure = ImmortalClosure {
     rc: IMMORTAL,
     desc: &THREE,
 };
 
-fn block(f: &'static Immortal) -> Block {
-    <Block as Returned>::of(f as *const Immortal as Word)
+fn block(f: &'static ImmortalClosure) -> Block {
+    <Block as Returned>::of(f as *const ImmortalClosure as Word)
 }
 
-/// Stacks for a scheduler, a task handle in it, and `f` made a body of task 1 returning into it,
-/// the effects descriptor `descriptor` and its words `words`.
 fn started(
     ctx: &mut Ctx,
-    f: &'static Immortal,
+    f: &'static ImmortalClosure,
     descriptor: &[Word],
     words: &mut [Word],
 ) -> (Word, Word) {
@@ -478,7 +469,6 @@ fn started(
     let b = word_of(unsafe {
         tasks::rt_task_body(c, handle(t), block(f), descriptor.as_ptr(), words.as_ptr())
     });
-    // The body copied the words it was handed.
     words.iter_mut().for_each(|w| *w = 0);
     unsafe { tasks::rt_task_started(c, handle(s), I64(1), handle(b)) };
     let_go(ctx, b);
@@ -487,7 +477,8 @@ fn started(
 }
 
 #[test]
-fn a_task_runs_its_body_with_the_words_its_maker_held_and_returns_into_its_handle() {
+fn a_started_task_runs_its_body_with_its_descriptor_and_captured_values_and_stores_the_result_in_its_handle()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     let descriptor = [1, 0, -1];
@@ -517,11 +508,12 @@ fn a_task_runs_its_body_with_the_words_its_maker_held_and_returns_into_its_handl
 }
 
 #[test]
-fn a_task_asks_where_its_perform_stood_and_unwinds_or_raises_as_its_loop_resumes_it() {
+fn a_task_that_performs_an_operation_reports_its_operation_numbers_and_source_span_and_can_be_resumed_to_unwind_or_fail()
+ {
     let mut ctx = context();
     let c: *mut Ctx = &mut ctx;
     (ctx.performed_root, ctx.performed_start, ctx.performed_end) = (9, 10, 11);
-    let (s, t) = started(&mut ctx, &ASKS_THREE, &[0], &mut []);
+    let (s, t) = started(&mut ctx, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
     let asked = unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     assert_eq!(asked.0, 3);
     let said = |f: unsafe extern "C" fn(*mut Ctx, Handle, I64) -> I64, i| unsafe { f(c, handle(s), I64(i)) }.0;
@@ -541,7 +533,7 @@ fn a_task_asks_where_its_perform_stood_and_unwinds_or_raises_as_its_loop_resumes
     let_go(&mut ctx, t);
     let_go(&mut ctx, s);
 
-    let (s, t) = started(&mut ctx, &ASKS_THREE, &[0], &mut []);
+    let (s, t) = started(&mut ctx, &YIELDS_CODE_THREE_CLOSURE, &[0], &mut []);
     unsafe { tasks::rt_task_resumed(c, handle(s), I64(1), I64(0), I64(0)) };
     let failure = b"\x05E0414\x01m\x01\x04\x02\x06\x01\x01t\x01\x01n";
     let ended = unsafe {
@@ -559,7 +551,7 @@ fn a_task_asks_where_its_perform_stood_and_unwinds_or_raises_as_its_loop_resumes
         unsafe { tasks::rt_task_restored(c, handle(s), I64(1), none, I64(0)) }.0,
         1
     );
-    assert_eq!(ctx.failed, FAILED_PENDING);
+    assert_eq!(ctx.failed, FAILED_PENDING_RAISE);
     let d = ctx.take_failure().expect("the raise is put back");
     assert_eq!(d.message, "m");
     unsafe { tasks::rt_task_freed(c, handle(s), I64(1)) };

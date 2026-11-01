@@ -2,9 +2,10 @@ import compiler.check.types (NamedType, SingletonResource, NamedResource, Resour
 import compiler.emit.keys (Evidence)
 import compiler.emit.evidence (evidence_type, max_evidence_params)
 import compiler.emit.output (GenericCall, Need, EffectsGeneric)
-import compiler.emit.typed_ir (param_ownerships, reps_of, AsImmediate, AsInt, Var, Arg, VarOperand,
-                               ZeroOperand, Rvalue, Call, Apply, Static, Op, OfHandling, Inst, Let,
-                               Do, Handle, Fn, Block, Return, Lambda, Closure)
+import compiler.emit.typed_ir (param_ownerships, reps_of, AsImmediate, AsInt, Variable, Arg,
+                               VariableOperand, ZeroOperand, Rvalue, Call, Apply, Static,
+                               OperationCall, OfHandling, Instruction, Let, Do, Handle, Function,
+                               Block, Return, Lambda, Closure)
 import compiler.emit.typed_ir.handling (WordArray, ObjectAt)
 import compiler.emit.emit_harness (Program, program_of, lowered_root, checked, printed_by_ir)
 
@@ -33,69 +34,74 @@ fn corpus() -> Bytes =
 fn program() -> Program / {abort.raise} =
   match program_of(corpus()) { Ok(p) -> p, Err(reason) -> panic(String::of_bytes_lossy(reason)) }
 
-fn lowered(name: Bytes) -> Fn / {abort.raise} = lowered_root(program(), name)
+fn lowered(name: Bytes) -> Function / {abort.raise} = lowered_root(program(), name)
 
-fn vals(b: Block) -> List<Rvalue> =
-  b.fold([], |acc: List<Rvalue>, i: Inst|
+fn rvalues(b: Block) -> List<Rvalue> =
+  b.fold([], |accumulator: List<Rvalue>, i: Instruction|
     match i {
-      Let(l) -> acc.push(l.value),
-      Do(d) -> acc.push(d.value),
-      Handle(h) -> acc.concat(vals(h.body)),
-      _ -> acc,
+      Let(l) -> accumulator.push(l.value),
+      Do(d) -> accumulator.push(d.value),
+      Handle(h) -> accumulator.concat(rvalues(h.body)),
+      _ -> accumulator,
     })
 
-fn call_arguments(f: Fn) -> List<List<Arg>> =
-  vals(f.body).fold([], |acc: List<List<Arg>>, v: Rvalue|
-    match v { Call(c) -> acc.push(c.args), _ -> acc })
+fn call_arguments(f: Function) -> List<List<Arg>> =
+  rvalues(f.body).fold([], |accumulator: List<List<Arg>>, v: Rvalue|
+    match v { Call(c) -> accumulator.push(c.args), _ -> accumulator })
 
 fn evidence_of(name: Bytes) -> Evidence = { effect: name, resource: SingletonResource }
 
-test "a definition takes a word for each effect and resource in its effects, past its parameters" {
+test "a function takes one evidence parameter for each effect and resource in its effects, after its declared parameters" {
   let f = lowered(b"noted");
-  assert_eq(f.params.map(|v: Var| v.representation), [AsInt, AsImmediate, AsImmediate]);
-  assert_eq(f.params.drop(1).map(|v: Var| v.ty), [evidence_type(), evidence_type()]);
+  assert_eq(f.params.map(|v: Variable| v.representation), [AsInt, AsImmediate, AsImmediate]);
+  assert_eq(f.params.drop(1).map(|v: Variable| v.ty), [evidence_type(), evidence_type()]);
   assert_eq(f.convention.params.len(), 3)
 }
 
-test "a call hands its callee the words the caller holds, and a handle around it its own" {
+test "a call passes its callee the evidence values the caller received, and a `handle` around the call passes its own" {
   let relayed = lowered(b"relayed");
   assert_eq(call_arguments(relayed), [
     [
-      VarOperand(relayed.params.get(0)),
-      VarOperand(relayed.params.get(1)),
-      VarOperand(relayed.params.get(2)),
+      VariableOperand(relayed.params.get(0)),
+      VariableOperand(relayed.params.get(1)),
+      VariableOperand(relayed.params.get(2)),
     ],
   ]);
   let quiet = lowered(b"quiet");
   assert_eq(call_arguments(quiet).map(|args: List<Arg>| args.drop(1)), [
-    [VarOperand(quiet.params.get(1))].concat(evidence_objects(quiet.body).map(VarOperand)),
+    [VariableOperand(quiet.params.get(1))].concat(
+      evidence_objects(quiet.body).map(VariableOperand),
+    ),
   ])
 }
 
-fn evidence_objects(b: Block) -> List<Var> =
-  b.fold([], |acc: List<Var>, i: Inst|
+fn evidence_objects(b: Block) -> List<Variable> =
+  b.fold([], |accumulator: List<Variable>, i: Instruction|
     match i {
       Let(l) -> match l.value {
-        Op(o) -> match o.op { OfHandling(ObjectAt(_)) -> acc.push(l.var), _ -> acc },
-        _ -> acc,
+        OperationCall(o) -> match o.operation {
+          OfHandling(ObjectAt(_)) -> accumulator.push(l.var),
+          _ -> accumulator,
+        },
+        _ -> accumulator,
       },
-      Handle(h) -> acc.concat(evidence_objects(h.body)),
-      _ -> acc,
+      Handle(h) -> accumulator.concat(evidence_objects(h.body)),
+      _ -> accumulator,
     })
 
-test "more words than a function takes apart go as one array" {
+test "a function that needs more evidence values than the maximum number of evidence parameters receives them as one array" {
   let wide = lowered(b"wide");
   assert_eq(wide.params.len(), 1);
   assert(5 > max_evidence_params(), None);
   let widely = lowered(b"widely");
   assert_eq(
-    vals(widely.body).any(|v: Rvalue|
-      match v { Op(o) -> o.op == OfHandling(WordArray), _ -> false }),
+    rvalues(widely.body).any(|v: Rvalue|
+      match v { OperationCall(o) -> o.operation == OfHandling(WordArray), _ -> false }),
     true,
   )
 }
 
-test "a definition generic over effects is resolved by its callers, at the effects they hand words for" {
+test "a definition generic over effects is resolved by its callers, which supply the evidence for the effects they use" {
   assert_eq(lowered(b"apply").links.needs.contains({ var: 0 - 1, reads: EffectsGeneric }), true);
   let logged = lowered(b"logged");
   assert_eq(logged.links.generics.map(|g: GenericCall| g.effect_evidence), [
@@ -111,18 +117,18 @@ test "a definition generic over effects is resolved by its callers, at the effec
   }
 }
 
-test "a call of a function value hands it its effects' descriptor and an array of the words" {
+test "a call of a function value passes it two arguments, the descriptor of its effects and an array of evidence values" {
   let logged = lowered(b"logged");
-  let applies = vals(logged.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false });
+  let applies = rvalues(logged.body).filter(|v: Rvalue| match v { Apply(_) -> true, _ -> false });
   assert_eq(applies, []);
   let apply = lowered(b"apply");
-  let applied = vals(apply.body).fold([], |acc: List<List<Arg>>, v: Rvalue|
-    match v { Apply(c) -> acc.push(c.args), _ -> acc });
+  let applied = rvalues(apply.body).fold([], |accumulator: List<List<Arg>>, v: Rvalue|
+    match v { Apply(c) -> accumulator.push(c.args), _ -> accumulator });
   assert_eq(applied.map(|args: List<Arg>| args.len()), [2]);
-  assert(vals(apply.body).any(|v: Rvalue| match v { Static(_) -> true, _ -> false }), None)
+  assert(rvalues(apply.body).any(|v: Rvalue| match v { Static(_) -> true, _ -> false }), None)
 }
 
-test "each form with words checks and prints" {
+test "each function that takes evidence values lowers to IR and prints C without errors" {
   let p = program();
   [b"noted", b"relayed", b"quiet", b"logged", b"sent", b"wide", b"widely"].map(|n: Bytes|
     match printed_by_ir(p, n) {
@@ -132,13 +138,13 @@ test "each form with words checks and prints" {
   ()
 }
 
-test "a definition handed as a value to a function generic over its effects takes its words from the call" {
+test "a definition passed as a value to a function generic over its effects receives its evidence values from the call" {
   let named = lowered(b"named_noting");
   assert_eq(named.links.generics.map(|g: GenericCall| g.effect_evidence), [
     [[evidence_of(b"m.log")]],
   ]);
   assert_eq(named.lambdas.map(|l: Lambda| match l { Closure(c) -> c.words.count }), [1]);
-  let applied = vals(lowered(b"through").body).filter(|v: Rvalue|
+  let applied = rvalues(lowered(b"through").body).filter(|v: Rvalue|
     match v { Apply(_) -> true, _ -> false });
   assert_eq(applied.len(), 1)
 }

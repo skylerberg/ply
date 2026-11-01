@@ -1,14 +1,10 @@
-//! Which sink a run writes its records to, and at what level.
-
 use ply_host::trace::{Discard, Json, Level, Sink, Text, Trace};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct TraceOptions {
-    /// Where a `trace` record goes: `json` lines or `text` lines on stderr, or `off`.
     pub sink: SinkArg,
 
-    /// The lowest level the sink writes; spans and metrics are `info`.
     pub level: LevelArg,
 }
 
@@ -50,7 +46,6 @@ impl LevelArg {
 }
 
 impl TraceOptions {
-    /// The sink and level a run's `trace SINK LEVEL` entry names, `json` at `info` without one.
     pub fn of_grants(grants: &ply_core::host::Grants) -> TraceOptions {
         let Some([sink, level]) = grants.named("trace").next() else {
             return TraceOptions::default();
@@ -74,7 +69,6 @@ impl TraceOptions {
         self.level.name()
     }
 
-    /// The driver a run binds: the sink, the host clock, and the span table.
     pub fn open(&self) -> Arc<Trace> {
         let sink: Arc<dyn Sink> = match self.sink {
             SinkArg::Json => Arc::new(Json::new(self.level.level())),

@@ -10,7 +10,6 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-/// Counts reads, so a test can assert that a discarded event reads the clock zero times.
 #[derive(Default)]
 struct Counting {
     reads: AtomicU64,
@@ -20,7 +19,6 @@ struct Counting {
 impl Clock for Counting {
     fn micros(&self) -> i64 {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        // Ascending by one per read, so a duration counts reads and golden stamps do not move.
         self.at.fetch_add(1, Ordering::Relaxed) + 1
     }
 }
@@ -172,7 +170,6 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
         "{rejected:?}"
     );
 
-    // Nothing was recorded for the rejection, and the span is still task 1's to close.
     assert_eq!(f.kinds(), [RecordKind::Enter]);
     f.exit_as(Some(TaskId(1)), "http", first, Outcome::Ok)
         .expect("task 1 closes its own span");
@@ -180,7 +177,7 @@ fn a_span_opened_in_one_task_does_not_close_in_another() {
 }
 
 #[test]
-fn a_span_closed_on_another_channel_is_rejected() {
+fn closing_a_span_with_a_different_trace_channel_than_it_was_opened_with_is_rejected() {
     let f = fixture();
     let id = enter(&f, "http", "request");
     let reason = f
@@ -190,7 +187,6 @@ fn a_span_closed_on_another_channel_is_rejected() {
     exit(&f, "http", id);
 }
 
-/// Checked against the tree the records imply, not the driver's own bookkeeping.
 #[test]
 fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
     let f = fixture();
@@ -210,7 +206,6 @@ fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
     close(two, b);
     close(one, a);
 
-    // The reference: each name's `enter`, and what its parent's name is.
     let records = f.records();
     let parent_of = |name: &str| -> String {
         let record = records
@@ -231,9 +226,8 @@ fn two_tasks_interleaving_produce_correctly_nested_parent_links() {
     assert_eq!(f.trace.counts().abandoned, 0);
 }
 
-/// Nothing runs the inner `exit`, so the outer closes both and only it carries the outcome.
 #[test]
-fn closing_an_outer_span_abandons_the_spans_above_it() {
+fn closing_an_outer_span_writes_each_open_inner_span_as_ended_without_a_close() {
     let f = fixture();
     let outer = enter(&f, "orders", "place_order");
     let _inner = enter(&f, "orders", "reserve");
@@ -300,9 +294,8 @@ fn teardown_closes_what_the_program_left_open_and_reports_w0609() {
     );
 }
 
-/// A task that finished with a span open can never close it, so its retirement does.
 #[test]
-fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
+fn when_a_task_ends_the_spans_it_left_open_are_written_with_an_abandoned_status() {
     let f = fixture();
     let task = TaskId(3);
     f.enter_as(Some(task), "http", "request");
@@ -336,9 +329,8 @@ fn a_retired_task_writes_the_spans_it_left_open_as_abandoned() {
     );
 }
 
-/// Leaving a span open is the same mistake in a task as in the entry point, whenever it closes.
 #[test]
-fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_ends() {
+fn a_span_left_open_by_a_task_that_has_ended_produces_warning_w0609_when_the_entry_point_ends() {
     let f = fixture();
     f.enter_as(Some(TaskId(3)), "db", "query");
     f.trace.end_task(f.machine, TaskId(3));
@@ -367,10 +359,8 @@ fn a_retired_tasks_open_span_is_still_reported_as_w0609_when_the_entry_point_end
     );
 }
 
-/// What a run reports left open is the sum of what its `W0609`s counted: a span an outer `exit`
-/// closed through is `Abandoned` without having been left open, and a retired task's span was.
 #[test]
-fn the_spans_left_open_are_what_the_warnings_counted() {
+fn warning_w0609_counts_spans_left_open_by_ended_tasks_and_by_the_entry_point() {
     let f = fixture();
     let outer = enter(&f, "orders", "place_order");
     enter(&f, "orders", "reserve");
@@ -408,9 +398,9 @@ fn the_spans_left_open_are_what_the_warnings_counted() {
     assert_eq!(f.trace.left_open(), 3, "each entry point's count adds up");
 }
 
-/// After a discarded continuation, the span's record is all that says what the request was doing.
 #[test]
-fn teardown_writes_before_it_flushes() {
+fn ending_the_entry_point_writes_the_closing_records_without_flushing_the_output_and_a_later_explicit_flush_does()
+ {
     let f = fixture();
     enter(&f, "orders", "place_order");
     assert_eq!(f.sink.flushes(), 0);
@@ -422,7 +412,8 @@ fn teardown_writes_before_it_flushes() {
 }
 
 #[test]
-fn a_metric_is_a_record_on_the_channel_the_call_site_named() {
+fn the_count_gauge_and_time_metric_calls_each_write_a_trace_record_to_the_channel_the_caller_passes_in()
+ {
     let f = fixture();
     let owner = f.owner(None);
     let gauge: ply_core::Decimal = "41.75".parse().expect("a decimal");
@@ -482,9 +473,9 @@ fn a_discarded_record_reads_no_clock_and_writes_nothing() {
     );
 }
 
-/// `E0445` is about the program, so a verdict that moved with `--trace off` would be undebuggable.
 #[test]
-fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
+fn spans_are_still_tracked_when_trace_records_are_dropped_so_span_errors_and_warnings_are_the_same_whatever_output_is_used()
+ {
     let (trace, _) = discarding();
     let machine = MachineId::next();
     let id = trace.enter((machine, Some(TaskId(1))), "http", "request", &[]);
@@ -506,7 +497,6 @@ fn spans_are_tracked_under_discard_so_a_verdict_does_not_depend_on_the_sink() {
     );
 }
 
-/// Only the record is saved: the sink is asked before anything is stamped.
 #[test]
 fn a_level_filter_drops_the_record_and_reads_no_clock() {
     let f = fixture_at(Level::Warn);
@@ -520,7 +510,6 @@ fn a_level_filter_drops_the_record_and_reads_no_clock() {
     assert_eq!(f.clock.reads(), 1);
     assert_eq!(f.kinds(), [RecordKind::Event]);
 
-    // A span is `Info`, so `warn` drops it, yet the stack keeps it for `E0445` and `W0609`.
     let span = enter(&f, "orders", "place_order");
     assert_eq!(f.trace.open_spans(), 1);
     exit(&f, "orders", span);
@@ -532,7 +521,6 @@ fn a_level_filter_drops_the_record_and_reads_no_clock() {
     assert_eq!(f.clock.reads(), 1, "and nothing at `info` was stamped");
 }
 
-/// Computed by the sink, so a call site never reads a clock and `clock.read` enters no tracing row.
 #[test]
 fn a_closing_span_carries_the_duration_the_sink_measured() {
     let f = fixture();
@@ -550,7 +538,8 @@ fn a_closing_span_carries_the_duration_the_sink_measured() {
 }
 
 #[test]
-fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
+fn a_program_field_named_level_span_or_ts_does_not_overwrite_the_trace_line_own_field_with_that_name()
+ {
     let f = fixture();
     f.event_with(
         "orders",
@@ -570,7 +559,8 @@ fn a_program_field_named_like_an_envelope_key_does_not_shadow_it() {
 }
 
 #[test]
-fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
+fn every_kind_of_trace_field_value_renders_as_json_and_an_event_with_no_fields_still_writes_an_empty_fields_object()
+ {
     let f = fixture();
     let render = |value: Field| -> String {
         f.event_with("orders", Level::Info, "x", &field("f", value));
@@ -584,7 +574,6 @@ fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
         render(Field::Text("a\"b\nc".to_string())),
         r#""fields":{"f":"a\"b\nc"}}"#
     );
-    // A `Decimal` is a string: a JSON number consumer would round its scale away.
     assert_eq!(
         render(Field::Decimal("41.750".parse().expect("a decimal"))),
         r#""fields":{"f":"41.750"}}"#
@@ -593,10 +582,8 @@ fn every_field_shape_renders_and_an_empty_field_set_still_writes_the_object() {
         render(Field::Bytes(vec![0, 255, 16])),
         r#""fields":{"f":"00ff10"}}"#
     );
-    // JSON has no NaN, so a writer that emitted one would produce a document no parser accepts.
     assert_eq!(render(Field::Float(f64::NAN)), r#""fields":{"f":"NaN"}}"#);
     assert_eq!(render(Field::Float(1.5)), r#""fields":{"f":1.5}}"#);
-    // JSON arrives as the text `std.json` wrote, and is written as it is.
     assert_eq!(
         render(Field::Json(r#"{"n":2,"sku":"BOLT-1"}"#.to_string())),
         r#""fields":{"f":{"n":2,"sku":"BOLT-1"}}}"#
@@ -624,7 +611,6 @@ fn an_exit_carries_its_outcome_and_a_failure_carries_its_reason() {
         line.contains(r#""outcome":"failed","reason":"23514""#),
         "{line}"
     );
-    // An `enter` carries no outcome: it has not happened yet.
     assert!(!f.sink.lines()[0].contains("outcome"));
 }
 

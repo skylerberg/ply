@@ -1,6 +1,3 @@
-//! Values emitted code hands the runtime with their type: counted, let go and handed back through
-//! the type's descriptor alone, which here counts a block at its offset 0 as emitted code does.
-
 use crate::bare::{context, helper};
 use ply_compiled::emitted::{Carried, Handed, PlyType};
 use ply_compiled::heap::{HEADER, Obj, Word};
@@ -10,7 +7,6 @@ use ply_compiled::rt::Ctx;
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 
-/// A value of `m.Box`: a block of one word.
 const BYTES: Word = (HEADER + 8) as Word;
 
 unsafe extern "C" fn dup(_ctx: *mut Ctx, w: Word) -> Word {
@@ -57,7 +53,8 @@ fn boxed(ctx: &mut Ctx) -> Word {
 }
 
 #[test]
-fn a_carried_value_is_counted_and_let_go_through_its_type() {
+fn a_carried_value_adds_a_reference_when_duplicated_and_frees_its_block_when_the_last_reference_is_released()
+ {
     let mut ctx = context();
     let w = boxed(&mut ctx);
     let held = unsafe { Carried::new(Handed::of(w), &BOX) };
@@ -75,9 +72,9 @@ fn a_carried_value_is_counted_and_let_go_through_its_type() {
     assert_eq!(ctx.heap.live(), 0);
 }
 
-/// Compiled code reads a handed word as the word it is.
 #[test]
-fn a_carried_value_handed_back_is_the_word_and_the_count_it_came_with() {
+fn a_carried_value_converted_back_into_a_raw_word_gives_the_same_word_and_the_same_reference_count_it_was_created_with()
+ {
     let mut ctx = context();
     let w = boxed(&mut ctx);
     let held = unsafe { Carried::new(Handed::of(w), &BOX) };

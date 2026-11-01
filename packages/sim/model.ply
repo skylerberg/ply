@@ -1,8 +1,3 @@
-//! `model` — enough of a scheduler to exercise the search, and none of the runtime: tasks that load
-//! and store a handler's variables, perform effects, spawn, join and yield, scheduled as the
-//! runtime's scheduler does, from the same stream. Its counts are the Rust search's on the same
-//! programs.
-
 import plan (Seed, Plan, PartialOrderReduction, Once, Random, default_plan, once, root_seed, u64_le)
 import recording (Step, Interleaving, Passed, Failed, Access, EffectAccess, VariableAccess)
 import search (Exploration, SearchResult, Exact, EveryPair, Cost, explore, explore_under,
@@ -13,10 +8,8 @@ import std.map
 type Operation =
   | Load(Int)
   | Store(Int)
-  /// `db.read[resource]` or `db.write[resource]`.
   | Perform(String, Bool)
   | Spawn(String, List<Operation>)
-  /// This task's `n`th child by spawn order, so a program means the same under every interleaving.
   | Join(Int)
   | Yield
 
@@ -39,8 +32,6 @@ fn expecting(model: Model, expected: List<{ variable: Int, value: Int }>) -> Mod
 
 fn max_steps() -> Int = 4096
 
-/// Done with its operations and blocked on nothing unfinished. A chain longer than the tasks has
-/// come round on itself, and tasks waiting on each other never finish.
 fn finished(tasks: List<ModelTask>, t: Int) -> Bool / {abort.raise} =
   match range(0, tasks.len() + 1).fold(
       { task: t, result: None },
@@ -70,7 +61,7 @@ fn enabled_tasks(tasks: List<ModelTask>) -> List<Int> / {abort.raise} =
   })
 
 fn widen_clock(clock: List<Int>, width: Int) -> List<Int> =
-  range(clock.len(), width).fold(clock, |acc: List<Int>, _i: Int| acc.push(0))
+  range(clock.len(), width).fold(clock, |accumulator: List<Int>, _i: Int| accumulator.push(0))
 
 fn tick_clock(tasks: List<ModelTask>, t: Int) -> List<ModelTask> / {abort.raise} = {
   let width = tasks.len();
@@ -88,7 +79,6 @@ fn merge_clock(tasks: List<ModelTask>, into: Int, from: Int) -> List<ModelTask> 
   tasks.set(into, { ..target, clock: merged })
 }
 
-/// The scheduler's stream: the simulation's domain, the root, tag 0 and the counter.
 fn random_u64(root: U64, counter: Int) -> U64 / {abort.raise} = {
   let b = Bytes::concat_all([
     Bytes::of_string("ply.sim.stream.1"),
@@ -102,7 +92,6 @@ fn random_u64(root: U64, counter: Int) -> U64 / {abort.raise} = {
   high * 4294967296u64 + low
 }
 
-/// Uniform over `0..n`, drawing again past the last whole multiple of `n`.
 fn random_below(root: U64, counter: Int, n: Int) -> { value: Int, counter: Int } / {abort.raise} = {
   let limit = 18446744073709551615u64 / U64::of_int(n) * U64::of_int(n);
   iterate(counter, 64, |c: Int| {
@@ -114,7 +103,7 @@ fn random_below(root: U64, counter: Int, n: Int) -> { value: Int, counter: Int }
 
 type RunState = {
   tasks: List<ModelTask>,
-  vars: Map<Int, Int>,
+  variables: Map<Int, Int>,
   counter: Int,
   steps: List<Step>,
   capped: Bool,
@@ -130,7 +119,7 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
     blocked: None,
     clock: [0],
   };
-  let start = { tasks: [main], vars: Map::new(), counter: 0, steps: [], capped: false };
+  let start = { tasks: [main], variables: Map::new(), counter: 0, steps: [], capped: false };
   let end = iterate(start, max_steps() + 2, |st: RunState| {
     let enabled = enabled_tasks(st.tasks);
     if enabled.len() == 0 { Stop(st) }
@@ -143,7 +132,7 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
     { steps: end.steps, verdict: Failed("no task can make progress"), virtual_time: 0 }
   } else {
     let wrong = model.expect.filter(|e: { variable: Int, value: Int }|
-      end.vars.get_or(e.variable, 0) != e.value);
+      end.variables.get_or(e.variable, 0) != e.value);
     match wrong {
       [first, ..] ->
         {
@@ -151,7 +140,7 @@ fn run(model: Model, seed: Seed) -> Interleaving<String> / {abort.raise} = {
           verdict: Failed(
             "expected " ++ first.value.to_string() ++ " in variable #" ++ first.variable.to_string()
               ++ ", found "
-              ++ end.vars.get_or(first.variable, 0).to_string(),
+              ++ end.variables.get_or(first.variable, 0).to_string(),
           ),
           virtual_time: 0,
         },
@@ -169,35 +158,35 @@ fn take_step(st: RunState, seed: Seed, enabled: List<Int>) -> RunState / {abort.
   let chosen = min(drawn.value, enabled.len() - 1);
   let t = enabled.get(chosen);
   let task = st.tasks.get(t);
-  let op = task.operations.get(task.program_counter);
+  let operation = task.operations.get(task.program_counter);
   let moved = tick_clock(st.tasks.set(t, { ..task, program_counter: task.program_counter + 1 }), t);
-  let did = match op {
+  let did = match operation {
     Load(v) ->
       {
-        tasks: moved.set(t, { ..moved.get(t), register: st.vars.get_or(v, 0) }),
-        vars: st.vars,
+        tasks: moved.set(t, { ..moved.get(t), register: st.variables.get_or(v, 0) }),
+        variables: st.variables,
         accesses: [VariableAccess({ handler: 0, index: v, write: false })],
       },
     Store(v) ->
       {
         tasks: moved,
-        vars: st.vars.insert(v, moved.get(t).register + 1),
+        variables: st.variables.insert(v, moved.get(t).register + 1),
         accesses: [VariableAccess({ handler: 0, index: v, write: true })],
       },
     Perform(resource, write) ->
       {
         tasks: moved,
-        vars: st.vars,
+        variables: st.variables,
         accesses: [
-          EffectAccess({ effect: "db", resource: Some(resource), write: write, op: None }),
+          EffectAccess({ effect: "db", resource: Some(resource), write: write, operation: None }),
         ],
       },
-    Spawn(name, ops) -> {
+    Spawn(name, operations) -> {
       let child = moved.len();
       let parent = moved.get(t);
       let born = {
         name: name,
-        operations: ops,
+        operations: operations,
         program_counter: 0,
         register: 0,
         children: [],
@@ -206,25 +195,24 @@ fn take_step(st: RunState, seed: Seed, enabled: List<Int>) -> RunState / {abort.
       };
       {
         tasks: moved.set(t, { ..parent, children: parent.children.push(child) }).push(born),
-        vars: st.vars,
+        variables: st.variables,
         accesses: [],
       }
     },
     Join(nth) -> {
       let child = moved.get(t).children.get(nth);
       if finished(moved, child) {
-        { tasks: merge_clock(moved, t, child), vars: st.vars, accesses: [] }
+        { tasks: merge_clock(moved, t, child), variables: st.variables, accesses: [] }
       } else {
         {
           tasks: moved.set(t, { ..moved.get(t), blocked: Some(child) }),
-          vars: st.vars,
+          variables: st.variables,
           accesses: [],
         }
       }
     },
-    Yield -> { tasks: moved, vars: st.vars, accesses: [] },
+    Yield -> { tasks: moved, variables: st.variables, accesses: [] },
   };
-  // A task blocked on a join observes everything its target did once the target finishes.
   let woken = range(0, did.tasks.len()).fold(did.tasks, |ts: List<ModelTask>, i: Int|
     match ts.get(i).blocked {
       Some(on) -> if finished(ts, on) { merge_clock(ts, i, on) } else { ts },
@@ -232,7 +220,7 @@ fn take_step(st: RunState, seed: Seed, enabled: List<Int>) -> RunState / {abort.
     });
   {
     tasks: woken,
-    vars: did.vars,
+    variables: did.variables,
     counter: drawn.counter,
     steps: st.steps.push({
       scheduler: 0,
@@ -256,7 +244,6 @@ fn read(r: String) -> Operation = Perform(r, false)
 
 fn write(r: String) -> Operation = Perform(r, true)
 
-/// Whether the two tasks ran in both orders across the interleavings the search ran.
 fn both_orders(model: Model, seeds: List<Seed>, a: Int, b: Int) -> Bool / {abort.raise} = {
   let orders = seeds.map(|seed: Seed| {
     let tasks = run(model, seed).steps.map(|st: Step| st.task);
@@ -285,14 +272,14 @@ test "tasks that never conflict explore exactly one interleaving" {
   )
 }
 
-test "the naive count for the same program is larger" {
+test "searching all interleavings of the same program runs more interleavings than the reduced search" {
   let m = expecting(independent_tasks(), [{ variable: 1, value: 1 }, { variable: 2, value: 1 }]);
   let e = measure_reduction(dpor(4096), |seed: Seed| run(m, seed));
   assert_eq(e.exploration.explored, 1);
   assert_eq(e.exploration.naive, Some({ explored: 71, stopped_early: false }))
 }
 
-test "a shared variable costs interleavings and still reduces" {
+test "a shared variable needs more interleavings, but the reduced search still runs fewer than the full search" {
   assert_eq(explore_model(lost_update(), dpor(4096)).exploration.explored, 9);
   assert_eq(
     explore_under(dpor(4096), EveryPair, |seed: Seed|
@@ -301,16 +288,15 @@ test "a shared variable costs interleavings and still reduces" {
   )
 }
 
-test "the naive count is exact on a fixture that can be counted by hand" {
+test "the full search's interleaving count matches the count worked out by hand for a small program" {
   let m = program([Spawn("a", [read("x")]), Spawn("b", [read("y")])]);
   let e = measure_reduction(dpor(64), |seed: Seed| run(m, seed));
   assert_eq(e.exploration.explored, 1);
   assert_eq(e.exploration.naive, Some({ explored: 3, stopped_early: false }));
-  // No two steps conflict, so there is no race for a missing clock to invent.
   assert_eq(e.exploration.no_clocks, Some({ explored: 1, stopped_early: false }))
 }
 
-test "a spent naive budget is reported as a bound" {
+test "a full search that runs out of budget reports its count as stopped early" {
   let m = program([
     Spawn("a", [read("x"), read("x"), read("x"), read("x")]),
     Spawn("b", [read("y"), read("y"), read("y"), read("y")]),
@@ -347,7 +333,6 @@ test "a conflicting pair is explored in both orders, and a lost update is found 
       assert(race.left.task != race.right.task);
       assert(race.left.access.starts_with("var.") && race.right.access.starts_with("var."));
       assert(race.left.definition != None && race.right.definition != None);
-      // The seed the artifact prints reproduces the failure, and a sampled run infers no race.
       let again = explore_model(race_model, once(seed));
       assert_eq((passed(again), again.exploration.explored, again.exploration.race), (
         false,
@@ -385,7 +370,7 @@ test "effects conflict on one resource only, and readers commute" {
   assert(both_orders(writer, w.seeds, 1, 2))
 }
 
-test "a nested spawn racing a sibling is found, and one that conflicts with nothing is one interleaving" {
+test "a race involving a nested spawned task is found, and a nested task that touches nothing shared runs as one interleaving" {
   let nested = expecting(
     program([
       Spawn("outer", [Spawn("inner", [Load(1), Store(1)]), Join(0)]),
@@ -430,7 +415,7 @@ test "a race with a task that was blocked at the backtrack point is still found"
   })
 }
 
-test "the backtrack rule queues alternatives when the racer is not enabled" {
+test "`backtracks` adds no alternative at an earlier step for a conflicting later task that could not run at that step, and adds one when it could" {
   let var = |w: Bool| [VariableAccess({ handler: 0, index: 1, write: w })];
   let step = |task: Int, enabled: List<Int>, choice: Int, accesses: List<Access>|
     {
@@ -457,7 +442,7 @@ test "the backtrack rule queues alternatives when the racer is not enabled" {
   assert_eq(match direct.get(0) { Some(m) -> m.get(1), None -> None }, Some(Some(1)))
 }
 
-test "a read the join already ordered costs no interleavings, and the clock-blind search pays for it" {
+test "a read that a join already orders after the writes adds no interleavings, but a search that ignores vector clocks explores six runs instead of one" {
   let m = expecting(
     program([
       Spawn("a", [Load(1), Store(1)]),
@@ -476,7 +461,7 @@ test "a read the join already ordered costs no interleavings, and the clock-blin
   assert_eq(measured.exploration.no_clocks, Some({ explored: 6, stopped_early: false }))
 }
 
-test "a spent budget is exhausted and not exhaustive, and no interleaving runs twice" {
+test "a search that uses up its budget stops before covering every interleaving, and no interleaving is run twice" {
   let e = explore_model(lost_update(), dpor(3));
   assert_eq((e.exploration.explored, e.exploration.exhausted, e.exploration.exhaustive), (
     3,
@@ -484,16 +469,16 @@ test "a spent budget is exhausted and not exhaustive, and no interleaving runs t
     false,
   ));
   let all = explore_model(lost_update(), dpor(4096));
-  let distinct = all.seeds.fold([], |acc: List<List<Int>>, seed: Seed| {
+  let distinct = all.seeds.fold([], |accumulator: List<List<Int>>, seed: Seed| {
     let trace = run(lost_update(), seed).steps.map(|st: Step| st.task);
-    if acc.fold(false, |b: Bool, t: List<Int>| b || t == trace) { acc } else { acc.push(trace) }
+    if accumulator.fold(false, |b: Bool, t: List<Int>| b || t == trace) { accumulator }
+    else { accumulator.push(trace) }
   });
   assert_eq(distinct.len(), all.seeds.len());
-  // The same search twice runs the same seeds.
   assert_eq(explore_model(lost_update(), dpor(4096)).seeds, all.seeds)
 }
 
-test "once runs the interleaving its seed names, and random one per root" {
+test "`once` runs only the interleaving that its seed describes, and `Random` mode runs one interleaving for each starting number in `roots`" {
   let e = explore_model(lost_update(), once({ root: 3u64, path: [0, 1] }));
   assert_eq((e.exploration.explored, e.seeds), (1, [{ root: 3u64, path: [0, 1] }]));
   let r = explore_model(lost_update(), {
@@ -506,7 +491,7 @@ test "once runs the interleaving its seed names, and random one per root" {
   assert_eq(r.exploration.explored, 3)
 }
 
-test "a step its enabled set does not offer is Ply's defect, and a replay that strays is a divergence" {
+test "a recorded step for a task that was not runnable is an internal error, and a replay that differs from its recording is a divergence" {
   let bad = |seed: Seed|
     {
       steps: [
@@ -525,12 +510,11 @@ test "a step its enabled set does not offer is Ply's defect, and a replay that s
     };
   match explore(dpor(4), bad).failure {
     Some(f) -> match f.cause {
-      InvalidRecording(u) -> assert(u.what.contains("does not offer")),
+      InvalidRecording(u) -> assert(u.what.contains("do not include that task at this choice")),
       _ -> panic("not unscheduled"),
     },
     None -> panic("a malformed recording was accepted"),
   };
-  // Every replay offers a different enabled set than the run it branched from recorded.
   let drifting = |seed: Seed| {
     let base = run(lost_update(), seed);
     if seed.path.len() == 0 { base }

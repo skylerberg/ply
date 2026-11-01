@@ -18,10 +18,10 @@ import compiler.check.infer (CheckOutput, BodyFacts, decode_facts, facts_by_owne
                              no_body_facts, body_facts_bin, is_pure_definition, types_named,
                              recorded_data, whole_body_data)
 import compiler.check.infer.checker (Location, DefinitionInfo, SpecInfo, TestInfo, LawInfo,
-                                     LawBinder, EffectInfo, OpInfo, ConstructorInfo, CheckCache,
-                                     empty_cache, CachedDefinition, CachedTest, CachedFacts,
-                                     WitnessOrder, listing_type, witness_order_bin, witness_params,
-                                     InstanceInfo, NumericInfo)
+                                     LawBinder, EffectInfo, OperationInfo, ConstructorInfo,
+                                     CheckCache, empty_cache, CachedDefinition, CachedTest,
+                                     CachedFacts, WitnessOrder, listing_type, witness_order_bin,
+                                     witness_params, InstanceInfo, NumericInfo)
 import compiler.check.typed (TypedBody, TypedExpression, TypedHandle, TypedClause, ConstantData,
                              constant_data_bin, typed_expression_nodes)
 import compiler.emit.keys (RootKey, Named, TestCases, Clause, Requires, Ensures, LawPart, LawGuard,
@@ -41,9 +41,10 @@ import compiler.front.rows (span_at, location_span, WrittenFunction, written_fun
                             EmitterConstructor, FunctionWidths, ListWidths, MapWidths, NoWidths,
                             RecordWidths, SumWidths, VariableWidths, FixedWidth, Widths,
                             FieldWidths, EffectHash, KnownDefinitionRow, constant_values,
-                            KnownTestRow, Rows, ModuleSpan, DefinitionRow, TestRow, LawRow, OpRow,
-                            EffectRow, ConstructorRow, HashRow, DefinitionHashRow, LawHashRow,
-                            TestHashRow, HashTableRow, OrdinalRow, Dump, normalized_diagnostic)
+                            KnownTestRow, Rows, ModuleSpan, DefinitionRow, TestRow, LawRow,
+                            OperationRow, EffectRow, ConstructorRow, HashRow, DefinitionHashRow,
+                            LawHashRow, TestHashRow, HashTableRow, OrdinalRow, Dump,
+                            normalized_diagnostic)
 import compiler.front.facts (outlines_of, effect_visibility, effect_hosts, effect_public_of,
                              type_rows, test_label_spans, law_literals, Frame, CheckedProgram,
                              Analysis, TaggedSite, tagged_of, root_tagged, TypedConst,
@@ -118,15 +119,19 @@ fn law_row(law_info: LawInfo, lits: List<Bytes>) -> LawRow / {abort.raise} =
     literals: lits,
   }
 
-fn op_row(module: Int, op_info: OpInfo, width_sums: WidthSums) -> OpRow / {abort.raise} =
+fn operation_row(
+  module: Int,
+  op_info: OperationInfo,
+  width_sums: WidthSums,
+) -> OperationRow / {abort.raise} =
   {
     name: op_info.name,
     mode: mode_text(op_info.mode),
     resource_param: op_info.resource_param,
-    kept: op_info.kept,
+    retained_parameters: op_info.keep_indices,
     params: op_info.params.map(canonical_type),
-    ret: canonical_type(op_info.ret),
-    scheme: match op_info.scheme { Some(sc) -> Some(canonical_scheme(sc)), None -> None },
+    return_type: canonical_type(op_info.return_type),
+    scheme: match op_info.scheme { Some(scheme) -> Some(canonical_scheme(scheme)), None -> None },
     at: span_at(module, op_info.at.span),
     carries: widths_of_all(width_sums, [], op_info.params).map(grounded),
   }
@@ -145,8 +150,8 @@ fn effect_row(
     simple_name: effect_info.simple_name,
     public: public,
     nondet: effect_info.nondet,
-    operations: effect_info.operations.map(|op_info: OpInfo|
-      op_row(effect_info.at.module, op_info, width_sums)),
+    operations: effect_info.operations.map(|op_info: OperationInfo|
+      operation_row(effect_info.at.module, op_info, width_sums)),
     at: location_span(effect_info.at),
     host: host,
     waits: match host {
@@ -166,15 +171,15 @@ fn waiting_operations(
     Some(f) ->
       f.bodies.flat_map(|b: TypedBody<Bytes>| typed_expression_nodes(b.body)).fold(
         [],
-        |acc: List<Bytes>, e: TypedExpression<Bytes>|
+        |accumulator: List<Bytes>, e: TypedExpression<Bytes>|
           match e.node {
             TypedHandle(h) ->
-              h.clauses.fold(acc, |ops: List<Bytes>, c: TypedClause<Bytes>|
+              h.clauses.fold(accumulator, |operations: List<Bytes>, c: TypedClause<Bytes>|
                 if c.effect == served
                     && c.effects.listed.any(|a: Effect| a.effect == b"std.internal.native.wait") {
-                  ops.push(c.op)
-                } else { ops }),
-            _ -> acc,
+                  operations.push(c.operation)
+                } else { operations }),
+            _ -> accumulator,
           },
       ),
   }
@@ -193,12 +198,18 @@ fn constructor_row(constructor_info: ConstructorInfo) -> ConstructorRow / {abort
   }
 
 fn by_name_many(xs: List<{ name: Bytes, hashes: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
-  xs.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
-    acc.insert(x.name, x.hashes))
+  xs.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
+      accumulator.insert(x.name, x.hashes),
+  )
 
 pub fn by_name_names(xs: List<{ name: Bytes, names: List<Bytes> }>) -> Map<Bytes, List<Bytes>> =
-  xs.fold(Map::new(), |acc: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
-    acc.insert(x.name, x.names))
+  xs.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, names: List<Bytes> }|
+      accumulator.insert(x.name, x.names),
+  )
 
 type HashTables = {
   definitions: Map<Bytes, Bytes>,
@@ -241,21 +252,21 @@ fn definition_hash_row(tables: HashTables, name: Bytes) -> HashRow / {abort.rais
 
 fn hash_rows(outlines: List<Outline>, hashes: HashOutput) -> List<HashTableRow> / {abort.raise} = {
   let t = hash_tables(hashes);
-  let definition = |acc: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, name: Bytes|
-    match acc.seen.get(name) {
-      Some(_) -> acc,
+  let definition = |accumulator: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, name: Bytes|
+    match accumulator.seen.get(name) {
+      Some(_) -> accumulator,
       None ->
         {
-          ..acc,
-          seen: acc.seen.insert(name, true),
-          frames: acc.frames.push(DefinitionHashRow(definition_hash_row(t, name))),
+          ..accumulator,
+          seen: accumulator.seen.insert(name, true),
+          frames: accumulator.frames.push(DefinitionHashRow(definition_hash_row(t, name))),
         },
     };
   outlines.fold(
     { seen: Map::new(), frames: [] },
-    |acc: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, o: Outline|
+    |accumulator: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, o: Outline|
       o.items.fold(
-        acc,
+        accumulator,
         |a: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, item: OutlineItem|
           match item {
             OutlinedFunction(f) -> definition(a, qualify(o.name, f.name)),
@@ -298,15 +309,15 @@ fn emitted_signature_text(
   definition_info: DefinitionInfo,
   values: Map<Bytes, ConstantData>,
 ) -> Bytes / {abort.raise} = {
-  let (params, ret, effects) = match definition_info.scheme.ty {
-    FunctionType(f) -> (f.params, f.ret, f.effects.listed),
+  let (params, return_type, effects) = match definition_info.scheme.ty {
+    FunctionType(f) -> (f.params, f.return_type, f.effects.listed),
     other -> ([], other, []),
   };
   let printed = params.fold(
     { p: printer_new(), texts: [] },
-    |acc: { p: Printer, texts: List<Bytes> }, ty: Type| {
-      let out = print_type(acc.p, ty);
-      { p: out.printer, texts: acc.texts.push(out.text) }
+    |accumulator: { p: Printer, texts: List<Bytes> }, ty: Type| {
+      let out = print_type(accumulator.p, ty);
+      { p: out.printer, texts: accumulator.texts.push(out.text) }
     },
   );
   let pure = if is_pure_definition(definition_info) { b"true" } else { b"false" };
@@ -314,7 +325,7 @@ fn emitted_signature_text(
     b"(",
     Bytes::join(printed.texts, b", "),
     b") -> ",
-    print_type(printed.p, ret).text,
+    print_type(printed.p, return_type).text,
     b" / ",
     effect_list_text(canonical_effects(effects), b", "),
     b" ",
@@ -424,10 +435,10 @@ pub fn root_keys(
       Some(
         w.owners.keys().concat(w.tests.keys()).fold(
           Map::new(),
-          |acc: Map<Bytes, Bool>, name: Bytes|
+          |accumulator: Map<Bytes, Bool>, name: Bytes|
             List::fold(
               match dependencies.get(name) { Some(ns) -> ns, None -> [] },
-              acc.insert(name, true),
+              accumulator.insert(name, true),
               |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true),
             ),
         ),
@@ -438,10 +449,10 @@ pub fn root_keys(
       match read { Some(r) -> r.contains(d.name), None -> true }).map(|d: DefinitionInfo|
       { key: d.name, value: emitted_signature_text(d, values) }),
   );
-  let guarded = checked.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: LawInfo|
-    acc.insert(l.key, l.has_guard));
-  outlines.fold([], |acc: List<KeyRow>, o: Outline|
-    o.items.fold(acc, |a: List<KeyRow>, item: OutlineItem|
+  let guarded = checked.laws.fold(Map::new(), |accumulator: Map<Bytes, Bool>, l: LawInfo|
+    accumulator.insert(l.key, l.has_guard));
+  outlines.fold([], |accumulator: List<KeyRow>, o: Outline|
+    o.items.fold(accumulator, |a: List<KeyRow>, item: OutlineItem|
       match item {
         OutlinedFunction(f) -> if !owned(qualify(o.name, f.name)) { a } else {
           function_key_rows(
@@ -506,8 +517,8 @@ fn emitter_constructors_of(
 ) -> List<EmitterConstructor> / {abort.raise} = {
   let prelude = checked.constructors.filter(|constructor_info: ConstructorInfo|
     constructor_info.module.len() == 0);
-  let rest = outlines.fold([], |acc: List<ConstructorInfo>, o: Outline|
-    acc.concat(
+  let rest = outlines.fold([], |accumulator: List<ConstructorInfo>, o: Outline|
+    accumulator.concat(
       checked.constructors.filter(|constructor_info: ConstructorInfo|
         constructor_info.module == o.name),
     ));
@@ -522,15 +533,15 @@ fn emitter_constructors_of(
       ),
       key: instance_by(checked, constructor_info.type_name, KeyInstance),
       show: instance_by(checked, constructor_info.type_name, ShowInstance),
-      numeric: checked.numeric_types.fold([], |acc: List<Bytes>, x: NumericInfo|
-        if x.type_name == constructor_info.type_name { x.functions } else { acc }),
+      numeric: checked.numeric_types.fold([], |accumulator: List<Bytes>, x: NumericInfo|
+        if x.type_name == constructor_info.type_name { x.functions } else { accumulator }),
       release: instance_by(checked, constructor_info.type_name, ReleaseInstance),
     })
 }
 
 fn instance_by(checked: CheckOutput, type_name: Bytes, kind: InstanceKind) -> Option<Bytes> =
-  checked.instances.fold(None, |acc: Option<Bytes>, x: InstanceInfo|
-    if x.type_name == type_name && x.kind == kind { Some(x.by) } else { acc })
+  checked.instances.fold(None, |accumulator: Option<Bytes>, x: InstanceInfo|
+    if x.type_name == type_name && x.kind == kind { Some(x.by) } else { accumulator })
 
 pub fn constructors_read(
   checked: CheckOutput,
@@ -553,18 +564,24 @@ fn width_number(name: Bytes) -> Option<Int> =
 type WidthSums = { sums: Map<Bytes, Bool> }
 
 fn width_sums_of(constructors: List<ConstructorInfo>) -> WidthSums = {
-  let held = holding_widths(constructors, []);
+  let fixed_width_types = types_with_fixed_width(constructors, []);
   {
     sums: Map::of_entries(
       constructors.map(|constructor_info: ConstructorInfo|
-        { key: constructor_info.type_name, value: held.contains(constructor_info.type_name) }),
+        {
+          key: constructor_info.type_name,
+          value: fixed_width_types.contains(constructor_info.type_name),
+        }),
     ),
   }
 }
 
-fn holding_widths(constructors: List<ConstructorInfo>, held: List<Bytes>) -> List<Bytes> =
+fn types_with_fixed_width(
+  constructors: List<ConstructorInfo>,
+  fixed_width_types: List<Bytes>,
+) -> List<Bytes> =
   range(0, constructors.len() + 1).fold(
-    { held: held, done: false },
+    { held: fixed_width_types, done: false },
     |st: { held: List<Bytes>, done: Bool }, i: Int|
       if st.done { st } else {
         let grown = constructors.fold(
@@ -579,27 +596,29 @@ fn holding_widths(constructors: List<ConstructorInfo>, held: List<Bytes>) -> Lis
       },
   ).held
 
-fn has_fixed_width(t: Type, held: List<Bytes>) -> Bool =
+fn has_fixed_width(t: Type, fixed_width_types: List<Bytes>) -> Bool =
   match t {
     VariableType(_) -> false,
     NamedType(c) ->
-      width_number(c.name) != None || held.contains(c.name)
-        || c.args.fold(false, |b: Bool, a: Type| b || has_fixed_width(a, held)),
+      width_number(c.name) != None || fixed_width_types.contains(c.name)
+        || c.args.fold(false, |b: Bool, a: Type| b || has_fixed_width(a, fixed_width_types)),
     FunctionType(_) -> false,
-    RecordType(fs) -> fs.fold(false, |b: Bool, field: Field| b || has_fixed_width(field.ty, held)),
+    RecordType(fs) ->
+      fs.fold(false, |b: Bool, field: Field| b || has_fixed_width(field.ty, fixed_width_types)),
     NominalType(n) ->
-      n.fields.fold(false, |b: Bool, field: Field| b || has_fixed_width(field.ty, held)),
+      n.fields.fold(false, |b: Bool, field: Field|
+        b || has_fixed_width(field.ty, fixed_width_types)),
   }
 
 fn has_no_widths(widths_of: Widths) -> Bool = match widths_of { NoWidths -> true, _ -> false }
 
-fn widths_of(width_sums: WidthSums, vars: List<Int>, ty: Type) -> Widths / {abort.raise} =
+fn widths_of(width_sums: WidthSums, type_variables: List<Int>, ty: Type) -> Widths / {abort.raise} =
   match ty {
-    VariableType(v) -> VariableWidths(var_number(vars, v)),
+    VariableType(v) -> VariableWidths(variable_number(type_variables, v)),
     NamedType(c) -> match width_number(c.name) {
       Some(n) -> FixedWidth(n),
       None -> {
-        let args = widths_of_all(width_sums, vars, c.args);
+        let args = widths_of_all(width_sums, type_variables, c.args);
         let plain = args.fold(true, |b: Bool, a: Widths| b && has_no_widths(a));
         if list_item(ty) != None || array_element(ty) != None || columns_row(ty) != None {
           if plain { NoWidths } else { ListWidths(args.get(0)) }
@@ -607,38 +626,39 @@ fn widths_of(width_sums: WidthSums, vars: List<Int>, ty: Type) -> Widths / {abor
           if plain { NoWidths } else { MapWidths(args.get(0), args.get(1)) }
         } else {
           match width_sums.sums.get(c.name) {
-            Some(holds) -> if holds || !plain { SumWidths(args) } else { NoWidths },
+            Some(fixed_width) -> if fixed_width || !plain { SumWidths(args) } else { NoWidths },
             None -> NoWidths,
           }
         }
       },
     },
     FunctionType(f) -> {
-      let params = widths_of_all(width_sums, vars, f.params);
-      let ret = widths_of(width_sums, vars, f.ret);
-      if has_no_widths(ret) && params.fold(true, |b: Bool, p: Widths| b && has_no_widths(p)) {
-        NoWidths
-      } else { FunctionWidths(params, ret) }
+      let params = widths_of_all(width_sums, type_variables, f.params);
+      let return_widths = widths_of(width_sums, type_variables, f.return_type);
+      if has_no_widths(return_widths)
+          && params.fold(true, |b: Bool, p: Widths| b && has_no_widths(p)) { NoWidths }
+      else { FunctionWidths(params, return_widths) }
     },
-    RecordType(fs) -> record_widths(width_sums, vars, fs),
-    NominalType(n) -> record_widths(width_sums, vars, n.fields),
+    RecordType(fs) -> record_widths(width_sums, type_variables, fs),
+    NominalType(n) -> record_widths(width_sums, type_variables, n.fields),
   }
 
 fn record_widths(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   fs: List<Field>,
 ) -> Widths / {abort.raise} = {
-  let fields = fs.map(|f: Field| { name: f.name, widths: widths_of(width_sums, vars, f.ty) });
+  let fields = fs.map(|f: Field|
+    { name: f.name, widths: widths_of(width_sums, type_variables, f.ty) });
   if fields.fold(true, |b: Bool, f: FieldWidths| b && has_no_widths(f.widths)) { NoWidths }
   else { RecordWidths(fields) }
 }
 
 fn widths_of_all(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   types: List<Type>,
-) -> List<Widths> / {abort.raise} = types.map(|ty: Type| widths_of(width_sums, vars, ty))
+) -> List<Widths> / {abort.raise} = types.map(|ty: Type| widths_of(width_sums, type_variables, ty))
 
 fn grounded(c: Widths) -> Widths =
   match c {
@@ -667,19 +687,19 @@ fn grounded(c: Widths) -> Widths =
     other -> other,
   }
 
-fn var_number(vars: List<Int>, v: Int) -> Int / {abort.raise} =
-  range(0, vars.len()).fold(vars.len() + v, |acc: Int, i: Int|
-    if acc >= vars.len() && vars.get(i) == v { i } else { acc })
+fn variable_number(type_variables: List<Int>, v: Int) -> Int / {abort.raise} =
+  range(0, type_variables.len()).fold(type_variables.len() + v, |accumulator: Int, i: Int|
+    if accumulator >= type_variables.len() && type_variables.get(i) == v { i } else { accumulator })
 
-fn emit_signature(ty: Type) -> { params: List<Type>, ret: Type } =
+fn emit_signature(ty: Type) -> { params: List<Type>, result_type: Type } =
   match ty {
-    FunctionType(f) -> { params: f.params, ret: f.ret },
-    other -> { params: [], ret: other },
+    FunctionType(f) -> { params: f.params, result_type: f.return_type },
+    other -> { params: [], result_type: other },
   }
 
 fn emitter_root(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   witnesses: List<Int>,
   root: RootKey,
   params: List<Type>,
@@ -694,21 +714,21 @@ fn emitter_root(
     arity: taken.len() + labels,
     pure: pure,
     at: place,
-    params: widths_of_all(width_sums, vars, taken),
-    result: widths_of(width_sums, vars, result),
+    params: widths_of_all(width_sums, type_variables, taken),
+    result: widths_of(width_sums, type_variables, result),
     witnesses: witnesses,
   }
 }
 
 fn proposition_root(
   width_sums: WidthSums,
-  vars: List<Int>,
+  type_variables: List<Int>,
   witnesses: List<Int>,
   root: RootKey,
   params: List<Type>,
   place: ModuleSpan,
 ) -> EmitterRoot / {abort.raise} =
-  emitter_root(width_sums, vars, witnesses, root, params, bool_type(), 0, false, place)
+  emitter_root(width_sums, type_variables, witnesses, root, params, bool_type(), 0, false, place)
 
 fn witness_variables(definition: DefinitionInfo) -> List<Int> =
   witness_params(definition.constraints)
@@ -727,7 +747,7 @@ fn emitter_roots(
   let tests = Map::of_entries(checked.tests.map(|t: TestInfo| { key: t.key, value: t }));
   let walked = outlines.fold(
     { functions: [], tests: [], specs: [] },
-    |acc: EmitTables, o: Outline| {
+    |accumulator: EmitTables, o: Outline| {
       let items = o.items.fold(
         { functions: [], tests: [], specs: [] },
         |a: EmitTables, item: OutlineItem|
@@ -738,16 +758,16 @@ fn emitter_roots(
                 None -> a,
                 Some(definition) -> {
                   let sig = emit_signature(definition.scheme.ty);
-                  let vars = definition.scheme.type_variables;
+                  let function_variables = definition.scheme.type_variables;
                   let witnesses = witness_variables(definition);
                   let place = span_at(definition.at.module, definition.at.span);
                   let fn_row = emitter_root(
                     width_sums,
-                    vars,
+                    function_variables,
                     witnesses,
                     Named(name),
                     sig.params,
-                    sig.ret,
+                    sig.result_type,
                     definition.scheme.label_variables.len(),
                     is_pure_definition(definition),
                     place,
@@ -760,7 +780,7 @@ fn emitter_roots(
                           let root = clause_key(name, kind, b.requires);
                           let row = proposition_root(
                             width_sums,
-                            vars,
+                            function_variables,
                             witnesses,
                             root,
                             sig.params,
@@ -772,10 +792,10 @@ fn emitter_roots(
                           let root = clause_key(name, kind, b.ensures);
                           let row = proposition_root(
                             width_sums,
-                            vars,
+                            function_variables,
                             witnesses,
                             root,
-                            sig.params.push(sig.ret),
+                            sig.params.push(sig.result_type),
                             place,
                           );
                           { rows: b.rows.push(row), requires: b.requires, ensures: b.ensures + 1 }
@@ -824,7 +844,7 @@ fn emitter_roots(
                   Some(x) -> x.binders.map(|b: LawBinder| b.ty),
                   None -> [],
                 };
-                let vars = variables_in(binders);
+                let law_variables = variables_in(binders);
                 let place = match law {
                   Some(x) -> span_at(x.at.module, x.at.span),
                   None -> no_module_span(),
@@ -834,7 +854,7 @@ fn emitter_roots(
                   |part: LawPart| {
                     proposition_root(
                       width_sums,
-                      vars,
+                      law_variables,
                       [],
                       law_key(o.name, l.name, part),
                       binders,
@@ -849,9 +869,9 @@ fn emitter_roots(
           },
       );
       {
-        functions: acc.functions.concat(items.functions),
-        tests: acc.tests.concat(items.tests),
-        specs: acc.specs.concat(items.specs),
+        functions: accumulator.functions.concat(items.functions),
+        tests: accumulator.tests.concat(items.tests),
+        specs: accumulator.specs.concat(items.specs),
       }
     },
   );
@@ -861,17 +881,17 @@ fn emitter_roots(
 fn ordinal_row(o: Outline) -> OrdinalRow =
   {
     module: o.name,
-    items: o.items.fold([], |acc: List<Bytes>, item: OutlineItem|
+    items: o.items.fold([], |accumulator: List<Bytes>, item: OutlineItem|
       match item {
         OutlinedFunction(f) -> {
           let rooted = f.spec.filter(|kind: SpecKind| kind != CostClause && kind != SpaceClause);
           let kinds = if rooted.len() == 0 { b"" }
           else { b" ".concat(Bytes::join(rooted.map(spec_kind_text), b",")) };
-          acc.push(Bytes::concat_all([b"fn ", qualify(o.name, f.name), kinds]))
+          accumulator.push(Bytes::concat_all([b"fn ", qualify(o.name, f.name), kinds]))
         },
-        OutlinedTest(t) -> acc.push(b"test ".concat(qualify(o.name, t.name))),
-        OutlinedLaw(l) -> acc.push(b"law ".concat(qualify(o.name, l.name))),
-        _ -> acc,
+        OutlinedTest(t) -> accumulator.push(b"test ".concat(qualify(o.name, t.name))),
+        OutlinedLaw(l) -> accumulator.push(b"law ".concat(qualify(o.name, l.name))),
+        _ -> accumulator,
       }),
   }
 
@@ -960,19 +980,19 @@ pub fn checked_program_of(w: Analysis) -> CheckedProgram / {abort.raise} =
       tagged: root_tagged(
         w.module_packages,
         w.hashes,
-        range(0, w.modules.len()).fold([], |acc: List<TaggedSite>, i: Int|
-          acc.concat(tagged_of(w, i))),
+        range(0, w.modules.len()).fold([], |accumulator: List<TaggedSite>, i: Int|
+          accumulator.concat(tagged_of(w, i))),
       ),
       statements: root_statements(
         w.module_packages,
         w.hashes,
-        range(0, w.modules.len()).fold([], |acc: List<StatementSite>, i: Int|
-          acc.concat(statements_of(w, i))),
+        range(0, w.modules.len()).fold([], |accumulator: List<StatementSite>, i: Int|
+          accumulator.concat(statements_of(w, i))),
       ),
       consts: root_consts(
         w.module_packages,
-        range(0, w.modules.len()).fold([], |acc: List<TypedConst>, i: Int|
-          acc.concat(typed_consts_of(w, i))),
+        range(0, w.modules.len()).fold([], |accumulator: List<TypedConst>, i: Int|
+          accumulator.concat(typed_consts_of(w, i))),
       ),
     },
     checked: w.checked,
@@ -1001,12 +1021,12 @@ pub type AnalysisOutcome = | Rejected(List<Diagnostic>) | Analysed(Analysis)
 pub type ConstSite = { module: Int, span: Span, name: Bytes, hash: Bytes }
 
 pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abort.raise} = {
-  let named = frame.consts.fold(Map::new(), |acc: Map<Bytes, Bool>, c: TypedConst|
-    if c.type_name == type_name { acc.insert(c.name, true) } else { acc });
+  let named = frame.consts.fold(Map::new(), |accumulator: Map<Bytes, Bool>, c: TypedConst|
+    if c.type_name == type_name { accumulator.insert(c.name, true) } else { accumulator });
   let hashed = by_name(frame.hashes.definitions);
-  range(0, frame.outlines.len()).fold([], |acc: List<ConstSite>, i: Int| {
+  range(0, frame.outlines.len()).fold([], |accumulator: List<ConstSite>, i: Int| {
     let o = frame.outlines.get(i);
-    o.items.fold(acc, |sites: List<ConstSite>, item: OutlineItem|
+    o.items.fold(accumulator, |sites: List<ConstSite>, item: OutlineItem|
       match item {
         OutlinedFunction(f) -> {
           let name = qualify(o.name, f.name);
@@ -1023,14 +1043,14 @@ pub fn consts_of_type(frame: Frame, type_name: Bytes) -> List<ConstSite> / {abor
 fn known_definitions(
   rows: List<KnownDefinitionRow>,
 ) -> Map<Bytes, CachedDefinition> / {abort.raise} =
-  rows.fold(Map::new(), |acc: Map<Bytes, CachedDefinition>, row: KnownDefinitionRow|
+  rows.fold(Map::new(), |accumulator: Map<Bytes, CachedDefinition>, row: KnownDefinitionRow|
     match ((
         read_effects(row.effects),
         read_effects(row.performed_effects),
         read_effects(row.repeated_effects),
       )) {
       (Some(effects), Some(performed), Some(scaling)) ->
-        acc.insert(row.name, {
+        accumulator.insert(row.name, {
           effects: effects,
           performed: performed,
           unbounded_effects: scaling,
@@ -1040,14 +1060,14 @@ fn known_definitions(
           raises: row.raises,
           ownership_facts: row.facts,
         }),
-      _ -> acc,
+      _ -> accumulator,
     })
 
 fn known_tests(rows: List<KnownTestRow>) -> Map<Bytes, CachedTest> / {abort.raise} =
-  rows.fold(Map::new(), |acc: Map<Bytes, CachedTest>, r: KnownTestRow|
+  rows.fold(Map::new(), |accumulator: Map<Bytes, CachedTest>, r: KnownTestRow|
     match read_effects(r.effects) {
-      None -> acc,
-      Some(effects) -> acc.insert(r.key, { effects: effects, facts: r.body_facts }),
+      None -> accumulator,
+      Some(effects) -> accumulator.insert(r.key, { effects: effects, facts: r.body_facts }),
     })
 
 pub fn cache_from_rows(rows: Rows, root: Int) -> CheckCache / {abort.raise} =
@@ -1060,12 +1080,12 @@ pub fn cache_from_rows(rows: Rows, root: Int) -> CheckCache / {abort.raise} =
   }
 
 fn effect_hashes_of(declarations: Map<Bytes, Bytes>, effects: List<Effect>) -> List<EffectHash> =
-  effects.fold(Map::new(), |acc: Map<Bytes, Bytes>, entry: Effect|
+  effects.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, entry: Effect|
     match declarations.get(entry.effect) {
-      Some(h) -> acc.insert(entry.effect, h),
-      None -> acc,
-    }).fold([], |acc: List<EffectHash>, name: Bytes, hash: Bytes|
-    acc.push({ name: name, hash: hash }))
+      Some(h) -> accumulator.insert(entry.effect, h),
+      None -> accumulator,
+    }).fold([], |accumulator: List<EffectHash>, name: Bytes, hash: Bytes|
+    accumulator.push({ name: name, hash: hash }))
 
 pub fn definition_known_row(
   declarations: Map<Bytes, Bytes>,
@@ -1136,10 +1156,10 @@ fn test_known_row(
 
 type AllBodyFacts = { cached: Map<Bytes, Bytes>, computed: Map<Bytes, BodyFacts> }
 
-pub fn all_body_facts(checked: CheckOutput) -> AllBodyFacts / {abort.raise} =
+pub fn all_body_facts(checked: CheckOutput) -> AllBodyFacts =
   {
-    cached: checked.cached.fold(Map::new(), |acc: Map<Bytes, Bytes>, k: CachedFacts|
-      acc.insert(k.name, k.facts)),
+    cached: checked.cached.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, k: CachedFacts|
+      accumulator.insert(k.name, k.facts)),
     computed: facts_by_owner(checked.facts),
   }
 
@@ -1154,14 +1174,17 @@ pub fn types_of_rows(
   definitions: List<KnownDefinitionRow>,
   tests: List<KnownTestRow>,
 ) -> TypeTable / {abort.raise} = {
-  let bodies = |acc: List<TypedBody<Bytes>>, recorded: Bytes|
-    match decode_facts(recorded, 0, b"") { Some(f) -> acc.concat(f.bodies), None -> acc };
+  let bodies = |accumulator: List<TypedBody<Bytes>>, recorded: Bytes|
+    match decode_facts(recorded, 0, b"") {
+      Some(f) -> accumulator.concat(f.bodies),
+      None -> accumulator,
+    };
   types_named(
     table,
     tests.fold(
-      definitions.fold([], |acc: List<TypedBody<Bytes>>, r: KnownDefinitionRow|
-        bodies(acc, r.facts)),
-      |acc: List<TypedBody<Bytes>>, r: KnownTestRow| bodies(acc, r.body_facts),
+      definitions.fold([], |accumulator: List<TypedBody<Bytes>>, r: KnownDefinitionRow|
+        bodies(accumulator, r.facts)),
+      |accumulator: List<TypedBody<Bytes>>, r: KnownTestRow| bodies(accumulator, r.body_facts),
     ),
   )
 }
@@ -1179,18 +1202,18 @@ pub fn inferred_facts_of(
   modules: List<Bytes>,
   checked: CheckOutput,
 ) -> InferredFacts / {abort.raise} = {
-  let laws = checked.laws.fold(Map::new(), |acc: Map<Bytes, Bool>, l: LawInfo|
-    acc.insert(law_owner(l.module, l.name), true));
+  let laws = checked.laws.fold(Map::new(), |accumulator: Map<Bytes, Bool>, l: LawInfo|
+    accumulator.insert(law_owner(l.module, l.name), true));
   {
     modules: modules,
     pure: checked.facts.pure,
     orders: checked.facts.orders,
     law_facts: facts_by_owner(checked.facts).fold(
       [],
-      |acc: List<{ owner: Bytes, facts: BodyFacts }>, owner: Bytes, f: BodyFacts|
+      |accumulator: List<{ owner: Bytes, facts: BodyFacts }>, owner: Bytes, f: BodyFacts|
         if laws.contains(owner) {
-          acc.push({ owner: owner, facts: { ..f, types: types_named(f.types, f.bodies) } })
-        } else { acc },
+          accumulator.push({ owner: owner, facts: { ..f, types: types_named(f.types, f.bodies) } })
+        } else { accumulator },
     ),
   }
 }
@@ -1201,10 +1224,10 @@ pub fn rows_from(checked: CheckOutput, hashes: HashOutput) -> Rows / {abort.rais
   let read = all_body_facts(checked);
   let definitions = checked.definitions.fold(
     [],
-    |acc: List<KnownDefinitionRow>, definition_info: DefinitionInfo|
+    |accumulator: List<KnownDefinitionRow>, definition_info: DefinitionInfo|
       match keyed.get(definition_info.name) {
-        Some(x) -> acc.push(definition_known_row(declarations, definition_info, x, read)),
-        None -> acc,
+        Some(x) -> accumulator.push(definition_known_row(declarations, definition_info, x, read)),
+        None -> accumulator,
       },
   );
   let tests = test_rows(checked, hashes, declarations, read);

@@ -1,5 +1,5 @@
 import compiler.emit.code (Code, CodeHandler, CodeClause, CodeReturn, CodeStatement, CodeLet,
-                           CodeLetDestructure, CodeDo, CodeArm, CodeField, CodeApply, CodeVar,
+                           CodeLetDestructure, CodeDo, CodeArm, CodeField, CodeApply, CodeVariable,
                            NBuiltin, CodeIf, CodeBlock, CodeMatch, CodeUnary, CodeBinary,
                            CodeFieldRead, CodeUpdate, CodeRecord, CodeList, CodePerform,
                            CodeParallel, CodeHandle, CodeLambda, slots_read, all_read,
@@ -12,19 +12,20 @@ import compiler.syntax.items (is_shipped)
 import compiler.check.types (Type, FunctionType, RecordType, Effects, Resource, NamedResource,
                              SingletonResource, AnyResource, ResourceVariable, int_type,
                              string_type, fields_sorted, no_effects)
-import compiler.check.infer.expression (kept_type, marshalling_variables, variables_in_signature)
+import compiler.check.infer.expression (retained_type, marshalling_variables,
+                                        variables_in_signature)
 import compiler.emit.typing (unknown_type)
-import compiler.check.infer.checker (prelude_effects, EffectInfo, OpInfo)
+import compiler.check.infer.checker (prelude_effects, EffectInfo, OperationInfo)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, RaiseMode, InvalidMode, is_raise)
 import std.bytes (ascii_of_int)
 import compiler.emit.representations (EffectName, EffectOperation, parallel_results_type,
                                       type_variables)
 import compiler.emit.keys (module_of)
 import compiler.emit.marks (mark_type_params, dynamic_form)
-import compiler.emit.typed_ir (AsInt, AsWord, AsImmediate, Arg, VarOperand, ZeroOperand, Inst,
-                               Block, Op, OfHandling, Get, FieldPath, Assign, If, Case, Match, Miss,
-                               Loop, Next, Done, Return, Restart, Jump, Handle, IntOperand, Static,
-                               falls_through, reads)
+import compiler.emit.typed_ir (AsInt, AsWord, AsImmediate, Arg, VariableOperand, ZeroOperand,
+                               Instruction, Block, OperationCall, OfHandling, Get, FieldPath,
+                               Assign, If, Case, Match, Miss, Loop, Next, Done, Return, Restart,
+                               Jump, Handle, IntOperand, Static, falls_through, reads)
 import compiler.emit.typed_ir.handling (Perform, Label, Parallel, UnspecialisedBuiltin, Clause,
                                         SchedulerEvidence, Instance, HeapInstance, InstanceAddress,
                                         Entering, AllocateForwarding, SetForwarding, ObjectAt,
@@ -33,7 +34,7 @@ import compiler.emit.typed_ir.handling (Perform, Label, Parallel, UnspecialisedB
                                         Suspends, Resumes, Raises, HandleInstance, Returning,
                                         raise_offset)
 import compiler.emit.lower.marshalling (operation_descriptor, type_descriptor, effect_of, own_types)
-import compiler.emit.lower.kept (kept_conversion)
+import compiler.emit.lower.conversions (marked_conversion)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, Frame, EvidenceWord,
                                  CapturedEvidence, unreachable, fresh, bound_as, run_for_effect,
                                  emitted, exit_block, type_of, represented_as, static_added)
@@ -46,7 +47,7 @@ import compiler.emit.lower.data (record_literal_as)
 pub fn performed(
   context: Context,
   st: Lowering,
-  p: { effect: Bytes, op: Bytes, resource: Bytes },
+  p: { effect: Bytes, operation: Bytes, resource: Bytes },
   label: Option<Arg>,
   written: Option<Code>,
   args: List<Arg>,
@@ -54,10 +55,10 @@ pub fn performed(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match effect_of(context, p.effect) {
-    None -> unreachable(b"an effect the lowering does not resolve: ".concat(p.effect)),
+    None -> unreachable(b"the compiler cannot find the effect: ".concat(p.effect)),
     Some(en) -> {
       let index = range(0, en.operations.len()).find(|k: Int|
-        match en.operations.at(k) { Some(o) -> o.name == p.op, None -> false });
+        match en.operations.at(k) { Some(o) -> o.name == p.operation, None -> false });
       let resource = match written {
         Some(c) -> label_resource(context, c),
         None -> if p.resource == b"" { SingletonResource } else { NamedResource(p.resource) },
@@ -76,34 +77,41 @@ pub fn performed(
         },
         None -> { st: word.st, args: [] },
       };
-      let declared = op_declared(en, p.op);
+      let declared = declared_operation(en, p.operation);
       let mode = declared.mode;
-      let kept = kept_type_parameters(en.global, declared);
-      let crossed = range(0, args.len()).fold(
+      let marked_parameters = marked_type_parameters(en.global, declared);
+      let converted_arguments = range(0, args.len()).fold(
         { st: keyed.st, args: [] },
-        |acc: { st: Lowering, args: List<Arg> }, i: Int| {
-          let x = kept_argument(context, acc.st, declared.params.at(i), kept, args.get(i), at);
-          { st: x.st, args: acc.args.push(x.arg) }
+        |accumulator: { st: Lowering, args: List<Arg> }, i: Int| {
+          let x = marked_argument(
+            context,
+            accumulator.st,
+            declared.params.at(i),
+            marked_parameters,
+            args.get(i),
+            at,
+          );
+          { st: x.st, args: accumulator.args.push(x.arg) }
         },
       );
-      let words = crossed.args.fold(
-        { st: crossed.st, args: [] },
-        |acc: { st: Lowering, args: List<Arg> }, a: Arg| {
-          let w = represented_as({ st: acc.st, arg: a }, AsWord, at);
-          { st: w.st, args: acc.args.push(w.arg) }
+      let words = converted_arguments.args.fold(
+        { st: converted_arguments.st, args: [] },
+        |accumulator: { st: Lowering, args: List<Arg> }, a: Arg| {
+          let w = represented_as({ st: accumulator.st, arg: a }, AsWord, at);
+          { st: w.st, args: accumulator.args.push(w.arg) }
         },
       );
       let ty = result;
       {
         {
           let out = if is_raise(mode) { { ty: ty, marked: None } }
-          else { kept_result_type(declared.ret, kept, ty) };
+          else { marked_result_type(declared.return_type, marked_parameters, ty) };
           let d = operation_descriptor(
             context,
             words.st,
             en.global,
             declared,
-            crossed.args.map(type_of),
+            converted_arguments.args.map(type_of),
             out.ty,
           );
           let uses = {
@@ -112,13 +120,13 @@ pub fn performed(
             fails: true,
             suspends: !is_raise(mode),
           };
-          let op = match ((d.name, index)) {
+          let operation = match ((d.name, index)) {
             (Some(described), Some(k)) ->
-              Op({
-                op: OfHandling(
+              OperationCall({
+                operation: OfHandling(
                   Perform({
                     effect: en.global,
-                    op: p.op,
+                    operation: p.operation,
                     index: k,
                     resource: if label == None { p.resource } else { b"" },
                     labelled: label != None,
@@ -130,61 +138,69 @@ pub fn performed(
                 uses: { ..uses, takes: [false].concat(uses.takes) },
               }),
             _ ->
-              Op({
-                op: OfHandling(UnspecialisedBuiltin(p.op)),
+              OperationCall({
+                operation: OfHandling(UnspecialisedBuiltin(p.operation)),
                 args: keyed.args.concat(words.args),
                 uses: uses,
               }),
           };
           let returned = represented_as(
-            bound_as(d.st, out.ty, AsWord, op, at),
+            bound_as(d.st, out.ty, AsWord, operation, at),
             representation_of(context.setting, out.ty),
             at,
           );
           match out.marked {
             None -> returned,
-            Some(m) -> kept_conversion(context, returned.st, returned.arg, m, false, at),
+            Some(m) -> marked_conversion(context, returned.st, returned.arg, m, false, at),
           }
         }
       }
     },
   }
 
-fn kept_type_parameters(global: Bytes, op: EffectOperation) -> List<Int> / {abort.raise} =
-  if global.index_of(b".") == None || is_shipped(global) { [] }
-  else { variables_in_signature(op.params, op.ret, op.mode, op.own) }
+fn marked_type_parameters(global: Bytes, operation: EffectOperation) -> List<Int> / {abort.raise} =
+  if global.index_of(b".") == None || is_shipped(global) { [] } else {
+    variables_in_signature(operation.params, operation.return_type, operation.mode, operation.own)
+  }
 
-fn names_kept(declared: Type, kept: List<Int>) -> Bool =
-  type_variables(declared).any(|v: Int| kept.contains(v))
+fn names_marked(declared: Type, marked_parameters: List<Int>) -> Bool =
+  type_variables(declared).any(|v: Int| marked_parameters.contains(v))
 
-fn kept_argument(
+fn marked_argument(
   context: Context,
   st: Lowering,
   declared: Option<Type>,
-  kept: List<Int>,
+  marked_parameters: List<Int>,
   a: Arg,
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match declared {
-    Some(d) -> if !names_kept(d, kept) { { st: st, arg: a } } else {
-      kept_conversion(context, st, a, mark_type_params(d, type_of(a), kept).marked, true, at)
+    Some(d) -> if !names_marked(d, marked_parameters) { { st: st, arg: a } } else {
+      marked_conversion(
+        context,
+        st,
+        a,
+        mark_type_params(d, type_of(a), marked_parameters).marked,
+        true,
+        at,
+      )
     },
     None -> { st: st, arg: a },
   }
 
-fn kept_result_type(
+fn marked_result_type(
   declared: Type,
-  kept: List<Int>,
+  marked_parameters: List<Int>,
   recorded: Type,
 ) -> { ty: Type, marked: Option<Type> } / {abort.raise} =
-  if !names_kept(declared, kept) { { ty: recorded, marked: None } } else {
-    let marked_type = mark_type_params(declared, recorded, kept).marked;
+  if !names_marked(declared, marked_parameters) { { ty: recorded, marked: None } } else {
+    let marked_type = mark_type_params(declared, recorded, marked_parameters).marked;
     { ty: dynamic_form(marked_type), marked: Some(marked_type) }
   }
 
 pub fn scheduler_perform_call(
   context: Context,
-  p: { effect: Bytes, op: Bytes, resource: Bytes },
+  p: { effect: Bytes, operation: Bytes, resource: Bytes },
   codes: List<Code>,
   args: List<Arg>,
   result: Type,
@@ -194,25 +210,25 @@ pub fn scheduler_perform_call(
     Some(named) -> {
       let t = { ty: result };
       let marshalling = match prelude_effects().find(|e: EffectInfo| e.name == named.global) {
-        Some(e) -> match e.operations.find(|o: OpInfo| o.name == p.op) {
+        Some(e) -> match e.operations.find(|o: OperationInfo| o.name == p.operation) {
           Some(o) -> marshalling_variables(o),
           None -> [],
         },
         None -> [],
       };
       let en = match effect_of(context, named.global) { Some(e) -> e, None -> named };
-      let declared = op_declared(en, p.op);
+      let declared = declared_operation(en, p.operation);
       let types = own_types(declared, args.map(type_of), t.ty);
       if marshalling.len() == 0 || types.any(|x: Option<Type>| x == None)
-          || marshalling.all(|i: Int| types.at(i) == Some(Some(kept_type()))) { None } else {
+          || marshalling.all(|i: Int| types.at(i) == Some(Some(retained_type()))) { None } else {
         Some({
-          name: Bytes::concat_all([scheduler_module(), b"::crossing_", p.op]),
-          types: types.fold([], |acc: List<Type>, x: Option<Type>|
-            match x { Some(y) -> acc.push(y), None -> acc }),
-          rows: range(0, declared.params.len()).fold([], |acc: List<Effects>, i: Int|
+          name: Bytes::concat_all([scheduler_module(), b"::crossing_", p.operation]),
+          types: types.fold([], |accumulator: List<Type>, x: Option<Type>|
+            match x { Some(y) -> accumulator.push(y), None -> accumulator }),
+          rows: range(0, declared.params.len()).fold([], |accumulator: List<Effects>, i: Int|
             match declared.params.at(i) {
-              Some(FunctionType(f)) -> if f.effects.variable == None { acc } else {
-                acc.push(match codes.at(i) {
+              Some(FunctionType(f)) -> if f.effects.variable == None { accumulator } else {
+                accumulator.push(match codes.at(i) {
                   Some(c) -> match c.node {
                     CodeLambda(l) -> l.effects,
                     _ -> match args.at(i) {
@@ -226,7 +242,7 @@ pub fn scheduler_perform_call(
                   None -> no_effects(),
                 })
               },
-              _ -> acc,
+              _ -> accumulator,
             }),
         })
       }
@@ -239,15 +255,15 @@ pub fn label(context: Context, st: Lowering, name: Bytes, at: Span) -> LoweredVa
     st,
     int_type(),
     AsInt,
-    Op({
-      op: OfHandling(Label(name)),
+    OperationCall({
+      operation: OfHandling(Label(name)),
       args: [],
       uses: { takes: [], owned: false, fails: false, suspends: false },
     }),
     at,
   )
 
-pub fn clause_frame(clause: CodeClause, held: CapturedEvidence) -> Frame =
+pub fn clause_frame(clause: CodeClause, captured: CapturedEvidence) -> Frame =
   {
     params: clause.params + (if clause.binds_label { 1 } else { 0 })
       + (if clause.resume { 1 } else { 0 }),
@@ -257,10 +273,10 @@ pub fn clause_frame(clause: CodeClause, held: CapturedEvidence) -> Frame =
     body: clause.body,
     ty: clause.ty,
     words: [],
-    captured_evidence: held,
+    captured_evidence: captured,
   }
 
-pub fn return_frame(r: CodeReturn, held: CapturedEvidence) -> Frame =
+pub fn return_frame(r: CodeReturn, captured: CapturedEvidence) -> Frame =
   {
     params: 1,
     size: r.size,
@@ -269,7 +285,7 @@ pub fn return_frame(r: CodeReturn, held: CapturedEvidence) -> Frame =
     body: r.body,
     ty: r.ty,
     words: [],
-    captured_evidence: held,
+    captured_evidence: captured,
   }
 
 pub type HandlePlan = {
@@ -291,7 +307,7 @@ pub fn handle_plan(
   let known = match keys.find(|k: InstanceKey| k.effect.operations.len() == 0) {
     Some(k) ->
       unreachable(
-        b"a handle of an effect whose operations the lowering does not know: ".concat(
+        b"a handle expression uses an effect whose operations the compiler cannot find: ".concat(
           k.effect.global,
         ),
       ),
@@ -302,39 +318,39 @@ pub fn handle_plan(
     { st: made.st, forwarding: Some(made.forwarding) }
   };
   let around = match f.forwarding { Some(w) -> { ..context, words: w.outer }, None -> context };
-  let raised = h.clauses.fold(0, |m: Int, cl: CodeClause|
-    if clause_mode(context, cl) == 3 && cl.params > m { cl.params } else { m });
+  let raised = h.clauses.fold(0, |m: Int, clause: CodeClause|
+    if clause_mode(context, clause) == 3 && clause.params > m { clause.params } else { m });
   let records = raise_offset() + raised;
   let returned = h.clauses.len();
-  let vars = records + 4 * (returned + (if h.ret == None { 0 } else { 1 }));
+  let variable_count = records + 4 * (returned + (if h.return_clause == None { 0 } else { 1 }));
   let count = handler_variables(h.body);
   let tables = keys.fold(0, |n: Int, k: InstanceKey| n + tables_of(plan_key(around, h.clauses, k)));
   let objects = keys.fold(0, |n: Int, k: InstanceKey| n + object_words(k));
   let layout = {
     operand: 0,
     records: range(0, h.clauses.len()).map(|k: Int| records + 4 * k),
-    vars: vars,
+    variable_count: variable_count,
     count: count,
     pending: range(0, h.clauses.len()).find(|k: Int|
-      match h.clauses.at(k) { Some(cl) -> handles_abort(context, cl), None -> false }),
+      match h.clauses.at(k) { Some(clause) -> handles_abort(context, clause), None -> false }),
     result: None,
     raise_clause_indexes: range(0, h.clauses.len()).filter(|k: Int|
       match h.clauses.at(k) {
-        Some(cl) -> clause_mode(context, cl) == 3 && !handles_abort(context, cl),
+        Some(clause) -> clause_mode(context, clause) == 3 && !handles_abort(context, clause),
         None -> false,
       }),
     heap: None,
-    ret: if h.ret == None { None } else { Some(records + 4 * returned) },
+    return_clause: if h.return_clause == None { None } else { Some(records + 4 * returned) },
     preset: false,
   };
-  let words = vars + 2 * count + objects + tables;
+  let words = variable_count + 2 * count + objects + tables;
   if detached || spawning(context) {
     let b = bound_as(
       f.st,
       instance_block_type(),
       AsWord,
-      Op({
-        op: OfHandling(HeapInstance(words)),
+      OperationCall({
+        operation: OfHandling(HeapInstance(words)),
         args: [],
         uses: { takes: [], owned: true, fails: false, suspends: false },
       }),
@@ -344,7 +360,7 @@ pub fn handle_plan(
       b.st,
       evidence_type(),
       AsImmediate,
-      Op({ op: OfHandling(InstanceAddress), args: [b.arg], uses: reads(1) }),
+      OperationCall({ operation: OfHandling(InstanceAddress), args: [b.arg], uses: reads(1) }),
       at,
     );
     {
@@ -357,7 +373,7 @@ pub fn handle_plan(
       f.st,
       evidence_type(),
       AsImmediate,
-      Op({ op: OfHandling(Instance(words)), args: [], uses: reads(0) }),
+      OperationCall({ operation: OfHandling(Instance(words)), args: [], uses: reads(0) }),
       at,
     );
     { st: i.st, instance: { word: i.arg, layout: layout, block: None }, forwarding: None }
@@ -376,12 +392,12 @@ fn forwarding(
   st: Lowering,
   at: Span,
 ) -> { st: Lowering, forwarding: ForwardingBlock } / {abort.raise} = {
-  let known = context.words.fold([], |acc: List<OuterWord>, w: EvidenceWord|
+  let known = context.words.fold([], |accumulator: List<OuterWord>, w: EvidenceWord|
     match effect_of(context, w.evidence.effect) {
       Some(e) -> if e.operations.len() > 0 {
-        acc.push({ word: w, operation_count: e.operations.len() })
-      } else { acc },
-      None -> acc,
+        accumulator.push({ word: w, operation_count: e.operations.len() })
+      } else { accumulator },
+      None -> accumulator,
     });
   let outer = known.map(|f: OuterWord| f.word);
   let labels = outer.filter(|w: EvidenceWord|
@@ -390,8 +406,11 @@ fn forwarding(
   let tasks = header + outer.len();
   let forwards = known.fold(
     { at: tasks + outer.len() + labels.len(), starts: [] },
-    |acc: { at: Int, starts: List<Int> }, f: OuterWord|
-      { at: acc.at + 1 + 5 * f.operation_count, starts: acc.starts.push(acc.at) },
+    |accumulator: { at: Int, starts: List<Int> }, f: OuterWord|
+      {
+        at: accumulator.at + 1 + 5 * f.operation_count,
+        starts: accumulator.starts.push(accumulator.at),
+      },
   );
   let placed = {
     targets: header,
@@ -404,21 +423,25 @@ fn forwarding(
     st,
     evidence_type(),
     AsImmediate,
-    Op({ op: OfHandling(AllocateForwarding(placed.words)), args: [], uses: reads(0) }),
+    OperationCall({
+      operation: OfHandling(AllocateForwarding(placed.words)),
+      args: [],
+      uses: reads(0),
+    }),
     at,
   );
   let headed = forwarding_header(context, block.st, block.arg, outer, placed, at);
   let forwarded = range(0, known.len()).fold(
     { st: headed, words: [] },
-    |acc: { st: Lowering, words: List<EvidenceWord> }, i: Int| {
+    |accumulator: { st: Lowering, words: List<EvidenceWord> }, i: Int| {
       let f = known.get(i);
       let start = placed.forwards.get(i);
       let o = bound_as(
-        acc.st,
+        accumulator.st,
         evidence_type(),
         AsImmediate,
-        Op({
-          op: OfHandling(
+        OperationCall({
+          operation: OfHandling(
             ObjectAt({
               at: start,
               slots: range(0, f.operation_count).map(|j: Int|
@@ -435,7 +458,7 @@ fn forwarding(
         }),
         at,
       );
-      { st: o.st, words: acc.words.push({ ..f.word, word: o.arg }) }
+      { st: o.st, words: accumulator.words.push({ ..f.word, word: o.arg }) }
     },
   );
   let unknown = context.words.filter(|w: EvidenceWord| !outer.contains(w));
@@ -444,7 +467,7 @@ fn forwarding(
       forwarded.st,
       evidence_type(),
       AsImmediate,
-      Op({ op: OfHandling(SchedulerEvidence), args: [], uses: reads(0) }),
+      OperationCall({ operation: OfHandling(SchedulerEvidence), args: [], uses: reads(0) }),
       at,
     );
     { st: b.st, words: unknown.map(|w: EvidenceWord| { ..w, word: b.arg }) }
@@ -466,37 +489,37 @@ fn forwarding_header(
   let set = |s: Lowering, k: Int, a: Arg|
     run_for_effect(
       s,
-      Op({ op: OfHandling(SetForwarding(k)), args: [block, a], uses: reads(2) }),
+      OperationCall({ operation: OfHandling(SetForwarding(k)), args: [block, a], uses: reads(2) }),
       at,
     );
   let mapped = bound_as(
     st,
     evidence_type(),
     AsImmediate,
-    Op({ op: OfHandling(EffectsMapping), args: [], uses: reads(0) }),
+    OperationCall({ operation: OfHandling(EffectsMapping), args: [], uses: reads(0) }),
     at,
   );
   let d = static_added(mapped.st, effects_descriptor(outer.map(|w: EvidenceWord| w.evidence)));
-  let desc = bound_as(d.st, effects_descriptor_type(), AsImmediate, Static(d.name), at);
-  let words = fill_missing_evidence(desc.st, outer.map(|w: EvidenceWord| w.word), at);
+  let descriptor = bound_as(d.st, effects_descriptor_type(), AsImmediate, Static(d.name), at);
+  let words = fill_missing_evidence(descriptor.st, outer.map(|w: EvidenceWord| w.word), at);
   let headed = set(
-    set(set(set(words.st, 1, mapped.arg), 2, desc.arg), 3, IntOperand(outer.len())),
+    set(set(set(words.st, 1, mapped.arg), 2, descriptor.arg), 3, IntOperand(outer.len())),
     4,
     IntOperand(placed.words),
   );
   let targeted = range(0, words.args.len()).fold(headed, |s: Lowering, i: Int|
     set(s, placed.targets + i, words.args.get(i)));
-  let labels = outer.fold([], |acc: List<Arg>, w: EvidenceWord|
+  let labels = outer.fold([], |accumulator: List<Arg>, w: EvidenceWord|
     match w.evidence.resource {
-      ResourceVariable(p) -> acc.push(label_value(context, p)),
-      _ -> acc,
+      ResourceVariable(p) -> accumulator.push(label_value(context, p)),
+      _ -> accumulator,
     });
   range(0, labels.len()).fold(targeted, |s: Lowering, l: Int|
     set(s, placed.labels + l, labels.get(l)))
 }
 
-fn handles_abort(context: Context, cl: CodeClause) -> Bool / {abort.raise} =
-  cl.op == b"raise" && cl.effect == b"abort"
+fn handles_abort(context: Context, clause: CodeClause) -> Bool =
+  clause.operation == b"raise" && clause.effect == b"abort"
 
 fn handler_variables(body: Code) -> Int =
   match body.node {
@@ -521,15 +544,18 @@ pub fn clause_captured_evidence(
   plan: HandlePlan,
   effects: Effects,
   at: Span,
-) -> { st: Lowering, held: CapturedEvidence } / {abort.raise} = {
+) -> { st: Lowering, held: CapturedEvidence } = {
   let around = match plan.forwarding { Some(f) -> { ..context, words: f.outer }, None -> context };
   let words = captured_evidence_for(around, st, words_of(context, effects), at);
   {
     st: words.st,
     held: {
       words: words.words,
-      instance: Some({ word: plan.instance.word, vars: plan.instance.layout.vars }),
-      kept: context.kept,
+      instance: Some({
+        word: plan.instance.word,
+        variable_count: plan.instance.layout.variable_count,
+      }),
+      retained_values: context.retained_arguments,
     },
   }
 }
@@ -537,16 +563,20 @@ pub fn clause_captured_evidence(
 fn handle_keys(
   context: Context,
   clauses: List<CodeClause>,
-) -> List<{ evidence: Evidence, effect: EffectName }> / {abort.raise} =
-  clauses.fold([], |acc: List<{ evidence: Evidence, effect: EffectName }>, cl: CodeClause| {
-    let en = match effect_of(context, cl.effect) {
-      Some(e) -> e,
-      None -> { global: cl.effect, operations: [] },
-    };
-    let returned = { effect: en.global, resource: clause_resource(context, cl) };
-    if acc.any(|k: { evidence: Evidence, effect: EffectName }| k.evidence == returned) { acc }
-    else { acc.push({ evidence: returned, effect: en }) }
-  })
+) -> List<{ evidence: Evidence, effect: EffectName }> =
+  clauses.fold(
+    [],
+    |accumulator: List<{ evidence: Evidence, effect: EffectName }>, clause: CodeClause| {
+      let en = match effect_of(context, clause.effect) {
+        Some(e) -> e,
+        None -> { global: clause.effect, operations: [] },
+      };
+      let returned = { effect: en.global, resource: clause_resource(context, clause) };
+      if accumulator.any(|k: { evidence: Evidence, effect: EffectName }| k.evidence == returned) {
+        accumulator
+      } else { accumulator.push({ evidence: returned, effect: en }) }
+    },
+  )
 
 pub fn enter_handle(
   context: Context,
@@ -561,8 +591,11 @@ pub fn enter_handle(
     context: {
       ..context,
       words: made.words.concat(context.words),
-      instance: Some({ word: i.word, vars: i.layout.vars }),
-      kept: match i.block { Some(b) -> context.kept.push(b), None -> context.kept },
+      instance: Some({ word: i.word, variable_count: i.layout.variable_count }),
+      retained_arguments: match i.block {
+        Some(b) -> context.retained_arguments.push(b),
+        None -> context.retained_arguments,
+      },
     },
     st: made.st,
   }
@@ -578,7 +611,7 @@ pub fn instance_objects(
   let i = plan.instance;
   let around = match plan.forwarding { Some(f) -> { ..context, words: f.outer }, None -> context };
   let keys = instance_keys(context, h.clauses);
-  let first = i.layout.vars + 2 * i.layout.count;
+  let first = i.layout.variable_count + 2 * i.layout.count;
   let made = keys.fold(
     {
       st: st,
@@ -586,19 +619,28 @@ pub fn instance_objects(
       object: first,
       table: first + keys.fold(0, |n: Int, k: InstanceKey| n + object_words(k)),
     },
-    |acc: { st: Lowering, words: List<EvidenceWord>, object: Int, table: Int }, k: InstanceKey| {
+    |accumulator: { st: Lowering, words: List<EvidenceWord>, object: Int, table: Int }, k: InstanceKey| {
       let kp = plan_key(around, h.clauses, k);
-      let o = write_object(around, acc.st, h.clauses, i, kp, acc.object, acc.table, at);
+      let o = write_object(
+        around,
+        accumulator.st,
+        h.clauses,
+        i,
+        kp,
+        accumulator.object,
+        accumulator.table,
+        at,
+      );
       {
         st: o.st,
-        words: acc.words.push({
+        words: accumulator.words.push({
           evidence: kp.key.evidence,
           word: o.arg,
           inherited: false,
           handled: true,
         }),
-        object: acc.object + object_words(k),
-        table: acc.table + tables_of(kp),
+        object: accumulator.object + object_words(k),
+        table: accumulator.table + tables_of(kp),
       }
     },
   );
@@ -609,7 +651,7 @@ fn object_words(k: InstanceKey) -> Int = 1 + 2 * k.effect.operations.len()
 
 type InstanceKey = { evidence: Evidence, effect: EffectName }
 
-fn instance_keys(context: Context, clauses: List<CodeClause>) -> List<InstanceKey> / {abort.raise} = {
+fn instance_keys(context: Context, clauses: List<CodeClause>) -> List<InstanceKey> = {
   let keys = handle_keys(context, clauses);
   keys.filter(|k: InstanceKey|
     k.evidence.resource == AnyResource
@@ -630,34 +672,38 @@ fn plan_key(
   let outer = if !every { [] } else {
     context.words.fold(
       { out: [], closed: false },
-      |acc: { out: List<EvidenceWord>, closed: Bool }, w: EvidenceWord|
-        if acc.closed || w.evidence.effect != k.evidence.effect { acc }
-        else { { out: acc.out.push(w), closed: w.evidence.resource == AnyResource } },
+      |accumulator: { out: List<EvidenceWord>, closed: Bool }, w: EvidenceWord|
+        if accumulator.closed || w.evidence.effect != k.evidence.effect { accumulator }
+        else { { out: accumulator.out.push(w), closed: w.evidence.resource == AnyResource } },
     ).out
   };
   let plain = outer.len() == 0
     || (outer.len() == 1 && outer.get(0).evidence.resource == AnyResource);
-  let returning = |op: Bytes|
+  let returning = |operation_name: Bytes|
     range(0, clauses.len()).filter(|c: Int|
       match clauses.at(c) {
-        Some(cl) ->
-          cl.op == op && cl.effect == k.evidence.effect
-            && (every || clause_resource(context, cl) == k.evidence.resource),
+        Some(clause) ->
+          clause.operation == operation_name && clause.effect == k.evidence.effect
+            && (every || clause_resource(context, clause) == k.evidence.resource),
         None -> false,
       });
   let on_every = |c: Int|
-    match clauses.at(c) { Some(cl) -> clause_resource(context, cl) == AnyResource, None -> false };
+    match clauses.at(c) {
+      Some(clause) -> clause_resource(context, clause) == AnyResource,
+      None -> false,
+    };
   let words = range(0, outer.len());
   {
     key: k,
     outer: outer,
-    slots: k.effect.operations.map(|op: EffectOperation| {
-      let all = returning(op.name);
+    slots: k.effect.operations.map(|operation: EffectOperation| {
+      let all = returning(operation.name);
       if !every { match all.at(0) { Some(c) -> ByClause(c), None -> ByWord } } else {
         let reach = all.fold(
           { out: [], closed: false },
-          |acc: { out: List<Int>, closed: Bool }, c: Int|
-            if acc.closed { acc } else { { out: acc.out.push(c), closed: on_every(c) } },
+          |accumulator: { out: List<Int>, closed: Bool }, c: Int|
+            if accumulator.closed { accumulator }
+            else { { out: accumulator.out.push(c), closed: on_every(c) } },
         );
         match reach.out.at(0) {
           None -> if plain { ByWord } else { ByTable({ clauses: [], words: words }) },
@@ -688,14 +734,14 @@ fn write_object(
   } else { { st: st, args: [ZeroOperand(AsImmediate)] } };
   let first_label = 2 + kp.outer.len();
   let clause_slot = |c: Int| {
-    let cl = clauses.get(c);
-    let entry = match entry_of(clause_mode(context, cl)) {
-      ReturnsResult -> if module_of(context.key) == scheduler_module() && !cl.binds_label {
+    let clause = clauses.get(c);
+    let entry = match entry_of(clause_mode(context, clause)) {
+      ReturnsResult -> if module_of(context.key) == scheduler_module() && !clause.binds_label {
         Schedules
       } else { ReturnsResult },
       other -> other,
     };
-    ClauseSlot({ entry: entry, record: i.layout.records.get(c), labelled: cl.binds_label })
+    ClauseSlot({ entry: entry, record: i.layout.records.get(c), labelled: clause.binds_label })
   };
   let labelled = |s: Lowering, labels: List<Arg>, r: Resource|
     match r {
@@ -715,13 +761,17 @@ fn write_object(
     };
   let laid = range(0, kp.slots.len()).fold(
     { st: routed_to.st, labels: [], slots: [], table: table },
-    |acc: { st: Lowering, labels: List<Arg>, slots: List<Slot>, table: Int }, j: Int|
+    |accumulator: { st: Lowering, labels: List<Arg>, slots: List<Slot>, table: Int }, j: Int|
       match kp.slots.get(j) {
-        ByClause(c) -> { ..acc, slots: acc.slots.push(clause_slot(c)) },
-        ByWord -> { ..acc, slots: acc.slots.push(CopiedSlot({ operand: 1, op: j })) },
+        ByClause(c) -> { ..accumulator, slots: accumulator.slots.push(clause_slot(c)) },
+        ByWord ->
+          {
+            ..accumulator,
+            slots: accumulator.slots.push(CopiedSlot({ operand: 1, operation: j })),
+          },
         ByTable(t) -> {
           let by_clause = t.clauses.fold(
-            { st: acc.st, labels: acc.labels, rows: [] },
+            { st: accumulator.st, labels: accumulator.labels, rows: [] },
             |r: { st: Lowering, labels: List<Arg>, rows: List<KeyedCase> }, c: Int| {
               let l = labelled(r.st, r.labels, clause_resource(context, clauses.get(c)));
               {
@@ -738,15 +788,20 @@ fn write_object(
               {
                 st: l.st,
                 labels: l.labels,
-                rows: r.rows.push({ label: l.at, slot: CopiedSlot({ operand: 2 + w, op: j }) }),
+                rows: r.rows.push({
+                  label: l.at,
+                  slot: CopiedSlot({ operand: 2 + w, operation: j }),
+                }),
               }
             },
           );
           {
             st: by_word.st,
             labels: by_word.labels,
-            slots: acc.slots.push(KeyedSlot({ table: acc.table, rows: by_word.rows })),
-            table: acc.table + 1 + 3 * by_word.rows.len(),
+            slots: accumulator.slots.push(
+              KeyedSlot({ table: accumulator.table, rows: by_word.rows }),
+            ),
+            table: accumulator.table + 1 + 3 * by_word.rows.len(),
           }
         },
       },
@@ -765,8 +820,8 @@ fn write_object(
     outer.st,
     evidence_type(),
     AsImmediate,
-    Op({
-      op: OfHandling(
+    OperationCall({
+      operation: OfHandling(
         ObjectAt({
           at: object,
           slots: laid.slots,
@@ -803,7 +858,7 @@ fn shared_over(
     )
   }
 
-fn only_returns(context: Context, cl: CodeClause) -> Bool / {abort.raise} =
+fn only_returns(context: Context, cl: CodeClause) -> Bool =
   clause_mode(context, cl) == 0 && cl.captures.len() == 0
     && module_of(context.key) != scheduler_module()
 
@@ -815,16 +870,16 @@ fn entry_of(mode: Int) -> ClauseEntry =
 
 fn may_stop(c: Clause) -> Bool = match entry_of(c.mode) { Resumes -> true, _ -> false }
 
-fn clause_resource(context: Context, cl: CodeClause) -> Resource =
-  if cl.label != None {
+fn clause_resource(context: Context, clause: CodeClause) -> Resource =
+  if clause.label != None {
     match range(0, context.label_names.len()).find(|i: Int|
-        context.label_names.at(i) == Some(cl.resource)) {
+        context.label_names.at(i) == Some(clause.resource)) {
       Some(p) -> ResourceVariable(p),
-      None -> NamedResource(cl.resource),
+      None -> NamedResource(clause.resource),
     }
-  } else if cl.resource == b"" { SingletonResource }
-  else if cl.resource == b"*" { AnyResource }
-  else { NamedResource(cl.resource) }
+  } else if clause.resource == b"" { SingletonResource }
+  else if clause.resource == b"*" { AnyResource }
+  else { NamedResource(clause.resource) }
 
 pub fn body_frame(
   context: Context,
@@ -834,20 +889,29 @@ pub fn body_frame(
   result: Type,
 ) -> Frame = {
   let inside = bound_in(h.body);
-  let reads = slots_read(h.body).fold([], |acc: List<Int>, r: Int|
-    if acc.contains(r) || inside.contains(r) { acc } else { acc.push(r) });
+  let reads = slots_read(h.body).fold([], |accumulator: List<Int>, r: Int|
+    if accumulator.contains(r) || inside.contains(r) { accumulator } else { accumulator.push(r) });
   {
     params: 0,
     size: reads.concat(inside).fold(0, |m: Int, r: Int| if r + 1 > m { r + 1 } else { m }),
-    captures: reads.map(|r: Int| { src: r, destination: r }),
+    captures: reads.map(|r: Int| { source: r, destination: r }),
     resumes: None,
     body: h.body,
-    ty: { params: [], kept: [], once: false, ret: result, effects: no_effects() },
+    ty: {
+      params: [],
+      keep_parameters: [],
+      once: false,
+      return_type: result,
+      effects: no_effects(),
+    },
     words: [],
     captured_evidence: {
       words: own.concat(match plan.forwarding { Some(f) -> f.outer, None -> [] }),
-      instance: Some({ word: plan.instance.word, vars: plan.instance.layout.vars }),
-      kept: context.kept,
+      instance: Some({
+        word: plan.instance.word,
+        variable_count: plan.instance.layout.variable_count,
+      }),
+      retained_values: context.retained_arguments,
     },
   }
 }
@@ -857,53 +921,53 @@ pub fn handle_assembled(
   st: Lowering,
   body: LoweredValue,
   clauses: List<Arg>,
-  ret: Option<Arg>,
+  return_closure: Option<Arg>,
   h: CodeHandler,
   plan: HandlePlan,
   at: Span,
 ) -> LoweredValue / {abort.raise} = {
   let detached = detaches(h.clauses);
-  let ty = match ret {
+  let ty = match return_closure {
     Some(r) -> return_type_of(type_of(r)),
     None -> if detached { return_type_of(type_of(body.arg)) } else { type_of(body.arg) },
   };
   let result_rep = if detached { AsWord } else { representation_of(context.setting, ty) };
   let inner = if detached { { outer: body.st, block: [], word: None } }
-  else if !falls_through(body.st.insts) {
-    { outer: exit_block(st, body.st), block: body.st.insts, word: None }
+  else if !falls_through(body.st.instructions) {
+    { outer: exit_block(st, body.st), block: body.st.instructions, word: None }
   } else {
-    match ret {
+    match return_closure {
       Some(r) -> {
         let w = represented_as(body, representation_of(context.setting, param_of(type_of(r))), at);
         let given = run_for_effect(
           w.st,
-          Op({
-            op: OfHandling(Returning),
+          OperationCall({
+            operation: OfHandling(Returning),
             args: [plan.instance.word, w.arg],
             uses: { takes: [false, true], owned: false, fails: false, suspends: false },
           }),
           at,
         );
-        { outer: exit_block(st, given), block: given.insts, word: None }
+        { outer: exit_block(st, given), block: given.instructions, word: None }
       },
       None -> {
         let w = represented_as(body, result_rep, at);
-        { outer: exit_block(st, w.st), block: w.st.insts, word: Some(w.arg) }
+        { outer: exit_block(st, w.st), block: w.st.instructions, word: Some(w.arg) }
       },
     }
   };
   let laid = range(0, h.clauses.len()).fold(
     { st: inner.outer, args: [], takes: [], clauses: [], unknown_effect: None },
-    |acc: ClauseLayout, i: Int|
+    |accumulator: ClauseLayout, i: Int|
       match h.clauses.at(i) {
-        None -> acc,
-        Some(cl) -> match clauses.at(i) {
-          None -> acc,
-          Some(closure) -> clause_added(context, acc, cl, closure, at),
+        None -> accumulator,
+        Some(clause) -> match clauses.at(i) {
+          None -> accumulator,
+          Some(closure) -> clause_added(context, accumulator, clause, closure, at),
         },
       },
   );
-  let tail = match ret {
+  let tail = match return_closure {
     Some(r) -> { args: laid.args.push(r), takes: laid.takes.push(true), at: Some(laid.args.len()) },
     None -> { args: laid.args, takes: laid.takes, at: None },
   };
@@ -911,8 +975,14 @@ pub fn handle_assembled(
     { args: tail.args.push(body.arg), takes: tail.takes.push(true), at: Some(tail.args.len()) }
   } else { { args: tail.args, takes: tail.takes, at: None } };
   let i = plan.instance;
-  let held = all.args.push(i.word).concat(match i.block { Some(b) -> [b], None -> [] });
-  let forwarded = held.concat(match plan.forwarding { Some(f) -> [f.pointer], None -> [] });
+  let instance_arguments = all.args.push(i.word).concat(match i.block {
+    Some(b) -> [b],
+    None -> [],
+  });
+  let forwarded = instance_arguments.concat(match plan.forwarding {
+    Some(f) -> [f.pointer],
+    None -> [],
+  });
   let result = if laid.clauses.any(may_stop) {
     let d = type_descriptor(context, laid.st, ty, at);
     { st: d.st, args: [d.arg] }
@@ -929,15 +999,15 @@ pub fn handle_assembled(
       heap: match i.block { Some(_) -> Some(all.args.len() + 1), None -> None },
     },
     detached: match ((all.at, plan.forwarding)) {
-      (Some(body), Some(_)) -> Some({ body: body, forwards: held.len() }),
+      (Some(body), Some(_)) -> Some({ body: body, forwards: instance_arguments.len() }),
       _ -> None,
     },
   };
   let a = fresh(site.st, ty, result_rep);
   match laid.unknown_effect {
-    Some(name) -> unreachable(b"an effect the lowering does not resolve: ".concat(name)),
+    Some(name) -> unreachable(b"the compiler cannot find the effect: ".concat(name)),
     None -> if escapes(inner.block, false, false) {
-      unreachable(b"a handle body that leaves other than by its end")
+      unreachable(b"a handle body exits before reaching its end")
     } else {
       let out = emitted(
         a.st,
@@ -950,7 +1020,7 @@ pub fn handle_assembled(
           uses: { takes: site.takes, owned: true, fails: true, suspends: false },
           site: {
             clauses: laid.clauses,
-            ret: tail.at,
+            return_clause: tail.at,
             detached: site.detached,
             instance: site.instance,
           },
@@ -959,7 +1029,7 @@ pub fn handle_assembled(
         }),
       );
       represented_as(
-        { st: out, arg: VarOperand(a.var) },
+        { st: out, arg: VariableOperand(a.var) },
         representation_of(context.setting, ty),
         at,
       )
@@ -977,17 +1047,17 @@ pub fn lower_detached_handle(
   at: Span,
 ) -> LoweredValue / {abort.raise} =
   match context.instance {
-    Some(held) -> {
+    Some(enclosing_instance) -> {
       let i = plan.instance;
-      let inner = if !falls_through(body.st.insts) {
-        { outer: exit_block(before, body.st), block: body.st.insts, word: None }
+      let inner = if !falls_through(body.st.instructions) {
+        { outer: exit_block(before, body.st), block: body.st.instructions, word: None }
       } else {
         let w = represented_as(body, AsWord, at);
-        { outer: exit_block(before, w.st), block: w.st.insts, word: Some(w.arg) }
+        { outer: exit_block(before, w.st), block: w.st.instructions, word: Some(w.arg) }
       };
       let a = fresh(inner.outer, result, AsWord);
       if escapes(inner.block, false, false) {
-        unreachable(b"a handle body that leaves other than by its end")
+        unreachable(b"a handle body exits before reaching its end")
       } else {
         let out = emitted(
           a.st,
@@ -996,11 +1066,11 @@ pub fn lower_detached_handle(
               Some(w) -> inner.block.push(Assign({ var: a.var, arg: w })),
               None -> inner.block,
             },
-            args: [held.word],
+            args: [enclosing_instance.word],
             uses: { takes: [false], owned: true, fails: true, suspends: false },
             site: {
               clauses: preset_clauses(context, h.clauses),
-              ret: None,
+              return_clause: None,
               detached: None,
               instance: { ..i.layout, operand: 0, result: None, heap: Some(0), preset: true },
             },
@@ -1009,18 +1079,24 @@ pub fn lower_detached_handle(
           }),
         );
         represented_as(
-          { st: out, arg: VarOperand(a.var) },
+          { st: out, arg: VariableOperand(a.var) },
           representation_of(context.setting, result),
           at,
         )
       }
     },
-    None -> unreachable(b"a detached body holding no instance"),
+    None -> unreachable(b"a body that runs in a separate task has no enclosing handler instance"),
   }
 
-fn preset_clauses(context: Context, clauses: List<CodeClause>) -> List<Clause> / {abort.raise} =
-  clauses.map(|cl: CodeClause|
-    { effect: cl.effect, op: cl.op, mode: clause_mode(context, cl), string: None, handler: 0 })
+fn preset_clauses(context: Context, clauses: List<CodeClause>) -> List<Clause> =
+  clauses.map(|clause: CodeClause|
+    {
+      effect: clause.effect,
+      operation: clause.operation,
+      mode: clause_mode(context, clause),
+      string: None,
+      handler: 0,
+    })
 
 pub fn parallel_block(
   context: Context,
@@ -1031,26 +1107,26 @@ pub fn parallel_block(
 ) -> LoweredValue / {abort.raise} = {
   let closures = branches.fold(
     { st: st, args: [] },
-    |acc: { st: Lowering, args: List<Arg> }, b: Arg| {
-      let w = represented_as({ st: acc.st, arg: b }, AsWord, at);
-      { st: w.st, args: acc.args.push(w.arg) }
+    |accumulator: { st: Lowering, args: List<Arg> }, b: Arg| {
+      let w = represented_as({ st: accumulator.st, arg: b }, AsWord, at);
+      { st: w.st, args: accumulator.args.push(w.arg) }
     },
   );
   let described = branches.fold(
     { st: closures.st, args: [] },
-    |acc: { st: Lowering, args: List<Arg> }, b: Arg| {
-      let d = type_descriptor(context, acc.st, return_type_of(type_of(b)), at);
-      { st: d.st, args: acc.args.push(d.arg) }
+    |accumulator: { st: Lowering, args: List<Arg> }, b: Arg| {
+      let d = type_descriptor(context, accumulator.st, return_type_of(type_of(b)), at);
+      { st: d.st, args: accumulator.args.push(d.arg) }
     },
   );
   let unaborted = {
     ..context,
     words: context.words.filter(|w: EvidenceWord| w.evidence.effect != b"abort"),
   };
-  let handing = function_value_evidence(unaborted, described.st, performs, at);
+  let evidence = function_value_evidence(unaborted, described.st, performs, at);
   let entering = run_for_effect(
-    handing.st,
-    Op({ op: OfHandling(Entering), args: handing.args, uses: reads(2) }),
+    evidence.st,
+    OperationCall({ operation: OfHandling(Entering), args: evidence.args, uses: reads(2) }),
     at,
   );
   let words = { st: entering, args: closures.args.concat(described.args) };
@@ -1066,8 +1142,8 @@ pub fn parallel_block(
         }),
     ),
   );
-  let op = Op({
-    op: OfHandling(Parallel),
+  let parallel_operation = OperationCall({
+    operation: OfHandling(Parallel),
     args: words.args,
     uses: {
       takes: closures.args.map(|_: Arg| true).concat(described.args.map(|_: Arg| false)),
@@ -1077,23 +1153,23 @@ pub fn parallel_block(
     },
   });
   let results = branches.map(|b: Arg| return_type_of(type_of(b)));
-  let gathered = bound_as(words.st, parallel_results_type(results), AsWord, op, at);
+  let gathered = bound_as(words.st, parallel_results_type(results), AsWord, parallel_operation, at);
   match gathered.arg {
-    VarOperand(record) -> {
+    VariableOperand(record) -> {
       let parts = range(0, branches.len()).fold(
         { st: gathered.st, fields: [] },
-        |acc: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, i: Int| {
+        |accumulator: { st: Lowering, fields: List<{ name: Bytes, arg: Arg }> }, i: Int| {
           let name = b"_".concat(ascii_of_int(i));
           let t = results.get(i);
           let w = bound_as(
-            acc.st,
+            accumulator.st,
             t,
             AsWord,
             Get({ of: record, path: FieldPath({ name: name, at: i }) }),
             at,
           );
           let h = represented_as(w, representation_of(context.setting, t), at);
-          { st: h.st, fields: acc.fields.push({ name: name, arg: h.arg }) }
+          { st: h.st, fields: accumulator.fields.push({ name: name, arg: h.arg }) }
         },
       );
       record_literal_as(context, parts.st, parts.fields, ty, at)
@@ -1112,59 +1188,64 @@ type ClauseLayout = {
 
 fn clause_added(
   context: Context,
-  acc: ClauseLayout,
-  cl: CodeClause,
+  accumulator: ClauseLayout,
+  clause: CodeClause,
   closure: Arg,
   at: Span,
 ) -> ClauseLayout / {abort.raise} =
-  match effect_of(context, cl.effect) {
+  match effect_of(context, clause.effect) {
     None ->
       {
-        ..acc,
-        unknown_effect: match acc.unknown_effect { Some(u) -> Some(u), None -> Some(cl.effect) },
+        ..accumulator,
+        unknown_effect: match accumulator.unknown_effect {
+          Some(u) -> Some(u),
+          None -> Some(clause.effect),
+        },
       },
     Some(en) -> {
-      let stringed = cl.binds_label || (en.global == b"abort" && cl.op == b"raise");
+      let stringed = clause.binds_label || (en.global == b"abort" && clause.operation == b"raise");
       let bound = if stringed {
-        let d = type_descriptor(context, acc.st, string_type(), at);
+        let d = type_descriptor(context, accumulator.st, string_type(), at);
         { st: d.st, args: [d.arg] }
-      } else { { st: acc.st, args: [] } };
+      } else { { st: accumulator.st, args: [] } };
       {
         st: bound.st,
-        args: acc.args.push(closure).concat(bound.args),
-        takes: acc.takes.push(true).concat(bound.args.map(|_: Arg| false)),
-        clauses: acc.clauses.push({
+        args: accumulator.args.push(closure).concat(bound.args),
+        takes: accumulator.takes.push(true).concat(bound.args.map(|_: Arg| false)),
+        clauses: accumulator.clauses.push({
           effect: en.global,
-          op: cl.op,
-          mode: clause_mode(context, cl),
-          string: if stringed { Some(acc.args.len() + 1) } else { None },
-          handler: acc.args.len(),
+          operation: clause.operation,
+          mode: clause_mode(context, clause),
+          string: if stringed { Some(accumulator.args.len() + 1) } else { None },
+          handler: accumulator.args.len(),
         }),
-        unknown_effect: acc.unknown_effect,
+        unknown_effect: accumulator.unknown_effect,
       }
     },
   }
 
-fn clause_mode(context: Context, cl: CodeClause) -> Int / {abort.raise} =
-  if match effect_of(context, cl.effect) { Some(e) -> is_raise(op_mode(e, cl.op)), None -> false } {
-    3
-  } else if !cl.resume { 0 }
-  else if resume_in_tail_only(cl) { 1 }
+fn clause_mode(context: Context, clause: CodeClause) -> Int =
+  if match effect_of(context, clause.effect) {
+      Some(e) -> is_raise(operation_mode(e, clause.operation)),
+      None -> false,
+    } { 3 }
+  else if !clause.resume { 0 }
+  else if resume_in_tail_only(clause) { 1 }
   else { 2 }
 
 pub fn detaches(clauses: List<CodeClause>) -> Bool =
-  clauses.any(|cl: CodeClause| cl.resume && !resume_in_tail_only(cl))
+  clauses.any(|clause: CodeClause| clause.resume && !resume_in_tail_only(clause))
 
-fn resume_in_tail_only(cl: CodeClause) -> Bool = {
-  let k = cl.params + (if cl.binds_label { 1 } else { 0 });
-  slots_read(cl.body).fold(0, |n: Int, y: Int| if y == k { n + 1 } else { n })
-    == tail_calls_of(cl.body, k)
+fn resume_in_tail_only(clause: CodeClause) -> Bool = {
+  let k = clause.params + (if clause.binds_label { 1 } else { 0 });
+  slots_read(clause.body).fold(0, |n: Int, y: Int| if y == k { n + 1 } else { n })
+    == tail_calls_of(clause.body, k)
 }
 
 fn tail_calls_of(code: Code, k: Int) -> Int =
   match code.node {
     CodeApply(a) -> match a.function.node {
-      CodeVar(v) -> if v.slot == k && a.args.len() == 1 && !all_read(a.args).contains(k) { 1 }
+      CodeVariable(v) -> if v.slot == k && a.args.len() == 1 && !all_read(a.args).contains(k) { 1 }
       else { 0 },
       _ -> 0,
     },
@@ -1177,39 +1258,46 @@ fn tail_calls_of(code: Code, k: Int) -> Int =
 fn bound_in(c: Code) -> List<Int> =
   match c.node {
     CodeBlock(b) ->
-      b.statements.fold([], |acc: List<Int>, s: CodeStatement|
-        acc.concat(match s {
+      b.statements.fold([], |accumulator: List<Int>, s: CodeStatement|
+        accumulator.concat(match s {
           CodeLet(l) -> bound_in(l.value).push(l.slot),
           CodeLetDestructure(l) -> bound_in(l.value).concat(pattern_slots(l.pattern)),
           CodeDo(d) -> bound_in(d.code),
         })).concat(match b.tail { Some(t) -> bound_in(t), None -> [] }),
     CodeIf(i) -> bound_in(i.cond).concat(bound_in(i.then_branch)).concat(bound_in(i.else_branch)),
     CodeMatch(m) ->
-      m.arms.fold(bound_in(m.scrutinee), |acc: List<Int>, a: CodeArm|
-        acc.concat(pattern_slots(a.pattern)).concat(match a.guard {
+      m.arms.fold(bound_in(m.scrutinee), |accumulator: List<Int>, a: CodeArm|
+        accumulator.concat(pattern_slots(a.pattern)).concat(match a.guard {
           Some(g) -> bound_in(g),
           None -> [],
         }).concat(
           bound_in(a.body),
         )),
     CodeUnary(u) -> bound_in(u.operand),
-    CodeBinary(x) -> bound_in(x.lhs).concat(bound_in(x.rhs)),
+    CodeBinary(x) -> bound_in(x.left_operand).concat(bound_in(x.right_operand)),
     CodeApply(a) ->
-      a.args.fold(bound_in(a.function), |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
-    CodeList(l) -> l.items.fold([], |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
+      a.args.fold(bound_in(a.function), |accumulator: List<Int>, x: Code|
+        accumulator.concat(bound_in(x))),
+    CodeList(l) ->
+      l.items.fold([], |accumulator: List<Int>, x: Code| accumulator.concat(bound_in(x))),
     CodeRecord(r) ->
-      r.fields.fold([], |acc: List<Int>, f: CodeField| acc.concat(bound_in(f.value))),
+      r.fields.fold([], |accumulator: List<Int>, f: CodeField|
+        accumulator.concat(bound_in(f.value))),
     CodeFieldRead(f) -> bound_in(f.base),
     CodeUpdate(u) ->
-      u.sets.fold(bound_in(u.base), |acc: List<Int>, f: CodeField| acc.concat(bound_in(f.value))),
-    CodePerform(p) -> p.args.fold([], |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
-    CodeParallel(pr) -> pr.branches.fold([], |acc: List<Int>, x: Code| acc.concat(bound_in(x))),
-    CodeHandle(hd) -> bound_in(hd.body),
+      u.sets.fold(bound_in(u.base), |accumulator: List<Int>, f: CodeField|
+        accumulator.concat(bound_in(f.value))),
+    CodePerform(p) ->
+      p.args.fold([], |accumulator: List<Int>, x: Code| accumulator.concat(bound_in(x))),
+    CodeParallel(parallel_expression) ->
+      parallel_expression.branches.fold([], |accumulator: List<Int>, x: Code|
+        accumulator.concat(bound_in(x))),
+    CodeHandle(handle_expression) -> bound_in(handle_expression.body),
     _ -> [],
   }
 
 fn escapes(b: Block, matched: Bool, looped: Bool) -> Bool =
-  b.fold(false, |found: Bool, i: Inst|
+  b.fold(false, |found: Bool, i: Instruction|
     found
       || (match i {
         Return(_) -> true,
@@ -1228,11 +1316,12 @@ fn escapes(b: Block, matched: Bool, looped: Bool) -> Bool =
           m.arms.fold(escapes(m.rest, matched, looped), |any: Bool, a: Block|
             any || escapes(a, true, looped)),
         Loop(l) -> escapes(l.body, matched, true),
-        Handle(hd) -> escapes(hd.body, false, false),
+        Handle(handle_instruction) -> escapes(handle_instruction.body, false, false),
         _ -> false,
       }))
 
-fn return_type_of(t: Type) -> Type = match t { FunctionType(f) -> f.ret, _ -> unknown_type() }
+fn return_type_of(t: Type) -> Type =
+  match t { FunctionType(f) -> f.return_type, _ -> unknown_type() }
 
 fn param_of(t: Type) -> Type =
   match t {
@@ -1240,13 +1329,15 @@ fn param_of(t: Type) -> Type =
     _ -> unknown_type(),
   }
 
-fn op_declared(e: EffectName, op: Bytes) -> EffectOperation =
+fn declared_operation(e: EffectName, operation_name: Bytes) -> EffectOperation =
   e.operations.fold(
-    { name: op, mode: ReadMode, params: [], ret: unknown_type(), own: [] },
-    |acc: EffectOperation, o: EffectOperation| if o.name == op { o } else { acc },
+    { name: operation_name, mode: ReadMode, params: [], return_type: unknown_type(), own: [] },
+    |accumulator: EffectOperation, o: EffectOperation|
+      if o.name == operation_name { o } else { accumulator },
   )
 
-fn op_mode(e: EffectName, op: Bytes) -> Mode = op_declared(e, op).mode
+fn operation_mode(e: EffectName, operation_name: Bytes) -> Mode =
+  declared_operation(e, operation_name).mode
 
 fn mode_code(m: Mode) -> Int =
   match m { ReadMode -> 0, WriteMode -> 1, RaiseMode -> 2, InvalidMode -> 0 }

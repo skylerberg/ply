@@ -12,8 +12,9 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     InvalidExpression, HoleExpression, TryBlockExpression,
                                     Statement, LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, Param, NamedArg, MatchArm, HandleClause,
-                                    ReturnClause, HandlerVar, RecordLiteralField, expression_span,
-                                    TaggedLiteralExpression, Hole, home_modules, sees_homes)
+                                    ReturnClause, HandlerStateVariable, RecordLiteralField,
+                                    expression_span, TaggedLiteralExpression, Hole, home_modules,
+                                    sees_homes)
 import compiler.syntax.calls (slotted, ordered_arguments, Slot, FromDefault, UnmatchedReason,
                               NoSuchParameter, FilledByPosition)
 import std.list
@@ -45,10 +46,10 @@ fn rejected(qualifier: Qualifier, span: Span) -> Qualifier =
         b"E0121",
         qualifier.owner,
         span,
-        b"a parameter default must be a pure, closed expression",
-        b"this runs, rather than being a value",
+        b"a parameter default must be a pure constant value, not a computation",
+        b"this expression runs code instead of being a plain value",
         [
-          b"the default is copied into every call that omits the argument, so a call or a `perform` in it would run at the caller and not here",
+          b"the default is copied into every call that omits the argument, so a call or a `perform` in it would run at the caller, not where the default is written",
           b"a literal, a `const`, a constructor applied to these, a record or a list is fine",
         ],
       ),
@@ -163,7 +164,15 @@ fn qualify_expression(
     },
     LambdaExpression(l) -> {
       let o: QualifyResult = qualify_expression(resolved, qualifier, l.body);
-      { q: o.q, e: LambdaExpression({ span: l.span, body: o.e, params: l.params, ret: l.ret }) }
+      {
+        q: o.q,
+        e: LambdaExpression({
+          span: l.span,
+          body: o.e,
+          params: l.params,
+          return_clause: l.return_clause,
+        }),
+      }
     },
     CallExpression(a) -> if a.named.len() > 0
         || !(match a.function { NameExpression(v) -> starts_upper(v.name.name.name), _ -> false }) {
@@ -173,9 +182,9 @@ fn qualify_expression(
       let args = qualify_expressions(resolved, f.q, a.args);
       let named = a.named.fold(
         { q: args.q, xs: [] },
-        |acc: { q: Qualifier, xs: List<NamedArg> }, arg: NamedArg| {
-          let o = qualify_expression(resolved, acc.q, arg.value);
-          { q: o.q, xs: acc.xs.push({ name: arg.name, value: o.e, span: arg.span }) }
+        |accumulator: { q: Qualifier, xs: List<NamedArg> }, arg: NamedArg| {
+          let o = qualify_expression(resolved, accumulator.q, arg.value);
+          { q: o.q, xs: accumulator.xs.push({ name: arg.name, value: o.e, span: arg.span }) }
         },
       );
       {
@@ -193,18 +202,23 @@ fn qualify_expression(
       let s: QualifyResult = qualify_expression(resolved, qualifier, m.scrutinee);
       let arms = m.arms.fold(
         { q: s.q, xs: [] },
-        |acc: { q: Qualifier, xs: List<MatchArm> }, arm: MatchArm| {
+        |accumulator: { q: Qualifier, xs: List<MatchArm> }, arm: MatchArm| {
           let g: { q: Qualifier, e: Option<Expression> } = match arm.guard {
-            None -> { q: acc.q, e: None },
+            None -> { q: accumulator.q, e: None },
             Some(x) -> {
-              let o: QualifyResult = qualify_expression(resolved, acc.q, x);
+              let o: QualifyResult = qualify_expression(resolved, accumulator.q, x);
               { q: o.q, e: Some(o.e) }
             },
           };
           let body: QualifyResult = qualify_expression(resolved, g.q, arm.body);
           {
             q: body.q,
-            xs: acc.xs.push({ pattern: arm.pattern, guard: g.e, body: body.e, span: arm.span }),
+            xs: accumulator.xs.push({
+              pattern: arm.pattern,
+              guard: g.e,
+              body: body.e,
+              span: arm.span,
+            }),
           }
         },
       );
@@ -213,27 +227,31 @@ fn qualify_expression(
     BlockExpression(b) -> {
       let statements: { q: Qualifier, xs: List<Statement> } = b.statements.fold(
         { q: qualifier, xs: [] },
-        |acc: { q: Qualifier, xs: List<Statement> }, s: Statement|
+        |accumulator: { q: Qualifier, xs: List<Statement> }, s: Statement|
           match s {
             LetStatement(l) -> {
-              let o: QualifyResult = qualify_expression(resolved, acc.q, l.value);
+              let o: QualifyResult = qualify_expression(resolved, accumulator.q, l.value);
               {
                 q: o.q,
-                xs: acc.xs.push(
+                xs: accumulator.xs.push(
                   LetStatement({ span: l.span, pattern: l.pattern, ty: l.ty, value: o.e }),
                 ),
               }
             },
             LetElseStatement(l) -> {
-              let o: QualifyResult = qualify_expression(resolved, acc.q, l.value);
+              let o: QualifyResult = qualify_expression(resolved, accumulator.q, l.value);
               let fb: QualifyResult = qualify_expression(resolved, o.q, l.fallback);
-              { q: fb.q, xs: acc.xs.push(LetElseStatement({ ..l, value: o.e, fallback: fb.e })) }
+              {
+                q: fb.q,
+                xs: accumulator.xs.push(LetElseStatement({ ..l, value: o.e, fallback: fb.e })),
+              }
             },
             ExpressionStatement(x) -> {
-              let o: QualifyResult = qualify_expression(resolved, acc.q, x);
-              { q: o.q, xs: acc.xs.push(ExpressionStatement(o.e)) }
+              let o: QualifyResult = qualify_expression(resolved, accumulator.q, x);
+              { q: o.q, xs: accumulator.xs.push(ExpressionStatement(o.e)) }
             },
-            AssignmentStatement(x) -> { q: rejected(acc.q, x.span), xs: acc.xs.push(s) },
+            AssignmentStatement(x) ->
+              { q: rejected(accumulator.q, x.span), xs: accumulator.xs.push(s) },
           },
       );
       let tail: { q: Qualifier, e: Option<Expression> } = match b.tail {
@@ -246,13 +264,21 @@ fn qualify_expression(
       { q: tail.q, e: BlockExpression({ span: b.span, tail: tail.e, statements: statements.xs }) }
     },
     BinaryExpression(b) -> {
-      let l = qualify_expression(resolved, qualifier, b.lhs);
-      let rr = qualify_expression(resolved, l.q, b.rhs);
-      { q: rr.q, e: BinaryExpression({ span: b.span, op: b.op, lhs: l.e, rhs: rr.e }) }
+      let l = qualify_expression(resolved, qualifier, b.left_operand);
+      let rr = qualify_expression(resolved, l.q, b.right_operand);
+      {
+        q: rr.q,
+        e: BinaryExpression({
+          span: b.span,
+          operation: b.operation,
+          left_operand: l.e,
+          right_operand: rr.e,
+        }),
+      }
     },
     UnaryExpression(u) -> {
       let o: QualifyResult = qualify_expression(resolved, qualifier, u.operand);
-      { q: o.q, e: UnaryExpression({ span: u.span, op: u.op, operand: o.e }) }
+      { q: o.q, e: UnaryExpression({ span: u.span, operation: u.operation, operand: o.e }) }
     },
     IfExpression(i) -> {
       let c = qualify_expression(resolved, qualifier, i.cond);
@@ -260,14 +286,14 @@ fn qualify_expression(
       let el = qualify_expression(resolved, t.q, i.else_branch);
       { q: el.q, e: IfExpression({ span: i.span, cond: c.e, then_branch: t.e, else_branch: el.e }) }
     },
-    RecordExpression(rec) -> {
-      let o = qualify_fields(resolved, qualifier, rec.fields);
-      { q: o.q, e: RecordExpression({ span: rec.span, fields: o.xs }) }
+    RecordExpression(record) -> {
+      let o = qualify_fields(resolved, qualifier, record.fields);
+      { q: o.q, e: RecordExpression({ span: record.span, fields: o.xs }) }
     },
-    RecordUpdateExpression(rec) -> {
-      let b = qualify_expression(resolved, qualifier, rec.base);
-      let o = qualify_fields(resolved, b.q, rec.fields);
-      { q: o.q, e: RecordUpdateExpression({ span: rec.span, base: b.e, fields: o.xs }) }
+    RecordUpdateExpression(record) -> {
+      let b = qualify_expression(resolved, qualifier, record.base);
+      let o = qualify_fields(resolved, b.q, record.fields);
+      { q: o.q, e: RecordUpdateExpression({ span: record.span, base: b.e, fields: o.xs }) }
     },
     FieldExpression(f) -> {
       let o: QualifyResult = qualify_expression(resolved, qualifier, f.base);
@@ -289,9 +315,9 @@ fn qualify_expressions(
 ) -> { q: Qualifier, xs: List<Expression> } / {abort.raise} =
   expressions.fold(
     { q: qualifier, xs: [] },
-    |acc: { q: Qualifier, xs: List<Expression> }, expression: Expression| {
-      let o = qualify_expression(resolved, acc.q, expression);
-      { q: o.q, xs: acc.xs.push(o.e) }
+    |accumulator: { q: Qualifier, xs: List<Expression> }, expression: Expression| {
+      let o = qualify_expression(resolved, accumulator.q, expression);
+      { q: o.q, xs: accumulator.xs.push(o.e) }
     },
   )
 
@@ -302,9 +328,9 @@ fn qualify_fields(
 ) -> { q: Qualifier, xs: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { q: qualifier, xs: [] },
-    |acc: { q: Qualifier, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
-      let o = qualify_expression(resolved, acc.q, field.value);
-      { q: o.q, xs: acc.xs.push({ name: field.name, value: o.e }) }
+    |accumulator: { q: Qualifier, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
+      let o = qualify_expression(resolved, accumulator.q, field.value);
+      { q: o.q, xs: accumulator.xs.push({ name: field.name, value: o.e }) }
     },
   )
 
@@ -327,8 +353,8 @@ fn collect_signatures(
 ) -> SignatureCollection / {abort.raise} =
   range(0, modules.len()).fold(
     { sigs: [], owner_imports: [], diagnostics: [] },
-    |acc: SignatureCollection, m: Int|
-      modules.get(m).module.items.fold(acc, |c: SignatureCollection, item: Item|
+    |accumulator: SignatureCollection, m: Int|
+      modules.get(m).module.items.fold(accumulator, |c: SignatureCollection, item: Item|
         match item {
           FunctionItem(f) -> collect_signature(resolved, modules, m, c, f, constants),
           _ -> c,
@@ -349,10 +375,13 @@ fn collect_signature(
   let params = definition.params.map(|param: Param| param.name.span.site);
   let walked: { c: SignatureCollection, params: List<ParamInfo> } = definition.params.fold(
     { c: c, params: [] },
-    |acc: { c: SignatureCollection, params: List<ParamInfo> }, param: Param|
+    |accumulator: { c: SignatureCollection, params: List<ParamInfo> }, param: Param|
       match param.default {
         None ->
-          { ..acc, params: acc.params.push({ name: param.name.name, default: None, imports: [] }) },
+          {
+            ..accumulator,
+            params: accumulator.params.push({ name: param.name.name, default: None, imports: [] }),
+          },
         Some(d) -> {
           let o = qualify_expression(
             resolved,
@@ -362,7 +391,7 @@ fn collect_signature(
               binders: binders,
               params: params,
               imports: [],
-              diagnostics: acc.c.diagnostics,
+              diagnostics: accumulator.c.diagnostics,
               rejected: false,
               constants: constants,
             },
@@ -370,18 +399,22 @@ fn collect_signature(
           );
           if o.q.rejected {
             {
-              c: { ..acc.c, diagnostics: o.q.diagnostics },
-              params: acc.params.push({ name: param.name.name, default: None, imports: [] }),
+              c: { ..accumulator.c, diagnostics: o.q.diagnostics },
+              params: accumulator.params.push({
+                name: param.name.name,
+                default: None,
+                imports: [],
+              }),
             }
           } else {
             let owner_imports = o.q.imports.fold(
-              acc.c.owner_imports,
+              accumulator.c.owner_imports,
               |oi: List<{ module: Int, binder: Bytes, target: Int }>, binding: ModuleBinding|
                 oi.push({ module: m, binder: binding.binder, target: binding.target }),
             );
             {
-              c: { ..acc.c, diagnostics: o.q.diagnostics, owner_imports: owner_imports },
-              params: acc.params.push({
+              c: { ..accumulator.c, diagnostics: o.q.diagnostics, owner_imports: owner_imports },
+              params: accumulator.params.push({
                 name: param.name.name,
                 default: Some(o.e),
                 imports: o.q.imports,
@@ -444,7 +477,7 @@ fn reads_constant(f: FillContext, filler: Filler, name: QName) -> Bool / {abort.
 type Perform = {
   span: Span,
   effect_name: QName,
-  op: Identifier,
+  operation: Identifier,
   resource: Option<Identifier>,
   args: List<Expression>,
 }
@@ -453,12 +486,16 @@ fn method_of_constant(p: Perform, args: List<Expression>) -> Expression =
   CallExpression({
     span: p.span,
     function: FieldExpression({
-      span: synthetic_span_at(span_to(p.effect_name.span, p.op.span), p.span, role_member_field()),
+      span: synthetic_span_at(
+        span_to(p.effect_name.span, p.operation.span),
+        p.span,
+        role_member_field(),
+      ),
       base: constant_read(
         synthetic_span_at(p.effect_name.span, p.span, role_member_receiver()),
         p.effect_name,
       ),
-      field: p.op,
+      field: p.operation,
     }),
     named: [],
     args: args,
@@ -484,9 +521,9 @@ fn fill_children(
     TaggedLiteralExpression(t) -> {
       let filled = t.holes.fold(
         { filler: filler, holes: [] },
-        |acc: { filler: Filler, holes: List<Hole> }, h: Hole| {
-          let o: FillResult = fill_expression(f, acc.filler, h.value);
-          { filler: o.filler, holes: acc.holes.push({ ..h, value: o.expression }) }
+        |accumulator: { filler: Filler, holes: List<Hole> }, h: Hole| {
+          let o: FillResult = fill_expression(f, accumulator.filler, h.value);
+          { filler: o.filler, holes: accumulator.holes.push({ ..h, value: o.expression }) }
         },
       );
       { filler: filled.filler, expression: TaggedLiteralExpression({ ..t, holes: filled.holes }) }
@@ -500,15 +537,15 @@ fn fill_children(
     HoleExpression(_) -> { filler: filler, expression: expression },
     InvalidExpression(_) -> { filler: filler, expression: expression },
     BinaryExpression(b) -> {
-      let l = fill_expression(f, filler, b.lhs);
-      let rr = fill_expression(f, l.filler, b.rhs);
+      let l = fill_expression(f, filler, b.left_operand);
+      let rr = fill_expression(f, l.filler, b.right_operand);
       {
         filler: rr.filler,
         expression: BinaryExpression({
           span: b.span,
-          op: b.op,
-          lhs: l.expression,
-          rhs: rr.expression,
+          operation: b.operation,
+          left_operand: l.expression,
+          right_operand: rr.expression,
         }),
       }
     },
@@ -516,7 +553,11 @@ fn fill_children(
       let o: FillResult = fill_expression(f, filler, u.operand);
       {
         filler: o.filler,
-        expression: UnaryExpression({ span: u.span, op: u.op, operand: o.expression }),
+        expression: UnaryExpression({
+          span: u.span,
+          operation: u.operation,
+          operand: o.expression,
+        }),
       }
     },
     LambdaExpression(l) -> {
@@ -527,7 +568,7 @@ fn fill_children(
           span: l.span,
           body: o.expression,
           params: l.params,
-          ret: l.ret,
+          return_clause: l.return_clause,
         }),
       }
     },
@@ -536,11 +577,11 @@ fn fill_children(
       let args = fill_expressions(f, fn_.filler, a.args);
       let named = a.named.fold(
         { filler: args.filler, xs: [] },
-        |acc: { filler: Filler, xs: List<NamedArg> }, arg: NamedArg| {
-          let o = fill_expression(f, acc.filler, arg.value);
+        |accumulator: { filler: Filler, xs: List<NamedArg> }, arg: NamedArg| {
+          let o = fill_expression(f, accumulator.filler, arg.value);
           {
             filler: o.filler,
-            xs: acc.xs.push({ name: arg.name, value: o.expression, span: arg.span }),
+            xs: accumulator.xs.push({ name: arg.name, value: o.expression, span: arg.span }),
           }
         },
       );
@@ -573,18 +614,18 @@ fn fill_children(
       let s = fill_expression(f, filler, m.scrutinee);
       let arms = m.arms.fold(
         { filler: s.filler, xs: [] },
-        |acc: { filler: Filler, xs: List<MatchArm> }, arm: MatchArm| {
+        |accumulator: { filler: Filler, xs: List<MatchArm> }, arm: MatchArm| {
           let g: { filler: Filler, expression: Option<Expression> } = match arm.guard {
-            None -> { filler: acc.filler, expression: None },
+            None -> { filler: accumulator.filler, expression: None },
             Some(x) -> {
-              let o: FillResult = fill_expression(f, acc.filler, x);
+              let o: FillResult = fill_expression(f, accumulator.filler, x);
               { filler: o.filler, expression: Some(o.expression) }
             },
           };
           let body: FillResult = fill_expression(f, g.filler, arm.body);
           {
             filler: body.filler,
-            xs: acc.xs.push({
+            xs: accumulator.xs.push({
               pattern: arm.pattern,
               guard: g.expression,
               body: body.expression,
@@ -601,36 +642,36 @@ fn fill_children(
     BlockExpression(b) -> {
       let statements: { filler: Filler, xs: List<Statement> } = b.statements.fold(
         { filler: filler, xs: [] },
-        |acc: { filler: Filler, xs: List<Statement> }, s: Statement|
+        |accumulator: { filler: Filler, xs: List<Statement> }, s: Statement|
           match s {
             LetStatement(l) -> {
-              let o: FillResult = fill_expression(f, acc.filler, l.value);
+              let o: FillResult = fill_expression(f, accumulator.filler, l.value);
               {
                 filler: o.filler,
-                xs: acc.xs.push(
+                xs: accumulator.xs.push(
                   LetStatement({ span: l.span, pattern: l.pattern, ty: l.ty, value: o.expression }),
                 ),
               }
             },
             LetElseStatement(l) -> {
-              let o: FillResult = fill_expression(f, acc.filler, l.value);
+              let o: FillResult = fill_expression(f, accumulator.filler, l.value);
               let fb: FillResult = fill_expression(f, o.filler, l.fallback);
               {
                 filler: fb.filler,
-                xs: acc.xs.push(
+                xs: accumulator.xs.push(
                   LetElseStatement({ ..l, value: o.expression, fallback: fb.expression }),
                 ),
               }
             },
             ExpressionStatement(x) -> {
-              let o: FillResult = fill_expression(f, acc.filler, x);
-              { filler: o.filler, xs: acc.xs.push(ExpressionStatement(o.expression)) }
+              let o: FillResult = fill_expression(f, accumulator.filler, x);
+              { filler: o.filler, xs: accumulator.xs.push(ExpressionStatement(o.expression)) }
             },
             AssignmentStatement(x) -> {
-              let o: FillResult = fill_expression(f, acc.filler, x.value);
+              let o: FillResult = fill_expression(f, accumulator.filler, x.value);
               {
                 filler: o.filler,
-                xs: acc.xs.push(AssignmentStatement({ ..x, value: o.expression })),
+                xs: accumulator.xs.push(AssignmentStatement({ ..x, value: o.expression })),
               }
             },
           },
@@ -651,16 +692,16 @@ fn fill_children(
         }),
       }
     },
-    RecordExpression(rec) -> {
-      let o = fill_fields(f, filler, rec.fields);
-      { filler: o.filler, expression: RecordExpression({ span: rec.span, fields: o.xs }) }
+    RecordExpression(record) -> {
+      let o = fill_fields(f, filler, record.fields);
+      { filler: o.filler, expression: RecordExpression({ span: record.span, fields: o.xs }) }
     },
-    RecordUpdateExpression(rec) -> {
-      let b = fill_expression(f, filler, rec.base);
-      let o = fill_fields(f, b.filler, rec.fields);
+    RecordUpdateExpression(update) -> {
+      let b = fill_expression(f, filler, update.base);
+      let o = fill_fields(f, b.filler, update.fields);
       {
         filler: o.filler,
-        expression: RecordUpdateExpression({ span: rec.span, base: b.expression, fields: o.xs }),
+        expression: RecordUpdateExpression({ span: update.span, base: b.expression, fields: o.xs }),
       }
     },
     FieldExpression(fl) -> {
@@ -689,23 +730,23 @@ fn fill_children(
       }
     },
     HandleExpression(h) -> {
-      let vars: { filler: Filler, xs: List<HandlerVar> } = h.vars.fold(
+      let variables: { filler: Filler, xs: List<HandlerStateVariable> } = h.handler_variables.fold(
         { filler: filler, xs: [] },
-        |acc: { filler: Filler, xs: List<HandlerVar> }, v: HandlerVar| {
-          let o: FillResult = fill_expression(f, acc.filler, v.init);
-          { filler: o.filler, xs: acc.xs.push({ ..v, init: o.expression }) }
+        |accumulator: { filler: Filler, xs: List<HandlerStateVariable> }, v: HandlerStateVariable| {
+          let o: FillResult = fill_expression(f, accumulator.filler, v.init);
+          { filler: o.filler, xs: accumulator.xs.push({ ..v, init: o.expression }) }
         },
       );
-      let body: FillResult = fill_expression(f, vars.filler, h.body);
+      let body: FillResult = fill_expression(f, variables.filler, h.body);
       let clauses: { filler: Filler, xs: List<HandleClause> } = h.clauses.fold(
         { filler: body.filler, xs: [] },
-        |acc: { filler: Filler, xs: List<HandleClause> }, c: HandleClause| {
-          let o: FillResult = fill_expression(f, acc.filler, c.body);
+        |accumulator: { filler: Filler, xs: List<HandleClause> }, c: HandleClause| {
+          let o: FillResult = fill_expression(f, accumulator.filler, c.body);
           {
             filler: o.filler,
-            xs: acc.xs.push({
+            xs: accumulator.xs.push({
               effect_name: c.effect_name,
-              op: c.op,
+              operation: c.operation,
               resource: c.resource,
               wildcard_label: c.wildcard_label,
               label_binder: c.label_binder,
@@ -717,24 +758,24 @@ fn fill_children(
           }
         },
       );
-      let ret: { filler: Filler, expression: Option<ReturnClause> } = match h.ret {
+      let return_clause: { filler: Filler, expression: Option<ReturnClause> } = match h.return_clause {
         None -> { filler: clauses.filler, expression: None },
-        Some(rc) -> {
-          let o: FillResult = fill_expression(f, clauses.filler, rc.body);
+        Some(clause) -> {
+          let o: FillResult = fill_expression(f, clauses.filler, clause.body);
           {
             filler: o.filler,
-            expression: Some({ binder: rc.binder, body: o.expression, span: rc.span }),
+            expression: Some({ binder: clause.binder, body: o.expression, span: clause.span }),
           }
         },
       };
       {
-        filler: ret.filler,
+        filler: return_clause.filler,
         expression: HandleExpression({
           span: h.span,
           body: body.expression,
-          ret: ret.expression,
+          return_clause: return_clause.expression,
           clauses: clauses.xs,
-          vars: vars.xs,
+          handler_variables: variables.xs,
         }),
       }
     },
@@ -773,9 +814,9 @@ fn fill_expressions(
 ) -> { filler: Filler, xs: List<Expression> } / {abort.raise} =
   expressions.fold(
     { filler: filler, xs: [] },
-    |acc: { filler: Filler, xs: List<Expression> }, expression: Expression| {
-      let o = fill_expression(f, acc.filler, expression);
-      { filler: o.filler, xs: acc.xs.push(o.expression) }
+    |accumulator: { filler: Filler, xs: List<Expression> }, expression: Expression| {
+      let o = fill_expression(f, accumulator.filler, expression);
+      { filler: o.filler, xs: accumulator.xs.push(o.expression) }
     },
   )
 
@@ -786,9 +827,9 @@ fn fill_fields(
 ) -> { filler: Filler, xs: List<RecordLiteralField> } / {abort.raise} =
   fields.fold(
     { filler: filler, xs: [] },
-    |acc: { filler: Filler, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
-      let o = fill_expression(f, acc.filler, field.value);
-      { filler: o.filler, xs: acc.xs.push({ name: field.name, value: o.expression }) }
+    |accumulator: { filler: Filler, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
+      let o = fill_expression(f, accumulator.filler, field.value);
+      { filler: o.filler, xs: accumulator.xs.push({ name: field.name, value: o.expression }) }
     },
   )
 
@@ -816,7 +857,12 @@ type Call = {
   labels: List<Identifier>,
 }
 
-fn as_perform(filler: Filler, call: Call, on: Expression, op: Identifier) -> Option<FillResult> =
+fn as_perform(
+  filler: Filler,
+  call: Call,
+  on: Expression,
+  operation: Identifier,
+) -> Option<FillResult> =
   match on {
     NameExpression(v) -> if call.named.len() == 0
         || (is_bare(v.name) && filler.binders.contains(v.name.name.span.site)) { None } else {
@@ -833,7 +879,13 @@ fn as_perform(filler: Filler, call: Call, on: Expression, op: Identifier) -> Opt
                 b"E0123",
                 filler.module,
                 arg.span,
-                Bytes::concat_all([b"`", written, b".", op.name, b"` takes no named arguments"]),
+                Bytes::concat_all([
+                  b"`",
+                  written,
+                  b".",
+                  operation.name,
+                  b"` takes no named arguments",
+                ]),
                 b"named",
                 [b"an effect operation's arguments are positional"],
               ),
@@ -842,7 +894,7 @@ fn as_perform(filler: Filler, call: Call, on: Expression, op: Identifier) -> Opt
         expression: PerformExpression({
           span: call.span,
           effect_name: v.name,
-          op: op,
+          operation: operation,
           resource: call.labels.at(0),
           args: call.args,
         }),
@@ -952,18 +1004,18 @@ pub fn place_arguments(
         ),
       )
     },
-    imports: range(0, s.slots.len()).fold([], |im: List<ModuleBinding>, i: Int|
+    imports: range(0, s.slots.len()).fold([], |bindings: List<ModuleBinding>, i: Int|
       match s.slots.get(i) {
         FromDefault(_) ->
           signature.params.get(i).imports.fold(
-            im,
-            |acc: List<ModuleBinding>, binding: ModuleBinding|
-              match find_module_binding(acc, binding.binder) {
-                Some(_) -> acc,
-                None -> acc.push(binding),
+            bindings,
+            |accumulator: List<ModuleBinding>, binding: ModuleBinding|
+              match find_module_binding(accumulator, binding.binder) {
+                Some(_) -> accumulator,
+                None -> accumulator.push(binding),
               },
           ),
-        _ -> im,
+        _ -> bindings,
       }),
   }
 }
@@ -974,8 +1026,14 @@ fn fill_slots(filler: Filler, call: Call, signature: Parameters) -> FillResult /
     filler: {
       ..filler,
       diagnostics: filler.diagnostics.concat(filled.diagnostics),
-      implicit: filled.imports.fold(filler.implicit, |im: List<ModuleBinding>, b: ModuleBinding|
-        match find_module_binding(im, b.binder) { Some(_) -> im, None -> im.push(b) }),
+      implicit: filled.imports.fold(
+        filler.implicit,
+        |bindings: List<ModuleBinding>, b: ModuleBinding|
+          match find_module_binding(bindings, b.binder) {
+            Some(_) -> bindings,
+            None -> bindings.push(b),
+          },
+      ),
     },
     expression: CallExpression({ ..call, args: filled.args, named: [] }),
   }
@@ -988,12 +1046,12 @@ fn fill_params(
 ) -> { filler: Filler, xs: List<Param> } / {abort.raise} =
   params.fold(
     { filler: filler, xs: [] },
-    |acc: { filler: Filler, xs: List<Param> }, param: Param|
+    |accumulator: { filler: Filler, xs: List<Param> }, param: Param|
       match param.default {
-        None -> { ..acc, xs: acc.xs.push(param) },
+        None -> { ..accumulator, xs: accumulator.xs.push(param) },
         Some(d) -> {
-          let o = fill_expression(f, acc.filler, d);
-          { filler: o.filler, xs: acc.xs.push({ ..param, default: Some(o.expression) }) }
+          let o = fill_expression(f, accumulator.filler, d);
+          { filler: o.filler, xs: accumulator.xs.push({ ..param, default: Some(o.expression) }) }
         },
       },
   )
@@ -1008,9 +1066,9 @@ fn fill_item(
       let params = fill_params(f, filler, d.params);
       let spec: { filler: Filler, xs: List<SpecClause> } = d.spec.fold(
         { filler: params.filler, xs: [] },
-        |acc: { filler: Filler, xs: List<SpecClause> }, clause: SpecClause| {
-          let o = fill_expression(f, acc.filler, clause.expression);
-          { filler: o.filler, xs: acc.xs.push({ ..clause, expression: o.expression }) }
+        |accumulator: { filler: Filler, xs: List<SpecClause> }, clause: SpecClause| {
+          let o = fill_expression(f, accumulator.filler, clause.expression);
+          { filler: o.filler, xs: accumulator.xs.push({ ..clause, expression: o.expression }) }
         },
       );
       let measured: { filler: Filler, expression: Option<Expression> } = match d.decreases {
@@ -1028,7 +1086,7 @@ fn fill_item(
           name: d.name,
           generics: d.generics,
           params: params.xs,
-          ret: d.ret,
+          return_type: d.return_type,
           effects: d.effects,
           constraints: d.constraints,
           spec: spec.xs,
@@ -1084,13 +1142,13 @@ pub type ResolvedProgram = {
 
 fn constants_of(modules: List<ParsedModule>) -> Map<Bytes, Bool> =
   modules.fold(Map::new(), |found: Map<Bytes, Bool>, m: ParsedModule|
-    m.module.items.fold(found, |acc: Map<Bytes, Bool>, item: Item|
+    m.module.items.fold(found, |accumulator: Map<Bytes, Bool>, item: Item|
       match item {
         FunctionItem(d) -> match d.constant {
-          Some(_) -> acc.insert(qualify(m.name, d.name.name), true),
-          None -> acc,
+          Some(_) -> accumulator.insert(qualify(m.name, d.name.name), true),
+          None -> accumulator,
         },
-        _ -> acc,
+        _ -> accumulator,
       }))
 
 pub fn fill_defaults(
@@ -1102,25 +1160,30 @@ pub fn fill_defaults(
   let c = collect_signatures(r, modules, constants);
   let r2 = c.owner_imports.fold(
     r,
-    |acc: Resolution, oi: { module: Int, binder: Bytes, target: Int }|
-      add_module_binding(acc, oi.module, oi.binder, oi.target),
+    |accumulator: Resolution, oi: { module: Int, binder: Bytes, target: Int }|
+      add_module_binding(accumulator, oi.module, oi.binder, oi.target),
   );
   let f = {
     r: r2,
-    index: c.sigs.fold(Map::new(), |acc: Map<Bytes, Parameters>, signature: Parameters|
-      match acc.get(signature.name) {
-        Some(_) -> acc,
-        None -> acc.insert(signature.name, signature),
+    index: c.sigs.fold(Map::new(), |accumulator: Map<Bytes, Parameters>, signature: Parameters|
+      match accumulator.get(signature.name) {
+        Some(_) -> accumulator,
+        None -> accumulator.insert(signature.name, signature),
       }),
     constants: constants,
   };
   let walked = range(0, modules.len()).fold(
     { resolution: r2, modules: [], diagnostics: concat_diagnostics(diagnostics, c.diagnostics) },
-    |acc: ResolvedProgram, m: Int| {
+    |accumulator: ResolvedProgram, m: Int| {
       let mod: ParsedModule = modules.get(m);
       let items: { filler: Filler, xs: List<Item> } = mod.module.items.fold(
         {
-          filler: { module: m, binders: Map::new(), implicit: [], diagnostics: acc.diagnostics },
+          filler: {
+            module: m,
+            binders: Map::new(),
+            implicit: [],
+            diagnostics: accumulator.diagnostics,
+          },
           xs: [],
         },
         |ia: { filler: Filler, xs: List<Item> }, item: Item| {
@@ -1128,14 +1191,14 @@ pub fn fill_defaults(
           { filler: o.filler, xs: ia.xs.push(o.it) }
         },
       );
-      let reached = items.filler.implicit.fold(
-        acc.resolution,
+      let updated_resolution = items.filler.implicit.fold(
+        accumulator.resolution,
         |rr: Resolution, binding: ModuleBinding|
           add_module_binding(rr, m, binding.binder, binding.target),
       );
       {
-        resolution: reached,
-        modules: acc.modules.push({
+        resolution: updated_resolution,
+        modules: accumulator.modules.push({
           name: mod.name,
           module: { ..mod.module, items: items.xs },
           derived: mod.derived,
@@ -1152,9 +1215,10 @@ pub fn fill_defaults(
       visible_modules: range(0, modules.len()).map(|m: Int| {
         let seen = transitive_imports(walked.resolution.imports, m);
         if !sees_homes(modules.get(m).name) { seen } else {
-          range(0, modules.len()).fold(seen, |acc: List<Int>, k: Int|
-            if !acc.contains(k) && home_modules().contains(modules.get(k).name) { acc.push(k) }
-            else { acc })
+          range(0, modules.len()).fold(seen, |accumulator: List<Int>, k: Int|
+            if !accumulator.contains(k) && home_modules().contains(modules.get(k).name) {
+              accumulator.push(k)
+            } else { accumulator })
         }
       }),
     },
@@ -1170,9 +1234,9 @@ fn transitive_imports(imports: List<List<Int>>, m: Int) -> List<Int> / {abort.ra
           List::fold(
             match imports.at(k) { Some(ts) -> ts, None -> [] },
             { seen: s.seen, work: rest },
-            |acc: { seen: List<Int>, work: List<Int> }, t: Int|
-              if acc.seen.contains(t) { acc }
-              else { { seen: acc.seen.push(t), work: acc.work.push(t) } },
+            |accumulator: { seen: List<Int>, work: List<Int> }, t: Int|
+              if accumulator.seen.contains(t) { accumulator }
+              else { { seen: accumulator.seen.push(t), work: accumulator.work.push(t) } },
           ),
         ),
     })

@@ -1,5 +1,3 @@
-//! Spans, sources and diagnostics; `packages/cli/diagnostic.ply` renders them.
-
 use crate::codec::{FORMAT, shown, tag};
 use std::borrow::Cow;
 use std::collections::HashSet;
@@ -7,7 +5,6 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
-/// A cheaply-cloned name.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Symbol(Arc<str>);
 
@@ -50,7 +47,6 @@ impl std::ops::Deref for Symbol {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct SourceId(pub u32);
 
-/// A half-open byte range within a [`SourceId`].
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Span {
     pub source: SourceId,
@@ -63,7 +59,6 @@ impl Span {
         Span { source, start, end }
     }
 
-    /// A span usable where no real source location exists (builtins, synthesized nodes).
     pub const DUMMY: Span = Span {
         source: SourceId(u32::MAX),
         start: 0,
@@ -88,7 +83,6 @@ pub struct SourceFile {
 }
 
 impl SourceFile {
-    /// 1-based line and column (column counted in `char`s, not bytes).
     pub fn line_col(&self, offset: u32) -> (u32, u32) {
         let line = self
             .line_starts
@@ -146,9 +140,6 @@ impl SourceMap {
         }
     }
 
-    /// The file a span is a byte range of. A span that cuts a character in half is a defect in
-    /// whoever built it, and the line it points at is worth more to a reader than a dropped
-    /// label, so the only bound is the text's length.
     pub fn containing(&self, span: Span) -> Option<&SourceFile> {
         self.get(span.source)
             .filter(|f| span.start <= span.end && span.end as usize <= f.text.len())
@@ -165,18 +156,15 @@ pub enum Severity {
 pub struct Label {
     pub span: Span,
     pub message: String,
-    /// The primary label points at the cause; secondaries add context.
     pub primary: bool,
 }
 
-/// One replacement a fix makes: `text` in place of `span`; an empty span inserts, empty text deletes.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Edit {
     pub span: Span,
     pub text: String,
 }
 
-/// A change that applies as it is and leaves a program the diagnostic no longer holds for.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Fix {
     pub title: String,
@@ -191,13 +179,9 @@ pub struct Diagnostic {
     pub labels: Vec<Label>,
     pub notes: Vec<String>,
     pub fixes: Sparse<Fix>,
-    /// What the text names by [`slot`], each as the PLV1 bytes of a value a diagnostic shows,
-    /// rendered only by the CLI.
     pub values: Sparse<Vec<u8>>,
 }
 
-/// A list most diagnostics leave empty, held as one pointer: every runtime `Result` carries a
-/// `Diagnostic`, so its size is paid on every call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[allow(clippy::box_collection)]
 pub struct Sparse<T>(Option<Box<Vec<T>>>);
@@ -260,7 +244,6 @@ impl<T> IntoIterator for Sparse<T> {
     }
 }
 
-/// Where a diagnostic's message, label or note stands its `values[i]`.
 pub fn slot(i: usize) -> String {
     format!("\u{1}{i}\u{2}")
 }
@@ -316,13 +299,11 @@ impl Diagnostic {
         self
     }
 
-    /// Carries `values`, each a value's PLV1 bytes, which the text names by [`slot`].
     pub fn showing(mut self, values: Vec<Vec<u8>>) -> Self {
         self.values = values.into();
         self
     }
 
-    /// `text` with each slot said as what its value is, for a reader with no renderer.
     pub fn described(&self, text: &str) -> String {
         let mut out = String::with_capacity(text.len());
         let mut rest = text;
@@ -353,7 +334,6 @@ impl Diagnostic {
             .map(|l| l.span)
     }
 
-    /// For a reader that will not hold `sources`: each label they place becomes a note.
     pub fn placed(self, sources: &SourceMap) -> Diagnostic {
         let notes: Vec<String> = self
             .labels
@@ -373,8 +353,6 @@ impl Diagnostic {
     }
 }
 
-/// What a reader with no renderer is told in place of the value whose PLV1 bytes are `bytes`: its
-/// kind, read off the tag it opens with.
 fn told(bytes: &[u8]) -> &'static str {
     let at = FORMAT.len();
     match bytes.get(at).copied() {
@@ -401,7 +379,6 @@ fn told(bytes: &[u8]) -> &'static str {
     }
 }
 
-/// With no source to point into: the heading, then a line per note and per fix.
 impl fmt::Display for Diagnostic {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let titled = match self.severity {
@@ -426,7 +403,6 @@ impl fmt::Display for Diagnostic {
 
 impl std::error::Error for Diagnostic {}
 
-/// A code read at run time as a [`Diagnostic`]'s `&'static str`, leaked once per distinct code.
 pub fn intern_code(code: &str) -> &'static str {
     static POOL: OnceLock<Mutex<HashSet<&'static str>>> = OnceLock::new();
     let mut pool = POOL

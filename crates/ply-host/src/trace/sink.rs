@@ -1,5 +1,3 @@
-//! Trace sinks: where a record goes.
-
 use super::Level;
 use ply_core::Decimal;
 use std::fmt::Write as _;
@@ -9,11 +7,9 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub trait Clock: Send + Sync {
-    /// Epoch microseconds.
     fn micros(&self) -> i64;
 }
 
-/// The host clock, and the only thing in this crate that reads it.
 #[derive(Default)]
 pub struct HostClock;
 
@@ -22,7 +18,6 @@ impl Clock for HostClock {
         SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_micros() as i64)
-            // A clock set before the epoch is no reason to reject a log line.
             .unwrap_or(0)
     }
 }
@@ -65,7 +60,6 @@ impl RecordKind {
 pub enum Outcome {
     Ok,
     Failed(String),
-    /// The program's `exit` never ran: a rollback, a raise, or the entry point ended first.
     Abandoned,
 }
 
@@ -80,18 +74,14 @@ impl Outcome {
 }
 
 pub struct Record<'a> {
-    /// Epoch microseconds, stamped by the driver.
     pub ts: i64,
     pub kind: RecordKind,
     pub level: Level,
     pub channel: &'a str,
     pub name: &'a str,
-    /// The span this record belongs to, `0` outside any.
     pub span: i64,
-    /// That span's parent, `0` at depth zero.
     pub parent: i64,
     pub outcome: &'a Outcome,
-    /// `count`'s delta, `time`'s micros, or a closing span's duration when its `enter` was kept.
     pub amount: Option<i64>,
     pub value: Option<Decimal>,
     pub fields: &'a [(String, Field)],
@@ -106,14 +96,11 @@ pub trait Sink: Send + Sync {
 
     fn write(&self, record: &Record<'_>);
 
-    /// Called once at teardown, before the connection pool closes.
     fn flush(&self);
 }
 
-/// [`Discard::path`], so a caller can recognise the discarding sink without downcasting.
 pub const DISCARD_PATH: &str = "ply_host::trace::discard";
 
-/// `--trace off`.
 #[derive(Default)]
 pub struct Discard;
 
@@ -135,10 +122,8 @@ impl Sink for Discard {
     fn flush(&self) {}
 }
 
-/// `--trace json`: one JSON object per line, on stderr.
 pub struct Json {
     level: Level,
-    /// One `write_all` per line under one lock, so two tasks cannot interleave one line.
     out: Mutex<()>,
 }
 
@@ -169,7 +154,6 @@ impl Sink for Json {
         write_json(&mut line, record);
         line.push('\n');
         let _guard = lock(&self.out);
-        // A failed log write has nowhere to be reported and must not end the run.
         let _ = std::io::stderr().write_all(line.as_bytes());
     }
 
@@ -179,7 +163,6 @@ impl Sink for Json {
     }
 }
 
-/// `--trace text`: one human line per record, on stderr, stamped relative to the run's start.
 pub struct Text {
     level: Level,
     started: Instant,
@@ -255,7 +238,6 @@ impl Sink for Text {
     }
 }
 
-/// One record a [`Recording`] kept, owned so that nothing a `Value` holds crosses a thread.
 #[derive(Clone, PartialEq, Debug)]
 pub struct OwnedRecord {
     pub ts: i64,
@@ -361,12 +343,10 @@ impl Sink for Recording {
     }
 }
 
-/// Poison is ignored: the guarded data has no invariant a panic can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
 
-/// The envelope; `fields` is always present, even when empty.
 pub fn write_json(out: &mut String, record: &Record<'_>) {
     let _ = write!(out, "{{\"ts\":{}", record.ts);
     let _ = write!(out, ",\"level\":\"{}\"", record.level.as_str());
@@ -395,7 +375,6 @@ pub fn write_json(out: &mut String, record: &Record<'_>) {
         let _ = write!(out, ",\"{key}\":{amount}");
     }
     if let Some(value) = record.value {
-        // A string, so a JSON number consumer cannot round away the `Decimal`'s scale.
         out.push_str(",\"value\":");
         write_string(out, &value.to_string());
     }
@@ -420,7 +399,6 @@ fn write_json_field(out: &mut String, field: &Field) {
             let _ = write!(out, "{b}");
         }
         Field::Text(s) => write_string(out, s),
-        // JSON has no `NaN` or infinity, so those go out as strings.
         Field::Float(f) if f.is_finite() => {
             let _ = write!(out, "{}", ply_core::render_float(*f));
         }
@@ -444,7 +422,6 @@ fn write_text_field(out: &mut String, field: &Field) {
     }
 }
 
-/// A JSON string, with the escapes RFC 8259 requires and no others.
 pub fn write_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {

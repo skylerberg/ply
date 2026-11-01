@@ -23,7 +23,7 @@ import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_
 import compiler.front.diagnostics (parse_all, diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
                               request_of_key)
-import compiler.front.pkg (PackageSources, read_packages, judged_packages_bin, without_locations)
+import compiler.front.pkg (PackageSources, read_packages, validated_packages_bin, without_locations)
 import compiler.check.resolve.tables (Source, Diagnostic, Label, backticked, error_at)
 import compiler.syntax.parsing (Span, ParseDiagnostic, dummy_span)
 import compiler.store.hash.forms (CachedNode, CachedHashes, ModuleHashes, no_cached_hashes,
@@ -83,11 +83,11 @@ pub fn load_inputs_of(
   );
   let placed = range(0, dependencies.len() + 1).fold(
     [],
-    |acc: List<{ name: Bytes, placing: PackageLocation, text: Bytes }>, k: Int| {
+    |accumulator: List<{ name: Bytes, placing: PackageLocation, text: Bytes }>, k: Int| {
       let p = if k == 0 { root } else { dependencies.get(k - 1) };
       let prefix = prefix_in(j, k);
       p.files.fold(
-        acc,
+        accumulator,
         |a: List<{ name: Bytes, placing: PackageLocation, text: Bytes }>, f: PackageFile|
           a.push({
             name: if prefix.len() == 0 { f.module }
@@ -99,16 +99,16 @@ pub fn load_inputs_of(
     },
   );
   {
-    layout: bin::encode(without_locations(j), judged_packages_bin()),
+    layout: bin::encode(without_locations(j), validated_packages_bin()),
     places: placed.fold(
       Map::new(),
-      |acc: Map<Bytes, Bytes>, x: { name: Bytes, placing: PackageLocation, text: Bytes }|
-        acc.insert(x.name, bin::encode(x.placing, package_location_bin())),
+      |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, placing: PackageLocation, text: Bytes }|
+        accumulator.insert(x.name, bin::encode(x.placing, package_location_bin())),
     ),
     texts: placed.fold(
       Map::new(),
-      |acc: Map<Bytes, Bytes>, x: { name: Bytes, placing: PackageLocation, text: Bytes }|
-        acc.insert(x.name, x.text),
+      |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, placing: PackageLocation, text: Bytes }|
+        accumulator.insert(x.name, x.text),
     ),
     own: placed.map(|x: { name: Bytes, placing: PackageLocation, text: Bytes }| x.name),
     dependencies: range(1, dependencies.len() + 1).map(|k: Int| prefix_in(j, k)),
@@ -168,20 +168,20 @@ pub fn lookup_input<| e>(
   else { None }
 
 pub fn evaluator_of(stamps: Bytes) -> Bytes / {abort.raise} =
-  stamps.split(b"\n").fold(b"", |acc: Bytes, line: Bytes|
-    if line.starts_with(b"evaluator ") { line.slice(10, line.len()) } else { acc })
+  stamps.split(b"\n").fold(b"", |accumulator: Bytes, line: Bytes|
+    if line.starts_with(b"evaluator ") { line.slice(10, line.len()) } else { accumulator })
 
 pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, CheckQuery> / {abort.raise} =
   queries().fold(
     Map::new(),
-    |acc: Map<Bytes, CheckQuery>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
-      acc.insert(q.name, {
+    |accumulator: Map<Bytes, CheckQuery>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
+      accumulator.insert(q.name, {
         name: q.name,
         hash: match definition_hash(definitions, q.definition) {
           Some(h) -> blake3(Bytes::concat_all([h, b"\x00", evaluator])),
           None ->
             panic(
-              "the program holds no definition `" ++ String::of_bytes_lossy(q.definition) ++ "`",
+              "the program contains no definition `" ++ String::of_bytes_lossy(q.definition) ++ "`",
             ),
         },
         body: q.body,
@@ -193,8 +193,8 @@ pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, CheckQuery> 
 pub fn fresh_registry() -> Map<Bytes, CheckQuery> =
   queries().fold(
     Map::new(),
-    |acc: Map<Bytes, CheckQuery>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
-      acc.insert(q.name, {
+    |accumulator: Map<Bytes, CheckQuery>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
+      accumulator.insert(q.name, {
         name: q.name,
         hash: q.name,
         body: q.body,
@@ -227,7 +227,7 @@ pub type LoadResults = { results: List<CheckedModule>, pulled: List<Bytes> }
 pub fn query_load(
   qs: Map<Bytes, CheckQuery>,
   own: List<Bytes>,
-  asked: List<Bytes>,
+  required_modules: List<Bytes>,
   tested: Bool,
   run: Run,
 ) -> { run: Run, value: LoadResults } / {RunEffects, abort.raise} = {
@@ -252,25 +252,25 @@ pub fn query_load(
     );
     let asked_own = ordered.order.fold(
       { run: ordered.run, returned: Map::new(), written: Map::new(), stopped: Map::new() },
-      |acc: { run: Run, returned: Map<Bytes, CheckedModule>, written: Map<Bytes, List<Bytes>>, stopped: Map<Bytes, Bool> }, n: ModuleKey| {
+      |accumulator: { run: Run, returned: Map<Bytes, CheckedModule>, written: Map<Bytes, List<Bytes>>, stopped: Map<Bytes, Bool> }, n: ModuleKey| {
         let imports = match ordered.edges.get(n.module) { Some(ms) -> ms, None -> [] };
-        if imports.fold(false, |b: Bool, m: Bytes| b || acc.stopped.contains(m)) {
+        if imports.fold(false, |b: Bool, m: Bytes| b || accumulator.stopped.contains(m)) {
           {
-            ..acc,
-            returned: acc.returned.insert(n.module, {
+            ..accumulator,
+            returned: accumulator.returned.insert(n.module, {
               module: n.module,
               result: { ..absent(n.module), imports: imports },
             }),
-            stopped: acc.stopped.insert(n.module, true),
+            stopped: accumulator.stopped.insert(n.module, true),
           }
         } else {
-          let a = ask(acc.run, n);
+          let a = ask(accumulator.run, n);
           {
             run: a.run,
-            returned: acc.returned.insert(n.module, a.returned),
-            written: acc.written.insert(n.module, a.returned.result.shape.written),
-            stopped: if a.returned.result.rejected.len() == 0 { acc.stopped }
-            else { acc.stopped.insert(n.module, true) },
+            returned: accumulator.returned.insert(n.module, a.returned),
+            written: accumulator.written.insert(n.module, a.returned.result.shape.written),
+            stopped: if a.returned.result.rejected.len() == 0 { accumulator.stopped }
+            else { accumulator.stopped.insert(n.module, true) },
           }
         }
       },
@@ -280,28 +280,28 @@ pub fn query_load(
       results: own.map(|n: Bytes|
         match asked_own.returned.get(n) {
           Some(a) -> a,
-          None -> panic("each own module is checked"),
+          None -> panic("no check result exists for a module of the program"),
         }),
       written: asked_own.written,
     };
-    let listed = shipped_listed().fold(Map::new(), |acc: Map<Bytes, Bool>, n: Bytes|
-      acc.insert(n, true));
+    let listed = shipped_listed().fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
+      accumulator.insert(n, true));
     let pulled = iterate(
       { run: first.run, results: first.results, written: first.written, read: own, pulled: [] },
       listed.len() + 2,
       |x: { run: Run, results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }| {
-        let fresh = pulled_next(x.read, x.written, listed, asked);
+        let fresh = pulled_next(x.read, x.written, listed, required_modules);
         if fresh.len() == 0 { Stop(x) } else {
           Continue(
             fresh.fold(
               { ..x, read: x.read.concat(fresh), pulled: x.pulled.concat(fresh) },
-              |acc: { run: Run, results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }, n: Bytes| {
-                let a = ask(acc.run, { module: n, shipped: true, tested: tested });
+              |accumulator: { run: Run, results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }, n: Bytes| {
+                let a = ask(accumulator.run, { module: n, shipped: true, tested: tested });
                 {
-                  ..acc,
+                  ..accumulator,
                   run: a.run,
-                  results: acc.results.push(a.returned),
-                  written: acc.written.insert(n, a.returned.result.shape.written),
+                  results: accumulator.results.push(a.returned),
+                  written: accumulator.written.insert(n, a.returned.result.shape.written),
                 }
               },
             ),
@@ -387,21 +387,21 @@ pub fn check_shipped_modules(
     run,
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   );
-  let asked = ordered.order.fold(
+  let checked = ordered.order.fold(
     { run: ordered.run, rejected: [] },
-    |acc: { run: Run, rejected: List<CheckedModule> }, named: ModuleKey| {
+    |accumulator: { run: Run, rejected: List<CheckedModule> }, named: ModuleKey| {
       let at = bin::encode(named, module_key_bin());
-      let m = query_output(qs, acc.run, module_query(), at);
+      let m = query_output(qs, accumulator.run, module_query(), at);
       let a = decoded(m.output, module_result_bin(), "a module's result");
       {
         run: [hashes_query(), wanted_files_query()].fold(m.run, |r: Run, query: Bytes|
           query_output(qs, r, query, at).run),
-        rejected: if a.rejected.len() == 0 { acc.rejected }
-        else { acc.rejected.push({ module: named.module, result: a }) },
+        rejected: if a.rejected.len() == 0 { accumulator.rejected }
+        else { accumulator.rejected.push({ module: named.module, result: a }) },
       }
     },
   );
-  { run: declaring_in(qs, b"std", asked.run).run, rejected: asked.rejected }
+  { run: declaring_in(qs, b"std", checked.run).run, rejected: checked.rejected }
 }
 
 pub fn wanted_all(
@@ -412,29 +412,43 @@ pub fn wanted_all(
 ) -> { run: Run, value: Map<Bytes, ShippedWants> } / {RunEffects, abort.raise} =
   pulled.fold(
     { run: run, value: Map::new() },
-    |acc: { run: Run, value: Map<Bytes, ShippedWants> }, m: Bytes| {
+    |accumulator: { run: Run, value: Map<Bytes, ShippedWants> }, m: Bytes| {
       let a = query_output(
         qs,
-        acc.run,
+        accumulator.run,
         wanted_files_query(),
         bin::encode({ module: m, shipped: true, tested: tested }, module_key_bin()),
       );
       {
         run: a.run,
-        value: acc.value.insert(m, decoded(a.output, shipped_wants_bin(), "a module's wants")),
+        value: accumulator.value.insert(
+          m,
+          decoded(a.output, shipped_wants_bin(), "a module's wants"),
+        ),
       }
     },
   )
 
 pub fn documented_all(
   qs: Map<Bytes, CheckQuery>,
-  asked: List<ModuleKey>,
+  modules: List<ModuleKey>,
   run: Run,
 ) -> { run: Run, value: List<Pages> } / {RunEffects, abort.raise} =
-  asked.fold({ run: run, value: [] }, |acc: { run: Run, value: List<Pages> }, named: ModuleKey| {
-    let a = query_output(qs, acc.run, documented_query(), bin::encode(named, module_key_bin()));
-    { run: a.run, value: acc.value.push(decoded(a.output, pages_bin(), "a module's pages")) }
-  })
+  modules.fold(
+    { run: run, value: [] },
+    |accumulator: { run: Run, value: List<Pages> }, named: ModuleKey| {
+      let a = query_output(
+        qs,
+        accumulator.run,
+        documented_query(),
+        bin::encode(named, module_key_bin()),
+      );
+      {
+        run: a.run,
+        value: accumulator.value.push(decoded(a.output, pages_bin(), "a module's pages")),
+      }
+    },
+  )
 
 pub fn declaring_in(
   qs: Map<Bytes, CheckQuery>,
@@ -452,11 +466,11 @@ fn dependencies_first(
 ) -> { run: Run, order: List<ModuleKey>, edges: Map<Bytes, List<Bytes>> } / {RunEffects, abort.raise} = {
   let read = modules.fold(
     { run: run, edges: Map::new() },
-    |acc: { run: Run, edges: Map<Bytes, List<Bytes>> }, n: ModuleKey| {
-      let a = query_output(qs, acc.run, imports_query(), bin::encode(n, module_key_bin()));
+    |accumulator: { run: Run, edges: Map<Bytes, List<Bytes>> }, n: ModuleKey| {
+      let a = query_output(qs, accumulator.run, imports_query(), bin::encode(n, module_key_bin()));
       {
         run: a.run,
-        edges: acc.edges.insert(
+        edges: accumulator.edges.insert(
           n.module,
           decoded(a.output, imports_of_bin(), "a module's imports").imports.map(|i: ImportOf|
             i.named.module),
@@ -464,8 +478,8 @@ fn dependencies_first(
       }
     },
   );
-  let among = modules.fold(Map::new(), |acc: Map<Bytes, Bool>, n: ModuleKey|
-    acc.insert(n.module, true));
+  let among = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: ModuleKey|
+    accumulator.insert(n.module, true));
   let order = iterate(
     { placed: Map::new(), left: modules, out: [] },
     modules.len() + 2,
@@ -477,8 +491,8 @@ fn dependencies_first(
           |b: Bool, m: Bytes| b && (m == n.module || !among.contains(m) || x.placed.contains(m)),
         ));
       if ready.len() == 0 { Stop(x.out.concat(x.left)) } else {
-        let placed = ready.fold(x.placed, |acc: Map<Bytes, Bool>, n: ModuleKey|
-          acc.insert(n.module, true));
+        let placed = ready.fold(x.placed, |accumulator: Map<Bytes, Bool>, n: ModuleKey|
+          accumulator.insert(n.module, true));
         let left = x.left.filter(|n: ModuleKey| !placed.contains(n.module));
         if left.len() == 0 { Stop(x.out.concat(ready)) }
         else { Continue({ placed: placed, left: left, out: x.out.concat(ready) }) }
@@ -515,10 +529,15 @@ pub fn hashed_all(
     shipped.map(|n: Bytes| { module: n, shipped: true, tested: tested }),
   ).fold(
     { run: run, value: [] },
-    |acc: { run: Run, value: List<ModuleHashes> }, named: ModuleKey| {
-      let a = query_output(qs, acc.run, hashes_query(), bin::encode(named, module_key_bin()));
+    |accumulator: { run: Run, value: List<ModuleHashes> }, named: ModuleKey| {
+      let a = query_output(
+        qs,
+        accumulator.run,
+        hashes_query(),
+        bin::encode(named, module_key_bin()),
+      );
       let h = decoded(a.output, hash_result_bin(), "a module's hashing");
-      { run: a.run, value: acc.value.push({ record: h.record, cached: h.fixing }) }
+      { run: a.run, value: accumulator.value.push({ record: h.record, cached: h.fixing }) }
     },
   )
 
@@ -529,16 +548,16 @@ pub fn cycles_among(
 ) -> { run: Run, rejected: List<CheckedModule> } / {RunEffects, abort.raise} = {
   let read = own.fold(
     { run: run, edges: Map::new() },
-    |acc: { run: Run, edges: Map<Bytes, List<ImportOf>> }, m: Bytes| {
+    |accumulator: { run: Run, edges: Map<Bytes, List<ImportOf>> }, m: Bytes| {
       let a = query_output(
         qs,
-        acc.run,
+        accumulator.run,
         imports_query(),
         bin::encode({ module: m, shipped: false, tested: false }, module_key_bin()),
       );
       {
         run: a.run,
-        edges: acc.edges.insert(
+        edges: accumulator.edges.insert(
           m,
           decoded(a.output, imports_of_bin(), "a module's imports").imports.filter(|i: ImportOf|
             !i.named.shipped),
@@ -574,10 +593,10 @@ pub fn cycles_among(
   let rejected = own.sort_by(|a: Bytes, b: Bytes|
     match compare_values(a, b) { Greater -> false, _ -> true }).fold(
     { done: Map::new(), out: [] },
-    |acc: { done: Map<Bytes, Bool>, out: List<CheckedModule> }, m: Bytes|
-      if acc.done.contains(m) { acc } else {
+    |accumulator: { done: Map<Bytes, Bool>, out: List<CheckedModule> }, m: Bytes|
+      if accumulator.done.contains(m) { accumulator } else {
         match paths(m).get(m) {
-          None -> acc,
+          None -> accumulator,
           Some(path) -> {
             let closing = path.get(path.len() - 1);
             let span = List::fold(
@@ -614,8 +633,8 @@ pub fn cycles_among(
               )
             };
             {
-              done: path.fold(acc.done, |d: Map<Bytes, Bool>, p: Bytes| d.insert(p, true)),
-              out: acc.out.push({
+              done: path.fold(accumulator.done, |d: Map<Bytes, Bool>, p: Bytes| d.insert(p, true)),
+              out: accumulator.out.push({
                 module: closing,
                 result: { ..absent(closing), rejected: [diagnostic] },
               }),
@@ -643,25 +662,25 @@ pub fn entry_hash(
     let hashed = decoded(a.output, hash_result_bin(), "a module's hashing");
     {
       run: a.run,
-      hash: hashed.fixing.nodes.fold(None, |acc: Option<Bytes>, f: CachedNode|
-        if !f.declaration && f.name == name { Some(f.hash) } else { acc }),
+      hash: hashed.fixing.nodes.fold(None, |accumulator: Option<Bytes>, f: CachedNode|
+        if !f.declaration && f.name == name { Some(f.hash) } else { accumulator }),
     }
   }
 
 pub fn root_warnings(results: List<CheckedModule>, root: Int) -> List<Diagnostic> =
-  range(0, root).fold([], |acc: List<Diagnostic>, i: Int|
+  range(0, root).fold([], |accumulator: List<Diagnostic>, i: Int|
     match results.at(i) {
-      None -> acc,
+      None -> accumulator,
       Some(a) ->
-        acc.concat(
+        accumulator.concat(
           a.result.warnings.map(|d: Diagnostic|
             { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
         ),
     })
 
 pub fn rejected_first(results: List<CheckedModule>) -> List<CheckedModule> = {
-  let rejected = results.fold(Map::new(), |acc: Map<Bytes, Bool>, a: CheckedModule|
-    if a.result.rejected.len() > 0 { acc.insert(a.module, true) } else { acc });
+  let rejected = results.fold(Map::new(), |accumulator: Map<Bytes, Bool>, a: CheckedModule|
+    if a.result.rejected.len() > 0 { accumulator.insert(a.module, true) } else { accumulator });
   results.filter(|a: CheckedModule|
     a.result.rejected.len() > 0
       && !a.result.imports.fold(false, |b: Bool, m: Bytes| b || rejected.contains(m)))
@@ -740,7 +759,11 @@ pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {a
 
 fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
   load_inputs_of(
-    { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
+    {
+      root: b"",
+      manifest: None,
+      files: sources.map(|s: Source| { module: s.name, text: s.source_text }),
+    },
     [],
   )
 
@@ -756,7 +779,7 @@ fn lookup_input_shipping(
 ) -> Option<Bytes> / {abort.raise} = {
   let all = with_prelude_source(shipped);
   let source_text = |name: Bytes|
-    match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.src), None -> None };
+    match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.source_text), None -> None };
   lookup_input(
     w,
     source_text,
@@ -790,18 +813,19 @@ pub fn outcome_of(
     [] ->
       analyse_with(
         parse_all(sources),
-        results.fold(no_rows(), |acc: Rows, a: CheckedModule| {
+        results.fold(no_rows(), |accumulator: Rows, a: CheckedModule| {
           let r = rows_of_result(a.result);
           {
-            definitions: acc.definitions.concat(r.definitions),
-            tests: acc.tests.concat(r.tests),
-            types: tables_joined(acc.types, r.types),
+            definitions: accumulator.definitions.concat(r.definitions),
+            tests: accumulator.tests.concat(r.tests),
+            types: tables_joined(accumulator.types, r.types),
           }
         }),
       ),
     first ->
       Rejected(
-        first.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.rejected)),
+        first.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
+          accumulator.concat(a.result.rejected)),
       ),
   }
 
@@ -894,9 +918,10 @@ fn stored_results(name: Bytes) -> List<Bytes> / {abort.raise} = {
     layered(b"pub fn step(n: Int) -> Int = n + 1\n"),
     [],
   ).store;
-  memo::current_records(store).fold([], |acc: List<Bytes>, _key: Bytes, r: Record|
-    if r.query != name { acc }
-    else { match store.outputs.get(r.output) { Some(out) -> acc.push(out), None -> acc } })
+  memo::current_records(store).fold([], |accumulator: List<Bytes>, _key: Bytes, r: Record|
+    if r.query != name { accumulator } else {
+      match store.outputs.get(r.output) { Some(out) -> accumulator.push(out), None -> accumulator }
+    })
 }
 
 fn results_round_trip<a>(results: List<Bytes>, codec: bin::BinCodec<a>) -> Bool / {abort.raise} =
@@ -910,11 +935,11 @@ test "a module's result reads back as it was recorded" {
   assert(results_round_trip(stored_results(module_query()), module_result_bin()))
 }
 
-test "a module read for its owners reads back as it was recorded" {
+test "a module's definition list decodes to the same value that was stored" {
   assert(results_round_trip(stored_results(owners_query()), owners_result_bin()))
 }
 
-test "what hashing fixed of a group reads back as it was recorded" {
+test "a group's hashes decode to the same value that was stored" {
   assert(results_round_trip(stored_results(group_hash_query()), group_hashes_bin()))
 }
 
@@ -927,10 +952,10 @@ test "a module's hashes read back as they were recorded" {
 }
 
 fn embedding_queried(
-  src: Bytes,
+  source_text: Bytes,
   files: Map<Bytes, Bytes>,
 ) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
-  let w = inputs_alone([{ name: b"m", src: src }]);
+  let w = inputs_alone([{ name: b"m", source_text: source_text }]);
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
     match files.get(want.path) {
@@ -948,19 +973,19 @@ fn embedding_queried(
 }
 
 fn fixed_hash(fixing: CachedHashes, name: Bytes) -> Option<Bytes> =
-  fixing.nodes.fold(None, |acc: Option<Bytes>, f: CachedNode|
-    if f.name == name { Some(f.hash) } else { acc })
+  fixing.nodes.fold(None, |accumulator: Option<Bytes>, f: CachedNode|
+    if f.name == name { Some(f.hash) } else { accumulator })
 
 fn two_embeds() -> Bytes =
   b"pub fn a() -> Bytes = embed(\"a.bin\")\npub fn b() -> Bytes = embed(\"b.bin\")\n"
 
-test "a module's results know a file it embeds by its digest, and none holds the file's bytes" {
+test "a module's stored results refer to an embedded file by its digest and never contain the file's bytes" {
   let line = Bytes::concat_all(range(0, 10).map(|_: Int| b"0123456789"));
   let big = Bytes::concat_all(
     range(0, 1000).map(|i: Int| Bytes::concat_all([Bytes::of_string(i.to_string()), b":", line])),
   );
-  let src = b"pub fn data() -> Bytes = embed(\"big.bin\")\npub fn size() -> Int = data().len()\ntest \"sized\" { assert(size() > 0) }\n";
-  let done = embedding_queried(src, Map::new().insert(b"big.bin", big));
+  let source_text = b"pub fn data() -> Bytes = embed(\"big.bin\")\npub fn size() -> Int = data().len()\ntest \"sized\" { assert(size() > 0) }\n";
+  let done = embedding_queried(source_text, Map::new().insert(b"big.bin", big));
   assert_eq(rejected_first(done.results), []);
   assert(fixed_hash(done.fixing, b"m.data") != None);
   assert_eq(
@@ -977,7 +1002,7 @@ test "a module's results know a file it embeds by its digest, and none holds the
   )
 }
 
-test "an embedded file's bytes move the definition that embeds it, and no other" {
+test "changing an embedded file's bytes changes the hash of the definition that embeds it and of no other definition" {
   let over = |a: Bytes, b: Bytes|
     embedding_queried(two_embeds(), Map::new().insert(b"a.bin", a).insert(b"b.bin", b)).fixing;
   let first = over(b"one", b"two");
@@ -1014,7 +1039,11 @@ pub fn check_with_pack(
   derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> CheckedSources / {abort.raise} = {
   let w = load_inputs_of(
-    { root: b"", manifest: None, files: sources.map(|s: Source| { module: s.name, text: s.src }) },
+    {
+      root: b"",
+      manifest: None,
+      files: sources.map(|s: Source| { module: s.name, text: s.source_text }),
+    },
     [],
   );
   handle {
@@ -1069,17 +1098,17 @@ effect fetching {
 
 pub fn layered(lib: Bytes) -> List<Source> =
   [
-    { name: b"lib", src: lib },
-    { name: b"app", src: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n" },
-    { name: b"aside", src: b"pub fn alone() -> Int = 7\n" },
+    { name: b"lib", source_text: lib },
+    { name: b"app", source_text: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 1\n" },
+    { name: b"aside", source_text: b"pub fn alone() -> Int = 7\n" },
   ]
 
-test "a group that reads one that fails waits for it unchecked, and its module says what checking it whole says" {
+test "a definition group that calls a group with a type error is skipped, and the module reports the same errors as a whole-module check" {
   let source = |body: Bytes|
     [
       {
         name: b"lib",
-        src: Bytes::concat_all([
+        source_text: Bytes::concat_all([
           b"pub fn base(n: Int) -> Int = ",
           body,
           b"\n\npub fn over(n: Int) -> Int = base(n) + 1\n\npub fn top(n: Int) -> Int = over(n) * 2\n\n",
@@ -1095,24 +1124,25 @@ test "a group that reads one that fails waits for it unchecked, and its module s
   );
   let waiting = memo::current_records(broken.store).fold(
     [],
-    |acc: List<Bytes>, _key: Bytes, r: Record|
-      if r.query != group_query() { acc } else {
+    |accumulator: List<Bytes>, _key: Bytes, r: Record|
+      if r.query != group_query() { accumulator } else {
         match broken.store.outputs.get(r.output) {
-          None -> acc,
+          None -> accumulator,
           Some(out) -> {
             let a = owner_checks::decode_group(
               decoded(out, owner_checks::encoded_group_bin(), "a group's result"),
             );
             if a.rejected.any(|d: Diagnostic| d.message.index_of(b" waits on ") != None) {
-              acc.concat(decoded(r.input, group_key_bin(), "a group's names").owners)
-            } else { acc }
+              accumulator.concat(decoded(r.input, group_key_bin(), "a group's names").owners)
+            } else { accumulator }
           },
         }
       },
   );
   let checked = executed_for(broken.run, group_query()).fold(
     [],
-    |acc: List<Bytes>, b: Bytes| acc.concat(decoded(b, group_key_bin(), "a group's names").owners),
+    |accumulator: List<Bytes>, b: Bytes|
+      accumulator.concat(decoded(b, group_key_bin(), "a group's names").owners),
   ).filter(|o: Bytes| o != b"base");
   assert(checked.contains(b"over"));
   assert_eq(waiting.sort(), checked.sort())
@@ -1143,8 +1173,8 @@ fn shipped_store_results(
 
 test "computing the shipped modules' results names each one that fails" {
   let rejected = shipped_store_results([
-    { name: b"std.a", src: b"pub fn a() -> Int = 1\n" },
-    { name: b"std.b", src: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
+    { name: b"std.a", source_text: b"pub fn a() -> Int = 1\n" },
+    { name: b"std.b", source_text: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
   ]).value;
   assert_eq(rejected.map(|x: CheckedModule| x.module), [b"std.b"]);
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), [
@@ -1154,20 +1184,24 @@ test "computing the shipped modules' results names each one that fails" {
 
 test "a compiler module imports another below the compiler's root by its full name" {
   let shipped = [
-    { name: b"compiler.syntax.base", src: b"pub fn one() -> Int = 1\n" },
+    { name: b"compiler.syntax.base", source_text: b"pub fn one() -> Int = 1\n" },
     {
       name: b"compiler.check.user",
-      src: b"import compiler.syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
+      source_text: b"import compiler.syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
     },
   ];
   let rejected = shipped_store_results(shipped).value;
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), []);
   let user = [
-    { name: b"main", src: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n" },
+    {
+      name: b"main",
+      source_text: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n",
+    },
   ];
   let f = check_sources(empty_memory_store(), user, shipped);
   assert_eq(
-    f.results.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.rejected)),
+    f.results.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
+      accumulator.concat(a.result.rejected)),
     [],
   )
 }
@@ -1179,8 +1213,9 @@ pub fn pack_of(store: MemoryStore) -> Option<packs::PackFiles> / {abort.raise} =
         ..store,
         records: memo::current_records(store).fold(
           Map::new(),
-          |acc: Map<Bytes, Record>, k: Bytes, r: Record|
-            if shipped_queries().contains(r.query) { acc.insert(k, r) } else { acc },
+          |accumulator: Map<Bytes, Record>, k: Bytes, r: Record|
+            if shipped_queries().contains(r.query) { accumulator.insert(k, r) }
+            else { accumulator },
         ),
       },
       fresh_registry(),
@@ -1188,12 +1223,12 @@ pub fn pack_of(store: MemoryStore) -> Option<packs::PackFiles> / {abort.raise} =
     ),
   )
 
-test "a load fetches a module's read from a pack for what the read offered nothing of, not once an owner" {
+test "loading from a prebuilt store of shipped results fetches a module's definition list fewer times than the module has definitions" {
   let owners = 24;
   let shipped = [
     {
       name: b"std.many",
-      src: Bytes::concat_all(
+      source_text: Bytes::concat_all(
         range(0, owners).map(|i: Int|
           Bytes::of_string(f"pub fn f{i.to_string()}() -> Int = {i.to_string()} + 1\n\n")),
       ),
@@ -1203,107 +1238,114 @@ test "a load fetches a module's read from a pack for what the read offered nothi
   let read = memo::current_records(store).fold(b"", |found: Bytes, _: Bytes, r: Record|
     if r.query == owners_query() { r.output } else { found });
   let read_bytes = match store.outputs.get(read) { Some(o) -> o, None -> b"" };
-  let user = [{ name: b"main", src: b"import std.many (f0)\npub fn main() -> Int = f0()\n" }];
+  let user = [
+    { name: b"main", source_text: b"import std.many (f0)\npub fn main() -> Int = f0()\n" },
+  ];
   let load = check_with_pack(empty_memory_store(), pack_of(store), user, shipped);
   let fetches = load.fetched.filter(|b: Bytes| b == read_bytes).len();
   assert(fetches > 0, Some("the read is short enough to be kept inside its record"));
   assert(fetches < owners, Some(f"the read was fetched {fetches.to_string()} times"))
 }
 
-test "a load over a pack walks no owner of a shipped module" {
+test "loading from a prebuilt store of shipped results type-checks no definition of a shipped module" {
   let shipped = [
     {
       name: b"std.pair",
-      src: b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n\npub fn both(n: Int) -> Bool = even(n) || odd(n)\n",
+      source_text: b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n\npub fn both(n: Int) -> Bool = even(n) || odd(n)\n",
     },
   ];
-  let user = [{ name: b"main", src: b"import std.pair (both)\npub fn main() -> Bool = both(3)\n" }];
+  let user = [
+    { name: b"main", source_text: b"import std.pair (both)\npub fn main() -> Bool = both(3)\n" },
+  ];
   let load = check_with_pack(empty_memory_store(), pack_of(shipped_store(shipped)), user, shipped);
   assert_eq(executed_for(load.run, typed_query()), []);
   assert_eq(load.results, check_sources(empty_memory_store(), user, shipped).results)
 }
 
-test "a shipped module's imports are checked as an importer reads it, without what only its tests import" {
-  let user = [{ name: b"main", src: b"import std.a (two)\npub fn main() -> Int = two()\n" }];
+test "a shipped module's imports are checked as an importing module sees them, ignoring imports used only by its tests" {
+  let user = [
+    { name: b"main", source_text: b"import std.a (two)\npub fn main() -> Int = two()\n" },
+  ];
   let shipped = [
     {
       name: b"std.a",
-      src: b"import std.b (one)\nimport std.c (spare)\n\npub fn two() -> Int = one() + one()\ntest \"spared\" { assert_eq(spare(), 3) }\n",
+      source_text: b"import std.b (one)\nimport std.c (spare)\n\npub fn two() -> Int = one() + one()\ntest \"spared\" { assert_eq(spare(), 3) }\n",
     },
-    { name: b"std.b", src: b"pub fn one() -> Int = 1\n" },
-    { name: b"std.c", src: b"pub fn spare() -> Int = 3\n" },
+    { name: b"std.b", source_text: b"pub fn one() -> Int = 1\n" },
+    { name: b"std.c", source_text: b"pub fn spare() -> Int = 3\n" },
   ];
   let f = check_sources(empty_memory_store(), user, shipped);
   assert_eq(
-    f.results.fold([], |acc: List<Diagnostic>, a: CheckedModule| acc.concat(a.result.rejected)),
+    f.results.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
+      accumulator.concat(a.result.rejected)),
     [],
   )
 }
 
-test "a module fails with what its failing groups say, and nothing a group reading them says" {
+test "a module reports the errors of a definition with an error, and none from the definitions that call it" {
   let sources = [
     {
       name: b"app",
-      src: b"fn pick() -> Int = missing()\n\nfn read() -> Int = 1\n\nfn main() -> Int = pick() + read()\n",
+      source_text: b"fn pick() -> Int = missing()\n\nfn read() -> Int = 1\n\nfn main() -> Int = pick() + read()\n",
     },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(
-    f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.rejected.map(|d: Diagnostic| d.message))),
+    f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
+      accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.message))),
     [b"unknown name `missing`"],
   )
 }
 
-test "an import that names no module fails its module, though nothing reads it" {
-  let sources = [{ name: b"app", src: b"import nonesuch\npub fn f() -> Int = 1\n" }];
+test "an import of a module that does not exist fails the importing module even when nothing uses the import" {
+  let sources = [{ name: b"app", source_text: b"import nonesuch\npub fn f() -> Int = 1\n" }];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(
-    f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
+    f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
+      accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0106"],
   )
 }
 
-test "two imports that bind one module name fail their module, though nothing reads either" {
+test "two imports that give the same module name fail their module even when neither is used" {
   let sources = [
-    { name: b"net", src: b"pub fn x() -> Int = 1\n" },
-    { name: b"lib.net", src: b"pub fn y() -> Int = 2\n" },
-    { name: b"app", src: b"import net\nimport lib.net\npub fn f() -> Int = 1\n" },
+    { name: b"net", source_text: b"pub fn x() -> Int = 1\n" },
+    { name: b"lib.net", source_text: b"pub fn y() -> Int = 2\n" },
+    { name: b"app", source_text: b"import net\nimport lib.net\npub fn f() -> Int = 1\n" },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(
-    f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
+    f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
+      accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0110"],
   )
 }
 
 test "a name two imports select fails their module, though its module exports it" {
   let sources = [
-    { name: b"base", src: b"pub type T = | A | B\npub fn f() -> T = A\n" },
+    { name: b"base", source_text: b"pub type T = | A | B\npub fn f() -> T = A\n" },
     {
       name: b"app",
-      src: b"import base (T)\nimport base (T, f)\npub fn g() -> Bool = f() == f()\n",
+      source_text: b"import base (T)\nimport base (T, f)\npub fn g() -> Bool = f() == f()\n",
     },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(
-    f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
+    f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
+      accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0110"],
   )
 }
 
 test "a name a module selects that its module does not declare fails the module" {
   let sources = [
-    { name: b"lib", src: b"pub fn used() -> Int = 1\n" },
-    { name: b"app", src: b"import lib (used, gone)\nfn go() -> Int = used()\n" },
+    { name: b"lib", source_text: b"pub fn used() -> Int = 1\n" },
+    { name: b"app", source_text: b"import lib (used, gone)\nfn go() -> Int = used()\n" },
   ];
   let f = check_sources(empty_memory_store(), sources, []);
   assert_eq(
-    f.results.fold([], |acc: List<Bytes>, a: CheckedModule|
-      acc.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
+    f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
+      accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0101"],
   )
 }

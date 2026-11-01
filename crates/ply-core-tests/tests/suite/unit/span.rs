@@ -7,12 +7,12 @@ fn line_col_is_one_based_and_char_counted() {
     let f = sm.get(id).unwrap();
     assert_eq!(f.line_col(0), (1, 1));
     assert_eq!(f.line_col(4), (2, 1));
-    // `é` is two bytes; the column after it is still counted in chars.
     assert_eq!(f.line_col(7), (2, 3));
 }
 
 #[test]
-fn a_span_is_bounded_by_its_texts_length_alone() {
+fn a_span_past_the_end_of_the_text_or_reversed_has_an_empty_snippet_and_a_span_cutting_a_character_gives_a_replacement_character()
+ {
     let mut sm = SourceMap::new();
     let id = sm.add("t.ply", "fn f() = \"é\"\n");
     for outside in [Span::new(id, 21, 26), Span::new(id, 5, 2)] {
@@ -24,8 +24,6 @@ fn a_span_is_bounded_by_its_texts_length_alone() {
     assert_eq!(sm.snippet(halved), "\u{fffd}");
 }
 
-/// What `ply` prints for a failure no program is there to render: the heading, a line per note and
-/// per fix, and no label, since nothing holds the source a label points into.
 #[test]
 fn a_diagnostic_prints_its_heading_then_its_notes_and_fixes() {
     let d = Diagnostic::error(
@@ -56,10 +54,9 @@ fn a_diagnostic_prints_its_heading_then_its_notes_and_fixes() {
     );
 }
 
-/// Placed for a reader that will not hold the sources: each label that lands in one keeps its place
-/// as a note, and a label outside them is dropped rather than misplaced.
 #[test]
-fn a_placed_diagnostic_keeps_each_label_it_can_place_as_a_note() {
+fn placing_a_diagnostic_turns_each_label_that_has_a_source_span_into_a_note_with_file_line_and_column_and_drops_the_others()
+ {
     let mut sources = SourceMap::new();
     let id = sources.add("app/m.ply", "fn f() -> Int = 1\nfn g() -> Int = \"x\"\n");
     let d = Diagnostic::error(codes::RUNTIME_ERROR, "type mismatch")

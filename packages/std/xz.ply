@@ -30,8 +30,6 @@ import std.seq
 import std.seq (seq, Seq, Done, Skip, Yield)
 import std.gen
 
-// --- Errors -----------------------------------------------------------------
-
 /// Why a reader failed.
 pub type ErrorKind =
   /// The bytes do not open with a stream's magic number.
@@ -87,27 +85,8 @@ fn fail<a>(at: Int, reason: ErrorKind) -> a / {xz.fail} = xz.fail({ at: at, reas
 /// block may ask it to keep, which is the block's LZMA2 dictionary.
 pub type Limits = new { output: Int, window: Int }
 
-/// Each byte value as the one byte it is.
 const fn single_bytes() -> Array<Bytes> = Array::of_list(range(0, 256).map(byte_of_int))
 
-// --- LZMA -------------------------------------------------------------------
-
-// All probabilities are in one array. From 0: whether a match follows, by state and position.
-// From 192: whether a match repeats a distance. From 204, 216 and 228: whether it repeats the
-// last distance, the one before, or the third. From 240: whether a repeat of the last distance is
-// longer than one byte. From 432: distance slots by length. From 688 and 802: the low bits of near
-// and of far distances. From 818 for a match and 1332 for a repeat: lengths, each with two
-// choices, and within each, sixteen short three-bit codes from 2, sixteen codes for the next eight
-// lengths from 130, and one eight-bit code from 258. From 1846: the literals, 768 per context.
-
-// A chunk's constants are packed in one `Int`: the position mask in its low four bits, the literal
-// position mask in the next four, the literal context bits in the next four, the low four bits of
-// the dictionary's start in the next four, and above them the output length at the end of the
-// chunk. Values a symbol rarely reads are in an array: at 0 the dictionary's start in the output,
-// at 1 its size, and at 2 the stream offset of the chunk's coded bytes.
-
-/// The decoder state after a chunk: the bytes written, the probabilities, the state, the last four
-/// distances (the third and fourth packed in one `Int`, 31 bits each), and where its bits ended.
 type LzmaState = {
   out: Bytes,
   probs: Array<Int>,
@@ -119,13 +98,11 @@ type LzmaState = {
   code: Int,
 }
 
-/// The state after a literal.
 fn after_literal(state: Int) -> Int =
   if state < 4 { 0 } else if state < 10 { state - 3 } else { state - 6 }
 
-/// Decodes one symbol. A bit decides whether it is a literal, which is read here, or a match.
 fn decode_symbol(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -143,18 +120,18 @@ fn decode_symbol(
     let n = out.len();
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     if ip > lim.get(3) { fail(lim.get(2) + lim.get(3), Code) } else if n >= k >>> 16 {
       { out: out, probs: probs, state: state, rep0: rep0, rep1: rep1, r23: r23, ip: p, code: c }
     } else {
-      let pos = n - (k >>> 12 & 15);
-      let at = (state << 4) + (pos & k & 15);
+      let position = n - (k >>> 12 & 15);
+      let at = (state << 4) + (position & k & 15);
       let prob = probs.get(at);
       let bound = (r >>> 11) * prob;
       if c >= bound {
         choice(
-          src,
+          source,
           p,
           r - bound,
           c - bound,
@@ -171,13 +148,13 @@ fn decode_symbol(
       } else {
         let before = if n > lim.get(0) { out.at(n - 1) } else { 0 };
         let lc = k >>> 8 & 15;
-        let base = 1846 + ((before >>> 8 - lc) + ((pos & k >>> 4 & 15) << lc)) * 768;
+        let base = 1846 + ((before >>> 8 - lc) + ((position & k >>> 4 & 15) << lc)) * 768;
         let next = probs.set(at, prob + (2048 - prob >>> 5));
         if state < 7 {
-          literal(src, p, bound, c, next, out, state, rep0, rep1, r23, k, lim, fuel - 1, base, 1)
+          literal(source, p, bound, c, next, out, state, rep0, rep1, r23, k, lim, fuel - 1, base, 1)
         } else {
           matched_literal(
-            src,
+            source,
             p,
             bound,
             c,
@@ -199,9 +176,8 @@ fn decode_symbol(
     }
   }
 
-/// Reads a literal's bits from the most significant, each in the context of the bits before it.
 fn literal(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -220,7 +196,7 @@ fn literal(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(base + symbol);
     let bound = (r >>> 11) * prob;
@@ -228,7 +204,7 @@ fn literal(
       let next = probs.set(base + symbol, prob + (2048 - prob >>> 5));
       if symbol < 128 {
         literal(
-          src,
+          source,
           p,
           bound,
           c,
@@ -246,7 +222,7 @@ fn literal(
         )
       } else {
         decode_symbol(
-          src,
+          source,
           p,
           bound,
           c,
@@ -265,7 +241,7 @@ fn literal(
       let next = probs.set(base + symbol, prob - (prob >>> 5));
       if symbol < 128 {
         literal(
-          src,
+          source,
           p,
           r - bound,
           c - bound,
@@ -283,7 +259,7 @@ fn literal(
         )
       } else {
         decode_symbol(
-          src,
+          source,
           p,
           r - bound,
           c - bound,
@@ -301,11 +277,8 @@ fn literal(
     }
   }
 
-/// Reads a literal after a match, against the byte the match would have copied next. Each bit is
-/// also read in the context of that byte's bit, for as long as the two agree. `against` is that
-/// byte, with its next bit at bit 8.
 fn matched_literal(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -325,7 +298,7 @@ fn matched_literal(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let theirs = against & 256;
     let at = base + 256 + theirs + symbol;
@@ -335,7 +308,7 @@ fn matched_literal(
       let next = probs.set(at, prob + (2048 - prob >>> 5));
       if symbol >= 128 {
         decode_symbol(
-          src,
+          source,
           p,
           bound,
           c,
@@ -351,7 +324,7 @@ fn matched_literal(
         )
       } else if theirs == 0 {
         matched_literal(
-          src,
+          source,
           p,
           bound,
           c,
@@ -370,7 +343,7 @@ fn matched_literal(
         )
       } else {
         literal(
-          src,
+          source,
           p,
           bound,
           c,
@@ -391,7 +364,7 @@ fn matched_literal(
       let next = probs.set(at, prob - (prob >>> 5));
       if symbol >= 128 {
         decode_symbol(
-          src,
+          source,
           p,
           r - bound,
           c - bound,
@@ -407,7 +380,7 @@ fn matched_literal(
         )
       } else if theirs != 0 {
         matched_literal(
-          src,
+          source,
           p,
           r - bound,
           c - bound,
@@ -426,7 +399,7 @@ fn matched_literal(
         )
       } else {
         literal(
-          src,
+          source,
           p,
           r - bound,
           c - bound,
@@ -446,11 +419,8 @@ fn matched_literal(
     }
   }
 
-/// After a bit that chose a match, a bit decides whether its distance is new or one of the last
-/// four. A new distance moves the last three down and leaves the first to be read, marked by a
-/// value below zero.
 fn choice(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -467,13 +437,13 @@ fn choice(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(192 + state);
     let bound = (r >>> 11) * prob;
     if c < bound {
       length(
-        src,
+        source,
         p,
         bound,
         c,
@@ -490,7 +460,7 @@ fn choice(
       )
     } else {
       repeat_first(
-        src,
+        source,
         p,
         r - bound,
         c - bound,
@@ -507,9 +477,8 @@ fn choice(
     }
   }
 
-/// A repeat: a bit decides whether it repeats the last distance.
 fn repeat_first(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -526,13 +495,13 @@ fn repeat_first(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(204 + state);
     let bound = (r >>> 11) * prob;
     if c < bound {
       repeat_single_byte(
-        src,
+        source,
         p,
         bound,
         c,
@@ -548,7 +517,7 @@ fn repeat_first(
       )
     } else {
       repeat_second_distance(
-        src,
+        source,
         p,
         r - bound,
         c - bound,
@@ -565,9 +534,8 @@ fn repeat_first(
     }
   }
 
-/// A repeat of the last distance: a bit decides whether it is one byte or has a length.
 fn repeat_single_byte(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -584,14 +552,14 @@ fn repeat_single_byte(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let at = 240 + (state << 4) + (out.len() - (k >>> 12 & 15) & k & 15);
     let prob = probs.get(at);
     let bound = (r >>> 11) * prob;
     if c < bound {
       copy(
-        src,
+        source,
         p,
         bound,
         c,
@@ -607,7 +575,7 @@ fn repeat_single_byte(
       )
     } else {
       length(
-        src,
+        source,
         p,
         r - bound,
         c - bound,
@@ -625,10 +593,8 @@ fn repeat_single_byte(
     }
   }
 
-/// A repeat of an older distance: a bit decides whether it is the one before the last, which then
-/// swaps places with the last.
 fn repeat_second_distance(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -645,13 +611,13 @@ fn repeat_second_distance(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(216 + state);
     let bound = (r >>> 11) * prob;
     if c < bound {
       length(
-        src,
+        source,
         p,
         bound,
         c,
@@ -668,7 +634,7 @@ fn repeat_second_distance(
       )
     } else {
       repeat_third(
-        src,
+        source,
         p,
         r - bound,
         c - bound,
@@ -685,9 +651,8 @@ fn repeat_second_distance(
     }
   }
 
-/// A repeat of the third or fourth distance, which comes to the front as the others move down.
 fn repeat_third(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -704,13 +669,13 @@ fn repeat_third(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(228 + state);
     let bound = (r >>> 11) * prob;
     if c < bound {
       length(
-        src,
+        source,
         p,
         bound,
         c,
@@ -727,7 +692,7 @@ fn repeat_third(
       )
     } else {
       length(
-        src,
+        source,
         p,
         r - bound,
         c - bound,
@@ -745,10 +710,8 @@ fn repeat_third(
     }
   }
 
-/// A length's first choice, using the probabilities from `from`: a short three-bit code, or a
-/// second choice.
 fn length(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -766,13 +729,13 @@ fn length(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(from);
     let bound = (r >>> 11) * prob;
     if c < bound {
       length_bits(
-        src,
+        source,
         p,
         bound,
         c,
@@ -791,7 +754,7 @@ fn length(
       )
     } else {
       length_more(
-        src,
+        source,
         p,
         r - bound,
         c - bound,
@@ -809,9 +772,8 @@ fn length(
     }
   }
 
-/// A length's second choice: the next eight lengths in three bits, or the rest in eight.
 fn length_more(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -829,13 +791,13 @@ fn length_more(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(from + 1);
     let bound = (r >>> 11) * prob;
     if c < bound {
       length_bits(
-        src,
+        source,
         p,
         bound,
         c,
@@ -854,7 +816,7 @@ fn length_more(
       )
     } else {
       length_bits(
-        src,
+        source,
         p,
         r - bound,
         c - bound,
@@ -874,11 +836,8 @@ fn length_more(
     }
   }
 
-/// A length's code, read as a literal's bits are. The length is the code plus `add`, which is
-/// below -200 for the eight-bit code. The length is then packed above the state's four bits and
-/// passed on to where a new distance is read or a known one is copied.
 fn length_bits(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -898,7 +857,7 @@ fn length_bits(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(base + symbol);
     let bound = (r >>> 11) * prob;
@@ -910,7 +869,7 @@ fn length_bits(
     let grown = symbol * 2 + (if one { 1 } else { 0 });
     if grown < (if add < -200 { 256 } else { 8 }) {
       length_bits(
-        src,
+        source,
         p,
         r2,
         c2,
@@ -928,10 +887,24 @@ fn length_bits(
         add,
       )
     } else if rep0 >= 0 {
-      copy(src, p, r2, c2, next, out, state | grown + add << 4, rep0, rep1, r23, k, lim, fuel - 1)
+      copy(
+        source,
+        p,
+        r2,
+        c2,
+        next,
+        out,
+        state | grown + add << 4,
+        rep0,
+        rep1,
+        r23,
+        k,
+        lim,
+        fuel - 1,
+      )
     } else {
       distance_slot(
-        src,
+        source,
         p,
         r2,
         c2,
@@ -950,11 +923,8 @@ fn length_bits(
     }
   }
 
-/// A new distance's slot: six bits, using the probabilities its length selected. A slot below 4 is
-/// the distance. A slot below 14 gives two high bits and reads the rest in its own code. A higher
-/// slot reads all but the last four bits directly.
 fn distance_slot(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -973,7 +943,7 @@ fn distance_slot(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(base + symbol);
     let bound = (r >>> 11) * prob;
@@ -985,7 +955,7 @@ fn distance_slot(
     let grown = symbol * 2 + (if one { 1 } else { 0 });
     if grown < 64 {
       distance_slot(
-        src,
+        source,
         p,
         r2,
         c2,
@@ -1002,14 +972,14 @@ fn distance_slot(
         grown,
       )
     } else if grown < 68 {
-      copy(src, p, r2, c2, next, out, state, grown - 64, rep1, r23, k, lim, fuel - 1)
+      copy(source, p, r2, c2, next, out, state, grown - 64, rep1, r23, k, lim, fuel - 1)
     } else {
       let s = grown - 64;
       let more = (s >>> 1) - 1;
       let high = 2 + (s & 1);
       if s < 14 {
         near(
-          src,
+          source,
           p,
           r2,
           c2,
@@ -1028,7 +998,7 @@ fn distance_slot(
         )
       } else {
         far_distance_bits(
-          src,
+          source,
           p,
           r2,
           c2,
@@ -1047,13 +1017,11 @@ fn distance_slot(
     }
   }
 
-/// Each five-bit value with its bits reversed.
 fn bit_reversal() -> Bytes =
   b"\x00\x10\x08\x18\x04\x14\x0c\x1c\x02\x12\x0a\x1a\x06\x16\x0e\x1e\x01\x11\x09\x19\x05\x15\x0d\x1d\x03\x13\x0b\x1b\x07\x17\x0f\x1f"
 
-/// The `more` low bits of a near distance, lowest first, in their own code.
 fn near(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -1073,7 +1041,7 @@ fn near(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(base + symbol);
     let bound = (r >>> 11) * prob;
@@ -1084,10 +1052,27 @@ fn near(
     let c2 = if one { c - bound } else { c };
     let grown = symbol * 2 + (if one { 1 } else { 0 });
     if grown < 1 << more {
-      near(src, p, r2, c2, next, out, state, rep0, rep1, r23, k, lim, fuel - 1, base, grown, more)
+      near(
+        source,
+        p,
+        r2,
+        c2,
+        next,
+        out,
+        state,
+        rep0,
+        rep1,
+        r23,
+        k,
+        lim,
+        fuel - 1,
+        base,
+        grown,
+        more,
+      )
     } else {
       copy(
-        src,
+        source,
         p,
         r2,
         c2,
@@ -1104,9 +1089,8 @@ fn near(
     }
   }
 
-/// The `left` middle bits of a far distance, each read with a fixed probability of one half.
 fn far_distance_bits(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -1122,15 +1106,15 @@ fn far_distance_bits(
   left: Int,
 ) -> LzmaState / {xz.fail, abort.raise} =
   if fuel <= 0 { fail(lim.get(2), Code) } else if left <= 0 {
-    last_four(src, ip, range, code, probs, out, state, rep0 << 4, rep1, r23, k, lim, fuel - 1, 1)
+    last_four(source, ip, range, code, probs, out, state, rep0 << 4, rep1, r23, k, lim, fuel - 1, 1)
   } else {
     let low = range < 16777216;
     let r = (if low { range << 8 } else { range }) >>> 1;
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     if c >= r {
       far_distance_bits(
-        src,
+        source,
         p,
         r,
         c - r,
@@ -1147,7 +1131,7 @@ fn far_distance_bits(
       )
     } else {
       far_distance_bits(
-        src,
+        source,
         p,
         r,
         c,
@@ -1165,9 +1149,8 @@ fn far_distance_bits(
     }
   }
 
-/// The last four bits of a far distance, lowest first, in a code all far distances share.
 fn last_four(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -1185,7 +1168,7 @@ fn last_four(
   if fuel <= 0 { fail(lim.get(2), Code) } else {
     let low = range < 16777216;
     let r = if low { range << 8 } else { range };
-    let c = if low { (code << 8 | src.at(ip)) & 0xFFFF_FFFF } else { code };
+    let c = if low { (code << 8 | source.at(ip)) & 0xFFFF_FFFF } else { code };
     let p = if low { ip + 1 } else { ip };
     let prob = probs.get(802 + symbol);
     let bound = (r >>> 11) * prob;
@@ -1196,10 +1179,10 @@ fn last_four(
     let c2 = if one { c - bound } else { c };
     let grown = symbol * 2 + (if one { 1 } else { 0 });
     if grown < 16 {
-      last_four(src, p, r2, c2, next, out, state, rep0, rep1, r23, k, lim, fuel - 1, grown)
+      last_four(source, p, r2, c2, next, out, state, rep0, rep1, r23, k, lim, fuel - 1, grown)
     } else {
       copy(
-        src,
+        source,
         p,
         r2,
         c2,
@@ -1216,10 +1199,8 @@ fn last_four(
     }
   }
 
-/// Writes a match. Its length is above the state's four bits, and it copies from one more than
-/// `rep0` bytes back.
 fn copy(
-  src: Bytes,
+  source: Bytes,
   ip: Int,
   range: Int,
   code: Int,
@@ -1240,7 +1221,7 @@ fn copy(
       fail(lim.get(2) + min(ip, lim.get(3)), Distance)
     } else if n + length > k >>> 16 { fail(lim.get(2) + min(ip, lim.get(3)), Code) } else {
       decode_symbol(
-        src,
+        source,
         ip,
         range,
         code,
@@ -1258,14 +1239,8 @@ fn copy(
     }
   }
 
-// --- Streams and blocks -------------------------------------------------------
-
-/// A decoded number: its value and the offset of the byte after it. A value of -1 means the number
-/// was cut short at the given end, and -2 means it was badly encoded.
 type Number = { value: Int, next: Int }
 
-/// Reads a number stored seven bits per byte, lowest first, where a set high bit means another
-/// byte follows. It has at most nine bytes, and no last byte of zero, which would add nothing.
 fn number(b: Bytes, at: Int, end: Int, shift: Int, low: Int) -> Number / {abort.raise} =
   if at >= end { { value: -1, next: at } } else {
     let byte = b.at(at);
@@ -1275,14 +1250,11 @@ fn number(b: Bytes, at: Int, end: Int, shift: Int, low: Int) -> Number / {abort.
     else { number(b, at + 1, end, shift + 7, low | (byte & 127) << shift) }
   }
 
-/// `n` encoded as `number` reads it.
 fn number_bytes(n: Int) -> Bytes / {abort.raise} =
   if n < 128 { byte_of_int(n) } else { byte_of_int(n % 128 + 128).concat(number_bytes(n / 128)) }
 
-/// The running sum that a block's bytes are checked by.
 type RunningCheck = | NoCheck | CrcCheck(checksum::State) | HashCheck(hash::Hasher)
 
-/// The initial sum for a check type.
 fn running_check(check: Int) -> RunningCheck =
   if check == 1 { CrcCheck(checksum::init(checksum::Crc(checksum::crc32_iso_hdlc()))) }
   else if check == 4 { CrcCheck(checksum::init(checksum::Crc(crc64_xz()))) }
@@ -1296,7 +1268,6 @@ fn update_check(sum: RunningCheck, bytes: Bytes) -> RunningCheck / {abort.raise}
     HashCheck(state) -> HashCheck(hash::update(state, bytes)),
   }
 
-/// The bytes a block of a check type ends with.
 fn check_of(sum: RunningCheck, check: Int) -> Bytes / {abort.raise} =
   match sum {
     NoCheck -> b"",
@@ -1308,15 +1279,9 @@ fn check_of(sum: RunningCheck, check: Int) -> Bytes / {abort.raise} =
     },
   }
 
-/// How many bytes the check of a type is.
 fn check_size(check: Int) -> Int =
   if check == 1 { 4 } else if check == 4 { 8 } else if check == 10 { 32 } else { 0 }
 
-/// A block being read: its header's size and the sizes it declares, or -1; its dictionary's size
-/// and where in the history it starts; the stream offset of its first chunk and the bytes written
-/// before it; the LZMA state one chunk passes to the next; its properties as
-/// `lc | lp << 4 | pb << 8`, or -1 before a chunk sets them; whether a chunk has started the
-/// dictionary; and the running sum of its bytes.
 type Block = {
   head: Int,
   packed: Int,
@@ -1354,12 +1319,6 @@ fn no_block() -> Block =
     running_check: NoCheck,
   }
 
-/// A reader's state apart from its two buffers: its position in the input and how much it has
-/// returned, how many bytes it has dropped from the front of the history, the number of streams
-/// read, what comes next (0 a stream's header or the padding after one, 1 a block's header or the
-/// index, 2 a chunk, 3 a block's padding and check, 4 a stream's footer), how many bytes it needs
-/// before it can continue, whether a stream has ended, the stream's check type, a record of each
-/// block for the index to match, the index's size, and the block being read.
 type ReaderState = {
   limits: Limits,
   at: Int,
@@ -1376,8 +1335,6 @@ type ReaderState = {
   block: Block,
 }
 
-/// A reader partway through its input: the input not yet read, the bytes written that a match may
-/// still copy or that are not yet returned, and the rest of its state.
 type Decoder = { input: Bytes, history: Bytes, core: ReaderState }
 
 fn decoder(limits: Limits, input: Bytes) -> Decoder =
@@ -1405,8 +1362,6 @@ fn needing_input(d: Decoder, need: Int) -> Decoder = { ..d, core: { ..d.core, ne
 
 fn magic() -> Bytes = b"\xFD7zXZ\x00"
 
-/// Reads a stream's twelve-byte header, or the zero padding in groups of four that may come
-/// between two streams.
 fn stream_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let at = core.at;
@@ -1427,8 +1382,6 @@ fn stream_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   }
 }
 
-/// Reads the filters a block header lists from `p`, which must be LZMA2 alone with a byte giving
-/// its dictionary's size. Returns that size.
 fn filters(
   input: Bytes,
   p: Int,
@@ -1449,8 +1402,6 @@ fn filters(
   }
 }
 
-/// Reads a block's header: its size in a byte, flags, the sizes it declares, its filters, zero
-/// padding, and a CRC-32 of all of that.
 fn block_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let at = core.at;
@@ -1498,9 +1449,6 @@ fn block_start(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   }
 }
 
-/// Reads an uncompressed chunk: three bytes of header, where the second and third are one less
-/// than the number of bytes that follow. The first kind resets the dictionary, after which
-/// properties must be set again.
 fn plain_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort.raise} =
   if have < 3 { needing_input(d, 3) } else {
     let core = d.core;
@@ -1533,18 +1481,12 @@ fn plain_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
     }
   }
 
-/// The properties a byte encodes, as `lc | lp << 4 | pb << 8`: literal context bits, literal
-/// position bits and position bits. The first two add up to at most four.
 fn decode_properties(byte: Int, where: Int) -> Int / {xz.fail} = {
   let lc = byte % 9;
   let lp = byte / 9 % 5;
   if byte > 224 || lc + lp > 4 { fail(where, Chunk) } else { lc | lp << 4 | byte / 45 << 8 }
 }
 
-/// Reads an LZMA chunk. Its control byte contains the top bits of one less than its unpacked size,
-/// the next two bytes contain the rest, and the two after them are one less than its coded size.
-/// The control byte also states what is reset first: nothing, the state, the state with new
-/// properties in a following byte, or all of those and the dictionary.
 fn coded_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort.raise} = {
   let mode = control >>> 5 & 3;
   let head = if mode >= 2 { 6 } else { 5 };
@@ -1618,7 +1560,6 @@ fn coded_chunk(d: Decoder, have: Int, control: Int) -> Decoder / {xz.fail, abort
   }
 }
 
-/// One chunk of a block's LZMA2 data, or the zero byte that ends it.
 fn chunk(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let control = d.input.at(d.core.at);
   if control == 0 { { ..d, core: { ..d.core, at: d.core.at + 1, phase: 3, need: 0 } } }
@@ -1627,8 +1568,6 @@ fn chunk(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   else { plain_chunk(d, have, control) }
 }
 
-/// Reads what follows a block's data: zero padding to a multiple of four bytes, and its check.
-/// Also checks that the block's sizes match what its header declared.
 fn block_end(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let at = core.at;
@@ -1661,8 +1600,6 @@ fn block_end(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   }
 }
 
-/// The index that a stream's blocks require: a zero byte, the number of blocks, each block's size
-/// without padding and its unpacked size, zero padding to a multiple of four bytes, and a CRC-32.
 fn index_of(records: List<Bytes>) -> Bytes / {abort.raise} = {
   let listed = Bytes::concat_all([
     b"\x00",
@@ -1673,7 +1610,6 @@ fn index_of(records: List<Bytes>) -> Bytes / {abort.raise} = {
   filled.concat(u32_le(Int::of_u32(crc32(filled))))
 }
 
-/// Reads the index, which must match what the blocks read require, byte for byte.
 fn index(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   let core = d.core;
   let want = index_of(core.records);
@@ -1683,8 +1619,6 @@ fn index(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} = {
   else { { ..d, core: { ..core, at: core.at + n, phase: 4, need: 0, index: n, records: [] } } }
 }
 
-/// Reads a stream's twelve-byte footer: a CRC-32 of the six bytes after it, the index's size, the
-/// header's flags again, and two letters.
 fn footer(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} =
   if have < 12 { needing_input(d, 12) } else {
     let core = d.core;
@@ -1702,7 +1636,6 @@ fn footer(d: Decoder, have: Int) -> Decoder / {xz.fail, abort.raise} =
     }
   }
 
-/// One step of a reader. A reader that needs more input than it has records how much in `need`.
 fn step(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   let phase = d.core.phase;
   let have = d.input.len() - d.core.at;
@@ -1715,15 +1648,11 @@ fn step(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   else { block_start(d, have) }
 }
 
-/// Steps until the reader needs input, has `goal` bytes to return, or, when `one` is set, has
-/// read a stream.
 fn pump(d: Decoder, goal: Int, one: Bool, fuel: Int) -> Decoder / {xz.fail, abort.raise} =
   if fuel <= 0 || d.core.need > 0 || (one && d.core.closed)
       || d.history.len() - d.core.sent >= goal { d }
   else { pump(step(d), goal, one, fuel - 1) }
 
-/// Checks the reader's state at the end of its input. It must be just after a stream, with nothing
-/// left over except padding that `stream_start` skipped.
 fn finished(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   let at = d.core.at;
   let left = d.input.slice(at, d.input.len());
@@ -1735,7 +1664,6 @@ fn finished(d: Decoder) -> Decoder / {xz.fail, abort.raise} = {
   } else { d }
 }
 
-/// The bytes written and not yet returned.
 fn pending(d: Decoder) -> Bytes / {abort.raise} =
   if d.core.sent == 0 { d.history } else { d.history.slice(d.core.sent, d.history.len()) }
 
@@ -1757,9 +1685,6 @@ pub fn decompress_first(data: Bytes, limits: Limits) -> FirstStream / {xz.fail, 
   else { { plain: pending(end), used: end.core.at } }
 }
 
-// --- A stream a chunk at a time -----------------------------------------------
-
-/// The reader with `chunk` appended to the input it has not read.
 fn feed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
   let core = d.core;
   {
@@ -1771,9 +1696,6 @@ fn feed(d: Decoder, chunk: Bytes) -> Decoder / {abort.raise} = {
 
 type DecoderOutput = { out: Bytes, next: Decoder }
 
-/// What the reader has written and not yet returned, and the reader without the history no match
-/// can reach. Within a block's chunks a match can reach the block's dictionary, and elsewhere it
-/// can reach nothing.
 fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   let core = d.core;
   let block = core.block;
@@ -1797,8 +1719,6 @@ fn take_output(d: Decoder) -> DecoderOutput / {abort.raise} = {
   } else { { out: out, next: { ..d, core: { ..core, sent: n } } } }
 }
 
-/// How many bytes a reader writes before returning them: 64 KiB, or an eighth of the block's
-/// dictionary if that is more.
 fn stride(d: Decoder) -> Int = max(65536, d.core.block.dict >>> 3)
 
 fn decompress_chunks<| e>(
@@ -1824,20 +1744,18 @@ fn decompress_chunks<| e>(
       }
     }
 
-/// The decompressed contents of the `.xz` file in `packed`, as a sequence with a chunk for each
-/// pull that has bytes to return. A pull reads at most one chunk of `packed`, and decompresses
-/// until it has a stride of bytes (64 KiB, or an eighth of the block's dictionary) or needs the
-/// next chunk. So the reader keeps in memory one chunk of input, one LZMA2 chunk, which is at most
-/// 64 KiB packed and 2 MiB unpacked, and no more of its output than a block's dictionary plus a
-/// quarter of it plus a stride. The sequence fails where `decompress` would, at the same offset,
-/// and also when `packed` ends before the file does.
+/// Returns the decompressed contents of the `.xz` file in `packed` as a sequence of chunks. Each
+/// pull reads at most one chunk of `packed`, then decompresses until it has produced a stride of
+/// output or needs the next input chunk. A stride is 64 KiB, or an eighth of the block's dictionary
+/// size if that is larger. Memory use does not grow with the file: the decoder buffers one input
+/// chunk, one LZMA2 chunk, and an amount of output on the order of the block's dictionary size. The
+/// sequence fails where `decompress` fails, at the same offset, and also when `packed` ends before
+/// the file does.
 pub fn decompress_stream<| e>(
   packed: Seq<Bytes | e>,
   limits: Limits,
 ) -> Seq<Bytes | {xz.fail, abort.raise | e}> =
   decompress_chunks(packed, decoder(limits, b""), 0x3FFF_FFFF_FFFF_FFFF)
-
-// --- Tests ------------------------------------------------------------------
 
 fn checked() -> Bytes =
   b"Ply checks every effect a program performs, and a test that reads no host is cached. "
@@ -1848,7 +1766,6 @@ fn large_limits() -> Limits = { output: 1048576, window: 67108864 }
 
 type Fixture = { name: String, packed: String, plain: Bytes }
 
-/// Files written by `xz` 5.8.2.
 fn files() -> List<Fixture> =
   [
     {
@@ -1876,7 +1793,6 @@ fn files() -> List<Fixture> =
 fn file(i: Int) -> Bytes / {abort.raise} =
   match files().at(i) { Some(f) -> Bytes::of_hex(f.packed), None -> panic("no such file") }
 
-/// The decompressed chunks of a file, joined.
 fn joined(
   chunks: Seq<Bytes | {xz.fail, abort.raise}>,
 ) -> Bytes / {xz.fail, seq.spent, abort.raise} = Bytes::concat_all(seq::to_list(chunks, 1000000))
@@ -1908,26 +1824,22 @@ test "whichever byte of {f.name} is changed, a file whose blocks are checked is 
       Ok(_) -> true,
       Err(_) -> false,
     });
-  // With no check, a changed data byte just changes a byte of the result.
   assert(read == [] || whole.at(7) == 0, Some(read.len().to_string()))
 }
 
 fn assert_error(got: Result<Bytes, Error>, at: Int, reason: ErrorKind) -> Unit / {abort.raise} =
   assert_eq(got, Err({ at: at, reason: reason }))
 
-/// A stream's header for blocks of the check type `check`.
 fn stream_head(check: Int) -> Bytes / {abort.raise} = {
   let flags = b"\x00".concat(byte_of_int(check));
   Bytes::concat_all([magic(), flags, u32_le(Int::of_u32(crc32(flags)))])
 }
 
-/// A block's header that declares no size, for LZMA2 alone with the dictionary byte `dict`.
 fn block_head(dict: Int) -> Bytes / {abort.raise} = {
   let head = Bytes::concat_all([b"\x02\x00\x21\x01", byte_of_int(dict), b"\x00\x00\x00"]);
   head.concat(u32_le(Int::of_u32(crc32(head))))
 }
 
-/// `plain` as an `.xz` file of one block with no check, in uncompressed chunks of `size` bytes.
 fn stored(plain: Bytes, size: Int) -> Bytes / {abort.raise} = {
   let n = plain.len();
   let chunks = range(0, (n + size - 1) / size).map(|i: Int| {
@@ -1982,7 +1894,6 @@ test "a reader reports why bytes are not an .xz file, and where" {
     12,
     Filter(3),
   );
-  // The block's header is twenty bytes, so its first chunk starts at 32 and its coded bits at 38.
   assert_error(read(good.with_byte(32, 3)), 32, Chunk);
   assert_error(read(good.with_byte(32, 0x80)), 32, Chunk);
   assert_error(read(good.with_byte(38, 1)), 38, Code);
@@ -1993,7 +1904,7 @@ test "a reader reports why bytes are not an .xz file, and where" {
   assert_eq(try_decompress(good, { output: 255, window: 8388608 }), Ok(thrice()))
 }
 
-test "concatenated files are one file, with zero padding between and after, and the first reads alone" {
+test "concatenated files decompress as one file, with zero padding allowed between and after them, and the first file can be read by itself" {
   let a = file(2);
   let b = file(3);
   let both = checked().concat(checked());
@@ -2033,8 +1944,6 @@ test "a file of uncompressed chunks reads back, whole and however it is split" {
   })
 }
 
-/// Whether a reader limited to 4096 bytes returns no more than that or fails with an `xz` error,
-/// and raises nothing else.
 fn stays_within_limits(packed: Bytes) -> Bool = {
   let got: Result<Result<Bytes, Error>, String> = try[abort.raise] {
     try_decompress(packed, { output: 4096, window: 65536 })
@@ -2042,8 +1951,6 @@ fn stays_within_limits(packed: Bytes) -> Bool = {
   match got { Ok(Ok(plain)) -> plain.len() <= 4096, Ok(Err(_)) -> true, Err(_) -> false }
 }
 
-/// `coded` as the only LZMA chunk of a block, declared to unpack to `plain` bytes under the
-/// properties `props`.
 fn coded_file(coded: Bytes, plain: Int, props: Int) -> Bytes / {abort.raise} = {
   let body = Bytes::concat_all([b"\x00", coded, b"\x00\x00\x00\x00"]);
   Bytes::concat_all([
@@ -2060,7 +1967,7 @@ fn coded_file(coded: Bytes, plain: Int, props: Int) -> Bytes / {abort.raise} = {
   ])
 }
 
-test "whatever bytes a reader is given, as a file or a chunk's coded bits, it stays within its limits or fails" {
+test "decompressing any bytes, as a whole xz file or as a file with compressed data blocks, stays within the size limits or returns an error" {
   gen::check2(gen::bytes(), gen::any_int(), |x: Bytes, props: Int| {
     stays_within_limits(x) && stays_within_limits(stream_head(1).concat(x))
       && stays_within_limits(coded_file(x, 64, 0x5D))
@@ -2069,12 +1976,12 @@ test "whatever bytes a reader is given, as a file or a chunk's coded bits, it st
 }
 
 test "a block that requests a dictionary past the limit is rejected before any chunk is read" {
-  let asks = |dict: Int| try_decompress(stream_head(4).concat(block_head(dict)), large_limits());
-  assert_error(asks(40), 12, Window);
-  assert_error(asks(31), 12, Window)
+  let decompress_with_dictionary = |dict: Int|
+    try_decompress(stream_head(4).concat(block_head(dict)), large_limits());
+  assert_error(decompress_with_dictionary(40), 12, Window);
+  assert_error(decompress_with_dictionary(31), 12, Window)
 }
 
-/// The largest size the history reaches after returning output, reading `d` until it needs input.
 fn largest_history(
   d: Decoder,
   most: Int,
@@ -2085,7 +1992,7 @@ fn largest_history(
     largest_history(returned.next, max(most, returned.next.history.len()), fuel - 1)
   }
 
-test "a file is read in a history its dictionary bounds, however long it is" {
+test "the decompressor's retained history stays within the dictionary size, however long the file is" {
   let plain = checked().repeat(4000);
   let packed = stored(plain, 1000);
   assert(decompress(packed, large_limits()) == plain);

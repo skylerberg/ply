@@ -1,8 +1,3 @@
-//! The sockets `std.net` and `std.udp` open, in one table: TCP, TLS and Unix streams, listeners and
-//! datagram sockets, each under the handle and the resource label the program uses it by. The real
-//! handlers' natives call in here, and an operation that waits returns a job for the process's
-//! waiting pool.
-
 mod socket;
 pub mod wire;
 
@@ -16,18 +11,14 @@ use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
-/// The most bytes one `recv` allocates for, whatever `max` asks.
 pub const MAX_RECV: usize = 1 << 20;
 
-/// What an upgrade to TLS is asked with: the protocols to offer or accept, how many bytes of
-/// plaintext the caller read and has not consumed, and the deadline of the whole handshake.
 pub struct Upgrade {
     pub alpn: Vec<String>,
     pub unread: usize,
     pub timeout: Duration,
 }
 
-/// The resource label each open socket is operated under.
 pub struct Handles {
     open: Mutex<BTreeMap<i64, Option<String>>>,
     next: AtomicI64,
@@ -42,7 +33,6 @@ impl Default for Handles {
 impl Handles {
     pub fn new() -> Handles {
         Handles {
-            // Handles ascend from 1 and are never reused, so a stale handle names nothing.
             open: Mutex::new(BTreeMap::new()),
             next: AtomicI64::new(1),
         }
@@ -54,7 +44,6 @@ impl Handles {
         handle
     }
 
-    /// Check the label, binding it if this is the socket's first use.
     pub fn check(&self, handle: i64, label: &str, span: Span) -> Result<(), Diagnostic> {
         let mut open = lock(&self.open);
         let Some(held) = open.get_mut(&handle) else {
@@ -88,7 +77,6 @@ fn wrong_label(handle: i64, existing: &str, label: &str, span: Span) -> Diagnost
     .note("one socket under two labels is two resources the scheduler will not serialise, over one socket it must; give each socket a label and keep it")
 }
 
-/// Poison is ignored: the map has no invariant a panic can break.
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -134,7 +122,6 @@ fn not_a_stream(handle: i64, span: Span) -> Diagnostic {
     .primary(span, "this handle came from `net.listen`, not `net.accept`")
 }
 
-/// An upgrade of something that is not a plaintext TCP connection at rest.
 #[cold]
 fn not_upgradable(what: &str, handle: i64, reason: &str, span: Span) -> Diagnostic {
     Diagnostic::error(
@@ -146,7 +133,7 @@ fn not_upgradable(what: &str, handle: i64, reason: &str, span: Span) -> Diagnost
 }
 
 #[cold]
-fn a_datagram_socket(handle: i64, span: Span) -> Diagnostic {
+fn err_datagram_for_stream_socket(handle: i64, span: Span) -> Diagnostic {
     Diagnostic::error(
         codes::RUNTIME_ERROR,
         format!("socket {handle} is a datagram socket, and this operation wants a `net` one"),

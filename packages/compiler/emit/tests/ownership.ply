@@ -1,28 +1,29 @@
-import compiler.emit.typed_ir (Inst, Block, Let, Do, Allocate, Inc, Reset, Free, If, Case, Match,
-                               Loop, Handle, Fn, Rvalue, Get, Take, Op, OfStrings, OfContainers,
-                               PayloadPath, InlineRecordPath, AsInt, AsAddress, RecordAllocation,
+import compiler.emit.typed_ir (Instruction, Block, Let, Do, Allocate, Increment, Reset, Free, If,
+                               Case, Match, Loop, Handle, Function, Rvalue, Get, Take,
+                               OperationCall, OfStrings, OfContainers, PayloadPath,
+                               InlineRecordPath, AsInt, AsAddress, RecordAllocation,
                                FieldInitializer, BuiltInPlace, Update)
 import compiler.emit.typed_ir.containers (CopyOut, Retain)
 import compiler.emit.emit_harness (program_of, lowered_root, checked, printed_by_ir)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.verify (ownership_fault)
-import compiler.emit.print.count_functions (release_fn, call_start)
+import compiler.emit.print.count_functions (release_function, call_start)
 
-test "a lowered body that holds no count is left as it was, and passes the check" {
-  let src = Bytes::concat_all([
+test "a lowered function with no reference counting is unchanged by `insert_reference_counts` and passes the ownership check" {
+  let source = Bytes::concat_all([
     b"fn total(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { total(n - 1, acc + n) }\n",
     b"fn pick(c: Bool, a: Float, b: Float) -> Float = if c { a * b } else { b }\n",
   ]);
-  match program_of(src) {
+  match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
-      let kept = |name: Bytes| {
+      let unchanged = |name: Bytes| {
         let form = lowered_root(p, name);
         let o = insert_reference_counts(form);
         Ok(o.body == form.body && ownership_fault(o) == None)
       };
-      assert_eq(kept(b"total"), Ok(true));
-      assert_eq(kept(b"pick"), Ok(true))
+      assert_eq(unchanged(b"total"), Ok(true));
+      assert_eq(unchanged(b"pick"), Ok(true))
     },
   }
 }
@@ -71,34 +72,41 @@ fn corpus_names() -> List<Bytes> =
     b"kept_in",
   ]
 
-fn insts(b: Block) -> List<Inst> =
-  b.fold([], |acc: List<Inst>, i: Inst|
-    acc.push(i).concat(match i {
-      If(x) -> insts(x.then).concat(insts(x.otherwise)),
+fn instructions(b: Block) -> List<Instruction> =
+  b.fold([], |accumulator: List<Instruction>, i: Instruction|
+    accumulator.push(i).concat(match i {
+      If(x) -> instructions(x.then).concat(instructions(x.otherwise)),
       Case(c) ->
-        c.arms.fold(insts(c.rest), |a: List<Inst>, arm: { when: Int, body: Block }|
-          a.concat(insts(arm.body))),
-      Match(m) -> m.arms.fold(insts(m.rest), |a: List<Inst>, arm: Block| a.concat(insts(arm))),
-      Loop(l) -> insts(l.body),
-      Handle(h) -> insts(h.body),
+        c.arms.fold(
+          instructions(c.rest),
+          |a: List<Instruction>, arm: { when: Int, body: Block }| a.concat(instructions(arm.body)),
+        ),
+      Match(m) ->
+        m.arms.fold(instructions(m.rest), |a: List<Instruction>, arm: Block|
+          a.concat(instructions(arm))),
+      Loop(l) -> instructions(l.body),
+      Handle(h) -> instructions(h.body),
       _ -> [],
     }))
 
-test "the corpus lowers and passes the check, and a value read out of another is handed on with no count taken" {
+test "every function in the ownership test program lowers and passes the ownership check, and reading a value out of another adds no reference count" {
   match program_of(corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       assert_eq(
-        corpus_names().fold([], |acc: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
+        corpus_names().fold([], |accumulator: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
           match checked(p, n) {
-            Ok(_) -> acc,
-            Err(reason) -> acc.push({ name: n, reason: reason }),
+            Ok(_) -> accumulator,
+            Err(reason) -> accumulator.push({ name: n, reason: reason }),
           }),
         [],
       );
       let incs = |n: Bytes|
         match checked(p, n) {
-          Ok(f) -> insts(f.body).filter(|i: Inst| match i { Inc(_) -> true, _ -> false }).len(),
+          Ok(f) ->
+            instructions(f.body).filter(|i: Instruction|
+              match i { Increment(_) -> true, _ -> false }).len(
+            ),
           Err(_) -> 0 - 1,
         };
       assert_eq([b"rename", b"bump", b"label", b"first", b"pick", b"size", b"mirror"].map(incs), [
@@ -111,7 +119,10 @@ test "the corpus lowers and passes the check, and a value read out of another is
         0,
       ]);
       let resets = match checked(p, b"mirror") {
-        Ok(f) -> insts(f.body).filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
+        Ok(f) ->
+          instructions(f.body).filter(|i: Instruction|
+            match i { Reset(_) -> true, _ -> false }).len(
+          ),
         Err(_) -> 0 - 1,
       };
       assert_eq(resets, 1)
@@ -144,13 +155,13 @@ fn failure_corpus() -> Bytes =
     b"fn grown(xs: List<Int>, n: Int) -> List<Int> / {abort.raise} = xs.push(g(n) + g(n + 1))\n",
   ])
 
-test "a failure lets go of the list it holds on its way out, by one tail every such failure shares" {
+test "a failure releases the list it owns before exiting, and all such failures jump to the same cleanup code" {
   match program_of(failure_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> match printed_by_ir(p, b"grown") {
       Err(reason) -> assert_eq(reason, b""),
       Ok(t) -> {
-        assert_eq(t.split(call_start(release_fn(), [b"ctx", b"p0"])).len() - 1, 1);
+        assert_eq(t.split(call_start(release_function(), [b"ctx", b"p0"])).len() - 1, 1);
         let targets = t.split(b"goto ").drop(1).map(|s: Bytes|
           match s.index_of(b";") { Some(at) -> s.slice(0, at), None -> s });
         assert(targets.len() >= 3 && targets.all(|x: Bytes| Some(x) == targets.at(0)))
@@ -159,7 +170,7 @@ test "a failure lets go of the list it holds on its way out, by one tail every s
   }
 }
 
-test "a field read out of a payload read out of a parameter's field keeps the parameter held until it is read" {
+test "reading a field of a payload that came from a parameter's field passes the ownership check, because the parameter stays alive until that read" {
   match program_of(projection_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
@@ -174,10 +185,10 @@ test "a field read out of a payload read out of a parameter's field keeps the pa
           b"takes_both",
           b"takes_each",
           b"params_of",
-        ].fold([], |acc: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
+        ].fold([], |accumulator: List<{ name: Bytes, reason: Bytes }>, n: Bytes|
           match checked(p, n) {
-            Ok(_) -> acc,
-            Err(reason) -> acc.push({ name: n, reason: reason }),
+            Ok(_) -> accumulator,
+            Err(reason) -> accumulator.push({ name: n, reason: reason }),
           }),
         [],
       ),
@@ -203,20 +214,26 @@ fn inline_record_corpus() -> Bytes =
     b"fn nested(n: Int) -> Holder = { id: n, at: 0, to: 0, five: { a: n, b: 1, c: 2, d: 3, name: \"x\", w: (0, 0, 0, 0) }, other: { a: 1, b: n, c: 3, d: 4, name: \"y\", w: (0, 0, 0, 0) }, x: (0, 0, 0, 0) }\n",
   ])
 
-test "a record literal holding record literals is one box, each inner record built in its place" {
+test "a record literal containing record literals allocates one block, with each inner record built inside it" {
   match program_of(inline_record_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> match checked(p, b"nested") {
       Err(reason) -> assert_eq(reason, b""),
       Ok(f) -> {
-        let makes = insts(f.body).fold([], |acc: List<List<FieldInitializer>>, i: Inst|
-          match i {
-            Let(l) -> match l.value {
-              Allocate(m) -> match m.made { RecordAllocation(shape) -> acc.push(shape), _ -> acc },
-              _ -> acc,
+        let makes = instructions(f.body).fold(
+          [],
+          |accumulator: List<List<FieldInitializer>>, i: Instruction|
+            match i {
+              Let(l) -> match l.value {
+                Allocate(m) -> match m.made {
+                  RecordAllocation(shape) -> accumulator.push(shape),
+                  _ -> accumulator,
+                },
+                _ -> accumulator,
+              },
+              _ -> accumulator,
             },
-            _ -> acc,
-          });
+        );
         assert_eq(makes.len(), 1);
         assert_eq(
           makes.get(0).filter(|s: FieldInitializer|
@@ -229,7 +246,7 @@ test "a record literal holding record literals is one box, each inner record bui
   }
 }
 
-test "an update of a record in place inside an update of its holder is one update, writing at its word" {
+test "updating an inline record inside an update of its containing record is a single update that writes into the inline record's storage" {
   match program_of(inline_record_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
@@ -238,19 +255,19 @@ test "an update of a record in place inside an update of its holder is one updat
           match checked(p, n) {
             Ok(f) ->
               Ok(
-                insts(f.body).fold(
+                instructions(f.body).fold(
                   { updates: 0, places: 0 },
-                  |acc: { updates: Int, places: Int }, i: Inst|
+                  |accumulator: { updates: Int, places: Int }, i: Instruction|
                     match i {
                       Let(l) -> match l.value {
-                        Update(_) -> { ..acc, updates: acc.updates + 1 },
+                        Update(_) -> { ..accumulator, updates: accumulator.updates + 1 },
                         Get(g) -> match g.path {
-                          InlineRecordPath(_) -> { ..acc, places: acc.places + 1 },
-                          _ -> acc,
+                          InlineRecordPath(_) -> { ..accumulator, places: accumulator.places + 1 },
+                          _ -> accumulator,
                         },
-                        _ -> acc,
+                        _ -> accumulator,
                       },
-                      _ -> acc,
+                      _ -> accumulator,
                     },
                 ),
               ),
@@ -261,21 +278,26 @@ test "an update of a record in place inside an update of its holder is one updat
   }
 }
 
-fn place_reads(b: Block) -> { kept: Int, taken: Int } =
-  insts(b).fold({ kept: 0, taken: 0 }, |acc: { kept: Int, taken: Int }, i: Inst|
-    match i {
-      Let(l) -> match l.value {
-        Op(o) -> if o.op == OfContainers(Retain) { { ..acc, kept: acc.kept + 1 } } else { acc },
-        Take(t) -> match t.path {
-          InlineRecordPath(_) -> { ..acc, taken: acc.taken + 1 },
-          _ -> acc,
+fn place_reads(b: Block) -> { retained: Int, taken: Int } =
+  instructions(b).fold(
+    { retained: 0, taken: 0 },
+    |accumulator: { retained: Int, taken: Int }, i: Instruction|
+      match i {
+        Let(l) -> match l.value {
+          OperationCall(o) -> if o.operation == OfContainers(Retain) {
+            { ..accumulator, retained: accumulator.retained + 1 }
+          } else { accumulator },
+          Take(t) -> match t.path {
+            InlineRecordPath(_) -> { ..accumulator, taken: accumulator.taken + 1 },
+            _ -> accumulator,
+          },
+          _ -> accumulator,
         },
-        _ -> acc,
+        _ -> accumulator,
       },
-      _ -> acc,
-    })
+  )
 
-test "a record read where it lies moves out of a box held only here, and is kept only where a count of it is taken" {
+test "reading an inline record out of an allocation with no other users moves it out, and takes a reference count only where the record is used again" {
   match program_of(inline_record_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
@@ -293,15 +315,15 @@ test "a record read where it lies moves out of a box held only here, and is kept
         ].map(|n: Bytes|
           match checked(p, n) { Ok(f) -> Ok(place_reads(f.body)), Err(reason) -> Err(reason) }),
         [
-          Ok({ kept: 0, taken: 0 }),
-          Ok({ kept: 0, taken: 2 }),
-          Ok({ kept: 1, taken: 1 }),
-          Ok({ kept: 0, taken: 0 }),
-          Ok({ kept: 0, taken: 0 }),
-          Ok({ kept: 0, taken: 1 }),
-          Ok({ kept: 0, taken: 1 }),
-          Ok({ kept: 0, taken: 0 }),
-          Ok({ kept: 0, taken: 0 }),
+          Ok({ retained: 0, taken: 0 }),
+          Ok({ retained: 0, taken: 2 }),
+          Ok({ retained: 1, taken: 1 }),
+          Ok({ retained: 0, taken: 0 }),
+          Ok({ retained: 0, taken: 0 }),
+          Ok({ retained: 0, taken: 1 }),
+          Ok({ retained: 0, taken: 1 }),
+          Ok({ retained: 0, taken: 0 }),
+          Ok({ retained: 0, taken: 0 }),
         ],
       ),
   }
@@ -324,11 +346,11 @@ fn buffer_corpus() -> Bytes =
   ])
 
 fn reuse_of(b: Block) -> { incs: Int, resets: Int, reused: Int } = {
-  let all = insts(b);
+  let all = instructions(b);
   {
-    incs: all.filter(|i: Inst| match i { Inc(_) -> true, _ -> false }).len(),
-    resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
-    reused: all.filter(|i: Inst|
+    incs: all.filter(|i: Instruction| match i { Increment(_) -> true, _ -> false }).len(),
+    resets: all.filter(|i: Instruction| match i { Reset(_) -> true, _ -> false }).len(),
+    reused: all.filter(|i: Instruction|
       match i {
         Let(l) -> match l.value { Allocate(m) -> m.reuse != None, _ -> false },
         _ -> false,
@@ -337,7 +359,7 @@ fn reuse_of(b: Block) -> { incs: Int, resets: Int, reused: Int } = {
   }
 }
 
-test "a buffer appended to through a value held alone is handed on with no count taken, its cells reused" {
+test "appending to a buffer through its only reference takes no reference count and reuses the buffer's storage" {
   match program_of(buffer_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
@@ -365,23 +387,23 @@ fn tree_corpus() -> Bytes =
     b"fn prune(t: T, k: Int) -> T = match t { Leaf -> Leaf, Node(l, x, r) -> if x == k { Leaf } else { Node(prune(l, k), x, prune(r, k)) } }\n",
   ])
 
-test "a node a body takes apart and remakes at its shape is remade in its own box" {
+test "a tree node that a function destructures and rebuilds with the same shape is rebuilt in the same allocation" {
   match program_of(tree_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let counts = |n: Bytes|
         match checked(p, n) {
           Ok(f) -> {
-            let all = insts(f.body);
+            let all = instructions(f.body);
             Ok({
-              resets: all.filter(|i: Inst| match i { Reset(_) -> true, _ -> false }).len(),
-              reused: all.filter(|i: Inst|
+              resets: all.filter(|i: Instruction| match i { Reset(_) -> true, _ -> false }).len(),
+              reused: all.filter(|i: Instruction|
                 match i {
                   Let(l) -> match l.value { Allocate(m) -> m.reuse != None, _ -> false },
                   _ -> false,
                 }).len(
               ),
-              freed: all.filter(|i: Inst| match i { Free(_) -> true, _ -> false }).len(),
+              freed: all.filter(|i: Instruction| match i { Free(_) -> true, _ -> false }).len(),
             })
           },
           Err(reason) -> Err(reason),
@@ -401,8 +423,8 @@ fn bytes_corpus() -> Bytes =
     b"fn digested(b: Bytes) -> Bytes = b.blake3()\n",
   ])
 
-fn broken_in(b: Block, broken: (Inst) -> Option<Inst>) -> Block =
-  b.map(|i: Inst|
+fn broken_in(b: Block, broken: (Instruction) -> Option<Instruction>) -> Block =
+  b.map(|i: Instruction|
     match broken(i) {
       Some(x) -> x,
       None -> match i {
@@ -426,22 +448,22 @@ fn broken_in(b: Block, broken: (Inst) -> Option<Inst>) -> Block =
       },
     })
 
-fn rule_violation(i: Inst) -> Option<Inst> =
+fn rule_violation(i: Instruction) -> Option<Instruction> =
   match i {
     Let(l) -> match l.value {
-      Op(o) -> match o.op {
+      OperationCall(o) -> match o.operation {
         OfStrings(_) ->
           Some(
             Let({
               ..l,
-              value: Op({
+              value: OperationCall({
                 ..o,
                 uses: { ..o.uses, takes: o.uses.takes.map(|t: Bool| !t), owned: !o.uses.owned },
               }),
             }),
           ),
         OfContainers(CopyOut) ->
-          Some(Let({ ..l, value: Op({ ..o, uses: { ..o.uses, owned: false } }) })),
+          Some(Let({ ..l, value: OperationCall({ ..o, uses: { ..o.uses, owned: false } }) })),
         _ -> None,
       },
       Get(g) -> if g.path == PayloadPath {
@@ -450,9 +472,11 @@ fn rule_violation(i: Inst) -> Option<Inst> =
       _ -> None,
     },
     Do(d) -> match d.value {
-      Op(o) -> match o.op {
+      OperationCall(o) -> match o.operation {
         OfStrings(_) ->
-          Some(Do({ ..d, value: Op({ ..o, uses: { ..o.uses, owned: !o.uses.owned } }) })),
+          Some(
+            Do({ ..d, value: OperationCall({ ..o, uses: { ..o.uses, owned: !o.uses.owned } }) }),
+          ),
         _ -> None,
       },
       _ -> None,
@@ -460,22 +484,22 @@ fn rule_violation(i: Inst) -> Option<Inst> =
     _ -> None,
   }
 
-test "bytes read through an address, operated on and taken from a marshalling call pass the check, which rejects each held otherwise" {
+test "bytes read through an address, operated on and returned by a marshalling call pass the ownership check, and it rejects every deliberately broken copy" {
   match program_of(bytes_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
       let names = [b"first", b"starts", b"holds", b"cut", b"digested"];
-      let counted = names.fold([], |acc: List<{ name: Bytes, f: Fn }>, n: Bytes|
+      let counted = names.fold([], |accumulator: List<{ name: Bytes, f: Function }>, n: Bytes|
         match checked(p, n) {
-          Ok(f) -> acc.push({ name: n, f: f }),
+          Ok(f) -> accumulator.push({ name: n, f: f }),
           Err(reason) -> panic(String::of_bytes_lossy(n.concat(b": ").concat(reason))),
         });
       assert_eq(counted.len(), names.len());
       assert_eq(
-        counted.filter(|c: { name: Bytes, f: Fn }| {
+        counted.filter(|c: { name: Bytes, f: Function }| {
           let broken = broken_in(c.f.body, rule_violation);
           broken == c.f.body || ownership_fault({ ..c.f, body: broken }) == None
-        }).map(|c: { name: Bytes, f: Fn }| c.name),
+        }).map(|c: { name: Bytes, f: Function }| c.name),
         [],
       )
     },
@@ -499,7 +523,7 @@ fn inline_shape_corpus() -> Bytes =
     b"fn kept_both(o: Option<Holder>, t: Ran) -> Holder = match o { Some(r) -> if t.ok { { ..t.run, five: r.five } } else { r }, None -> t.run }\n",
   ])
 
-test "records in place read, kept and updated out of options, records and captures pass the check" {
+test "inline records read, copied and updated inside options, records and closure captures pass the ownership check" {
   match program_of(inline_shape_corpus()) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
@@ -515,10 +539,10 @@ test "records in place read, kept and updated out of options, records and captur
           b"nested_update",
           b"given_on",
           b"kept_both",
-        ].fold([], |acc: List<Bytes>, n: Bytes|
+        ].fold([], |accumulator: List<Bytes>, n: Bytes|
           match checked(p, n) {
-            Ok(_) -> acc,
-            Err(reason) -> acc.push(n.concat(b": ").concat(reason)),
+            Ok(_) -> accumulator,
+            Err(reason) -> accumulator.push(n.concat(b": ").concat(reason)),
           }),
         [],
       ),
