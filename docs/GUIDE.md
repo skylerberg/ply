@@ -1742,10 +1742,11 @@ unless it handles the console itself. A test may start the programs `--exec` gra
 ### 10.3 Which tests run
 
 `ply test` runs a `test/nondet` every time. It runs any other test only when no passing result is
-recorded for it. A passing result is recorded under two keys. The first key is the test's hash, which covers everything the test depends on but
-not names, comments or formatting. The second key is the compiled code the test ran. If an edit or a
-new `ply` compiles the test to the same code, the hash changes but the code does not, so the
-recorded pass still applies and `ply test` does not run the test.
+recorded for it. A passing result is recorded under two keys. The first key is the test's hash,
+which covers everything the test depends on but not names, comments or formatting. The second key
+is the compiled code the test ran. If an edit or a new `ply` compiles the test to the same code, the
+hash changes but the code does not, so the recorded pass still applies and `ply test` does not run
+the test.
 
 A pass also records each standard library function, type and effect the test used, and stays valid
 only while those are unchanged.
@@ -1783,8 +1784,8 @@ passed, and the test itself if its text changed. Edited definitions come first, 
 removed ones, then those that changed only because a definition they use changed. After the
 failures, `ply test` prints each change once, as a diff of the old and new text. A test that has
 never passed has no earlier version to compare with, so each definition it uses counts as a change.
-The exception is a definition that any earlier passing run of any test has already used. That
-definition does not count.
+The exception is a definition that was already in the program during an earlier run in which every
+test passed. That definition does not count.
 
 `--json` gives each failure's diagnostic, outside effects, changes and the command that runs it
 again, plus the diffs.

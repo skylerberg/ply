@@ -4,11 +4,11 @@ import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause, CostClaus
                               ReleaseInstance)
 import compiler.syntax.type_syntax (mode_text)
 import compiler.emit.code (dump)
-import compiler.check.types (Effect, Type, effect_bin, NamedType, FunctionType, RecordType,
-                             VariableType, effect_list_text, positional_effects_text, read_effects,
-                             Printer, printer_new, print_type, Field, canonical_effects,
-                             canonical_scheme, canonical_type, bool_type, int_type, bytes_type,
-                             unit_type, NominalType, TypeTable, variables_in)
+import compiler.check.types (Scheme, scheme_bin, Effect, Type, effect_bin, NamedType, FunctionType,
+                             RecordType, VariableType, effect_list_text, positional_effects_text,
+                             read_effects, Printer, printer_new, print_type, Field,
+                             canonical_effects, canonical_scheme, canonical_type, bool_type,
+                             int_type, bytes_type, unit_type, NominalType, TypeTable, variables_in)
 import compiler.check.known (fixed_widths, list_item, array_element, columns_row, map_parts)
 import compiler.check.resolve.tables (Diagnostic, qualify)
 import compiler.store.hash.forms (HashOutput, by_name, of_key)
@@ -17,7 +17,8 @@ import compiler.store.hash (digest)
 import compiler.check.infer (CheckOutput, BodyFacts, decode_facts, facts_by_owner, encode_facts,
                              no_body_facts, body_facts_bin, is_pure_definition, types_named,
                              recorded_data, whole_body_data)
-import compiler.check.infer.checker (Location, DefinitionInfo, SpecInfo, TestInfo, test_info_bin,
+import compiler.check.infer.checker (constructor_info_bin, instance_info_bin, numeric_info_bin,
+                                     Location, DefinitionInfo, SpecInfo, TestInfo, test_info_bin,
                                      LawInfo, LawBinder, EffectInfo, OperationInfo, ConstructorInfo,
                                      CheckCache, empty_cache, CachedDefinition, CachedTest,
                                      CachedFacts, WitnessOrder, listing_type, witness_order_bin,
@@ -34,18 +35,18 @@ import std.hash (blake3)
 import std.list
 import compiler.expand.embed (ModuleEmbed, module_embed_bin)
 import std.bytes (ascii_of_int)
-import compiler.front.rows (DeclaredEffect, declared_effect_bin, declared_effects, module_span_bin,
-                            span_at, location_span, WrittenFunction, written_functions,
-                            written_function_of, SpannedName, OutlinedEffect, OutlinedFunction,
-                            OutlinedLaw, OutlinedTest, OutlinedType, OutlineItem, Outline,
-                            module_row, imports_resolved, Cut, KeyRow, EmitterRoot,
-                            EmitterConstructor, FunctionWidths, ListWidths, MapWidths, NoWidths,
-                            RecordWidths, SumWidths, VariableWidths, FixedWidth, Widths,
-                            FieldWidths, EffectHash, KnownDefinitionRow, constant_values,
-                            KnownTestRow, Rows, ModuleSpan, DefinitionRow, TestRow, LawRow,
-                            OperationRow, EffectRow, ConstructorRow, HashRow, DefinitionHashRow,
-                            LawHashRow, TestHashRow, HashTableRow, OrdinalRow, Dump,
-                            normalized_diagnostic)
+import compiler.front.rows (ReleaseScheme, release_scheme_bin, DeclaredEffect, declared_effect_bin,
+                            declared_effects, module_span_bin, span_at, location_span,
+                            WrittenFunction, written_functions, written_function_of, SpannedName,
+                            OutlinedEffect, OutlinedFunction, OutlinedLaw, OutlinedTest,
+                            OutlinedType, OutlineItem, Outline, module_row, imports_resolved, Cut,
+                            KeyRow, EmitterRoot, EmitterConstructor, FunctionWidths, ListWidths,
+                            MapWidths, NoWidths, RecordWidths, SumWidths, VariableWidths,
+                            FixedWidth, Widths, FieldWidths, EffectHash, KnownDefinitionRow,
+                            constant_values, KnownTestRow, Rows, ModuleSpan, DefinitionRow, TestRow,
+                            LawRow, OperationRow, EffectRow, ConstructorRow, HashRow,
+                            DefinitionHashRow, LawHashRow, TestHashRow, HashTableRow, OrdinalRow,
+                            Dump, normalized_diagnostic)
 import compiler.front.facts (tagged_site_bin, statement_site_bin, outlines_of, effect_visibility,
                              effect_hosts, effect_public_of, ModuleShape, ModuleTables, one_module,
                              type_rows, test_label_spans, law_literals, Frame, CheckedProgram,
@@ -500,25 +501,105 @@ fn emitter_constructors_of(
         constructor_info.module == o.name),
     ));
   prelude.concat(rest).map(|constructor_info: ConstructorInfo|
-    {
-      name: constructor_info.name,
-      arity: constructor_info.arity,
-      fields: widths_of_all(
-        width_sums,
-        constructor_info.scheme.type_variables,
-        constructor_info.fields,
-      ),
-      key: instance_by(checked, constructor_info.type_name, KeyInstance),
-      show: instance_by(checked, constructor_info.type_name, ShowInstance),
-      numeric: checked.numeric_types.fold([], |accumulator: List<Bytes>, x: NumericInfo|
-        if x.type_name == constructor_info.type_name { x.functions } else { accumulator }),
-      release: instance_by(checked, constructor_info.type_name, ReleaseInstance),
-    })
+    emitter_constructor(constructor_info, width_sums, checked.instances, checked.numeric_types))
 }
 
-fn instance_by(checked: CheckOutput, type_name: Bytes, kind: InstanceKind) -> Option<Bytes> =
-  checked.instances.fold(None, |accumulator: Option<Bytes>, x: InstanceInfo|
+fn emitter_constructor(
+  constructor_info: ConstructorInfo,
+  width_sums: WidthSums,
+  instances: List<InstanceInfo>,
+  numeric_types: List<NumericInfo>,
+) -> EmitterConstructor / {abort.raise} =
+  {
+    name: constructor_info.name,
+    arity: constructor_info.arity,
+    fields: widths_of_all(
+      width_sums,
+      constructor_info.scheme.type_variables,
+      constructor_info.fields,
+    ),
+    key: instance_in(instances, constructor_info.type_name, KeyInstance),
+    show: instance_in(instances, constructor_info.type_name, ShowInstance),
+    numeric: numeric_types.fold([], |accumulator: List<Bytes>, x: NumericInfo|
+      if x.type_name == constructor_info.type_name { x.functions } else { accumulator }),
+    release: instance_in(instances, constructor_info.type_name, ReleaseInstance),
+  }
+
+fn instance_in(
+  instances: List<InstanceInfo>,
+  type_name: Bytes,
+  kind: InstanceKind,
+) -> Option<Bytes> =
+  instances.fold(None, |accumulator: Option<Bytes>, x: InstanceInfo|
     if x.type_name == type_name && x.kind == kind { Some(x.by) } else { accumulator })
+
+fn instance_by(checked: CheckOutput, type_name: Bytes, kind: InstanceKind) -> Option<Bytes> =
+  instance_in(checked.instances, type_name, kind)
+
+pub type KnownConstructors = {
+  constructors: List<ConstructorInfo>,
+  instances: List<InstanceInfo>,
+  numeric: List<NumericInfo>,
+  released: List<ReleaseScheme>,
+}
+
+derive bin for KnownConstructors
+
+fn no_location() -> Location = { module: 0, span: { start: 0, end: 0, site: 0 } }
+
+pub fn constructors_of_module(
+  shape: ModuleShape,
+  tables: ModuleTables,
+) -> KnownConstructors / {abort.raise} = {
+  let checked = one_module(shape, tables).checked;
+  let instances = checked.instances.map(|x: InstanceInfo| { ..x, at: no_location() });
+  let releases = instances.fold(Map::new(), |found: Map<Bytes, Bool>, x: InstanceInfo|
+    if x.kind == ReleaseInstance { found.insert(x.by, true) } else { found });
+  {
+    constructors: checked.constructors.map(|c: ConstructorInfo| { ..c, at: no_location() }),
+    instances: instances,
+    numeric: checked.numeric_types.map(|x: NumericInfo| { ..x, at: no_location() }),
+    released: checked.definitions.filter(|d: DefinitionInfo| releases.contains(d.name)).map(
+      |d: DefinitionInfo| { name: d.name, scheme: d.scheme },
+    ),
+  }
+}
+
+pub fn joined_constructors(all: List<KnownConstructors>) -> KnownConstructors / {abort.raise} = {
+  {
+    constructors: all.fold(
+      Map::new(),
+      |found: Map<Bytes, ConstructorInfo>, k: KnownConstructors|
+        k.constructors.fold(found, |m: Map<Bytes, ConstructorInfo>, c: ConstructorInfo|
+          m.insert(c.name, c)),
+    ).values(
+    ),
+    instances: all.flat_map(|k: KnownConstructors| k.instances).unique(),
+    numeric: all.flat_map(|k: KnownConstructors| k.numeric).unique(),
+    released: all.fold(
+      Map::new(),
+      |found: Map<Bytes, ReleaseScheme>, k: KnownConstructors|
+        k.released.fold(found, |m: Map<Bytes, ReleaseScheme>, r: ReleaseScheme|
+          m.insert(r.name, r)),
+    ).values(
+    ),
+  }
+}
+
+pub fn with_known_constructors(dump: Dump, known: KnownConstructors) -> Dump / {abort.raise} = {
+  let held = dump.constructors.fold(Map::new(), |found: Map<Bytes, Bool>, c: ConstructorRow|
+    found.insert(c.name, true));
+  let added = known.constructors.filter(|c: ConstructorInfo| !held.contains(c.name));
+  let width_sums = width_sums_of(known.constructors);
+  {
+    ..dump,
+    constructors: dump.constructors.concat(added.map(constructor_row)),
+    emitter_constructors: dump.emitter_constructors.concat(
+      added.map(|c: ConstructorInfo|
+        emitter_constructor(c, width_sums, known.instances, known.numeric)),
+    ),
+  }
+}
 
 pub fn constructors_read(
   checked: CheckOutput,

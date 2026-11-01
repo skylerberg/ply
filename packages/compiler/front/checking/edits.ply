@@ -35,8 +35,9 @@ import compiler.front.checking.world (PackageLocation, ModuleKey, InterfaceKey, 
                                       ModuleResult, package_location_bin, module_key_bin,
                                       interface_key_bin, embedding_bin, QueryEffects, CheckQuery,
                                       decoded, module_query, owner_interfaces_query, setting_bin)
-import compiler.front.checking.groups (GroupKey, module_rollup_query, owner_key_bin, group_key_bin,
-                                       owners_result_bin, owners_query, cycles_query, group_query,
+import compiler.front.checking.groups (GroupKey, hash_summary_query, module_rollup_query,
+                                       owner_key_bin, group_key_bin, owners_result_bin,
+                                       owners_query, cycles_query, group_query,
                                        owner_interface_query, signatures_query, typed_query,
                                        group_hash_query, owner_facts, always_entire, imports_of,
                                        GroupCheck, owners_check, current, current_unit, group_of,
@@ -2428,9 +2429,10 @@ fn queries_ran(run: Run) -> List<Bytes> / {abort.raise} =
       ran.push(Bytes::concat_all([t.query, b" ", Bytes::of_string(t.ran.to_string())]))
     } else { ran })
 
-fn rollups_run(
+fn each_module_run(
   store: MemoryStore,
   sources: List<Source>,
+  query: Bytes,
 ) -> { store: MemoryStore, ran: List<Bytes> } / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry();
@@ -2445,7 +2447,7 @@ fn rollups_run(
           memo::query_output(
             qs,
             so_far,
-            module_rollup_query(),
+            query,
             bin::encode({ module: m, shipped: false, tested: false }, module_key_bin()),
           ).run);
         { run: read, value: queries_ran(read) }
@@ -2492,11 +2494,35 @@ test "a body edit with an unchanged interface runs the same queries at two progr
   assert_eq(edit_at(3), edit_at(9))
 }
 
+fn runs_of_edit(sources: (Bytes) -> List<Source>, query: Bytes) -> List<Bytes> / {abort.raise} = {
+  let cold = each_module_run(empty_memory_store(), sources(b"n * 3"), query);
+  each_module_run(cold.store, sources(b"n * 4"), query).ran
+}
+
 test "a body edit reads the same rollups at two program sizes" {
-  let edit_at = |size: Int| {
-    let cold = rollups_run(empty_memory_store(), module_chain(size, b"n * 3"));
-    rollups_run(cold.store, module_chain(size, b"n * 4")).ran
-  };
+  let edit_at = |size: Int|
+    runs_of_edit(|body: Bytes| module_chain(size, body), module_rollup_query());
+  assert_eq(edit_at(3), edit_at(9))
+}
+
+fn beside_unrelated_modules(size: Int, body: Bytes) -> List<Source> =
+  range(1, size).fold(
+    [
+      {
+        name: b"edited",
+        source_text: Bytes::concat_all([b"pub fn step(n: Int) -> Int = ", body, b"\n"]),
+      },
+    ],
+    |found: List<Source>, i: Int|
+      found.push({
+        name: b"other".concat(Bytes::of_string(i.to_string())),
+        source_text: b"pub fn same(n: Int) -> Int = n + 1\n",
+      }),
+  )
+
+test "a body edit hashes the same modules for a test run at two program sizes" {
+  let edit_at = |size: Int|
+    runs_of_edit(|body: Bytes| beside_unrelated_modules(size, body), hash_summary_query());
   assert_eq(edit_at(3), edit_at(9))
 }
 
@@ -2546,6 +2572,14 @@ test "a comment between definitions runs nothing beyond parsing that file, at an
   };
   assert_eq(edit_at(3), [b"header text 1", b"imports 1", b"owners 1"]);
   assert_eq(edit_at(9), edit_at(3))
+}
+
+test "a comment inside a body runs the same queries at two program sizes" {
+  let edit_at = |size: Int| {
+    let cold = summary_run(empty_memory_store(), module_chain(size, b"n * 3"));
+    summary_run(cold.store, module_chain(size, b"n * // tripled\n  3")).ran
+  };
+  assert_eq(edit_at(3), edit_at(9))
 }
 
 fn apart_position(

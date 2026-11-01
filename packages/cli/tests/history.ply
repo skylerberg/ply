@@ -4,7 +4,7 @@ import compiler.front.checking (LoadInputs)
 import compiler.front.checking.view
 import compiler.front.checking.view (ModuleVersion)
 import compiler.store.hash.forms (CachedNode, ModuleHashes)
-import changes (StoredText, module_texts, text_at_test)
+import changes (StoredText, module_texts, stored_text_at)
 import diagnostic (SourceText)
 import program (ProgramStore, Session, in_program_store)
 import std.list
@@ -12,9 +12,9 @@ import tester (result_cache)
 import testing.conclude (Filing, PassRecord)
 import tests.listing (TestListing, TestReading, sources_named)
 
-pub type ModuleAtSlot = { slot: Int, version: ModuleVersion }
+pub type IndexedVersion = { index: Int, version: ModuleVersion }
 
-fn run_texts(
+fn recorded_test_texts(
   listing: TestListing,
   sources: List<Source>,
   filing: Filing,
@@ -22,7 +22,7 @@ fn run_texts(
   filing.records.fold([], |found: List<StoredText>, e: { key: Bytes, record: PassRecord }|
     match listing.tests.find(|t: TestInfo| t.key == e.key) {
       None -> found,
-      Some(t) -> match text_at_test(sources, t.at, e.record.test) {
+      Some(t) -> match stored_text_at(sources, t.at, e.record.test) {
         Some(text) -> found.push(text),
         None -> found,
       },
@@ -31,24 +31,24 @@ fn run_texts(
 pub fn store_versions(
   listing: TestListing,
   sources: List<Source>,
-  versions: List<ModuleAtSlot>,
+  versions: List<IndexedVersion>,
   filing: Filing,
 ) -> Unit / {result_cache.unstored, result_cache.history, abort.raise} = {
   let texts = versions.fold(
-    run_texts(listing, sources, filing),
-    |found: List<StoredText>, m: ModuleAtSlot|
-      found.concat(module_texts(m.version.one, m.version.hashes.cached, sources.get(m.slot))),
+    recorded_test_texts(listing, sources, filing),
+    |found: List<StoredText>, m: IndexedVersion|
+      found.concat(module_texts(m.version.one, m.version.hashes.cached, sources.get(m.index))),
   );
   let unstored = result_cache.unstored(texts.map(|t: StoredText| t.hash));
   result_cache.history(
     texts.filter(|t: StoredText| unstored.contains(t.hash)),
-    versions.map(|m: ModuleAtSlot| m.version.hashes),
+    versions.map(|m: IndexedVersion| m.version.hashes),
     listing.records,
   )
 }
 
-fn definitions_passed(versions: List<ModuleAtSlot>) -> List<Bytes> =
-  versions.fold([], |found: List<Bytes>, m: ModuleAtSlot|
+fn definitions_passed(versions: List<IndexedVersion>) -> List<Bytes> =
+  versions.fold([], |found: List<Bytes>, m: IndexedVersion|
     m.version.hashes.cached.nodes.fold(
       found.push(m.version.hashes.record),
       |hashes: List<Bytes>, n: CachedNode| if n.declaration { hashes } else { hashes.push(n.hash) },
@@ -60,17 +60,18 @@ pub fn store_run(
   places: List<SourceText>,
   filing: Filing,
   all_passed: Bool,
-) -> List<Bytes> / {result_cache.known, result_cache.filed, result_cache.unstored, result_cache.history, ProgramStore, abort.raise} = {
+) -> List<Bytes> / {result_cache.known, result_cache.has_records, result_cache.unstored, result_cache.history, ProgramStore, abort.raise} = {
   let records = listing.records;
   let recording = filing.records.len() > 0;
   let passed = if all_passed { result_cache.known(records) } else { records.map(|r: Bytes| true) };
-  let filed = if recording { result_cache.filed(records) } else { records.map(|r: Bytes| true) };
-  let slots = range(0, records.len()).filter(|i: Int|
-    !passed.at_or(i, true) || !filed.at_or(i, true));
+  let stored = if recording { result_cache.has_records(records) }
+  else { records.map(|r: Bytes| true) };
+  let unread = range(0, records.len()).filter(|i: Int|
+    !passed.at_or(i, true) || !stored.at_or(i, true));
   let keys = view::keys_of(t.modules);
-  let versions = if slots.len() == 0 { [] } else {
+  let versions = if unread.len() == 0 { [] } else {
     in_program_store(t.place, |_: LoadInputs|
-      slots.map(|i: Int| { slot: i, version: view::module_version(keys.get(i)) })).value
+      unread.map(|i: Int| { index: i, version: view::module_version(keys.get(i)) })).value
   };
   if recording { store_versions(listing, sources_named(listing.names, places), versions, filing) };
   if all_passed { definitions_passed(versions) } else { [] }
