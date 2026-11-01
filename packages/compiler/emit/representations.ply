@@ -994,30 +994,40 @@ fn key_within(constructors: Constructors, ty: Type, depth: Int) -> Bytes / {abor
       RecordType(fs) -> fields_key(fs),
       NominalType(x) -> fields_key(x.fields),
       NamedType(c) -> match constructors.sums.get(c.name) {
-        Some(cs) -> {
-          let recursive_group = constructors.recursive.get(c.name);
-          let cases = cs.fold([], |accumulator: List<Bytes>, k: SumConstructor| {
-            let boxed = match recursive_group {
-              Some(r) -> r.indirect.at(accumulator.len()) == Some(true),
-              None -> false,
-            };
-            accumulator.push(if boxed { b"_" } else {
-              Bytes::concat_all([
-                b"{",
-                Bytes::join(
-                  constructor_fields_at(k, c.args).map(|t: Type|
-                    key_within(constructors, t, depth - 1)),
-                  b",",
-                ),
-                b"}",
-              ])
-            })
-          });
-          Bytes::concat_all([b"_|<", Bytes::join(cases, b","), b">"])
-        },
+        Some(_) ->
+          Bytes::concat_all([
+            c.name,
+            b"<",
+            Bytes::join(c.args.map(|t: Type| key_within(constructors, t, depth - 1)), b","),
+            b">",
+          ]),
         None -> c.name,
       },
       _ -> b"_",
+    }
+  }
+
+pub fn layout_representative(constructors: Constructors, ty: Type) -> Type / {abort.raise} =
+  representative_within(constructors, ty, nesting())
+
+fn representative_within(constructors: Constructors, ty: Type, depth: Int) -> Type / {abort.raise} =
+  if depth <= 0 {
+    panic(String::of_bytes_lossy(b"a layout nested too deep: ".concat(encode_type(ty))))
+  } else if classes(layout_of(constructors, ty)) == [Pointer] && !is_record(ty) { bytes_type() }
+  else {
+    let of_fields = |fs: List<Field>|
+      RecordType(
+        fs.map(|f: Field| { ..f, ty: representative_within(constructors, f.ty, depth - 1) }),
+      );
+    match ty {
+      RecordType(fs) -> of_fields(fs),
+      NominalType(x) -> of_fields(x.fields),
+      NamedType(c) ->
+        NamedType({
+          ..c,
+          args: c.args.map(|t: Type| representative_within(constructors, t, depth - 1)),
+        }),
+      _ -> ty,
     }
   }
 
@@ -1405,11 +1415,15 @@ test "a sum case that directly contains its own recursive type is stored in a bo
   )
 }
 
-test "two sums laid alike share a layout key, and Option<Color> and Option<String> do not" {
+test "one layout key has one representative type, a sum's key names the sum, and Option<Color> and Option<String> differ" {
   let t = sample_constructors();
   let key = |ty: Type| layout_key(t, ty);
   let either = |x: Type| applied(b"m.Either", [x, x]);
-  assert_eq(key(named_type(b"m.Shape")), key(named_type(b"m.Size")));
+  assert(key(named_type(b"m.Shape")) != key(named_type(b"m.Size")), None);
+  assert_eq(
+    layout_representative(t, option_type(option_type(string_type()))),
+    layout_representative(t, option_type(option_type(bytes_type()))),
+  );
   assert(key(option_type(string_type())) != key(option_type(named_type(b"m.Color"))), None);
   assert(key(named_type(b"m.Shape")) != key(option_type(string_type())), None);
   assert_eq(

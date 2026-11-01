@@ -23,7 +23,8 @@ import compiler.front.facts (ModuleShape, ModuleTables, no_shape, module_shape_b
 import compiler.syntax.expressions (prelude_module)
 import compiler.front.rows (OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw)
 import compiler.syntax.items (Module, Item, TypeItem, LawItem, ImportDeclaration, SelectedNames,
-                              header, header_of, parse, is_explicit_import)
+                              header, header_of, parse, is_explicit_import, InstanceItem,
+                              NumericItem, NumericOperation, KeyInstance, ShowInstance, SumBody)
 import compiler.expand.derive (import_path)
 import compiler.front.diagnostics (ParsedSource, diagnostic_in_module)
 import compiler.front.interface (imported, blanked)
@@ -33,6 +34,7 @@ import compiler.check.resolve.tables (Source, Diagnostic, Label, backticked, dia
 import compiler.syntax.parsing (Identifier, dummy_span)
 import compiler.check.infer.definitions (checked_functions, check_order)
 import compiler.check.infer.checker (BodyChecking, CheckOnly)
+import compiler.check.types (TypeTable)
 import compiler.store.hash.forms (CachedNode, CachedTest, CachedLaw, CachedHashes, NodeRef,
                                   HashInput, HashNode, hash_forms, cached_hashes_bin,
                                   hash_input_bin, definition_key, joined_forms, module_record,
@@ -69,6 +71,7 @@ pub type OwnersResult = {
   recorded: List<Bytes>,
   wanted: List<Mention>,
   publishing: Map<Bytes, List<Mention>>,
+  stated: List<Bytes>,
   rejecting: Bool,
 }
 
@@ -195,6 +198,7 @@ pub fn owners_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
         recorded: [],
         wanted: [],
         publishing: Map::new(),
+        stated: [],
         rejecting: false,
       },
     Some(m) -> {
@@ -311,6 +315,7 @@ pub fn owners_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
               _ -> accumulator,
             },
         ),
+        stated: stated_functions(module, m.parsed.module),
         rejecting: m.reading.given.fold(false, |b: Bool, g: ParsedSource|
             b || g.diagnostics.fold(false, |c: Bool, d: Diagnostic| c || d.severity == b"error"))
           || m.names.any(|n: Bytes| !m.present.contains(n))
@@ -320,6 +325,29 @@ pub fn owners_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   };
   prefill_projections(key, read);
   bin::encode(read, owners_result_bin())
+}
+
+fn stated_functions(module: Bytes, parsed: Module) -> List<Bytes> = {
+  let sums = parsed.items.fold(Map::new(), |accumulator: Map<Bytes, Bool>, item: Item|
+    match item {
+      TypeItem(d) -> match d.body {
+        SumBody(_) -> accumulator.insert(d.name.name, true),
+        _ -> accumulator,
+      },
+      _ -> accumulator,
+    });
+  parsed.items.fold([], |accumulator: List<Bytes>, item: Item|
+    match item {
+      InstanceItem(d) -> if sums.contains(d.target.name)
+          && (d.kind == KeyInstance || d.kind == ShowInstance) {
+        accumulator.push(qualify(module, d.function.name))
+      } else { accumulator },
+      NumericItem(d) -> if !sums.contains(d.target.name) { accumulator } else {
+        d.operations.fold(accumulator, |a: List<Bytes>, o: NumericOperation|
+          a.push(qualify(module, o.by.name)))
+      },
+      _ -> accumulator,
+    })
 }
 
 pub fn owner_facts_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
@@ -866,9 +894,10 @@ pub fn unit_checked(
   imported: List<Imported>,
   sibling: (Bytes) -> Sibling,
   body_supplier: BodySupplier,
+  also: List<Mention> = [],
 ) -> UnitCheck / {QueryEffects, abort.raise} = {
   let checked_of = |published: Bool| {
-    let c = owners_check(named, members, imported, published, sibling);
+    let c = owners_check(named, members, imported, published, sibling, also: also);
     let source = group_source_from(named.module, c.reads, c.imported, c.needed);
     {
       texts: c.reads,
@@ -943,6 +972,71 @@ fn finalize_group(
     );
     owner_checks::finalized_result(checked_group_result(key.module, c), walked, c.source.items)
   }
+}
+
+type GroupProgram = {
+  named: ModuleKey,
+  members: List<OwnerFacts>,
+  imported: List<Imported>,
+  sibling: (Bytes) -> Sibling,
+  bodies: BodySupplier,
+  types: List<TypeTable>,
+}
+
+fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise} = {
+  let named = { module: key.module, shipped: key.shipped, tested: key.tested };
+  let members = key.owners.map(|o: Bytes| owner_facts(named, o));
+  let cycle = match key.owners {
+    [] -> false,
+    [o, ..] ->
+      unit_key_of({
+          module: key.module,
+          shipped: key.shipped,
+          tested: key.tested,
+          owner: o,
+        }).owners.len(
+        )
+        >= 2,
+  };
+  if !cycle {
+    {
+      named: named,
+      members: members,
+      imported: imports_of(key),
+      sibling: always_entire,
+      bodies: no_bodies,
+      types: [],
+    }
+  } else {
+    let walked = key.owners.map(|o: Bytes| { owner: o, typed: inference_of(named, o) });
+    {
+      named: named,
+      members: members,
+      imported: imports_of(key),
+      sibling: sibling_for_called(called_in(key, walked)),
+      bodies: |source: OwnerSource|
+        Some(owner_checks::supplied_bodies(walked, source.items, source.offset)),
+      types: walked.map(|w: { owner: Bytes, typed: owner_checks::InferenceResult }| w.typed.types),
+    }
+  }
+}
+
+pub fn group_program_read(
+  key: GroupKey,
+  also: List<Mention>,
+) -> Map<Bytes, Map<Bytes, OwnerInterface>> / {QueryEffects, abort.raise} = {
+  let g = group_program_of(key);
+  let c = owners_check(g.named, g.members, g.imported, false, g.sibling, also: also);
+  reading_of(c.setting);
+  c.needed
+}
+
+pub fn group_program(
+  key: GroupKey,
+  also: List<Mention>,
+) -> { check: UnitCheck, types: List<TypeTable> } / {QueryEffects, abort.raise} = {
+  let g = group_program_of(key);
+  { check: unit_checked(g.named, g.members, g.imported, g.sibling, g.bodies, also), types: g.types }
 }
 
 fn inference_of(
@@ -1127,6 +1221,7 @@ pub fn owners_check(
   published: Bool,
   sibling: (Bytes) -> Sibling,
   reached: (Bytes, Bytes) -> Bool = no_body_reached,
+  also: List<Mention> = [],
 ) -> GroupCheck / {QueryEffects, abort.raise} = {
   let key = {
     module: named.module,
@@ -1153,6 +1248,7 @@ pub fn owners_check(
         e,
       )
     };
+  let asker = key.shipped && also.len() == 0;
   let entries = |module: Bytes, n: Bytes|
     if module == key.module {
       declared_of(module, key.shipped, key.tested, n).fold(
@@ -1170,13 +1266,11 @@ pub fn owners_check(
             }
           },
       )
-    } else {
-      owner_interfaces_of(key.shipped, module, n).map(|e: OwnerInterface| read_in(module, e))
-    };
+    } else { owner_interfaces_of(asker, module, n).map(|e: OwnerInterface| read_in(module, e)) };
   let needed = group_needs(
     key.module,
     reads,
-    members.fold([], |accumulator: List<Mention>, f: OwnerFacts| accumulator.concat(f.mentions)),
+    members.fold(also, |accumulator: List<Mention>, f: OwnerFacts| accumulator.concat(f.mentions)),
     imported,
     entries,
     interface_header_of,
@@ -1188,7 +1282,7 @@ pub fn owners_check(
   {
     needed: needed,
     imported: imported,
-    places: module_origins_of(key.shipped, needed.keys().filter(|m: Bytes| m != key.module)),
+    places: module_origins_of(asker, needed.keys().filter(|m: Bytes| m != key.module)),
     setting: setting,
     reads: reads,
   }
@@ -1202,7 +1296,7 @@ pub fn current(g: GroupKey) -> Bool / {memo.read, abort.raise} =
         == g.owners,
   }
 
-fn group_key_of(o: OwnerKey) -> GroupKey / {memo.read, abort.raise} =
+pub fn group_key_of(o: OwnerKey) -> GroupKey / {memo.read, abort.raise} =
   {
     module: o.module,
     shipped: o.shipped,
@@ -1425,6 +1519,17 @@ pub fn entry_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 pub fn group_keys(named: ModuleKey, read: OwnersResult) -> List<GroupKey> =
   read.groups.map(|g: List<Bytes>|
     { module: named.module, shipped: named.shipped, tested: named.tested, owners: g })
+
+pub fn module_groups(
+  named: ModuleKey,
+  read: OwnersResult,
+) -> List<GroupKey> / {memo.read, abort.raise} =
+  group_keys(named, read).fold([], |accumulator: List<GroupKey>, unit: GroupKey|
+    accumulator.concat(
+      (if unit.owners.len() < 2 { [unit.owners] } else { cycles_of(unit) }).map(
+        |owners: List<Bytes>| { ..unit, owners: owners },
+      ),
+    ))
 
 pub fn facts_of(read: OwnersResult) -> Map<Bytes, OwnerFacts> / {abort.raise} =
   read.owners.fold(
