@@ -1,0 +1,79 @@
+//! `ply cache`, and a store a run could not read: what the commands report and change, and that a
+//! damaged file costs a run what it stored and never the run.
+
+import harness (scratch, on_disk, CliEffects, Shipped)
+import spawning.harness (write_program, write, all_output, stdout, stderr, json_of, at, path, nth,
+                         items, str, json_text)
+import std.bytes
+import std.json
+import std.json (Json)
+import std.string
+import std.list
+
+fn green() -> String = String::of_bytes_lossy(embed("../programs/cache_store/green.ply"))
+
+fn inspect_report(what: String) -> Json / {CliEffects, Shipped, abort.raise, diverges} =
+  json_of(on_disk(["cache", "inspect", what, "--json"]))
+
+test "cache inspect prints a resolved type rather than a serialization" {
+  scratch(|| {
+    write_program(
+      "effect db {\n  read all[t]() -> List<Int>\n}\nfn active(n: Int) -> List<Int> / {db.read[users]} = db.all[users]()\n",
+    );
+    assert(on_disk(["check"]).code == 0, None);
+    let r = on_disk(["cache", "inspect", "active"]);
+    assert(r.code == 0, Some(all_output(r)));
+    let text = stdout(r);
+    assert(text.contains("m.active"), Some(text));
+    assert(
+      text.contains("(Int) -> List<Int> / {m.db.read[users]}"),
+      Some("the type must read as a signature, not as JSON:\n" ++ text),
+    );
+    assert(text.contains("performs   {m.db.read[users]}"), Some(text));
+    assert(text.contains("m.ply:4:"), Some("the declaring position must be shown:\n" ++ text));
+    assert(text.contains("effects"), Some(text));
+    assert(text.contains("body"), Some(text));
+    assert(text.contains("result"), Some(text))
+  })
+}
+
+test "cache inspect accepts a hash prefix and emits json" {
+  scratch(|| {
+    write_program(green());
+    assert(on_disk(["check"]).code == 0, None);
+    let v = inspect_report("double");
+    assert(str(at(v, "command")) == "cache", Some(json_text(v)));
+    assert(str(at(v, "action")) == "inspect", Some(json_text(v)));
+    assert(items(at(v, "matches")).len() == 1, Some(json_text(v)));
+    let found = nth(at(v, "matches"), 0);
+    assert(str(at(found, "name")) == "m.double", Some(json_text(found)));
+    assert(str(at(found, "kind")) == "fn", Some(json_text(found)));
+    assert(str(at(found, "file")) == "m.ply", Some(json_text(found)));
+    assert(str(path(found, ["interface", "type"])) == "(Int) -> Int", Some(json_text(found)));
+    let by_prefix = inspect_report(str(at(found, "hash")).slice(0, 6));
+    assert(
+      str(at(nth(at(by_prefix, "matches"), 0), "name")) == "m.double",
+      Some(json_text(by_prefix)),
+    );
+    // What a load returns is of the text as it stands: an edit's hash, at its place.
+    write("m.ply", green().replace("x * 2", "x + 2"));
+    let edited = nth(at(inspect_report("double"), "matches"), 0);
+    assert(str(at(edited, "hash")) != str(at(found, "hash")), Some(json_text(edited)));
+    assert(str(at(edited, "location")).starts_with("m.ply:1:"), Some(json_text(edited)))
+  })
+}
+
+test "cache inspect of an unknown name is E0101 and exits two" {
+  scratch(|| {
+    write_program(green());
+    assert(on_disk(["check"]).code == 0, None);
+    let r = on_disk(["cache", "inspect", "no_such_thing"]);
+    assert(r.code == 2, Some(all_output(r)));
+    assert(stderr(r).contains("E0101"), Some(stderr(r)));
+    let j = on_disk(["cache", "inspect", "no_such_thing", "--json"]);
+    assert(j.code == 2, Some(all_output(j)));
+    let v = json_of(j);
+    assert(at(v, "ok") == json::Bool(false), Some(json_text(v)));
+    assert(str(at(nth(at(v, "diagnostics"), 0), "code")) == "E0101", Some(json_text(v)))
+  })
+}

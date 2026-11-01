@@ -3,7 +3,7 @@
 
 use crate::emitted::{Block, Carried, Handed, KeepRoot, PlyOp, PlyType};
 use crate::heap::{self, CLOSURE_CAPTURES, CLOSURE_CODE, Heap, Word, obj, set_word, word_at};
-use crate::native::{I64, Raises};
+use crate::native::I64;
 use crate::stack::{Stack, switch};
 use ply_core::builtins::scoped_released;
 use ply_core::{Diagnostic, Effect, Mode, Resource, Span, Symbol, codes};
@@ -22,7 +22,6 @@ mod frames;
 mod marshalling;
 mod memory;
 mod natives;
-mod numbers;
 mod tables;
 
 pub use budget::*;
@@ -34,5 +33,4 @@ pub use frames::*;
 pub use marshalling::*;
 pub use memory::*;
 pub use natives::*;
-pub use numbers::*;
 pub use tables::*;
