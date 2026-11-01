@@ -256,27 +256,62 @@ fn comes_first(a: WorldClaim, b: WorldClaim) -> Bool = {
     || (x.rank == y.rank && (x.module < y.module || (x.module == y.module && x.start <= y.start)))
 }
 
-fn belongs_to(names: List<Bytes>, module: Bytes, key: String) -> Bool = {
-  let within = |m: Bytes| key.starts_with(String::of_bytes_lossy(m) ++ ".");
-  within(module) && !names.any(|m: Bytes| m.len() > module.len() && within(m))
+type FreshModules = {
+  claims: Map<Int, List<Claim>>,
+  laws: Map<Bytes, List<WrittenLaw>>,
+  warnings: Map<Int, List<Diagnostic>>,
+  definitions: Map<Bytes, List<Definition>>,
 }
 
-fn labelled_at(d: Diagnostic, index: Int) -> Bool = d.labels.any(|l: Label| l.module == index)
+fn law_module(names: Map<Bytes, Bool>, key: String) -> Bytes / {abort.raise} = {
+  let parts = Bytes::of_string(key).split(b".");
+  parts.take(parts.len() - 1).fold(
+    { prefix: b"", found: b"" },
+    |at: { prefix: Bytes, found: Bytes }, part: Bytes| {
+      let prefix = if at.prefix.len() == 0 { part }
+      else { Bytes::concat_all([at.prefix, b".", part]) };
+      { prefix: prefix, found: if names.contains(prefix) { prefix } else { at.found } }
+    },
+  ).found
+}
 
-fn fresh_claims(
+fn warnings_by_module(warnings: List<Diagnostic>) -> Map<Int, List<Diagnostic>> =
+  warnings.fold(Map::new(), |found: Map<Int, List<Diagnostic>>, d: Diagnostic|
+    d.labels.fold(Map::new(), |at: Map<Int, Bool>, l: Label| at.insert(l.module, true)).keys().fold(
+      found,
+      |all: Map<Int, List<Diagnostic>>, module: Int|
+        all.insert(module, all.get(module).unwrap_or([]).push(d)),
+    ))
+
+fn fresh_by_module(
   fresh: OwnClaims,
   v: CheckedProgram,
   names: List<Bytes>,
-  known: KnownModule,
-) -> ModuleClaims / {abort.raise} =
+  opened: Map<Bytes, Int>,
+) -> FreshModules / {abort.raise} = {
+  let known = names.fold(Map::new(), |found: Map<Bytes, Bool>, m: Bytes| found.insert(m, true));
+  let own = v.checked.definitions.filter(|d: DefinitionInfo| opened.contains(d.module));
+  let written = defined(own, v.frame.hashes);
   {
-    claims: fresh.claims.filter(|c: Claim| c.at.module == known.index),
-    laws: fresh.laws.filter(|l: WrittenLaw| belongs_to(names, known.name, l.key)),
-    warnings: fresh.warnings.filter(|d: Diagnostic| labelled_at(d, known.index)),
-    definitions: defined(
-      v.checked.definitions.filter(|d: DefinitionInfo| d.module == known.name),
-      v.frame.hashes,
+    claims: fresh.claims.group_by(|c: Claim| c.at.module),
+    laws: fresh.laws.group_by(|l: WrittenLaw| law_module(known, l.key)),
+    warnings: warnings_by_module(fresh.warnings),
+    definitions: range(0, own.len()).fold(
+      Map::new(),
+      |found: Map<Bytes, List<Definition>>, i: Int| {
+        let module = own.get(i).module;
+        found.insert(module, found.get(module).unwrap_or([]).push(written.get(i)))
+      },
     ),
+  }
+}
+
+fn fresh_claims(fresh: FreshModules, name: Bytes, index: Int) -> ModuleClaims =
+  {
+    claims: fresh.claims.get(index).unwrap_or([]),
+    laws: fresh.laws.get(name).unwrap_or([]),
+    warnings: fresh.warnings.get(index).unwrap_or([]),
+    definitions: fresh.definitions.get(name).unwrap_or([]),
   }
 
 fn claims_of_program(
@@ -319,10 +354,11 @@ fn claimed_with_view(
         match loaded_at.get(k.name) { Some(i) -> found.insert(k.name, i), None -> found });
       let places = known.fold(Map::new(), |found: Map<Int, Int>, k: KnownModule|
         match opened.get(k.name) { Some(i) -> found.insert(i, k.index), None -> found });
+      let by_module = fresh_by_module(fresh, v, names, opened);
       let current = known.fold([], |found: List<ModuleClaims>, k: KnownModule|
         match opened.get(k.name) {
           Some(i) -> {
-            let c = fresh_claims(fresh, v, names, { ..k, index: i });
+            let c = fresh_claims(by_module, k.name, i);
             toolchain.write_file(k.path, bin::encode(c, module_claims_bin()));
             found.push({ ..placed_claims(c, k.index), claims: [] })
           },
