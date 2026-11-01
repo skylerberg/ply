@@ -1,19 +1,22 @@
 import std.bin
 import std.list
 import compiler.check.resolve.tables (Source)
-import compiler.emit.keys (Named, EntryPoint, test_key)
-import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone, over_decoding,
-                                prelude_frames, prelude_files, query_load)
+import compiler.emit.keys (Named, EntryPoint, RootKey, module_of, test_key)
+import compiler.front (analyse_pulling_std_with)
+import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone,
+                                lookup_input_shipping, over_decoding, prelude_frames, prelude_files,
+                                query_load)
 import compiler.front.checking.groups (GroupKey)
 import compiler.front.checking.units (OfGroup, Entries, PartCode, code_query, code_unit_bin,
                                       codes_of_part, part_text, program_code)
 import compiler.front.checking.world (decode_cache)
 import compiler.cc (WrittenPart)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.published (analyse, dump_of)
+import compiler.front.published (analyse, dump_of, no_rows)
 import compiler.store.memo (memo, MemoryStore, QueryStats, Run, empty_memory_store, executed_for,
                             in_session, query_stats, reading)
-import compiler.unit (UnitCode, unit_code_bin, lowered_whole, requested_roots, sources_in_order)
+import compiler.unit (UnitCode, WholeLowering, unit_code_bin, lowered_whole, requested_roots,
+                      sources_in_order)
 
 type Built = { codes: Map<Bytes, Bytes>, text: Bytes }
 
@@ -173,4 +176,42 @@ test "a body edit runs the same queries at two program sizes, through code and p
 test "code built with nothing changed runs no query" {
   let cold = built_from(empty_memory_store(), chain_of(3, b"n * 3"), false);
   assert_eq(queries_run(built_from(cold.store, chain_of(3, b"n * 3"), false).run), [])
+}
+
+fn built_over_shipped(
+  sources: List<Source>,
+  shipped: List<Source>,
+  entries: Entries,
+  first: Option<WholeLowering>,
+) -> Map<Bytes, Bytes> / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  over_decoding(
+    empty_memory_store(),
+    prelude_frames,
+    prelude_files(),
+    |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          query_load(w.own, [], false);
+          match first { Some(l) -> decode_cache.cache_whole_lowering(l), None -> () };
+          program_code(entries).parts.fold(Map::new(), |found: Map<Bytes, Bytes>, p: PartCode|
+            range(0, p.part.units.len()).fold(found, |m: Map<Bytes, Bytes>, i: Int|
+              m.insert(bin::encode(p.part.units.get(i), code_unit_bin()), p.made.codes.get(i))))
+        })),
+  ).value
+}
+
+pub fn codes_apart(sources: List<Source>, shipped: List<Source>) -> List<Bytes> / {abort.raise} = {
+  let dump = dump_of(analyse_pulling_std_with(sources, shipped, no_rows()).out);
+  let own = sources.fold(Map::new(), |m: Map<Bytes, Bool>, s: Source| m.insert(s.name, true));
+  let roots = requested_roots(dump).keys.filter(|k: RootKey| own.contains(module_of(k)));
+  let entries = { roots: roots, tested: false };
+  let whole = lowered_whole(dump, sources_in_order(dump, sources.concat(shipped)), roots, Some([]));
+  let alone = built_over_shipped(sources, shipped, entries, None);
+  let batched = built_over_shipped(sources, shipped, entries, Some(whole));
+  assert(whole.results.len() > 0, None);
+  alone.fold([], |found: List<Bytes>, unit: Bytes, digest: Bytes|
+    if batched.get(unit) == Some(digest) { found } else { found.push(unit) })
 }

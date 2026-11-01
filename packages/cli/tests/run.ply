@@ -59,7 +59,7 @@ import tests.cases (Scope, scope_of, over_cases, list_cases, run_unit, ExpandedT
                     codes_of, passed_by_code, concluded_run, search_of, sim_json)
 import semantics (semantics)
 
-pub type TestReading = { listing: ProgramListing, later: Option<ModuleResults> }
+pub type TestReading = { listing: ProgramListing, results: ModuleResults, checks_later: Bool }
 
 pub type Iteration = {
   result: CommandOutput,
@@ -77,12 +77,14 @@ fn test_reading(
   flags: Flags,
   modules: Modules,
   read: ProgramSummary,
-) -> TestReading / {memo.read, abort.raise} =
+) -> TestReading / {memo.read, abort.raise} = {
+  let results = listed_results(modules.own);
   {
-    listing: view::listed(modules),
-    later: if read.checked_later || flags.no_cache { Some(listed_results(modules.own)) }
-    else { None },
+    listing: view::listing_from(modules, results.results, results.modules),
+    results: results,
+    checks_later: read.checked_later || flags.no_cache,
   }
+}
 
 pub fn run_once(
   flags: Flags,
@@ -283,12 +285,9 @@ type CodeLoad = { timed: TimedLoad, view: CheckedProgram }
 
 fn code_load(
   t: Session<TestReading>,
-  later: Option<TimedLoad>,
-) -> CodeLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
-  let timed = match later {
-    Some(x) -> x,
-    None -> timed_over(t.paths, t.project, time.elapsed_ms(), false, listed: true),
-  };
+  no_cache: Bool,
+) -> CodeLoad / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
+  let timed = timed_of(t, t.value.results, false, no_cache);
   match program_view(timed.program) {
     Some(view) -> { timed: timed, view: view },
     None -> panic("a program that checked did not load for code generation"),
@@ -304,24 +303,20 @@ fn tests_over(
   begun: Int,
 ) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.compiled, emit.libraries, cost_checker.report, evaluation.verdicts, evaluation.statements, shipped.read_pack, toolchain.reuse_dir, Derives, abort.raise} = {
   let loaded_at = time.elapsed_us();
-  let later = match t.value.later {
-    Some(checked) -> Some(timed_of(t, checked, false, flags.no_cache)),
-    None -> None,
-  };
-  let broken = match later {
-    None -> [],
-    Some(timed) -> match timed.program.frame {
+  let broken = if !t.value.checks_later { [] } else {
+    let timed = timed_of(t, t.value.results, false, flags.no_cache);
+    match timed.program.frame {
       None -> timed.program.diagnostics,
       Some(frame) -> {
         let unkept = reuse_violations(timed.program, frame);
         if unkept.len() > 0 { unkept } else { evaluation_errors(timed, frame) }
       },
-    },
+    }
   };
   let promised_at = time.elapsed_us();
   let spent = { ..no_time_spent(), before_us: begun, promises_us: promised_at - loaded_at };
   if broken.len() > 0 { rejected(style, "test", broken, places) }
-  else { selected(flags, style, options, t, places, later, spent) }
+  else { selected(flags, style, options, t, places, spent) }
 }
 
 fn selected(
@@ -330,7 +325,6 @@ fn selected(
   options: Options,
   t: Session<TestReading>,
   places: List<SourceText>,
-  later: Option<TimedLoad>,
   spent: TimeSpent,
 ) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, env.variable, env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.unit, emit.code, emit.compiled, emit.libraries, shipped.read_pack, toolchain.reuse_dir, Derives, abort.raise} = {
   let analysis = t.value.listing;
@@ -352,7 +346,7 @@ fn selected(
     let to_list = unkept.map(|a: case_listings::ListingRequest| a.test);
     let handoff_start = time.elapsed_us();
     let schema = options.machine.config.schema != None;
-    let built = if schema || to_list.len() > 0 { Some(code_load(t, later)) } else { None };
+    let built = if schema || to_list.len() > 0 { Some(code_load(t, flags.no_cache)) } else { None };
     let lister = match built {
       Some(c) -> if to_list.len() == 0 { None } else { Some(code_program(c.timed, c.view)) },
       None -> None,
@@ -377,7 +371,6 @@ fn selected(
           t,
           places,
           expand_cases(analysis, cases),
-          match built { Some(c) -> Some(c.timed), None -> later },
           opened,
           { ..spent, store_us: handoff_start - configuring, handoff_us: listing - handoff_start },
           listing,
@@ -445,7 +438,6 @@ fn decided_run(
   t: Session<TestReading>,
   places: List<SourceText>,
   over: ExpandedTests,
-  loaded: Option<TimedLoad>,
   opened: List<Diagnostic>,
   spent: TimeSpent,
   listing: Int,
@@ -486,7 +478,7 @@ fn decided_run(
   let code = if !runs_code {
     { front: no_loaded_analysis(), place: { project: t.project, store: None } }
   } else {
-    let c = code_load(t, loaded);
+    let c = code_load(t, flags.no_cache);
     code_program(c.timed, c.view)
   };
   let unit_at = time.elapsed_us();
