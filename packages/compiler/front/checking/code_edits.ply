@@ -9,7 +9,7 @@ import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone
                                 lookup_input_shipping, over_decoding, prelude_frames, prelude_files,
                                 query_load, listed_module)
 import compiler.front.checking.units (Entries, PartCode, code_unit_bin, codes_of_part, part_text,
-                                      program_code)
+                                      program_code, entries_of, roots_of_modules)
 import compiler.cc (WrittenPart)
 import compiler.front.published (dump_of, no_rows)
 import compiler.front.emitter_input (Analysed, Rejected)
@@ -27,8 +27,8 @@ const main_entry: Entries =
     tested: false,
   }
 
-fn built_program() -> Built / {memo.read, abort.raise} = {
-  let code = program_code(main_entry);
+fn built_program(entries: Entries) -> Built / {memo.read, abort.raise} = {
+  let code = program_code(entries);
   code.parts.fold({ codes: Map::new(), text: b"" }, |accumulator: Built, p: PartCode| {
     let codes = codes_of_part(p.part);
     {
@@ -45,7 +45,11 @@ fn built_program() -> Built / {memo.read, abort.raise} = {
   })
 }
 
-fn built_from(store: MemoryStore, sources: List<Source>) -> Finished / {abort.raise} = {
+fn built_from(
+  store: MemoryStore,
+  sources: List<Source>,
+  wanted: () -> Entries / {memo.read, abort.raise},
+) -> Finished / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry();
   let done = over_decoding(
@@ -57,7 +61,7 @@ fn built_from(store: MemoryStore, sources: List<Source>) -> Finished / {abort.ra
       in_session(qs, |run: Run| {
         let done = reading(qs, run, || {
           query_load(w.own, [], false, listed_module);
-          built_program()
+          built_program(wanted())
         });
         { run: done.run, value: done }
       }),
@@ -92,12 +96,43 @@ test "after a series of edits each unit's code equals a build from nothing" {
   ];
   steps.fold(empty_memory_store, |store: MemoryStore, step: { limit: Bytes, body: Bytes }| {
     let sources = [library(step.limit), program(step.body)];
-    let warm = built_from(store, sources);
-    let cold = built_from(empty_memory_store, sources);
+    let warm = built_from(store, sources, || main_entry);
+    let cold = built_from(empty_memory_store, sources, || main_entry);
     assert_eq(warm.built.codes, cold.built.codes);
     assert_eq(warm.built.text, cold.built.text);
     warm.store
   });
+  ()
+}
+
+fn every_root_kind(body: Bytes) -> Source =
+  {
+    name: b"kinds",
+    source_text: Bytes::concat_all([
+      b"pub fn edited(n: Int) -> Int = ",
+      body,
+      b"\n\npub fn positive(x: Int) -> Int requires x > 0 ensures result > 0 = x\n\n",
+      b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\n",
+      b"pub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n\n",
+      b"pub fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n\n",
+      b"law \"grows\" forall (x: Int) where x > 0 { positive(x) + 1 > x }\n\n",
+      b"test \"it holds\" {\n  assert(even(2));\n  assert_eq(total([1, 2]), 3)\n}\n",
+    ]),
+  }
+
+test "lowering a group after an edit to another group reads the group's stored check, and its code equals a build from nothing" {
+  let wanted = || entries_of(roots_of_modules([b"kinds"]));
+  [b"n * 2", b"n + 7", b"positive(n)"].fold(
+    empty_memory_store,
+    |store: MemoryStore, body: Bytes| {
+      let sources = [every_root_kind(body)];
+      let warm = built_from(store, sources, wanted);
+      let cold = built_from(empty_memory_store, sources, wanted);
+      assert_eq(warm.built.codes, cold.built.codes);
+      assert_eq(warm.built.text, cold.built.text);
+      warm.store
+    },
+  );
   ()
 }
 

@@ -5,11 +5,10 @@ import std.hash (blake3)
 import std.list
 import compiler.check.infer.definitions (Extern, extern_bin, module_externs)
 import compiler.check.resolve.tables (module_of_name, qualify)
-import compiler.program.group_check (checked_group)
 import compiler.check.infer.definitions (declared_natives)
 import compiler.check.infer (types_joined)
 import compiler.check.typed (ConstantData, constant_data_bin)
-import compiler.check.types (Type, NamedType, TypeTable)
+import compiler.check.types (Type, NamedType)
 import compiler.check.resolve.tables (ParsedModule)
 import compiler.cc (WrittenPart)
 import compiler.emit
@@ -22,20 +21,17 @@ import compiler.emit.representations (BoundLambda, Imported, EmitReads, over_cod
                                       stored_sources, lowering)
 import compiler.emit.roots (root_id)
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
-import compiler.front.checking.groups (GroupKey, group_key_bin, module_groups, group_program,
-                                       group_program_of, with_group_read, GroupRead, declared_of,
-                                       owners_result_of, stored_rows, OwnersResult, owner_key_bin,
-                                       group_key_of, owner_facts, checked_law_outline,
-                                       over_full_names, module_key_in)
+import compiler.front.checking.groups (GroupKey, group_key_bin, module_groups, resolved_group_of,
+                                       stored_lowering, declared_of, owners_result_of, stored_rows,
+                                       OwnersResult, owner_key_bin, group_key_of, owner_facts,
+                                       checked_law_outline, over_full_names, module_key_in)
 import compiler.front.owner_checks (MemberResult)
 import compiler.front.checking.world (module_read, ModuleKey, module_key_bin, decoded, QueryEffects,
                                       RunEffects, CheckQuery, decode_cache, package_location_of)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.facts (Analysis)
+import compiler.front.emitter_input (GroupLowering)
 import compiler.check.resolve.tables (Diagnostic)
 import compiler.front.exports (Mention, mention_bin, OwnerInterface)
-import compiler.front.published (dump_of, inferred_facts)
-import compiler.front.rows (Dump, OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
+import compiler.front.rows (OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
                             KnownDefinitionRow)
 import compiler.store.hash.template (emitted_code)
 import compiler.store.memo (memo)
@@ -43,8 +39,8 @@ import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (lowering_rejected, always_enters, CalleeFacts, LoweredBatch, LoweredUnit,
                       UnitCode, UnitSummary, RootSummary, unit_code_bin, unit_summary_bin,
-                      no_callee_facts, with_callee, unit_lowered, program_batch, types_keyed,
-                      part_library, enters)
+                      no_callee_facts, with_callee, unit_lowered, types_keyed, part_library, enters,
+                      LoweringInput, lowering_input)
 
 pub type CodeUnit = | OfGroup(GroupKey) | OfRoot(RootAt) | NoCode
 
@@ -323,7 +319,7 @@ fn program_of_root(k: RootKey, tested: Bool) -> GroupKey / {memo.read, abort.rai
     _ -> group_of_root(k, tested),
   }
 
-type ProgramScope = { scope: emit::Scope, batch: LoweredBatch }
+type ProgramScope = { scope: emit::Scope, input: LoweringInput }
 
 type Lowering = { scopes: Map<Bytes, ProgramScope>, tested: Bool }
 
@@ -393,25 +389,53 @@ fn constant_value(named: Mention, tested: Bool) -> Option<ConstantData> / {memo.
 fn module_key_of(g: GroupKey) -> ModuleKey =
   { module: g.module, shipped: g.shipped, tested: g.tested }
 
-type LoweredGroup = { analysis: Analysis, dump: Dump, types: List<TypeTable> }
+type StoredGroup = { lowering: GroupLowering, rows: Rows }
 
-fn group_lowered(
-  key: GroupKey,
-) -> Result<LoweredGroup, List<Diagnostic>> / {QueryEffects, abort.raise} = {
-  let g = group_program_of(key);
-  let rows = stored_rows(key);
-  with_group_read(
-    [{ named: g.named, members: g.members, imported: g.imported }],
-    g.sibling,
-    g.bodies,
-    [],
-    |group: GroupRead|
-      match checked_group({ ..group.inputs, rows: rows }, group.walks).pulled.out {
-        Rejected(ds) -> Err(ds),
-        Analysed(a) -> Ok({ analysis: a, dump: dump_of(Analysed(a)), types: g.types }),
-      },
+fn stored_group(key: GroupKey) -> Option<StoredGroup> / {memo.read, abort.raise} =
+  match stored_lowering(key) {
+    None -> None,
+    Some(l) -> {
+      let rows = stored_rows(key);
+      Some({
+        lowering: l,
+        rows: { ..rows, tests: l.tests, types: types_joined(rows.types, l.test_types) },
+      })
+    },
+  }
+
+fn group_input(g: StoredGroup) -> LoweringInput / {abort.raise} =
+  lowering_input(g.lowering.roots, g.rows.definitions, g.lowering.laws)
+
+fn unlowered<a>(key: GroupKey, ds: List<Diagnostic>) -> a / {abort.raise} =
+  panic(
+    String::of_bytes_lossy(
+      Bytes::concat_all([
+        b"a checked group of `",
+        key.module,
+        b"` was rejected when it was lowered alone: ",
+        emit::diagnostics_text(ds),
+      ]),
+    ),
   )
-}
+
+fn group_scope(key: GroupKey, roots: List<RootKey>) -> ProgramScope / {QueryEffects, abort.raise} =
+  match ((stored_group(key), resolved_group_of(key))) {
+    (_, Err(ds)) -> unlowered(key, ds),
+    (None, Ok(r)) -> unlowered(key, r.problems),
+    (Some(g), Ok(r)) -> if r.problems.len() > 0 { unlowered(key, r.problems) } else {
+      {
+        scope: emit::scope_over(
+          r.program.modules,
+          r.program.r,
+          true,
+          roots,
+          g.rows,
+          g.lowering.inferred,
+        ),
+        input: group_input(g),
+      }
+    },
+  }
 
 fn program_scope(
   s: Lowering,
@@ -421,30 +445,9 @@ fn program_scope(
   let at = bin::encode(key, group_key_bin());
   match s.scopes.get(at) {
     Some(p) -> { state: s, program: p },
-    None -> match group_lowered(key) {
-      Err(ds) ->
-        panic(
-          String::of_bytes_lossy(
-            Bytes::concat_all([
-              b"a checked group of `",
-              key.module,
-              b"` was rejected when it was lowered alone: ",
-              emit::diagnostics_text(ds),
-            ]),
-          ),
-        ),
-      Ok(g) -> {
-        let scope = emit::scope_over(
-          g.analysis.modules,
-          g.analysis.r,
-          true,
-          roots,
-          { ..g.dump.rows, types: g.types.fold(g.dump.rows.types, types_joined) },
-          inferred_facts(g.analysis),
-        );
-        let p = { scope: scope, batch: program_batch(g.dump, []) };
-        { state: { ..s, scopes: s.scopes.insert(at, p) }, program: p }
-      },
+    None -> {
+      let p = group_scope(key, roots);
+      { state: { ..s, scopes: s.scopes.insert(at, p) }, program: p }
     },
   }
 }
@@ -538,8 +541,8 @@ fn asked_of_program(
   {
     state: lent.state,
     batches: accumulator.batches.push({
-      ..p.program.batch,
       results: emit::root_outputs(p.program.scope, ks, ownership, Some(lent.lent)),
+      input: p.program.input,
     }),
   }
 }
@@ -868,10 +871,10 @@ pub fn enterable_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let at = decoded(input, root_at_bin(), "a root's key");
   let key = program_of_root(at.key, at.tested);
   bin::encode(
-    match group_lowered(key) {
-      Err(_) -> false,
-      Ok(g) -> handle {
-        with_code_reads(key.tested, || enters(g.dump, at.key))
+    match stored_group(key) {
+      None -> false,
+      Some(g) -> handle {
+        with_code_reads(key.tested, || enters(group_input(g), at.key))
       } with {
         lowering.fail(reason) -> panic(String::of_bytes_lossy(reason)),
       },
