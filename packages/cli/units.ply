@@ -1,4 +1,4 @@
-import compiler.load (Derives, entry_roots, every_root, LoadedAnalysis)
+import compiler.load (Derives)
 import compiler.expand.embed (ModuleEmbed)
 import compiler.front.checking.view (NamedRollup)
 import compiler.front.rows (ModuleSpan)
@@ -10,21 +10,17 @@ import compiler.cc
 import compiler.cc (compilers, toolchain, WrittenPart)
 import compiler.syntax.parsing (no_module, dummy_span)
 import compiler.unit
-import compiler.unit (WholeLowering, shipped, shipped_runtime, cache_parts, code_rejections,
-                      entry_rejections, lowered_whole, whole_program_text)
+import compiler.unit (shipped, shipped_runtime, cache_parts, code_rejections, whole_program_text)
 import compiler.emit.keys (RootKey, Named, EntryPoint)
 import compiler.front.checking (LoadInputs)
 import compiler.front.checking.units (Entries, PartCode, ProgramCode, codes_of_part, decoded_code,
-                                      encoded_code, part_text, program_code, root_enters,
-                                      whole_lowering_pays)
-import compiler.front.checking.world (decode_cache)
+                                      encoded_code, part_text, program_code, root_enters)
 import compiler.store.memo (memo)
 import compiler.store.memo_files
 import compiler.front.facts (CheckedProgram, ProgramListing)
 import compiler.check.infer.checker (ConstructorInfo)
 import std.bytes (u32_be)
-import program (ProgramPlace, Session, TimedLoad, in_program_store, loaded_analysis, store_of,
-                whole_front)
+import program (ProgramPlace, Session, TimedLoad, in_program_store, loaded_analysis, store_of)
 import std.env (env)
 import sources
 import std.fs (fs)
@@ -49,15 +45,12 @@ pub type Emitted = {
 }
 
 pub effect emit {
-  read code(program: CodeProgram, roots: List<RootKey>) -> Result<Emitted, List<Diagnostic>>
+  read code(program: CodeProgram, roots: List<RootKey>) -> Emitted
   read compiled(sources: List<cc::Source>, profile: cc::Profile) -> Result<String, List<Diagnostic>>
   read libraries(emitted: Emitted, profile: cc::Profile) -> Result<String, List<Diagnostic>>
 }
 
 pub effect set Emits = {shipped.runtime, shipped.definitions, toolchain.bodies_dir, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.report_view_used, Derives}
-
-fn texts(front: LoadedAnalysis) -> List<Bytes> =
-  front.files.map(|f: { path: String, name: String, text: Bytes }| f.text)
 
 pub effect set EmbeddedFiles = {fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]}
 
@@ -121,12 +114,6 @@ pub fn library(
   profile: cc::Profile,
 ) -> Result<String, List<Diagnostic>> / {emit.compiled} = emit.compiled(sources, profile)
 
-pub fn library_over(
-  r: Result<Emitted, List<Diagnostic>>,
-  profile: cc::Profile,
-) -> Result<String, List<Diagnostic>> / {emit.libraries} =
-  match r { Ok(e) -> emit.libraries(e, profile), Err(diagnostics) -> Err(diagnostics) }
-
 pub fn cached_library(
   text: Bytes,
   profile: cc::Profile,
@@ -135,34 +122,6 @@ pub fn cached_library(
     Err(reason) -> Err([unbuildable(reason)]),
     Ok(sources) -> library(sources, profile),
   }
-
-fn whole_lowering(
-  place: ProgramPlace,
-  entries: Entries,
-) -> Result<WholeLowering, List<Diagnostic>> / {Emits, abort.raise} = {
-  let whole = whole_front(place);
-  let front = whole.front;
-  let named = entries.roots.fold([], |found: List<Bytes>, k: RootKey|
-    match k { Named(n) -> found.push(n), _ -> found });
-  let only_named = entries.roots.all(|k: RootKey|
-    match k { Named(_) -> true, EntryPoint(_) -> true, _ -> false });
-  match entry_rejections(front.dump) {
-    [] ->
-      Ok(
-        lowered_whole(
-          front.dump,
-          texts(front),
-          if only_named { entry_roots(front, whole.hashes, named) } else { every_root(front) },
-          Some(entered_of(entries)),
-        ),
-      ),
-    rejected -> Err(rejected),
-  }
-}
-
-fn entered_of(entries: Entries) -> List<RootKey> =
-  entries.roots.fold([], |found: List<RootKey>, k: RootKey|
-    match k { EntryPoint(e) -> found.push(e), _ -> found })
 
 fn with_codes(
   code: ProgramCode,
@@ -179,30 +138,10 @@ fn with_codes(
     },
   }
 
-fn code_of(
-  program: CodeProgram,
-  roots: List<RootKey>,
-) -> Result<Emitted, List<Diagnostic>> / {Emits, abort.raise} = {
-  let held = program.place.store == None;
-  let ready = in_program_store(program.place, |_: LoadInputs| {
-    let entries = entries_of(roots);
-    if whole_lowering_pays(entries) { { entries: entries, built: None } }
-    else { { entries: entries, built: Some(with_codes(program_code(entries), held)) } }
-  }).value;
-  match ready.built {
-    Some(found) ->
-      Ok({ code: found.code, held: found.held, place: program.place, inputs: program.inputs }),
-    None -> match whole_lowering(program.place, ready.entries) {
-      Err(rejected) -> Err(rejected),
-      Ok(whole) -> {
-        let found = in_program_store(program.place, |_: LoadInputs| {
-          decode_cache.cache_whole_lowering(whole);
-          with_codes(program_code(ready.entries), held)
-        }).value;
-        Ok({ code: found.code, held: found.held, place: program.place, inputs: program.inputs })
-      },
-    },
-  }
+fn code_of(program: CodeProgram, roots: List<RootKey>) -> Emitted / {Emits, abort.raise} = {
+  let found = in_program_store(program.place, |_: LoadInputs|
+    with_codes(program_code(entries_of(roots)), program.place.store == None)).value;
+  { code: found.code, held: found.held, place: program.place, inputs: program.inputs }
 }
 
 fn stored_codes(
@@ -232,23 +171,20 @@ pub fn whole_program(code: CodeProgram, listing: ProgramListing) -> WholeProgram
 pub fn whole_text(
   program: WholeProgram,
   roots: List<RootKey>,
-) -> Result<Bytes, List<Diagnostic>> / {emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, abort.raise} =
-  match emit.code(program.code, roots) {
-    Err(diagnostics) -> Err(diagnostics),
-    Ok(e) -> {
-      let digests = e.code.parts.fold([], |all: List<Bytes>, p: PartCode| all.concat(p.made.codes));
-      let stored = stored_codes(e, digests);
-      let codes = digests.map(|digest: Bytes|
-        match stored.get(digest) {
-          Some(b) -> decoded_code(b),
-          None -> panic("a part's code is missing from the database that listed it"),
-        });
-      match code_rejections(shipped_runtime(), codes) {
-        [] -> Ok(whole_program_text(codes, program.constructors, program.modules, e.inputs)),
-        rejected -> Err(rejected),
-      }
-    },
+) -> Result<Bytes, List<Diagnostic>> / {emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, abort.raise} = {
+  let e = emit.code(program.code, roots);
+  let digests = e.code.parts.fold([], |all: List<Bytes>, p: PartCode| all.concat(p.made.codes));
+  let stored = stored_codes(e, digests);
+  let codes = digests.map(|digest: Bytes|
+    match stored.get(digest) {
+      Some(b) -> decoded_code(b),
+      None -> panic("a part's code is missing from the database that listed it"),
+    });
+  match code_rejections(shipped_runtime(), codes) {
+    [] -> Ok(whole_program_text(codes, program.constructors, program.modules, e.inputs)),
+    rejected -> Err(rejected),
   }
+}
 
 type KnownPart = { part: PartCode, library: Option<String> }
 

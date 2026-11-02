@@ -11,7 +11,7 @@ import compiler.emit.lower.module_context (CodeElsewhere)
 import compiler.check.infer.checker (CheckReads)
 import compiler.check.infer (types_joined)
 import compiler.check.typed (ConstantData, constant_data_bin)
-import compiler.check.types (Type)
+import compiler.check.types (Type, NamedType)
 import compiler.cc (WrittenPart)
 import compiler.emit
 import compiler.emit.keys (RootKey, Named, Specialisation, Generated, Test, TestCases, Law, Clause,
@@ -40,7 +40,7 @@ import compiler.store.memo (memo)
 import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (always_enters, CalleeFacts, LoweredBatch, LoweredUnit, UnitCode, UnitSummary,
-                      RootSummary, WholeLowering, unit_code_bin, unit_summary_bin, no_callee_facts,
+                      RootSummary, unit_code_bin, unit_summary_bin, no_callee_facts,
                       with_callee, unit_lowered, program_batch, types_keyed, part_library, enters)
 
 pub type CodeUnit = | OfGroup(GroupKey) | OfRoot(RootAt) | NoCode
@@ -299,6 +299,36 @@ fn group_of_root(k: RootKey, tested: Bool) -> GroupKey / {memo.read, abort.raise
     },
   }
 
+fn owner_of_type(named: ModuleKey, ty: Type) -> Option<Bytes> / {memo.read, abort.raise} =
+  match ty {
+    NamedType(c) -> {
+      let module = module_of_name(c.name);
+      if module != named.module { None } else {
+        declared_of(
+          named.module,
+          named.shipped,
+          named.tested,
+          c.name.slice(module.len() + 1, c.name.len()),
+        ).at(
+          0,
+        )
+      }
+    },
+    _ -> None,
+  }
+
+fn group_of_type(named: ModuleKey, ty: Type) -> GroupKey / {memo.read, abort.raise} =
+  match owner_of_type(named, ty) {
+    Some(owner) ->
+      group_key_of({
+        module: named.module,
+        shipped: named.shipped,
+        tested: named.tested,
+        owner: owner,
+      }),
+    None -> { module: named.module, shipped: named.shipped, tested: named.tested, owners: [] },
+  }
+
 fn program_of_root(k: RootKey, tested: Bool) -> ProgramKey / {memo.read, abort.raise} =
   match k {
     Specialisation(a, _) ->
@@ -312,13 +342,11 @@ fn program_of_root(k: RootKey, tested: Bool) -> ProgramKey / {memo.read, abort.r
       { ..p, also: p.also.concat(host_mentions) }
     },
     TestCases(t) -> program_of_root(t, tested),
-    Generated(_, _) -> {
-      let named = module_key_in(module_of(k), tested);
+    Generated(w, _) ->
       {
-        group: { module: named.module, shipped: named.shipped, tested: named.tested, owners: [] },
+        group: group_of_type(module_key_in(module_of(k), tested), w.ty),
         also: type_mentions(k).concat(generated_mentions(k)),
-      }
-    },
+      },
     _ -> { group: group_of_root(k, tested), also: [] },
   }
 
@@ -480,35 +508,6 @@ fn program_scope(
   }
 }
 
-fn agrees_with(ownership: Map<RootName, OwnershipSignature>, a: Output) -> Bool =
-  signatures_from(a.tables.assumed).fold(true, |same: Bool, n: RootName, h: OwnershipSignature|
-    same && (match ownership.get(n) { Some(given) -> given == h, None -> true }))
-
-fn whole_batch(
-  ks: List<RootKey>,
-  ownership: Map<RootName, OwnershipSignature>,
-) -> Option<LoweredBatch> / {decode_cache.read} =
-  match decode_cache.whole_lowering() {
-    None -> None,
-    Some(whole) -> {
-      let found = ks.fold([], |accumulator: List<RootOutput>, k: RootKey|
-        match whole.results.get(root_name(k)) {
-          Some(a) -> if agrees_with(ownership, a) {
-            accumulator.push({ name: root_name(k), result: a })
-          } else { accumulator },
-          None -> accumulator,
-        });
-      if found.len() < ks.len() { None } else {
-        Some({
-          results: found,
-          constructors: whole.constructors,
-          program: whole.program,
-          natives: whole.natives,
-        })
-      }
-    },
-  }
-
 type Asked = { state: Lowering, batches: List<LoweredBatch> }
 
 fn lambda_owners(ks: List<RootKey>) -> List<RootKey> =
@@ -525,26 +524,23 @@ fn asked_of_program(
 ) -> Asked / {QueryEffects, abort.raise} = {
   let tested = accumulator.state.tested;
   let key = decoded(at, program_key_bin(), "a unit's program");
-  let owners = lambda_owners(ks);
-  match whole_batch(ks, ownership) {
-    Some(b) -> { state: accumulator.state, batches: accumulator.batches.push(b) },
-    None -> {
-      let p = program_scope(accumulator.state, key, ks);
-      let lent = owners.fold({ state: p.state, lent: Map::new() }, |l: LentLambdas, o: RootKey| {
-        let q = program_scope(l.state, program_of_root(o, tested), [o]);
-        {
-          state: q.state,
-          lent: l.lent.insert(root_name(o), emit::owner_lambdas(q.program.scope, o)),
-        }
-      });
+  let p = program_scope(accumulator.state, key, ks);
+  let lent = lambda_owners(ks).fold(
+    { state: p.state, lent: Map::new() },
+    |l: LentLambdas, o: RootKey| {
+      let q = program_scope(l.state, program_of_root(o, tested), [o]);
       {
-        state: lent.state,
-        batches: accumulator.batches.push({
-          ..p.program.batch,
-          results: emit::root_outputs(p.program.scope, ks, ownership, Some(lent.lent)),
-        }),
+        state: q.state,
+        lent: l.lent.insert(root_name(o), emit::owner_lambdas(q.program.scope, o)),
       }
     },
+  );
+  {
+    state: lent.state,
+    batches: accumulator.batches.push({
+      ..p.program.batch,
+      results: emit::root_outputs(p.program.scope, ks, ownership, Some(lent.lent)),
+    }),
   }
 }
 
@@ -932,17 +928,6 @@ pub fn part_text(
   codes: List<UnitCode>,
   inputs: Map<Bytes, Bytes>,
 ) -> List<WrittenPart> / {abort.raise} = part_library(codes, made.foreign, inputs).parts
-
-fn is_lowered(k: RootKey, tested: Bool) -> Bool / {memo.read, abort.raise} =
-  match unit_of_root(k, tested) {
-    NoCode -> true,
-    unit -> memo.is_cached(code_query, bin::encode(unit, code_unit_bin())),
-  }
-
-pub fn whole_lowering_pays(entries: Entries) -> Bool / {memo.read, abort.raise} = {
-  let missing = entries.roots.filter(|k: RootKey| !is_lowered(k, entries.tested)).len();
-  missing > 0 && missing * 2 >= entries.roots.len()
-}
 
 fn linked_program(
   digests: Map<Bytes, Bytes>,

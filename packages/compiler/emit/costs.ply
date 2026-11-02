@@ -1,4 +1,4 @@
-import compiler.syntax.parsing (Span, span_bin, span_between)
+import compiler.syntax.parsing (Span, dummy_span, span_bin, span_between)
 import compiler.emit.code (Code, CodeLiteral, CodeVariable, NDefinition, NConstructor, NBuiltin,
                            CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeLambda, CodeSimulate,
@@ -14,7 +14,9 @@ import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, FnDefinitio
 import compiler.syntax.expressions (Param, prelude_own)
 import compiler.expand.embed (ModuleEmbed, embed_tables, inline_embeds_by_name)
 import compiler.check.resolve.tables (ParsedModule, Resolution, qualify)
-import compiler.check.infer.checker (Builtin, builtins, WitnessOrder)
+import compiler.check.infer.checker (Builtin, builtins, WitnessOrder, StatedReturn, StatedFresh,
+                                     StatedParameter, call_shape)
+import compiler.emit.representations
 import compiler.check.infer (CheckOutput)
 import compiler.check.typed (witness_param_name)
 import compiler.front.facts (Analysis)
@@ -131,13 +133,15 @@ type Arms = { state: CostState, owner: Option<Owner> }
 
 type Args = { state: CostState, owners: List<Owner> }
 
+type DeclaredAt = { return_type: ReturnOwnership, span: Span }
+
 type Definition = {
   name: Bytes,
   module_name: Bytes,
   params: List<Bytes>,
   arity: Int,
   own: Bool,
-  declared_return: Option<{ return_type: ReturnOwnership, span: Span }>,
+  declared_return: Option<DeclaredAt>,
 }
 
 type Body = {
@@ -1179,20 +1183,35 @@ fn definition_of_function(
     params: params,
     arity: params.len(),
     own: own,
-    declared_return: match definition.returns {
-      None -> None,
-      Some(ReturnsFresh(return_span)) -> Some({ return_type: FreshReturn, span: return_span }),
-      Some(ReturnsParam(x)) ->
-        Some({
-          return_type: ReturnOfParam(
-            range(0, params.len()).fold(0, |accumulator: Int, k: Int|
-              if params.get(k) == x.name { k } else { accumulator }),
-          ),
-          span: x.span,
-        }),
-    },
+    declared_return: declared_at(call_shape(definition).returned, match definition.returns {
+      Some(ReturnsFresh(return_span)) -> return_span,
+      Some(ReturnsParam(x)) -> x.span,
+      None -> dummy_span,
+    }),
   }
 }
+
+fn declared_at(stated: Option<StatedReturn>, span: Span) -> Option<DeclaredAt> =
+  match stated {
+    None -> None,
+    Some(StatedFresh) -> Some({ return_type: FreshReturn, span: span }),
+    Some(StatedParameter(k)) -> Some({ return_type: ReturnOfParam(k), span: span }),
+  }
+
+fn definition_elsewhere(
+  module: Bytes,
+  own: Bool,
+  d: representations::Definition,
+  returned: Map<Bytes, StatedReturn>,
+) -> Definition =
+  {
+    name: qualify(module, d.name),
+    module_name: module,
+    params: [],
+    arity: d.arity,
+    own: own,
+    declared_return: declared_at(returned.get(qualify(module, d.name)), dummy_span),
+  }
 
 fn violates(declared: ReturnOwnership, got: ReturnOwnership) -> Bool =
   match got {
@@ -1276,19 +1295,25 @@ fn definitions_of(p: CostInput) -> List<Definition> / {abort.raise} = {
   range(0, p.modules.len()).fold([], |accumulator: List<Definition>, i: Int| {
     let m: ParsedModule = p.modules.get(i);
     let ws = match orders.get(i) { Some(o) -> o, None -> Map::new() };
-    m.module.items.fold(accumulator, |xs: List<Definition>, item: Item|
+    let own = own_module(p.module_packages, i);
+    let written = m.module.items.fold(accumulator, |xs: List<Definition>, item: Item|
       match item {
         FunctionItem(d) ->
           xs.push(
             definition_of_function(
               m.name,
-              own_module(p.module_packages, i),
+              own,
               d,
               match ws.get(d.name.name) { Some(w) -> w.map(witness_param_name), None -> [] },
             ),
           ),
         _ -> xs,
-      })
+      });
+    written.concat(
+      match p.elsewhere.definitions.get(m.name) { Some(ds) -> ds, None -> [] }.map(
+        |d: representations::Definition| definition_elsewhere(m.name, own, d, p.elsewhere.returned),
+      ),
+    )
   })
 }
 

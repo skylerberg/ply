@@ -11,16 +11,13 @@ import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone
 import compiler.front.checking.groups (GroupKey)
 import compiler.front.checking.units (OfGroup, Entries, PartCode, code_query, code_unit_bin,
                                       codes_of_part, part_text, program_code)
-import compiler.front.checking.world (decode_cache)
 import compiler.cc (WrittenPart)
-import compiler.front.diagnostics (parse_all)
-import compiler.front.published (analyse, dump_of, no_rows)
+import compiler.front.published (dump_of, no_rows)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.emit (diagnostics_text)
 import compiler.store.memo (memo, MemoryStore, QueryStats, Run, empty_memory_store, executed_for,
                             in_session, query_stats, reading)
-import compiler.unit (UnitCode, WholeLowering, unit_code_bin, lowered_whole, requested_roots,
-                      sources_in_order)
+import compiler.unit (UnitCode, unit_code_bin, requested_roots)
 
 type Built = { codes: Map<Bytes, Bytes>, text: Bytes }
 
@@ -50,20 +47,9 @@ fn built_program() -> Built / {memo.read, abort.raise} = {
   })
 }
 
-fn built_from(store: MemoryStore, sources: List<Source>, whole: Bool) -> Finished / {abort.raise} = {
+fn built_from(store: MemoryStore, sources: List<Source>) -> Finished / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry();
-  let first = if !whole { None } else {
-    let dump = dump_of(analyse(parse_all(sources)));
-    Some(
-      lowered_whole(
-        dump,
-        sources_in_order(dump, sources),
-        requested_roots(dump).keys,
-        Some([Named(b"app.main"), test_key(b"app", b"it adds")]),
-      ),
-    )
-  };
   let done = over_decoding(
     store,
     prelude_frames,
@@ -73,7 +59,6 @@ fn built_from(store: MemoryStore, sources: List<Source>, whole: Bool) -> Finishe
       in_session(qs, |run: Run| {
         let done = reading(qs, run, || {
           query_load(w.own, [], false);
-          match first { Some(l) -> decode_cache.cache_whole_lowering(l), None -> () };
           built_program()
         });
         { run: done.run, value: done }
@@ -100,15 +85,6 @@ fn program(body: Bytes) -> Source =
     ]),
   }
 
-test "a unit lowered alone equals the same unit from the whole-program pipeline" {
-  let sources = [library(b"3"), program(b"n * 2")];
-  let alone = built_from(empty_memory_store, sources, false);
-  let whole = built_from(empty_memory_store, sources, true);
-  assert(alone.built.codes.len() > 0, None);
-  assert_eq(whole.built.codes, alone.built.codes);
-  assert_eq(whole.built.text, alone.built.text)
-}
-
 test "after a series of edits each unit's code equals a build from nothing" {
   let steps = [
     { limit: b"3", body: b"n * 2" },
@@ -118,8 +94,8 @@ test "after a series of edits each unit's code equals a build from nothing" {
   ];
   steps.fold(empty_memory_store, |store: MemoryStore, step: { limit: Bytes, body: Bytes }| {
     let sources = [library(step.limit), program(step.body)];
-    let warm = built_from(store, sources, false);
-    let cold = built_from(empty_memory_store, sources, false);
+    let warm = built_from(store, sources);
+    let cold = built_from(empty_memory_store, sources);
     assert_eq(warm.built.codes, cold.built.codes);
     assert_eq(warm.built.text, cold.built.text);
     warm.store
@@ -127,12 +103,23 @@ test "after a series of edits each unit's code equals a build from nothing" {
   ()
 }
 
-fn built_over_shipped(
+pub fn lowered_over_shipped(
   sources: List<Source>,
-  shipped: List<Source>,
-  entries: Entries,
-  first: Option<WholeLowering>,
-) -> Map<Bytes, Bytes> / {abort.raise} = {
+  shipped_files: List<Source>,
+) -> List<PartCode> / {abort.raise} = {
+  let shipped = shipped_files.map(|s: Source|
+    if s.name == prelude_module { { ..s, source_text: prelude_source::text } } else { s });
+  let analysed = analyse_pulling_std_with(sources, shipped, no_rows).out;
+  match analysed {
+    Rejected(ds) ->
+      panic("the package did not check: " ++ String::of_bytes_lossy(diagnostics_text(ds))),
+    Analysed(_) -> (),
+  };
+  let own = sources.fold(Map::new(), |m: Map<Bytes, Bool>, s: Source| m.insert(s.name, true));
+  let entries = {
+    roots: requested_roots(dump_of(analysed)).keys.filter(|k: RootKey| own.contains(module_of(k))),
+    tested: false,
+  };
   let w = inputs_alone(sources);
   let qs = fresh_registry();
   over_decoding(
@@ -144,39 +131,12 @@ fn built_over_shipped(
       in_session(qs, |run: Run|
         reading(qs, run, || {
           query_load(w.own, [], false);
-          match first { Some(l) -> decode_cache.cache_whole_lowering(l), None -> () };
-          program_code(entries).parts.fold(Map::new(), |found: Map<Bytes, Bytes>, p: PartCode|
-            range(0, p.part.units.len()).fold(found, |m: Map<Bytes, Bytes>, i: Int|
-              m.insert(bin::encode(p.part.units.get(i), code_unit_bin()), p.made.codes.get(i))))
+          program_code(entries).parts
         })),
   ).value
 }
 
-pub fn codes_apart(
-  sources: List<Source>,
-  shipped_files: List<Source>,
-) -> List<Bytes> / {abort.raise} = {
-  let shipped = shipped_files.map(|s: Source|
-    if s.name == prelude_module { { ..s, source_text: prelude_source::text } } else { s });
-  let analysed = analyse_pulling_std_with(sources, shipped, no_rows).out;
-  match analysed {
-    Rejected(ds) ->
-      panic("the package did not check: " ++ String::of_bytes_lossy(diagnostics_text(ds))),
-    Analysed(_) -> (),
-  };
-  let dump = dump_of(analysed);
-  let own = sources.fold(Map::new(), |m: Map<Bytes, Bool>, s: Source| m.insert(s.name, true));
-  let every = requested_roots(dump).keys;
-  let entries = { roots: every.filter(|k: RootKey| own.contains(module_of(k))), tested: false };
-  let whole = lowered_whole(dump, sources_in_order(dump, sources.concat(shipped)), every, Some([]));
-  let alone = built_over_shipped(sources, shipped, entries, None);
-  let batched = built_over_shipped(sources, shipped, entries, Some(whole));
-  assert(whole.results.len() > 0, None);
-  alone.fold([], |found: List<Bytes>, unit: Bytes, digest: Bytes|
-    if batched.get(unit) == Some(digest) { found } else { found.push(unit) })
-}
-
-test "a copy that calls a function passed from another module lowers the same alone" {
+test "a copy that calls a function passed from another module lowers" {
   let sources = [
     { name: b"names", source_text: b"pub type Oid = Oid(List<Int>)\n" },
     {
@@ -188,5 +148,9 @@ test "a copy that calls a function passed from another module lowers the same al
       source_text: b"import names\nimport reader\nimport reader (Reader, Read)\n\npub type Name = | Registered(names::Oid) | Blank\n\npub fn name_at(r: Reader) -> Read<Name> / {abort.raise} = {\n  let id = reader::tagged(r, reader::read_oid);\n  { value: Registered(id.value), rest: id.rest }\n}\n\npub fn main() -> Int / {abort.raise} = match name_at(reader::start(b\"x\")).value { Registered(_) -> 1, Blank -> 0 }\n",
     },
   ];
-  assert_eq(codes_apart(sources, [{ name: prelude_module, source_text: prelude_source::text }]), [])
+  assert(
+    lowered_over_shipped(sources, [{ name: prelude_module, source_text: prelude_source::text }]).len()
+      > 0,
+    None,
+  )
 }
