@@ -31,9 +31,10 @@ import compiler.check.typed (TypedBody, TypedExpression, TypedCall, TypedRead, R
                              BodyPart, WholeBody, MeasureBody, ClauseBody, TypedParam, body_retyped,
                              without_witnesses, typed_expression_nodes,
                              typed_expression_nodes_mapped, ReadBuiltin, without_releases)
-import compiler.check.infer (CheckOutput, BodyFacts, types_joined, decode_facts, no_body_facts,
-                             elaborate, terminating_definitions, measured_definitions, bodies_with,
-                             bodies_read, check_output_with, EmitFacts)
+import compiler.check.infer (CheckOutput, BodyFacts, types_joined, types_named, decode_facts,
+                             no_body_facts, elaborate, terminating_definitions,
+                             measured_definitions, bodies_with, bodies_read, check_output_with,
+                             EmitFacts)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, CachedFacts, BodyChecking,
                                      CheckEvery, WitnessOrder, MemberSite, witness_params, Builtin,
                                      builtins)
@@ -55,15 +56,16 @@ import std.list
 import compiler.expand.embed (ModuleEmbed, ItemEmbeds)
 import compiler.syntax.items (parse, read_without_import, homes_declaring, unimported_of, HomeNames)
 import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefinitionRow, KnownTestRow,
-                            Rows, known_definition_row_bin, rows_bin, ModuleSpan, DefinitionRow,
-                            TestRow, DefinitionHashRow, HashTableRow, Dump, normalized_diagnostic)
+                            KnownLawRow, Rows, known_definition_row_bin, rows_bin, ModuleSpan,
+                            DefinitionRow, TestRow, DefinitionHashRow, HashTableRow, Dump,
+                            normalized_diagnostic)
 import compiler.front.facts (Analysis, PackageTables, package_tables, toolchain_tree, tree_named,
                              home_of, ToolchainTree, NoTree)
 import compiler.front.emitter_input (test_root_at, checked_program_of, view_dump, Analysed,
                                      AnalysisOutcome, Rejected, cache_from_rows, InferredFacts,
                                      inferred_facts_of, rows_from)
 
-pub const no_rows: Rows = { definitions: [], tests: [], types: Map::new() }
+pub const no_rows: Rows = { definitions: [], tests: [], laws: [], types: Map::new() }
 
 pub type EncodedRows = { types: List<InternedType>, at: List<Int>, rows: Rows }
 
@@ -103,7 +105,7 @@ pub fn decode_rows(b: Bytes) -> Rows / {abort.raise} =
 pub fn rows_of(analysis: Analysis) -> Rows / {abort.raise} =
   rows_from(analysis.checked, analysis.hashes)
 
-pub fn inferred_facts(analysis: Analysis) -> InferredFacts / {abort.raise} =
+pub fn inferred_facts(analysis: Analysis) -> InferredFacts =
   inferred_facts_of(analysis.modules.map(|parsed: ParsedModule| parsed.name), analysis.checked)
 
 pub type LoweringTargets = { roots: Map<Bytes, Bool>, modules: Map<Bytes, Bool> }
@@ -154,18 +156,16 @@ pub fn facts_read(
   );
   let tests = rows.tests.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, row: KnownTestRow|
     accumulator.insert(row.owner, row.body_facts));
-  let loose = w.law_facts.fold(
+  let loose = rows.laws.fold(
     { ..no_body_facts, types: rows.types },
-    |accumulator: BodyFacts, l: { owner: Bytes, facts: BodyFacts }| {
-      let f = l.facts;
-      joined_facts(accumulator, {
-        members: f.members.fold([], |a: List<MemberSite>, x: MemberSite|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-        types: f.types,
-        bodies: f.bodies.fold([], |a: List<TypedBody<Bytes>>, x: TypedBody<Bytes>|
-          match moved.get(x.module) { Some(j) -> a.push({ ..x, module: j }), None -> a }),
-      })
-    },
+    |accumulator: BodyFacts, row: KnownLawRow|
+      match here.get(module_of_name(row.owner)) {
+        None -> accumulator,
+        Some(i) -> match decode_facts(row.body_facts, i, row.owner) {
+          None -> accumulator,
+          Some(f) -> joined_facts(accumulator, { ..f, types: types_named(f.types, f.bodies) }),
+        },
+      },
   );
   let roots = match wanted { None -> None, Some(x) -> Some(x.roots) };
   let lowered = match wanted { None -> None, Some(x) -> Some(x.modules) };
@@ -1388,11 +1388,8 @@ pub fn checked_bodies(analysis: Analysis) -> LoweringTargets / {abort.raise} = {
   let tests = rows.tests.fold(functions, |accumulator: Map<Bytes, Bool>, row: KnownTestRow|
     if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner, true) });
   {
-    roots: inferred_facts(analysis).law_facts.fold(
-      tests,
-      |accumulator: Map<Bytes, Bool>, l: { owner: Bytes, facts: BodyFacts }|
-        accumulator.insert(l.owner, true),
-    ),
+    roots: rows.laws.fold(tests, |accumulator: Map<Bytes, Bool>, row: KnownLawRow|
+      if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner, true) }),
     modules: analysis.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
       accumulator.insert(m.name, true)),
   }
@@ -1435,6 +1432,7 @@ pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> List<TypedBody<Type>>
     {
       definitions: rows.definitions.filter(|row: KnownDefinitionRow| !walked.contains(row.name)),
       tests: rows.tests,
+      laws: rows.laws,
       types: rows.types,
     },
     0,

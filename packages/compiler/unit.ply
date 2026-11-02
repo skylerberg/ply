@@ -26,15 +26,20 @@ import compiler.emit.keys (printed, RootKey, Named, Specialisation, Generated, T
                            law_key, entry_name, root_name_bin, unspecialised)
 import compiler.emit
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
-import compiler.emit.representations (Constructors, layout_variables, has_variables, is_scalar_type,
-                                      constructor_sums, constructors_of, type_variables, layout_key,
-                                      layout_representative, no_constructors, numeric_sum,
-                                      type_names, with_sums_laid, with_released)
+import compiler.emit.representations (layout_variables, has_variables, is_scalar_type,
+                                      type_variables, layout_key, layout_representative,
+                                      numeric_sum, type_names, sums_around, code_facts, EmitReads,
+                                      ShapeReads, with_no_shapes)
+import compiler.emit.lower.module_context (definition_called)
+import compiler.store.hash.template (emitted_code)
 import compiler.front.rows (Dump, EmitterRoot, EmitterConstructor, KeyRow, ReleaseScheme, ModuleRow,
                             OrdinalRow, KnownDefinitionRow, DefinitionRow, SpecRow, TestRow, LawRow,
                             BinderRow, TypeRow, EffectRow, HashTableRow, DefinitionHashRow)
 import compiler.emit.generated (MarshalledSums, marshalled_sums)
 import compiler.front.published (analyse, no_rows, dump_of)
+import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
+import compiler.front.facts (Analysis)
+import compiler.emit.reads (over_analysis)
 import compiler.front (analyse_pulling_std_with)
 import compiler.emit.typing (unknown_type)
 import compiler.front.diagnostics (parse_all)
@@ -503,33 +508,54 @@ fn taken_bodies(
 pub fn always_enters(k: RootKey) -> Bool =
   match k { Test(_) -> true, TestCases(_) -> true, _ -> false }
 
-fn runtime_enters(p: Program, k: RootKey) -> Bool =
+fn runtime_enters(p: Program, marshalling: MarshalledSums, k: RootKey) -> Bool =
   match k {
     Test(_) -> true,
     TestCases(_) -> true,
     Law(_) -> match p.binders.get(root_name(k)) {
-      Some(types) -> types.all(|t: Type| emit::liftable(p.marshalling, t)),
+      Some(types) -> types.all(|t: Type| emit::liftable(marshalling, t)),
       None -> false,
     },
     Clause(c) ->
-      runtime_enters(p, c.definition)
+      runtime_enters(p, marshalling, c.definition)
         && (match c.definition {
           Named(n) -> match p.schemes.get(n) {
-            Some(scheme) -> emit::judgeable(p.marshalling, scheme),
+            Some(scheme) -> emit::judgeable(marshalling, scheme),
             None -> false,
           },
           _ -> false,
         }),
     Named(n) -> match ((p.schemes.get(n), p.roots.get(root_name(k)))) {
       (Some(scheme), Some(r)) ->
-        emit::enterable(p.marshalling, scheme)
+        emit::enterable(marshalling, scheme)
           && (scheme.type_variables.len() == 0 || r.witnesses.len() == 0),
       (Some(scheme), None) ->
-        emit::enterable(p.marshalling, scheme) && scheme.type_variables.len() == 0,
+        emit::enterable(marshalling, scheme) && scheme.type_variables.len() == 0,
       _ -> false,
     },
     _ -> false,
   }
+
+fn entered_types(p: Program, k: RootKey) -> List<Type> =
+  match k {
+    Law(_) -> match p.binders.get(root_name(k)) { Some(types) -> types, None -> [] },
+    Clause(c) -> entered_types(p, c.definition),
+    Named(n) -> match p.schemes.get(n) { Some(scheme) -> [scheme.ty], None -> [] },
+    _ -> [],
+  }
+
+fn marshalling_of(types: List<Type>) -> MarshalledSums / {EmitReads} = {
+  let defined = emitted_code.calls.concat(emitted_code.insert_calls).fold(
+    Map::new(),
+    |found: Map<Bytes, Bool>, n: Bytes|
+      if definition_called(qualify(prelude_module, n)) == None { found }
+      else { found.insert(n, true) },
+  );
+  marshalled_sums(
+    sums_around(|n: Bytes| code_facts.sum_named(n), types.flat_map(type_names)),
+    |n: Bytes| defined.contains(n),
+  )
+}
 
 pub type RequestedRoots = { keys: List<RootKey>, unkeyed: List<Bytes> }
 
@@ -1463,11 +1489,9 @@ pub type Program = {
   modules: List<ModuleRow>,
   imports: Map<Bytes, List<Bytes>>,
   read: Map<Bytes, List<Bytes>>,
-  sources: List<Bytes>,
   embeds: Map<Int, Bytes>,
   schemes: Map<Bytes, Scheme>,
   binders: Map<RootName, List<Type>>,
-  marshalling: MarshalledSums,
   declared: Map<Bytes, Bytes>,
   digests: Map<Bytes, Bytes>,
   constructor_functions: Map<Bytes, Bool>,
@@ -1518,7 +1542,6 @@ pub fn program_of(
         accumulator.insert(n, m.imports),
     ),
     read: read,
-    sources: sources,
     embeds: reads.fold(Map::new(), |accumulator: Map<Int, Bytes>, i: Int, parts: List<Bytes>|
       accumulator.insert(i, blake3(Bytes::concat_all(sorted_unique(parts))))),
     schemes: schemes,
@@ -1527,8 +1550,6 @@ pub fn program_of(
       [LawGuard, LawBody].fold(accumulator, |m: Map<RootName, List<Type>>, part: LawPart|
         m.insert(root_name(law_key(l.module, l.name, part)), types))
     }),
-    marshalling: marshalled_sums(constructor_sums(dump.constructors), |n: Bytes|
-      schemes.contains(prelude.concat(n))),
     declared: {
       let types = dump.types.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: TypeRow|
         accumulator.insert(t.name, true));
@@ -1577,35 +1598,6 @@ fn modules_read(
   ).read
 }
 
-fn required_modules(p: Program, ks: List<RootKey>) -> Map<Bytes, Bool> / {abort.raise} = {
-  let starts = ks.fold(
-    modules_lowered(ks).insert(prelude_module, true),
-    |accumulator: Map<Bytes, Bool>, k: RootKey|
-      types_keyed(k).fold(accumulator, |m: Map<Bytes, Bool>, t: Type|
-        type_names(t).fold(m, |into: Map<Bytes, Bool>, n: Bytes| {
-          let home = module_of_name(n);
-          if home.len() == 0 { into } else { into.insert(home, true) }
-        })),
-  );
-  iterate(
-    { closed: Map::new(), next: starts.keys().filter(|m: Bytes| p.read.contains(m)) },
-    p.read.len() + 1,
-    |s: { closed: Map<Bytes, Bool>, next: List<Bytes> }| {
-      let closed = s.next.fold(s.closed, |accumulator: Map<Bytes, Bool>, m: Bytes|
-        accumulator.insert(m, true));
-      let next = s.next.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: Bytes|
-        List::fold(
-          match p.read.get(m) { Some(ds) -> ds, None -> [] },
-          accumulator,
-          |a: Map<Bytes, Bool>, d: Bytes|
-            if closed.contains(d) || !p.read.contains(d) { a } else { a.insert(d, true) },
-        ));
-      if next.len() == 0 { Stop({ closed: closed, next: [] }) }
-      else { Continue({ closed: closed, next: next.keys() }) }
-    },
-  ).closed
-}
-
 pub fn types_keyed(k: RootKey) -> List<Type> =
   match k {
     Specialisation(_, _) ->
@@ -1627,14 +1619,6 @@ fn stated_functions(dump: Dump) -> Map<Bytes, Bool> =
       ),
   )
 
-fn text_at(program: Program, index: Int) -> Option<Bytes> = program.sources.at(index)
-
-fn definition_scheme(dump: Dump, by: Bytes) -> Option<Scheme> =
-  match dump.rows.definitions.find(|d: KnownDefinitionRow| d.name == by) {
-    Some(d) -> Some(d.scheme),
-    None -> None,
-  }
-
 type Body = { text: Bytes, shared: List<SharedFunction> }
 
 derive bin for Body
@@ -1644,64 +1628,6 @@ fn output_body(a: Output) -> Body = { text: a.text, shared: a.tables.shared }
 fn summarised(a: Output) -> Output = { text: b"", tables: { ..a.tables, shared: [] } }
 
 fn body_digest(a: Output) -> Bytes / {abort.raise} = blake3(bin::encode(output_body(a), body_bin()))
-
-pub fn program_constructors(
-  dump: Dump,
-  constructors: List<Constructor>,
-  released_by: List<ReleaseScheme> = [],
-) -> Constructors = {
-  let table = constructors_of(
-    constructors.map(|c: Constructor| c.name),
-    dump.emitter_constructors.filter(|c: EmitterConstructor| c.key != None).map(
-      |c: EmitterConstructor| c.name,
-    ),
-    dump.emitter_constructors.filter(|c: EmitterConstructor| c.numeric.len() > 0).map(
-      |c: EmitterConstructor| c.name,
-    ),
-    constructor_sums(dump.constructors),
-  );
-  let released = dump.emitter_constructors.fold(
-    Map::new(),
-    |m: Map<Bytes, Bytes>, c: EmitterConstructor|
-      match c.release {
-        Some(f) -> match table.sum_of.get(c.name) { Some(t) -> m.insert(t, f), None -> m },
-        None -> m,
-      },
-  );
-  with_sums_laid({
-    ..with_released(table, released, |by: Bytes| match released_by.find(|r: ReleaseScheme| r.name == by) { Some(r) -> Some(r.scheme), None -> definition_scheme(dump, by) }),
-    stated: stated_functions(dump),
-  })
-}
-
-fn scope_of_modules(
-  dump: Dump,
-  p: Program,
-  constructors: List<Constructor>,
-  roots: List<RootKey>,
-  modules: Map<Bytes, Bool>,
-) -> emit::Scope / {abort.raise} = {
-  let read = p.modules.filter(|m: ModuleRow| modules.contains(m.name));
-  let names = read.map(|m: ModuleRow| m.name);
-  emit::scope_of(
-    emit::zip_sources(
-      names,
-      read.map(|m: ModuleRow| match text_at(p, m.index) { Some(t) -> t, None -> b"" }),
-    ),
-    program_constructors(dump, constructors),
-    true,
-    roots,
-    if dump.packages.len() == 0 { [{ prefix: b"", dependencies: [] }] } else { dump.packages },
-    if dump.packages.len() == 0 { names.map(|_: Bytes| 0) } else {
-      read.map(|m: ModuleRow| match dump.module_packages.at(m.index) { Some(k) -> k, None -> 0 })
-    },
-    dump.embeds,
-    dump.rows,
-    dump.effects,
-    dump.inferred_facts,
-    derived: dump.derived,
-  )
-}
 
 fn batch_count() -> Int = 64
 
@@ -1810,33 +1736,9 @@ pub type LevelTally = {
 
 pub const entered_timeout_ms: Int = 60000
 
-fn constructor_names(dump: Dump) -> List<Constructor> =
-  dump.emitter_constructors.map(|c: EmitterConstructor| { name: c.name, arity: c.arity })
-
-fn entered_roots(
-  p: Program,
-  every: List<RootKey>,
-  entered: Option<List<RootKey>>,
-) -> List<RootKey> =
-  (match entered { Some(ks) -> ks, None -> every }).filter(|k: RootKey| runtime_enters(p, k)).map(
-    EntryPoint,
-  )
-
-pub fn entry_points(dump: Dump, roots: List<RootKey>) -> List<RootKey> / {abort.raise} =
-  entered_roots(program_of(dump, [], roots), roots, None)
-
-pub fn enters(dump: Dump, root: RootKey, elsewhere: Map<Bytes, Scheme>) -> Bool / {abort.raise} = {
+pub fn enters(dump: Dump, root: RootKey) -> Bool / {EmitReads} = {
   let p = program_of(dump, [], [root]);
-  runtime_enters(
-    {
-      ..p,
-      marshalling: marshalled_sums(constructor_sums(dump.constructors), |n: Bytes| {
-        let name = qualify(prelude_module, n);
-        p.schemes.contains(name) || elsewhere.contains(name)
-      }),
-    },
-    root,
-  )
+  runtime_enters(p, marshalling_of(entered_types(p, root)), root)
 }
 
 pub type RootSummary = { key: RootKey, calls: List<RootKey>, head: Option<Prototype> }
@@ -1846,6 +1748,7 @@ pub type UnitSummary = {
   needs: Map<RootName, List<Need>>,
   called: Map<RootName, List<Int>>,
   roots: List<RootSummary>,
+  failure: Option<Bytes>,
 }
 
 pub type UnitCode = {
@@ -1862,12 +1765,7 @@ derive bin for UnitCode
 
 pub type LoweredUnit = { code: UnitCode, summary: UnitSummary }
 
-pub type LoweredBatch = {
-  results: List<RootOutput>,
-  constructors: Constructors,
-  program: Program,
-  natives: List<Extern>,
-}
+pub type LoweredBatch = { results: List<RootOutput>, program: Program }
 
 pub type CalleeFacts = {
   published: Map<RootName, PublishedSignature>,
@@ -1949,7 +1847,8 @@ pub fn unit_lowered<s | e>(
   ask: (s, List<RootKey>, Map<RootName, OwnershipSignature>) -> { state: s, batches: List<LoweredBatch> } / {abort.raise | e},
   callees_read: (CalleeFacts, List<RootKey>) -> CalleeFacts / {abort.raise | e},
   belongs: (RootKey) -> Bool / {abort.raise | e},
-) -> LoweredUnit / {abort.raise | e} = {
+  natives_here: (s) -> List<Extern> / {abort.raise | e},
+) -> LoweredUnit / {EmitReads | e} = {
   let seeded = callees_read(no_callee_facts, roots.map(unspecialised));
   let first = ask(start, roots, seeded.ownership);
   let settled = iterate(
@@ -1978,11 +1877,11 @@ pub fn unit_lowered<s | e>(
       let called = extended_called(bodies, facts.called);
       let more = names.fold(Map::new(), |accumulator: Map<RootName, RootKey>, n: RootName|
         match ((w.results.get(n), w.batches.get(n))) {
-          (Some(b), Some(batch)) -> if specialised_by_callers(w.keys, n, b.tables, needs) {
+          (Some(b), Some(_)) -> if specialised_by_callers(w.keys, n, b.tables, needs) {
             accumulator
           } else {
             b.tables.generics.calls.fold(accumulator, |m: Map<RootName, RootKey>, g: GenericCall| {
-              let root = call_specialisation(g, needs, called, batch.constructors);
+              let root = call_specialisation(g, needs, called);
               let name = root_name(root);
               if w.results.contains(name) || m.contains(name) || !belongs(root) { m }
               else { m.insert(name, root) }
@@ -1999,16 +1898,11 @@ pub fn unit_lowered<s | e>(
       }
     },
   );
-  unit_finished(settled)
+  unit_finished(settled, natives_here(settled.state))
 }
 
-fn unit_finished<s>(w: UnitWalk<s>) -> LoweredUnit / {abort.raise} = {
-  let constructors_at = |n: RootName|
-    match w.batches.get(n) {
-      Some(b) -> b.constructors,
-      None -> panic("a unit's root was lowered in no batch"),
-    };
-  let resolved = generic_calls_specialised(w.results, w.keys, w.needs, w.called, constructors_at);
+fn unit_finished<s>(w: UnitWalk<s>, natives_here: List<Extern>) -> LoweredUnit / {EmitReads} = {
+  let resolved = generic_calls_specialised(w.results, w.keys, w.needs, w.called);
   let outputs = with_unemitted_rejected(resolved.results, w.keys, resolved.unemitted);
   let finished = outputs.fold(
     Map::new(),
@@ -2043,13 +1937,9 @@ fn unit_finished<s>(w: UnitWalk<s>) -> LoweredUnit / {abort.raise} = {
           } else { accumulator },
           None -> accumulator,
         }),
-      externs: w.batches.fold(
+      externs: called_externs(called_natives, natives_here).fold(
         Map::new(),
-        |accumulator: Map<Bytes, Extern>, _: RootName, b: LoweredBatch|
-          called_externs(called_natives, b.natives).fold(
-            accumulator,
-            |m: Map<Bytes, Extern>, x: Extern| m.insert(x.name, x),
-          ),
+        |m: Map<Bytes, Extern>, x: Extern| m.insert(x.name, x),
       ).values(
       ),
     },
@@ -2084,26 +1974,13 @@ fn unit_finished<s>(w: UnitWalk<s>) -> LoweredUnit / {abort.raise} = {
             }),
           None -> accumulator,
         }),
+      failure: None,
     },
   }
 }
 
-pub fn program_batch(
-  dump: Dump,
-  results: List<RootOutput>,
-  stated: List<Bytes>,
-  natives: List<Extern>,
-  released_by: List<ReleaseScheme> = [],
-) -> LoweredBatch / {abort.raise} = {
-  let table = program_constructors(dump, constructor_names(dump), released_by);
-  {
-    results: results,
-    constructors: stated.fold(table, |c: Constructors, n: Bytes|
-      { ..c, stated: c.stated.insert(n, true) }),
-    program: program_of(dump, [], []),
-    natives: natives,
-  }
-}
+pub fn program_batch(dump: Dump, results: List<RootOutput>) -> LoweredBatch / {abort.raise} =
+  { results: results, program: program_of(dump, [], []) }
 
 fn requested_root(p: Program, k: RootKey, home: Bytes) -> RequestedRoot =
   match k {
@@ -2273,8 +2150,7 @@ fn call_specialisation(
   call: GenericCall,
   needs: Map<RootName, List<Need>>,
   called: Map<RootName, List<Int>>,
-  constructors: Constructors,
-) -> RootKey / {abort.raise} = {
+) -> RootKey / {ShapeReads} = {
   let callee = root_name(call.callee);
   let ns = match needs.get(callee) { Some(x) -> x, None -> [] };
   let open = KeyType(unknown_type);
@@ -2284,17 +2160,16 @@ fn call_specialisation(
     let arg = call.args.get(j);
     let loader_tables = ||
       KeyLayout({
-        key: layout_key(constructors, arg),
-        at: if functions.len() > 0 { arg } else { layout_representative(constructors, arg) },
+        key: layout_key(arg),
+        at: if functions.len() > 0 { arg } else { layout_representative(arg) },
       });
     if has_variables(arg) { open }
     else if ns.contains({ var: j, reads: Exact }) { KeyType(arg) }
     else if call.specialised_variables.contains(j) || ns.contains({ var: j, reads: Layout }) {
       loader_tables()
     } else if ns.contains({ var: j, reads: Scalar }) && is_scalar_type(arg) { loader_tables() }
-    else if ns.contains({ var: j, reads: Scalar }) && numeric_sum(constructors, arg) {
-      KeyType(arg)
-    } else { open }
+    else if ns.contains({ var: j, reads: Scalar }) && numeric_sum(arg) { KeyType(arg) }
+    else { open }
   });
   match definition_of(call.callee) {
     Some(definition) -> if functions.len() == 0 && args.all(|a: KeyArg| a == open)
@@ -2310,8 +2185,7 @@ fn generic_calls_specialised(
   keys: Map<RootName, RootKey>,
   needs: Map<RootName, List<Need>>,
   called: Map<RootName, List<Int>>,
-  constructors: (RootName) -> Constructors / {abort.raise},
-) -> { results: Map<RootName, Output>, named: Map<RootName, List<RootName>>, unemitted: Map<RootName, Bool> } / {abort.raise} = {
+) -> { results: Map<RootName, Output>, named: Map<RootName, List<RootName>>, unemitted: Map<RootName, Bool> } / {ShapeReads} = {
   let unemitted = unemitted_generics(results, keys, needs);
   let named = results.fold(
     Map::new(),
@@ -2320,7 +2194,7 @@ fn generic_calls_specialised(
         accumulator.insert(
           n,
           a.tables.generics.calls.map(|g: GenericCall|
-            root_name(call_specialisation(g, needs, called, constructors(n)))),
+            root_name(call_specialisation(g, needs, called))),
         )
       },
   );
@@ -2329,7 +2203,7 @@ fn generic_calls_specialised(
     |accumulator: Map<RootName, Output>, n: RootName, a: Output|
       accumulator.insert(n, if a.tables.generics.calls.len() == 0 { a } else {
         let resolved = a.tables.generics.calls.map(|g: GenericCall|
-          call_specialisation(g, needs, called, constructors(n)));
+          call_specialisation(g, needs, called));
         let roots = resolved.map(root_name);
         let calls = resolved.fold(a.tables.calls, |cs: List<RootKey>, r: RootKey|
           if cs.any(|c: RootKey| root_name(c) == root_name(r)) { cs } else { cs.push(r) });
@@ -2507,6 +2381,8 @@ pub fn code_rejections(runtime: Runtime, codes: List<UnitCode>) -> List<Diagnost
   else { [] }
 }
 
+pub fn lowering_rejected(reason: Bytes) -> Diagnostic = error_with_labels(b"E0505", reason, [], [])
+
 pub fn unit_text(parts: List<WrittenPart>) -> Bytes =
   Bytes::concat_all([unit_header].concat(parts.map(|w: WrittenPart| w.text)))
 
@@ -2592,18 +2468,18 @@ test "a generic call is compiled for an argument type only in the detail its cal
     { key: b"m.same", value: [{ var: 0, reads: Exact }] },
   ]);
   let root = |callee: Bytes, arg: Bytes|
-    call_specialisation(
-      {
-        callee: Named(callee),
-        args: [parsed_type(arg)],
-        specialised_variables: [],
-        functions: [],
-        effect_evidence: [],
-      },
-      needs,
-      Map::new(),
-      no_constructors,
-    );
+    with_no_shapes(||
+      call_specialisation(
+        {
+          callee: Named(callee),
+          args: [parsed_type(arg)],
+          specialised_variables: [],
+          functions: [],
+          effect_evidence: [],
+        },
+        needs,
+        Map::new(),
+      ));
   let call = |callee: Bytes, arg: Bytes| root_text(root_name(root(callee, arg)));
   assert_eq(call(b"m.lay", b"{x:Float}"), b"m.lay@{x:Float}");
   assert_eq(call(b"m.lay", b"_"), b"m.lay@_");
@@ -2637,18 +2513,18 @@ test "a lambda argument is inlined only into a callee that calls the parameter r
   assert_eq(called.get(definition_root(b"m.pass")), Some([0]));
   let call = |callee: Bytes, param: Int|
     printed(
-      call_specialisation(
-        {
-          callee: Named(callee),
-          args: [],
-          specialised_variables: [],
-          functions: [{ param: param, owner: Named(b"m.main"), nth: 0 }],
-          effect_evidence: [],
-        },
-        Map::new(),
-        called,
-        no_constructors,
-      ),
+      with_no_shapes(||
+        call_specialisation(
+          {
+            callee: Named(callee),
+            args: [],
+            specialised_variables: [],
+            functions: [{ param: param, owner: Named(b"m.main"), nth: 0 }],
+            effect_evidence: [],
+          },
+          Map::new(),
+          called,
+        )),
     );
   assert_eq(call(b"m.each", 1), b"m.each@|1=m.main:0");
   assert_eq(call(b"m.pass", 0), b"m.pass@|0=m.main:0");
@@ -2832,13 +2708,13 @@ fn program_calling_f_at(
     ),
   );
   let c = compiled(had.results, had.keys);
-  let s = generic_calls_specialised(
-    c.results,
-    c.keys,
-    transitive_needs(had.results, had.keys),
-    transitive_called(had.results, had.keys),
-    |_: RootName| no_constructors,
-  );
+  let s = with_no_shapes(||
+    generic_calls_specialised(
+      c.results,
+      c.keys,
+      transitive_needs(had.results, had.keys),
+      transitive_called(had.results, had.keys),
+    ));
   {
     coded: c.coded.map(|x: { key: RootKey, home: Bytes }| x.key),
     bodies: s.results.fold(Map::new(), |m: Map<RootName, Output>, n: RootName, a: Output|
@@ -2964,7 +2840,7 @@ test "`split_lines` splits on newlines, treats a final newline as ending the las
 }
 
 fn one_body(name: Bytes, calls: List<Bytes>) -> Output / {abort.raise} = {
-  let own = statics_of(StringDatum(name));
+  let own = with_no_shapes(|| statics_of(StringDatum(name)));
   {
     text: Bytes::concat_all([
       b"Word ",
@@ -3483,44 +3359,7 @@ test "a unit depends only on the modules that contain its roots and the modules 
   assert_eq(read(b"b.g"), [b"b", b"c"]);
   assert_eq(read(b"a.f"), [b"a", b"b", b"c"]);
   let p = over(b"b.g");
-  assert_eq(p.digests.keys(), [b"b", b"c"]);
-  let whole = program_of(dump, three_modules, [Named(b"a.f")]);
-  assert_eq(required_modules(whole, [Named(b"b.g")]).keys(), p.read.keys());
-  let scope = scope_of_modules(
-    dump,
-    whole,
-    [],
-    [Named(b"b.g")],
-    required_modules(whole, [Named(b"b.g")]),
-  );
-  assert_eq(
-    emit::root_outputs(scope, [Named(b"b.g")], Map::new()).map(|r: RootOutput| root_text(r.name)),
-    [b"b.g"],
-  )
-}
-
-test "a specialisation's scope includes the module declaring its type argument, even when the generic function's module does not import it" {
-  let user = [
-    { name: b"s", source_text: b"pub type E = | A | B\n" },
-    {
-      name: b"g",
-      source_text: b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
-    },
-    {
-      name: b"m",
-      source_text: b"import g\nimport s (E)\nfn pick(xs: List<E>) -> Option<E> = g::first(xs)\n",
-    },
-  ];
-  let dump = dump_of(analyse(parse_all(user)));
-  let p = program_of(dump, sources_in_order(dump, user), requested_roots(dump).keys);
-  let at = specialisation_key(b"g.first", [NamedType({ name: b"s.E", args: [] })], []);
-  assert_eq(modules_lowered([at]).keys(), [b"g"]);
-  let scoped_modules = required_modules(p, [at]);
-  assert(
-    scoped_modules.contains(b"s") && scoped_modules.contains(b"g")
-      && !scoped_modules.contains(b"m"),
-    None,
-  )
+  assert_eq(p.digests.keys(), [b"b", b"c"])
 }
 
 test "roots generated for types are split into separate batches, however many types one module generates roots for" {
@@ -3666,7 +3505,8 @@ test "each root a program requests has a key built from its kind, and the key's 
       b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} = match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
     ]),
   };
-  let dump = dump_of(analyse_pulling_std_with(user, [cases], no_rows).out);
+  let analysed = analyse_pulling_std_with(user, [cases], no_rows).out;
+  let dump = dump_of(analysed);
   let offers = requested_roots(dump);
   assert_eq(offers.unkeyed, []);
   assert_eq(offers.keys.map(printed), dump.emitter_roots.map(|r: EmitterRoot| r.root));
@@ -3685,7 +3525,7 @@ test "each root a program requests has a key built from its kind, and the key's 
   let p = program_of(dump, sources_in_order(dump, user.concat([cases])), offers.keys);
   let mine = offers.keys.filter(|k: RootKey| module_of(k) == b"m");
   assert_eq(
-    mine.filter(|k: RootKey| runtime_enters(p, k)),
+    mine.filter(|k: RootKey| over_outcome(analysed, |_: Analysis| enters(dump, k))),
     mine.filter(|k: RootKey| k != law_key(b"m", b"s", LawBody)),
   )
 }
@@ -3745,10 +3585,11 @@ test "an `ensures` clause about a function that a definition returns gets no ent
       source_text: b"pub fn adder(n: Int) -> (Int) -> Int ensures result(1) == n + 1 = |x: Int| x + n\n",
     },
   ];
-  let dump = dump_of(analyse(parse_all(user)));
-  let p = program_of(dump, sources_in_order(dump, user), requested_roots(dump).keys);
-  assert(runtime_enters(p, Named(b"m.adder")), None);
-  assert(!runtime_enters(p, Clause({ definition: Named(b"m.adder"), kind: Ensures, n: 0 })), None)
+  let analysed = analyse(parse_all(user));
+  let dump = dump_of(analysed);
+  let entered = |k: RootKey| over_outcome(analysed, |_: Analysis| enters(dump, k));
+  assert(entered(Named(b"m.adder")), None);
+  assert(!entered(Clause({ definition: Named(b"m.adder"), kind: Ensures, n: 0 })), None)
 }
 
 const identifier_bytes: Bytes =
@@ -3787,7 +3628,8 @@ test "a method of a type that a module calls without importing is compiled from 
       source_text: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
     },
   ];
-  let dump = dump_of(analyse_pulling_std_with(user, shipped, no_rows).out);
+  let analysed = analyse_pulling_std_with(user, shipped, no_rows).out;
+  let dump = dump_of(analysed);
   let root = Named(b"m.first");
   let p = program_of(dump, sources_in_order(dump, user.concat(shipped)), [root]);
   let places = module_levels(p);
@@ -3795,15 +3637,22 @@ test "a method of a type that a module calls without importing is compiled from 
     match ((places.get(b"m"), places.get(b"std.list"))) { (Some(a), Some(b)) -> a > b, _ -> false },
     None,
   );
-  let modules = required_modules(p, [root]);
-  assert(modules.contains(b"std.list"), None);
-  assert_eq(
-    emit::root_outputs(scope_of_modules(dump, p, [], [root], modules), [root], Map::new()).map(
-      |r: RootOutput| root_text(r.name),
-    ),
-    [b"m.first"],
-  )
+  assert_eq(outputs_of(analysed, root), [b"m.first"])
 }
+
+fn over_outcome<a>(
+  analysed: AnalysisOutcome,
+  body: (Analysis) -> a / {EmitReads},
+) -> a / {abort.raise} =
+  match analysed {
+    Analysed(a) -> over_analysis(a, || body(a)),
+    Rejected(_) -> panic("the program does not check"),
+  }
+
+fn outputs_of(analysed: AnalysisOutcome, root: RootKey) -> List<Bytes> / {abort.raise} =
+  over_outcome(analysed, |a: Analysis|
+    emit::root_outputs(emit::scope_of(a, true, [root]), [root], Map::new()).map(|r: RootOutput|
+      root_text(r.name)))
 
 test "a module's analysis record lists the standard library modules it uses without importing, such as the list module and the scheduler, and a build reads them too" {
   let user = [
@@ -3836,17 +3685,8 @@ test "a `law` whose body uses a type variable that the checker treats as unknown
       source_text: b"fn pair<a>(x: a) -> a = x\n\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n",
     },
   ];
-  let dump = dump_of(analyse(parse_all(user)));
   let root = law_key(b"m", b"identity is identity", LawBody);
-  let p = program_of(dump, sources_in_order(dump, user), [root]);
-  assert_eq(
-    emit::root_outputs(
-      scope_of_modules(dump, p, [], [root], required_modules(p, [root])),
-      [root],
-      Map::new(),
-    ).map(|r: RootOutput| root_text(r.name)),
-    [printed(root)],
-  )
+  assert_eq(outputs_of(analyse(parse_all(user)), root), [printed(root)])
 }
 
 test "a build compiles the definitions requested from it, finds their compiled functions, and lists the definitions it contains" {

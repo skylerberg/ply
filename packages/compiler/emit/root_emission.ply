@@ -8,8 +8,9 @@ import compiler.emit.typing (unknown_type)
 import compiler.emit.roots (symbol_of)
 import compiler.emit.output (Tables, no_tables, EmittedRoot, Prototype, DefinitionSymbol, Exact,
                              needs_specialisation, Keyed, KeyedTag, KeyedField, KeyedEntry)
-import compiler.emit.representations (Definition, EmitParam, Constructors, substituted_fully,
-                                      no_constructors)
+import compiler.emit.representations (Definition, EmitParam, substituted_fully, EmitReads,
+                                      ShapeReads, code_facts, with_no_shapes, lowering)
+import compiler.emit.reads (over_nothing_declared)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Generated, Law, Clause, Order, Reflect, Show, Digest,
                            NumericFunction, RootName, root_name, root_text, key_types,
@@ -22,7 +23,7 @@ import compiler.emit.evidence (declared_arity)
 import compiler.emit.typed_ir.statics (StaticDefinition, StaticStruct, RawWord, EntryWord,
                                        named_by_content, entries_of)
 import compiler.emit.lower (root_lowered)
-import compiler.emit.lower.module_context (ModuleContext, Root, param_type)
+import compiler.emit.lower.module_context (ModuleContext, Root, param_type, definition_rooted)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.release (release_needs)
 import compiler.emit.verify (ownership_fault)
@@ -30,31 +31,34 @@ import compiler.emit.print (printed_function)
 import compiler.emit.print.text (PrintOutput)
 import compiler.emit.print.value_printing (signature_types)
 
-pub fn root_at(s: ModuleContext, key: RootKey, base: Int, ps: List<EmitParam>, code: Code) -> Root =
+pub fn root_at(
+  s: ModuleContext,
+  key: RootKey,
+  base: Int,
+  ps: List<EmitParam>,
+  code: Code,
+) -> Root / {EmitReads} =
   {
     key: key,
     base: base,
     params: ps,
     types: ps.map(param_type),
-    result_type: root_result_type(s.definitions, key),
+    result_type: root_result_type(s, key),
     code: code,
     performs: no_effects,
   }
 
-fn root_result_type(here: List<Definition>, key: RootKey) -> Type = {
-  let own = unspecialised(key);
-  let args = key_types(key);
-  here.fold(generated_result_type(key), |accumulator: Type, d: Definition|
-    if d.root != own { accumulator } else {
-      match d.scheme {
-        Some(scheme) -> match scheme.ty {
-          FunctionType(f) -> substituted_fully(f.return_type, args),
-          _ -> accumulator,
-        },
-        None -> accumulator,
-      }
-    })
-}
+fn root_result_type(s: ModuleContext, key: RootKey) -> Type / {EmitReads} =
+  match definition_rooted(s, unspecialised(key)) {
+    Some(d) -> match d.scheme {
+      Some(scheme) -> match scheme.ty {
+        FunctionType(f) -> substituted_fully(f.return_type, key_types(key)),
+        _ -> generated_result_type(key),
+      },
+      None -> generated_result_type(key),
+    },
+    None -> generated_result_type(key),
+  }
 
 fn generated_result_type(key: RootKey) -> Type =
   match key {
@@ -74,15 +78,20 @@ fn generated_result_type(key: RootKey) -> Type =
     _ -> unknown_type,
   }
 
-pub fn naming<a>(name: Bytes, run: () -> a / {abort.raise}) -> a / {abort.raise} =
+pub fn naming<a | e>(
+  name: Bytes,
+  run: () -> a / {lowering.fail, abort.raise | e},
+) -> a / {lowering.fail, abort.raise | e} =
   handle {
     run()
   } with {
     abort.raise(m) ->
       panic(String::of_bytes_lossy(Bytes::concat_all([b"Ply failed making `", name, b"`: "])) ++ m),
+    lowering.fail(reason) ->
+      lowering.fail(Bytes::concat_all([b"Ply failed making `", name, b"`: ", reason])),
   }
 
-pub fn emitted_of(f: Function, constructors: Constructors) -> EmittedRoot / {abort.raise} = {
+pub fn emitted_of(f: Function) -> EmittedRoot / {ShapeReads, lowering.fail} = {
   let full = root_name(f.key);
   naming(root_text(full), || {
     let counted = built_form(f);
@@ -95,7 +104,7 @@ pub fn emitted_of(f: Function, constructors: Constructors) -> EmittedRoot / {abo
             ),
           ),
         None -> {
-          let printed = printed_function(counted, constructors);
+          let printed = printed_function(counted);
           {
             name: full,
             text: body_text(
@@ -103,7 +112,7 @@ pub fn emitted_of(f: Function, constructors: Constructors) -> EmittedRoot / {abo
               counted.members.map(|m: typed_ir::Member| m.key),
               printed.pieces,
             ),
-            tables: ir_tables(counted, printed, constructors.stated),
+            tables: ir_tables(counted, printed),
           }
         },
       }
@@ -133,11 +142,7 @@ pub fn with_refcounts(f: Function) -> Function =
 
 pub fn built_form(f: Function) -> Function = release_needs(with_refcounts(f))
 
-fn ir_tables(
-  f: Function,
-  printed: PrintOutput,
-  stated: Map<Bytes, Bool>,
-) -> Tables / {abort.raise} = {
+fn ir_tables(f: Function, printed: PrintOutput) -> Tables / {ShapeReads} = {
   let signatures = if f.members.len() == 0 {
     [{ key: f.key, arity: declared_arity(f.params), head: signature_types(f.convention) }]
   } else {
@@ -162,7 +167,10 @@ fn ir_tables(
     handles: printed.handles,
     members: f.members.map(|m: typed_ir::Member| m.key),
     defined: signatures.map(|h: { key: RootKey, arity: Int, head: Prototype }|
-      { entered: has_entry(h.key, h.arity, stated), head: h.head }),
+      {
+        entered: has_entry(h.key, h.arity, |n: Bytes| code_facts.stated_function(n)),
+        head: h.head,
+      }),
     statics: statics,
     handings: [],
     assumed: [],
@@ -202,29 +210,19 @@ pub fn root_from_code(
   ps: List<EmitParam>,
   code: Code,
   performs: Effects = { listed: [], variable: None },
-) -> Function / {abort.raise} =
+) -> Function / {EmitReads} =
   root_lowered(s, { ..root_at(s, key, base, ps, code), performs: performs })
 
 const empty_module_context: ModuleContext =
-  {
-    module: b"m",
-    definitions: [],
-    imports: [],
-    constructors: no_constructors,
-    builtins: [],
-    declared: Map::new(),
-    machine: Map::new(),
-    effects: [],
-    release_build: false,
-  }
+  { module: b"m", definitions: [], imports: [], release_build: false }
 
 fn literal_code(l: SourceLiteral) -> Code = { node: CodeLiteral(l), span: dummy_span, ty: int_type }
 
 test "a root is emitted with an `_entry` function that the runtime calls, and is recorded as defined with that entry" {
-  let e = emitted_of(
-    root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7))),
-    no_constructors,
-  );
+  let e = over_nothing_declared(||
+    emitted_of(
+      root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7))),
+    ));
   assert_eq(e.tables.defined.map(|d: DefinitionSymbol| d.entered), [true]);
   assert_eq(e.text.index_of(symbol_of(b"m.f")), None);
   assert(
@@ -251,9 +249,11 @@ test "a function that a static's type-descriptor entry points to is listed among
       ],
     }),
   );
-  let f = root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7)));
-  let counted = { ..insert_reference_counts(f), statics: [type_descriptor] };
-  let t = ir_tables(counted, printed_function(counted, no_constructors), Map::new());
+  let t = over_nothing_declared(|| {
+    let f = root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7)));
+    let counted = { ..insert_reference_counts(f), statics: [type_descriptor] };
+    ir_tables(counted, printed_function(counted))
+  });
   assert(t.calls.contains(dup))
 }
 
@@ -277,10 +277,10 @@ test "a release function for a type-variable value emits no C and records which 
     links: typed_ir::no_links,
     statics: [],
   };
-  let resolved = emitted_of(f, no_constructors);
+  let resolved = with_no_shapes(|| emitted_of(f));
   assert_eq(resolved.text, b"");
   assert_eq(resolved.tables.generics.needs, [{ var: 0, reads: Exact }]);
   assert_eq(resolved.tables.defined, []);
-  let known = emitted_of({ ..f, params: [{ ..p, ty: bytes_type }] }, no_constructors);
+  let known = with_no_shapes(|| emitted_of({ ..f, params: [{ ..p, ty: bytes_type }] }));
   assert(known.text.len() > 0 && known.tables.generics.needs == [], None)
 }

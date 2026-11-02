@@ -13,7 +13,8 @@ import compiler.check.resolve.tables (Binding, Declaration, Declarations, Effect
                                       no_declarations)
 import compiler.program.group_check (GroupChecked, GroupInputs, LoadedSource, checked_group,
                                      source_of_group)
-import compiler.program.reads (NameDeclarations, StoredReads, name_declarations_bin, over_stored)
+import compiler.program.reads (NameDeclarations, StoredReads, name_declarations_bin, over_stored,
+                               first_stored)
 import compiler.program.stored (decoded_declarations, encoded_declarations)
 import compiler.store.hash.graph (NameElsewhere)
 import compiler.syntax.expressions (implicitly_imported_by)
@@ -40,6 +41,7 @@ import compiler.front (PulledAnalysis, embed_read_of, may_call_embed, published,
 import compiler.front.pkg (Package)
 import compiler.front.published (encode_rows, decode_rows, no_rows)
 import compiler.emit.representations (type_names)
+import compiler.emit.lower.module_context (stated_functions)
 import compiler.check.infer (types_joined)
 import compiler.front.facts (compiler_package, std_package, ModuleShape, ModuleTables, effect_hosts,
                              no_shape, module_shape_bin, encode_tables, decode_tables, read_outline,
@@ -339,29 +341,6 @@ pub fn owners_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       bin::encode(read, owners_result_bin())
     },
   }
-}
-
-fn stated_functions(module: Bytes, parsed: Module) -> List<Bytes> = {
-  let sums = parsed.items.fold(Map::new(), |accumulator: Map<Bytes, Bool>, item: Item|
-    match item {
-      TypeItem(d) -> match d.body {
-        SumBody(_) -> accumulator.insert(d.name.name, true),
-        _ -> accumulator,
-      },
-      _ -> accumulator,
-    });
-  parsed.items.fold([], |accumulator: List<Bytes>, item: Item|
-    match item {
-      InstanceItem(d) -> if sums.contains(d.target.name)
-          && (d.kind == KeyInstance || d.kind == ShowInstance) {
-        accumulator.push(qualify(module, d.function.name))
-      } else { accumulator },
-      NumericItem(d) -> if !sums.contains(d.target.name) { accumulator } else {
-        d.operations.fold(accumulator, |a: List<Bytes>, o: NumericOperation|
-          a.push(qualify(module, o.by.name)))
-      },
-      _ -> accumulator,
-    })
 }
 
 pub fn owner_facts_result(input: Bytes) -> Bytes / {memo.write, abort.raise} = {
@@ -1081,6 +1060,90 @@ fn stored_reads(
     every_module: || visible_modules_of(named),
     shipped_modules: shipped_names_listed,
   }
+
+pub fn with_stored_reads<a | e>(
+  named: ModuleKey,
+  body: () -> a / {CheckReads, SessionReads, abort.raise | e},
+) -> a / {SessionReads, abort.raise | e} =
+  over_stored(
+    stored_reads(named, named.shipped, import_packages(named), Map::new(), always_entire),
+    body,
+  )
+
+pub fn module_key_in(module: Bytes, tested: Bool) -> ModuleKey / {memo.read, abort.raise} = {
+  let shipped = package_location_of(module) == None;
+  { module: module, shipped: shipped, tested: shipped && tested }
+}
+
+pub fn over_full_names<a | e>(
+  tested: Bool,
+  body: () -> a / {program.read, SessionReads, abort.raise | e},
+) -> a / {SessionReads, abort.raise | e} =
+  handle {
+    body()
+  } with {
+    var cache: Map<Bytes, List<StoredDeclarations>> = Map::new(),
+    program.type_named(name) -> {
+      let l = declared_by_full_name(tested, cache, name, Some(TypeSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.types.get(name))
+    },
+    program.effect_named(name) -> {
+      let l = declared_by_full_name(tested, cache, name, Some(EffectSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.effects.get(name))
+    },
+    program.constructor_named(name) -> {
+      let l = declared_by_full_name(tested, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.constructors.get(name))
+    },
+    program.definition_named(name) -> {
+      let l = declared_by_full_name(tested, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name))
+    },
+    program.host_named(name) -> {
+      let l = declared_by_full_name(tested, cache, name, None);
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.hosts.get(name))
+    },
+  }
+
+fn declared_by_full_name(
+  tested: Bool,
+  cache: Map<Bytes, List<StoredDeclarations>>,
+  name: Bytes,
+  namespace: Option<Namespace>,
+) -> { found: List<StoredDeclarations>, cache: Map<Bytes, List<StoredDeclarations>> } / {SessionReads, abort.raise} = {
+  let module = module_of_name(name);
+  let key = Bytes::concat_all([
+    match namespace {
+      None -> b"*",
+      Some(TypeSpace) -> b"t",
+      Some(EffectSpace) -> b"e",
+      Some(_) -> b"v",
+    },
+    b" ",
+    name,
+  ]);
+  match cache.get(key) {
+    Some(found) -> { found: found, cache: cache },
+    None -> {
+      let found = if module.len() == 0 { [] } else {
+        let own = module_key_in(module, tested);
+        owners_declaring_in(
+          own,
+          own.shipped,
+          module,
+          name.slice(module.len() + 1, name.len()),
+          namespace,
+        ).map(|at: OwnerKey| stored_declarations_of(at, Entire))
+      };
+      { found: found, cache: cache.insert(key, found) }
+    },
+  }
+}
 
 fn names_in_stored(stored: StoredDeclarations) -> List<Bytes> = stored.definitions.keys()
 

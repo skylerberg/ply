@@ -6,46 +6,45 @@ import std.list
 import compiler.check.infer.definitions (Extern, extern_bin, module_externs)
 import compiler.check.resolve.tables (module_of_name, qualify)
 import compiler.program.group_check (checked_group)
-import compiler.program.lowering (code_elsewhere)
-import compiler.emit.lower.module_context (CodeElsewhere)
-import compiler.check.infer.checker (CheckReads, OperationInfo, program)
+import compiler.check.infer.definitions (declared_natives)
 import compiler.check.infer (types_joined)
 import compiler.check.typed (ConstantData, constant_data_bin)
-import compiler.check.types (Type, NamedType, Scheme, TypeNode, TypeTable, NodeNamed, NodeNominal)
+import compiler.check.types (Type, NamedType, TypeTable)
+import compiler.check.resolve.tables (ParsedModule)
 import compiler.cc (WrittenPart)
 import compiler.emit
 import compiler.emit.keys (RootKey, Named, Specialisation, Generated, Test, TestCases, Law, Clause,
                            EntryPoint, RootName, InlinedLambda, root_key_bin, root_name, root_text,
                            inlined_lambdas, module_of, unspecialised, test_roots, law_key, LawGuard,
                            LawBody, ClauseKind, Requires, Ensures, root_name_bin)
-import compiler.emit.generated (builds_values)
 import compiler.emit.output (Output, RootOutput, Prototype, prototype_bin)
-import compiler.emit.representations (type_names, BoundLambda)
+import compiler.emit.representations (BoundLambda, Imported, EmitReads, over_code_facts,
+                                      stored_sources, lowering)
 import compiler.emit.roots (root_id)
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
-import compiler.front.checking.groups (known_of_types, GroupKey, group_key_bin, module_groups,
-                                       group_program, group_program_of, with_group_read, GroupRead,
-                                       with_performed_effects, declared_of, owners_result_of,
-                                       stored_rows, OwnersResult, owner_key_bin, group_key_of,
-                                       owner_facts, checked_law_outline)
+import compiler.front.checking.groups (GroupKey, group_key_bin, module_groups, group_program,
+                                       group_program_of, with_group_read, GroupRead, declared_of,
+                                       owners_result_of, stored_rows, OwnersResult, owner_key_bin,
+                                       group_key_of, owner_facts, checked_law_outline,
+                                       over_full_names, module_key_in)
 import compiler.front.owner_checks (MemberResult)
 import compiler.front.checking.world (module_read, ModuleKey, module_key_bin, decoded, QueryEffects,
                                       RunEffects, CheckQuery, decode_cache, package_location_of)
-import compiler.front.emitter_input (Analysed, KnownConstructors, Rejected, stated_by_constructor,
-                                     with_known_constructors)
+import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (Analysis)
 import compiler.check.resolve.tables (Diagnostic)
 import compiler.front.exports (Mention, mention_bin, OwnerInterface)
-import compiler.front.published (dump_of)
+import compiler.front.published (dump_of, inferred_facts)
 import compiler.front.rows (Dump, OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
                             KnownDefinitionRow)
 import compiler.store.hash.template (emitted_code)
 import compiler.store.memo (memo)
 import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
-import compiler.unit (always_enters, CalleeFacts, LoweredBatch, LoweredUnit, UnitCode, UnitSummary,
-                      RootSummary, unit_code_bin, unit_summary_bin, no_callee_facts, with_callee,
-                      unit_lowered, program_batch, types_keyed, part_library, enters)
+import compiler.unit (lowering_rejected, always_enters, CalleeFacts, LoweredBatch, LoweredUnit,
+                      UnitCode, UnitSummary, RootSummary, unit_code_bin, unit_summary_bin,
+                      no_callee_facts, with_callee, unit_lowered, program_batch, types_keyed,
+                      part_library, enters)
 
 pub type CodeUnit = | OfGroup(GroupKey) | OfRoot(RootAt) | NoCode
 
@@ -61,15 +60,25 @@ pub type PartMembers = { module: Bytes, label: Bytes, units: List<CodeUnit> }
 
 pub type RootLink = { root: RootName, unit: Bytes, calls: List<RootName> }
 
-pub type Reached = { parts: List<PartMembers>, roots: List<RootKey>, links: List<RootLink> }
+pub type UnitFailure = { unit: CodeUnit, reason: Bytes }
+
+pub type Reached = {
+  parts: List<PartMembers>,
+  roots: List<RootKey>,
+  links: List<RootLink>,
+  failures: List<UnitFailure>,
+}
 
 pub type MadePart = { identity: Bytes, foreign: Map<RootName, Prototype>, codes: List<Bytes> }
 
 pub type PartCode = { part: PartMembers, made: MadePart }
 
-pub type ProgramCode = { parts: List<PartCode>, roots: List<RootKey>, links: List<RootLink> }
-
-type ProgramKey = { group: GroupKey, also: List<Mention> }
+pub type ProgramCode = {
+  parts: List<PartCode>,
+  roots: List<RootKey>,
+  links: List<RootLink>,
+  failures: List<UnitFailure>,
+}
 
 derive bin for RootAt
 
@@ -85,6 +94,8 @@ derive bin for PartMembers
 
 derive bin for RootLink
 
+derive bin for UnitFailure
+
 derive bin for Reached
 
 derive bin for MadePart
@@ -92,8 +103,6 @@ derive bin for MadePart
 derive bin for PartCode
 
 derive bin for ProgramCode
-
-derive bin for ProgramKey
 
 pub const code_query: Bytes = b"code"
 
@@ -108,11 +117,6 @@ pub const reachable_query: Bytes = b"reachable"
 pub const part_query: Bytes = b"part"
 
 pub const constant_values_query: Bytes = b"constant values"
-
-fn module_key_in(module: Bytes, tested: Bool) -> ModuleKey / {memo.read, abort.raise} = {
-  let shipped = package_location_of(module) == None;
-  { module: module, shipped: shipped, tested: shipped && tested }
-}
 
 fn clause_at(name: Bytes, kind: ClauseKind, n: Int) -> RootKey =
   Clause({ definition: Named(name), kind: kind, n: n })
@@ -270,37 +274,6 @@ pub fn unit_of_root(k: RootKey, tested: Bool) -> CodeUnit / {memo.read, abort.ra
     _ -> written_unit(k, tested),
   }
 
-fn named_mention(accumulator: List<Mention>, name: Bytes) -> List<Mention> / {abort.raise} = {
-  let module = module_of_name(name);
-  if module.len() == 0 { accumulator }
-  else { accumulator.push({ module: module, name: name.slice(module.len() + 1, name.len()) }) }
-}
-
-fn type_mentions(k: RootKey) -> List<Mention> / {abort.raise} =
-  types_keyed(k).fold([], |accumulator: List<Mention>, t: Type|
-    type_names(t).fold(accumulator, named_mention))
-
-fn lambda_mentions(k: RootKey, tested: Bool) -> List<Mention> / {memo.read, abort.raise} =
-  inlined_lambdas(k).flat_map(|f: InlinedLambda| {
-    let p = program_of_root(f.owner, tested);
-    p.group.owners.flat_map(|o: Bytes| owner_facts(module_key_of(p.group), o).mentions).concat(
-      p.also,
-    )
-  })
-
-fn generated_mentions(k: RootKey) -> List<Mention> =
-  match k {
-    Generated(w, _) ->
-      marshalling_mentions.concat(if builds_values(w.operation) {
-        [{ module: b"std.value", name: b"Value" }]
-      } else { [] }),
-    _ -> [],
-  }
-
-const host_mentions: List<Mention> =
-  prelude_hosts.map(|h: { effect: Bytes, module: Bytes, by: Bytes }|
-    { module: h.module, name: h.by })
-
 fn group_of_root(k: RootKey, tested: Bool) -> GroupKey / {memo.read, abort.raise} =
   match unit_of_root(k, tested) {
     OfGroup(g) -> g,
@@ -340,28 +313,14 @@ fn group_of_type(named: ModuleKey, ty: Type) -> GroupKey / {memo.read, abort.rai
     None -> { module: named.module, shipped: named.shipped, tested: named.tested, owners: [] },
   }
 
-fn program_of_root(k: RootKey, tested: Bool) -> ProgramKey / {memo.read, abort.raise} =
+fn program_of_root(k: RootKey, tested: Bool) -> GroupKey / {memo.read, abort.raise} =
   match k {
-    Specialisation(a, _) ->
-      {
-        group: group_of_root(Named(a.definition), tested),
-        also: type_mentions(k).concat(lambda_mentions(k, tested)),
-      },
-    Clause(c) -> {
-      let p = program_of_root(c.definition, tested);
-      { ..p, also: p.also.concat(type_mentions(k)) }
-    },
-    EntryPoint(e) -> {
-      let p = program_of_root(e, tested);
-      { ..p, also: p.also.concat(host_mentions) }
-    },
+    Specialisation(a, _) -> group_of_root(Named(a.definition), tested),
+    Clause(c) -> program_of_root(c.definition, tested),
+    EntryPoint(e) -> program_of_root(e, tested),
     TestCases(t) -> program_of_root(t, tested),
-    Generated(w, _) ->
-      {
-        group: group_of_type(module_key_in(module_of(k), tested), w.ty),
-        also: type_mentions(k).concat(generated_mentions(k)),
-      },
-    _ -> { group: group_of_root(k, tested), also: [] },
+    Generated(w, _) -> group_of_type(module_key_in(module_of(k), tested), w.ty),
+    _ -> group_of_root(k, tested),
   }
 
 type ProgramScope = { scope: emit::Scope, batch: LoweredBatch }
@@ -431,134 +390,128 @@ fn constant_value(named: Mention, tested: Bool) -> Option<ConstantData> / {memo.
   )
 }
 
-pub fn code_of_group(
-  group: GroupRead,
-  tested: Bool,
-) -> CodeElsewhere / {CheckReads, QueryEffects, abort.raise} =
-  code_elsewhere(group.mentioned, |named: Mention| constant_value(named, tested), |module: Bytes|
-    natives_of(module, tested))
-
 fn module_key_of(g: GroupKey) -> ModuleKey =
   { module: g.module, shipped: g.shipped, tested: g.tested }
 
-fn names_in_table(table: TypeTable) -> List<Bytes> =
-  table.fold([], |found: List<Bytes>, _: Bytes, node: TypeNode|
-    match node {
-      NodeNamed(n) -> found.push(n.name),
-      NodeNominal(n) -> found.push(n.name),
-      _ -> found,
-    })
-
-type LoweredGroup = {
-  analysis: Analysis,
-  dump: Dump,
-  known: KnownConstructors,
-  elsewhere: CodeElsewhere,
-  types: List<TypeTable>,
-}
+type LoweredGroup = { analysis: Analysis, dump: Dump, types: List<TypeTable> }
 
 fn group_lowered(
-  key: ProgramKey,
-  roots: List<RootKey>,
-  tested: Bool,
+  key: GroupKey,
 ) -> Result<LoweredGroup, List<Diagnostic>> / {QueryEffects, abort.raise} = {
-  let g = group_program_of(key.group);
-  let rows = stored_rows(key.group);
+  let g = group_program_of(key);
+  let rows = stored_rows(key);
   with_group_read(
     [{ named: g.named, members: g.members, imported: g.imported }],
     g.sibling,
     g.bodies,
-    key.also,
-    |group: GroupRead| {
+    [],
+    |group: GroupRead|
       match checked_group({ ..group.inputs, rows: rows }, group.walks).pulled.out {
         Rejected(ds) -> Err(ds),
-        Analysed(a) -> {
-          let dump = dump_of(Analysed(a));
-          let found = code_of_group(
-            { ..group, mentioned: with_performed_effects(group.mentioned) },
-            tested,
-          );
-          let known = known_of_types(
-            g.types.concat([rows.types, dump.rows.types]).flat_map(names_in_table).concat(
-              found.schemes.values().flat_map(|s: Scheme| type_names(s.ty)),
-            ).concat(
-              roots.flat_map(types_keyed).flat_map(type_names),
-            ).concat(
-              group.mentioned.flat_map(mentioned_types),
-            ),
-          );
-          Ok({
-            analysis: a,
-            dump: with_known_constructors(dump, known),
-            known: known,
-            elsewhere: { ..found, stated: stated_by_constructor(known) },
-            types: g.types,
-          })
-        },
-      }
-    },
+        Analysed(a) -> Ok({ analysis: a, dump: dump_of(Analysed(a)), types: g.types }),
+      },
   )
-}
-
-fn mentioned_types(m: Mention) -> List<Bytes> / {CheckReads} = {
-  let name = qualify(m.module, m.name);
-  match program.constructor_named(name) {
-    Some(c) -> [c.type_name],
-    None -> match program.effect_named(name) {
-      Some(e) ->
-        e.operations.flat_map(|o: OperationInfo| o.params.push(o.return_type).flat_map(type_names)),
-      None -> [name],
-    },
-  }
 }
 
 fn program_scope(
   s: Lowering,
-  key: ProgramKey,
+  key: GroupKey,
   roots: List<RootKey>,
 ) -> { state: Lowering, program: ProgramScope } / {QueryEffects, abort.raise} = {
-  let at = bin::encode(key, program_key_bin());
+  let at = bin::encode(key, group_key_bin());
   match s.scopes.get(at) {
     Some(p) -> { state: s, program: p },
-    None -> match group_lowered(key, roots, s.tested) {
+    None -> match group_lowered(key) {
       Err(ds) ->
         panic(
           String::of_bytes_lossy(
             Bytes::concat_all([
               b"a checked group of `",
-              key.group.module,
+              key.module,
               b"` was rejected when it was lowered alone: ",
               emit::diagnostics_text(ds),
             ]),
           ),
         ),
       Ok(g) -> {
-        let batch = program_batch(
-          g.dump,
-          [],
-          module_units_of(module_key_of(key.group)).stated,
-          [],
-          released_by: g.known.released,
-        );
         let scope = emit::scope_over(
           g.analysis.modules,
           g.analysis.r,
-          batch.constructors,
           true,
           roots,
           { ..g.dump.rows, types: g.types.fold(g.dump.rows.types, types_joined) },
-          g.dump.effects,
-          g.dump.inferred_facts,
-          g.elsewhere,
+          inferred_facts(g.analysis),
         );
-        let p = { scope: scope, batch: { ..batch, natives: scope.natives } };
+        let p = { scope: scope, batch: program_batch(g.dump, []) };
         { state: { ..s, scopes: s.scopes.insert(at, p) }, program: p }
       },
     },
   }
 }
 
-type Asked = { state: Lowering, batches: List<LoweredBatch> }
+fn native_read(name: Bytes, tested: Bool) -> Option<Extern> / {memo.read, abort.raise} = {
+  let module = module_of_name(name);
+  let short = if module.len() == 0 { name } else { name.slice(module.len() + 1, name.len()) };
+  natives_of(if module.len() == 0 { prelude_module } else { module }, tested).find(|e: Extern|
+    e.name == short)
+}
+
+fn stated_read(name: Bytes, tested: Bool) -> Bool / {memo.read, abort.raise} = {
+  let module = module_of_name(name);
+  module.len() > 0 && module_units_of(module_key_in(module, tested)).stated.contains(name)
+}
+
+pub fn with_code_reads<a>(
+  tested: Bool,
+  body: () -> a / {EmitReads, QueryEffects},
+) -> a / {lowering.fail, QueryEffects, abort.raise} =
+  over_full_names(tested, ||
+    over_code_facts(
+      stored_sources(
+        |name: Bytes| {
+          let module = module_of_name(name);
+          constant_value({ module: module, name: name.slice(module.len() + 1, name.len()) }, tested)
+        },
+        |name: Bytes| native_read(name, tested),
+        |name: Bytes| stated_read(name, tested),
+      ),
+      body,
+    ))
+
+fn natives_here(s: Lowering) -> List<Extern> / {memo.read, abort.raise} =
+  s.scopes.values().fold([prelude_module], |modules: List<Bytes>, p: ProgramScope|
+    p.scope.modules.map(|m: ParsedModule| m.name).concat(
+      p.scope.module_scopes.flat_map(|t: emit::ModuleScope| t.imports.map(|i: Imported| i.module)),
+    ).fold(modules, |found: List<Bytes>, m: Bytes|
+      if found.contains(m) { found } else { found.push(m) })).fold(
+    declared_natives,
+    |found: List<Extern>, m: Bytes| found.concat(natives_of(m, s.tested)),
+  )
+
+fn failed_unit(reason: Bytes) -> LoweredUnit =
+  {
+    code: { results: [], requested: [], externs: [] },
+    summary: {
+      published: [],
+      needs: Map::new(),
+      called: Map::new(),
+      roots: [],
+      failure: Some(reason),
+    },
+  }
+
+fn lowered_or_failed(
+  unit: CodeUnit,
+  roots: List<RootKey>,
+  tested: Bool,
+) -> LoweredUnit / {QueryEffects, abort.raise} =
+  handle {
+    with_code_reads(tested, || lowered_unit(unit, roots, tested))
+  } with {
+    lowering.fail(reason) -> failed_unit(reason),
+  }
+
+type LoweredBatches = { state: Lowering, batches: List<LoweredBatch> }
 
 fn lambda_owners(ks: List<RootKey>) -> List<RootKey> =
   ks.fold([], |accumulator: List<RootKey>, k: RootKey|
@@ -567,13 +520,13 @@ fn lambda_owners(ks: List<RootKey>) -> List<RootKey> =
 type LentLambdas = { state: Lowering, lent: Map<RootName, Option<BoundLambda>> }
 
 fn asked_of_program(
-  accumulator: Asked,
+  accumulator: LoweredBatches,
   at: Bytes,
   ks: List<RootKey>,
   ownership: Map<RootName, OwnershipSignature>,
-) -> Asked / {QueryEffects, abort.raise} = {
+) -> LoweredBatches / {EmitReads, QueryEffects} = {
   let tested = accumulator.state.tested;
-  let key = decoded(at, program_key_bin(), "a unit's program");
+  let key = decoded(at, group_key_bin(), "a unit's program");
   let p = program_scope(accumulator.state, key, ks);
   let lent = lambda_owners(ks).fold(
     { state: p.state, lent: Map::new() },
@@ -595,11 +548,11 @@ fn lowered_batches(
   s: Lowering,
   roots: List<RootKey>,
   ownership: Map<RootName, OwnershipSignature>,
-) -> Asked / {QueryEffects, abort.raise} =
+) -> LoweredBatches / {EmitReads, QueryEffects} =
   roots.fold(Map::new(), |m: Map<Bytes, List<RootKey>>, k: RootKey| {
-    let at = bin::encode(program_of_root(k, s.tested), program_key_bin());
+    let at = bin::encode(program_of_root(k, s.tested), group_key_bin());
     m.insert(at, List::push(match m.get(at) { Some(ks) -> ks, None -> [] }, k))
-  }).fold({ state: s, batches: [] }, |accumulator: Asked, at: Bytes, ks: List<RootKey>|
+  }).fold({ state: s, batches: [] }, |accumulator: LoweredBatches, at: Bytes, ks: List<RootKey>|
     asked_of_program(accumulator, at, ks, ownership))
 
 fn has_published_signature(k: RootKey) -> Bool =
@@ -628,7 +581,7 @@ fn lowered_unit(
   unit: CodeUnit,
   roots: List<RootKey>,
   tested: Bool,
-) -> LoweredUnit / {QueryEffects, abort.raise} =
+) -> LoweredUnit / {EmitReads, QueryEffects} =
   unit_lowered(
     roots,
     { scopes: Map::new(), tested: tested },
@@ -637,6 +590,7 @@ fn lowered_unit(
     |facts: CalleeFacts, ks: List<RootKey>|
       ks.fold(facts, |f: CalleeFacts, k: RootKey| callee_read(unit, tested, f, k)),
     |k: RootKey| inlined_lambdas(k).len() > 0 && unit_of_root(k, tested) == unit,
+    natives_here,
   )
 
 fn group_roots(g: GroupKey) -> List<RootKey> / {memo.read, abort.raise} =
@@ -648,9 +602,9 @@ fn tested_of(g: GroupKey) -> Bool = g.shipped && g.tested
 pub fn code_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let unit = decoded(input, code_unit_bin(), "a unit of code");
   let made = match unit {
-    OfGroup(g) -> lowered_unit(unit, group_roots(g), tested_of(g)),
-    OfRoot(r) -> lowered_unit(unit, [r.key], r.tested),
-    NoCode -> lowered_unit(unit, [], false),
+    OfGroup(g) -> lowered_or_failed(unit, group_roots(g), tested_of(g)),
+    OfRoot(r) -> lowered_or_failed(unit, [r.key], r.tested),
+    NoCode -> lowered_or_failed(unit, [], false),
   };
   memo.provide(summary_query, input, bin::encode(made.summary, unit_summary_bin()));
   bin::encode(made.code, unit_code_bin())
@@ -669,6 +623,7 @@ type ReachWalk = {
   units: Map<Bytes, CodeUnit>,
   modules: Map<Bytes, ModuleUnits>,
   links: List<RootLink>,
+  failures: List<UnitFailure>,
 }
 
 const copy_buckets: Int = 16
@@ -738,6 +693,7 @@ pub fn reachable_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
       units: Map::new(),
       modules: Map::new(),
       links: [],
+      failures: [],
     },
     1099511627776,
     |w: ReachWalk|
@@ -746,7 +702,8 @@ pub fn reachable_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         Some(k) -> if w.seen.contains(root_name(k)) { Continue({ ..w, next: w.next + 1 }) } else {
           let unit = unit_of_root(k, entries.tested);
           let at = bin::encode(unit, code_unit_bin());
-          let calls = if unit == NoCode { [] } else { roots_called(summary_of(unit), k) };
+          let summary = if unit == NoCode { None } else { Some(summary_of(unit)) };
+          let calls = match summary { Some(s) -> roots_called(s, k), None -> [] };
           Continue({
             ..w,
             next: w.next + 1,
@@ -754,6 +711,7 @@ pub fn reachable_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
             units: if unit == NoCode { w.units } else { w.units.insert(at, unit) },
             work: calls.fold(w.work, |all: List<RootKey>, c: RootKey| all.push(c)),
             links: w.links.push({ root: root_name(k), unit: at, calls: calls.map(root_name) }),
+            failures: with_failure(w.failures, unit, summary),
           })
         },
       },
@@ -763,10 +721,29 @@ pub fn reachable_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
     |b: PartsBuilt, at: Bytes, unit: CodeUnit| with_part(b, at, unit),
   );
   bin::encode(
-    { parts: built.parts.values(), roots: walked.work.unique(), links: walked.links },
+    {
+      parts: built.parts.values(),
+      roots: walked.work.unique(),
+      links: walked.links,
+      failures: walked.failures,
+    },
     reached_bin(),
   )
 }
+
+fn with_failure(
+  failures: List<UnitFailure>,
+  unit: CodeUnit,
+  summary: Option<UnitSummary>,
+) -> List<UnitFailure> =
+  match summary {
+    Some(s) -> match s.failure {
+      Some(reason) -> if failures.any(|f: UnitFailure| f.unit == unit) { failures }
+      else { failures.push({ unit: unit, reason: reason }) },
+      None -> failures,
+    },
+    None -> failures,
+  }
 
 fn unit_code_of(unit: CodeUnit) -> UnitCode / {memo.read, abort.raise} =
   decoded(
@@ -887,21 +864,17 @@ pub const code_product_queries: List<Bytes> =
 
 pub const enterable_query: Bytes = b"enterable"
 
-const marshalling_mentions: List<Mention> =
-  emitted_code.calls.concat(emitted_code.insert_calls).map(|n: Bytes|
-    { module: prelude_module, name: n })
-
 pub fn enterable_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let at = decoded(input, root_at_bin(), "a root's key");
   let key = program_of_root(at.key, at.tested);
   bin::encode(
-    match group_lowered(
-        { ..key, also: key.also.concat(marshalling_mentions) },
-        [at.key],
-        at.tested,
-      ) {
+    match group_lowered(key) {
       Err(_) -> false,
-      Ok(g) -> enters(g.dump, at.key, g.elsewhere.schemes),
+      Ok(g) -> handle {
+        with_code_reads(key.tested, || enters(g.dump, at.key))
+      } with {
+        lowering.fail(reason) -> panic(String::of_bytes_lossy(reason)),
+      },
     },
     bin::bool_bin(),
   )
@@ -943,6 +916,7 @@ pub fn program_code(entries: Entries) -> ProgramCode / {memo.read, abort.raise} 
       }),
     roots: reached.roots,
     links: reached.links,
+    failures: reached.failures,
   }
 }
 
@@ -965,11 +939,25 @@ pub fn reached_digests(code: ProgramCode) -> List<Bytes> / {abort.raise} = {
   ).found
 }
 
-pub fn reached_codes(code: ProgramCode) -> List<UnitCode> / {memo.read, abort.raise} =
-  code.links.map(|l: RootLink| l.unit).unique().fold([], |found: List<UnitCode>, at: Bytes| {
-    let unit = decoded(at, code_unit_bin(), "a unit of code");
-    if unit == NoCode { found } else { found.push(unit_code_of(unit)) }
-  })
+pub fn code_failures(code: ProgramCode) -> List<Diagnostic> =
+  code.failures.map(|f: UnitFailure| lowering_rejected(f.reason))
+
+pub fn reached_codes(
+  code: ProgramCode,
+) -> Result<List<UnitCode>, List<Diagnostic>> / {memo.read, abort.raise} =
+  match code_failures(code) {
+    [] ->
+      Ok(
+        code.links.map(|l: RootLink| l.unit).unique().fold(
+          [],
+          |found: List<UnitCode>, at: Bytes| {
+            let unit = decoded(at, code_unit_bin(), "a unit of code");
+            if unit == NoCode { found } else { found.push(unit_code_of(unit)) }
+          },
+        ),
+      ),
+    failed -> Err(failed),
+  }
 
 pub fn closure_codes(code: ProgramCode) -> Map<RootName, Bytes> / {abort.raise} = {
   let links = code.links;
@@ -1039,6 +1027,7 @@ fn linked_program(
           None -> [],
         },
       }),
+    failures: [],
   }
 
 test "a root's code digest changes when anything it can call changes, and not otherwise" {

@@ -6,8 +6,12 @@ import compiler.emit.code (Code, CodeLiteral, CodeVariable, NDefinition, NConstr
                            CodeLabel, CodeStatement, CodeLet, CodeLetDestructure, CodeDo, CodeArm,
                            CodeField, CodeClause, Capture, pattern_slots)
 import compiler.emit.moves (Moves, no_moves, read_moved, capture_moved, field_moved, root_moves)
-import compiler.emit.lower.module_context (CodeElsewhere, nothing_elsewhere, natives_with,
-                                           ModuleContext, ItemRoot, module_contexts_in)
+import compiler.emit.lower.module_context (ModuleContext, ItemRoot, module_contexts_in,
+                                           definition_called, returned_called)
+import compiler.emit.representations (EmitReads)
+import compiler.emit.reads (over_analysis)
+import compiler.emit.code (code_children)
+import compiler.check.resolve.tables (module_of_name)
 import compiler.check.infer.definitions (Extern, parsed_natives)
 import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, FnDefinition, ReturnsFresh,
                               ReturnsParam)
@@ -903,7 +907,7 @@ fn declared_in(p: CostInput, prog: Program) -> List<DeclaredReturn> / {abort.rai
 pub fn walked_group<| e>(
   p: CostInput,
   returned: (Bytes) -> ReturnOwnership / {abort.raise | e},
-) -> GroupWalk / {abort.raise | e} =
+) -> GroupWalk / {EmitReads | e} =
   match program_of(p) {
     None -> { ok: false, bodies: [], declared: [] },
     Some(prog) -> {
@@ -1126,10 +1130,9 @@ fn module_bodies(
   i: Int,
   setting: ModuleContext,
   roots: List<ItemRoot>,
-  natives: List<Bytes>,
   index: Map<Bytes, Int>,
-) -> List<Body> / {abort.raise} = {
-  let s = { ..setting, builtins: natives };
+) -> List<Body> / {EmitReads} = {
+  let s = setting;
   let m = setting.module;
   roots.fold([], |a: List<Body>, ir: ItemRoot| {
     let moves = root_moves(s, ir.root);
@@ -1202,15 +1205,14 @@ fn definition_elsewhere(
   module: Bytes,
   own: Bool,
   d: representations::Definition,
-  returned: Map<Bytes, StatedReturn>,
-) -> Definition =
+) -> Definition / {EmitReads} =
   {
     name: qualify(module, d.name),
     module_name: module,
     params: [],
     arity: d.arity,
     own: own,
-    declared_return: declared_at(returned.get(qualify(module, d.name)), dummy_span),
+    declared_return: declared_at(returned_called(qualify(module, d.name)), dummy_span),
   }
 
 fn violates(declared: ReturnOwnership, got: ReturnOwnership) -> Bool =
@@ -1246,7 +1248,6 @@ pub type CostInput = {
   walked: List<Int>,
   roots: Option<Map<Bytes, Bool>>,
   origin: Int,
-  elsewhere: CodeElsewhere,
 }
 
 pub fn cost_input_of(analysis: Analysis) -> CostInput / {abort.raise} =
@@ -1262,7 +1263,6 @@ pub fn cost_input_of(analysis: Analysis) -> CostInput / {abort.raise} =
       own_module(analysis.module_packages, i)),
     roots: None,
     origin: 0,
-    elsewhere: nothing_elsewhere,
   }
 
 fn own_module(module_packages: List<Int>, i: Int) -> Bool =
@@ -1307,15 +1307,42 @@ fn definitions_of(p: CostInput) -> List<Definition> / {abort.raise} = {
           ),
         _ -> xs,
       });
-    written.concat(
-      (match p.elsewhere.definitions.get(m.name) { Some(ds) -> ds, None -> [] }).map(
-        |d: representations::Definition| definition_elsewhere(m.name, own, d, p.elsewhere.returned),
-      ),
-    )
+    written
   })
 }
 
-fn lowered_bodies(p: CostInput, index: Map<Bytes, Int>) -> Option<List<Body>> / {abort.raise} = {
+fn called_names(found: List<Bytes>, c: Code) -> List<Bytes> / {abort.raise} =
+  code_children(c).fold(
+    match c.node {
+      NDefinition(d) -> if found.contains(d.full) { found } else { found.push(d.full) },
+      _ -> found,
+    },
+    called_names,
+  )
+
+fn with_definitions_elsewhere(
+  p: CostInput,
+  definitions: List<Definition>,
+  bodies: List<Body>,
+) -> List<Definition> / {EmitReads} = {
+  let places = places(p.modules);
+  bodies.fold([], |found: List<Bytes>, b: Body| called_names(found, b.code)).fold(
+    definitions,
+    |all: List<Definition>, full: Bytes|
+      if all.any(|d: Definition| d.name == full) { all } else {
+        let module = module_of_name(full);
+        match places.get(module) {
+          None -> all,
+          Some(i) -> match definition_called(full) {
+            Some(d) -> all.push(definition_elsewhere(module, own_module(p.module_packages, i), d)),
+            None -> all,
+          },
+        }
+      },
+  )
+}
+
+fn lowered_bodies(p: CostInput, index: Map<Bytes, Int>) -> Option<List<Body>> / {EmitReads} = {
   let tables = embed_tables(p.embeds);
   let wants = p.walked.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
   let read = range(0, p.modules.len()).fold(
@@ -1332,17 +1359,13 @@ fn lowered_bodies(p: CostInput, index: Map<Bytes, Int>) -> Option<List<Body>> / 
     },
   );
   if read.bad { None } else {
-    let natives = natives_with(p.modules, p.elsewhere).map(|e: Extern| e.name);
     match module_contexts_in(
         p.r,
-        p.checked,
         p.rows,
         p.facts,
         read.modules,
-        p.elsewhere,
         p.walked,
-        |i: Int, s: ModuleContext, roots: List<ItemRoot>|
-          module_bodies(i, s, roots, natives, index),
+        |i: Int, s: ModuleContext, roots: List<ItemRoot>| module_bodies(i, s, roots, index),
         match p.roots {
           None -> None,
           Some(roots) ->
@@ -1359,22 +1382,24 @@ fn lowered_bodies(p: CostInput, index: Map<Bytes, Int>) -> Option<List<Body>> / 
   }
 }
 
-fn program_of(p: CostInput) -> Option<Program> / {abort.raise} = {
-  let definitions = definitions_of(p);
-  let index = range(0, definitions.len()).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Int>, i: Int| accumulator.insert(definitions.get(i).name, i),
-  );
-  match lowered_bodies(p, index) {
+fn indexed(definitions: List<Definition>) -> Map<Bytes, Int> / {abort.raise} =
+  range(0, definitions.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
+    accumulator.insert(definitions.get(i).name, i))
+
+fn program_of(p: CostInput) -> Option<Program> / {EmitReads} = {
+  let written = definitions_of(p);
+  match lowered_bodies(p, indexed(written)) {
     None -> None,
-    Some(bodies) ->
+    Some(bodies) -> {
+      let definitions = with_definitions_elsewhere(p, written, bodies);
       Some({
-        index: index,
+        index: indexed(definitions),
         builtins: builtin_names.fold(Map::new(), |accumulator: Map<Bytes, Bool>, b: Bytes|
           accumulator.insert(b, true)),
         definitions: definitions,
         bodies: bodies,
-      }),
+      })
+    },
   }
 }
 
@@ -1444,21 +1469,23 @@ fn checked_cost_input(
   names: List<Bytes>,
   sources: List<Bytes>,
   module_packages: List<Int> = [],
-) -> CostInput / {abort.raise} =
+) -> { analysis: Analysis, input: CostInput } / {abort.raise} =
   match analyse(
       parse_all(
         range(0, names.len()).map(|i: Int| { name: names.get(i), source_text: sources.get(i) }),
       ),
     ) {
     Rejected(_) -> panic("the checker rejected a program that should be valid"),
-    Analysed(w) ->
-      cost_input_of({
+    Analysed(w) -> {
+      let a = {
         ..w,
         module_packages: module_packages.concat(w.module_packages.drop(module_packages.len())),
-      }),
+      };
+      { analysis: a, input: cost_input_of(a) }
+    },
   }
 
-pub fn report_over_one_walk(p: CostInput) -> Report / {abort.raise} = {
+pub fn report_over_one_walk(p: CostInput) -> Report / {EmitReads} = {
   let walked = walked_group(p, |_: Bytes| FreshReturn);
   report_of([module_costs([{ items: [], walk: walked }], parameters_of([demands_of([walked])]))])
 }
@@ -1467,8 +1494,10 @@ fn reported(
   names: List<Bytes>,
   sources: List<Bytes>,
   module_packages: List<Int> = [],
-) -> Report / {abort.raise} =
-  report_over_one_walk(checked_cost_input(names, sources, module_packages))
+) -> Report / {abort.raise} = {
+  let c = checked_cost_input(names, sources, module_packages);
+  over_analysis(c.analysis, || report_over_one_walk(c.input))
+}
 
 test "a cost report gives each update's source location, whether it copies or reuses, the reason, and an edit that would avoid the copy" {
   let source = b"reuse fn grow(m: Map<Int, List<Int>>, n: Int) -> List<Int> =\n  match m.get(0) { Some(xs) -> xs.push(n), None -> [] }\n";
@@ -1611,10 +1640,11 @@ test "`fold` is treated as returning whatever its callback returns" {
 
 test "a callee in another body is read through the given return, and a demand names the callee" {
   let source = b"pub fn kept(xs: List<Int>) -> List<Int> = xs\nfn grow(xs: List<Int>, n: Int) -> List<Int> = kept(xs).push(n)\n";
-  let p = checked_cost_input([b"m"], [source]);
-  let only_grow = { ..p, roots: Some(Map::new().insert(b"m.grow", true)) };
-  let walked = walked_group(only_grow, |name: Bytes|
-    if name == b"m.kept" { ReturnOfParam(0) } else { FreshReturn });
+  let c = checked_cost_input([b"m"], [source]);
+  let only_grow = { ..c.input, roots: Some(Map::new().insert(b"m.grow", true)) };
+  let walked = over_analysis(c.analysis, ||
+    walked_group(only_grow, |name: Bytes|
+      if name == b"m.kept" { ReturnOfParam(0) } else { FreshReturn }));
   assert_eq(walked.bodies.map(|b: WalkedBody| b.definition), [Some(b"m.grow")]);
   assert_eq(walked.bodies.get(0).demands, [{ callee: b"m.kept", param: 0, owner: ParamOwner(0) }])
 }

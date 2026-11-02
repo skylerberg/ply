@@ -7,7 +7,7 @@ import compiler.emit.roots (root_id, builtin_pointed)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Root, Generated, has_entry, definition_of)
 import compiler.emit.evidence (declared_arity)
-import compiler.emit.representations (Constructors, no_constructors, known_layout)
+import compiler.emit.representations (known_layout, ShapeReads, code_facts, with_no_shapes)
 import compiler.emit.layout (Boxed, tag_bits, inline_word_at, words, header_bytes)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, ConstructorTag, FailureOwner, InGroup,
                              LambdaOwner, FromCaller, merged, pieces_text, own_symbol)
@@ -62,10 +62,9 @@ import compiler.emit.print.frames (site_linked, handle_linked, unlinked, record_
 import compiler.emit.print.count_functions (duplicate_function, release_function, call_text)
 import compiler.emit.verify (word)
 
-pub fn printed_function(f: Function, constructors: Constructors) -> PrintOutput / {abort.raise} = {
+pub fn printed_function(f: Function) -> PrintOutput / {ShapeReads} = {
   let name = own_symbol(None);
-  let own = if f.members.len() == 0 { root_printed(name, f, constructors) }
-  else { group_printed(name, f, constructors) };
+  let own = if f.members.len() == 0 { root_printed(name, f) } else { group_printed(name, f) };
   let closures = range(0, f.lambdas.len()).fold(
     { printing: own.printing, out: [] },
     |accumulator: { printing: Printing, out: List<Piece> }, k: Int|
@@ -101,8 +100,7 @@ pub fn printed_function(f: Function, constructors: Constructors) -> PrintOutput 
 fn root_printed(
   name: Bytes,
   f: Function,
-  constructors: Constructors,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} = {
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} = {
   let sited = match definition_of(f.key) {
     Some(d) -> if is_marshalling_function(d) { Some(FromCaller) } else { None },
     None -> None,
@@ -111,12 +109,11 @@ fn root_printed(
   let own = if scheduling { name.concat(b"_scheduling") } else { name };
   let body = body_printed(name, f, sited, {
     ..empty_printing(param_names(f)),
-    constructors: constructors,
     count_root_type: counted_here(f.key),
   });
-  let entered = if !has_entry(f.key, declared_arity(f.params), constructors.stated) {
-    { printing: body, out: [] }
-  } else { runtime_entry(body, name, entry_signature_of(f)) };
+  let entered = if !has_entry(f.key, declared_arity(f.params), |n: Bytes|
+      code_facts.stated_function(n)) { { printing: body, out: [] } }
+  else { runtime_entry(body, name, entry_signature_of(f)) };
   let opening = match f.kind {
     Metered -> if needs_stack_check(f) { head_probe(f.convention.result) } else { b"" },
     Plain -> if !is_drop_root(f.key) { b"" }
@@ -165,8 +162,7 @@ fn scheduler_entry(name: Bytes, own: Bytes, f: Function) -> Bytes =
 fn group_printed(
   name: Bytes,
   f: Function,
-  constructors: Constructors,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} = {
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} = {
   let g = name.concat(b"_group");
   let width = f.members.fold(0, |w: Int, m: Member|
     if m.params.len() > w { m.params.len() } else { w });
@@ -183,10 +179,10 @@ fn group_printed(
     unwinds: [],
     epilogue: b"",
   };
-  let start = {
-    ..empty_printing(match f.params.at(0) { Some(which) -> Map::new().insert(which.id, b"which"), None -> Map::new() }),
-    constructors: constructors,
-  };
+  let start = empty_printing(match f.params.at(0) {
+    Some(which) -> Map::new().insert(which.id, b"which"),
+    None -> Map::new(),
+  });
   let switched = match f.body {
     [Case(c)] -> {
       let arms = c.arms.fold(start, |printing: Printing, a: { when: Int, body: Block }|
@@ -290,11 +286,11 @@ fn group_printed(
 fn moved_to_destination(
   printing: Printing,
   a: Arg,
-) -> { printing: Printing, text: Bytes } / {abort.raise} =
+) -> { printing: Printing, text: Bytes } / {ShapeReads} =
   match a {
     VariableOperand(x) -> if !printing.placing.destination_passing
         || printing.placing.results.contains(x.id) { { printing: printing, text: b"" } } else {
-      match known_layout(printing.constructors, x.ty) {
+      match known_layout(x.ty) {
         Some(l) -> {
           let moved = write_inline(
             printing,
@@ -345,7 +341,7 @@ fn counted_here(k: RootKey) -> Option<Type> =
 fn return_epilogue(f: Function) -> Bytes =
   match f.kind { Plain -> if is_drop_root(f.key) { b"ply_drop_done(ctx);" } else { b"" }, _ -> b"" }
 
-fn param_names(f: Function) -> Map<Int, Bytes> / {abort.raise} =
+fn param_names(f: Function) -> Map<Int, Bytes> / {ShapeReads} =
   range(0, f.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
     m.insert(f.params.get(i).id, b"p".concat(ascii_of_int(i))))
 
@@ -354,7 +350,7 @@ fn closure_printed(
   nth: Int,
   l: Lambda,
   printing: Printing,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match l {
     Closure(c) -> body_printed(symbol, c.body, None, function_body(printing, lambda_names(l, nth))),
   }
@@ -364,7 +360,7 @@ fn body_printed(
   f: Function,
   sited: Option<FailureOwner>,
   given: Printing,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let with_caller_site = if sited == Some(FromCaller) {
     line(
       given,
@@ -459,7 +455,7 @@ fn exiting(
   unwind: List<Variable>,
   into: Option<Variable>,
   value: Rvalue,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let x = failure_exit_through(printing, p.u.unwinds, unwind, failure_target(p.u));
   let l = site_linked({ ..p, exit_statement: x.leave }, x.printing, unwind, value);
   let after = unlinked(
@@ -504,12 +500,7 @@ fn with_site_scope(s: BlockState, borrowed: Option<SiteOrigin>) -> BlockState =
     },
   }
 
-fn printed(
-  home: BodyContext,
-  printing: Printing,
-  b: Block,
-  depth: Int,
-) -> Printing / {abort.raise} =
+fn printed(home: BodyContext, printing: Printing, b: Block, depth: Int) -> Printing / {ShapeReads} =
   b.fold(
     { printing: printing, context: home, outer: [] },
     |sites: BlockState, i: Instruction| {
@@ -723,7 +714,7 @@ fn value_printed(
   printing: Printing,
   into: Option<Variable>,
   value: Rvalue,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match value {
     Primitive(x) -> primitive(p, printing, into, x),
     Literal(l) -> literal(p, printing, into, l),
@@ -765,7 +756,7 @@ fn taken(
   printing: Printing,
   into: Option<Variable>,
   t: { of: Variable, path: Path },
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match into {
     None -> unsupported(b"a field is read but its value is never used", variable_text(t.of)),
     Some(v) -> match match ((t.of.representation, t.path)) {
@@ -799,8 +790,8 @@ fn taken_from_inline_record(
   v: Variable,
   of: Variable,
   at: Int,
-) -> Printing / {abort.raise} =
-  match known_layout(printing.constructors, v.ty) {
+) -> Printing / {ShapeReads} =
+  match known_layout(v.ty) {
     Some(l) -> {
       let m = words(l);
       let block = name_of(printing, of);
@@ -850,7 +841,7 @@ fn taken_from_block(
   printing: Printing,
   v: Variable,
   t: { of: Variable, path: Path },
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match field_of(name_of(printing, t.of), t.of.representation, t.path) {
     None ->
       unsupported(
@@ -932,7 +923,7 @@ fn native(
   printing: Printing,
   into: Option<Variable>,
   n: { name: Bytes, args: List<Arg>, uses: OperationSignature },
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let call = Bytes::concat_all([
     n.name,
     b"(ctx",
@@ -961,9 +952,7 @@ fn c_declaration(name: Bytes, f: Function) -> Bytes =
     b")",
   ])
 
-fn restart_printed(
-  restart: (Arg, Arg) -> List<Arg>,
-) -> { text: Bytes, arm: Bytes } / {abort.raise} = {
+fn restart_printed(restart: (Arg, Arg) -> List<Arg>) -> { text: Bytes, arm: Bytes } / {ShapeReads} = {
   let int = int_type;
   let local = |id: Int, rep: Representation| { id: id, ty: int, representation: rep };
   let n = local(0, AsInt);
@@ -1014,7 +1003,7 @@ fn restart_printed(
     links: no_links,
     statics: [],
   };
-  let text = pieces_text(printed_function(f, no_constructors).pieces);
+  let text = pieces_text(printed_alone(f).pieces);
   {
     text: text,
     arm: match text.index_of(b"} else {") { Some(i) -> text.slice(i, text.len()), None -> b"" },
@@ -1060,29 +1049,24 @@ fn handle_over(result: Variable, body: Block) -> Instruction =
     unwind: [],
   })
 
+fn printed_alone(f: Function) -> PrintOutput / {abort.raise} =
+  with_no_shapes(|| printed_function(f))
+
 fn returning(result: Variable, body: Block) -> Bytes / {abort.raise} =
   pieces_text(
-    printed_function(
-      {
-        key: Named(b"m.guarded"),
-        kind: Metered,
-        params: [],
-        convention: {
-          params: [],
-          result: AsWord,
-          destination_passing: false,
-          returned: OwnedResult,
-        },
-        result_type: result.ty,
-        body: body.push(Return(VariableOperand(result))),
-        lambdas: [],
-        base: 0,
-        members: [],
-        links: no_links,
-        statics: [],
-      },
-      no_constructors,
-    ).pieces,
+    printed_alone({
+      key: Named(b"m.guarded"),
+      kind: Metered,
+      params: [],
+      convention: { params: [], result: AsWord, destination_passing: false, returned: OwnedResult },
+      result_type: result.ty,
+      body: body.push(Return(VariableOperand(result))),
+      lambdas: [],
+      base: 0,
+      members: [],
+      links: no_links,
+      statics: [],
+    }).pieces,
   )
 
 fn nested_handle_text(fails: Bool) -> Bytes / {abort.raise} = {
@@ -1148,40 +1132,37 @@ test "a group of mutually tail-calling functions prints as one function that swi
     returned: OwnedResult,
   };
   let text = pieces_text(
-    printed_function(
-      {
-        key: Named(b"m.even"),
-        kind: Metered,
-        params: [which],
-        convention: {
-          params: [{ ownership: OwnedParam, representation: AsInt }],
-          result: AsWord,
-          destination_passing: false,
-          returned: OwnedResult,
-        },
-        result_type: m.ty,
-        body: [
-          Case({
-            on: which,
-            test: IntTest([0, 1]),
-            arms: [
-              { when: 0, body: [Jump({ member: 1, args: [VariableOperand(n)] })] },
-              { when: 1, body: [Return(VariableOperand(m))] },
-            ],
-            rest: [Return(ZeroOperand(AsWord))],
-          }),
-        ],
-        lambdas: [],
-        base: 0,
-        members: [
-          { key: Named(b"m.even"), base: 0, params: [n], convention: conv },
-          { key: Named(b"m.odd"), base: 40, params: [m], convention: conv },
-        ],
-        links: no_links,
-        statics: [],
+    printed_alone({
+      key: Named(b"m.even"),
+      kind: Metered,
+      params: [which],
+      convention: {
+        params: [{ ownership: OwnedParam, representation: AsInt }],
+        result: AsWord,
+        destination_passing: false,
+        returned: OwnedResult,
       },
-      no_constructors,
-    ).pieces,
+      result_type: m.ty,
+      body: [
+        Case({
+          on: which,
+          test: IntTest([0, 1]),
+          arms: [
+            { when: 0, body: [Jump({ member: 1, args: [VariableOperand(n)] })] },
+            { when: 1, body: [Return(VariableOperand(m))] },
+          ],
+          rest: [Return(ZeroOperand(AsWord))],
+        }),
+      ],
+      lambdas: [],
+      base: 0,
+      members: [
+        { key: Named(b"m.even"), base: 0, params: [n], convention: conv },
+        { key: Named(b"m.odd"), base: 40, params: [m], convention: conv },
+      ],
+      links: no_links,
+      statics: [],
+    }).pieces,
   );
   let g = own_symbol(None).concat(b"_group");
   let text_message = Some(String::of_bytes_lossy(text));
@@ -1237,7 +1218,7 @@ test "a closure's C function is printed after the function that makes it, and nu
   let inner = closure_printed(name, 0, l, { ..empty_printing(Map::new()), temps: 7, labels: 3 });
   let body = pieces_text(inner.out);
   assert(body.index_of(b" t1;") != None && body.index_of(b"t8") == None, None);
-  let printed = printed_function(f, no_constructors);
+  let printed = printed_alone(f);
   assert(
     pieces_text(printed.pieces).ends_with(
       b"}\n".concat(pieces_text(lambda_text(name, 0, l, inner).out)),
@@ -1276,7 +1257,7 @@ test "a generated function never checks the stack, but a generated drop function
     };
   let text_of = |type_operation: keys::TypeOperation| {
     let f = plain(type_operation);
-    let all = pieces_text(printed_function(f, no_constructors).pieces);
+    let all = pieces_text(printed_alone(f).pieces);
     let own = Bytes::concat_all([c_declaration(own_symbol(None), f), b" {"]);
     match all.index_of(own) {
       Some(i) -> match all.index_of_from(b"\n}\n", i) { Some(j) -> all.slice(i, j), None -> b"" },
@@ -1338,7 +1319,7 @@ test "after a `SiteScope` instruction, failure messages name the scope's functio
   let main = { root: Named(b"app.main"), base: 1000 };
   let other = { root: Named(b"lib.k"), base: 2000 };
   let text = pieces_text(
-    printed_function(
+    printed_alone(
       int_root([v(0)], [
         add(v(0), span_between(110, 115)),
         SiteScope(Some(main)),
@@ -1358,7 +1339,6 @@ test "after a `SiteScope` instruction, failure messages name the scope's functio
         add(v(21), span_between(130, 135)),
         Return(VariableOperand(v(22))),
       ]),
-      no_constructors,
     ).pieces,
   );
   let sites = text.split(b"PLY_SITE(").drop(1).map(|rest: Bytes|
@@ -1386,7 +1366,7 @@ test "taking a field moves it out and clears it in place when the block has one 
       returned: OwnedResult,
     },
   };
-  let text = pieces_text(printed_function(f, no_constructors).pieces);
+  let text = pieces_text(printed_alone(f).pieces);
   assert(
     text.index_of(b"ply_words(p0)[1] = 0;") != None
       && text.index_of(call_text(duplicate_function, [b"t1"])) != None,
@@ -1396,12 +1376,11 @@ test "taking a field moves it out and clears it in place when the block has one 
 
 test "printing a constructor's tag emits a hole that is replaced with the tag's value after printing" {
   let k = { id: 0, ty: int_type, representation: AsInt };
-  let printing = printed_function(
+  let printing = printed_alone(
     int_root([], [
       Let({ var: k, value: Tag(b"m.Box"), at: span_between(0, 0), unwind: [] }),
       Return(VariableOperand(k)),
     ]),
-    no_constructors,
   );
   assert(printing.pieces.contains(Hole(ConstructorTag(b"m.Box"))))
 }
@@ -1424,18 +1403,15 @@ fn let_unwinding(v: Variable, value: Rvalue, unwind: List<Variable>) -> Instruct
 
 fn word_root(params: List<Variable>, body: Block) -> Bytes / {abort.raise} =
   pieces_text(
-    printed_function(
-      {
-        ..int_root(params, body),
-        convention: {
-          params: owned_params(params.map(|v: Variable| v.representation)),
-          result: AsWord,
-          destination_passing: false,
-          returned: OwnedResult,
-        },
+    printed_alone({
+      ..int_root(params, body),
+      convention: {
+        params: owned_params(params.map(|v: Variable| v.representation)),
+        result: AsWord,
+        destination_passing: false,
+        returned: OwnedResult,
       },
-      no_constructors,
-    ).pieces,
+    }).pieces,
   )
 
 fn released_text(name: Bytes) -> Bytes / {abort.raise} =

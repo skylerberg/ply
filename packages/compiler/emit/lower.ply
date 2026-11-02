@@ -8,12 +8,13 @@ import compiler.emit.code (Code, read_name, CodeLiteral, CodeVariable, NDefiniti
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (LiteralUnit)
 import compiler.syntax.expressions (detached_closure_span, scheduler_module)
-import compiler.emit.representations (Definition, resume_result_type, no_constructors)
+import compiler.emit.representations (Definition, resume_result_type, EmitReads)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.typed_ir (Arg, AsBool, AsListView, Return, Function, Metered, falls_through,
                                operand_representation, CleanupScope, Unwinding, Fail, LetMismatch,
                                operand_variable)
-import compiler.emit.lower.module_context (ModuleContext, Root)
+import compiler.emit.lower.module_context (ModuleContext, Root, definition_at)
+import compiler.check.resolve.tables (module_of_name)
 import compiler.emit.keys (Named, root_name, root_text, module_of)
 import compiler.check.types (Type, no_effects)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, ToConstructor, ToBuiltin,
@@ -46,17 +47,17 @@ import compiler.emit.evidence (evidence_type)
 import compiler.emit.output (EffectsGeneric)
 import compiler.emit.statics (folded)
 
-pub fn root_lowered(setting: ModuleContext, r: Root) -> Function / {abort.raise} = {
+pub fn root_lowered(setting: ModuleContext, r: Root) -> Function / {EmitReads} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn(context_of(setting, r, body), body)
 }
 
-pub fn root_observed(setting: ModuleContext, r: Root) -> Function / {abort.raise} = {
+pub fn root_observed(setting: ModuleContext, r: Root) -> Function / {EmitReads} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn({ ..context_of(setting, r, body), emits_notes: true }, body)
 }
 
-pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Function / {abort.raise} =
+pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Function / {EmitReads} =
   lowered_group(
     roots.map(|r: Root| {
       let body = known_body(root_text(root_name(r.key)), r.params, r.code);
@@ -66,29 +67,32 @@ pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Function / {a
 
 pub type TailCall = { full: Bytes, args: List<Type> }
 
+fn calls_own_definition(s: ModuleContext, full: Bytes, arity: Int) -> Bool / {EmitReads} =
+  module_of_name(full) == s.module
+    && (match definition_at(s, full) {
+      Some(d) -> d.definition.root == Named(full) && d.definition.arity == arity,
+      None -> false,
+    })
+
 pub fn tail_calls(
-  here: List<Definition>,
+  s: ModuleContext,
   code: Code,
   accumulator: List<TailCall>,
-) -> List<TailCall> / {abort.raise} =
+) -> List<TailCall> / {EmitReads} =
   match code.node {
     CodeApply(a) -> match a.function.node {
-      NDefinition(d) -> if here.any(|h: Definition|
-          h.root == Named(d.full) && h.arity == a.args.len()) {
+      NDefinition(d) -> if calls_own_definition(s, d.full, a.args.len()) {
         accumulator.push({ full: d.full, args: d.args })
       } else { accumulator },
       _ -> accumulator,
     },
     CodeBinary(b) -> if b.operation == b"and" || b.operation == b"or" {
-      tail_calls(here, b.right_operand, accumulator)
+      tail_calls(s, b.right_operand, accumulator)
     } else { accumulator },
-    CodeIf(i) -> tail_calls(here, i.else_branch, tail_calls(here, i.then_branch, accumulator)),
-    CodeBlock(b) -> match b.tail {
-      Some(t) -> tail_calls(here, t, accumulator),
-      None -> accumulator,
-    },
+    CodeIf(i) -> tail_calls(s, i.else_branch, tail_calls(s, i.then_branch, accumulator)),
+    CodeBlock(b) -> match b.tail { Some(t) -> tail_calls(s, t, accumulator), None -> accumulator },
     CodeMatch(m) ->
-      m.arms.fold(accumulator, |a: List<TailCall>, arm: CodeArm| tail_calls(here, arm.body, a)),
+      m.arms.fold(accumulator, |a: List<TailCall>, arm: CodeArm| tail_calls(s, arm.body, a)),
     _ -> accumulator,
   }
 
@@ -99,7 +103,7 @@ fn spawn_argument_lowered(
   context: Context,
   state: Lowering,
   x: Code,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match x.node {
     CodeLambda(l) -> {
       let captured_evidence = captured_evidence_for(
@@ -147,7 +151,7 @@ fn let_with_mismatch(
   written: Code,
   pattern: CodePattern,
   at: Span,
-) -> Lowering / {abort.raise} = {
+) -> Lowering / {EmitReads} = {
   let written_arguments = match written.node {
     CodeApply(a) -> a.args.take(a.args.len() - 1),
     _ -> [],
@@ -180,7 +184,7 @@ fn within_cleanup_scope(
   state: Lowering,
   args: List<Code>,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match args.at(args.len() - 1) {
     None -> unreachable(b"a cleanup scope has no body expression"),
     Some(body) -> {
@@ -213,7 +217,7 @@ fn within_cleanup_scope(
     },
   }
 
-pub fn lowered_fn(context: Context, body: Code) -> Function / {abort.raise} = {
+pub fn lowered_fn(context: Context, body: Code) -> Function / {EmitReads} = {
   let conv = convention(context);
   let known_representations = parameter_representations(context);
   let declared = context.params.len();
@@ -240,7 +244,7 @@ pub fn lowered_fn(context: Context, body: Code) -> Function / {abort.raise} = {
   let returned = if falls_through(out.st.instructions) {
     represented_as(out, conv.result, body.span)
   } else { out };
-  folded(context.setting.constructors, {
+  folded({
     key: context.key,
     kind: Metered,
     params: params,
@@ -257,7 +261,7 @@ pub fn lowered_fn(context: Context, body: Code) -> Function / {abort.raise} = {
   })
 }
 
-pub fn lowered_group(members: List<GroupMember>) -> Function / {abort.raise} = {
+pub fn lowered_group(members: List<GroupMember>) -> Function / {EmitReads} = {
   let starts = group_body_starts(members);
   let bodies = range(0, members.len()).fold(
     { after: None, out: [] },
@@ -274,13 +278,10 @@ pub fn lowered_group(members: List<GroupMember>) -> Function / {abort.raise} = {
         },
       },
   );
-  folded(
-    match members.at(0) { Some(m) -> m.context.setting.constructors, None -> no_constructors },
-    {
-      ..tail_group_root(members, bodies.out),
-      statics: match bodies.after { Some(a) -> a.statics, None -> [] },
-    },
-  )
+  folded({
+    ..tail_group_root(members, bodies.out),
+    statics: match bodies.after { Some(a) -> a.statics, None -> [] },
+  })
 }
 
 type SlotRead = { slot: Int, at: Span, arg: Arg }
@@ -292,7 +293,7 @@ fn slot_read(
   state: Lowering,
   x: Code,
   views: Bool,
-) -> Option<{ st: Lowering, read: SlotRead }> / {abort.raise} =
+) -> Option<{ st: Lowering, read: SlotRead }> / {EmitReads} =
   match x.node {
     CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) -> {
@@ -313,18 +314,14 @@ fn slot_taken(
   a: Arg,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let l = list_of_view({ st: state, arg: a }, at);
   if is_label_binder(name) { l } else if resume_result_type(type_of(a)) != None {
     continuation_closure(context, l.st, slot, a, at)
   } else { typed_slot_read(context, l, name, slot, ty, at) }
 }
 
-fn callee_lowered(
-  context: Context,
-  state: Lowering,
-  function: Code,
-) -> LoweredValue / {abort.raise} =
+fn callee_lowered(context: Context, state: Lowering, function: Code) -> LoweredValue / {EmitReads} =
   match function.node {
     CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) -> if resume_result_type(type_of(a)) != None {
@@ -348,7 +345,7 @@ fn list_view_slot(state: Lowering, c: Code) -> Option<{ slot: Int, arg: Arg }> =
 fn reads_noted(context: Context, state: Lowering, read: List<SlotRead>) -> Lowering =
   read.fold(state, |s: Lowering, r: SlotRead| note_slot_read(context, s, read_note, r.slot, r.at))
 
-fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredValue / {abort.raise} =
+fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredValue / {EmitReads} =
   match c.node {
     CodeLiteral(l) -> literal(context, state, l, c.span),
     CodeVariable(v) -> match state.env.get(v.slot) {
