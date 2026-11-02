@@ -1,3 +1,4 @@
+import compiler.syntax.items (InstanceItem, HostInstance)
 import compiler.syntax.items (effect_set_definition_bin, schema_definition_bin, SchemaDefinition,
                               SchemaItem)
 import compiler.check.resolve.tables (parameters_bin)
@@ -481,7 +482,12 @@ pub type BodyChecking =
 
 pub type ReusedBody = { body: CheckedBody, facts: Bytes }
 
-pub type AliasFacts = { t: Type, keys: List<MapKeySite> }
+pub type AliasFacts = {
+  t: Type,
+  keys: List<MapKeySite>,
+  params: List<Int>,
+  effect_params: List<Int>,
+}
 
 pub type TypeFacts = {
   declaration: TypeDeclaration,
@@ -497,9 +503,29 @@ pub type TypeFacts = {
   resource: Bool,
 }
 
+pub type CallShape = { constant: Bool, witnesses: Int, arity: Int, borrowed: List<Int> }
+
+pub fn call_shape(d: FnDefinition) -> CallShape = {
+  let witnesses = d.constraints.fold([], |found: List<Bytes>, c: Constraint|
+    if !is_predicate(c.deriver) || found.contains(c.param.name) { found }
+    else { found.push(c.param.name) }).len(
+  );
+  {
+    constant: d.constant != None,
+    witnesses: witnesses,
+    arity: witnesses + d.params.len() + d.generics.labels.len(),
+    borrowed: range(0, d.params.len()).filter(|i: Int|
+      match d.params.at(i) { Some(p) -> parameter_mode(p).borrowed, None -> false }).map(
+      |i: Int| i + witnesses,
+    ),
+  }
+}
+
 pub type DefinitionFacts = {
   scheme: Scheme,
   definition: Option<DefinitionInfo>,
+  call: Option<CallShape>,
+  pure: Bool,
   contract: Option<Contract>,
   constraints: Option<List<DefinitionConstraint>>,
   parameters: Option<List<Int>>,
@@ -515,6 +541,7 @@ pub type StoredDeclarations = {
   sets: Map<Bytes, EffectSetDefinition>,
   schemas: Map<Bytes, SchemaDefinition>,
   parameters: Map<Bytes, Parameters>,
+  hosts: Map<Bytes, Bytes>,
 }
 
 pub const no_stored_declarations: StoredDeclarations =
@@ -526,6 +553,7 @@ pub const no_stored_declarations: StoredDeclarations =
     sets: Map::new(),
     schemas: Map::new(),
     parameters: Map::new(),
+    hosts: Map::new(),
   }
 
 fn located_elsewhere(at: Location) -> Location = { module: module_elsewhere, span: dummy_span }
@@ -562,8 +590,17 @@ fn effect_elsewhere(e: EffectInfo) -> EffectInfo =
     operations: e.operations.map(|o: OperationInfo| { ..o, at: located_elsewhere(o.at) }),
   }
 
-pub fn declarations_checked(checker: Checker, parsed: ParsedModule) -> StoredDeclarations = {
+pub fn declarations_checked(
+  checker: Checker,
+  parsed: ParsedModule,
+  pure: List<Bytes>,
+) -> StoredDeclarations = {
   let module = parsed.name;
+  let shapes = parsed.module.items.fold(Map::new(), |found: Map<Bytes, CallShape>, item: Item|
+    match item {
+      FunctionItem(f) -> found.insert(qualify(module, f.name.name), call_shape(f)),
+      _ -> found,
+    });
   let own = |name: Bytes| name.starts_with(module.concat(b"."));
   {
     types: checker.types.fold(
@@ -606,6 +643,8 @@ pub fn declarations_checked(checker: Checker, parsed: ParsedModule) -> StoredDec
                 found.insert(name, {
                   scheme: scheme,
                   definition: None,
+                  call: None,
+                  pure: false,
                   contract: checker.contracts.get(name),
                   constraints: checker.constraints.get(name),
                   parameters: checker.function_parameters.get(name),
@@ -622,6 +661,8 @@ pub fn declarations_checked(checker: Checker, parsed: ParsedModule) -> StoredDec
           found.insert(d.name, {
             scheme: d.scheme,
             definition: Some(definition_elsewhere(d)),
+            call: shapes.get(d.name),
+            pure: pure.contains(d.name),
             contract: checker.contracts.get(d.name),
             constraints: checker.constraints.get(d.name),
             parameters: checker.function_parameters.get(d.name),
@@ -648,6 +689,13 @@ pub fn declarations_checked(checker: Checker, parsed: ParsedModule) -> StoredDec
       |found: Map<Bytes, Parameters>, name: Bytes, p: Parameters|
         if own(name) { found.insert(name, p) } else { found },
     ),
+    hosts: parsed.module.items.fold(Map::new(), |found: Map<Bytes, Bytes>, item: Item|
+      match item {
+        InstanceItem(d) -> if d.kind == HostInstance {
+          found.insert(qualify(module, d.target.name), d.function.name)
+        } else { found },
+        _ -> found,
+      }),
   }
 }
 
@@ -656,6 +704,8 @@ derive bin for RigidParam
 derive bin for MapKeySite
 
 derive bin for AliasFacts
+
+derive bin for CallShape
 
 derive bin for TypeFacts
 
@@ -670,6 +720,7 @@ pub effect program {
   read effect_named(name: Bytes) -> Option<EffectInfo>
   read constructor_named(name: Bytes) -> Option<ConstructorInfo>
   read definition_named(name: Bytes) -> Option<DefinitionFacts>
+  read host_named(name: Bytes) -> Option<Bytes>
 }
 
 pub fn with_no_other_definitions<a | e>(
@@ -682,6 +733,7 @@ pub fn with_no_other_definitions<a | e>(
     program.effect_named(name) -> None,
     program.constructor_named(name) -> None,
     program.definition_named(name) -> None,
+    program.host_named(name) -> None,
     mode_facts.modes_named(name) -> None,
     summary_facts.summary_stored(name) -> None,
     summary_facts.ending_stored(name) -> None,

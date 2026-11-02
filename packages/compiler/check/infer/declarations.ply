@@ -1,4 +1,4 @@
-import compiler.check.resolve.tables (module_names, scope_bindings)
+import compiler.check.resolve.tables (module_elsewhere, module_names, scope_bindings)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
 import compiler.check.infer.checker (program)
@@ -409,14 +409,25 @@ fn convert_constructor(
                     } else { sites };
                   let memo = declaration.params.len() == 0 && declaration.labels.len() == 0
                     && declaration.effect_params.len() == 0;
-                  match if memo { alias_declared(g.checker, qualified) } else { None } {
+                  match if memo || declaration.owner == module_elsewhere {
+                      alias_declared(g.checker, qualified)
+                    } else { None } {
                     Some(m) -> {
                       let assumed = assumed_for(g.checker, OrderingDeriver);
+                      let given = applied_args(converted.types, over.labels, over.effect_arguments);
+                      let at_args = |t: Type| apply_arguments(t, m.params, m.effect_params, given);
                       let keys = m.keys.map(|s: MapKeySite|
-                        { ..s, scope: g.checker.scope, assumed: assumed });
+                        {
+                          ..s,
+                          scope: g.checker.scope,
+                          assumed: assumed,
+                          key: at_args(s.key),
+                          whole: at_args(s.whole),
+                          carrier: match s.carrier { Some(c) -> Some(at_args(c)), None -> None },
+                        });
                       {
                         checker: { ..g.checker, map_keys: placed(g.checker.map_keys.concat(keys)) },
-                        ty: m.t,
+                        ty: at_args(m.t),
                       }
                     },
                     None -> {
@@ -465,6 +476,8 @@ fn convert_constructor(
                             o.checker.aliases.insert(qualified, {
                               t: o.ty,
                               keys: sites_from(o.checker.map_keys, before),
+                              params: [],
+                              effect_params: [],
                             })
                           } else { o.checker.aliases },
                         },
@@ -480,6 +493,72 @@ fn convert_constructor(
       },
     }
   }
+
+pub fn with_declared_aliases(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise, program.read, module_names.read} =
+  parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item {
+      TypeItem(definition) -> {
+        let qualified = qualify(parsed.name, definition.name.name);
+        match type_declared(c, qualified) {
+          Some(declaration) -> match declaration.declared {
+            DeclaredAlias(body) ->
+              declared_alias(c, qualified, declaration, body, alias_depth_limit(c)),
+            _ -> c,
+          },
+          None -> c,
+        }
+      },
+      _ -> c,
+    })
+
+fn declared_alias(
+  checker: Checker,
+  qualified: Bytes,
+  declaration: TypeDeclaration,
+  body: TypeExpression,
+  room: Int,
+) -> Checker / {abort.raise, program.read, module_names.read} = {
+  let bound: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> } = declaration.params.fold(
+    { checker: checker, vars: [], params: Map::new() },
+    |accumulator: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> }, p: Bytes| {
+      let o: WithVariable = new_type_variable(accumulator.checker);
+      {
+        checker: o.checker,
+        vars: accumulator.vars.push(o.var),
+        params: accumulator.params.insert(p, VariableType(o.var)),
+      }
+    },
+  );
+  let own = bind_declaration_params(
+    {
+      ..bound.checker,
+      type_params: bound.params,
+      alias_stack: checker.alias_stack.push(qualified),
+      module: declaration.owner,
+    },
+    declaration,
+  );
+  let before = checker.map_keys.len();
+  let o: WithType = convert_type_within(own.checker, body, room - 1);
+  {
+    ..o.checker,
+    type_params: checker.type_params,
+    effect_params: checker.effect_params,
+    label_params: checker.label_params,
+    alias_stack: checker.alias_stack,
+    module: checker.module,
+    map_keys: checker.map_keys,
+    aliases: o.checker.aliases.insert(qualified, {
+      t: o.ty,
+      keys: sites_from(o.checker.map_keys, before),
+      params: bound.vars.concat(own.labels),
+      effect_params: own.effect_params,
+    }),
+  }
+}
 
 fn declared_record(
   checker: Checker,

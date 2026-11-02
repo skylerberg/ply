@@ -9,7 +9,7 @@ import compiler.check.resolve.tables (Binding, Declaration, Declarations, Effect
                                       SetSpace, TypeSpace, ValueSpace, binding_of, declarations_of,
                                       lookup_declared, module_names, module_of_name,
                                       no_declarations)
-import compiler.program.group_check (checked_group, source_of_group)
+import compiler.program.group_check (GroupInputs, checked_group, source_of_group)
 import compiler.program.reads (StoredReads, over_stored)
 import compiler.program.stored (decoded_declarations, encoded_declarations)
 import compiler.store.hash.graph (NameElsewhere)
@@ -947,7 +947,7 @@ pub type UnitCheck = {
   out: { pulled: PulledAnalysis, at: Int },
 }
 
-type BodySupplier = (OwnerSource) -> Option<(Int) -> BodyChecking / {abort.raise}> / {abort.raise}
+pub type BodySupplier = (OwnerSource) -> Option<(Int) -> BodyChecking / {abort.raise}> / {abort.raise}
 
 pub fn no_bodies(_: OwnerSource) -> Option<(Int) -> BodyChecking / {abort.raise}> = None
 
@@ -1233,13 +1233,17 @@ fn setting_of(named: ModuleKey) -> Setting / {memo.read, abort.raise} =
     "a module's setting",
   )
 
-fn group_checked(
+pub type GroupRead = { inputs: GroupInputs, walks: BodyChecking, mentioned: List<Mention> }
+
+pub fn with_group_read<a>(
   named: ModuleKey,
   members: List<OwnerFacts>,
   imported: List<Imported>,
   sibling: keep (Bytes) -> Sibling,
   body_supplier: BodySupplier,
-) -> UnitCheck / {QueryEffects, abort.raise} = {
+  also: List<Mention>,
+  body: (GroupRead) -> a / {CheckReads, QueryEffects, abort.raise},
+) -> a / {QueryEffects, abort.raise} = {
   let texts = members.map(|f: OwnerFacts| f.text);
   let source = source_of_group(named.module, texts, imported);
   let own = texts.fold(Map::new(), |found: Map<Bytes, Bool>, o: OwnerText|
@@ -1250,9 +1254,9 @@ fn group_checked(
     embed_read_of(named.module, setting.embeds, setting.wanted_texts, setting.data)
   };
   let tables = import_packages(named);
-  over_stored(stored_reads(named, tables, texts.map(|o: OwnerText| o.owner), sibling), || {
-    let inside = texts.map(|o: OwnerText| o.owner);
-    let mentions = mentions_of(members).fold([], |found: List<Mention>, m: Mention|
+  let inside = texts.map(|o: OwnerText| o.owner);
+  over_stored(stored_reads(named, tables, inside, sibling), || {
+    let mentions = mentions_of(members).concat(also).fold([], |found: List<Mention>, m: Mention|
       if m.module.len() == 0 { found.concat(members_named(named, inside, m.name)) }
       else if m.name.starts_with(any_module_name(b"")) {
         found.concat(members_in(named, inside, m.module, m.name.slice(2, m.name.len())))
@@ -1278,22 +1282,35 @@ fn group_checked(
         None -> n,
       })
     });
-    {
-      texts: texts,
-      source: source,
-      out: checked_group(
-        {
-          source: source,
-          elsewhere: unique.values(),
-          tables: tables,
-          shipped: named.shipped,
-          embed_read: embed_read,
-        },
-        walks,
-      ),
-    }
+    body({
+      inputs: {
+        source: source,
+        elsewhere: unique.values(),
+        tables: tables,
+        shipped: named.shipped,
+        embed_read: embed_read,
+      },
+      walks: walks,
+      mentioned: seen.values().filter(|m: Mention|
+        !(m.module == named.module && own.contains(m.name))),
+    })
   })
 }
+
+pub fn group_checked(
+  named: ModuleKey,
+  members: List<OwnerFacts>,
+  imported: List<Imported>,
+  sibling: keep (Bytes) -> Sibling,
+  body_supplier: BodySupplier,
+  also: List<Mention> = [],
+) -> UnitCheck / {QueryEffects, abort.raise} =
+  with_group_read(named, members, imported, sibling, body_supplier, also, |read: GroupRead|
+    {
+      texts: members.map(|f: OwnerFacts| f.text),
+      source: read.inputs.source,
+      out: checked_group(read.inputs, read.walks),
+    })
 
 fn checked_group_result(module: Bytes, c: UnitCheck) -> owner_checks::GroupResult / {abort.raise} =
   owner_checks::group_result(
@@ -1354,7 +1371,7 @@ fn finalize_group(
   }
 }
 
-type GroupProgram = {
+pub type GroupProgram = {
   named: ModuleKey,
   members: List<OwnerFacts>,
   imported: List<Imported>,
@@ -1363,7 +1380,7 @@ type GroupProgram = {
   types: List<TypeTable>,
 }
 
-fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise} = {
+pub fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise} = {
   let named = { module: key.module, shipped: key.shipped, tested: key.tested };
   let members = key.owners.map(|o: Bytes| owner_facts(named, o));
   let cycle = match key.owners {
@@ -1401,22 +1418,15 @@ fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise}
   }
 }
 
-pub fn group_program_read(
-  key: GroupKey,
-  also: List<Mention>,
-) -> Map<Bytes, Map<Bytes, OwnerInterface>> / {QueryEffects, abort.raise} = {
-  let g = group_program_of(key);
-  let c = owners_check(g.named, g.members, g.imported, false, g.sibling, also: also);
-  reading_of(c.setting);
-  c.needed
-}
-
 pub fn group_program(
   key: GroupKey,
   also: List<Mention>,
 ) -> { check: UnitCheck, types: List<TypeTable> } / {QueryEffects, abort.raise} = {
   let g = group_program_of(key);
-  { check: unit_checked(g.named, g.members, g.imported, g.sibling, g.bodies, also), types: g.types }
+  {
+    check: group_checked(g.named, g.members, g.imported, g.sibling, g.bodies, also),
+    types: g.types,
+  }
 }
 
 fn inference_of(
@@ -1718,6 +1728,7 @@ fn declared_by(
     definitions: entries_named(stored.definitions, mine),
     sets: entries_named(stored.sets, mine),
     schemas: entries_named(stored.schemas, mine),
+    hosts: entries_named(stored.hosts, mine),
     parameters: entries_named(stored.parameters, mine),
   }
 }

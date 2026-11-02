@@ -21,7 +21,8 @@ import compiler.check.typed (TypedBody, TypedParam, BodyPart, WholeBody, TestRun
                              body_retyped, ConstantData)
 import compiler.check.infer (CheckOutput, BodyFacts, item_owner, facts_by_owner)
 import compiler.check.infer.checker (MemberSite, Builtin, builtins, EffectInfo, OperationInfo)
-import compiler.check.infer.definitions (MachineCall, machine_calls, parsed_natives)
+import compiler.check.infer.definitions (Extern, MachineCall, machine_calls, natives_beside,
+                                         parsed_natives)
 import compiler.front.facts (Analysis)
 import compiler.front.emitter_input (InferredFacts, inferred_facts_bin, constructors_read)
 import compiler.front.rows (Rows, KnownDefinitionRow, constant_values, ConstructorRow, EffectRow,
@@ -70,6 +71,7 @@ pub fn module_context_in(
         rows_of(a),
         inferred_facts(a),
         a.modules,
+        nothing_elsewhere,
         [i],
         |_: Int, s: ModuleContext, rs: List<ItemRoot>|
           { setting: s, roots: rs.map(|r: ItemRoot| r.root) },
@@ -88,12 +90,49 @@ pub fn scheduler_imported(definitions_of: (Bytes) -> List<Definition>) -> List<I
 
 pub type ItemRoot = { item: Item, root: Root }
 
+pub type HostHandler = { call: Bytes, import: Imported }
+
+pub type CodeElsewhere = {
+  definitions: Map<Bytes, List<Definition>>,
+  schemes: Map<Bytes, Scheme>,
+  effects: List<EffectName>,
+  natives: List<Extern>,
+  hosts: Map<Bytes, HostHandler>,
+}
+
+pub const nothing_elsewhere: CodeElsewhere =
+  { definitions: Map::new(), schemes: Map::new(), effects: [], natives: [], hosts: Map::new() }
+
+pub fn definitions_beside(
+  modules: List<ParsedModule>,
+  pure: Map<Bytes, Bool>,
+  schemes: Map<Bytes, Scheme>,
+  values: Map<Bytes, ConstantData>,
+  elsewhere: CodeElsewhere,
+) -> Map<Bytes, List<Definition>> =
+  modules.fold(
+    elsewhere.definitions,
+    |accumulator: Map<Bytes, List<Definition>>, m: ParsedModule|
+      accumulator.insert(
+        m.name,
+        definitions_in(m.name, m.module, pure, schemes, values).concat(
+          match accumulator.get(m.name) { Some(ds) -> ds, None -> [] },
+        ),
+      ),
+  )
+
+pub fn natives_with(
+  modules: List<ParsedModule>,
+  elsewhere: CodeElsewhere,
+) -> List<Extern> / {abort.raise} = natives_beside(parsed_natives(modules), [elsewhere.natives])
+
 pub fn module_contexts_in<b | e>(
   r: Resolution,
   checked: CheckOutput,
   rows: Rows,
   walked: InferredFacts,
   modules: List<ParsedModule>,
+  elsewhere: CodeElsewhere,
   wanted: List<Int>,
   each: (Int, ModuleContext, List<ItemRoot>) -> b / {abort.raise | e},
   targets: Option<LoweringTargets> = None,
@@ -105,16 +144,11 @@ pub fn module_contexts_in<b | e>(
       let pure = facts.pure.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
         accumulator.insert(n, true));
       let schemes = rows.definitions.fold(
-        Map::new(),
+        elsewhere.schemes,
         |accumulator: Map<Bytes, Scheme>, row: KnownDefinitionRow|
           accumulator.insert(row.name, row.scheme),
       );
-      let values = constant_values(rows);
-      let by_name = expanded.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, List<Definition>>, m: ParsedModule|
-          accumulator.insert(m.name, definitions_in(m.name, m.module, pure, schemes, values)),
-      );
+      let by_name = definitions_beside(expanded, pure, schemes, constant_values(rows), elsewhere);
       let definitions_of = |path: Bytes| match by_name.get(path) { Some(ds) -> ds, None -> [] };
       let read = constructors_read(checked);
       let constructors = with_released(
@@ -128,8 +162,10 @@ pub fn module_contexts_in<b | e>(
         |by: Bytes| schemes.get(by),
       );
       let declared = declared_schemes;
-      let effects = declared_effects(r, checked_operations(checked.effects));
-      let machine = machine_calls(parsed_natives(expanded));
+      let effects = declared_effects(r, checked_operations(checked.effects)).concat(
+        elsewhere.effects,
+      );
+      let machine = machine_calls(natives_with(expanded, elsewhere));
       let owned = facts_by_owner(facts);
       Ok(
         wanted.filter(|i: Int| i < expanded.len()).map(|i: Int| {

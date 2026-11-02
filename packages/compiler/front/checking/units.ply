@@ -3,7 +3,12 @@ import std.bytes
 import std.graph
 import std.hash (blake3)
 import std.list
+import compiler.check.infer.definitions (Extern, extern_bin, module_externs)
 import compiler.check.resolve.tables (module_of_name, qualify)
+import compiler.program.group_check (checked_group)
+import compiler.program.lowering (code_elsewhere)
+import compiler.emit.lower.module_context (CodeElsewhere)
+import compiler.check.infer.checker (CheckReads)
 import compiler.check.infer (types_joined)
 import compiler.check.typed (ConstantData, constant_data_bin)
 import compiler.check.types (Type)
@@ -18,12 +23,12 @@ import compiler.emit.representations (type_names, BoundLambda)
 import compiler.emit.roots (root_id)
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
 import compiler.front.checking.groups (constructors_reached_from, GroupKey, group_key_bin,
-                                       module_groups, group_program, group_program_read,
-                                       owners_result_of, OwnersResult, owner_key_bin, group_key_of,
-                                       group_of)
+                                       module_groups, group_program, group_program_of,
+                                       with_group_read, GroupRead, declared_of, owners_result_of,
+                                       OwnersResult, owner_key_bin, group_key_of, group_of)
 import compiler.front.owner_checks (MemberResult)
-import compiler.front.checking.world (ModuleKey, module_key_bin, decoded, QueryEffects, RunEffects,
-                                      CheckQuery, decode_cache, package_location_of)
+import compiler.front.checking.world (module_read, ModuleKey, module_key_bin, decoded, QueryEffects,
+                                      RunEffects, CheckQuery, decode_cache, package_location_of)
 import compiler.front.emitter_input (Analysed, KnownConstructors, Rejected, joined_constructors,
                                      with_known_constructors)
 import compiler.front.exports (Mention, mention_bin, OwnerInterface)
@@ -319,11 +324,7 @@ fn program_of_root(k: RootKey, tested: Bool) -> ProgramKey / {memo.read, abort.r
 
 type ProgramScope = { scope: emit::Scope, batch: LoweredBatch }
 
-type Lowering = {
-  scopes: Map<Bytes, ProgramScope>,
-  values: Map<Bytes, Map<Bytes, ConstantData>>,
-  tested: Bool,
-}
+type Lowering = { scopes: Map<Bytes, ProgramScope>, tested: Bool }
 
 fn constant_values_bin() -> bin::BinCodec<Map<Bytes, ConstantData>> =
   bin::map_bin(bin::bytes_bin(), constant_data_bin())
@@ -342,47 +343,65 @@ pub fn constant_values_result(input: Bytes) -> Bytes / {memo.read, abort.raise} 
     constant_values_bin(),
   )
 
-fn constants_needed(
-  needed: Map<Bytes, Map<Bytes, OwnerInterface>>,
-  tested: Bool,
-) -> Map<Bytes, ConstantData> / {memo.read, abort.raise} =
-  needed.fold(
-    Map::new(),
-    |found: Map<Bytes, ConstantData>, module: Bytes, owners: Map<Bytes, OwnerInterface>|
-      owners.fold(found, |f: Map<Bytes, ConstantData>, owner: Bytes, _: OwnerInterface| {
-        let named = module_key_in(module, tested);
-        decoded(
-          memo.fetch(
-            constant_values_query,
-            bin::encode(
-              { module: module, shipped: named.shipped, tested: named.tested, owner: owner },
-              owner_key_bin(),
-            ),
-          ),
-          constant_values_bin(),
-          "a constant's value",
-        ).fold(f, |m: Map<Bytes, ConstantData>, n: Bytes, v: ConstantData| m.insert(n, v))
-      }),
+pub const module_natives_query: Bytes = b"module natives"
+
+pub fn module_natives_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
+  let key = decoded(input, module_key_bin(), "a module's name");
+  bin::encode(
+    match module_read(key) {
+      Some(m) -> module_externs(m.source.name, m.parsed.module),
+      None -> [],
+    },
+    bin::list_bin(extern_bin()),
+  )
+}
+
+fn natives_of(module: Bytes, tested: Bool) -> List<Extern> / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(module_natives_query, bin::encode(module_key_in(module, tested), module_key_bin())),
+    bin::list_bin(extern_bin()),
+    "a module's natives",
   )
 
-fn program_read(s: Lowering, key: ProgramKey) -> Lowering / {QueryEffects, abort.raise} = {
-  let at = bin::encode(key, program_key_bin());
-  if s.values.contains(at) { s } else {
-    let needed = group_program_read(key.group, key.also);
-    module_units_of(module_key_of(key.group));
-    { ..s, values: s.values.insert(at, constants_needed(needed, s.tested)) }
-  }
+fn constant_value(named: Mention, tested: Bool) -> Option<ConstantData> / {memo.read, abort.raise} = {
+  let module = module_key_in(named.module, tested);
+  declared_of(named.module, module.shipped, module.tested, named.name).fold(
+    None,
+    |found: Option<ConstantData>, owner: Bytes|
+      match found {
+        Some(_) -> found,
+        None ->
+          decoded(
+            memo.fetch(
+              constant_values_query,
+              bin::encode(
+                {
+                  module: named.module,
+                  shipped: module.shipped,
+                  tested: module.tested,
+                  owner: owner,
+                },
+                owner_key_bin(),
+              ),
+            ),
+            constant_values_bin(),
+            "a constant's value",
+          ).get(
+            qualify(named.module, named.name),
+          ),
+      },
+  )
 }
+
+pub fn code_of_group(
+  group: GroupRead,
+  tested: Bool,
+) -> CodeElsewhere / {CheckReads, QueryEffects, abort.raise} =
+  code_elsewhere(group.mentioned, |named: Mention| constant_value(named, tested), |module: Bytes|
+    natives_of(module, tested))
 
 fn module_key_of(g: GroupKey) -> ModuleKey =
   { module: g.module, shipped: g.shipped, tested: g.tested }
-
-fn rows_with_constants(rows: Rows, values: Map<Bytes, ConstantData>) -> Rows =
-  {
-    ..rows,
-    definitions: rows.definitions.map(|r: KnownDefinitionRow|
-      match values.get(r.name) { Some(v) -> { ..r, value: Some(v) }, None -> r }),
-  }
 
 fn constructors_known(
   key: ProgramKey,
@@ -406,8 +425,21 @@ fn program_scope(
   match s.scopes.get(at) {
     Some(p) -> { state: s, program: p },
     None -> {
-      let program = group_program(key.group, key.also);
-      match program.check.out.pulled.out {
+      let g = group_program_of(key.group);
+      let read = with_group_read(
+        g.named,
+        g.members,
+        g.imported,
+        g.sibling,
+        g.bodies,
+        key.also,
+        |group: GroupRead|
+          {
+            out: checked_group(group.inputs, group.walks),
+            elsewhere: code_of_group(group, s.tested),
+          },
+      );
+      match read.out.pulled.out {
         Rejected(ds) ->
           panic(
             String::of_bytes_lossy(
@@ -435,12 +467,10 @@ fn program_scope(
             batch.constructors,
             true,
             roots,
-            rows_with_constants(
-              { ..dump.rows, types: program.types.fold(dump.rows.types, types_joined) },
-              match s.values.get(at) { Some(v) -> v, None -> Map::new() },
-            ),
+            { ..dump.rows, types: g.types.fold(dump.rows.types, types_joined) },
             dump.effects,
             dump.inferred_facts,
+            read.elsewhere,
           );
           let p = { scope: scope, batch: { ..batch, natives: scope.natives } };
           { state: { ..s, scopes: s.scopes.insert(at, p) }, program: p }
@@ -496,12 +526,10 @@ fn asked_of_program(
   let tested = accumulator.state.tested;
   let key = decoded(at, program_key_bin(), "a unit's program");
   let owners = lambda_owners(ks);
-  let read = owners.fold(program_read(accumulator.state, key), |s: Lowering, o: RootKey|
-    program_read(s, program_of_root(o, tested)));
   match whole_batch(ks, ownership) {
-    Some(b) -> { state: read, batches: accumulator.batches.push(b) },
+    Some(b) -> { state: accumulator.state, batches: accumulator.batches.push(b) },
     None -> {
-      let p = program_scope(read, key, ks);
+      let p = program_scope(accumulator.state, key, ks);
       let lent = owners.fold({ state: p.state, lent: Map::new() }, |l: LentLambdas, o: RootKey| {
         let q = program_scope(l.state, program_of_root(o, tested), [o]);
         {
@@ -560,7 +588,7 @@ fn lowered_unit(
 ) -> LoweredUnit / {QueryEffects, abort.raise} =
   unit_lowered(
     roots,
-    { scopes: Map::new(), values: Map::new(), tested: tested },
+    { scopes: Map::new(), tested: tested },
     |s: Lowering, ks: List<RootKey>, ownership: Map<RootName, OwnershipSignature>|
       lowered_batches(s, ks, ownership),
     |facts: CalleeFacts, ks: List<RootKey>|
@@ -755,6 +783,11 @@ pub fn part_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 pub fn code_queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }> =
   [
     {
+      name: module_natives_query,
+      definition: b"compiler.front.checking.units.module_natives_result",
+      body: module_natives_result,
+    },
+    {
       name: code_query,
       definition: b"compiler.front.checking.units.code_result",
       body: code_result,
@@ -813,7 +846,6 @@ pub const enterable_query: Bytes = b"enterable"
 pub fn enterable_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let at = decoded(input, root_at_bin(), "a root's key");
   let key = program_of_root(at.key, at.tested);
-  group_program_read(key.group, key.also);
   let program = group_program(key.group, key.also);
   bin::encode(
     match program.check.out.pulled.out {

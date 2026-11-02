@@ -16,11 +16,12 @@ import compiler.check.infer.definitions (Extern, MachineCall, parsed_natives, ma
 import compiler.check.types (Type, NamedType, VariableType, FunctionType, Scheme, Effect, int_type,
                              bool_type, bytes_type, unit_type, function_type, monomorphic,
                              no_effects, read_effects)
-import compiler.emit.lower.module_context (ModuleContext, declared_schemes, decode_inferred_facts,
-                                           definitions_in, resolved_imports, declared_effects,
-                                           recorded_annotations, param_type, scheduler_imported,
-                                           published_operations, root_body, resolved_at,
-                                           root_params, body_code)
+import compiler.emit.lower.module_context (CodeElsewhere, HostHandler, nothing_elsewhere,
+                                           definitions_beside, natives_with, ModuleContext,
+                                           declared_schemes, decode_inferred_facts, definitions_in,
+                                           resolved_imports, declared_effects, recorded_annotations,
+                                           param_type, scheduler_imported, published_operations,
+                                           root_body, resolved_at, root_params, body_code)
 import compiler.check.typed
 import compiler.check.typed (BodyPart, WholeBody, ClauseBody, TestRun, CaseListing)
 import compiler.emit.lower.calling (known_body, lambdas_of, named_in, definition_in)
@@ -222,8 +223,6 @@ pub type Scope = {
   test_effects: Map<Bytes, List<Effect>>,
 }
 
-pub type HostHandler = { call: Bytes, import: Imported }
-
 pub type ModuleScope = {
   here: List<Definition>,
   imports: List<Imported>,
@@ -286,7 +285,17 @@ pub fn scope_of(
     ResolveFailed(diagnostics) -> unread(diagnostics_text(diagnostics)),
     ResolveSucceeded(x) -> x,
   };
-  scope_over(x.modules, x.resolution, constructors, release, roots, rows, effects, walked)
+  scope_over(
+    x.modules,
+    x.resolution,
+    constructors,
+    release,
+    roots,
+    rows,
+    effects,
+    walked,
+    nothing_elsewhere,
+  )
 }
 
 pub fn scope_over(
@@ -298,9 +307,10 @@ pub fn scope_over(
   rows: Rows,
   effects: List<EffectRow>,
   walked: Bytes,
+  elsewhere: CodeElsewhere,
 ) -> Scope / {abort.raise} = {
   let schemes = rows.definitions.fold(
-    Map::new(),
+    elsewhere.schemes,
     |accumulator: Map<Bytes, Scheme>, row: KnownDefinitionRow|
       accumulator.insert(row.name, row.scheme),
   );
@@ -321,11 +331,7 @@ pub fn scope_over(
     Err(reason) -> unread(reason),
   };
   let values = constant_values(rows);
-  let program = modules.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Definition>>, m: ParsedModule|
-      accumulator.insert(m.name, definitions_in(m.name, m.module, pure, schemes, values)),
-  );
+  let program = definitions_beside(modules, pure, schemes, values, elsewhere);
   let definitions_of = |path: Bytes| match program.get(path) { Some(ds) -> ds, None -> [] };
   let members = facts.members.fold(
     Map::new(),
@@ -335,8 +341,10 @@ pub fn scope_over(
         List::push(match accumulator.get(s.module) { Some(xs) -> xs, None -> [] }, s),
       ),
   );
-  let natives = parsed_natives(modules);
-  let declared = declared_effects(resolution, published_operations(effects));
+  let natives = natives_with(modules, elsewhere);
+  let declared = declared_effects(resolution, published_operations(effects)).concat(
+    elsewhere.effects,
+  );
   {
     modules: modules,
     places: range(0, modules.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
@@ -378,7 +386,11 @@ pub fn scope_over(
       |m: Map<RootName, List<Int>>, module: Bytes, definitions: List<Definition>|
         declared_borrows(m, module, definitions),
     ),
-    hosts: with_prelude_handlers(host_handlers(modules, definitions_of), definitions_of),
+    hosts: elsewhere.hosts.fold(
+      with_prelude_handlers(host_handlers(modules, definitions_of), definitions_of),
+      |found: Map<Bytes, HostHandler>, effect_name: Bytes, host: HostHandler|
+        found.insert(effect_name, host),
+    ),
     test_effects: rows.tests.fold(Map::new(), |m: Map<Bytes, List<Effect>>, r: KnownTestRow|
       match read_effects(r.effects) { Some(xs) -> m.insert(r.key, xs), None -> m }),
   }

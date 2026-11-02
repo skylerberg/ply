@@ -1,3 +1,4 @@
+import compiler.check.infer.checker (CallShape, call_shape)
 import compiler.syntax.items (FnDefinition, Constraint, is_predicate)
 import compiler.syntax.type_syntax (Mode)
 import compiler.emit.code (Lambda)
@@ -727,14 +728,14 @@ fn field_type(f: Field) -> FieldShape = {
 
 pub type Sig = { params: List<Type>, result_type: Type }
 
-pub fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
-  match schemes.get(full) {
-    Some(s) -> match s.ty {
-      FunctionType(f) -> Some({ params: f.params, result_type: f.return_type }),
-      _ -> None,
-    },
-    None -> None,
+fn sig_of_scheme(s: Scheme) -> Option<Sig> =
+  match s.ty {
+    FunctionType(f) -> Some({ params: f.params, result_type: f.return_type }),
+    _ -> None,
   }
+
+pub fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
+  match schemes.get(full) { Some(s) -> sig_of_scheme(s), None -> None }
 
 pub fn layout_of(constructors: Constructors, ty: Type) -> layout::ValueLayout / {abort.raise} =
   match known_layout(constructors, ty) {
@@ -1153,6 +1154,33 @@ pub fn substituted_fully(ty: Type, args: List<Type>) -> Type =
       }),
   }
 
+pub fn definition_shaped(
+  module: Bytes,
+  name: Bytes,
+  shape: CallShape,
+  pure: Bool,
+  scheme: Scheme,
+  value: Option<ConstantData>,
+) -> Definition = {
+  let return_shape = match sig_of_scheme(scheme) {
+    Some(s) -> Some(kind_of(s.result_type)),
+    None -> None,
+  };
+  {
+    name: name,
+    return_kind: match return_shape { Some(r) -> Some(r.kind), None -> None },
+    return_type: match return_shape { Some(r) -> r.ty, None -> OpenShape([]) },
+    pure: pure,
+    constant: shape.constant,
+    value: value,
+    arity: shape.arity,
+    scheme: Some(scheme),
+    witnesses: shape.witnesses,
+    borrowed: shape.borrowed,
+    root: Named(qualify(module, name)),
+  }
+}
+
 pub fn definition_entry(
   module: Bytes,
   d: FnDefinition,
@@ -1161,27 +1189,24 @@ pub fn definition_entry(
   values: Map<Bytes, ConstantData>,
 ) -> Definition = {
   let full = qualify(module, d.name.name);
-  let sig = sig_of(schemes, full);
-  let return_shape = match sig { Some(s) -> Some(kind_of(s.result_type)), None -> None };
-  let witnesses = d.constraints.fold([], |accumulator: List<Bytes>, c: Constraint|
-    if !is_predicate(c.deriver) || accumulator.contains(c.param.name) { accumulator }
-    else { accumulator.push(c.param.name) }).len(
-  );
-  {
-    name: d.name.name,
-    return_kind: match return_shape { Some(r) -> Some(r.kind), None -> None },
-    return_type: match return_shape { Some(r) -> r.ty, None -> OpenShape([]) },
-    pure: pure.contains(full),
-    constant: d.constant != None,
-    value: values.get(full),
-    arity: witnesses + d.params.len() + d.generics.labels.len(),
-    scheme: schemes.get(full),
-    witnesses: witnesses,
-    borrowed: range(0, d.params.len()).filter(|i: Int|
-      match d.params.at(i) { Some(p) -> parameter_mode(p).borrowed, None -> false }).map(
-      |i: Int| i + witnesses,
-    ),
-    root: Named(full),
+  let shape = call_shape(d);
+  match schemes.get(full) {
+    Some(scheme) ->
+      definition_shaped(module, d.name.name, shape, pure.contains(full), scheme, values.get(full)),
+    None ->
+      {
+        name: d.name.name,
+        return_kind: None,
+        return_type: OpenShape([]),
+        pure: pure.contains(full),
+        constant: shape.constant,
+        value: values.get(full),
+        arity: shape.arity,
+        scheme: None,
+        witnesses: shape.witnesses,
+        borrowed: shape.borrowed,
+        root: Named(full),
+      },
   }
 }
 
