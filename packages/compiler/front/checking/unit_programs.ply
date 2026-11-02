@@ -1,0 +1,965 @@
+import std.list
+import compiler.check.resolve.tables (Diagnostic, Source)
+import compiler.check.infer.definitions (declared_natives)
+import compiler.emit.print.unit_header (bound_functions)
+import compiler.emit.layout (intrinsics)
+import std.bytes (ascii_of_int)
+import compiler.emit.keys (RootKey, RootName)
+import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_shipping, over_decoding,
+                                prelude_files, prelude_frames, query_load)
+import compiler.front.checking.units (PartCode, codes_of_part, entries_of, program_code,
+                                      roots_of_modules)
+import compiler.store.memo (Run, empty_memory_store, in_session, reading)
+import compiler.unit (UnitCode, UnitOutput, program_output)
+import compiler.emit.output (RootOutput)
+import compiler.emit.abi (Native, word_native)
+import compiler.emit.abi
+import compiler.prelude_source
+import compiler.emit.keys
+import compiler.check.infer.definitions (program_natives)
+import compiler.check.types (string_type)
+import compiler.emit.abi (Machine, Runtime)
+import compiler.emit.keys (Clause, Ensures, EntryPoint, Named, Specialisation, claims_key, printed,
+                           root_name, root_text, test_key)
+import compiler.emit.layout (Intrinsic)
+import compiler.emit.pieces (own_symbol)
+import compiler.emit.print.constants (const_read_fn, constant_read_fn)
+import compiler.emit.print.count_functions (identity_function)
+import compiler.emit.roots (builtin_helper, entry_symbol, symbol_of)
+import compiler.emit.release (root_of)
+import compiler.emit.print.count_functions (allocates)
+import compiler.front (analyse_pulling_std_with)
+import compiler.front.diagnostics (parse_all)
+import compiler.front.published (analyse, dump_of, no_rows)
+import compiler.unit (UnitBody, a_runtime, bridged_in, code_rejections, declared_signature,
+                      defined_in, fresh, holes, natives_rejected, no_machine, one_each, own_root,
+                      placeholders_named, pointers_named, read_of, rejection_codes, results_by_name,
+                      runtime_rejected, sorted_unique, unit_text)
+import compiler.emit.output (Keyed, KeyedTag, SharedFunction)
+import compiler.front.rows (EffectRow)
+import compiler.unit (Hole, keyed_key, keyed_of)
+
+pub type Compiled = { output: UnitOutput, codes: List<UnitCode>, roots: List<RootKey> }
+
+fn constructors_named(codes: List<UnitCode>) -> List<Bytes> =
+  codes.flat_map(|c: UnitCode|
+    c.results.flat_map(|r: RootOutput|
+      r.result.tables.keyed.fold([], |found: List<Bytes>, k: Keyed|
+        match k { KeyedTag(name) -> found.push(name), _ -> found }))).unique(
+  )
+
+pub fn compiled_program(
+  user: List<Source>,
+  shipped: List<Source>,
+  wanted: Option<List<RootKey>> = None,
+) -> Compiled / {abort.raise} = {
+  let w = inputs_alone(user);
+  let qs = fresh_registry();
+  over_decoding(
+    empty_memory_store,
+    prelude_frames,
+    prelude_files,
+    |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          query_load(w.own, [], false);
+          let roots = match wanted { Some(rs) -> rs, None -> roots_of_modules(w.own) };
+          let code = program_code(entries_of(roots));
+          let codes = code.parts.flat_map(|p: PartCode| codes_of_part(p.part));
+          let output = program_output(codes, constructors_named(codes), 1, Map::new());
+          {
+            output: output,
+            codes: codes,
+            roots: code.roots.filter(|k: RootKey| output.taken.contains(root_name(k))),
+          }
+        })),
+  ).value
+}
+
+pub fn built(modules: List<Source>) -> Result<Compiled, Bytes> =
+  handle {
+    Ok(compiled_program(modules, []))
+  } with {
+    abort.raise(message) -> Err(Bytes::of_string(message)),
+  }
+
+pub fn roots_built(modules: List<Source>) -> Result<List<RootKey>, Bytes> =
+  match built(modules) { Ok(e) -> Ok(e.roots), Err(reason) -> Err(reason) }
+
+fn unit_builder(source: Bytes) -> { unit: (List<RootKey>) -> Compiled / {abort.raise} } =
+  {
+    unit: |every: List<RootKey>|
+      compiled_program(
+        [{ name: b"m", source_text: source }],
+        [{ name: b"std.prelude", source_text: prelude_source::text }],
+        Some(every),
+      ),
+  }
+
+fn unit_against_runtime(
+  user: List<Source>,
+  shipped: List<Source>,
+  natives: List<Native>,
+) -> Result<Bytes, List<Diagnostic>> / {abort.raise} = {
+  let program = compiled_program(user, shipped);
+  match code_rejections({ ..a_runtime(b"r"), natives: natives }, program.codes) {
+    [] -> Ok(unit_text(program.output.parts)),
+    rejected -> Err(rejected),
+  }
+}
+
+const sample_unit: Compiled =
+  unit_builder(
+    Bytes::concat_all([
+      b"effect e {\n  write op(k: Int) -> Int\n}\n",
+      b"effect oops {\n  raise boom(n: Int)\n}\n",
+      b"fn bang(n: Int) -> Int / {oops.boom} = if n > 0 { oops.boom(n) } else { n }\n",
+      b"fn caught(n: Int) -> Int = handle { bang(n) } with { oops.boom(k) -> k + 1 }\n",
+      b"type Shape = | Dot | Line(Int)\n",
+      b"fn handled() -> Int = handle { e.op(1) } with { var n = 0, e.op(k) -> { n = k; n }, return x -> x + n }\n",
+      b"fn decimals(d: Decimal) -> Decimal = d * d + d\n",
+      b"fn floats(x: Float) -> Float = x.sqrt()\n",
+      b"fn texts(s: String) -> Int = (s ++ s).len()\n",
+      b"fn listed(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n",
+      b"fn shaped(n: Int) -> Shape = if n > 0 { Line(n) } else { Dot }\n",
+      b"fn width(s: Shape) -> Int = match s { Line(n) -> n, Dot -> 0 }\n",
+      b"fn table() -> List<Int> = [1, 2]\n",
+      b"fn read() -> Int = table().len()\n",
+      b"fn sum(f: (Int) -> Int, n: Int) -> Int = if n <= 0 { 0 } else { f(n) + sum(f, n - 1) }\n",
+      b"fn one() -> Int = sum(|x: Int| x, 3)\n",
+      b"fn two() -> Int = sum(|x: Int| x, 4)\n",
+      b"type Length = | Metres(Int) | Millimetres(Int)\n",
+      b"key for Length by millimetres\n",
+      b"numeric for Length by { add: plus, sub: minus, mul: times, neg: negated, of_int: metres }\n",
+      b"fn millimetres(l: Length) -> Int = match l { Metres(n) -> n * 1000, Millimetres(n) -> n }\n",
+      b"fn plus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) + millimetres(b))\n",
+      b"fn minus(a: Length, b: Length) -> Length = Millimetres(millimetres(a) - millimetres(b))\n",
+      b"fn times(a: Length, b: Length) -> Length = Millimetres(millimetres(a) * millimetres(b))\n",
+      b"fn negated(a: Length) -> Length = Millimetres(0 - millimetres(a))\n",
+      b"fn metres(n: Int) -> Length = Metres(n)\n",
+      b"fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
+      b"fn all(xs: List<Length>) -> Length = total(xs)\n",
+    ]),
+  ).unit(
+    [
+      b"m.handled",
+      b"m.caught",
+      b"m.decimals",
+      b"m.floats",
+      b"m.texts",
+      b"m.listed",
+      b"m.shaped",
+      b"m.width",
+      b"m.read",
+      b"m.one",
+      b"m.two",
+      b"m.all",
+    ].map(
+      Named,
+    ),
+  )
+
+test "a call to mutually recursive generic functions at a type compiles to their specialisations for that type, whichever one is called" {
+  let source = Bytes::concat_all([
+    b"fn ping<a>(x: a, n: Int) -> a = if n <= 0 { x } else { pong(x, n - 1) }\n",
+    b"fn pong<a>(x: a, n: Int) -> a = if n <= 0 { x } else { ping(x, n - 1) }\n",
+    b"fn go() -> Float = ping(1.5, 3)\n",
+    b"fn back() -> String = pong(\"s\", 3)\n",
+  ]);
+  let e = compiled_program(
+    [{ name: b"m", source_text: source }],
+    [],
+    Some([Named(b"m.go"), Named(b"m.back")]),
+  );
+  assert_eq(
+    [b"m.ping@Float", b"m.pong@String", b"m.ping", b"m.pong"].filter(|n: Bytes|
+      e.output.taken.map(root_text).contains(n)),
+    [b"m.ping@Float", b"m.pong@String"],
+  )
+}
+
+test "no drop function is generated for lists of scalars, whose memory the runtime frees by size when the last reference ends" {
+  let source = Bytes::concat_all([
+    b"effect e {\n  write op(k: Int) -> Float\n}\n",
+    b"fn listed<a>(x: a, y: a) -> List<a> = [x, y]\n",
+    b"fn ints(n: Int) -> Int = match listed(n, n + 1) { [x, ..] -> x, [] -> 0 }\n",
+    b"fn floats(x: Float) -> Float = match listed(x, x) { [y, ..] -> y, [] -> 0.0 }\n",
+    b"fn decimals(d: Decimal) -> Int = listed(d, d).len()\n",
+    b"fn wides(w: U128) -> Int = listed(w, w).len()\n",
+    b"fn held(w: U128) -> Int = [{ a: w, b: \"x\" }].len()\n",
+    b"fn performed(n: Int) -> Float / {e.op} = e.op(n)\n",
+  ]);
+  let every = [b"m.ints", b"m.floats", b"m.decimals", b"m.wides", b"m.held", b"m.performed"];
+  let produced = compiled_program(
+    [{ name: b"m", source_text: source }],
+    [],
+    Some(every.map(Named)),
+  ).output;
+  let taken = produced.taken.map(root_text);
+  let drop_at = |ty: Bytes| b"std.prelude.drop#".concat(ty);
+  assert_eq(
+    [b"List<Int>", b"List<Float>", b"List<Decimal>", b"List<U128>"].filter(|t: Bytes|
+      !taken.contains(drop_at(t))),
+    [],
+  );
+  assert(unit_text(produced.parts).index_of(identity_function) != None, None);
+  assert_eq(
+    taken.filter(|n: Bytes|
+      [b"Int", b"Float", b"Decimal", b"U128"].any(|t: Bytes|
+        [b"drop#", b"dup#", b"release#"].any(|prefix: Bytes| n.ends_with(prefix.concat(t))))),
+    [],
+  )
+}
+
+test "a constant that can fail with `abort.raise` still has a function-table entry naming its function, never an empty name" {
+  let user = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub const limit: Int = if 2 > 3 { abort.raise(\"never\") } else { 7 }\n",
+        b"pub fn twice() -> Int = limit + limit\n",
+      ]),
+    },
+  ];
+  let e = compiled_program(user, []);
+  let text = unit_text(e.output.parts);
+  let output_text = Some(String::of_bytes_lossy(text));
+  assert(
+    text.index_of(Bytes::concat_all([b"(void *)&", entry_symbol(b"m.limit"), b",\n"])) != None,
+    output_text,
+  );
+  assert(
+    text.index_of(b"(void *)&,") == None && text.index_of(b"extern char ;") == None,
+    output_text,
+  )
+}
+
+test "a test that performs the `sim` effect compiles, with the generated entry function supplying the runtime's handler for `sim`" {
+  let user = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"fn timed(n: Int) -> Int / {sim.read} = n + sim.seed() * 0\n",
+        b"test \"timed\" { assert_eq(timed(1), 1) }\n",
+      ]),
+    },
+  ];
+  let e = compiled_program(user, []);
+  assert(unit_text(e.output.parts).len() > 0, None)
+}
+
+test "generated code that compares or hashes a value, or runs a test on it, compiles when it calls a generic function whose effects are the value's effects" {
+  let user = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub type Step<a | e> = () -> Option<a> / e\n",
+        b"pub type Seq<a | e> = | Seq(Step<a | e>)\n",
+        b"pub fn empty<a | e>() -> Seq<a | e> = {\n  let step: Step<a | e> = || None;\n  Seq(step)\n}\n",
+        b"pub fn none<| e>() -> Seq<Int | e> = empty()\n",
+        b"pub type Hook<a | e> = | Hook(String, (a) -> Unit / e) | Unhooked\n",
+        b"key for Hook by named\n",
+        b"pub fn named<a | e>(h: Hook<a | e>) -> Option<String> =\n",
+        b"  match h { Hook(name, _) -> Some(name), Unhooked -> None }\n",
+        b"test \"rows\" {\n",
+        b"  let quiet: Hook<Int | {}> = Hook(\"save\", |_n: Int| ());\n",
+        b"  let held: Seq<Int | {}> = none();\n",
+        b"  assert(quiet == quiet);\n",
+        b"  assert_eq(digest(quiet), digest(quiet))\n",
+        b"}\n",
+      ]),
+    },
+  ];
+  let dump = dump_of(analyse(parse_all(user)));
+  let e = compiled_program(user, []);
+  assert_eq(dump.diagnostics.map(|d: Diagnostic| d.message), []);
+  let ran = e.roots.map(printed);
+  assert_eq(
+    [
+      b"m.empty#entered",
+      b"m.none#entered",
+      b"m.empty@Int/{}",
+      b"m.none@/{}",
+      b"m.named@Int/{}",
+      b"m.Hook<Int,_>#eq",
+      b"m.digest#m.Hook<Int,_>",
+    ].filter(|n: Bytes| !ran.contains(n)),
+    [],
+  );
+}
+
+test "a generic function's `ensures` clause is compiled once for each type the function is checked with" {
+  let user = [
+    { name: b"m", source_text: b"pub fn none<a>() -> List<a> ensures result.len() == 0 = []\n" },
+  ];
+  let clause = |definition: RootKey| Clause({ definition: definition, kind: Ensures, n: 0 });
+  let e = compiled_program(
+    user,
+    [],
+    Some([clause(Named(b"m.none")), clause(claims_key(b"m.none", 1))]),
+  );
+  let clause_roots = [EntryPoint(clause(Named(b"m.none"))), clause(claims_key(b"m.none", 1))].map(
+    root_name,
+  );
+  assert(clause_roots.all(|n: RootName| e.output.taken.contains(n)), None)
+}
+
+test "a function named by a type's `key for` gets an entry function the runtime can call, but a function with a second parameter does not" {
+  let user = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub type Box = | Box(Int)\n",
+        b"pub fn size(b: Box) -> Int = match b { Box(n) -> n }\n",
+        b"key for Box by size\n",
+        b"pub fn grown(b: Box, by: Int) -> Box = match b { Box(n) -> Box(n + by) }\n",
+      ]),
+    },
+  ];
+  let e = compiled_program(user, []);
+  let entry = |n: Bytes| entry_symbol(n).concat(b"(PlyCtx *ctx, const Word *args) {");
+  assert_eq(
+    [b"m.size", b"m.grown"].map(|n: Bytes| unit_text(e.output.parts).index_of(entry(n)) != None),
+    [true, false],
+  )
+}
+
+test "only a generic definition whose calls resolve without extra type information gets an entry function" {
+  let user = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub fn first<a>(xs: List<a>) -> Option<a> = match xs { [x, ..] -> Some(x), _ -> None }\n",
+        b"pub fn made<a>(make: () -> a) -> a = make()\n",
+        b"pub fn total<a>(xs: List<a>) -> a where numeric(a) = xs.fold(numeric_of_int(0), |s: a, x: a| s + x)\n",
+        b"pub fn counted<a>(xs: Columns<a>) -> Int = xs.len()\n",
+      ]),
+    },
+  ];
+  let e = compiled_program(user, []);
+  let entry = |n: Bytes| root_name(EntryPoint(Named(n)));
+  assert_eq(
+    [b"m.first", b"m.made", b"m.total", b"m.counted"].filter(|n: Bytes|
+      e.output.taken.contains(entry(n))),
+    [b"m.first"],
+  )
+}
+
+test "a function's entry function runs it under the runtime's own handler for each effect the function declares" {
+  let user = [
+    {
+      name: b"m",
+      source_text: b"import std.fact (fact)\npub fn asked() -> Int / {fact.get} = fact.get()\npub fn plain() -> Int = 1\npub fn shifted(n: Int, s: String) -> Int / {fact.get} = fact.get() + n + s.len()\n",
+    },
+  ];
+  let fact = {
+    name: b"std.fact",
+    source_text: b"pub effect fact {\n  read get() -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / e = handle { go() } with { fact.get() -> 7 }\n",
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [fact], no_rows).out);
+  assert_eq(
+    dump.effects.filter(|r: EffectRow| r.name == b"std.fact.fact").map(|r: EffectRow| r.host),
+    [Some(b"std.fact.served")],
+  );
+  let e = compiled_program(user, [fact]);
+  let entries = [b"m.asked", b"m.plain", b"m.shifted"].map(|n: Bytes|
+    root_name(EntryPoint(Named(n))));
+  assert(entries.all(|n: RootName| e.output.taken.contains(n)), None);
+  assert_eq(
+    [Named(b"m.asked"), Named(b"m.shifted")].map(|k: RootKey|
+      bridged_in(unit_text(e.output.parts), k)),
+    [b"", b""],
+  );
+  assert(
+    e.output.taken.any(|n: RootName|
+      root_text(n).starts_with(b"std.fact.served") && root_text(n) != b"std.fact.served"),
+    None,
+  )
+}
+
+test "a function that performs `task` runs under the scheduler and the runtime's `task` handler, and also under the `clock` handler if it performs `clock`" {
+  let user = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub fn yielded() -> Int / {task.write} = {\n  task.yield();\n  1\n}\npub fn plain() -> Int = 1\n",
+        b"pub fn timed() -> Int / {task.write, clock.read} = {\n  task.yield();\n  match clock.now() { Instant(n) -> n }\n}\n",
+      ]),
+    },
+  ];
+  let clauses = [
+    b"spawn(f)",
+    b"join(t)",
+    b"await(t)",
+    b"cancel(t)",
+    b"yield()",
+    b"channel(n)",
+    b"send(c, x)",
+    b"recv(c)",
+    b"close(c)",
+    b"select(arms, wait)",
+  ];
+  let scheduler = {
+    name: b"std.internal.schedule",
+    source_text: Bytes::concat_all([
+      b"pub fn scheduled<a | e>(body: keep () -> a / {task.write | e}) -> a / {abort.raise | e} =\n",
+      b"  handle { body() } with {\n",
+      Bytes::concat_all(
+        clauses.map(|c: Bytes|
+          Bytes::concat_all([b"    task.", c, b" -> abort.raise(\"none\"),\n"])),
+      ),
+      b"  }\n",
+      b"pub fn clocked<a | e>(go: () -> a / {clock.read, clock.write | e}) -> a / e =\n",
+      b"  handle { go() } with {\n    clock.now() -> Instant(0),\n    clock.sleep(_d) -> (),\n  }\n",
+    ]),
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [scheduler], no_rows).out);
+  assert_eq(
+    dump.diagnostics.filter(|d: Diagnostic| d.severity == b"error").map(|d: Diagnostic| d.message),
+    [],
+  );
+  assert_eq(dump.effects.filter(|r: EffectRow| r.name == b"task").map(|r: EffectRow| r.host), [
+    Some(b"std.internal.schedule.scheduled"),
+  ]);
+  let e = compiled_program(user, [scheduler]);
+  let entry = |n: Bytes| root_name(EntryPoint(Named(n)));
+  assert(
+    e.output.taken.any(|n: RootName|
+      root_text(n).starts_with(b"std.internal.schedule.scheduled")
+        && root_text(n) != b"std.internal.schedule.scheduled"),
+    None,
+  )
+}
+
+test "a function's entry function passes it the runtime's handler for each effect that no handler in the program covers" {
+  let user = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"import std.time (time)\n",
+        b"effect ask {\n  read get() -> Int\n}\n",
+        b"pub fn main() -> Int / {ask.read, time.read, clock.read, abort.raise} = {\n",
+        b"  let n = ask.get() + time.now() + match clock.now() { Instant(at) -> at };\n",
+        b"  if n < 0 { panic(\"negative\") } else { n }\n",
+        b"}\n",
+      ]),
+    },
+  ];
+  let time = {
+    name: b"std.time",
+    source_text: b"pub nondet effect time {\n  read now() -> Int\n}\n",
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [time], no_rows).out);
+  let e = compiled_program(user, [time]);
+  let entry = defined_in(
+    unit_text(e.output.parts),
+    symbol_of(root_text(root_name(EntryPoint(Named(b"m.main"))))),
+  );
+  let count_of = |object: Bytes| entry.split(object).len() - 1;
+  assert_eq([b"ctx->unserved", b"ctx->bridge"].map(count_of), [1, 1])
+}
+
+test "a simulation passes the scheduler a handler for each effect it needs, including effects the simulation's own effect list does not name" {
+  let user = [
+    {
+      name: b"m",
+      source_text: b"pub fn main() -> Int / {abort.raise, sim.read} = simulate { 1 }\n",
+    },
+  ];
+  let scheduler = {
+    name: b"std.internal.schedule",
+    source_text: Bytes::concat_all([
+      b"import std.internal.native (native)\n",
+      b"extern fn seed_path() -> Bytes / {native.read}\n",
+      b"pub fn simulated<a | e>(root: Int, start: Int, end: Int, body: keep () -> a / {task.write, clock.read, clock.write, random.write, sim.read | e}) -> a / {abort.raise, native.read | e} = {\n",
+      b"  let _ = seed_path();\n",
+      b"  abort.raise(\"none\")\n",
+      b"}\n",
+    ]),
+  };
+  let native = { name: b"std.internal.native", source_text: b"pub nondet effect native {}\n" };
+  let dump = dump_of(analyse_pulling_std_with(user, [scheduler, native], no_rows).out);
+  assert_eq(
+    dump.diagnostics.filter(|d: Diagnostic| d.severity == b"error").map(|d: Diagnostic| d.message),
+    [],
+  );
+  let e = compiled_program(user, [scheduler, native]);
+  assert(unit_text(e.output.parts).index_of(b"seed_path") != None, None)
+}
+
+test "a test's entry function runs it under the runtime's handler for each effect it performs, including effects with a type-level label such as `put[cell]`" {
+  let user = [
+    {
+      name: b"m",
+      source_text: b"import std.fact (fact)\ntest \"asks\" {\n  fact.put[cell](1);\n  assert(fact.get() == 7)\n}\n",
+    },
+  ];
+  let fact = {
+    name: b"std.fact",
+    source_text: b"pub effect fact {\n  read get() -> Int\n  write put[r](x: Int) -> Unit\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get, fact.put[*] | e}) -> a / e = handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }\n",
+  };
+  let dump = dump_of(analyse_pulling_std_with(user, [fact], no_rows).out);
+  let e = compiled_program(user, [fact]);
+  assert(
+    e.output.taken.any(|n: RootName| root_text(n).starts_with(b"std.fact.served")),
+    Some(String::of_bytes_lossy(Bytes::join(e.output.taken.map(root_text), b", "))),
+  );
+  assert_eq(bridged_in(unit_text(e.output.parts), test_key(b"m", b"asks")), b"")
+}
+
+test "a unit is rejected where the runtime does not implement a native it calls as declared, and not for one it never calls" {
+  let program = [
+    {
+      name: b"m",
+      source_text: b"fn digest(b: Bytes) -> Bytes = b.blake3()\nfn plus<a>(x: a, y: a) -> a where numeric(a) = x + y\n",
+    },
+  ];
+  let implemented = declared_natives.map(declared_signature);
+  let taking = |name: Bytes, words: Int|
+    implemented.map(|n: Native|
+      if n.name == name { word_native(name, words, n.result != None, n.raises) } else { n });
+  assert_eq(
+    match unit_against_runtime(program, [], implemented) {
+      Ok(c) -> c.index_of(b"builtin_elaborated_blake3_p(ctx") != None,
+      Err(_) -> false,
+    },
+    true,
+  );
+  assert_eq(rejection_codes(unit_against_runtime(program, [], implemented)), []);
+  assert_eq(
+    rejection_codes(
+      unit_against_runtime(
+        program,
+        [],
+        taking(b"Secret::verify", 9).filter(|n: Native| n.name != b"Secret::is_empty"),
+      ),
+    ),
+    [],
+  );
+  assert_eq(rejection_codes(unit_against_runtime(program, [], taking(b"?numeric_binary", 5))), []);
+  assert_eq(rejection_codes(unit_against_runtime(program, [], taking(b"Map::new", 3))), []);
+  let rejected = rejection_codes(unit_against_runtime(program, [], taking(b"?blake3", 1)));
+  assert_eq(rejected.at(0), Some(b"E0476"));
+  assert_eq(
+    rejected.at(1),
+    Some(
+      b"the compiler's `?blake3` takes [Addr, I64], returns I64 and cannot raise, and the runtime's native takes [Word], returns Word and cannot raise",
+    ),
+  );
+  let twice = implemented.concat(implemented.filter(|n: Native| n.name == b"?blake3"));
+  assert_eq(
+    rejection_codes(unit_against_runtime(program, [], twice)).at(1),
+    Some(b"the compiler's `?blake3`: 2 natives of the runtime implement it"),
+  )
+}
+
+test "a unit whose bodies define their own `extern fn` declarations does not require the runtime to implement those functions" {
+  let implemented = program_natives([]).map(declared_signature);
+  let names = implemented.map(|n: Native| n.name);
+  assert_eq(
+    intrinsics.filter(|i: { name: Bytes, operation: Intrinsic }|
+      names.contains(i.name.slice(b"std.prelude.".len(), i.name.len()))).len(
+    ),
+    0,
+  );
+  let calls = b"\npub fn pushed(xs: List<Int>) -> List<Int> = xs.push(1)\npub fn emptied(m: Map<Int, Int>) -> Map<Int, Int> = MapNode::map_swap(m, None, 0, 0).map\n";
+  let program = [{ name: b"std.prelude", source_text: prelude_source::text.concat(calls) }];
+  match unit_against_runtime(program, [], implemented) {
+    Ok(c) -> {
+      let helper_calls = intrinsics.map(|i: { name: Bytes, operation: Intrinsic }|
+        builtin_helper(i.name.slice(b"std.prelude.".len(), i.name.len())).concat(b"_p(ctx, "));
+      assert_eq(helper_calls.filter(|t: Bytes| c.index_of(t) != None), [])
+    },
+    Err(diagnostics) -> assert_eq(diagnostics.map(|d: Diagnostic| d.code), []),
+  }
+}
+
+test "a unit is rejected when the runtime's helper functions or data layout differ from what the compiler declares" {
+  let program = compiled_program([{ name: b"m", source_text: b"fn one() -> Int = 1\n" }], []);
+  let over = |runtime: Runtime|
+    code_rejections(runtime, program.codes).fold([], |found: List<Bytes>, d: Diagnostic|
+      found.push(d.code).concat(d.notes_text));
+  let r = a_runtime(b"r");
+  assert_eq(over(r), []);
+  let moved = { ..r, facts: r.facts.insert(b"PlyCtx.frames.at", 72) };
+  let rejected = over({
+    ..moved,
+    helpers: moved.helpers.filter(|n: Native| n.name != b"rt_release_drain"),
+  });
+  assert_eq(rejected, [
+    b"E0481",
+    b"the runtime has no helper `rt_release_drain`, which emitted code calls",
+    b"the runtime lays out `PlyCtx.frames.at` as 72, where this compiler declares 64",
+    runtime_rejected([]).notes_text.get(0),
+  ]);
+  assert_eq(over({ ..moved, natives: [] }).at(0), Some(b"E0481"))
+}
+
+test "the runtime functions listed for a compiled definition are exactly the `builtin_` functions its C code calls through a function pointer" {
+  let bodies = sample_unit.output.made.bodies;
+  let scanned = |k: UnitBody|
+    k.tables.shared.fold(
+      pointers_named(k.text, b"builtin_", Map::new()),
+      |m: Map<Bytes, Bool>, f: SharedFunction| pointers_named(f.text, b"builtin_", m),
+    ).keys(
+    );
+  assert_eq(
+    bodies.filter(|k: UnitBody| sorted_unique(k.tables.natives) != scanned(k)).map(|k: UnitBody|
+      root_text(k.name)),
+    [],
+  );
+  assert(bodies.any(|k: UnitBody| k.tables.natives.len() > 0), None)
+}
+
+test "the keyed values listed for a compiled definition are exactly the keyed values that appear in its C code and are recorded in its file's table" {
+  let bodies = sample_unit.output.made.bodies;
+  let scanned = |k: UnitBody|
+    sorted_unique(
+      holes(k.text).filter(|h: Hole| ![114, 115, 103].contains(h.kind)).map(|h: Hole|
+        keyed_key(keyed_of(h), k.tables)),
+    );
+  let reported = |k: UnitBody| sorted_unique(k.tables.keyed.map(|x: Keyed| keyed_key(x, k.tables)));
+  assert_eq(
+    bodies.filter(|k: UnitBody| reported(k) != scanned(k)).map(|k: UnitBody| root_text(k.name)),
+    [],
+  );
+  let all = bodies.fold([], |accumulator: List<Bytes>, k: UnitBody|
+    accumulator.concat(reported(k)));
+  assert_eq([84, 102, 108].filter(|kind: Int| !all.any(|key: Bytes| key.at(0) == kind)), [])
+}
+
+test "a generated C file is unchanged when the name of each definition it contains is replaced by that definition's C symbol" {
+  let made = sample_unit.output.made;
+  let constructors = sorted_unique(
+    made.bodies.fold([], |accumulator: List<Bytes>, k: UnitBody|
+      k.tables.keyed.fold(accumulator, |a: List<Bytes>, x: Keyed|
+        match x { KeyedTag(n) -> a.push(n), _ -> a })),
+  ).map(|n: Bytes| { name: n, arity: 0 });
+  let unit = |texts: List<Bytes>|
+    fresh(
+      constructors,
+      made.requested,
+      1,
+      results_by_name(
+        range(0, made.bodies.len()).map(|i: Int| {
+          let k = made.bodies.get(i);
+          { name: k.name, result: { text: texts.get(i), tables: k.tables } }
+        }),
+      ),
+      Map::new(),
+      no_machine,
+      one_each,
+    ).text;
+  let symbol = |n: RootName| symbol_of(root_text(n));
+  let spelled_out = |k: UnitBody| {
+    let members = k.tables.members.map(root_name);
+    Bytes::join(
+      range(0, members.len()).fold(k.text, |t: Bytes, i: Int|
+        Bytes::join(t.split(own_symbol(Some(i))), symbol(members.get(i)))).split(
+        own_symbol(None),
+      ),
+      symbol(own_root(k)),
+    )
+  };
+  let resolved = made.bodies.map(|k: UnitBody|
+    match made.named.get(k.name) {
+      Some(roots) -> { ..k, text: placeholders_named(k.text, roots) },
+      None -> k,
+    });
+  let written = unit(resolved.map(|k: UnitBody| k.text));
+  assert(resolved.any(|k: UnitBody| k.text.index_of(own_symbol(None)) != None), None);
+  assert_eq(written.index_of(b"@@"), None);
+  assert_eq(written, unit(resolved.map(spelled_out)))
+}
+
+test "every function that a unit's C code calls through a function pointer is defined by the unit" {
+  let k = unit_builder(
+    Bytes::concat_all([
+      b"effect e {\n  write op(k: Int) -> Int\n}\n",
+      b"fn handled() -> Int = handle { e.op(1) } with { var n = 0, e.op(k) -> { n = k; n }, return x -> x + n }\n",
+      b"fn decimals(d: Decimal) -> Decimal = d * d + d\n",
+      b"fn wides(w: U128) -> U128 = w * w\n",
+      b"fn floats(x: Float) -> Float = x.sqrt()\n",
+      b"fn texts(s: String) -> Int = (s ++ s).len()\n",
+      b"fn listed(xs: List<Int>) -> List<Int> = xs.map(|x: Int| x + 1)\n",
+    ]),
+  );
+  let roots = [b"m.handled", b"m.decimals", b"m.wides", b"m.floats", b"m.texts", b"m.listed"];
+  let text = unit_text(k.unit(roots.map(Named)).output.parts);
+  let declared = bound_functions.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Native|
+    accumulator.insert(n.name, true));
+  let named = pointers_named(text, b"rt_", pointers_named(text, b"builtin_", Map::new()));
+  assert_eq(named.keys().filter(|n: Bytes| !declared.contains(n)), []);
+  assert(named.contains(b"rt_alloc_bytes") && named.contains(b"builtin_elaborated_out_int"), None)
+}
+
+test "a unit is rejected when the runtime implements a shipped module's `extern fn` with a different signature from the one the unit calls" {
+  let native = [
+    {
+      name: b"std.native",
+      source_text: b"pub extern fn counted(x: Int) -> Int\npub extern fn named(id: Int) -> String\n",
+    },
+  ];
+  let program = [
+    {
+      name: b"m",
+      source_text: b"import std.native (counted, named)\nfn f() -> Int = counted(1)\nfn g() -> String = named(7)\n",
+    },
+  ];
+  let count_line = |params: List<Machine>|
+    { name: b"counted", params: params, result: Some(abi::I64), raises: false };
+  let named = |result: Machine|
+    { name: b"named", params: [abi::I64], result: Some(result), raises: false };
+  let implemented = |a: Native, b: Native| declared_natives.map(declared_signature).push(a).push(b);
+  assert_eq(
+    rejection_codes(
+      unit_against_runtime(program, native, implemented(count_line([abi::I64]), named(abi::Taken))),
+    ),
+    [],
+  );
+  assert_eq(
+    rejection_codes(
+      unit_against_runtime(
+        program,
+        native,
+        implemented(count_line([abi::I64, abi::I64]), named(abi::Taken)),
+      ),
+    ),
+    [
+      b"E0476",
+      b"`extern fn counted` of `std.native` takes [I64], returns I64 and cannot raise, and the runtime's native takes [I64, I64], returns I64 and cannot raise",
+      natives_rejected([]).notes_text.get(0),
+    ],
+  );
+  assert_eq(
+    rejection_codes(
+      unit_against_runtime(program, native, implemented(count_line([abi::I64]), named(abi::I64))),
+    ),
+    [
+      b"E0476",
+      b"`extern fn named` of `std.native` takes [I64], returns Taken and cannot raise, and the runtime's native takes [I64], returns I64 and cannot raise",
+      natives_rejected([]).notes_text.get(0),
+    ],
+  )
+}
+
+test "a build declares a standard library `extern fn` with the runtime's low-level parameter types where C code calls it, and defines it after the other definitions" {
+  let native = [
+    {
+      name: b"std.native",
+      source_text: b"pub extern fn named(id: Int, sep: String) -> String\npub extern fn told(on: Bool, x: Float, c: Char, w: U8) -> Char\npub extern fn noted(b: Bytes) -> Unit\n",
+    },
+  ];
+  let program = [
+    {
+      name: b"m",
+      source_text: b"import std.native (named, told, noted)\nfn g() -> String = named(7, \"-\")\nfn h() -> Char = told(true, 1.5, 'a', 3u8)\nfn k() -> Unit = noted(b\"x\")\n",
+    },
+  ];
+  let named = {
+    name: b"named",
+    params: [abi::I64, abi::Address, abi::I64],
+    result: Some(abi::Taken),
+    raises: false,
+  };
+  let native_request = {
+    name: b"told",
+    params: [abi::I64, abi::F64, abi::I64, abi::I64],
+    result: Some(abi::I64),
+    raises: false,
+  };
+  let noted = { name: b"noted", params: [abi::Address, abi::I64], result: None, raises: false };
+  match unit_against_runtime(
+      program,
+      native,
+      declared_natives.map(declared_signature).push(named).push(native_request).push(noted),
+    ) {
+    Err(diagnostics) -> assert_eq(diagnostics.map(|d: Diagnostic| d.code), []),
+    Ok(text) -> {
+      let pointer = b"Word (*builtin_named_p)(PlyCtx*, Word, Word, Word)";
+      assert(text.index_of(b"builtin_named_p(ctx, ") != None, None);
+      assert_eq(text.split(b"extern ".concat(pointer)).len(), 2);
+      assert(text.index_of(pointer.concat(b";\n")) != None, None);
+      assert(
+        text.index_of(
+            Bytes::concat_all([
+              b"builtin_named_p = (Word (*)(PlyCtx*, Word, Word, Word))fns[",
+              ascii_of_int(bound_functions.len()),
+              b"]",
+            ]),
+          )
+          != None,
+        None,
+      );
+      assert(text.index_of(b"builtin_named 3 1") != None, None);
+      assert(
+        text.index_of(b"extern Word (*builtin_told_p)(PlyCtx*, Word, Word, Word, Word);\n") != None,
+        None,
+      );
+      assert(
+        text.index_of(b"extern void (*builtin_noted_p)(PlyCtx*, Word, Word);\n") != None,
+        None,
+      );
+      assert(text.index_of(b"builtin_noted 2 0") != None, None)
+    },
+  }
+}
+
+test "reading a definition that has no parameters computes its value once and caches it permanently, using the cache function for its result type" {
+  let k = unit_builder(
+    Bytes::concat_all([
+      b"fn flag() -> Bool = 1 < 2\n",
+      b"fn word() -> String = \"a\" ++ \"b\"\n",
+      b"fn none<a>() -> Option<a> = None\n",
+      b"fn read() -> Int = if flag() { word().len() } else { 0 }\n",
+      b"fn nothing() -> Option<Int> = none()\n",
+    ]),
+  );
+  let unit = k.unit([b"m.flag", b"m.word", b"m.none", b"m.read", b"m.nothing"].map(Named));
+  let text = unit_text(unit.output.parts);
+  let read_with = |keep: Bytes|
+    text.index_of(Bytes::concat_all([b", (Word)(intptr_t)", keep, b")"])) != None;
+  assert(text.index_of(read_of(constant_read_fn)) != None, None);
+  assert(read_with(identity_function), None);
+  assert(read_with(symbol_of(printed(root_of(keys::Keep, string_type)))), None);
+}
+
+test "a `const` is read through the check that no raise left it, and a plain definition is not" {
+  let reads = |source: Bytes| {
+    let k = unit_builder(source);
+    let text = unit_text(k.unit([b"m.table", b"m.read"].map(Named)).output.parts);
+    let count = |helper: Bytes| text.split(read_of(helper)).len() - 1;
+    [count(const_read_fn), count(constant_read_fn)]
+  };
+  let constant = reads(b"const table: List<Int> = [1, 2]\nfn read() -> Int = table.len()\n");
+  let plain = reads(b"fn table() -> List<Int> = [1, 2]\nfn read() -> Int = table().len()\n");
+  assert_eq(constant, [1, plain.get(1) - 1]);
+  assert_eq(plain.get(0), 0)
+}
+
+test "a function that can fail is called at every read, and one that cannot is read once" {
+  let slots = |source: Bytes| {
+    let k = unit_builder(source);
+    let text = unit_text(k.unit([b"m.kept", b"m.read"].map(Named)).output.parts);
+    text.split(read_of(constant_read_fn)).len() - 1
+  };
+  let cached = slots(b"fn kept() -> List<Int> = [1, 2]\nfn read() -> Int = kept().len()\n");
+  let called = slots(
+    b"fn kept() -> List<Int> / {abort.raise} = [10 / divisor()]\nfn divisor() -> Int = 2\nfn read() -> Int / {abort.raise} = kept().len()\n",
+  );
+  assert(cached > called, None)
+}
+
+test "a read of a definition whose body is data made of literals is that data, with no allocation" {
+  let text = |source: Bytes| unit_text(unit_builder(source).unit([Named(b"m.read")]).output.parts);
+  let reads = |source: Bytes, helper: Bytes| text(source).index_of(read_of(helper)) != None;
+  let read_body = |unit: Bytes| {
+    let at = match unit.index_of(symbol_of(b"m.read").concat(b"(PlyCtx *ctx, int64_t p0) {")) {
+      Some(i) -> i,
+      None -> panic("the unit defines m.read"),
+    };
+    let body = unit.slice(at, unit.len());
+    body.slice(0, match body.index_of(b"\n}\n") { Some(i) -> i, None -> body.len() })
+  };
+  let int = text(b"fn kept() -> Int = 300\nfn read(n: Int) -> Int = n + kept()\n");
+  assert(int.index_of(b"INT64_C(300)") != None, None);
+  assert(int.index_of(read_of(constant_read_fn)) == None, None);
+  assert(int.index_of(b"ply_m_kept_") == None, None);
+  let wide = text(
+    b"type W = { a: Int, b: Int, c: Int, d: Int, e: Int, f: Int, g: Int, h: Int, i: Int, j: Bytes }\nfn kept() -> W = { a: 1, b: 2, c: 3, d: 4, e: 5, f: 6, g: 7, h: 8, i: 9, j: b\"abc\" }\nfn read(n: Int) -> Int = n + kept().i\n",
+  );
+  assert(wide.index_of(read_of(constant_read_fn)) == None, None);
+  assert(wide.index_of(b"ply_m_kept_") == None, None);
+  assert(!allocates(read_body(wide)), None);
+  let boxed = text(
+    b"type T = | Off | Pair(Int, Option<Bytes>)\nfn kept() -> T = Pair(7, Some(b\"abc\"))\nfn read(n: Int) -> Int = match kept() { Pair(k, _) -> k + n, Off -> n }\n",
+  );
+  assert(boxed.index_of(read_of(constant_read_fn)) == None, None);
+  assert(!allocates(read_body(boxed)), None);
+  assert(
+    !reads(
+      b"type R = { a: Option<Int>, b: Bool }\nfn kept() -> R = { a: None, b: true }\nfn read(n: Int) -> Int = if kept().b { n } else { 0 }\n",
+      constant_read_fn,
+    ),
+    None,
+  );
+  assert(
+    reads(
+      b"fn kept() -> List<Int> = [1, 2]\nfn read(n: Int) -> Int = n + kept().len()\n",
+      constant_read_fn,
+    ),
+    None,
+  );
+  assert(
+    reads(
+      b"type T = | Make(Int)\nfn kept() -> { make: (Int) -> T } = { make: Make }\nfn read(n: Int) -> T = (kept().make)(n)\n",
+      constant_read_fn,
+    ),
+    None,
+  );
+  assert(
+    !reads(
+      b"fn kept() -> Bytes = b\"abc\"\nfn read(n: Int) -> Int = n + kept().len()\n",
+      constant_read_fn,
+    ),
+    None,
+  );
+  assert(
+    !reads(b"fn kept() -> U8 = 200u8\nfn read(_: Int) -> U8 = kept()\n", constant_read_fn),
+    None,
+  );
+  assert(
+    !reads(
+      b"const kept: String = \"abc\"\nfn read(n: Int) -> Int = n + kept.len()\n",
+      const_read_fn,
+    ),
+    None,
+  );
+  assert(
+    reads(b"fn kept() -> Int = 1 + 2\nfn read(n: Int) -> Int = n + kept()\n", constant_read_fn),
+    None,
+  )
+}
+
+test "a unit compiles specialisations whose code is alike as one body, and each as a stub of its own name" {
+  let source = Bytes::concat_all([
+    b"fn apply<a>(f: (a) -> a, x: a) -> a = f(x)\n",
+    b"fn one() -> Int = apply(|x: Int| x, 1)\n",
+    b"fn two() -> Int = apply(|x: Int| x, 2)\n",
+  ]);
+  match built([{ name: b"m", source_text: source }]) {
+    Err(reason) -> assert_eq(reason, b""),
+    Ok(e) -> {
+      let specialisations = e.roots.filter(|k: RootKey|
+        match k { Specialisation(a, _) -> a.definition == b"m.apply", _ -> false });
+      let codes = e.output.taken.filter(|n: RootName| root_text(n).starts_with(b"m.apply@="));
+      let named = |symbol: Bytes| unit_text(e.output.parts).index_of(symbol) != None;
+      assert_eq([specialisations.len(), codes.len()], [2, 1]);
+      assert(specialisations.all(|k: RootKey| named(symbol_of(printed(k)))), None);
+      assert(codes.all(|n: RootName| named(symbol_of(root_text(n)))), None)
+    },
+  }
+}
+
+test "specialisations of a recursive function that differ only in their names compile to a single shared piece of C" {
+  let source = Bytes::concat_all([
+    b"fn sum(f: (Int) -> Int, n: Int) -> Int = if n <= 0 { 0 } else { f(n) + sum(f, n - 1) }\n",
+    b"fn one() -> Int = sum(|x: Int| x, 3)\n",
+    b"fn two() -> Int = sum(|x: Int| x, 4)\n",
+  ]);
+  match built([{ name: b"m", source_text: source }]) {
+    Err(reason) -> assert_eq(reason, b""),
+    Ok(e) -> {
+      let specialisations = e.roots.filter(|k: RootKey|
+        match k { Specialisation(a, _) -> a.definition == b"m.sum", _ -> false });
+      let codes = e.output.taken.filter(|n: RootName| root_text(n).starts_with(b"m.sum@="));
+      assert_eq([specialisations.len(), codes.len()], [2, 1]);
+      assert(
+        specialisations.all(|k: RootKey|
+          unit_text(e.output.parts).index_of(symbol_of(printed(k))) != None),
+        None,
+      )
+    },
+  }
+}

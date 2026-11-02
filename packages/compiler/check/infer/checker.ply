@@ -1,4 +1,5 @@
-import compiler.syntax.items (InstanceItem, HostInstance, ReturnsFresh, ReturnsParam)
+import compiler.syntax.items (InstanceItem, HostInstance, KeyInstance, ReturnsFresh, ReturnsParam,
+                              ShowInstance)
 import compiler.syntax.items (effect_set_definition_bin, schema_definition_bin, SchemaDefinition,
                               SchemaItem)
 import compiler.check.resolve.tables (parameters_bin)
@@ -501,6 +502,9 @@ pub type TypeFacts = {
   keyed: Bool,
   release_function: Option<Bytes>,
   resource: Bool,
+  shape: Option<AlgebraicShape>,
+  compared: Option<AlgebraicShape>,
+  shown: Option<AlgebraicShape>,
 }
 
 pub type StatedReturn = | StatedFresh | StatedParameter(Int)
@@ -628,6 +632,9 @@ pub fn declarations_checked(
       _ -> found,
     });
   let own = |name: Bytes| name.starts_with(module.concat(b"."));
+  let plain_shapes = algebraic_shapes(checker);
+  let compared_shapes = instance_shapes(checker.instances, plain_shapes, EqDeriver);
+  let shown_shapes = instance_shapes(checker.instances, plain_shapes, ShowDeriver);
   {
     types: checker.types.fold(
       Map::new(),
@@ -649,6 +656,9 @@ pub fn declarations_checked(
             keyed: checker.keyed_names.contains(name),
             release_function: checker.release_functions.get(name),
             resource: checker.resource_types.contains(name),
+            shape: plain_shapes.get(name),
+            compared: compared_shapes.get(name),
+            shown: shown_shapes.get(name),
           })
         },
     ),
@@ -734,6 +744,8 @@ derive bin for AliasFacts
 derive bin for StatedReturn
 
 derive bin for CallShape
+
+derive bin for AlgebraicShape
 
 derive bin for TypeFacts
 
@@ -1363,6 +1375,23 @@ pub fn is_keyed(checker: Checker, name: Bytes) -> Bool / {program.read} =
   checker.keyed_names.contains(name)
     || type_facts(name, |f: TypeFacts| if f.keyed { Some(true) } else { None }) != None
 
+pub fn numeric_stated(checker: Checker, type_name: Bytes) -> Option<NumericInfo> / {program.read} =
+  match checker.numeric_types.find(|x: NumericInfo| x.type_name == type_name) {
+    Some(x) -> Some(x),
+    None -> type_facts(type_name, |f: TypeFacts| f.numeric),
+  }
+
+pub fn instance_stated(
+  checker: Checker,
+  type_name: Bytes,
+  kind: InstanceKind,
+) -> Option<InstanceInfo> / {program.read} =
+  match checker.instances.find(|x: InstanceInfo| x.type_name == type_name && x.kind == kind) {
+    Some(x) -> Some(x),
+    None ->
+      type_facts(type_name, |f: TypeFacts| f.instances.find(|x: InstanceInfo| x.kind == kind)),
+  }
+
 pub fn constructors_of_type(
   checker: Checker,
   name: Bytes,
@@ -1854,7 +1883,7 @@ pub fn builtin_of_extern(
   );
   let keyed = params.types.push(return_type.ty).fold([], |accumulator: List<Type>, t: Type|
     map_key_types(t, accumulator)).fold([], |accumulator: List<Int>, k: Type|
-    ints_union(accumulator, order_needs(k, Map::new())));
+    ints_union(accumulator, with_no_other_definitions(|| order_needs(k, Map::new()))));
   let found = range(0, definition.generics.types.len()).fold(
     written,
     |accumulator: List<DefinitionConstraint>, i: Int|
@@ -2106,12 +2135,98 @@ pub type Shapes = Map<Bytes, AlgebraicShape>
 
 pub fn find_adt(adts: Shapes, name: Bytes) -> Option<AlgebraicShape> = adts.get(name)
 
+pub fn algebraic_shapes(checker: Checker) -> Shapes =
+  checker.types.fold(
+    sum_shapes(checker.constructors),
+    |accumulator: Shapes, name: Bytes, declaration: TypeDeclaration|
+      match declaration.declared {
+        DeclaredExtern ->
+          accumulator.insert(name, {
+            name: name,
+            params: [],
+            effect_params: [],
+            fields: [],
+            native: true,
+          }),
+        _ -> accumulator,
+      },
+  )
+
+pub fn sum_shapes(constructors: List<ConstructorInfo>) -> Shapes =
+  constructors.fold(Map::new(), |accumulator: Shapes, constructor_info: ConstructorInfo|
+    match accumulator.get(constructor_info.type_name) {
+      None -> {
+        let scheme = constructor_info.scheme;
+        accumulator.insert(constructor_info.type_name, {
+          name: constructor_info.type_name,
+          params: if scheme.label_variables.len() == 0 { scheme.type_variables }
+          else { scheme.type_variables.concat(scheme.label_variables) },
+          effect_params: scheme.effect_variables,
+          fields: constructor_info.fields,
+          native: false,
+        })
+      },
+      Some(a) ->
+        accumulator.insert(constructor_info.type_name, {
+          ..a,
+          fields: a.fields.concat(constructor_info.fields),
+        }),
+    })
+
+pub fn compares_through_key(deriver: Deriver) -> Bool =
+  deriver == EqDeriver || deriver == OrderingDeriver || deriver == HashDeriver
+
+fn instances_by_type(
+  instances: List<InstanceInfo>,
+  kind: InstanceKind,
+) -> Map<Bytes, InstanceInfo> =
+  instances.fold(Map::new(), |accumulator: Map<Bytes, InstanceInfo>, x: InstanceInfo|
+    if x.kind != kind || accumulator.contains(x.type_name) { accumulator }
+    else { accumulator.insert(x.type_name, x) })
+
+pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver) -> Shapes =
+  if instances.len() == 0 { adts } else {
+    let keyed = compares_through_key(deriver);
+    if !keyed && !(deriver == ShowDeriver) { adts } else {
+      let stated = instances_by_type(instances, if keyed { KeyInstance } else { ShowInstance });
+      adts.fold(adts, |accumulator: Shapes, name: Bytes, shape: AlgebraicShape|
+        match stated.get(name) {
+          Some(x) ->
+            accumulator.insert(name, {
+              ..shape,
+              params: x.params,
+              effect_params: x.effect_params,
+              fields: if keyed { [x.results] } else { [] },
+            }),
+          None -> accumulator,
+        })
+    }
+  }
+
+fn shape_named(
+  deriver: Deriver,
+  adts: Shapes,
+  name: Bytes,
+) -> Option<AlgebraicShape> / {program.read} =
+  match find_adt(adts, name) {
+    Some(a) -> Some(a),
+    None -> match program.type_named(name) {
+      Some(f) -> if compares_through_key(deriver) { f.compared }
+      else if deriver == ShowDeriver { f.shown }
+      else { f.shape },
+      None -> None,
+    },
+  }
+
+const most_types_on_a_path: Int = 1048576
+
 pub fn derivable(
   deriver: Deriver,
   ty: Type,
   adts: Shapes,
   assumed: List<Int>,
-) -> Option<Blocker> / {abort.raise} = derivable_within(deriver, ty, adts, assumed, [], adts.len())
+) -> Option<Blocker> / {abort.raise, program.read} =
+  derivable_within(deriver, ty, adts, assumed, [], most_types_on_a_path)
 
 fn first_blocked(
   deriver: Deriver,
@@ -2120,7 +2235,7 @@ fn first_blocked(
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
-) -> Option<Blocker> / {abort.raise} =
+) -> Option<Blocker> / {abort.raise, program.read} =
   types.fold(None, |accumulator: Option<Blocker>, ty: Type|
     match accumulator {
       Some(_) -> accumulator,
@@ -2134,7 +2249,7 @@ fn derivable_within(
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
-) -> Option<Blocker> / {abort.raise} =
+) -> Option<Blocker> / {abort.raise, program.read} =
   match ty {
     VariableType(v) -> if assumed.contains(v) { None }
     else { Some({ ty: ty, reason: Unconstrained(v) }) },
@@ -2148,7 +2263,7 @@ fn derivable_within(
       Rejected(reason) -> Some({ ty: ty, reason: reason }),
       Structural -> first_blocked(deriver, c.args, adts, assumed, visiting, room),
       Nominal -> if visiting.contains(c.name) { None } else {
-        match find_adt(adts, c.name) {
+        match shape_named(deriver, adts, c.name) {
           None -> None,
           Some(adt) -> if adt.native { Some({ ty: ty, reason: ContainsNative }) }
           else if room <= 0 { panic("the search visited a type more than once on one path") } else {
@@ -2166,7 +2281,7 @@ fn derivable_within(
     },
   }
 
-pub fn order_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise} =
+pub fn order_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise, program.read} =
   iterate([], variables_of_type(ty).len() + 2, |found: List<Int>|
     match derivable(OrderingDeriver, ty, shapes, found) {
       Some(b) -> match b.reason {

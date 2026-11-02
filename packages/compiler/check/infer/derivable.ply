@@ -1,7 +1,8 @@
 import compiler.check.resolve.tables (module_names)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
-import compiler.check.infer.checker (program)
+import compiler.check.infer.checker (program, numeric_stated, instance_stated)
+import compiler.check.infer.checker (algebraic_shapes, compares_through_key, instance_shapes)
 import compiler.check.infer.checker (type_declared)
 import compiler.syntax.parsing (Span)
 import compiler.syntax.items (Item, FunctionItem, FnDefinition, Deriver, EqDeriver, OrderingDeriver,
@@ -33,7 +34,7 @@ import compiler.check.infer.declarations (assume, written_signature, OrderedPart
 import compiler.check.infer.expression (operation_free_variables, numeric_of, ordered_parts,
                                         note_type_constraints_in)
 import compiler.check.known (name_of, is_integer_name, is_float, is_decimal)
-import compiler.check.infer.definitions (algebraic_shapes, is_key)
+import compiler.check.infer.definitions (is_key)
 
 fn with_flexible(checker: Checker, ty: Type, assumed: List<Int>) -> List<Int> / {abort.raise} =
   variables_of_type(ty).fold(assumed, |vs: List<Int>, v: Int|
@@ -352,7 +353,7 @@ fn declared_type_constraints(
 fn ordered_params_of(
   type_contents: List<TypeContents>,
   ordering: Shapes,
-) -> Map<Bytes, List<Int>> / {abort.raise} = {
+) -> Map<Bytes, List<Int>> / {abort.raise, program.read} = {
   let room = type_contents.fold(2, |n: Int, h: TypeContents| n + h.params.len());
   iterate(Map::new(), room, |table: Map<Bytes, List<Int>>| {
     let next = type_contents.fold(
@@ -375,7 +376,7 @@ fn positions_among(variables: List<Int>, keyed: List<Int>) -> List<Int> =
   range(0, variables.len()).filter(|i: Int|
     match variables.at(i) { Some(v) -> keyed.contains(v), None -> false })
 
-pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise} = {
+pub fn check_map_keys(checker: Checker) -> Checker / {abort.raise, program.read} = {
   let ordered = instance_shapes(checker.instances, algebraic_shapes(checker), OrderingDeriver);
   let walked = checker.map_keys.fold(
     { checker: { ..checker, map_keys: [] }, seen: [] },
@@ -464,7 +465,7 @@ fn with_alias_note(notes: List<Bytes>, via: Bytes) -> List<Bytes> =
 fn is_case_constraint(site: ConstraintSite) -> Bool =
   site.callee == b"std.cases.listed" || site.callee == b"std.cases.chosen"
 
-pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
+pub fn check_constraints(checker: Checker) -> Checker / {abort.raise, program.read} = {
   let adts = algebraic_shapes(checker);
   let shapes = deriver_shapes(checker.instances, adts);
   let walked = checker.constrained_uses.fold(
@@ -565,7 +566,11 @@ pub fn check_constraints(checker: Checker) -> Checker / {abort.raise} = {
   walked.checker
 }
 
-pub fn resolved_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
+pub fn resolved_witness(
+  checker: Checker,
+  deriver: Deriver,
+  ty: Type,
+) -> Option<NumericWitness> / {program.read} =
   match ty {
     VariableType(v) -> match checker.witnessed.get(v) {
       Some(w) -> Some(ParamWitness(w.param)),
@@ -574,15 +579,19 @@ pub fn resolved_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<
     _ -> concrete_witness(checker, deriver, ty),
   }
 
-fn concrete_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<NumericWitness> =
+fn concrete_witness(
+  checker: Checker,
+  deriver: Deriver,
+  ty: Type,
+) -> Option<NumericWitness> / {program.read} =
   match ty {
     NamedType(k) -> if k.args.len() != 0 { None }
     else if is_integer_name(k.name) { Some(ConcreteWitness(k.name)) }
     else if deriver == NumericDeriver && (is_float(ty) || is_decimal(ty)) {
       Some(ConcreteWitness(k.name))
     } else if deriver == NumericDeriver {
-      match numeric_of(checker.numeric_types, k.name) {
-        Some(x) -> match instance_of(checker.instances, k.name, KeyInstance) {
+      match numeric_stated(checker, k.name) {
+        Some(x) -> match instance_stated(checker, k.name, KeyInstance) {
           Some(_) -> Some(StatedWitness(x.constructor)),
           None -> None,
         },
@@ -592,7 +601,11 @@ fn concrete_witness(checker: Checker, deriver: Deriver, ty: Type) -> Option<Nume
     _ -> None,
   }
 
-fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option<NumericWitness> =
+fn predicate_witness(
+  checker: Checker,
+  site: ConstraintSite,
+  ty: Type,
+) -> Option<NumericWitness> / {program.read} =
   match ty {
     VariableType(v) -> if !site.assumed.contains(v) { None } else {
       match site.params.fold(None, |accumulator: Option<Bytes>, r: RigidParam|
@@ -604,7 +617,11 @@ fn predicate_witness(checker: Checker, site: ConstraintSite, ty: Type) -> Option
     _ -> concrete_witness(checker, site.deriver, ty),
   }
 
-fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker / {abort.raise} = {
+fn check_predicate(
+  checker: Checker,
+  site: ConstraintSite,
+  ty: Type,
+) -> Checker / {abort.raise, program.read} = {
   let callee = default_binder(site.callee);
   let dv = deriver_text(site.deriver);
   if !site.called {
@@ -679,7 +696,7 @@ fn check_predicate(checker: Checker, site: ConstraintSite, ty: Type) -> Checker 
               [
                 b"the numeric types are `Int`, the eight fixed-width integers, `Float`, `Decimal`, and a type that states `numeric` and a `key`",
               ].concat(match ty {
-                NamedType(k) -> match numeric_of(checker.numeric_types, k.name) {
+                NamedType(k) -> match numeric_stated(checker, k.name) {
                   Some(_) ->
                     [
                       Bytes::concat_all([
@@ -715,36 +732,6 @@ pub fn instance_of(
       Some(_) -> accumulator,
       None -> if x.type_name == type_name && x.kind == kind { Some(x) } else { None },
     })
-
-fn compares_through_key(deriver: Deriver) -> Bool =
-  deriver == EqDeriver || deriver == OrderingDeriver || deriver == HashDeriver
-
-fn instances_by_type(
-  instances: List<InstanceInfo>,
-  kind: InstanceKind,
-) -> Map<Bytes, InstanceInfo> =
-  instances.fold(Map::new(), |accumulator: Map<Bytes, InstanceInfo>, x: InstanceInfo|
-    if x.kind != kind || accumulator.contains(x.type_name) { accumulator }
-    else { accumulator.insert(x.type_name, x) })
-
-pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Deriver) -> Shapes =
-  if instances.len() == 0 { adts } else {
-    let keyed = compares_through_key(deriver);
-    if !keyed && !(deriver == ShowDeriver) { adts } else {
-      let stated = instances_by_type(instances, if keyed { KeyInstance } else { ShowInstance });
-      adts.fold(adts, |accumulator: Shapes, name: Bytes, shape: AlgebraicShape|
-        match stated.get(name) {
-          Some(x) ->
-            accumulator.insert(name, {
-              ..shape,
-              params: x.params,
-              effect_params: x.effect_params,
-              fields: if keyed { [x.results] } else { [] },
-            }),
-          None -> accumulator,
-        })
-    }
-  }
 
 type DeriverShapes = { plain: Shapes, comparison: Shapes, shown: Shapes }
 

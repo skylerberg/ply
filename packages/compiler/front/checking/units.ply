@@ -11,7 +11,7 @@ import compiler.emit.lower.module_context (CodeElsewhere)
 import compiler.check.infer.checker (CheckReads)
 import compiler.check.infer (types_joined)
 import compiler.check.typed (ConstantData, constant_data_bin)
-import compiler.check.types (Type, NamedType)
+import compiler.check.types (Type, NamedType, Scheme, TypeNode, TypeTable, NodeNamed, NodeNominal)
 import compiler.cc (WrittenPart)
 import compiler.emit
 import compiler.emit.keys (RootKey, Named, Specialisation, Generated, Test, TestCases, Law, Clause,
@@ -22,26 +22,28 @@ import compiler.emit.output (Output, RootOutput, Prototype, prototype_bin)
 import compiler.emit.representations (type_names, BoundLambda)
 import compiler.emit.roots (root_id)
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
-import compiler.front.checking.groups (constructors_reached_from, GroupKey, group_key_bin,
-                                       module_groups, group_program, group_program_of,
-                                       with_group_read, GroupRead, declared_of, owners_result_of, stored_rows,
-                                       OwnersResult, owner_key_bin, group_key_of, group_of)
+import compiler.front.checking.groups (known_of_types, GroupKey, group_key_bin, module_groups,
+                                       group_program, group_program_of, with_group_read, GroupRead,
+                                       declared_of, owners_result_of, stored_rows, OwnersResult,
+                                       owner_key_bin, group_key_of, group_of)
 import compiler.front.owner_checks (MemberResult)
 import compiler.front.checking.world (module_read, ModuleKey, module_key_bin, decoded, QueryEffects,
                                       RunEffects, CheckQuery, decode_cache, package_location_of)
-import compiler.front.emitter_input (Analysed, KnownConstructors, Rejected, joined_constructors,
+import compiler.front.emitter_input (Analysed, KnownConstructors, Rejected, stated_by_constructor,
                                      with_known_constructors)
+import compiler.front.facts (Analysis)
+import compiler.check.resolve.tables (Diagnostic)
 import compiler.front.exports (Mention, mention_bin, OwnerInterface)
 import compiler.front.published (dump_of)
-import compiler.front.rows (OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
+import compiler.front.rows (Dump, OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
                             KnownDefinitionRow)
 import compiler.store.hash.template (emitted_code)
 import compiler.store.memo (memo)
 import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (always_enters, CalleeFacts, LoweredBatch, LoweredUnit, UnitCode, UnitSummary,
-                      RootSummary, unit_code_bin, unit_summary_bin, no_callee_facts,
-                      with_callee, unit_lowered, program_batch, types_keyed, part_library, enters)
+                      RootSummary, unit_code_bin, unit_summary_bin, no_callee_facts, with_callee,
+                      unit_lowered, program_batch, types_keyed, part_library, enters)
 
 pub type CodeUnit = | OfGroup(GroupKey) | OfRoot(RootAt) | NoCode
 
@@ -276,13 +278,11 @@ fn type_mentions(k: RootKey) -> List<Mention> / {abort.raise} =
 fn generated_mentions(k: RootKey) -> List<Mention> =
   match k {
     Generated(w, _) ->
-      emitted_code.calls.map(|n: Bytes| { module: prelude_module, name: n }).concat(
-        match w.operation {
-          Reflect -> [{ module: b"std.value", name: b"Value" }],
-          Show -> [{ module: b"std.value", name: b"Value" }],
-          _ -> [],
-        },
-      ),
+      marshalling_mentions.concat(match w.operation {
+        Reflect -> [{ module: b"std.value", name: b"Value" }],
+        Show -> [{ module: b"std.value", name: b"Value" }],
+        _ -> [],
+      }),
     _ -> [],
   }
 
@@ -431,18 +431,60 @@ pub fn code_of_group(
 fn module_key_of(g: GroupKey) -> ModuleKey =
   { module: g.module, shipped: g.shipped, tested: g.tested }
 
-fn constructors_known(
+fn names_in_table(table: TypeTable) -> List<Bytes> =
+  table.fold([], |found: List<Bytes>, _: Bytes, node: TypeNode|
+    match node {
+      NodeNamed(n) -> found.push(n.name),
+      NodeNominal(n) -> found.push(n.name),
+      _ -> found,
+    })
+
+type LoweredGroup = {
+  analysis: Analysis,
+  dump: Dump,
+  known: KnownConstructors,
+  elsewhere: CodeElsewhere,
+  types: List<TypeTable>,
+}
+
+fn group_lowered(
   key: ProgramKey,
   roots: List<RootKey>,
   tested: Bool,
-) -> KnownConstructors / {memo.read, abort.raise} =
-  joined_constructors(
-    key.also.map(|m: Mention| m.module).concat(lambda_owners(roots).map(module_of)).unique().filter(
-      |m: Bytes| m.len() > 0 && m != key.group.module,
-    ).map(|m: Bytes| constructors_reached_from(module_key_in(m, tested))).push(
-      constructors_reached_from(module_key_of(key.group)),
-    ),
+) -> Result<LoweredGroup, List<Diagnostic>> / {QueryEffects, abort.raise} = {
+  let g = group_program_of(key.group);
+  let rows = stored_rows(key.group);
+  with_group_read(
+    [{ named: g.named, members: g.members, imported: g.imported }],
+    g.sibling,
+    g.bodies,
+    key.also,
+    |group: GroupRead|
+      match checked_group({ ..group.inputs, rows: rows }, group.walks).pulled.out {
+        Rejected(ds) -> Err(ds),
+        Analysed(a) -> {
+          let dump = dump_of(Analysed(a));
+          let found = code_of_group(group, tested);
+          let known = known_of_types(
+            g.types.concat([rows.types, dump.rows.types]).flat_map(names_in_table).concat(
+              found.schemes.values().flat_map(|s: Scheme| type_names(s.ty)),
+            ).concat(
+              roots.flat_map(types_keyed).flat_map(type_names),
+            ).concat(
+              group.mentioned.map(|m: Mention| qualify(m.module, m.name)),
+            ),
+          );
+          Ok({
+            analysis: a,
+            dump: with_known_constructors(dump, known),
+            known: known,
+            elsewhere: { ..found, stated: stated_by_constructor(known) },
+            types: g.types,
+          })
+        },
+      },
   )
+}
 
 fn program_scope(
   s: Lowering,
@@ -452,56 +494,40 @@ fn program_scope(
   let at = bin::encode(key, program_key_bin());
   match s.scopes.get(at) {
     Some(p) -> { state: s, program: p },
-    None -> {
-      let g = group_program_of(key.group);
-      let read = with_group_read(
-        [{ named: g.named, members: g.members, imported: g.imported }],
-        g.sibling,
-        g.bodies,
-        key.also,
-        |group: GroupRead|
-          {
-            out: checked_group({ ..group.inputs, rows: stored_rows(key.group) }, group.walks),
-            elsewhere: code_of_group(group, s.tested),
-          },
-      );
-      match read.out.pulled.out {
-        Rejected(ds) ->
-          panic(
-            String::of_bytes_lossy(
-              Bytes::concat_all([
-                b"a checked group of `",
-                key.group.module,
-                b"` was rejected when it was lowered alone: ",
-                emit::diagnostics_text(ds),
-              ]),
-            ),
+    None -> match group_lowered(key, roots, s.tested) {
+      Err(ds) ->
+        panic(
+          String::of_bytes_lossy(
+            Bytes::concat_all([
+              b"a checked group of `",
+              key.group.module,
+              b"` was rejected when it was lowered alone: ",
+              emit::diagnostics_text(ds),
+            ]),
           ),
-        Analysed(a) -> {
-          let known = constructors_known(key, roots, s.tested);
-          let dump = with_known_constructors(dump_of(Analysed(a)), known);
-          let batch = program_batch(
-            dump,
-            [],
-            module_units_of(module_key_of(key.group)).stated,
-            [],
-            released_by: known.released,
-          );
-          let scope = emit::scope_over(
-            a.modules,
-            a.r,
-            batch.constructors,
-            true,
-            roots,
-            { ..dump.rows, types: g.types.fold(dump.rows.types, types_joined) },
-            dump.effects,
-            dump.inferred_facts,
-            read.elsewhere,
-          );
-          let p = { scope: scope, batch: { ..batch, natives: scope.natives } };
-          { state: { ..s, scopes: s.scopes.insert(at, p) }, program: p }
-        },
-      }
+        ),
+      Ok(g) -> {
+        let batch = program_batch(
+          g.dump,
+          [],
+          module_units_of(module_key_of(key.group)).stated,
+          [],
+          released_by: g.known.released,
+        );
+        let scope = emit::scope_over(
+          g.analysis.modules,
+          g.analysis.r,
+          batch.constructors,
+          true,
+          roots,
+          { ..g.dump.rows, types: g.types.fold(g.dump.rows.types, types_joined) },
+          g.dump.effects,
+          g.dump.inferred_facts,
+          g.elsewhere,
+        );
+        let p = { scope: scope, batch: { ..batch, natives: scope.natives } };
+        { state: { ..s, scopes: s.scopes.insert(at, p) }, program: p }
+      },
     },
   }
 }
@@ -527,10 +553,7 @@ fn asked_of_program(
     { state: p.state, lent: Map::new() },
     |l: LentLambdas, o: RootKey| {
       let q = program_scope(l.state, program_of_root(o, tested), [o]);
-      {
-        state: q.state,
-        lent: l.lent.insert(root_name(o), emit::owner_lambdas(q.program.scope, o)),
-      }
+      { state: q.state, lent: l.lent.insert(root_name(o), emit::owner_lambdas(q.program.scope, o)) }
     },
   );
   {
@@ -837,14 +860,21 @@ pub const code_product_queries: List<Bytes> =
 
 pub const enterable_query: Bytes = b"enterable"
 
+const marshalling_mentions: List<Mention> =
+  emitted_code.calls.concat(emitted_code.insert_calls).map(|n: Bytes|
+    { module: prelude_module, name: n })
+
 pub fn enterable_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let at = decoded(input, root_at_bin(), "a root's key");
   let key = program_of_root(at.key, at.tested);
-  let program = group_program(key.group, key.also);
   bin::encode(
-    match program.check.out.pulled.out {
-      Rejected(_) -> false,
-      Analysed(a) -> enters(dump_of(Analysed(a)), at.key),
+    match group_lowered(
+        { ..key, also: key.also.concat(marshalling_mentions) },
+        [at.key],
+        at.tested,
+      ) {
+      Err(_) -> false,
+      Ok(g) -> enters(g.dump, at.key, g.elsewhere.schemes),
     },
     bin::bool_bin(),
   )
