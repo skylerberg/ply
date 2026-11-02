@@ -1,12 +1,21 @@
-import compiler.load (Derives, LoadedAnalysis)
+import compiler.load (Derives)
+import compiler.check.types (Effect)
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.front.checking.view
+import compiler.front.checking.view (Modules, NamedRollup)
+import entries
+import entries (Runnable)
 import args (Flags, no_flags, style_of, root_of)
 import config_schema
 import configuration
 import configuration (Report, ReportKey, Resolution)
 import std.env (env)
-import program (TimedLoad, loaded_analysis, timed_uncached, program_view)
+import program (places_of, session)
 import builder (builder)
 import compiler.unit (shipped)
+import compiler.cc (toolchain)
+import compiler.store.memo (memo)
+import std.random (entropy)
 import std.fs (fs, Missing)
 import std.time (time)
 import compiler.check.resolve.tables (Diagnostic)
@@ -20,7 +29,7 @@ import std.list (prepend)
 import std.machine as entering
 import machine
 import units
-import units (CodeProgram, code_program, emit)
+import units (CodeProgram, emit)
 import std.term (Style, plain, red)
 import std.string
 import std.text
@@ -362,25 +371,51 @@ fn preview_output(style: Style, flags: Flags, p: Preview) -> CommandOutput / {ab
     Bound -> hosts_output(style, flags, p),
   }
 
+type HostsReading = {
+  rollups: List<NamedRollup>,
+  performed: List<Effect>,
+  schema: Option<Diagnostic>,
+}
+
+fn hosts_reading(
+  options: machine::Options,
+  modules: Modules,
+) -> HostsReading / {memo.read, abort.raise} =
+  {
+    rollups: view::rollups(modules),
+    performed: view::performed_by(modules),
+    schema: config_schema::listed_schema_error(modules, options.config.schema),
+  }
+
 pub fn run(
   flags: Flags,
   options: machine::Options,
-) -> CommandOutput / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, entering::machine.open, entering::machine.enter, entering::machine.close, entering::machine.hosting, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.code, emit.libraries, Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, entering::machine.open, entering::machine.enter, entering::machine.close, entering::machine.hosting, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.code, emit.libraries, Derives, abort.raise, diverges} = {
   let s: Style = style_of(flags);
-  let t: TimedLoad = timed_uncached(flags.paths, flags.verify_dependencies);
-  match program_view(t.program) {
-    None -> rejected(s, "hosts", t.program.diagnostics, t.program.source_texts),
-    Some(w) -> match config_schema::schema_error(w.checked.definitions, options.config.schema) {
-      Some(d) -> binding_failure(s, [d], t.program.source_texts),
-      None ->
-        bind_and_preview(
-          s,
-          flags,
-          options,
-          code_program(t, w),
-          loaded_analysis(t, w),
-          t.program.source_texts,
-        ),
+  match session(
+      flags.paths,
+      flags.verify_dependencies,
+      false,
+      |modules: Modules, _: ProgramSummary| hosts_reading(options, modules),
+    ) {
+    Err(r) -> rejected(s, "hosts", r.diagnostics, r.places),
+    Ok(opened) -> {
+      let places = places_of(opened);
+      match opened.value.schema {
+        Some(d) -> binding_failure(s, [d], places),
+        None -> match units::code_program_of(opened, opened.value.rollups) {
+          Err(diagnostics) -> rejected(s, "hosts", diagnostics, places),
+          Ok(program) ->
+            bind_and_preview(
+              s,
+              flags,
+              options,
+              program,
+              entries::runnable_from_rollups(opened.value.rollups, opened.value.performed),
+              places,
+            ),
+        },
+      }
     },
   }
 }
@@ -390,20 +425,24 @@ fn bind_and_preview(
   flags: Flags,
   options: machine::Options,
   program: CodeProgram,
-  front: LoadedAnalysis,
+  runnable: Runnable,
   places: List<SourceText>,
 ) -> CommandOutput / {entering::machine.open, entering::machine.enter, entering::machine.close, entering::machine.hosting, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], emit.code, emit.libraries, abort.raise} =
   match configuration::resolve_configuration(options.config, |name: String|
       configuration::evaluate_schema(program, options.profile, name)) {
     Err(diagnostics) -> binding_failure(style, diagnostics, places),
     Ok(r) ->
-      preview_output(style, flags, preview_of(root_of(flags).machine, options, front, r, places)),
+      preview_output(
+        style,
+        flags,
+        preview_of(root_of(flags).machine, options, runnable, r, places),
+      ),
   }
 
 fn preview_of(
   path: String,
   options: machine::Options,
-  front: LoadedAnalysis,
+  runnable: Runnable,
   resolution: Resolution,
   places: List<SourceText>,
 ) -> Preview / {entering::machine.hosting, abort.raise} = {
@@ -433,7 +472,7 @@ fn preview_of(
     diagnostics: resolution.warnings,
     places: places,
   };
-  let declared = host_listing::declared_of(front.dump);
+  let declared = runnable.declared;
   let rejected = match host_listing::allow_error(options.allow, declared) {
     Some(d) -> [d],
     None -> hosting.rejections.map(machine::unplaced),
@@ -441,7 +480,7 @@ fn preview_of(
   if rejected.len() > 0 {
     { ..base, stage: NotBound, diagnostics: base.diagnostics.concat(rejected) }
   } else {
-    let l = host_listing::listing_of(declared, host_listing::performed_effects(front.dump));
+    let l = host_listing::listing_of(declared, runnable.performed);
     let d = host_listing::host_settings_of(
       l,
       hosting,

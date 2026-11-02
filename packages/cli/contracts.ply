@@ -5,15 +5,16 @@ import paths (ResolvedPath, here)
 import registry (BaseUrl, base_of, registry_unreachable, unset, rejected_package, url_variable)
 import remote (FetchedClosure, fetch_closure, index_of)
 import report (CommandOutput, indent, ok_code, count_of, reported)
-import sources (shipping_for)
+import sources (DependencyPackage, File, Project)
 import std.term (Style, bold, green, yellow)
 import builder (builder)
-import compiler.front.published (no_rows)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.facts (Analysis)
-import compiler.front (EmbedRecord, ShippedInputs, analyse_pulling_std_with)
-import compiler.store.hash (Contract, public_contracts)
-import compiler.front.pkg (PackageSources, SuppliedPackage, is_dotted_path)
+import compiler.store.hash (Contract)
+import compiler.load (Derives)
+import compiler.front.checking (LoadInputs)
+import compiler.front.checking.interfaces (PublishedModule, published_module)
+import compiler.front.checking.view
+import program (ProgramStore, in_program_store)
+import compiler.front.pkg (SuppliedPackage, is_dotted_path)
 import compiler.check.resolve.tables (Diagnostic, Source, error_at)
 import std.fs (fs)
 import std.json (Json, Array, Bool, Number, Str, object)
@@ -46,54 +47,71 @@ fn consumer_manifest(manifest: Manifest) -> Bytes =
       ++ ", source: Registry }], entry: None }\n",
   )
 
-pub type Consumer = {
-  packages: PackageSources,
-  whole: Analysis,
-  modules: List<Bytes>,
-  shipping: ShippedInputs,
-}
-
-pub fn analyse_as_consumer(
-  root: Bytes,
+fn consumer_project(
+  root: String,
   manifest: Manifest,
-  own: SuppliedPackage,
-  dependencies: List<SuppliedPackage>,
-  embeds: List<EmbedRecord>,
-) -> Result<Consumer, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let packages: PackageSources = {
+  packages: List<DependencyPackage>,
+) -> Project =
+  {
+    files: [],
+    sources: [],
+    diagnostics: [],
+    manifest: Some({
+      path: "ply.pkg",
+      module: "",
+      text: consumer_manifest(manifest),
+      at: { label: "abs", path: root ++ "/ply.pkg" },
+    }),
+    packages: packages,
+    root_key: root,
+  }
+
+pub fn package_of_supplied(s: SuppliedPackage) -> DependencyPackage = {
+  let root = String::of_bytes_lossy(s.root);
+  {
     root: root,
-    manifest: Some(consumer_manifest(manifest)),
-    supplied: dependencies.fold([own], |accumulator: List<SuppliedPackage>, s: SuppliedPackage|
-      accumulator.push(s)),
-  };
-  let shipping = shipping_for([], packages);
-  match analyse_pulling_std_with(
-      [],
-      shipping.sources,
-      no_rows,
-      packages,
-      embeds,
-      unread: shipping.unread,
-      data: shipping.data,
-    ).out {
-    Rejected(ds) -> Err(ds),
-    Analysed(w) -> {
-      let prefix = Bytes::of_string(prefix_of(manifest));
-      Ok({
-        packages: packages,
-        whole: w,
-        modules: own.modules.map(|s: Source| Bytes::concat_all([prefix, b".", s.name])),
-        shipping: shipping,
-      })
-    },
+    dir: root,
+    manifest: s.manifest,
+    files: s.modules.map(|m: Source| {
+      let module = String::of_bytes_lossy(m.name);
+      {
+        path: module,
+        module: module,
+        text: m.source_text,
+        at: { label: "abs", path: root ++ "/" ++ module },
+      }
+    }),
   }
 }
 
-pub fn consumer_contracts(c: Consumer) -> List<Contract> / {abort.raise} = {
-  let mine = c.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: Bytes|
-    accumulator.insert(m, true));
-  public_contracts(c.whole.index, c.whole.hashes, |m: Bytes| mine.contains(m))
+pub fn consumed_modules(
+  store: Option<ResolvedPath>,
+  root: String,
+  manifest: Manifest,
+  own: DependencyPackage,
+  dependencies: List<DependencyPackage>,
+) -> Result<List<PublishedModule>, List<Diagnostic>> / {ProgramStore, abort.raise} = {
+  let prefix = prefix_of(manifest);
+  let names = own.files.map(|f: File| Bytes::of_string(prefix ++ "." ++ f.module));
+  in_program_store(
+    { project: consumer_project(root, manifest, [own].concat(dependencies)), store: store },
+    |w: LoadInputs|
+      match view::rejections(w.own, view::summary(w.own)) {
+        [] ->
+          Ok(
+            names.map(|name: Bytes|
+              match published_module({ module: name, shipped: false, tested: false }) {
+                Some(m) -> m,
+                None -> panic("a module the consumer's check accepted has no interface"),
+              }),
+          ),
+        rejected -> Err(rejected),
+      },
+  ).value
 }
+
+pub fn contracts_in(modules: List<PublishedModule>) -> List<Contract> =
+  modules.fold([], |found: List<Contract>, m: PublishedModule| found.concat(m.contracts))
 
 pub type ContractChanges = { added: List<String>, changed: List<String>, removed: List<String> }
 
@@ -232,24 +250,24 @@ pub fn unpublished(name: String, version: Version) -> Diagnostic =
 
 pub fn published_contracts(
   base: BaseUrl,
-  root: String,
+  at: ResolvedPath,
   name: String,
   index: Index,
   version: Version,
-) -> Result<List<Contract>, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+) -> Result<List<Contract>, List<Diagnostic>> / {ProgramStore, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
   match release_at(index, version) {
     None -> Err([unpublished(name, version)]),
-    Some(r) -> match fetch_closure(base, root, name, r) {
+    Some(r) -> match fetch_closure(base, at.absolute, name, r) {
       Err(d) -> Err([d]),
-      Ok(c) -> match analyse_as_consumer(
-          Bytes::of_string(root),
+      Ok(c) -> match consumed_modules(
+          Some(at),
+          at.absolute,
           c.manifest,
-          c.own,
-          c.dependencies,
-          [],
+          package_of_supplied(c.own),
+          c.dependencies.map(package_of_supplied),
         ) {
         Err(ds) -> Err(ds),
-        Ok(x) -> Ok(consumer_contracts(x)),
+        Ok(modules) -> Ok(contracts_in(modules)),
       },
     },
   }
@@ -257,7 +275,7 @@ pub fn published_contracts(
 pub fn run(
   flags: Flags,
   opts: Options,
-) -> CommandOutput / {env.variable, fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
+) -> CommandOutput / {env.variable, ProgramStore, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
   let s = style_of(flags);
   if !is_dotted_path(opts.name) {
     reported(
@@ -283,10 +301,10 @@ pub fn run(
           Ok(base) -> match index_of(base, opts.name) {
             Err(d) -> reported(s, "contracts", [d], []),
             Ok(index) -> {
-              let root = root_of(flags).absolute;
-              match published_contracts(base, root, opts.name, index, from) {
+              let at = root_of(flags);
+              match published_contracts(base, at, opts.name, index, from) {
                 Err(ds) -> reported(s, "contracts", ds, []),
-                Ok(was) -> match published_contracts(base, root, opts.name, index, to) {
+                Ok(was) -> match published_contracts(base, at, opts.name, index, to) {
                   Err(ds) -> reported(s, "contracts", ds, []),
                   Ok(now) -> contracts_output(s, opts, from, to, contract_changes(was, now)),
                 },

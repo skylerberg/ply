@@ -4,7 +4,10 @@ import builder (builder)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
 import compiler.front
-import compiler.front.facts (CheckedProgram)
+import compiler.front.facts (ProgramListing)
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.front.checking.view
+import compiler.front.checking.view (Modules)
 import compiler.front.rows (OutlineItem, OutlinedType, KnownTestRow)
 import compiler.front.published (StoredBody, stored_bodies)
 import compiler.front.emitter_input (all_body_facts, definition_known_row)
@@ -15,12 +18,12 @@ import compiler.store.memo_files (KindUsage)
 import compiler.check.resolve.tables (Diagnostic, qualify)
 import compiler.syntax.type_syntax (mode_text)
 import compiler.check.types (Type, scheme_text, type_text)
-import diagnostic (position_of)
+import diagnostic (SourceText, position_of)
 import project_store
 import paths
 import std.env (env)
 import std.path (join, strip_root)
-import program (Program, load_program, program_view)
+import program (places_of, session)
 import module_queries
 import std.bin
 import std.bytes
@@ -594,10 +597,10 @@ fn matches_query(query: String, name: Bytes, hash: Bytes) -> Bool / {abort.raise
 }
 
 fn file_location(
-  program: Program,
+  places: List<SourceText>,
   at: Location,
 ) -> { file: String, location: Option<String> } / {abort.raise} =
-  match program.source_texts.at(at.module) {
+  match places.at(at.module) {
     Some(place) ->
       {
         file: place.path,
@@ -619,15 +622,15 @@ fn operation_of(o: OperationInfo) -> Operation / {abort.raise} =
   }
 
 fn matches_in(
-  program: Program,
-  w: CheckedProgram,
+  places: List<SourceText>,
+  w: ProgramListing,
   query: String,
   proven: Map<Bytes, Bool>,
 ) -> List<Entry> / {abort.raise} = {
-  let definitions = by_name(w.frame.hashes.definitions);
-  let declarations = by_name(w.frame.hashes.declarations);
+  let definitions = by_name(w.hashes.definitions);
+  let declarations = by_name(w.hashes.declarations);
   let read = all_body_facts(w.checked);
-  let bodies = stored_bodies(w.frame.hashes).fold(
+  let bodies = stored_bodies(w.hashes).fold(
     Map::new(),
     |accumulator: Map<Bytes, Int>, b: StoredBody| accumulator.insert(b.hash, b.body.len()),
   );
@@ -636,7 +639,7 @@ fn matches_in(
   let functions = w.checked.definitions.fold([], |accumulator: List<Entry>, d: DefinitionInfo| {
     let hash = hash_of(d.name, definitions);
     if !matches_query(query, d.name, hash) { accumulator } else {
-      let at = file_location(program, d.at);
+      let at = file_location(places, d.at);
       let row = if definitions.contains(d.name) {
         Some(definition_known_row(declarations, d, read))
       } else { None };
@@ -657,48 +660,45 @@ fn matches_in(
       })
     }
   });
-  let types = range(0, w.frame.outlines.len()).fold(
-    functions,
-    |accumulator: List<Entry>, i: Int| {
-      let o = w.frame.outlines.get(i);
-      o.items.fold(accumulator, |a: List<Entry>, item: OutlineItem|
-        match item {
-          OutlinedType(t) -> {
-            let name = qualify(o.name, t.name);
-            let hash = hash_of(name, declarations);
-            if !matches_query(query, name, hash) { a } else {
-              let at = file_location(program, { module: i, span: t.span });
-              a.push({
-                name: String::of_bytes_lossy(name),
-                kind: TypeEntry,
-                hash: hash.hex_of(),
-                file: at.file,
-                location: at.location,
-                interface: TypeInterface(
-                  t.arity,
-                  w.checked.constructors.filter(|c: ConstructorInfo| c.type_name == name).map(
-                    |c: ConstructorInfo|
-                      {
-                        name: String::of_bytes_lossy(c.simple_name),
-                        fields: c.fields.map(|f: Type| String::of_bytes_lossy(type_text(f))),
-                      },
-                  ),
+  let types = range(0, w.outlines.len()).fold(functions, |accumulator: List<Entry>, i: Int| {
+    let o = w.outlines.get(i);
+    o.items.fold(accumulator, |a: List<Entry>, item: OutlineItem|
+      match item {
+        OutlinedType(t) -> {
+          let name = qualify(o.name, t.name);
+          let hash = hash_of(name, declarations);
+          if !matches_query(query, name, hash) { a } else {
+            let at = file_location(places, { module: i, span: t.span });
+            a.push({
+              name: String::of_bytes_lossy(name),
+              kind: TypeEntry,
+              hash: hash.hex_of(),
+              file: at.file,
+              location: at.location,
+              interface: TypeInterface(
+                t.arity,
+                w.checked.constructors.filter(|c: ConstructorInfo| c.type_name == name).map(
+                  |c: ConstructorInfo|
+                    {
+                      name: String::of_bytes_lossy(c.simple_name),
+                      fields: c.fields.map(|f: Type| String::of_bytes_lossy(type_text(f))),
+                    },
                 ),
-                effects: None,
-                effect_hashes: [],
-                body: None,
-                outcome: None,
-              })
-            }
-          },
-          _ -> a,
-        })
-    },
-  );
+              ),
+              effects: None,
+              effect_hashes: [],
+              body: None,
+              outcome: None,
+            })
+          }
+        },
+        _ -> a,
+      })
+  });
   let effects = w.checked.effects.fold(types, |accumulator: List<Entry>, e: EffectInfo| {
     let hash = hash_of(e.name, declarations);
     if !matches_query(query, e.name, hash) { accumulator } else {
-      let at = file_location(program, e.at);
+      let at = file_location(places, e.at);
       accumulator.push({
         name: String::of_bytes_lossy(e.name),
         kind: EffectEntry,
@@ -713,15 +713,15 @@ fn matches_in(
       })
     }
   });
-  let rows = emitter_input::rows_from(w.checked, w.frame.hashes).tests.fold(
+  let rows = emitter_input::rows_from(w.checked, w.hashes).tests.fold(
     Map::new(),
     |accumulator: Map<Bytes, KnownTestRow>, r: KnownTestRow| accumulator.insert(r.key, r),
   );
   w.checked.tests.fold(effects, |accumulator: List<Entry>, t: TestInfo| {
-    let hash = match w.frame.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" };
+    let hash = match w.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" };
     if !matches_query(query, t.name, hash) && !matches_query(query, t.key, hash) { accumulator }
     else {
-      let at = file_location(program, t.at);
+      let at = file_location(places, t.at);
       let row = rows.get(t.key);
       accumulator.push({
         name: String::of_bytes_lossy(t.name),
@@ -741,37 +741,29 @@ fn matches_in(
 
 fn inspect_store<[r]>(
   place: project_store::StoreLocation,
-  program: Program,
+  places: List<SourceText>,
+  listing: ProgramListing,
   query: String,
-) -> Result<Matches, Rejection> / {fs.read[r], abort.raise} =
-  match program_view(program) {
-    None ->
-      Err({
-        directory: Some(display_path(place, "")),
-        diagnostics: program.diagnostics,
-        warnings: [],
-      }),
-    Some(w) -> {
-      let c = tables::open_cache[r](place.dir, place.stamps);
-      let proven = w.frame.hashes.tests.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Bool>, key: Bytes, h: Bytes|
-          match tables::pass_record(c, key).value {
-            Some(r) -> if r.test_hash == h { accumulator.insert(h, true) } else { accumulator },
-            None -> accumulator,
-          },
-      );
-      Ok({
-        directory: display_path(place, ""),
-        warnings: project_store::diagnostics_of(tables::warnings(c)),
-        entries: matches_in(program, w, query, proven),
-      })
-    },
+) -> Matches / {fs.read[r], abort.raise} = {
+  let c = tables::open_cache[r](place.dir, place.stamps);
+  let proven = listing.hashes.tests.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bool>, key: Bytes, h: Bytes|
+      match tables::pass_record(c, key).value {
+        Some(r) -> if r.test_hash == h { accumulator.insert(h, true) } else { accumulator },
+        None -> accumulator,
+      },
+  );
+  {
+    directory: display_path(place, ""),
+    warnings: project_store::diagnostics_of(tables::warnings(c)),
+    entries: matches_in(places, listing, query, proven),
   }
+}
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {env.working_directory, semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_us, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {env.working_directory, semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, time.elapsed_us, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   let place = project_store::store_location_of(flags.paths, project_store::shipped_stamps());
   let cwd = place.label == "cwd";
@@ -784,9 +776,28 @@ pub fn run(
   } else if flags.action == "clear" {
     clear_result(s, if cwd { clear_store[cwd](place) } else { clear_store[abs](place) })
   } else if flags.action == "copy" { copied_result(s, flags) } else {
-    let program = load_program(flags.paths, flags.verify_dependencies);
-    inspect_result(s, flags.query, if cwd { inspect_store[cwd](place, program, flags.query) }
-    else { inspect_store[abs](place, program, flags.query) })
+    inspect_result(
+      s,
+      flags.query,
+      match session(
+          flags.paths,
+          flags.verify_dependencies,
+          false,
+          |modules: Modules, _: ProgramSummary| view::listed(modules),
+        ) {
+        Err(r) ->
+          Err({
+            directory: Some(display_path(place, "")),
+            diagnostics: r.diagnostics,
+            warnings: [],
+          }),
+        Ok(opened) -> {
+          let places = places_of(opened);
+          Ok(if cwd { inspect_store[cwd](place, places, opened.value, flags.query) }
+          else { inspect_store[abs](place, places, opened.value, flags.query) })
+        },
+      },
+    )
   }
 }
 

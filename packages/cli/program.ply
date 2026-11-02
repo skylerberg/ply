@@ -316,38 +316,10 @@ pub fn module_derivations(program: Program) -> List<ModuleDerivations> =
     else { accumulator.push({ module: outline.name, derivations: outline.derived }) }
   })
 
-fn published_rows(program: Program) -> Rows / {abort.raise} =
-  program.returned.fold(no_rows, |accumulator: Rows, _: Bytes, a: ModuleResult| {
-    let rows = rows_of_result(a);
-    {
-      definitions: accumulator.definitions.concat(rows.definitions),
-      tests: accumulator.tests.concat(rows.tests),
-      types: tables_joined(accumulator.types, rows.types),
-    }
-  })
-
 pub fn program_view(program: Program) -> Option<CheckedProgram> / {abort.raise} =
   match program.frame {
     None -> None,
     Some(f) -> Some(checked_program_from_results(f, program.reads, program.returned)),
-  }
-
-fn whole_of(program: Program) -> Result<Analysis, List<Diagnostic>> / {abort.raise} =
-  match program.frame {
-    None -> Err(program.diagnostics),
-    Some(f) -> match front_end(
-        program.sources,
-        program.shipping,
-        published_rows(program),
-        program.packages,
-        program.embeds,
-        program.prune_unreached,
-        joined_cached_hashes(program.modules),
-        module_derivations(program),
-      ).out {
-      Rejected(ds) -> Err(ds),
-      Analysed(w) -> Ok({ ..w, warnings: f.warnings }),
-    },
   }
 
 pub type ParsedSources = Map<Bytes, ParsedSource>
@@ -471,8 +443,6 @@ pub fn renamed_resolution(
   }
 }
 
-fn usable(project: Project) -> Bool = project.diagnostics.len() == 0 && project.sources.len() > 0
-
 fn assembled(
   project: Project,
   shipping: ShippedInputs,
@@ -571,39 +541,6 @@ fn slots_of(project: Project) -> List<String> / {abort.raise} =
     project.packages.map(|package: DependencyPackage| package.root),
   )
 
-fn verified(
-  project: Project,
-  shipping: ShippedInputs,
-  verify: Bool,
-  program: Program,
-) -> Program / {fs.read_file[abs], abort.raise} =
-  if !verify || program.frame == None { program } else {
-    match whole_of(program) {
-      Err(ds) -> { ..program, diagnostics: ds, frame: None },
-      Ok(w) -> match interfaces::rederive_mismatches(
-          slots_of(project),
-          interfaces::dependency_sources(
-            packages_of(project),
-            project.sources.map(|source: Source| source.name),
-          ),
-          w,
-        ) {
-        [] -> program,
-        rejected -> { ..program, diagnostics: program.diagnostics.concat(rejected), frame: None },
-      },
-    }
-  }
-
-fn source_files(program: Program, frame: Frame) -> List<SourceFile> / {abort.raise} = {
-  let a_definition = modules_of(program.source_texts, frame.outlines);
-  range(0, program.source_texts.len()).map(|i: Int|
-    {
-      path: match program.source_texts.at(i) { Some(place) -> place.path, None -> "" },
-      name: match a_definition.at(i) { Some(m) -> m.name, None -> "pkg" },
-      text: match program.source_texts.at(i) { Some(place) -> place.text, None -> b"" },
-    })
-}
-
 pub fn store_of(resolved: paths::ResolvedPath) -> String =
   paths::in_root(resolved, ".ply-cache/memo").path
 
@@ -646,7 +583,7 @@ type Reached<a> = {
   rejected: List<Diagnostic>,
   warnings: List<Diagnostic>,
   value: Option<a>,
-  checked: Option<ModuleResults>,
+  mismatches: List<Diagnostic>,
 }
 
 fn root_of_inputs(project: Project, w: LoadInputs) -> List<Bytes> =
@@ -655,7 +592,7 @@ fn root_of_inputs(project: Project, w: LoadInputs) -> List<Bytes> =
 fn reached<a>(
   project: Project,
   w: LoadInputs,
-  verify: Bool,
+  published: List<interfaces::SlotInterface>,
   work: (Modules, ProgramSummary) -> a / {memo.read, abort.raise},
 ) -> Reached<a> / {memo.read, abort.raise} = {
   let read = view::summary(w.own);
@@ -668,7 +605,14 @@ fn reached<a>(
   );
   let rejected = if packaged.len() > 0 { [] } else { view::rejections(w.own, read) };
   if packaged.len() > 0 || rejected.len() > 0 {
-    { read: read, packaged: packaged, rejected: rejected, warnings: [], value: None, checked: None }
+    {
+      read: read,
+      packaged: packaged,
+      rejected: rejected,
+      warnings: [],
+      value: None,
+      mismatches: [],
+    }
   } else {
     {
       read: read,
@@ -676,7 +620,7 @@ fn reached<a>(
       rejected: [],
       warnings: view::warnings(root, read),
       value: Some(work({ root: root.len(), own: w.own, pulled: read.pulled }, read)),
-      checked: if verify { Some(module_queries::module_results(w.own)) } else { None },
+      mismatches: interfaces::rederive_mismatches(published, w.own),
     }
   }
 }
@@ -710,7 +654,7 @@ pub fn session<a>(
   verify: Bool,
   no_cache: Bool,
   work: (Modules, ProgramSummary) -> a / {memo.read, abort.raise},
-) -> Result<Session<a>, Refusal> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+) -> Result<Session<a>, Refusal> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, abort.raise, diverges} = {
   let started = time.elapsed_ms();
   session_over(paths, load_resolved(paths), started, verify, no_cache, work)
 }
@@ -722,7 +666,7 @@ pub fn session_over<a>(
   verify: Bool,
   no_cache: Bool,
   work: (Modules, ProgramSummary) -> a / {memo.read, abort.raise},
-) -> Result<Session<a>, Refusal> / {shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
+) -> Result<Session<a>, Refusal> / {shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, abort.raise} = {
   let read_ms = time.elapsed_ms() - started;
   if project.diagnostics.len() > 0 {
     Err(refused_before(own_places(project), project.diagnostics, read_ms))
@@ -735,8 +679,9 @@ pub fn session_over<a>(
       ),
     )
   } else {
+    let published = if verify { interfaces::published_interfaces(slots_of(project)) } else { [] };
     let opened = over_project(paths, project, no_cache, |w: LoadInputs|
-      reached(project, w, verify, work));
+      reached(project, w, published, work));
     let own = project_sources(project);
     let phases = {
       read_ms: read_ms,
@@ -780,15 +725,9 @@ pub fn session_over<a>(
           missing_results: opened.missing_results,
           phases: phases,
         };
-        match reach.checked {
-          None -> Ok(opened_session),
-          Some(checked) -> {
-            let timed = timed_of(opened_session, checked, true);
-            if timed.program.frame == None {
-              refused(timed.program.source_texts, timed.program.diagnostics)
-            } else { Ok(opened_session) }
-          },
-        }
+        if reach.mismatches.len() > 0 {
+          refused(own.modules.concat(own.manifests), reach.mismatches)
+        } else { Ok(opened_session) }
       },
     }
   }
@@ -820,12 +759,7 @@ pub fn program_within<a>(
   results: ModuleResults,
   no_cache: Bool,
 ) -> Program / {toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} =
-  timed_of(
-    { ..s, project: narrowed_project(s.project, included) },
-    results,
-    false,
-    no_cache,
-  ).program
+  timed_of({ ..s, project: narrowed_project(s.project, included) }, results, no_cache).program
 
 type MentionReading = { included: Map<Bytes, Bool>, results: ModuleResults }
 
@@ -861,7 +795,6 @@ pub fn load_mentioning(
 pub fn timed_of<a>(
   s: Session<a>,
   checked: ModuleResults,
-  verify: Bool,
   no_cache: Bool = false,
 ) -> TimedLoad / {toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
   let results = module_queries::results_of(s.project, {
@@ -874,42 +807,16 @@ pub fn timed_of<a>(
   });
   let shipping = if no_cache { shipping_of(results.pulled) }
   else { shipping_cached(results.pulled, results.wants) };
-  timed_from(s.paths, s.project, results, verify, shipping, s.phases.read_ms, !no_cache)
+  timed_from(s.paths, s.project, results, shipping, s.phases.read_ms, !no_cache)
 }
-
-pub fn load_program(
-  paths: List<paths::ResolvedPath>,
-  verify: Bool,
-) -> Program / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
-  let project = load_resolved(paths);
-  let results = stored_results(paths, project);
-  program_from(paths, project, results, verify, shipping_cached(results.pulled, results.wants))
-}
-
-fn stored_results(
-  paths: List<paths::ResolvedPath>,
-  project: Project,
-) -> QueryResults / {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise} =
-  if !usable(project) { module_queries::nothing } else {
-    module_queries::results_of(
-      project,
-      over_project(paths, project, false, |w: LoadInputs| module_queries::module_results(w.own)),
-    )
-  }
 
 fn program_from(
   paths: List<paths::ResolvedPath>,
   project: Project,
   results: QueryResults,
-  verify: Bool,
   shipping: ShippedInputs,
-) -> Program / {fs.read_file[abs], shipped.report_view_used, abort.raise} = {
-  let p: Program = verified(
-    project,
-    shipping,
-    verify,
-    assembled(project, shipping, paths, results),
-  );
+) -> Program / {shipped.report_view_used, abort.raise} = {
+  let p: Program = assembled(project, shipping, paths, results);
   report_viewed(p.shipped_views, true);
   p
 }
@@ -952,46 +859,16 @@ pub fn pins_for(
 ) -> Result<Pinned, { diagnostics: List<Diagnostic>, places: List<SourceText> }> / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise, diverges} =
   pins_of(load_resolved(paths))
 
-pub fn loaded_analysis(timed: TimedLoad, view: CheckedProgram) -> LoadedAnalysis / {abort.raise} = {
-  {
-    dump: view_dump({ ..view, frame: { ..view.frame, warnings: timed.program.diagnostics } }),
-    files: source_files(timed.program, view.frame),
-    inputs: timed.program.inputs,
-    read_ms: timed.read_ms,
-    front_end_ms: timed.front_end_ms,
-    store_ms: timed.store_ms,
-    cached: timed.cached,
-  }
-}
-
-pub fn timed_uncached(
-  paths: List<paths::ResolvedPath>,
-  verify: Bool,
-) -> TimedLoad / {shipped.read_pack, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, Derives, abort.raise, diverges} = {
-  let started = time.elapsed_ms();
-  let project = load_resolved(paths);
-  let results = if !usable(project) { module_queries::nothing } else {
-    module_queries::results_of(
-      project,
-      module_queries::temporary_session(project, |w: LoadInputs|
-        module_queries::module_results(w.own)),
-    )
-  };
-  let shipping = shipping_of(results.pulled);
-  timed_from(paths, project, results, verify, shipping, time.elapsed_ms() - started, false)
-}
-
 fn timed_from(
   paths: List<paths::ResolvedPath>,
   project: Project,
   results: QueryResults,
-  verify: Bool,
   shipping: ShippedInputs,
   read_ms: Int,
   cached: Bool,
-) -> TimedLoad / {fs.read_file[abs], time.elapsed_ms, shipped.report_view_used, abort.raise} = {
+) -> TimedLoad / {time.elapsed_ms, shipped.report_view_used, abort.raise} = {
   let read_done = time.elapsed_ms();
-  let p = program_from(paths, project, results, verify, shipping);
+  let p = program_from(paths, project, results, shipping);
   {
     program: { ..p, place: { project: project, store: if cached { paths.at(0) } else { None } } },
     read_ms: read_ms,

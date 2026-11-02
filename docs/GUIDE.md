@@ -2524,8 +2524,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 
 ### 17.4 Reusing results
 
-After a change, commands check again only what depends on it. `ply hosts`, `ply publish` and
-`--no-cache` always check from scratch.
+After a change, commands check again only what depends on it. `--no-cache` checks from scratch.
 
 ### 17.5 Compiling
 

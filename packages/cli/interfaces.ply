@@ -1,8 +1,8 @@
 import std.bin
 import std.fs (fs)
-import compiler.front.facts (Analysis)
-import compiler.front.interface (Interface, ModuleInterface, interface_of, interface_bin,
-                                 envelope_of)
+import compiler.store.memo (memo)
+import compiler.front.checking.interfaces (published_module)
+import compiler.front.interface (Interface, ModuleInterface, interface_bin, envelope_of)
 import compiler.front.pkg (PackageSources, closure, registry_dir)
 import compiler.check.resolve.tables (Diagnostic, Source, error_at)
 import semantics
@@ -76,22 +76,37 @@ fn decode_interface(bytes: Bytes) -> Option<Interface> / {abort.raise} =
     else { match bin::decode(e.payload, interface_bin()) { Err(_) -> None, Ok(p) -> Some(p) } },
   }
 
-pub fn rederive_mismatches(
+pub type SlotInterface = { slot: String, interface: Interface }
+
+pub fn published_interfaces(
   slots: List<String>,
-  sources: List<Source>,
-  analysis: Analysis,
-) -> List<Diagnostic> / {fs.read_file[abs], abort.raise} =
-  slots.fold([], |accumulator: List<Diagnostic>, slot: String|
+) -> List<SlotInterface> / {fs.read_file[abs], abort.raise} =
+  slots.fold([], |found: List<SlotInterface>, slot: String|
     match read_slot_interface(slot) {
-      None -> accumulator,
+      None -> found,
       Some(bytes) -> match decode_interface(bytes) {
-        None -> accumulator,
-        Some(p) -> match interface_difference(
-            p,
-            interface_of(analysis, sources, p.modules.map(|m: ModuleInterface| m.exports.module)),
-          ) {
-          None -> accumulator,
-          Some(what) -> accumulator.push(rederive_mismatch(slot, what)),
-        },
+        None -> found,
+        Some(p) -> found.push({ slot: slot, interface: p }),
       },
     })
+
+pub fn rederive_mismatches(
+  published: List<SlotInterface>,
+  own: List<Bytes>,
+) -> List<Diagnostic> / {memo.read, abort.raise} =
+  published.fold([], |accumulator: List<Diagnostic>, p: SlotInterface| {
+    let derived = p.interface.modules.fold(
+      [],
+      |found: List<ModuleInterface>, m: ModuleInterface|
+        if !own.contains(m.exports.module) { found } else {
+          match published_module({ module: m.exports.module, shipped: false, tested: false }) {
+            Some(x) -> found.push(x.interface),
+            None -> found,
+          }
+        },
+    );
+    match interface_difference(p.interface, { modules: derived }) {
+      None -> accumulator,
+      Some(what) -> accumulator.push(rederive_mismatch(p.slot, what)),
+    }
+  })
