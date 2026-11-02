@@ -178,8 +178,7 @@ pub effect memo_store {
   read inputs() -> List<StoredInput>
   read facts_of(prefix: Bytes) -> List<Bytes>
   read code(name: Bytes) -> Option<Bytes>
-  read external(kind: Bytes, at: Bytes) -> Option<Bytes>
-  read external_digest(kind: Bytes, at: Bytes) -> Bytes
+  read external(kind: Bytes, at: Bytes) -> InputRead
   read is_out_of_date(key: Bytes) -> Bool
   read next_out_of_date() -> Option<Waited>
   read out_of_date_level() -> List<Waited>
@@ -343,7 +342,7 @@ pub fn reading<a | e>(
     body()
   } with {
     var at = run,
-    memo.external(kind, place) -> memo_store.external(kind, place),
+    memo.external(kind, place) -> memo_store.external(kind, place).value,
     memo.fetch(name, input) -> {
       let a = query_output(queries, at, name, input);
       at = a.run;
@@ -401,7 +400,7 @@ fn marked_for_new_inputs() -> Unit / {memo_store.read, memo_store.write, abort.r
         }
       }
     } else if !stored.fixed {
-      let now = memo_store.external_digest(stored.kind, stored.at);
+      let now = memo_store.external(stored.kind, stored.at).digest;
       if now != stored.digest {
         memo_store.note_edit();
         memo_store.put_input({ ..stored, digest: now });
@@ -809,7 +808,7 @@ fn reads_still_hold<| e>(
       if !sofar.same { sofar } else {
         match r {
           ExternalDependency(kind, at, digest) ->
-            { run: sofar.run, same: memo_store.external_digest(kind, at) == digest },
+            { run: sofar.run, same: memo_store.external(kind, at).digest == digest },
           QueryDependency(key, digest) -> match details_before(memo_store.fact(key)) {
             None -> { run: sofar.run, same: false },
             Some(d) -> match queries.named.get(d.query) {
@@ -1033,14 +1032,14 @@ fn world_read(
   kind: Bytes,
   at: Bytes,
 ) -> { st: Execution, found: Option<Bytes> } / {memo_store.read, memo_store.write, abort.raise} = {
-  let found = memo_store.external(kind, at);
-  let d = memo_store.external_digest(kind, at);
+  let read = memo_store.external(kind, at);
+  let d = read.digest;
   let seen = location_id(kind, at).concat(d);
   let { run, reads, external_reads, query_reads, depth, wrote } = s;
   let held = external_reads.contains(seen);
   if !held { memo_store.put_input({ kind: kind, at: at, digest: d, fixed: false }) };
   {
-    found: found,
+    found: read.value,
     st: {
       run: run,
       query_reads: query_reads,
@@ -1091,12 +1090,10 @@ fn reads_moved(s: Execution) -> Bool =
       ExternalDependency(_, _, _) -> false,
     })
 
-type Looked = { found: Option<Bytes>, digest: Bytes }
-
 type Snapshot = {
   facts: Map<Bytes, Settled>,
   outputs: Map<Bytes, Bytes>,
-  world: Map<Bytes, Looked>,
+  world: Map<Bytes, InputRead>,
 }
 
 const empty_snapshot: Snapshot = { facts: Map::new(), outputs: Map::new(), world: Map::new() }
@@ -1143,11 +1140,8 @@ fn with_wanted(k: Known, wanted: Wanted) -> Known / {memo_store.read, abort.rais
     WantedWorld(kind, at) -> {
       let id = location_id(kind, at);
       if k.snapshot.world.contains(id) { k } else {
-        let looked = {
-          found: memo_store.external(kind, at),
-          digest: memo_store.external_digest(kind, at),
-        };
-        { ..k, snapshot: { ..k.snapshot, world: k.snapshot.world.insert(id, looked) }, added: true }
+        let read = memo_store.external(kind, at);
+        { ..k, snapshot: { ..k.snapshot, world: k.snapshot.world.insert(id, read) }, added: true }
       }
     },
     WantedFact(name, input) -> {
@@ -1459,7 +1453,7 @@ fn attempted_body<| e>(
     memo.external(kind, at) -> match snapshot.world.get(location_id(kind, at)) {
       Some(l) -> {
         performed = performed.push(ReadWorld(kind, at));
-        l.found
+        l.value
       },
       None -> unsettled.needed(WantedWorld(kind, at)),
     },
@@ -1679,8 +1673,47 @@ pub fn sealed_lookup<| e>(
 
 pub fn pack_row_key(key: Bytes) -> Bytes = pack_key(key)
 
+pub type InputRead = { value: Option<Bytes>, digest: Bytes }
+
+pub type InputSnapshot = { reads: Map<Bytes, InputRead> }
+
+pub const empty_input_snapshot: InputSnapshot = { reads: Map::new() }
+
+pub effect input_snapshot {
+  read held(id: Bytes) -> Option<InputRead>
+  write hold(id: Bytes, read: InputRead) -> Unit
+}
+
+pub fn with_snapshot<a | e>(
+  snapshot: InputSnapshot,
+  body: () -> a / {input_snapshot.read, input_snapshot.write | e},
+) -> { snapshot: InputSnapshot, value: a } / e =
+  handle {
+    body()
+  } with {
+    var held = snapshot,
+    input_snapshot.held(id) -> held.reads.get(id),
+    input_snapshot.hold(id, read) -> {
+      held = { reads: held.reads.insert(id, read) };
+    },
+    return value -> { snapshot: held, value: value },
+  }
+
+pub fn snapshot_read<| e>(
+  id: Bytes,
+  read: () -> Option<Bytes> / {abort.raise | e},
+) -> InputRead / {input_snapshot.read, input_snapshot.write, abort.raise | e} =
+  match input_snapshot.held(id) {
+    Some(x) -> x,
+    None -> {
+      let value = read();
+      let x = { value: value, digest: digest_of(value) };
+      input_snapshot.hold(id, x);
+      x
+    },
+  }
+
 type MemoryRun = {
-  looked: Map<Bytes, { value: Option<Bytes>, digest: Bytes }>,
   pack: packs::PackReader,
   trusted: Bool,
   transient: Map<Bytes, Bytes>,
@@ -1733,213 +1766,198 @@ pub fn stored_outputs(store: MemoryStore) -> Map<Bytes, Bytes> =
 
 pub fn with_memory_store<a | e>(
   initial: MemoryStore,
+  snapshot: InputSnapshot,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> { store: MemoryStore, value: a } / {abort.raise | e} = {
-  let looked = |r: MemoryRun, held: MemoryStore, kind: Bytes, at: Bytes| {
+) -> { store: MemoryStore, snapshot: InputSnapshot, value: a } / {abort.raise | e} = {
+  let looked = |held: MemoryStore, kind: Bytes, at: Bytes| {
     let id = location_id(kind, at);
-    match r.looked.get(id) {
-      Some(x) -> { running: r, looked: x },
-      None -> {
-        let value = match held.inputs.get(id) {
-          Some(i) -> if i.fixed { held.outputs.get(i.digest) } else { look(kind, at) },
-          None -> look(kind, at),
-        };
-        let x = { value: value, digest: digest_of(value) };
-        { running: { ..r, looked: r.looked.insert(id, x) }, looked: x }
-      },
-    }
+    snapshot_read(id, ||
+      match held.inputs.get(id) {
+        Some(i) -> if i.fixed { held.outputs.get(i.digest) } else { look(kind, at) },
+        None -> look(kind, at),
+      })
   };
   let sealed_record = |r: MemoryRun, key: Bytes|
     if !r.trusted { { running: r, record: None } } else {
       let found = sealed_lookup(r.pack, read, key);
       { running: { ..r, pack: found.reading }, record: found.record }
     };
-  handle {
-    work()
-  } with {
-    var store = initial,
-    var running: MemoryRun = {
-      looked: Map::new(),
-      pack: packs::open_reader(read),
-      trusted: false,
-      transient: Map::new(),
-      waiting: nothing_waiting,
-    },
-    var pack_differs = false,
-    var edit_noted = false,
-    memo_store.fact(key) -> store.facts.get(key),
-    memo_store.details(digest) -> store.details.get(digest),
-    memo_store.output(digest) -> match store.outputs.get(digest) {
-      Some(o) -> Some(o),
-      None -> match running.transient.get(digest) {
+  let done = with_snapshot(snapshot, ||
+    handle {
+      work()
+    } with {
+      var store = initial,
+      var running: MemoryRun = {
+        pack: packs::open_reader(read),
+        trusted: false,
+        transient: Map::new(),
+        waiting: nothing_waiting,
+      },
+      var pack_differs = false,
+      var edit_noted = false,
+      memo_store.fact(key) -> store.facts.get(key),
+      memo_store.details(digest) -> store.details.get(digest),
+      memo_store.output(digest) -> match store.outputs.get(digest) {
         Some(o) -> Some(o),
-        None -> {
-          let found = packs::output(running.pack, read, digest);
-          running = { ..running, pack: found.reading };
-          found.bytes
+        None -> match running.transient.get(digest) {
+          Some(o) -> Some(o),
+          None -> {
+            let found = packs::output(running.pack, read, digest);
+            running = { ..running, pack: found.reading };
+            found.bytes
+          },
         },
       },
-    },
-    memo_store.sealed(key) -> {
-      let s = sealed_record(running, key);
-      running = s.running;
-      match s.record {
-        Some(b) -> {
-          match pack_inline_of(b) {
-            Some(o) -> {
-              running = { ..running, transient: running.transient.insert(digest_of(Some(o)), o) };
-            },
-            None -> (),
-          };
-          pack_digest_of(b)
-        },
-        None -> None,
-      }
-    },
-    memo_store.sealed_changed() -> pack_differs,
-    memo_store.has_dependents(key) -> store.dependents.contains(key),
-    memo_store.dependents(key) -> match store.dependents.get(key) {
-      Some(m) -> m.keys(),
-      None -> [],
-    },
-    memo_store.inputs() -> store.inputs.values(),
-    memo_store.facts_of(prefix) -> store.facts.keys().filter(|k: Bytes| k.starts_with(prefix)),
-    memo_store.code(name) -> store.codes.get(name),
-    memo_store.external(kind, at) -> {
-      let l = looked(running, store, kind, at);
-      running = l.running;
-      l.looked.value
-    },
-    memo_store.external_digest(kind, at) -> {
-      let l = looked(running, store, kind, at);
-      running = l.running;
-      l.looked.digest
-    },
-    memo_store.is_out_of_date(key) -> running.waiting.depths.contains(key),
-    memo_store.put_fact(key, fact) -> {
-      store = { ..store, facts: store.facts.insert(key, fact) };
-    },
-    memo_store.next_out_of_date() -> first_waiting(running.waiting),
-    memo_store.out_of_date_level() -> lowest_waiting(running.waiting),
-    memo_store.put(key, fact, details, _, output, lasting) -> {
-      let persisted = lasting || inline_output(output) != None;
-      running = if persisted { running }
-      else { { ..running, transient: running.transient.insert(fact.output, output) } };
-      store = {
-        ..store,
-        facts: store.facts.insert(key, fact),
-        details: store.details.insert(fact.details, details),
-        outputs: if persisted { store.outputs.insert(fact.output, output) } else { store.outputs },
-      };
-    },
-    memo_store.keep_output(digest, output, lasting) -> {
-      if lasting {
-        store = { ..store, outputs: store.outputs.insert(digest, output) };
-      } else {
-        running = { ..running, transient: running.transient.insert(digest, output) };
-      };
-    },
-    memo_store.delete(key) -> {
-      running = { ..running, waiting: without_mark(running.waiting, key) };
-      store = { ..store, facts: store.facts.remove(key) };
-    },
-    memo_store.add_dependent(key, dependent) -> {
-      let listed = match store.dependents.get(key) { Some(m) -> m, None -> Map::new() };
-      store = { ..store, dependents: store.dependents.insert(key, listed.insert(dependent, true)) };
-    },
-    memo_store.remove_dependent(key, dependent) -> {
-      let listed = match store.dependents.get(key) { Some(m) -> m, None -> Map::new() };
-      let left = listed.remove(dependent);
-      store = {
-        ..store,
-        dependents: if left.len() == 0 { store.dependents.remove(key) }
-        else { store.dependents.insert(key, left) },
-      };
-    },
-    memo_store.put_input(input) -> {
-      let id = if input.kind == sealed_kind { input.at } else { location_id(input.kind, input.at) };
-      let fixed = match store.inputs.get(id) { Some(i) -> i.fixed, None -> false };
-      if !fixed {
-        store = { ..store, inputs: store.inputs.insert(id, input) };
-      };
-    },
-    memo_store.fix_input(kind, at) -> {
-      let id = location_id(kind, at);
-      match running.looked.get(id) {
-        Some({ value: Some(v), digest: d }) -> {
-          store = {
-            ..store,
-            outputs: store.outputs.insert(d, v),
-            inputs: store.inputs.insert(id, { kind: kind, at: at, digest: d, fixed: true }),
-          };
-        },
-        _ -> (),
-      };
-    },
-    memo_store.delete_input(id) -> {
-      store = { ..store, inputs: store.inputs.remove(id) };
-    },
-    memo_store.put_code(name, hash) -> {
-      store = { ..store, codes: store.codes.insert(name, hash) };
-    },
-    memo_store.mark_out_of_date(key, depth) -> {
-      running = { ..running, waiting: with_mark(running.waiting, key, depth) };
-    },
-    memo_store.settle(key) -> {
-      running = { ..running, waiting: without_mark(running.waiting, key) };
-    },
-    memo_store.log_change(key) -> {
-      store = { ..store, log: store.log.push(key) };
-    },
-    memo_store.note_edit() -> {
-      if !edit_noted {
-        store = { ..store, edits: store.edits + 1 };
-      };
-      edit_noted = true;
-    },
-    memo_store.deferred_kind(key) -> deferred_kind(running.waiting, key),
-    memo_store.defer_products(kinds) -> {
-      running = { ..running, waiting: { ..running.waiting, products: kinds } };
-    },
-    memo_store.push_products(kind) -> {
-      running = {
-        ..running,
-        waiting: { ..running.waiting, pushing: running.waiting.pushing.insert(kind, true) },
-      };
-    },
-    memo_store.logged_changes(kind) -> match store.cursors.get(kind) {
-      Some(at) -> store.log.drop(at),
-      None -> [],
-    },
-    memo_store.log_read(kind) -> {
-      store = { ..store, cursors: store.cursors.insert(kind, store.log.len()) };
-    },
-    memo_store.running(id) -> {
-      let trusted = match running.pack.index {
-        Some(i) -> packs::is_trusted(i, id, world),
-        None -> false,
-      };
-      let pack_id = if trusted { blake3(id.concat(world)) } else { b"" };
-      pack_differs = pack_id != store.pack_id;
-      store = { ..store, pack_id: pack_id };
-      running = { ..running, trusted: trusted };
-    },
-    return value -> {
-      nothing_left_waiting(running.waiting);
-      { store: store, value: value }
-    },
-  }
+      memo_store.sealed(key) -> {
+        let s = sealed_record(running, key);
+        running = s.running;
+        match s.record {
+          Some(b) -> {
+            match pack_inline_of(b) {
+              Some(o) -> {
+                running = { ..running, transient: running.transient.insert(digest_of(Some(o)), o) };
+              },
+              None -> (),
+            };
+            pack_digest_of(b)
+          },
+          None -> None,
+        }
+      },
+      memo_store.sealed_changed() -> pack_differs,
+      memo_store.has_dependents(key) -> store.dependents.contains(key),
+      memo_store.dependents(key) -> match store.dependents.get(key) {
+        Some(m) -> m.keys(),
+        None -> [],
+      },
+      memo_store.inputs() -> store.inputs.values(),
+      memo_store.facts_of(prefix) -> store.facts.keys().filter(|k: Bytes| k.starts_with(prefix)),
+      memo_store.code(name) -> store.codes.get(name),
+      memo_store.external(kind, at) -> looked(store, kind, at),
+      memo_store.is_out_of_date(key) -> running.waiting.depths.contains(key),
+      memo_store.put_fact(key, fact) -> {
+        store = { ..store, facts: store.facts.insert(key, fact) };
+      },
+      memo_store.next_out_of_date() -> first_waiting(running.waiting),
+      memo_store.out_of_date_level() -> lowest_waiting(running.waiting),
+      memo_store.put(key, fact, details, _, output, lasting) -> {
+        let persisted = lasting || inline_output(output) != None;
+        running = if persisted { running }
+        else { { ..running, transient: running.transient.insert(fact.output, output) } };
+        store = {
+          ..store,
+          facts: store.facts.insert(key, fact),
+          details: store.details.insert(fact.details, details),
+          outputs: if persisted { store.outputs.insert(fact.output, output) }
+          else { store.outputs },
+        };
+      },
+      memo_store.keep_output(digest, output, lasting) -> {
+        if lasting {
+          store = { ..store, outputs: store.outputs.insert(digest, output) };
+        } else {
+          running = { ..running, transient: running.transient.insert(digest, output) };
+        };
+      },
+      memo_store.delete(key) -> {
+        running = { ..running, waiting: without_mark(running.waiting, key) };
+        store = { ..store, facts: store.facts.remove(key) };
+      },
+      memo_store.add_dependent(key, dependent) -> {
+        let listed = match store.dependents.get(key) { Some(m) -> m, None -> Map::new() };
+        store = {
+          ..store,
+          dependents: store.dependents.insert(key, listed.insert(dependent, true)),
+        };
+      },
+      memo_store.remove_dependent(key, dependent) -> {
+        let listed = match store.dependents.get(key) { Some(m) -> m, None -> Map::new() };
+        let left = listed.remove(dependent);
+        store = {
+          ..store,
+          dependents: if left.len() == 0 { store.dependents.remove(key) }
+          else { store.dependents.insert(key, left) },
+        };
+      },
+      memo_store.put_input(input) -> {
+        let id = if input.kind == sealed_kind { input.at }
+        else { location_id(input.kind, input.at) };
+        let fixed = match store.inputs.get(id) { Some(i) -> i.fixed, None -> false };
+        if !fixed {
+          store = { ..store, inputs: store.inputs.insert(id, input) };
+        };
+      },
+      memo_store.fix_input(kind, at) -> {
+        let id = location_id(kind, at);
+        match input_snapshot.held(id) {
+          Some({ value: Some(v), digest: d }) -> {
+            store = {
+              ..store,
+              outputs: store.outputs.insert(d, v),
+              inputs: store.inputs.insert(id, { kind: kind, at: at, digest: d, fixed: true }),
+            };
+          },
+          _ -> (),
+        };
+      },
+      memo_store.delete_input(id) -> {
+        store = { ..store, inputs: store.inputs.remove(id) };
+      },
+      memo_store.put_code(name, hash) -> {
+        store = { ..store, codes: store.codes.insert(name, hash) };
+      },
+      memo_store.mark_out_of_date(key, depth) -> {
+        running = { ..running, waiting: with_mark(running.waiting, key, depth) };
+      },
+      memo_store.settle(key) -> {
+        running = { ..running, waiting: without_mark(running.waiting, key) };
+      },
+      memo_store.log_change(key) -> {
+        store = { ..store, log: store.log.push(key) };
+      },
+      memo_store.note_edit() -> {
+        if !edit_noted {
+          store = { ..store, edits: store.edits + 1 };
+        };
+        edit_noted = true;
+      },
+      memo_store.deferred_kind(key) -> deferred_kind(running.waiting, key),
+      memo_store.defer_products(kinds) -> {
+        running = { ..running, waiting: { ..running.waiting, products: kinds } };
+      },
+      memo_store.push_products(kind) -> {
+        running = {
+          ..running,
+          waiting: { ..running.waiting, pushing: running.waiting.pushing.insert(kind, true) },
+        };
+      },
+      memo_store.logged_changes(kind) -> match store.cursors.get(kind) {
+        Some(at) -> store.log.drop(at),
+        None -> [],
+      },
+      memo_store.log_read(kind) -> {
+        store = { ..store, cursors: store.cursors.insert(kind, store.log.len()) };
+      },
+      memo_store.running(id) -> {
+        let trusted = match running.pack.index {
+          Some(i) -> packs::is_trusted(i, id, world),
+          None -> false,
+        };
+        let pack_id = if trusted { blake3(id.concat(world)) } else { b"" };
+        pack_differs = pack_id != store.pack_id;
+        store = { ..store, pack_id: pack_id };
+        running = { ..running, trusted: trusted };
+      },
+      return value -> {
+        nothing_left_waiting(running.waiting);
+        { store: store, value: value }
+      },
+    });
+  { store: done.value.store, snapshot: done.snapshot, value: done.value.value }
 }
-
-pub fn with_temporary_store<a | e>(
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
-  world: Bytes,
-  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> a / {abort.raise | e} = with_memory_store(empty_memory_store, read, world, look, work).value
 
 pub fn pack_memory_store<| e>(
   store: MemoryStore,
@@ -2013,6 +2031,7 @@ fn fetched_in(
   let queries = plain_queries(named);
   let done = with_memory_store(
     w.store,
+    empty_input_snapshot,
     packs::no_pack,
     b"",
     |_: Bytes, at: Bytes| w.files.get(at),
@@ -2120,6 +2139,7 @@ fn input_looks(
   handle {
     with_memory_store(
       store,
+      empty_input_snapshot,
       packs::no_pack,
       b"",
       |_: Bytes, at: Bytes| {
@@ -2388,11 +2408,18 @@ test "a fact in a trusted pack is used as it is, and a project records what it u
   let qs = plain_queries(q);
   let pack = pack_memory_store(source.store, qs, b"files");
   let read = |path: String, offset: Int, len: Int| packs::frame_in(Some(pack), path, offset, len);
-  let done = with_memory_store(empty_memory_store, read, b"files", |_: Bytes, _: Bytes| None, ||
-    in_session(qs, |run: Run| {
-      let a = query_output(qs, run, b"label", b"a");
-      { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
-    }));
+  let done = with_memory_store(
+    empty_memory_store,
+    empty_input_snapshot,
+    read,
+    b"files",
+    |_: Bytes, _: Bytes| None,
+    ||
+      in_session(qs, |run: Run| {
+        let a = query_output(qs, run, b"label", b"a");
+        { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
+      }),
+  );
   assert_eq(done.value, { output: b"long 4", ran: [b"label"] });
   assert_eq(done.store.inputs.values().map(|i: StoredInput| i.kind), [b"sealed"])
 }
@@ -2407,7 +2434,7 @@ test "a fact that used a sealed fact is recomputed when a new pack changes that 
   let older = pack_of(four, b"old");
   let newer = pack_of(world_of([{ at: b"a", text: b"forty" }]), b"new");
   let run_with = |store: MemoryStore, read: (String, Int, Int) -> Option<Bytes> / {abort.raise}, files: Bytes|
-    with_memory_store(store, read, files, |_: Bytes, _: Bytes| None, ||
+    with_memory_store(store, empty_input_snapshot, read, files, |_: Bytes, _: Bytes| None, ||
       in_session_of(plain_queries(q), b"label", b"a"));
   let first = run_with(empty_memory_store, older, b"old");
   assert_eq(first.value, b"long 4");

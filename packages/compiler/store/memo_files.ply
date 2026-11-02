@@ -6,19 +6,19 @@ import compiler.store.fact_store
 import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, fact_damage,
                                   recent_reads, with_recent_reads)
 import compiler.store.memo
-import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, deferred_kind, digest_of,
-                            fact_details_bin, first_waiting, in_session, inline_output, location_id,
+import compiler.store.memo (FactDetails, InputSnapshot, StoredFact, StoredInput, Waiting,
+                            deferred_kind, digest_of, empty_input_snapshot, fact_details_bin,
+                            first_waiting, in_session, inline_output, input_snapshot, location_id,
                             lowest_waiting, memo, memo_store, nothing_left_waiting, nothing_waiting,
                             pack_digest_of, pack_inline_of, pack_record_bytes, pack_row_key, query,
-                            sealed_lookup, stored_fact_bin, stored_input_bin, with_mark,
-                            without_mark)
+                            sealed_lookup, snapshot_read, stored_fact_bin, stored_input_bin,
+                            with_mark, with_snapshot, without_mark)
 import compiler.store.packs
 import compiler.store.segments
 import compiler.store.segments (Committed, LockHeld, StoreChanged, WriteFailed)
 
 type StoreRun = {
   db: Database,
-  looked: Map<Bytes, { value: Option<Bytes>, digest: Bytes }>,
   outputs: Map<Bytes, Bytes>,
   outputs_size: Int,
   details: Map<Bytes, FactDetails>,
@@ -128,27 +128,20 @@ fn over_database<a, [r] | e>(
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e} = {
-  let looked = |o: StoreRun, kind: Bytes, at: Bytes| {
+) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, input_snapshot.read, input_snapshot.write, abort.raise | e} = {
+  let looked = |db: Database, kind: Bytes, at: Bytes| {
     let id = location_id(kind, at);
-    match o.looked.get(id) {
-      Some(x) -> { open: o, looked: x },
-      None -> {
-        let value = match fixed_input[r](o.db, id) {
-          Some(i) -> fact_store::result_of[r](o.db, result_key(i.digest)),
-          None -> look(kind, at),
-        };
-        let x = { value: value, digest: digest_of(value) };
-        { open: { ..o, looked: o.looked.insert(id, x) }, looked: x }
-      },
-    }
+    snapshot_read(id, ||
+      match fixed_input[r](db, id) {
+        Some(i) -> fact_store::result_of[r](db, result_key(i.digest)),
+        None -> look(kind, at),
+      })
   };
   handle {
     work()
   } with {
     var st: StoreRun = {
       db: database,
-      looked: Map::new(),
       outputs: Map::new(),
       outputs_size: 0,
       details: Map::new(),
@@ -225,16 +218,7 @@ fn over_database<a, [r] | e>(
         undecoded(b, stored_input_bin())),
     memo_store.facts_of(prefix) -> fact_store::entries_under[r](st.db, Facts, prefix).keys(),
     memo_store.code(name) -> fact_store::value_of[r](st.db, Codes, code_key(name)),
-    memo_store.external(kind, at) -> {
-      let l = looked(st, kind, at);
-      st = l.open;
-      l.looked.value
-    },
-    memo_store.external_digest(kind, at) -> {
-      let l = looked(st, kind, at);
-      st = l.open;
-      l.looked.digest
-    },
+    memo_store.external(kind, at) -> looked(st.db, kind, at),
     memo_store.is_out_of_date(key) -> st.waiting.depths.contains(key),
     memo_store.put_fact(key, fact) -> {
       st = {
@@ -293,7 +277,7 @@ fn over_database<a, [r] | e>(
     },
     memo_store.fix_input(kind, at) -> {
       let id = location_id(kind, at);
-      match if fixed_input[r](st.db, id) == None { st.looked.get(id) } else { None } {
+      match if fixed_input[r](st.db, id) == None { input_snapshot.held(id) } else { None } {
         Some({ value: Some(v), digest: d }) -> {
           let stored = stored_output[r](st, d, v);
           st = {
@@ -388,12 +372,13 @@ fn over_database<a, [r] | e>(
   }
 }
 
-pub type StoreOutcome<a> = { value: a, damage: Option<String> }
+pub type StoreOutcome<a> = { value: a, damage: Option<String>, snapshot: InputSnapshot }
 
 pub const unreadable_manifest: String = "its manifest does not read"
 
 pub fn with_memo_store<a, [r] | e>(
   dir: String,
+  snapshot: InputSnapshot,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
@@ -401,22 +386,24 @@ pub fn with_memo_store<a, [r] | e>(
 ) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
   with_recent_reads(|| {
     let db = fact_store::open[r](dir);
-    let first = handle {
-      Ok(over_database[r](db, read, world, look, work))
-    } with {
-      fact_damage.damaged(reason) -> Err(reason),
-    };
-    let run = match first {
-      Ok(v) -> { value: v, damage: if db.garbled { Some(unreadable_manifest) } else { None } },
-      Err(reason) ->
-        {
-          value: fact_store::undamaged(||
-            over_database[r](fact_store::emptied(db), read, world, look, work)),
-          damage: Some(reason),
-        },
-    };
+    let run = with_snapshot(snapshot, || {
+      let first = handle {
+        Ok(over_database[r](db, read, world, look, work))
+      } with {
+        fact_damage.damaged(reason) -> Err(reason),
+      };
+      match first {
+        Ok(v) -> { value: v, damage: if db.garbled { Some(unreadable_manifest) } else { None } },
+        Err(reason) ->
+          {
+            value: fact_store::undamaged(||
+              over_database[r](fact_store::emptied(db), read, world, look, work)),
+            damage: Some(reason),
+          },
+      }
+    });
     fact_store::close[r](db);
-    run
+    { value: run.value.value, damage: run.value.damage, snapshot: run.snapshot }
   })
 
 pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
@@ -612,11 +599,18 @@ fn quoted_in<[r]>(
   text: Bytes,
 ) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
   let queries = test_queries();
-  with_memo_store[r](checkout, packs::no_pack, b"", |_: Bytes, _: Bytes| Some(text), ||
-    in_session(queries, |run: memo::Run| {
-      let a = memo::query_output(queries, run, b"quoted", b"a");
-      { run: a.run, value: { output: a.output, ran: memo::executed_count(a.run) } }
-    })).value
+  with_memo_store[r](
+    checkout,
+    empty_input_snapshot,
+    packs::no_pack,
+    b"",
+    |_: Bytes, _: Bytes| Some(text),
+    ||
+      in_session(queries, |run: memo::Run| {
+        let a = memo::query_output(queries, run, b"quoted", b"a");
+        { run: a.run, value: { output: a.output, ran: memo::executed_count(a.run) } }
+      }),
+  ).value
 }
 
 fn quoted_over<[r]>(
@@ -649,6 +643,69 @@ test "a query's digest and result survive a reopen, and an edit reruns what depe
   let moved = fs::on_mem[abs](first.tree, || quoted_over[abs](b"forty"));
   assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
   assert_eq(fs::on_mem[abs](moved.tree, || quoted_over[abs](b"forty")).value.ran, 0)
+}
+
+fn read_then_saved<[r]>(
+  path: String,
+  saved: Option<Bytes>,
+) -> Option<Bytes> / {fs.read[r], fs.write[r]} = {
+  let found = fs.read_file[r](path);
+  match saved {
+    Some(bytes) -> {
+      fs.write_file[r](path, bytes);
+      ()
+    },
+    None -> (),
+  };
+  found
+}
+
+fn session_over_files<[r]>(
+  snapshot: InputSnapshot,
+  saved: Option<Bytes>,
+  name: Bytes,
+) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], abort.raise} = {
+  let queries = test_queries();
+  with_memo_store[r](
+    "s",
+    snapshot,
+    packs::no_pack,
+    b"",
+    |_: Bytes, at: Bytes| read_then_saved[r]("files/" ++ String::of_bytes_lossy(at), saved),
+    ||
+      in_session(queries, |run: memo::Run| {
+        let a = memo::query_output(queries, run, name, b"a");
+        { run: a.run, value: a.output }
+      }),
+  )
+}
+
+test "a session uses the bytes it compared at its start, so a file saved after that read waits for the next command" {
+  let first = fs::on_mem[abs](fs::mem_of([{ path: "files/a", body: b"four" }]), ||
+    session_over_files[abs](empty_input_snapshot, None, b"quoted"));
+  let edited = fs::on_mem[abs](first.tree, || {
+    fs.write_file[abs]("files/a", b"forty");
+    session_over_files[abs](empty_input_snapshot, Some(b"FORTY"), b"quoted")
+  });
+  let next = fs::on_mem[abs](edited.tree, ||
+    session_over_files[abs](empty_input_snapshot, None, b"quoted"));
+  assert_eq([first.value.value, edited.value.value, next.value.value], [
+    b"\"four\"",
+    b"\"forty\"",
+    b"\"FORTY\"",
+  ])
+}
+
+test "a second session in one command reads the bytes the first session read, not a file saved between them" {
+  let command = fs::on_mem[abs](fs::mem_of([{ path: "files/a", body: b"four" }]), || {
+    let first = session_over_files[abs](empty_input_snapshot, None, b"quoted");
+    fs.write_file[abs]("files/a", b"forty");
+    let second = session_over_files[abs](first.snapshot, None, b"text");
+    [first.value, second.value]
+  });
+  let next = fs::on_mem[abs](command.tree, ||
+    session_over_files[abs](empty_input_snapshot, None, b"text"));
+  assert_eq(command.value.push(next.value.value), [b"\"four\"", b"four", b"forty"])
 }
 
 test "a stored value that fails its checksum makes the run start over from nothing" {
@@ -702,6 +759,7 @@ test "a pack holds the facts of the keys it is built from, and a trusted run use
   let used = fs::on_mem[abs](fs::mem_of([]), ||
     with_memo_store[abs](
       "s",
+      empty_input_snapshot,
       |path: String, offset: Int, len: Int| packs::frame_in(Some(pack.written), path, offset, len),
       b"files",
       |_: Bytes, _: Bytes| None,
