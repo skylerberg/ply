@@ -49,7 +49,6 @@ pub fn called_of(modules: List<Bytes>, names: List<Bytes>) -> List<Mention> =
       a.push({ module: m, name: any_module_name(n) })))
 
 pub type OwnerInterface = {
-  transitive_digest: Bytes,
   owner: Bytes,
   mentions: List<Mention>,
   text: Bytes,
@@ -58,25 +57,6 @@ pub type OwnerInterface = {
   fixed: List<CachedNode>,
   derived: List<Derivation>,
 }
-
-pub type InterfaceHeader = { transitive_digest: Bytes, owner: Bytes, mentions: List<Mention> }
-
-derive bin for InterfaceHeader
-
-pub fn interface_header(b: Bytes) -> InterfaceHeader / {abort.raise} =
-  match interface_header_bin().take(b, 0) {
-    Ok(t) -> t.value,
-    Err(_) -> panic("the stored interface entry has no header"),
-  }
-
-pub fn with_reach_digest(b: Bytes, reach: Bytes) -> Bytes / {abort.raise} =
-  match bin::take_bytes(b, 0) {
-    Ok(t) -> bin::encode(reach, bin::bytes_bin()).concat(b.slice(t.at, b.len())),
-    Err(_) -> panic("the stored interface entry has no header"),
-  }
-
-pub fn interface_header_of(e: OwnerInterface) -> InterfaceHeader =
-  { transitive_digest: e.transitive_digest, owner: e.owner, mentions: e.mentions }
 
 pub type Exports = {
   module: Bytes,
@@ -679,7 +659,6 @@ pub fn exports_of(
         ).filter(|m: Mention| !(m.module == module && m.name == o));
         let runtimes = deriver_modules_of(raw, its);
         accumulator.insert(o, {
-          transitive_digest: b"",
           owner: o,
           text: printed,
           imports: canonical_imports(
@@ -777,94 +756,6 @@ pub fn imported_mentions_of(
   )
 }
 
-pub fn needed_by<| e>(
-  entries: (Bytes, Bytes) -> List<OwnerInterface> / {abort.raise | e},
-  wanted: List<Mention>,
-  imported: List<Bytes>,
-  returning: (Bytes) -> List<Bytes> / {abort.raise | e},
-) -> Map<Bytes, Map<Bytes, OwnerInterface>> / {abort.raise | e} =
-  needed_entries(entries, interface_header_of, wanted, imported, |_: Bytes, _: Bytes| [], returning)
-
-pub fn needed_entries<x | e>(
-  entries: (Bytes, Bytes) -> List<x> / {abort.raise | e},
-  head: (x) -> InterfaceHeader,
-  wanted: List<Mention>,
-  imported: List<Bytes>,
-  publishing: (Bytes, Bytes) -> List<Mention> / {abort.raise | e},
-  returning: (Bytes) -> List<Bytes> / {abort.raise | e},
-) -> Map<Bytes, Map<Bytes, x>> / {abort.raise | e} =
-  iterate(
-    {
-      out: imported.fold(Map::new(), |accumulator: Map<Bytes, Map<Bytes, x>>, m: Bytes|
-        accumulator.insert(m, Map::new())),
-      requested: Map::new(),
-      work: wanted,
-    },
-    1000000,
-    |s: { out: Map<Bytes, Map<Bytes, x>>, requested: Map<Bytes, Bool>, work: List<Mention> }|
-      match s.work {
-        [] -> Stop(s.out),
-        [m, ..rest] -> if s.requested.contains(mention_key(m)) { Continue({ ..s, work: rest }) }
-        else if m.module == b"" {
-          Continue({
-            ..s,
-            requested: s.requested.insert(mention_key(m), true),
-            work: rest.concat(called_of(returning(m.name), [m.name])),
-          })
-        } else {
-          let have = match s.out.get(m.module) { Some(h) -> h, None -> Map::new() };
-          let fresh = entries(m.module, m.name).fold(
-            [],
-            |accumulator: List<{ head: InterfaceHeader, x: x }>, e: x| {
-              let h = head(e);
-              if have.contains(h.owner) { accumulator } else { accumulator.push({ head: h, x: e }) }
-            },
-          );
-          let visited_mentions = s.requested.insert(mention_key(m), true);
-          if fresh.len() == 0 {
-            Continue({
-              out: if s.out.contains(m.module) || m.name.starts_with(b"::")
-                  || entries(m.module, b"").len() == 0 { s.out }
-              else { s.out.insert(m.module, have) },
-              requested: visited_mentions,
-              work: rest,
-            })
-          } else {
-            Continue({
-              out: s.out.insert(
-                m.module,
-                fresh.fold(have, |h: Map<Bytes, x>, f: { head: InterfaceHeader, x: x }|
-                  h.insert(f.head.owner, f.x)),
-              ),
-              requested: visited_mentions,
-              work: fresh.fold(rest, |w: List<Mention>, f: { head: InterfaceHeader, x: x }|
-                w.concat(f.head.mentions.concat(publishing(m.module, f.head.owner)))),
-            })
-          }
-        },
-      },
-  )
-
-pub fn owner_interfaces_under(x: Exports, name: Bytes) -> List<OwnerInterface> =
-  if name == b"" {
-    x.entries.fold([], |accumulator: List<OwnerInterface>, _: Bytes, e: OwnerInterface|
-      accumulator.push(e))
-  } else {
-    match x.owners.get(name) {
-      None -> [],
-      Some(os) ->
-        os.fold([], |accumulator: List<OwnerInterface>, o: Bytes|
-          match x.entries.get(o) { Some(e) -> accumulator.push(e), None -> accumulator }),
-    }
-  }
-
-pub fn owner_interfaces_in(
-  exports: Map<Bytes, Exports>,
-  module: Bytes,
-  name: Bytes,
-) -> List<OwnerInterface> =
-  match exports.get(module) { None -> [], Some(x) -> owner_interfaces_under(x, name) }
-
 fn nowhere(i: Identifier) -> Identifier = { ..i, span: dummy_span }
 
 fn without_spans(d: ImportDeclaration) -> ImportDeclaration =
@@ -888,48 +779,30 @@ fn import_key(d: ImportDeclaration) -> Bytes =
     },
   ])
 
-fn merged_imports(entries: List<OwnerInterface>) -> List<ImportDeclaration> / {abort.raise} = {
-  let merged = entries.fold(
+fn merged_imports(imports: List<ImportDeclaration>) -> List<ImportDeclaration> / {abort.raise} = {
+  let merged = imports.fold(
     { order: [], held: Map::new() },
-    |accumulator: { order: List<Bytes>, held: Map<Bytes, ImportDeclaration> }, e: OwnerInterface|
-      e.imports.fold(
-        accumulator,
-        |a: { order: List<Bytes>, held: Map<Bytes, ImportDeclaration> }, d: ImportDeclaration| {
-          let k = import_key(d);
-          match a.held.get(k) {
-            None -> { order: a.order.push(k), held: a.held.insert(k, d) },
-            Some(had) -> match ((had.kind, d.kind)) {
-              (SelectedNames(xs), SelectedNames(ys)) -> {
-                let names = ys.fold(xs, |ns: List<Identifier>, y: Identifier|
-                  if ns.fold(false, |b: Bool, n: Identifier| b || n.name == y.name) { ns }
-                  else { ns.push(y) });
-                { ..a, held: a.held.insert(k, { ..had, kind: SelectedNames(names) }) }
-              },
-              _ -> a,
-            },
-          }
+    |a: { order: List<Bytes>, held: Map<Bytes, ImportDeclaration> }, d: ImportDeclaration| {
+      let k = import_key(d);
+      match a.held.get(k) {
+        None -> { order: a.order.push(k), held: a.held.insert(k, d) },
+        Some(had) -> match ((had.kind, d.kind)) {
+          (SelectedNames(xs), SelectedNames(ys)) -> {
+            let names = ys.fold(xs, |ns: List<Identifier>, y: Identifier|
+              if ns.fold(false, |b: Bool, n: Identifier| b || n.name == y.name) { ns }
+              else { ns.push(y) });
+            { ..a, held: a.held.insert(k, { ..had, kind: SelectedNames(names) }) }
+          },
+          _ -> a,
         },
-      ),
+      }
+    },
   );
   merged.order.map(|k: Bytes|
     match merged.held.get(k) {
       Some(d) -> d,
       None -> panic("internal error: an import was merged but its merged result is missing"),
     })
-}
-
-pub fn interface_source(
-  module: Bytes,
-  entries: Map<Bytes, OwnerInterface>,
-) -> Source / {abort.raise} = {
-  let es = entries.fold([], |accumulator: List<OwnerInterface>, _: Bytes, e: OwnerInterface|
-    accumulator.push(e));
-  {
-    name: module,
-    source_text: print_standalone(b"", merged_imports(es), []).concat(
-      Bytes::join(es.map(|e: OwnerInterface| e.text), b"\n"),
-    ),
-  }
 }
 
 pub type ModuleOrigin = | InRoot | InPackage(Int, Bytes) | ShippedModule
@@ -945,130 +818,6 @@ pub type CheckInputs = {
   data: List<EmbedFile>,
   embeds: List<EmbedRecord>,
   given: List<ParsedSource>,
-}
-
-fn staged_with_interfaces(
-  source: Source,
-  placed: ModuleOrigin,
-  dependencies: Map<Bytes, Map<Bytes, OwnerInterface>>,
-  fixed: List<CachedNode>,
-  placing: (Bytes) -> ModuleOrigin / {abort.raise},
-  reading: CheckInputs,
-) -> { staged: StagedLoad, at: Int } / {abort.raise} = {
-  let dependency_sources = dependencies.fold(
-    [],
-    |accumulator: List<{ placed: ModuleOrigin, source: Source }>, m: Bytes, es: Map<Bytes, OwnerInterface>|
-      accumulator.push({ placed: placing(m), source: interface_source(m, es) }),
-  );
-  let rooted = dependency_sources.fold(
-    [],
-    |accumulator: List<Source>, x: { placed: ModuleOrigin, source: Source }|
-      match x.placed { InRoot -> accumulator.push(x.source), _ -> accumulator },
-  );
-  let standing_in = dependency_sources.fold(
-    [],
-    |accumulator: List<Source>, x: { placed: ModuleOrigin, source: Source }|
-      match x.placed { ShippedModule -> accumulator.push(x.source), _ -> accumulator },
-  );
-  let shipped = if source.name == prelude_module
-      || standing_in.concat(reading.all_sources).any(|s: Source| s.name == prelude_module) {
-    standing_in
-  } else { standing_in.push(interface_source(prelude_module, Map::new())) };
-  let supplied = range(0, reading.packages.supplied.len()).map(|i: Int| {
-    let package_sources = dependency_sources.fold(
-      [],
-      |accumulator: List<Source>, x: { placed: ModuleOrigin, source: Source }|
-        match x.placed {
-          InPackage(k, rel) -> if k == i + 1 {
-            accumulator.push({ name: rel, source_text: x.source.source_text })
-          } else { accumulator },
-          _ -> accumulator,
-        },
-    );
-    {
-      ..reading.packages.supplied.get(i),
-      modules: match placed {
-        InPackage(k, rel) -> if k == i + 1 {
-          package_sources.push({ name: rel, source_text: source.source_text })
-        } else { package_sources },
-        _ -> package_sources,
-      },
-    }
-  });
-  let own = placed != ShippedModule;
-  let at = match placed {
-    InRoot -> rooted.len(),
-    InPackage(k, _) ->
-      rooted.len()
-        + range(0, k).fold(0, |n: Int, i: Int|
-          match supplied.at(i) { Some(p) -> n + p.modules.len(), None -> n })
-        - 1,
-    ShippedModule ->
-      rooted.len() + supplied.fold(0, |n: Int, p: SuppliedPackage| n + p.modules.len()),
-  };
-  let staged = load_with_shipped(
-    match placed { InRoot -> rooted.push(source), _ -> rooted },
-    shipped.concat(reading.all_sources).concat(if own { [] } else { [source] }),
-    { ..reading.packages, supplied: supplied },
-    { nodes: fixed, tests: [], laws: [] },
-    reading.embeds,
-    tested: reading.tested,
-    cut_unused: false,
-    data: reading.data,
-    unread: {
-      let staged = shipped.concat(reading.all_sources).fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Bool>, s: Source| accumulator.insert(s.name, true),
-      );
-      reading.unread.filter(|n: Bytes| !staged.contains(n))
-    },
-    required: shipped.map(|s: Source| s.name).concat(if own { [] } else { [source.name] }),
-    apart: placed == InRoot && is_shipped(source.name),
-    given: reading.given,
-    derived: dependencies.fold(
-      [],
-      |accumulator: List<ModuleDerivations>, m: Bytes, es: Map<Bytes, OwnerInterface>|
-        accumulator.push({
-          module: m,
-          derivations: es.fold([], |ds: List<Derivation>, _: Bytes, e: OwnerInterface|
-            ds.concat(e.derived)),
-        }),
-    ),
-    package_verdicts: reading.checked_packages,
-    checked: Some(source.name),
-  );
-  {
-    staged: staged,
-    at: if own { at } else {
-      range(0, staged.pulled.len()).fold(at, |found: Int, i: Int|
-        if staged.pulled.at(i) == Some(source.name) { at + i } else { found })
-    },
-  }
-}
-
-pub fn checked_against(
-  source: Source,
-  placed: ModuleOrigin,
-  dependencies: Map<Bytes, Map<Bytes, OwnerInterface>>,
-  placing: (Bytes) -> ModuleOrigin / {abort.raise},
-  reading: CheckInputs,
-) -> { pulled: PulledAnalysis, at: Int } / {abort.raise} = {
-  let rows = dependencies.fold(
-    [],
-    |accumulator: List<KnownDefinitionRow>, _: Bytes, es: Map<Bytes, OwnerInterface>|
-      es.fold(accumulator, |a: List<KnownDefinitionRow>, _: Bytes, e: OwnerInterface|
-        a.concat(e.rows)),
-  );
-  let fixed = dependencies.fold(
-    [],
-    |accumulator: List<CachedNode>, _: Bytes, es: Map<Bytes, OwnerInterface>|
-      es.fold(accumulator, |a: List<CachedNode>, _: Bytes, e: OwnerInterface| a.concat(e.fixed)),
-  );
-  let s = staged_with_interfaces(source, placed, dependencies, fixed, placing, reading);
-  {
-    pulled: checked_staged(s.staged, { definitions: rows, tests: [], types: Map::new() }),
-    at: s.at,
-  }
 }
 
 pub fn owner_items(raw: Module, owner: Bytes) -> List<Item> =
@@ -1281,159 +1030,32 @@ pub type OwnerSource = {
   offset: Int,
   items: List<ItemAt>,
   derived: List<Derivation>,
-  dependencies: Map<Bytes, Map<Bytes, OwnerInterface>>,
-  rows: List<KnownDefinitionRow>,
-  fixed: List<CachedNode>,
-}
-
-derive bin for OwnerSource
-
-pub fn group_source<| e>(
-  module: Bytes,
-  members: List<OwnerText>,
-  mentions: List<Mention>,
-  imported: List<Imported>,
-  entries: (Bytes, Bytes) -> List<OwnerInterface> / {abort.raise | e},
-  returning: (Bytes) -> List<Bytes> / {abort.raise | e},
-) -> OwnerSource / {abort.raise | e} =
-  group_source_from(
-    module,
-    members,
-    imported,
-    group_needs(
-      module,
-      members,
-      mentions,
-      imported,
-      entries,
-      interface_header_of,
-      |_: Bytes, _: Bytes| [],
-      returning,
-    ),
-  )
-
-pub fn group_needs<x | e>(
-  module: Bytes,
-  members: List<OwnerText>,
-  mentions: List<Mention>,
-  imported: List<Imported>,
-  entries: (Bytes, Bytes) -> List<x> / {abort.raise | e},
-  head: (x) -> InterfaceHeader,
-  publishing: (Bytes, Bytes) -> List<Mention> / {abort.raise | e},
-  returning: (Bytes) -> List<Bytes> / {abort.raise | e},
-) -> Map<Bytes, Map<Bytes, x>> / {abort.raise | e} = {
-  let names = members.map(|o: OwnerText| o.owner);
-  let selected = imported.fold([], |accumulator: List<Mention>, x: Imported|
-    match x.declaration.kind {
-      SelectedNames(ns) ->
-        accumulator.concat(ns.map(|n: Identifier| { module: x.target, name: n.name })),
-      _ -> accumulator,
-    });
-  needed_entries(
-    entries,
-    head,
-    mentions.filter(|m: Mention| !(m.module == module && names.contains(m.name))).concat(selected),
-    imported.map(|x: Imported| x.target).push(module),
-    publishing,
-    returning,
-  )
 }
 
 pub fn group_source_from(
   module: Bytes,
   members: List<OwnerText>,
   imported: List<Imported>,
-  needed: Map<Bytes, Map<Bytes, OwnerInterface>>,
 ) -> OwnerSource / {abort.raise} = {
-  let names = members.map(|o: OwnerText| o.owner);
   let own = Bytes::join(
     members.fold([], |accumulator: List<Bytes>, o: OwnerText| accumulator.concat(o.texts)),
     b"\n\n",
   );
-  let siblings = match needed.get(module) {
-    Some(es) ->
-      names.fold(es, |accumulator: Map<Bytes, OwnerInterface>, n: Bytes| accumulator.remove(n)),
-    None -> Map::new(),
-  };
-  let dependencies = needed.remove(module);
-  let sibling_interfaces = siblings.fold(
-    [],
-    |accumulator: List<OwnerInterface>, _: Bytes, e: OwnerInterface| accumulator.push(e),
-  );
   let written = print_standalone(
     b"",
-    merged_imports(
-      sibling_interfaces.push({
-        transitive_digest: b"",
-        owner: b"",
-        text: own,
-        imports: imported.map(|x: Imported| x.declaration),
-        mentions: [],
-        rows: [],
-        fixed: [],
-        derived: [],
-      }),
-    ),
+    merged_imports(imported.map(|x: Imported| x.declaration)),
     [],
-  );
-  let all = dependencies.fold(
-    [],
-    |accumulator: List<Map<Bytes, OwnerInterface>>, _: Bytes, es: Map<Bytes, OwnerInterface>|
-      accumulator.push(es),
-  ).push(
-    siblings,
   );
   {
-    source: {
-      name: module,
-      source_text: Bytes::concat_all([
-        written,
-        own,
-        b"\n\n",
-        Bytes::join(sibling_interfaces.map(|e: OwnerInterface| e.text), b"\n"),
-      ]),
-    },
+    source: { name: module, source_text: Bytes::concat_all([written, own, b"\n\n"]) },
     offset: written.len(),
     items: item_layout(members),
-    derived: members.fold(
-      sibling_interfaces.fold([], |accumulator: List<Derivation>, e: OwnerInterface|
-        accumulator.concat(e.derived)),
-      |accumulator: List<Derivation>, o: OwnerText| accumulator.concat(o.derived),
-    ),
-    dependencies: dependencies,
-    rows: all.fold([], |accumulator: List<KnownDefinitionRow>, es: Map<Bytes, OwnerInterface>|
-      es.fold(accumulator, |a: List<KnownDefinitionRow>, _: Bytes, e: OwnerInterface|
-        a.concat(e.rows))),
-    fixed: all.fold([], |accumulator: List<CachedNode>, es: Map<Bytes, OwnerInterface>|
-      es.fold(accumulator, |a: List<CachedNode>, _: Bytes, e: OwnerInterface| a.concat(e.fixed))),
+    derived: members.fold([], |accumulator: List<Derivation>, o: OwnerText|
+      accumulator.concat(o.derived)),
   }
 }
 
 pub fn unplaced_imports(raw: Module) -> List<ImportDeclaration> = raw.imports.map(without_spans)
-
-pub fn owner_source<| e>(
-  parsed: ParsedModule,
-  raw: Module,
-  text: Bytes,
-  targets: List<Bytes>,
-  owner: Bytes,
-  entries: (Bytes, Bytes) -> List<OwnerInterface> / {abort.raise | e},
-  returning: (Bytes) -> List<Bytes> / {abort.raise | e},
-) -> OwnerSource / {abort.raise | e} = {
-  let scope = module_scope(parsed, raw, targets);
-  let members = owner_texts(parsed, raw, text).filter(|o: OwnerText| o.owner == owner);
-  let tokens = lex(text).tokens;
-  let mentions = members.fold([], |accumulator: List<Mention>, o: OwnerText|
-    accumulator.concat(owner_mentions(parsed.name, scope, o, text, owner_tokens(tokens, o))));
-  group_source(
-    parsed.name,
-    members,
-    mentions,
-    group_imports(parsed.name, members, mentions, unplaced_imports(raw), targets),
-    entries,
-    returning,
-  )
-}
 
 pub fn named_as_owned(m: Module, o: OwnerSource) -> Module / {abort.raise} =
   {
@@ -1453,463 +1075,6 @@ pub fn named_as_owned(m: Module, o: OwnerSource) -> Module / {abort.raise} =
         _ -> item,
       }),
   }
-
-pub fn checked_owner(
-  o: OwnerSource,
-  placed: ModuleOrigin,
-  placing: (Bytes) -> ModuleOrigin / {abort.raise},
-  reading: CheckInputs,
-  walks: Option<(Int) -> BodyChecking / {abort.raise}> = None,
-) -> { pulled: PulledAnalysis, at: Int } / {abort.raise} = {
-  let raw = parse(o.source.source_text);
-  let parsed = parse_from(
-    0,
-    o.source,
-    { ..raw, node: named_as_owned(raw.node, o) },
-    derivations: o.derived,
-  );
-  let s = staged_with_interfaces(o.source, placed, o.dependencies, o.fixed, placing, {
-    ..reading,
-    given: reading.given.push(parsed),
-  });
-  {
-    pulled: checked_staged(
-      s.staged,
-      { definitions: o.rows, tests: [], types: Map::new() },
-      match walks { Some(at) -> at(s.at), None -> CheckEvery },
-    ),
-    at: s.at,
-  }
-}
-
-fn outcome(p: PulledAnalysis) -> Analysis / {abort.raise} =
-  match p.out {
-    Rejected(ds) ->
-      panic(
-        "the program failed to check: "
-          ++ String::of_bytes_lossy(
-            Bytes::concat_all(
-              ds.map(|d: Diagnostic| Bytes::concat_all([d.code, b" ", d.message, b"; "])),
-            ),
-          ),
-      ),
-    Analysed(w) -> w,
-  }
-
-type Agreed = {
-  schemes: List<{ name: Bytes, scheme: Scheme }>,
-  rows: List<KnownDefinitionRow>,
-  warnings: List<Bytes>,
-}
-
-fn module_check_result(w: Analysis, module: Bytes) -> Agreed / {abort.raise} = {
-  let mine = |name: Bytes| is_declared_in(module, name);
-  let at_module = range(0, w.modules.len()).fold(0, |accumulator: Int, i: Int|
-    if w.modules.get(i).name == module { i } else { accumulator });
-  {
-    schemes: w.checked.definitions.filter(|d: DefinitionInfo| mine(d.name)).map(
-      |d: DefinitionInfo| { name: d.name, scheme: canonical_scheme(d.scheme) },
-    ),
-    rows: rows_of(w).definitions.filter(|r: KnownDefinitionRow| mine(r.name)).map(
-      |r: KnownDefinitionRow| r,
-    ),
-    warnings: w.warnings.filter(|d: Diagnostic|
-      d.labels.fold(false, |b: Bool, l: Label| b || (l.primary && l.module == at_module))).map(
-      |d: Diagnostic| d.message,
-    ),
-  }
-}
-
-fn per_module(
-  whole: Analysis,
-  sources: List<Source>,
-) -> List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: CachedHashes, rehashed: CachedHashes }> / {abort.raise} = {
-  let texts = sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.source_text));
-  let read = with_prelude_source(sources).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, s: Source| accumulator.insert(s.name, s.source_text),
-  );
-  let text_at = |i: Int| match read.get(whole.modules.get(i).name) { Some(t) -> t, None -> b"" };
-  let exports = range(0, whole.modules.len()).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Exports>, i: Int|
-      accumulator.insert(whole.modules.get(i).name, exports_of(whole, i, text_at(i))),
-  );
-  let fixed_of = |keep: (Bytes) -> Bool|
-    cached_hashes_of(
-      whole.index,
-      whole.hashes,
-      whole.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
-        if keep(m.name) { accumulator.insert(m.name, true) } else { accumulator }),
-    );
-  let reading = {
-    packages: { root: b"", manifest: None, supplied: [] },
-    tested: true,
-    all_sources: [],
-    data: [],
-    embeds: [],
-    given: [],
-    checked_packages: None,
-    unread: [],
-  };
-  let placing = |m: Bytes| if texts.contains(m) { InRoot } else { ShippedModule };
-  range(0, whole.modules.len()).fold(
-    [],
-    |accumulator: List<{ module: Bytes, whole: Agreed, apart: Agreed, hashed: CachedHashes, rehashed: CachedHashes }>, i: Int| {
-      let name = whole.modules.get(i).name;
-      if !texts.contains(name) { accumulator } else {
-        let dependencies = needed_by(
-          |module: Bytes, n: Bytes| owner_interfaces_in(exports, module, n),
-          imported_mentions_of(whole, i, text_at(i)),
-          import_targets(whole, i),
-          |_: Bytes| visible_modules(whole, i),
-        );
-        let source = { name: name, source_text: text_at(i) };
-        let parsed = parse_from(
-          0,
-          source,
-          parse(source.source_text),
-          derivations: whole.modules.get(i).derived.map(derivation_of),
-        );
-        let apart = match checked_against(source, InRoot, dependencies, placing, {
-            ..reading,
-            given: [parsed],
-          }).pulled.out {
-          Rejected(ds) -> rejected_alone(name, "checks", ds),
-          Analysed(w) -> w,
-        };
-        let at_apart = range(0, apart.modules.len()).fold(0, |k: Int, j: Int|
-          if apart.modules.get(j).name == name { j } else { k });
-        accumulator.push({
-          module: name,
-          whole: module_check_result(whole, name),
-          apart: module_check_result(apart, name),
-          hashed: fixed_of(|m: Bytes| m == name),
-          rehashed: hash_forms(
-            selection_forms(apart.index, apart.module_packages, {
-              ..module_selection(apart.index, at_apart),
-              called: Some(called_at(apart.checked.facts.members)),
-            }),
-            fixed_of(|m: Bytes| m != name).nodes,
-          ),
-        })
-      }
-    },
-  )
-}
-
-fn agreed_owner(
-  w: Analysis,
-  module: Bytes,
-  owned: (Bytes) -> Bool / {abort.raise},
-) -> Agreed / {abort.raise} = {
-  let a = module_check_result(w, module);
-  {
-    schemes: a.schemes.filter(|s: { name: Bytes, scheme: Scheme }| owned(s.name)),
-    rows: a.rows.filter(|r: KnownDefinitionRow| owned(r.name)),
-    warnings: [],
-  }
-}
-
-fn checked_alone(
-  whole: Analysis,
-  sources: List<Source>,
-  i: Int,
-  o: Bytes,
-  shipped: List<Source> = [],
-) -> Analysis / {abort.raise} = {
-  let texts = sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.source_text));
-  let read = with_prelude_source(sources.concat(shipped)).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, s: Source| accumulator.insert(s.name, s.source_text),
-  );
-  let text_at = |k: Int| match read.get(whole.modules.get(k).name) { Some(t) -> t, None -> b"" };
-  let exports = range(0, whole.modules.len()).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Exports>, k: Int|
-      accumulator.insert(whole.modules.get(k).name, exports_of(whole, k, text_at(k))),
-  );
-  let reading = {
-    packages: { root: b"", manifest: None, supplied: [] },
-    tested: true,
-    all_sources: shipped,
-    data: [],
-    embeds: [],
-    given: [],
-    checked_packages: None,
-    unread: [],
-  };
-  let placing = |m: Bytes| if texts.contains(m) { InRoot } else { ShippedModule };
-  let parsed = whole.modules.get(i);
-  let source = owner_source(
-    parsed,
-    parse(text_at(i)).node,
-    text_at(i),
-    import_targets(whole, i),
-    o,
-    |module: Bytes, n: Bytes| owner_interfaces_in(exports, module, n),
-    |_: Bytes| visible_modules(whole, i),
-  );
-  match checked_owner(source, InRoot, placing, reading).pulled.out {
-    Rejected(ds) -> rejected_alone(Bytes::concat_all([parsed.name, b".", o]), "checks", ds),
-    Analysed(w) -> w,
-  }
-}
-
-fn per_owner(
-  whole: Analysis,
-  sources: List<Source>,
-  shipped: List<Source> = [],
-) -> List<{ owner: Bytes, whole: Agreed, apart: Agreed }> / {abort.raise} = {
-  let texts = sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.source_text));
-  range(0, whole.modules.len()).fold(
-    [],
-    |accumulator: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, i: Int| {
-      let parsed = whole.modules.get(i);
-      let name = parsed.name;
-      match texts.get(name) {
-        None -> accumulator,
-        Some(text) -> {
-          let raw = parse(text).node;
-          let functions = function_owners(raw, parsed);
-          let owned_by = |o: Bytes, n: Bytes| functions.get(simple_of(name, n)) == Some(o);
-          let owners = raw.items.fold(Map::new(), |m: Map<Bytes, Bytes>, item: Item|
-            match item { FunctionItem(d) -> m.insert(d.name.name, d.name.name), _ -> m }).values(
-          );
-          owners.fold(
-            accumulator,
-            |a: List<{ owner: Bytes, whole: Agreed, apart: Agreed }>, o: Bytes| {
-              let apart = checked_alone(whole, sources, i, o, shipped: shipped);
-              a.push({
-                owner: Bytes::concat_all([name, b".", o]),
-                whole: agreed_owner(whole, name, |n: Bytes| owned_by(o, n)),
-                apart: agreed_owner(apart, name, |n: Bytes| owned_by(o, n)),
-              })
-            },
-          )
-        },
-      }
-    },
-  )
-}
-
-test "a test checked alone gets the same name as in its module, even when an earlier test has the same label" {
-  let source = b"test \"holds {n}\" for n: Int in [1] { assert(n > 0) }\n\n// the second\ntest \"holds {n}\" for n: Int in [2] { assert(n > 0) }\n";
-  let sources = [{ name: b"m", source_text: source }];
-  let shipped = [
-    {
-      name: b"std.cases",
-      source_text: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
-    },
-    { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"\n" },
-  ];
-  let whole = outcome(analyse_pulling_std_with(sources, shipped, no_rows));
-  let m = range(0, whole.modules.len()).fold(0, |k: Int, j: Int|
-    if whole.modules.get(j).name == b"m" { j } else { k });
-  let keys = |w: Analysis|
-    w.checked.tests.filter(|t: TestInfo| t.module == b"m").map(|t: TestInfo| t.key);
-  assert_eq(keys(whole), [b"m.holds {n}", b"m.holds {n} (2)"]);
-  assert_eq(
-    [b"test holds {n}", b"test holds {n} (2)"].map(|o: Bytes|
-      keys(checked_alone(whole, sources, m, o, shipped: shipped))),
-    [[b"m.holds {n}"], [b"m.holds {n} (2)"]],
-  )
-}
-
-test "each function checked alone against the interfaces of what it uses returns the same result as checking its whole module" {
-  let sources = [
-    { name: b"core", source_text: core_source },
-    { name: b"shop", source_text: shop_source },
-  ];
-  let found = per_owner(outcome(analyse_pulling_std_with(sources, [], no_rows)), sources);
-  assert_eq(found.map(|f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner), [
-    b"core.helper",
-    b"core.price",
-    b"core.twice",
-    b"shop.doubled",
-    b"shop.stored",
-    b"shop.total",
-  ]);
-  for_all(found, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| {
-    assert_eq(f.owner, f.owner);
-    assert_eq(f.apart, f.whole)
-  })
-}
-
-fn rejected_alone<a>(name: Bytes, what: String, ds: List<Diagnostic>) -> a / {abort.raise} =
-  panic(
-    "module `" ++ String::of_bytes_lossy(name) ++ "` " ++ what ++ " apart: "
-      ++ String::of_bytes_lossy(
-        Bytes::concat_all(
-          ds.map(|d: Diagnostic| Bytes::concat_all([d.code, b" ", d.message, b"; "])),
-        ),
-      ),
-  )
-
-const core_source: Bytes =
-  b"pub type Money = Int\npub type Item =\n  | Book(String, Money)\n  | Note(String)\npub effect db {\n  read fetch[r](key: Int) -> Int\n  write put[r](key: Int, value: Int) -> Int\n}\n/// The price.\npub fn price(i: Item) -> Money =\n  match i {\n    Book(_, p) -> p,\n    Note(_) -> 0,\n  }\npub fn twice<a>(x: a, f: (a) -> a) -> a = f(f(x))\nfn helper() -> Int = 7\ntest \"a note is free\" {\n  assert_eq(price(Note(\"n\")), 0)\n}\n"
-
-const shop_source: Bytes =
-  b"import core\nfn total(items: List<core::Item>) -> Int =\n  items.fold(0, |acc, i: core::Item| acc + core::price(i))\nfn doubled(n: Int) -> Int = core::twice(n, |x: Int| x + x)\nfn stored(k: Int) -> Int / {core::db.read[cart]} = core::db.fetch[cart](k)\ntest \"it adds up\" {\n  assert_eq(total([core::Book(\"b\", 3), core::Note(\"n\")]), 3)\n}\n"
-
-const likeness_source: Bytes = b"pub fn derive(declaration: Bytes) -> Bytes = declaration\n"
-
-const kinds_source: Bytes =
-  b"import likeness\npub type Shape =\n  | Dot\n  | Line(Int)\npub type Pair = { left: Shape, right: Shape }\nderive likeness for Shape\nderive likeness for Pair\npub fn same(a: Pair, b: Pair) -> Bool = pair_alike(a, b)\n"
-
-const kinds_derived: List<ModuleDerivations> =
-  [
-    {
-      module: b"kinds",
-      derivations: [
-        {
-          deriver: b"likeness",
-          target: b"Shape",
-          written: [
-            b"pub fn shape_alike(a: Shape, b: Shape) -> Bool = a == b",
-            b"pub fn shape_order(a: Shape, b: Shape) -> Ordering = compare(a, b)",
-          ],
-        },
-        {
-          deriver: b"likeness",
-          target: b"Pair",
-          written: [b"pub fn pair_alike(a: Pair, b: Pair) -> Bool = a == b"],
-        },
-      ],
-    },
-  ]
-
-const sorter_source: Bytes =
-  b"import kinds\nfn alike(a: kinds::Shape, b: kinds::Shape) -> Bool = kinds::shape_alike(a, b)\nfn order(a: kinds::Shape, b: kinds::Shape) -> Ordering = kinds::shape_order(a, b)\nfn paired(a: kinds::Shape) -> Bool = kinds::same({ left: a, right: a }, { left: a, right: a })\n"
-
-test "an interface lists a `derive` as the signatures of the functions it generates, without bodies, and checks against it give the same result as checking the whole program" {
-  let sources = [
-    { name: b"likeness", source_text: likeness_source },
-    { name: b"kinds", source_text: kinds_source },
-    { name: b"sorter", source_text: sorter_source },
-  ];
-  let whole = outcome(analyse_pulling_std_with(sources, [], no_rows, derived: kinds_derived));
-  let kinds = range(0, whole.modules.len()).fold(0, |k: Int, i: Int|
-    if whole.modules.get(i).name == b"kinds" { i } else { k });
-  let shape = match exports_of(whole, kinds, kinds_source).entries.get(b"Shape") {
-    Some(e) -> e.text,
-    None -> b"",
-  };
-  assert(shape.index_of(b"pub type Shape") != None);
-  assert(shape.index_of(b"fn shape_alike(") != None);
-  assert(shape.index_of(b"fn shape_order(") != None);
-  assert_eq(shape.index_of(b"derive"), None);
-  assert_eq(shape.index_of(b"=="), None);
-  for_all(
-    per_module(whole, sources),
-    |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: CachedHashes, rehashed: CachedHashes }| {
-      assert_eq(f.apart, f.whole);
-      assert_eq(f.rehashed, f.hashed)
-    },
-  );
-  let apart = per_owner(whole, sources);
-  assert_eq(apart.map(|f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner), [
-    b"likeness.derive",
-    b"kinds.same",
-    b"sorter.alike",
-    b"sorter.order",
-    b"sorter.paired",
-  ]);
-  for_all(apart, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| assert_eq(f.apart, f.whole))
-}
-
-const rows_source: Bytes =
-  b"import std.sql\npub type Line = { sku: String, count: Int }\nderive sql for Line\npub fn columns() -> Int = line_width()\n"
-
-const report_source: Bytes =
-  b"import rows\nfn width() -> Int = rows::line_width() + rows::columns()\n"
-
-const rows_derived: List<ModuleDerivations> =
-  [
-    {
-      module: b"rows",
-      derivations: [
-        { deriver: b"sql", target: b"Line", written: [b"pub fn line_width() -> Int = 2"] },
-      ],
-    },
-  ]
-
-test "a type's interface includes its `derive sql` line, so a definition checked alone matches the whole program" {
-  let sources = [
-    { name: b"rows", source_text: rows_source },
-    { name: b"report", source_text: report_source },
-  ];
-  let shipped = [{ name: b"std.sql", source_text: likeness_source }];
-  let whole = outcome(analyse_pulling_std_with(sources, shipped, no_rows, derived: rows_derived));
-  let rows = range(0, whole.modules.len()).fold(0, |k: Int, i: Int|
-    if whole.modules.get(i).name == b"rows" { i } else { k });
-  match exports_of(whole, rows, rows_source).entries.get(b"Line") {
-    Some(e) -> {
-      assert(e.text.index_of(b"derive sql for Line") != None, Some(String::of_bytes_lossy(e.text)));
-      assert_eq(e.derived, rows_derived.get(0).derivations)
-    },
-    None -> panic("`rows` exports no interface for `Line`"),
-  };
-  let apart = per_owner(whole, sources, shipped: shipped);
-  assert_eq(apart.map(|f: { owner: Bytes, whole: Agreed, apart: Agreed }| f.owner).sort(), [
-    b"report.width",
-    b"rows.columns",
-  ]);
-  for_all(apart, |f: { owner: Bytes, whole: Agreed, apart: Agreed }| assert_eq(f.apart, f.whole))
-}
-
-test "each module checked and hashed against the interfaces of its imports gives the same results as the whole program" {
-  let sources = [
-    { name: b"core", source_text: core_source },
-    { name: b"shop", source_text: shop_source },
-  ];
-  let found = per_module(outcome(analyse_pulling_std_with(sources, [], no_rows)), sources);
-  assert_eq(
-    found.map(
-      |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: CachedHashes, rehashed: CachedHashes }|
-        f.module,
-    ),
-    [b"core", b"shop"],
-  );
-  for_all(
-    found,
-    |f: { module: Bytes, whole: Agreed, apart: Agreed, hashed: CachedHashes, rehashed: CachedHashes }| {
-      assert_eq(f.apart, f.whole);
-      assert_eq(f.rehashed, f.hashed)
-    },
-  )
-}
-
-test "an interface's header can be read from its encoded bytes alone, and the bytes include its dependency digest" {
-  let sources = [
-    { name: b"core", source_text: core_source },
-    { name: b"shop", source_text: shop_source },
-  ];
-  let whole = outcome(analyse_pulling_std_with(sources, [], no_rows));
-  let entries = range(0, whole.modules.len()).fold(
-    [],
-    |accumulator: List<OwnerInterface>, i: Int|
-      sources.fold(accumulator, |a: List<OwnerInterface>, s: Source|
-        if whole.modules.get(i).name != s.name { a } else {
-          exports_of(whole, i, s.source_text).entries.fold(
-            a,
-            |b: List<OwnerInterface>, _: Bytes, e: OwnerInterface| b.push(e),
-          )
-        }),
-  );
-  assert(entries.len() > 4);
-  for_all(entries, |e: OwnerInterface| {
-    let b = bin::encode(e, owner_interface_bin());
-    assert_eq(interface_header(b), interface_header_of(e));
-    assert_eq(
-      with_reach_digest(b, b"reached"),
-      bin::encode({ ..e, transitive_digest: b"reached" }, owner_interface_bin()),
-    )
-  })
-}
 
 fn for_all<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =
   xs.fold((), |_: Unit, x: a| f(x))
