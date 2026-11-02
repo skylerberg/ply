@@ -70,7 +70,6 @@ pub type Run = {
   took: Map<Bytes, Int>,
   ran: Map<Bytes, Int>,
   inputs: List<Step>,
-  restored: List<Step>,
   offers: Map<Bytes, Offer>,
   runs: Map<Bytes, Int>,
   lost: Map<Bytes, Int>,
@@ -87,7 +86,6 @@ const new_run: Run =
     took: Map::new(),
     ran: Map::new(),
     inputs: [],
-    restored: [],
     offers: Map::new(),
     runs: Map::new(),
     lost: Map::new(),
@@ -131,9 +129,6 @@ pub fn merged_query_stats(a: List<QueryStats>, b: List<QueryStats>) -> List<Quer
 
 pub fn executed_for(run: Run, name: Bytes) -> List<Bytes> =
   run.inputs.filter(|r: Step| r.query == name).map(|r: Step| r.input)
-
-pub fn restored_for(run: Run, name: Bytes) -> List<Bytes> =
-  run.restored.filter(|r: Step| r.query == name).map(|r: Step| r.input)
 
 pub fn executed_count(run: Run) -> Int = run.ran.fold(0, |n: Int, _: Bytes, k: Int| n + k)
 
@@ -183,10 +178,8 @@ pub effect memo_store {
   read external_digest(kind: Bytes, at: Bytes) -> Bytes
   read is_out_of_date(key: Bytes) -> Bool
   read next_out_of_date() -> Option<Waited>
-  read past(key: Bytes) -> Option<StoredFact>
   write put(key: Bytes, fact: StoredFact, details: FactDetails, output: Bytes, lasting: Bool) -> Unit
   write keep_output(digest: Bytes, output: Bytes, lasting: Bool) -> Unit
-  write keep_past(key: Bytes, fact: StoredFact) -> Unit
   write put_fact(key: Bytes, fact: StoredFact) -> Unit
   write delete(key: Bytes) -> Unit
   write add_dependent(key: Bytes, dependent: Bytes) -> Unit
@@ -251,7 +244,6 @@ fn deleted_one(key: Bytes) -> List<Bytes> / {memo_store.read, memo_store.write, 
     Some(f) -> {
       marked_dependents(key);
       let before = memo_store.details(f.details);
-      memo_store.keep_past(key, f);
       memo_store.delete(key);
       match before {
         None -> [],
@@ -410,18 +402,8 @@ fn recomputed<| e>(
   iterate(run, 1099511627776, |r: Run|
     match memo_store.next_out_of_date() {
       None -> Stop(r),
-      Some(next) ->
-        Continue(if waits_for_earlier_version(next) { r } else { recompute(queries, r, next.key) }),
+      Some(next) -> Continue(recompute(queries, r, next.key)),
     })
-
-fn waits_for_earlier_version(next: Waited) -> Bool / {memo_store.read, memo_store.write} = {
-  let deepest = match memo_store.past(next.key) {
-    Some(f) -> max(next.depth, f.depth),
-    None -> next.depth,
-  };
-  if deepest > next.depth { memo_store.mark_out_of_date(next.key, deepest) };
-  deepest > next.depth
-}
 
 fn recompute<| e>(
   queries: Map<Bytes, Query<| e>>,
@@ -656,14 +638,9 @@ fn run_opened<| e>(
     };
     let unchanged = if may_restore { product_unchanged(queries, opened, q, key, left - 1) }
     else { { run: opened, at: None } };
-    let earlier = match unchanged.at {
-      Some(_) -> unchanged,
-      None -> if may_restore { restored(queries, unchanged.run, q, key, left - 1) }
-      else { unchanged },
-    };
-    let done = match earlier.at {
-      Some(at) -> { run: earlier.run, at: at },
-      None -> execute(queries, earlier.run, q, key, input, left - 1),
+    let done = match unchanged.at {
+      Some(at) -> { run: unchanged.run, at: at },
+      None -> execute(queries, unchanged.run, q, key, input, left - 1),
     };
     {
       run: {
@@ -719,136 +696,6 @@ fn product_unchanged<| e>(
     },
   }
 
-fn inputs_recorded(
-  reads: List<Dependency>,
-) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
-  reads.fold((), |_: Unit, r: Dependency|
-    match r {
-      ExternalDependency(kind, at, digest) ->
-        memo_store.put_input({ kind: kind, at: at, digest: digest }),
-      QueryDependency(name, input, digest) -> {
-        let key = fact_key(name, input);
-        if memo_store.sealed(key) != None {
-          memo_store.put_input({ kind: sealed_kind, at: key, digest: digest })
-        }
-      },
-    })
-
-fn version_usable<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  fact: StoredFact,
-) -> Bool / {memo_store.read} =
-  match details_before(Some(fact)) {
-    None -> false,
-    Some(d) -> match queries.get(d.query) {
-      None -> false,
-      Some(q) -> d.code == q.hash && (!q.persistent || memo_store.output(fact.output) != None),
-    },
-  }
-
-fn written_version<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  writer: Bytes,
-  written: WrittenFact,
-) -> Option<StoredFact> / {memo_store.read} = {
-  [memo_store.fact(written.key), memo_store.past(written.key)].fold(
-    None,
-    |found: Option<StoredFact>, version: Option<StoredFact>|
-      match ((found, version)) {
-        (None, Some(f)) -> if f.written_by == writer && f.output == written.output
-            && version_usable(queries, f) { Some(f) }
-        else { None },
-        _ -> found,
-      },
-  )
-}
-
-fn written_versions<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  writer: Bytes,
-  wrote: List<WrittenFact>,
-) -> Option<List<{ key: Bytes, fact: StoredFact }>> / {memo_store.read} =
-  wrote.fold(
-    Some([]),
-    |found: Option<List<{ key: Bytes, fact: StoredFact }>>, written: WrittenFact|
-      match found {
-        None -> None,
-        Some(versions) -> match written_version(queries, writer, written) {
-          Some(f) -> Some(versions.push({ key: written.key, fact: f })),
-          None -> None,
-        },
-      },
-  )
-
-fn replaced_fact(key: Bytes, fact: StoredFact) -> Unit / {memo_store.read, memo_store.write} = {
-  match memo_store.fact(key) {
-    Some(f) -> {
-      if f.output != fact.output { marked_dependents(key) };
-      if f != fact { memo_store.keep_past(key, f) }
-    },
-    None -> (),
-  };
-  memo_store.put_fact(key, fact);
-  memo_store.settle(key)
-}
-
-fn restored_from<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  run: Run,
-  q: Query<| e>,
-  key: Bytes,
-  past: StoredFact,
-  left: Int,
-) -> { run: Run, at: Option<Settled> } / {memo_store.read, memo_store.write, abort.raise | e} =
-  match memo_store.details(past.details) {
-    None -> { run: run, at: None },
-    Some(d) -> if d.code != q.hash || past.written_by != b""
-        || (q.persistent && memo_store.output(past.output) == None) { { run: run, at: None } }
-    else {
-      let held = reads_still_hold(queries, run, d.reads, left - 1);
-      match if held.same { written_versions(queries, key, d.wrote) } else { None } {
-        None -> { run: held.run, at: None },
-        Some(written) -> {
-          let before = details_before(memo_store.fact(key));
-          edges_updated(key, reads_in(before), d.reads);
-          inputs_recorded(d.reads);
-          let placed = written.fold(
-            Map::new(),
-            |found: Map<Bytes, Bool>, w: { key: Bytes, fact: StoredFact }| {
-              edges_updated(w.key, reads_in(details_before(memo_store.fact(w.key))), []);
-              replaced_fact(w.key, w.fact);
-              found.insert(w.key, true)
-            },
-          );
-          wrote_in(before).fold((), |_: Unit, k: Bytes| if !placed.contains(k) { deleted(k) });
-          replaced_fact(key, past);
-          {
-            run: {
-              ..held.run,
-              took: incremented(held.run.took, q.name),
-              restored: held.run.restored.push({ query: q.name, input: d.input }),
-            },
-            at: Some({ digest: past.output, depth: past.depth, sealed: false }),
-          }
-        },
-      }
-    },
-  }
-
-fn restored<| e>(
-  queries: Map<Bytes, Query<| e>>,
-  run: Run,
-  q: Query<| e>,
-  key: Bytes,
-  left: Int,
-) -> { run: Run, at: Option<Settled> } / {memo_store.read, memo_store.write, abort.raise | e} =
-  if left <= 0 { panic(String::of_bytes_lossy(too_deep)) } else {
-    match memo_store.past(key) {
-      None -> { run: run, at: None },
-      Some(earlier) -> restored_from(queries, run, q, key, earlier, left - 1),
-    }
-  }
-
 fn report_cycle<a>(run: Run, step: Step) -> a / {abort.raise} =
   panic(
     "the query `" ++ String::of_bytes_lossy(step.query) ++ "` asks for its own result, through"
@@ -887,7 +734,6 @@ fn written_fact<| e>(
     } else {
       edges_updated(key, reads_in(details_before(stored)), []);
       if f.output != digest { marked_dependents(key) };
-      memo_store.keep_past(key, f);
       memo_store.put(
         key,
         {
@@ -949,7 +795,6 @@ fn recorded<| e>(
       let same_details = match stored { Some(f) -> f.details == d, None -> false };
       if !same_output && stored != None { marked_dependents(key) };
       if same_output && same_details { memo_store.keep_output(digest, output, q.persistent) } else {
-        match stored { Some(f) -> memo_store.keep_past(key, f), None -> () };
         memo_store.put(
           key,
           { output: digest, details: d, depth: depth, written_by: b"" },
@@ -1225,7 +1070,6 @@ type MemoryRun = {
 
 pub type MemoryStore = {
   facts: Map<Bytes, StoredFact>,
-  past: Map<Bytes, StoredFact>,
   details: Map<Bytes, FactDetails>,
   outputs: Map<Bytes, Bytes>,
   dependents: Map<Bytes, Map<Bytes, Bool>>,
@@ -1240,7 +1084,6 @@ pub type MemoryStore = {
 pub const empty_memory_store: MemoryStore =
   {
     facts: Map::new(),
-    past: Map::new(),
     details: Map::new(),
     outputs: Map::new(),
     dependents: Map::new(),
@@ -1354,10 +1197,6 @@ pub fn with_memory_store<a | e>(
       l.looked.digest
     },
     memo_store.is_out_of_date(key) -> running.waiting.depths.contains(key),
-    memo_store.past(key) -> store.past.get(key),
-    memo_store.keep_past(key, fact) -> {
-      store = { ..store, past: store.past.insert(key, fact) };
-    },
     memo_store.put_fact(key, fact) -> {
       store = { ..store, facts: store.facts.insert(key, fact) };
     },
@@ -1683,38 +1522,12 @@ fn line_queries() -> Map<Bytes, Query<| {}>> =
 
 fn lines_world(text: Bytes) -> TestWorld = world_of([{ at: b"f", text: text }])
 
-test "a fact computed by other code does not come back" {
-  let first = fetched_in(lengths(b"h1"), four, b"label", b"a");
-  let moved = fetched_in(lengths(b"h2"), edited(first.world, b"a", b"forty"), b"label", b"a");
-  let undone = fetched_in(lengths(b"h2"), edited(moved.world, b"a", b"four"), b"label", b"a");
-  assert_eq(undone.ran, [b"length"])
-}
-
 test "a fact that a query wrote never comes back on its own, because its writer decides it" {
   let q = line_queries();
   let first = fetched_in(q, lines_world(b"one\ntwo"), b"line", b"f1");
   let shorter = fetched_in(q, edited(first.world, b"f", b"one"), b"shout", b"f0");
   let longer = fetched_in(q, edited(shorter.world, b"f", b"one\nTWO"), b"line", b"f1");
   assert_eq(longer.output, b"TWO")
-}
-
-test "a query that wrote facts comes back with the versions it wrote" {
-  let q = line_queries();
-  let first = fetched_in(q, lines_world(b"one\ntwo"), b"shout", b"f1");
-  let moved = fetched_in(q, edited(first.world, b"f", b"one\nTWO"), b"shout", b"f1");
-  let undone = fetched_in(q, edited(moved.world, b"f", b"one\ntwo"), b"shout", b"f1");
-  assert_eq(undone.output, b"two!");
-  assert_eq(undone.ran, [])
-}
-
-test "a query that comes back takes the version of each fact it wrote, not an older version" {
-  let q = line_queries();
-  let first = fetched_in(q, lines_world(b"one\ntwo"), b"shout", b"f1");
-  let moved = fetched_in(q, edited(first.world, b"f", b"one\nTWO"), b"shout", b"f1");
-  let other = fetched_in(q, edited(moved.world, b"f", b"uno\nTWO"), b"shout", b"f1");
-  let undone = fetched_in(q, edited(other.world, b"f", b"one\nTWO"), b"shout", b"f1");
-  assert_eq(undone.output, b"TWO!");
-  assert(!undone.ran.contains(b"split"), None)
 }
 
 test "a query that writes several facts changes only the dependents of the facts that differ" {
@@ -1845,15 +1658,6 @@ test "a product whose code changed runs when a command asks for it" {
   });
   assert_eq(fetched_in(q, first.world, b"length", b"a").ran, []);
   assert_eq(fetched_in(q, first.world, b"hash", b"a").ran, [b"hash"])
-}
-
-test "undoing an edit brings back the earlier fact without running its query" {
-  let q = lengths(b"h1");
-  let first = fetched_in(q, four, b"label", b"a");
-  let moved = fetched_in(q, edited(first.world, b"a", b"forty"), b"label", b"a");
-  let undone = fetched_in(q, edited(moved.world, b"a", b"four"), b"label", b"a");
-  assert_eq(undone.output, b"long 4");
-  assert_eq(undone.ran, [])
 }
 
 fn over_two(input: Bytes) -> Bytes / {memo.read} =
