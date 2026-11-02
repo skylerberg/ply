@@ -18,7 +18,7 @@ import claims (proof_store, AcceptResult, ClaimsEntry)
 import std.env (env)
 import proof.obligation (ClaimSnapshot)
 import tester (result_cache, LastPass, StoreResult, ListingRequest, CasesListed, ListedCase,
-               listed_case_bin)
+               StartedTest, listed_case_bin)
 import sources
 import std.path (strip_root)
 import semantics (semantics)
@@ -206,14 +206,147 @@ fn without_warnings(k: OpenStore) -> OpenStore =
 fn cache_warnings(cache: tables::Cache) -> List<Diagnostic> =
   project_store::diagnostics_of(tables::warnings(cache))
 
+type JournalHeader = { runtime_digest: String, code: String }
+
+type JournalRow = { slot: Bytes, payload: Bytes }
+
+type JournalMark = { key: Bytes, hash: Bytes }
+
+type JournalRows = { key: Bytes, rows: List<JournalRow> }
+
+type JournalEntry = | Began(JournalHeader) | Started(JournalMark) | Finished(JournalRows)
+
+derive bin for JournalHeader
+derive bin for JournalRow
+derive bin for JournalMark
+derive bin for JournalRows
+derive bin for JournalEntry
+
+type Journal = { label: String, path: String, base: tables::Cache }
+
+fn journal_of(k: OpenStore) -> Journal =
+  { label: k.place.label, path: k.place.dir ++ "/test-journal", base: k.cache }
+
+fn header_of(stamps: tables::Stamps) -> JournalHeader =
+  { runtime_digest: stamps.runtime_digest, code: stamps.code }
+
+fn framed(entry: JournalEntry) -> Bytes / {abort.raise} =
+  bin::put_bytes(b"", bin::encode(entry, journal_entry_bin()))
+
+fn journal_entries(bytes: Bytes) -> List<JournalEntry> / {abort.raise} =
+  iterate({ at: 0, found: [] }, bytes.len() + 1, |s: { at: Int, found: List<JournalEntry> }|
+    if s.at >= bytes.len() { Stop(s.found) } else {
+      match bin::take_bytes(bytes, s.at) {
+        Err(_) -> Stop(s.found),
+        Ok(frame) -> match bin::decode(frame.value, journal_entry_bin()) {
+          Err(_) -> Stop(s.found),
+          Ok(entry) -> Continue({ at: frame.at, found: s.found.push(entry) }),
+        },
+      }
+    })
+
+type Recovery = { rows: List<JournalRow>, interrupted: List<StartedTest> }
+
+fn recovery_of(entries: List<JournalEntry>, stamps: tables::Stamps) -> Recovery =
+  match entries.at(0) {
+    Some(Began(header)) -> if header != header_of(stamps) { { rows: [], interrupted: [] } } else {
+      let finished = entries.fold(Map::new(), |found: Map<Bytes, Bool>, e: JournalEntry|
+        match e { Finished(f) -> found.insert(f.key, true), _ -> found });
+      entries.fold({ rows: [], interrupted: [] }, |r: Recovery, e: JournalEntry|
+        match e {
+          Finished(f) -> { ..r, rows: r.rows.concat(f.rows) },
+          Started(m) -> if finished.contains(m.key)
+              || r.interrupted.any(|t: StartedTest| t.key == m.key) { r }
+          else { { ..r, interrupted: r.interrupted.push({ key: m.key, hash: m.hash }) } },
+          Began(_) -> r,
+        })
+    },
+    _ -> { rows: [], interrupted: [] },
+  }
+
+fn read_journal<[r]>(j: Journal) -> List<JournalEntry> / {fs.read[r], abort.raise} =
+  match fs.read_file[r](j.path) { Some(bytes) -> journal_entries(bytes), None -> [] }
+
+fn begun_journal<[r]>(
+  k: OpenStore,
+  j: Journal,
+) -> { store: OpenStore, interrupted: List<StartedTest> } / {fs.read[r], fs.write[r], abort.raise} = {
+  let found = recovery_of(read_journal[r](j), k.cache.stamps);
+  let cache = if found.rows.len() == 0 { k.cache }
+  else { tables::flush_cache[r](tables::with_written_rows(k.cache, found.rows)) };
+  let _ = fs.create_dir[r](k.place.dir);
+  let _ = fs.write_file[r](j.path, framed(Began(header_of(k.cache.stamps))));
+  { store: { ..k, cache: cache }, interrupted: found.interrupted }
+}
+
+fn appended(
+  journal: Option<Journal>,
+  entry: JournalEntry,
+) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} =
+  match journal {
+    None -> (),
+    Some(j) -> {
+      let _ = if j.label == "cwd" { fs.append[cwd](j.path, framed(entry)) }
+      else { fs.append[abs](j.path, framed(entry)) };
+      ()
+    },
+  }
+
+fn ended_journal(journal: Option<Journal>) -> Unit / {fs.write[cwd], fs.write[abs]} =
+  match journal {
+    None -> (),
+    Some(j) -> {
+      let _ = if j.label == "cwd" { fs.remove[cwd](j.path) } else { fs.remove[abs](j.path) };
+      ()
+    },
+  }
+
+fn finished_rows(
+  journal: Option<Journal>,
+  update: StoreUpdate,
+) -> List<JournalRow> / {abort.raise} =
+  match journal {
+    None -> [],
+    Some(j) -> tables::rows_written(j.base, |c: tables::Cache| put_update(c, update, [])),
+  }
+
 pub fn with_result_cache<a | e>(
   opened_store: Option<OpenStore>,
-  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings | e},
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} = {
+  let begun = match opened_store {
+    None -> None,
+    Some(k) ->
+      Some(if k.place.label == "cwd" { begun_journal[cwd](k, journal_of(k)) }
+      else { begun_journal[abs](k, journal_of(k)) }),
+  };
+  let journal = begun.map(|b: { store: OpenStore, interrupted: List<StartedTest> }|
+    journal_of(b.store));
+  let result = journaled(
+    begun.map(|b: { store: OpenStore, interrupted: List<StartedTest> }| b.store),
+    match begun { Some(b) -> b.interrupted, None -> [] },
+    journal,
+    go,
+  );
+  ended_journal(journal);
+  result
+}
+
+fn journaled<a | e>(
+  opened_store: Option<OpenStore>,
+  interrupted: List<StartedTest>,
+  journal: Option<Journal>,
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
   handle {
     go()
   } with {
     var store_state = opened_store,
+    result_cache.interrupted() -> interrupted,
+    result_cache.started(running) ->
+      appended(journal, Started({ key: running.key, hash: running.hash })),
+    result_cache.finished(key, update) ->
+      appended(journal, Finished({ key: key, rows: finished_rows(journal, update) })),
     result_cache.open_warnings() -> match store_state {
       None -> [],
       Some(k) -> {
@@ -624,6 +757,56 @@ test "opening the cache under a different runtime digest drops the stored baseli
   }).value;
   assert_eq(back.baselines, [None]);
   assert_eq(back.texts, [Some(original_definition.text)])
+}
+
+test "a journal names the tests it saw start but not finish, returns the rows of the finished ones, ignores a torn last entry, and counts for nothing under other stamps" {
+  let row = { slot: b"\x05" ++ hashed("pass"), payload: b"" };
+  let journal = Bytes::concat_all([
+    framed(Began(header_of(some_stamps))),
+    framed(Started({ key: b"m.passes", hash: b"p" })),
+    framed(Started({ key: b"m.crashes", hash: b"c" })),
+    framed(Finished({ key: b"m.passes", rows: [row] })),
+  ]);
+  let torn = framed(Finished({ key: b"m.crashes", rows: [] }));
+  let read = recovery_of(journal_entries(journal ++ torn.slice(0, torn.len() - 1)), some_stamps);
+  assert_eq(read.interrupted, [{ key: b"m.crashes", hash: b"c" }]);
+  assert_eq(read.rows, [row]);
+  assert_eq(recovery_of(journal_entries(journal), { ..some_stamps, code: "another" }), {
+    rows: [],
+    interrupted: [],
+  })
+}
+
+test "a run after a crash stores the passes its journal finished, returns the tests it left running, and starts a new journal" {
+  let back = run_in_memory(mem_empty(), || {
+    let opened = {
+      place: { label: "mem", dir: "cache", root: "", stamps: some_stamps },
+      cache: tables::open_cache[mem]("cache", some_stamps),
+    };
+    let j = journal_of(opened);
+    let rows = tables::rows_written(opened.cache, |c: tables::Cache| put_update(c, an_update, []));
+    let _ = fs.create_dir[mem]("cache");
+    let _ = fs.write_file[mem](
+      j.path,
+      Bytes::concat_all([
+        framed(Began(header_of(some_stamps))),
+        framed(Started({ key: b"m.t", hash: b"" })),
+        framed(Finished({ key: b"m.t", rows: rows })),
+        framed(Started({ key: b"m.crashes", hash: b"c" })),
+      ]),
+    );
+    let begun = begun_journal[mem](opened, j);
+    {
+      interrupted: begun.interrupted,
+      passes: read_pass_traces(tables::open_cache[mem]("cache", some_stamps), [
+        hashed("t key"),
+      ]).value,
+      left: recovery_of(read_journal[mem](j), some_stamps),
+    }
+  }).value;
+  assert_eq(back.interrupted, [{ key: b"m.crashes", hash: b"c" }]);
+  assert_eq(back.passes, [Some(b"file\tcwd\ta\td\n")]);
+  assert_eq(back.left, { rows: [], interrupted: [] })
 }
 
 test "storing a run with no results reads back no passing results, no ran-test flags and no baselines" {

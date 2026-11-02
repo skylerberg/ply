@@ -22,12 +22,13 @@ import coverage (Coverage)
 import std.json (Bool)
 import tester
 import tester (result_cache, ExecutionResult, InterleavingFailure, BindingReport, LastPass, Options,
-               TestRun, TestUnit, Usage, joined_trace, sum_usage, no_usage)
+               TestRun, TestUnit, Usage, StartedTest, KnownFailure, joined_trace, sum_usage,
+               no_usage)
 import std.machine as entering
 import changes (Compared, ChangeDiff, compared, delta_of, change_diffs, stored_baseline_texts)
 import changes
 import views
-import testing.conclude (Conclusion, StaleIndex, UnobservedSearch, is_written)
+import testing.conclude (Conclusion, StaleIndex, StoreUpdate, UnobservedSearch, is_written)
 import testing.conclude
 import testing.delta (Delta)
 import testing.diagnose (changes_of)
@@ -56,11 +57,22 @@ pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
   effects.fold(false, |found: Bool, a: types::Effect| found || a.effect == b"sim")
 
 pub fn entry_of(index: Int, key: Bytes) -> Entry =
-  { test: index, key: key, case: None, unlisted: None }
+  { test: index, key: key, case: None, known_failure: None }
 
 pub type Reporting = { style: Style, width: Int, to_stderr: Bool }
 
-type SearchOptions = { plan: plan::Plan, measuring: Bool, lanes: Option<Int>, reporting: Reporting }
+pub type Journaling = {
+  started: (Int) -> StartedTest,
+  stored: (JobResult) -> StoreUpdate / {abort.raise},
+}
+
+type SearchOptions = {
+  plan: plan::Plan,
+  measuring: Bool,
+  lanes: Option<Int>,
+  reporting: Reporting,
+  journaling: Journaling,
+}
 
 type Job = { unit: TestUnit, test: Int, name: String, entry: Entry, search: Option<plan::Plan> }
 
@@ -104,14 +116,74 @@ pub fn job_of(
       },
   }
 
+pub fn journaling_of(
+  analysis: TestListing,
+  concluding: List<conclude::Test>,
+  era: Bytes,
+  chosen: conclude::RunSelection,
+) -> Journaling = {
+  let declared = concluding.fold(
+    Map::new(),
+    |found: Map<Int, conclude::Test>, t: conclude::Test| found.insert(t.index, t),
+  );
+  {
+    started: |i: Int|
+      {
+        key: match test_at(analysis, i) { Some(t) -> t.key, None -> b"" },
+        hash: test_hash_at(analysis, i).unwrap_or(b""),
+      },
+    stored: |done: JobResult|
+      match declared.get(done.test) {
+        Some(t) -> conclude::stored_by(conclusion_of(done), t, era, chosen),
+        None -> conclude::nothing_stored,
+      },
+  }
+}
+
+pub fn crashes_of(analysis: TestListing, interrupted: List<StartedTest>) -> Map<Int, KnownFailure> =
+  if interrupted.len() == 0 { Map::new() } else {
+    range(0, analysis.tests.len()).fold(Map::new(), |found: Map<Int, KnownFailure>, i: Int|
+      match test_at(analysis, i) {
+        None -> found,
+        Some(t) -> {
+          let hash = test_hash_at(analysis, i).unwrap_or(b"");
+          if interrupted.any(|s: StartedTest| s.key == t.key && s.hash == hash) {
+            found.insert(
+              i,
+              tester::crashed(
+                t,
+                interrupted.filter(|s: StartedTest| s.key != t.key).map(|s: StartedTest| s.key),
+              ),
+            )
+          } else { found }
+        },
+      })
+  }
+
+pub fn with_crash(j: Job, crashes: Map<Int, KnownFailure>) -> Job =
+  match crashes.get(j.test) {
+    Some(f) -> { ..j, entry: { ..j.entry, known_failure: Some(f) } },
+    None -> j,
+  }
+
 pub fn run_class(
   jobs: List<Job>,
   search_options: SearchOptions,
-) -> List<JobResult> / {entering::machine.enter, entering::machine.report, abort.raise} = {
+) -> List<JobResult> / {entering::machine.enter, entering::machine.report, result_cache.started, result_cache.finished, abort.raise} = {
   let lanes = machine::split_into_lanes(jobs, search_options.lanes);
-  machine::merge_lanes(
-    run_lanes(lanes, search_options.measuring, search_options.reporting, 0, lanes.len(), 64),
-  )
+  machine::merge_lanes(run_lanes(lanes, search_options, 0, lanes.len(), 64))
+}
+
+fn journaled_run(
+  j: Job,
+  measuring: Bool,
+  journaling: Journaling,
+) -> JobResult / {entering::machine.enter, result_cache.started, result_cache.finished, abort.raise} = {
+  let started = (journaling.started)(j.test);
+  result_cache.started(started);
+  let done = run_job(j, measuring);
+  result_cache.finished(started.key, (journaling.stored)(done));
+  done
 }
 
 fn reported(
@@ -128,27 +200,32 @@ fn reported(
 
 fn run_lanes(
   lanes: List<List<Job>>,
-  measuring: Bool,
-  reporting: Reporting,
+  options: SearchOptions,
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<List<JobResult>> / {entering::machine.enter, entering::machine.report, abort.raise} =
+) -> List<List<JobResult>> / {entering::machine.enter, entering::machine.report, result_cache.started, result_cache.finished, abort.raise} =
   if hi - lo <= 0 { [] } else if hi - lo == 1 || depth_left <= 0 {
     range(lo, hi).fold([], |lanes_done: List<List<JobResult>>, i: Int|
       match lanes.at(i) {
         Some(lane) ->
           lanes_done.push(
             lane.fold([], |out: List<JobResult>, j: Job|
-              out.push(reported(run_job(j, measuring), j, reporting))),
+              out.push(
+                reported(
+                  journaled_run(j, options.measuring, options.journaling),
+                  j,
+                  options.reporting,
+                ),
+              )),
           ),
         None -> lanes_done,
       })
   } else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      run_lanes(lanes, measuring, reporting, lo, mid, depth_left - 1),
-      run_lanes(lanes, measuring, reporting, mid, hi, depth_left - 1),
+      run_lanes(lanes, options, lo, mid, depth_left - 1),
+      run_lanes(lanes, options, mid, hi, depth_left - 1),
     };
     halves._0.concat(halves._1)
   }
@@ -156,7 +233,7 @@ fn run_lanes(
 type SearchTotals = { usage: Usage, trace: Option<Bytes>, unobserved: Bool }
 
 pub fn run_job(j: Job, measuring: Bool) -> JobResult / {entering::machine.enter, abort.raise} =
-  match j.entry.unlisted {
+  match j.entry.known_failure {
     Some(reason) ->
       {
         test: j.test,
