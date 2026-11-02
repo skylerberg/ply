@@ -11,8 +11,8 @@ import compiler.check.resolve.tables (Binding, Declaration, Declarations, Effect
                                       SetSpace, TypeSpace, ValueSpace, binding_of, declarations_of,
                                       lookup_declared, module_names, module_of_name,
                                       no_declarations)
-import compiler.program.group_check (GroupChecked, GroupInputs, LoadedSource, checked_group,
-                                     source_of_group)
+import compiler.program.group_check (GroupChecked, GroupInputs, LoadedSource, ResolvedGroup,
+                                     checked_group, resolved_group, source_of_group)
 import compiler.program.reads (NameDeclarations, StoredReads, name_declarations_bin, over_stored,
                                first_stored)
 import compiler.program.stored (decoded_declarations, encoded_declarations)
@@ -36,7 +36,8 @@ import compiler.front.exports (OwnerInterface, HashEntry, ModuleOrigin, InRoot, 
                                call_cycles)
 import compiler.front.owner_checks
 import compiler.front.emitter_input (KnownConstructors, Analysed, Rejected, module_rollup,
-                                     module_rollup_bin)
+                                     module_rollup_bin, GroupLowering, group_lowering,
+                                     group_lowering_bin, no_group_lowering)
 import compiler.front (PulledAnalysis, embed_read_of, may_call_embed, published, shipped_wants_bin)
 import compiler.front.pkg (Package)
 import compiler.front.published (encode_rows, decode_rows, no_rows)
@@ -61,7 +62,7 @@ import compiler.check.resolve.tables (Source, Diagnostic, Label, backticked, dia
 import compiler.syntax.parsing (Identifier, dummy_span)
 import compiler.check.infer.definitions (checked_functions, check_order)
 import compiler.check.infer.checker (BodyChecking, CheckOnly)
-import compiler.check.types (Effect, FunctionType, TypeTable)
+import compiler.check.types (Effect, FunctionType)
 import compiler.store.hash.forms (CachedNode, CachedTest, CachedLaw, CachedHashes, NodeRef,
                                   HashInput, HashNode, hash_forms, cached_hashes_bin,
                                   hash_input_bin, definition_key, joined_forms, module_record,
@@ -829,12 +830,11 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       < 2;
     let members = key.owners.map(|o: Bytes| owner_facts(named, o));
     let checked = if alone {
-      checked_group_result(
-        key.module,
-        group_checked(named, members, imports_of(key), always_entire, no_bodies),
-      )
+      let c = group_checked(named, members, imports_of(key), always_entire, no_bodies);
+      { result: checked_group_result(key.module, c), lowering: lowering_of(c) }
     } else { finalize_group(named, key, members) };
-    let result = checked;
+    let result = checked.result;
+    memo.provide(group_lowering_query, input, bin::encode(checked.lowering, stored_lowering_bin()));
     memo.provide(
       group_listing_query,
       input,
@@ -1456,17 +1456,24 @@ fn called_in(
 fn sibling_for_called(called: List<Bytes>) -> (Bytes) -> Sibling =
   |o: Bytes| if called.contains(o) { ByGroupResult } else { BySignature }
 
+type CheckedGroup = { result: owner_checks::GroupResult, lowering: Option<GroupLowering> }
+
+fn lowering_of(c: UnitCheck) -> Option<GroupLowering> / {abort.raise} =
+  match c.out.pulled.out { Analysed(w) -> Some(group_lowering(w)), Rejected(_) -> None }
+
 fn finalize_group(
   named: ModuleKey,
   key: GroupKey,
   members: List<OwnerFacts>,
-) -> owner_checks::GroupResult / {QueryEffects, abort.raise} = {
+) -> CheckedGroup / {QueryEffects, abort.raise} = {
   let walked = key.owners.map(|o: Bytes| { owner: o, typed: inference_of(named, o) });
   let rejected = owner_checks::inference_errors(
     walked,
     item_layout(members.map(|f: OwnerFacts| f.text)),
   );
-  if rejected.len() > 0 { { ..owner_checks::no_group, rejected: rejected } } else {
+  if rejected.len() > 0 {
+    { result: { ..owner_checks::no_group, rejected: rejected }, lowering: None }
+  } else {
     let c = group_checked(
       named,
       members,
@@ -1475,20 +1482,28 @@ fn finalize_group(
       |source: OwnerSource|
         Some(owner_checks::supplied_bodies(walked, source.items, source.offset)),
     );
-    owner_checks::finalized_result(checked_group_result(key.module, c), walked, c.source.items)
+    {
+      result: owner_checks::finalized_result(
+        checked_group_result(key.module, c),
+        walked,
+        c.source.items,
+      ),
+      lowering: lowering_of(c),
+    }
   }
 }
 
-pub type GroupProgram = {
-  named: ModuleKey,
-  members: List<OwnerFacts>,
-  imported: List<Imported>,
-  sibling: (Bytes) -> Sibling,
-  bodies: BodySupplier,
-  types: List<TypeTable>,
+type GroupProgram = { source: GroupSource, sibling: (Bytes) -> Sibling }
+
+pub fn resolved_group_of(
+  key: GroupKey,
+) -> Result<ResolvedGroup, List<Diagnostic>> / {QueryEffects, abort.raise} = {
+  let g = group_program_of(key);
+  with_group_read([g.source], g.sibling, no_bodies, [], |read: GroupRead|
+    resolved_group(read.inputs))
 }
 
-pub fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise} = {
+fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise} = {
   let named = { module: key.module, shipped: key.shipped, tested: key.tested };
   let members = key.owners.map(|o: Bytes| owner_facts(named, o));
   let cycle = match key.owners {
@@ -1503,37 +1518,13 @@ pub fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.ra
         )
         >= 2,
   };
-  if !cycle {
-    {
-      named: named,
-      members: members,
-      imported: imports_of(key),
-      sibling: always_entire,
-      bodies: no_bodies,
-      types: [],
-    }
-  } else {
-    let walked = key.owners.map(|o: Bytes| { owner: o, typed: inference_of(named, o) });
-    {
-      named: named,
-      members: members,
-      imported: imports_of(key),
-      sibling: sibling_for_called(called_in(key, walked)),
-      bodies: |source: OwnerSource|
-        Some(owner_checks::supplied_bodies(walked, source.items, source.offset)),
-      types: walked.map(|w: { owner: Bytes, typed: owner_checks::InferenceResult }| w.typed.types),
-    }
-  }
-}
-
-pub fn group_program(
-  key: GroupKey,
-  also: List<Mention>,
-) -> { check: UnitCheck, types: List<TypeTable> } / {QueryEffects, abort.raise} = {
-  let g = group_program_of(key);
   {
-    check: group_checked(g.named, g.members, g.imported, g.sibling, g.bodies, also),
-    types: g.types,
+    source: { named: named, members: members, imported: imports_of(key) },
+    sibling: if !cycle { always_entire } else {
+      sibling_for_called(
+        called_in(key, key.owners.map(|o: Bytes| { owner: o, typed: inference_of(named, o) })),
+      )
+    },
   }
 }
 
@@ -1738,8 +1729,9 @@ pub fn stored_rows(g: GroupKey) -> Rows / {memo.read, abort.raise} =
   if g.owners.len() == 0 { no_rows } else {
     member_rows(g).fold(no_rows, |rows: Rows, r: Rows|
       {
-        ..rows,
         definitions: rows.definitions.concat(r.definitions),
+        tests: rows.tests.concat(r.tests),
+        laws: rows.laws.concat(r.laws),
         types: types_joined(rows.types, r.types),
       })
   }
@@ -1750,6 +1742,26 @@ pub fn group_rows_result(input: Bytes) -> Bytes / {memo.write, abort.raise} =
   match memo.written_by(group_query, input) {
     Some(o) -> o,
     None -> bin::encode([], bin::list_bin(bin::bytes_bin())),
+  }
+
+pub const group_lowering_query: Bytes = b"group lowering"
+
+fn stored_lowering_bin() -> bin::BinCodec<Option<GroupLowering>> =
+  bin::option_bin(group_lowering_bin())
+
+pub fn group_lowering_result(input: Bytes) -> Bytes / {memo.write, abort.raise} =
+  match memo.written_by(group_query, input) {
+    Some(o) -> o,
+    None -> bin::encode(None, stored_lowering_bin()),
+  }
+
+pub fn stored_lowering(g: GroupKey) -> Option<GroupLowering> / {memo.read, abort.raise} =
+  if g.owners.len() == 0 { Some(no_group_lowering) } else {
+    decoded(
+      memo.fetch(group_lowering_query, bin::encode(g, group_key_bin())),
+      stored_lowering_bin(),
+      "a group's lowering facts",
+    )
   }
 
 fn member_rows(g: GroupKey) -> List<Rows> / {memo.read, abort.raise} =
@@ -2645,6 +2657,11 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
       name: group_rows_query,
       definition: b"compiler.front.checking.groups.group_rows_result",
       body: group_rows_result,
+    },
+    {
+      name: group_lowering_query,
+      definition: b"compiler.front.checking.groups.group_lowering_result",
+      body: group_lowering_result,
     },
     {
       name: group_listing_query,

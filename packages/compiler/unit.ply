@@ -37,7 +37,7 @@ import compiler.front.rows (Dump, EmitterRoot, EmitterConstructor, KeyRow, Relea
                             BinderRow, TypeRow, EffectRow, HashTableRow, DefinitionHashRow)
 import compiler.emit.generated (MarshalledSums, marshalled_sums)
 import compiler.front.published (analyse, no_rows, dump_of)
-import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
+import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, KeyedRoot, LawBinders)
 import compiler.front.facts (Analysis)
 import compiler.emit.reads (over_analysis)
 import compiler.front (analyse_pulling_std_with)
@@ -508,7 +508,7 @@ fn taken_bodies(
 pub fn always_enters(k: RootKey) -> Bool =
   match k { Test(_) -> true, TestCases(_) -> true, _ -> false }
 
-fn runtime_enters(p: Program, marshalling: MarshalledSums, k: RootKey) -> Bool =
+fn runtime_enters(p: LoweringInput, marshalling: MarshalledSums, k: RootKey) -> Bool =
   match k {
     Test(_) -> true,
     TestCases(_) -> true,
@@ -536,7 +536,7 @@ fn runtime_enters(p: Program, marshalling: MarshalledSums, k: RootKey) -> Bool =
     _ -> false,
   }
 
-fn entered_types(p: Program, k: RootKey) -> List<Type> =
+fn entered_types(p: LoweringInput, k: RootKey) -> List<Type> =
   match k {
     Law(_) -> match p.binders.get(root_name(k)) { Some(types) -> types, None -> [] },
     Clause(c) -> entered_types(p, c.definition),
@@ -1497,12 +1497,46 @@ pub type Program = {
   constructor_functions: Map<Bytes, Bool>,
 }
 
+pub type LoweringInput = {
+  roots: Map<RootName, EmitterRoot>,
+  schemes: Map<Bytes, Scheme>,
+  binders: Map<RootName, List<Type>>,
+}
+
+pub fn lowering_input(
+  roots: List<KeyedRoot>,
+  definitions: List<KnownDefinitionRow>,
+  laws: List<LawBinders>,
+) -> LoweringInput / {abort.raise} =
+  {
+    roots: roots.fold(Map::new(), |found: Map<RootName, EmitterRoot>, k: KeyedRoot|
+      found.insert(root_name(k.key), k.root)),
+    schemes: definitions.fold(Map::new(), |found: Map<Bytes, Scheme>, row: KnownDefinitionRow|
+      found.insert(row.name, row.scheme)),
+    binders: laws.fold(Map::new(), |found: Map<RootName, List<Type>>, l: LawBinders|
+      [LawGuard, LawBody].fold(found, |m: Map<RootName, List<Type>>, part: LawPart|
+        m.insert(root_name(law_key(l.module, l.name, part)), l.types))),
+  }
+
+pub fn lowering_input_of(dump: Dump) -> LoweringInput / {abort.raise} =
+  keyed_lowering_input(dump, roots_by_row_name(dump))
+
+fn keyed_lowering_input(dump: Dump, keys: Map<Bytes, RootKey>) -> LoweringInput / {abort.raise} =
+  lowering_input(
+    dump.emitter_roots.fold([], |found: List<KeyedRoot>, root: EmitterRoot|
+      match keys.get(root.root) { Some(k) -> found.push({ key: k, root: root }), None -> found }),
+    dump.rows.definitions,
+    dump.laws.map(|l: LawRow|
+      { module: l.module, name: l.name, types: l.binders.map(|b: BinderRow| b.ty) }),
+  )
+
 pub fn program_of(
   dump: Dump,
   sources: List<Bytes>,
   roots: List<RootKey>,
 ) -> Program / {abort.raise} = {
   let results_and_keys = roots_by_row_name(dump);
+  let input = keyed_lowering_input(dump, results_and_keys);
   let named = |row: Bytes|
     match results_and_keys.get(row) { Some(k) -> Some(root_name(k)), None -> None };
   let by_name = dump.modules.fold(Map::new(), |accumulator: Map<Bytes, ModuleRow>, m: ModuleRow|
@@ -1520,18 +1554,8 @@ pub fn program_of(
           ),
         ),
     });
-  let schemes = dump.rows.definitions.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Scheme>, row: KnownDefinitionRow|
-      accumulator.insert(row.name, row.scheme),
-  );
-  let prelude = prelude_module.concat(b".");
   {
-    roots: dump.emitter_roots.fold(
-      Map::new(),
-      |accumulator: Map<RootName, EmitterRoot>, root: EmitterRoot|
-        match named(root.root) { Some(n) -> accumulator.insert(n, root), None -> accumulator },
-    ),
+    roots: input.roots,
     keys: dump.keys.fold(Map::new(), |accumulator: Map<RootName, Bytes>, k: KeyRow|
       match named(k.root) { Some(n) -> accumulator.insert(n, k.key), None -> accumulator }),
     modules: dump.ordinals.fold([], |accumulator: List<ModuleRow>, o: OrdinalRow|
@@ -1544,12 +1568,8 @@ pub fn program_of(
     read: read,
     embeds: reads.fold(Map::new(), |accumulator: Map<Int, Bytes>, i: Int, parts: List<Bytes>|
       accumulator.insert(i, blake3(Bytes::concat_all(sorted_unique(parts))))),
-    schemes: schemes,
-    binders: dump.laws.fold(Map::new(), |accumulator: Map<RootName, List<Type>>, l: LawRow| {
-      let types = l.binders.map(|b: BinderRow| b.ty);
-      [LawGuard, LawBody].fold(accumulator, |m: Map<RootName, List<Type>>, part: LawPart|
-        m.insert(root_name(law_key(l.module, l.name, part)), types))
-    }),
+    schemes: input.schemes,
+    binders: input.binders,
     declared: {
       let types = dump.types.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: TypeRow|
         accumulator.insert(t.name, true));
@@ -1736,9 +1756,8 @@ pub type LevelTally = {
 
 pub const entered_timeout_ms: Int = 60000
 
-pub fn enters(dump: Dump, root: RootKey) -> Bool / {EmitReads} = {
-  let p = program_of(dump, [], [root]);
-  runtime_enters(p, marshalling_of(entered_types(p, root)), root)
+pub fn enters(input: LoweringInput, root: RootKey) -> Bool / {EmitReads} = {
+  runtime_enters(input, marshalling_of(entered_types(input, root)), root)
 }
 
 pub type RootSummary = { key: RootKey, calls: List<RootKey>, head: Option<Prototype> }
@@ -1765,7 +1784,7 @@ derive bin for UnitCode
 
 pub type LoweredUnit = { code: UnitCode, summary: UnitSummary }
 
-pub type LoweredBatch = { results: List<RootOutput>, program: Program }
+pub type LoweredBatch = { results: List<RootOutput>, input: LoweringInput }
 
 pub type CalleeFacts = {
   published: Map<RootName, PublishedSignature>,
@@ -1933,7 +1952,7 @@ fn unit_finished<s>(w: UnitWalk<s>, natives_here: List<Extern>) -> LoweredUnit /
       requested: w.keys.fold([], |accumulator: List<RequestedRoot>, n: RootName, k: RootKey|
         match w.batches.get(n) {
           Some(b) -> if finished.contains(n) {
-            accumulator.push(requested_root(b.program, k, home_of(k)))
+            accumulator.push(requested_root(b.input, k, home_of(k)))
           } else { accumulator },
           None -> accumulator,
         }),
@@ -1979,10 +1998,7 @@ fn unit_finished<s>(w: UnitWalk<s>, natives_here: List<Extern>) -> LoweredUnit /
   }
 }
 
-pub fn program_batch(dump: Dump, results: List<RootOutput>) -> LoweredBatch / {abort.raise} =
-  { results: results, program: program_of(dump, [], []) }
-
-fn requested_root(p: Program, k: RootKey, home: Bytes) -> RequestedRoot =
+fn requested_root(p: LoweringInput, k: RootKey, home: Bytes) -> RequestedRoot =
   match k {
     EntryPoint(_) ->
       { key: k, name: root_name(k), arity: 0, constant: false, site: site_owner(k), home: home },
@@ -3525,7 +3541,8 @@ test "each root a program requests has a key built from its kind, and the key's 
   let p = program_of(dump, sources_in_order(dump, user.concat([cases])), offers.keys);
   let mine = offers.keys.filter(|k: RootKey| module_of(k) == b"m");
   assert_eq(
-    mine.filter(|k: RootKey| over_outcome(analysed, |_: Analysis| enters(dump, k))),
+    mine.filter(|k: RootKey|
+      over_outcome(analysed, |_: Analysis| enters(lowering_input_of(dump), k))),
     mine.filter(|k: RootKey| k != law_key(b"m", b"s", LawBody)),
   )
 }
@@ -3587,7 +3604,8 @@ test "an `ensures` clause about a function that a definition returns gets no ent
   ];
   let analysed = analyse(parse_all(user));
   let dump = dump_of(analysed);
-  let entered = |k: RootKey| over_outcome(analysed, |_: Analysis| enters(dump, k));
+  let entered = |k: RootKey|
+    over_outcome(analysed, |_: Analysis| enters(lowering_input_of(dump), k));
   assert(entered(Named(b"m.adder")), None);
   assert(!entered(Clause({ definition: Named(b"m.adder"), kind: Ensures, n: 0 })), None)
 }
