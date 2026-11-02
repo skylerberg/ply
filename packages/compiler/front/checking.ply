@@ -44,12 +44,12 @@ import compiler.front.checking.promises (promise_queries, cost_walk_query, cost_
                                          module_parameters_query, module_costs_query, measure_query,
                                          measures_query)
 import compiler.front.checking.groups (module_rollup_query, hash_summary_query, group_key_bin,
-                                       owners_result_bin, group_hashes_bin, owners_query,
-                                       owner_query, calls_query, cycles_query, shape_query,
-                                       unit_of_query, signature_unit_query, setting_query,
-                                       group_imports_query, visible_modules_query,
-                                       wanted_files_query, group_query, signatures_query,
-                                       typed_query, group_hash_query, names_query,
+                                       module_rejected, listed_result, owners_result_bin,
+                                       group_hashes_bin, owners_query, owner_query, calls_query,
+                                       cycles_query, shape_query, unit_of_query,
+                                       signature_unit_query, setting_query, group_imports_query,
+                                       visible_modules_query, wanted_files_query, group_query,
+                                       signatures_query, typed_query, group_hash_query, names_query,
                                        header_text_query, header_query, owner_imports_query,
                                        signature_imports_query, signature_rejected_query,
                                        hashes_query, documented_query, declaring_query,
@@ -254,6 +254,10 @@ pub fn checked_program_from_results(
 
 pub type LoadResults = { results: List<CheckedModule>, pulled: List<Bytes> }
 
+pub fn listed_module(named: ModuleKey) -> CheckedModule / {memo.read, abort.raise} =
+  if module_rejected(named) { module_of(named) }
+  else { { module: named.module, result: listed_result(named) } }
+
 pub fn module_of(named: ModuleKey) -> CheckedModule / {memo.read, abort.raise} =
   {
     module: named.module,
@@ -268,6 +272,7 @@ pub fn query_load(
   own: List<Bytes>,
   required_modules: List<Bytes>,
   tested: Bool,
+  read: (ModuleKey) -> CheckedModule / {memo.read, abort.raise},
 ) -> LoadResults / {memo.read, abort.raise} = {
   let cycles = cycles_among(own);
   if cycles.len() > 0 { { results: cycles, pulled: [] } } else {
@@ -288,7 +293,7 @@ pub fn query_load(
             stopped: accumulator.stopped.insert(n.module, true),
           }
         } else {
-          let a = module_of(n);
+          let a = read(n);
           {
             returned: accumulator.returned.insert(n.module, a),
             written: accumulator.written.insert(n.module, a.result.shape.written),
@@ -320,7 +325,7 @@ pub fn query_load(
             fresh.fold(
               { ..x, read: x.read.concat(fresh), pulled: x.pulled.concat(fresh) },
               |accumulator: { results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }, n: Bytes| {
-                let a = module_of({ module: n, shipped: true, tested: tested });
+                let a = read({ module: n, shipped: true, tested: tested });
                 {
                   ..accumulator,
                   results: accumulator.results.push(a),
@@ -421,15 +426,11 @@ pub fn check_shipped_modules(
   let rejected = dependencies_first(
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   ).order.fold([], |accumulator: List<CheckedModule>, named: ModuleKey| {
-    let a = module_of(named);
-    [hashes_query, wanted_files_query, module_summary_query, module_listing_query].fold(
-      (),
-      |_: Unit, query: Bytes| {
-        memo.fetch(query, bin::encode(named, module_key_bin()));
-        ()
-      },
-    );
-    if a.result.rejected.len() == 0 { accumulator } else { accumulator.push(a) }
+    [hashes_query, wanted_files_query, module_listing_query].fold((), |_: Unit, query: Bytes| {
+      memo.fetch(query, bin::encode(named, module_key_bin()));
+      ()
+    });
+    if module_rejected(named) { accumulator.push(module_of(named)) } else { accumulator }
   });
   declaring_in(b"std");
   rejected
@@ -757,7 +758,7 @@ pub fn lookup_input_shipping(
 fn hashed_load(
   own: List<Bytes>,
 ) -> { results: List<CheckedModule>, fixing: CachedHashes } / {memo.read, abort.raise} = {
-  let all = query_load(own, [], false);
+  let all = query_load(own, [], false, module_of);
   {
     results: all.results,
     fixing: if rejected_first(all.results).len() > 0 { no_cached_hashes }
@@ -1041,7 +1042,7 @@ pub fn check_under(
       || {
         in_session(qs, |run: Run| {
           let done = reading(qs, run, || {
-            let all = query_load(w.own, [], false);
+            let all = query_load(w.own, [], false, module_of);
             {
               results: all.results,
               fixing: joined_cached_hashes(hashed_all(w.own, all.pulled, false)),
