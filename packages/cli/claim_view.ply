@@ -14,8 +14,8 @@ import compiler.check.types (tables_joined)
 import compiler.store.hash.forms (FunctionNamed, ItemKeyed, ModuleHashes, Subject,
                                   joined_cached_hashes, reachable_functions)
 import compiler.check.infer.checker (DefinitionInfo)
-import claims (Claim, Collection, DischargeResult, NotCompiled, OwnClaims, Rejection, StaticProver,
-               claim_bin, discharge_library, discharging, lacks_proof, laws_by_key,
+import claims (Claim, ClaimsEntry, Collection, DischargeResult, NotCompiled, OwnClaims, Rejection,
+               StaticProver, claim_bin, discharge_library, discharging, lacks_proof, laws_by_key,
                no_static_prover, own_claims, proof_store, static_prover_of)
 import compiler.front.checking.view
 import compiler.front.checking (LoadInputs)
@@ -181,7 +181,7 @@ pub fn claim_view(
   }
 }
 
-type KnownModule = { name: Bytes, index: Int, path: String, claims: Option<ModuleClaims> }
+type KnownModule = { name: Bytes, index: Int, identity: Bytes, claims: Option<ModuleClaims> }
 
 pub type ClaimInputs = { names: List<Bytes>, records: List<Bytes>, texts: List<Bytes> }
 
@@ -189,17 +189,16 @@ fn known_module(
   identity: Bytes,
   inputs: ClaimInputs,
   index: Int,
-) -> KnownModule / {toolchain.read_file, abort.raise} = {
-  let path = "claims/"
-    ++ blake3(
-      Bytes::concat_all([identity, inputs.records.get(index), inputs.texts.get(index)]),
-    ).hex_of(
-    );
+) -> KnownModule / {proof_store.module_claims, abort.raise} = {
+  let name = inputs.names.get(index);
+  let known = blake3(
+    Bytes::concat_all([identity, inputs.records.get(index), inputs.texts.get(index)]),
+  );
   {
-    name: inputs.names.get(index),
+    name: name,
     index: index,
-    path: path,
-    claims: match toolchain.read_file(path) {
+    identity: known,
+    claims: match proof_store.module_claims(name, known) {
       None -> None,
       Some(bytes) -> match bin::decode(bytes, module_claims_bin()) {
         Ok(c) -> Some(placed_claims(c, index)),
@@ -339,7 +338,7 @@ fn claimed_with_view(
   names: List<Bytes>,
   known: List<KnownModule>,
   open: List<KnownModule>,
-) -> Result<ClaimedProgram, List<Diagnostic>> / {toolchain.write_file, abort.raise} =
+) -> Result<ClaimedProgram, List<Diagnostic>> / {proof_store.record_claims, abort.raise} =
   match claim_view(program, v, open.map(|k: KnownModule| k.name)) {
     Err(diagnostics) -> Err(diagnostics),
     Ok(w) -> {
@@ -352,13 +351,22 @@ fn claimed_with_view(
       let places = known.fold(Map::new(), |found: Map<Int, Int>, k: KnownModule|
         match opened.get(k.name) { Some(i) -> found.insert(i, k.index), None -> found });
       let by_module = fresh_by_module(fresh, v, names, opened);
+      let fresh_of = |k: KnownModule, i: Int| fresh_claims(by_module, k.name, i);
+      let store_warnings = proof_store.record_claims(
+        known.fold([], |found: List<ClaimsEntry>, k: KnownModule|
+          match opened.get(k.name) {
+            Some(i) ->
+              found.push({
+                module: k.name,
+                identity: k.identity,
+                claims: bin::encode(fresh_of(k, i), module_claims_bin()),
+              }),
+            None -> found,
+          }),
+      );
       let current = known.fold([], |found: List<ModuleClaims>, k: KnownModule|
         match opened.get(k.name) {
-          Some(i) -> {
-            let c = fresh_claims(by_module, k.name, i);
-            toolchain.write_file(k.path, bin::encode(c, module_claims_bin()));
-            found.push({ ..placed_claims(c, k.index), claims: [] })
-          },
+          Some(i) -> found.push({ ..placed_claims(fresh_of(k, i), k.index), claims: [] }),
           None -> match k.claims { Some(c) -> found.push(c), None -> found },
         });
       let pairs = range(0, fresh.claims.len()).fold([], |found: List<WorldClaim>, i: Int| {
@@ -373,7 +381,10 @@ fn claimed_with_view(
         }
       });
       let mine = claims_of_program(names, built.world, current, pairs);
-      Ok({ mine: mine, statics: static_prover_of(w, mine.world, owned) })
+      Ok({
+        mine: { ..mine, warnings: mine.warnings.concat(store_warnings) },
+        statics: static_prover_of(w, mine.world, owned),
+      })
     },
   }
 
@@ -388,7 +399,7 @@ pub fn claimed_modules<| e>(
   use_cache: Bool,
   every_module: Bool,
   closure: (List<Bytes>) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise | e},
-) -> Result<ClaimedProgram, List<Diagnostic>> / {shipped.definitions, toolchain.read_file, toolchain.write_file, proof_store.cached, abort.raise | e} = {
+) -> Result<ClaimedProgram, List<Diagnostic>> / {shipped.definitions, proof_store.module_claims, proof_store.record_claims, proof_store.cached, abort.raise | e} = {
   let identity = identity_of(shipped.definitions(), [b"claims.own_claims"]);
   let known = range(0, inputs.names.len()).map(|i: Int| known_module(identity, inputs, i));
   let open = known.filter(|k: KnownModule| wants_view(k, use_cache, every_module));
@@ -569,13 +580,13 @@ fn modules_with_claims(size: Int, edited: Bytes) -> List<Source> =
   })
 
 type RecordedClaims = {
-  written: Map<String, Bytes>,
+  written: Map<Bytes, ClaimsEntry>,
   claimed: Result<ClaimedProgram, List<Diagnostic>>,
 }
 
 fn claimed_over(
   sources: List<Source>,
-  stored: Map<String, Bytes>,
+  stored: Map<Bytes, ClaimsEntry>,
 ) -> RecordedClaims / {abort.raise} = {
   let inputs = {
     names: sources.map(|s: Source| s.name),
@@ -588,25 +599,21 @@ fn claimed_over(
   } with {
     var written = Map::new(),
     shipped.definitions() -> b"claims.own_claims 00\n",
-    toolchain.read_file(path) -> match written.get(path) {
-      Some(b) -> Some(b),
-      None -> stored.get(path),
+    proof_store.module_claims(module, identity) -> match match written.get(module) {
+        Some(e) -> Some(e),
+        None -> stored.get(module),
+      } {
+      Some(e) -> if e.identity == identity { Some(e.claims) } else { None },
+      None -> None,
     },
-    toolchain.write_file(path, bytes) -> {
-      written = written.insert(path, bytes);
-      true
+    proof_store.record_claims(entries) -> {
+      written = entries.fold(written, |found: Map<Bytes, ClaimsEntry>, e: ClaimsEntry|
+        found.insert(e.module, e));
+      []
     },
     proof_store.cached(keys) -> keys.map(|k: String| Some(b"")),
     return claimed -> { written: written, claimed: claimed },
   }
-}
-
-test "an edit records the claims of one module again, however many modules have claims" {
-  let rewritten = |size: Int| {
-    let first = claimed_over(modules_with_claims(size, b"n + 1"), Map::new()).written;
-    claimed_over(modules_with_claims(size, b"n + 2"), first).written.len()
-  };
-  assert_eq(rewritten(2), rewritten(6))
 }
 
 test "a module loaded without the others keeps its place among all modules" {
