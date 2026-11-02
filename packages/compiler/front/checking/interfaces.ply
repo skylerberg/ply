@@ -1,11 +1,15 @@
 import std.bin
 import compiler.store.memo (memo)
-import compiler.store.hash (Contract, contract_bin, public_contracts)
-import compiler.front.interface (ModuleInterface, module_interface_bin, module_interface_of)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.exports (OwnerSource)
-import compiler.front.checking.world (ModuleKey, QueryEffects, decoded, module_key_bin)
-import compiler.front.checking.promises (modules_analysed)
+import compiler.store.hash (Contract, contract_bin)
+import compiler.store.hash.forms (CachedNode)
+import compiler.front.interface (ModuleInterface, module_interface_bin)
+import compiler.front.exports (exports_from, function_owners, hashes_by_owner)
+import compiler.front.rows (KnownDefinitionRow)
+import compiler.front.checking.world (ModuleKey, QueryEffects, decoded, module_key_bin, module_read)
+import compiler.front.checking.groups (GroupHashes, GroupKey, group_hashes_of, group_keys,
+                                       owners_result_of, stored_rows, summary_of)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, Module, is_pub)
+import std.list
 
 pub type PublishedModule = { interface: ModuleInterface, contracts: List<Contract> }
 
@@ -15,23 +19,57 @@ pub const interface_query: Bytes = b"interface"
 
 pub fn interface_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let key = decoded(input, module_key_bin(), "a module's name");
-  let analysed = modules_analysed([key]);
   bin::encode(
-    match analysed.outcome {
-      Rejected(_) -> None,
-      Analysed(a) ->
-        Some({
-          interface: module_interface_of(
-            a,
-            analysed.loaded.map(|l: OwnerSource| l.source),
-            key.module,
-          ),
-          contracts: public_contracts(a.index, a.hashes, |m: Bytes| m == key.module),
-        }),
+    if summary_of(key).rejected { None } else {
+      match module_read(key) {
+        None -> None,
+        Some(m) -> {
+          let read = owners_result_of(key);
+          let groups = group_keys(key, read);
+          let nodes = groups.flat_map(|g: GroupKey| group_hashes_of(g).fixing.nodes);
+          let rows = groups.flat_map(|g: GroupKey| stored_rows(g).definitions);
+          Some({
+            interface: {
+              exports: exports_from(
+                m.parsed,
+                m.raw,
+                m.source.source_text,
+                read.context.targets,
+                rows,
+                nodes,
+              ),
+              hashes: hashes_by_owner(key.module, nodes, function_owners(m.raw, m.parsed)),
+            },
+            contracts: contracts_of(key.module, m.raw, nodes),
+          })
+        },
+      }
     },
     bin::option_bin(published_module_bin()),
   )
 }
+
+pub fn contracts_of(module: Bytes, raw: Module, nodes: List<CachedNode>) -> List<Contract> = {
+  let public = raw.items.fold(Map::new(), |found: Map<Bytes, Bool>, item: Item|
+    match public_name(item) {
+      Some(name) -> found.insert(module.concat(b".").concat(name), true),
+      None -> found,
+    });
+  nodes.filter(|n: CachedNode| public.contains(n.name)).map(|n: CachedNode|
+    {
+      name: n.name,
+      declaration: n.declaration,
+      hash: if n.declaration { n.hash } else { n.contract },
+    })
+}
+
+fn public_name(item: Item) -> Option<Bytes> =
+  match item {
+    FunctionItem(d) -> if is_pub(d.visibility) { Some(d.name.name) } else { None },
+    TypeItem(d) -> if is_pub(d.visibility) { Some(d.name.name) } else { None },
+    EffectItem(d) -> if is_pub(d.visibility) { Some(d.name.name) } else { None },
+    _ -> None,
+  }
 
 pub fn published_module(key: ModuleKey) -> Option<PublishedModule> / {memo.read, abort.raise} =
   decoded(
