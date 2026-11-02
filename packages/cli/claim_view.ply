@@ -1,52 +1,42 @@
 import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.facts (Analysis, CheckedProgram, Frame, ModuleShape, assembled_load)
-import compiler.front.interface (blank_cuts)
-import compiler.front.rows (Cut, KnownDefinitionRow, ModuleDerivations, Outline, OutlineItem,
-                            OutlinedFunction, OutlinedLaw, Rows)
+import compiler.front.facts (Analysis)
+import compiler.front.exports (ItemAt)
+import compiler.front.rows (ModuleSpan)
 import compiler.front.published (no_rows)
-import compiler.front.checking (CheckedModule, checked_program_from_results, fresh_registry,
-                                queried_results, rows_of_result)
-import compiler.front.checking.world (ModuleResult)
+import compiler.front.checking (LoadInputs, read_over)
+import compiler.front.checking.promises (ClaimsProgram, PlacedModule, claims_analysed)
 import compiler.check.resolve.tables (placed_in)
-import compiler.check.resolve.tables (Source, Diagnostic, Label, ParsedModule, diagnostic_bin,
-                                      qualify)
-import compiler.check.types (tables_joined)
-import compiler.store.hash.forms (FunctionNamed, ItemKeyed, ModuleHashes, Subject,
-                                  joined_cached_hashes, reachable_functions)
+import compiler.check.resolve.tables (Source, Diagnostic, Edit, Fix, Label, ParsedModule,
+                                      diagnostic_bin)
+import compiler.store.hash.forms (no_cached_hashes)
+import compiler.emit.costs (placed_span)
+import compiler.syntax.parsing (span_between)
 import compiler.check.infer.checker (DefinitionInfo)
 import claims (Claim, ClaimsEntry, Collection, DischargeResult, NotCompiled, OwnClaims, Rejection,
                StaticProver, claim_bin, discharge_library, discharging, lacks_proof, laws_by_key,
                evidence_keys, no_static_prover, own_claims, proof_store, static_prover_of)
 import compiler.front.checking.view
-import compiler.front.checking (LoadInputs)
 import compiler.front.checking.groups (HashSummary)
 import compiler.front.checking.view (LaterReading, Modules)
 import compiler.store.memo (memo)
-import module_queries (module_results)
 import proof.decide (StaticResult)
 import std.machine as entering
 import std.time (time)
 import units
 import units (EmbeddedFiles, emit)
-import compiler.cc (toolchain)
-import compiler.load (Derives)
 import compiler.unit (identity_of, shipped)
-import program (Program, ProgramStore, Session, front_end, in_program_store, in_root_package,
-                module_derivations, modules_within, no_program, program_view, program_within)
+import program (ProgramStore, Session, front_end, in_program_store)
 import proof.obligation (Builds, Definition, Kind, Law, WrittenLaw, definition_bin, written_law_bin)
 import proof.prover_input (Obligation, ProverInput, Static, Unhandled, empty_prover_input,
-                           invariants_of, prover_input_of)
+                           prover_input_of)
 import proof.static_prover (claims_for, diagnosis_of, modules_of, prover_of)
 import proof.decide (Proved)
 import proof.goal (default_prove_budget)
-import sources (Embed, File)
+import sources (File)
 import std.bin
-import std.fs (fs)
 import std.hash (blake3)
 import std.list
-import std.random (entropy)
 import std.string
-import compiler.store.memo (empty_memory_store)
 
 pub type ClaimReading = { later: LaterReading, summaries: List<HashSummary> }
 
@@ -76,110 +66,53 @@ pub type ModuleClaims = {
 
 derive bin for ModuleClaims
 
-fn claims_in_outline(o: Outline) -> List<Subject> =
-  o.items.fold([], |found: List<Subject>, item: OutlineItem|
-    match item {
-      OutlinedFunction(f) -> if f.spec.len() == 0 { found }
-      else { found.push(FunctionNamed(qualify(o.name, f.name))) },
-      OutlinedLaw(l) -> found.push(ItemKeyed(qualify(o.name, l.name))),
+type Placement = { slot: Int, offset: Int, items: List<ItemAt> }
+
+fn placements(
+  w: Analysis,
+  placed: List<PlacedModule>,
+  names: List<Bytes>,
+) -> Map<Int, Placement> / {abort.raise} =
+  range(0, w.modules.len()).fold(Map::new(), |found: Map<Int, Placement>, i: Int| {
+    let name = w.modules.get(i).name;
+    match ((placed.find(|p: PlacedModule| p.module == name), names.index_of(name))) {
+      (Some(p), Some(slot)) -> found.insert(i, { slot: slot, offset: p.offset, items: p.items }),
       _ -> found,
-    })
+    }
+  })
 
-fn every_function(o: Outline) -> List<Subject> =
-  o.items.fold([], |found: List<Subject>, item: OutlineItem|
-    match item {
-      OutlinedFunction(f) -> found.push(FunctionNamed(qualify(o.name, f.name))),
-      _ -> found,
-    })
+fn in_file(p: Placement, position: Int) -> Int =
+  placed_span(p.items, span_between(position - p.offset, position - p.offset)).start
 
-fn imported_closure(frame: Frame, start: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
-  let imports = range(0, frame.outlines.len()).fold(
-    Map::new(),
-    |found: Map<Bytes, List<Bytes>>, i: Int|
-      found.insert(frame.outlines.get(i).name, frame.imports.at_or(i, [])),
-  );
-  iterate(
-    { seen: Map::new(), work: start },
-    1000000,
-    |s: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
-      match s.work {
-        [] -> Stop(s.seen),
-        [m, ..rest] -> if s.seen.contains(m) { Continue({ ..s, work: rest }) } else {
-          Continue({
-            seen: s.seen.insert(m, true),
-            work: rest.concat(match imports.get(m) { Some(ms) -> ms, None -> [] }),
-          })
-        },
-      },
-  )
-}
-
-fn unreached_cuts(o: Outline, stored: Map<Bytes, Bool>, reached: Map<Bytes, Bool>) -> List<Cut> =
-  o.cuts.filter(|c: Cut| stored.contains(c.name) && !reached.contains(c.name))
-
-fn without_bodies(s: Source, cuts: Map<Bytes, List<Cut>>) -> Source / {abort.raise} =
-  match cuts.get(s.name) {
-    None -> s,
-    Some(c) -> { ..s, source_text: blank_cuts(s.source_text, c) },
+fn placed_at(placing: Map<Int, Placement>, at: ModuleSpan) -> ModuleSpan =
+  match placing.get(at.module) {
+    Some(p) -> { module: p.slot, start: in_file(p, at.start), end: in_file(p, at.end) },
+    None -> at,
   }
 
-fn rows_outside(program: Program, dropped: Map<Bytes, Bool>) -> Rows / {abort.raise} =
-  program.returned.fold(no_rows, |accumulator: Rows, name: Bytes, a: ModuleResult|
-    if dropped.contains(name) { accumulator } else {
-      let rows = rows_of_result(a);
+fn placed_diagnostic(placing: Map<Int, Placement>, d: Diagnostic) -> Diagnostic =
+  {
+    ..d,
+    labels: d.labels.map(|l: Label| {
+      let at = placed_at(placing, { module: l.module, start: l.start, end: l.end });
+      { ..l, module: at.module, start: at.start, end: at.end }
+    }),
+    fixes: d.fixes.map(|f: Fix|
       {
-        definitions: accumulator.definitions.concat(rows.definitions),
-        tests: accumulator.tests.concat(rows.tests),
-        types: tables_joined(accumulator.types, rows.types),
-      }
-    })
-
-pub fn claim_view(
-  program: Program,
-  v: CheckedProgram,
-  open: List<Bytes>,
-) -> Result<Analysis, List<Diagnostic>> / {abort.raise} = {
-  let frame = v.frame;
-  let own = frame.outlines.take(program.files.len());
-  let outlines_asked_for = own.filter(|o: Outline| open.contains(o.name));
-  let stated = outlines_asked_for.fold([], |found: List<Subject>, o: Outline|
-    found.concat(claims_in_outline(o)));
-  let subjects = if invariants_of(v.checked.instances).len() == 0 { stated } else {
-    outlines_asked_for.fold(stated, |found: List<Subject>, o: Outline|
-      found.concat(every_function(o)))
-  };
-  let bearing = outlines_asked_for.filter(|o: Outline|
-    claims_in_outline(o).len() > 0 || o.schemas.len() > 0 || subjects.len() > stated.len()).map(
-    |o: Outline| o.name,
-  );
-  let included = imported_closure(frame, if bearing.len() > 0 { bearing }
-  else { program.sources.map(|s: Source| s.name).take(1) });
-  let reached = reachable_functions(frame.hashes, subjects);
-  let dropped = program.sources.fold(Map::new(), |found: Map<Bytes, Bool>, s: Source|
-    if included.contains(s.name) { found } else { found.insert(s.name, true) });
-  let rows = rows_outside(program, dropped);
-  let stored = rows.definitions.fold(
-    Map::new(),
-    |found: Map<Bytes, Bool>, d: KnownDefinitionRow| found.insert(d.name, true),
-  );
-  let cuts = own.fold(Map::new(), |found: Map<Bytes, List<Cut>>, o: Outline|
-    found.insert(o.name, unreached_cuts(o, stored, reached)));
-  match front_end(
-      program.sources.map(|s: Source|
-        if included.contains(s.name) { without_bodies(s, cuts) }
-        else { { ..s, source_text: b"" } }),
-      program.shipping,
-      rows,
-      program.packages,
-      program.embeds.filter(|e: Embed| !dropped.contains(e.embedded.module)),
-      program.prune_unreached,
-      joined_cached_hashes(program.modules),
-      module_derivations(program).filter(|m: ModuleDerivations| !dropped.contains(m.module)),
-    ).out {
-    Rejected(ds) -> Err(ds),
-    Analysed(w) -> Ok({ ..w, warnings: frame.warnings }),
+        ..f,
+        edits: f.edits.map(|e: Edit| {
+          let at = placed_at(placing, { module: e.module, start: e.start, end: e.end });
+          { ..e, module: at.module, start: at.start, end: at.end }
+        }),
+      }),
   }
-}
+
+fn placed_own(fresh: OwnClaims, placing: Map<Int, Placement>) -> OwnClaims =
+  {
+    ..fresh,
+    claims: fresh.claims.map(|c: Claim| { ..c, at: placed_at(placing, c.at) }),
+    warnings: fresh.warnings.map(|d: Diagnostic| placed_diagnostic(placing, d)),
+  }
 
 type KnownModule = { name: Bytes, index: Int, identity: Bytes, claims: Option<ModuleClaims> }
 
@@ -281,12 +214,12 @@ fn warnings_by_module(warnings: List<Diagnostic>) -> Map<Int, List<Diagnostic>> 
 
 fn fresh_by_module(
   fresh: OwnClaims,
-  v: CheckedProgram,
+  w: Analysis,
   names: List<Bytes>,
   opened: Map<Bytes, Int>,
 ) -> FreshModules = {
   let known = names.fold(Map::new(), |found: Map<Bytes, Bool>, m: Bytes| found.insert(m, true));
-  let module_of = v.checked.definitions.fold(
+  let module_of = w.checked.definitions.fold(
     Map::new(),
     |found: Map<String, Bytes>, d: DefinitionInfo|
       found.insert(String::of_bytes_lossy(d.name), d.module),
@@ -338,72 +271,49 @@ fn claims_of_program(
 }
 
 fn claimed_with_view(
-  program: Program,
-  v: CheckedProgram,
+  c: ClaimClosure,
   names: List<Bytes>,
   known: List<KnownModule>,
   open: List<KnownModule>,
-) -> Result<ClaimedProgram, List<Diagnostic>> / {proof_store.record_claims, abort.raise} =
-  match claim_view(program, v, open.map(|k: KnownModule| k.name)) {
-    Err(diagnostics) -> Err(diagnostics),
-    Ok(w) -> {
-      let owned = in_root_package(v.frame);
-      let built = prover_input_of(w, owned);
-      let fresh = own_claims(w, built);
-      let loaded_at = positions_in(program);
-      let opened = open.fold(Map::new(), |found: Map<Bytes, Int>, k: KnownModule|
-        match loaded_at.get(k.name) { Some(i) -> found.insert(k.name, i), None -> found });
-      let places = known.fold(Map::new(), |found: Map<Int, Int>, k: KnownModule|
-        match opened.get(k.name) { Some(i) -> found.insert(i, k.index), None -> found });
-      let by_module = fresh_by_module(fresh, v, names, opened);
-      let fresh_of = |k: KnownModule, i: Int| fresh_claims(by_module, k.name, i);
-      let store_warnings = proof_store.record_claims(
-        known.fold([], |found: List<ClaimsEntry>, k: KnownModule|
-          match opened.get(k.name) {
-            Some(i) -> {
-              let c = fresh_of(k, i);
-              found.push({
-                module: k.name,
-                identity: k.identity,
-                claims: bin::encode(c, module_claims_bin()),
-                evidence: c.claims.flat_map(|claim: Claim| {
-                  let keys = evidence_keys(claim);
-                  [Bytes::of_hex(keys.bare), Bytes::of_hex(keys.ran)]
-                }),
-              })
-            },
-            None -> found,
-          }),
-      );
-      let current = known.fold([], |found: List<ModuleClaims>, k: KnownModule|
-        match opened.get(k.name) {
-          Some(i) -> found.push({ ..placed_claims(fresh_of(k, i), k.index), claims: [] }),
-          None -> match k.claims { Some(c) -> found.push(c), None -> found },
-        });
-      let pairs = range(0, fresh.claims.len()).fold([], |found: List<WorldClaim>, i: Int| {
-        let c = fresh.claims.get(i);
-        match places.get(c.at.module) {
-          Some(index) ->
-            found.push({
-              claim: { ..c, at: { ..c.at, module: index } },
-              obligation: built.world.obligations.get(i),
-            }),
-          None -> found,
-        }
-      });
-      let mine = claims_of_program(names, built.world, current, pairs);
-      Ok({
-        mine: { ..mine, warnings: mine.warnings.concat(store_warnings) },
-        statics: static_prover_of(w, mine.world, owned),
-      })
-    },
-  }
+) -> Result<ClaimedProgram, List<Diagnostic>> / {proof_store.record_claims, abort.raise} = {
+  let w = c.analysis;
+  let owned = |m: Bytes| names.contains(m);
+  let built = prover_input_of(w, owned);
+  let fresh = placed_own(own_claims(w, built), placements(w, c.placed, names));
+  let opened = open.fold(Map::new(), |found: Map<Bytes, Int>, k: KnownModule|
+    found.insert(k.name, k.index));
+  let by_module = fresh_by_module(fresh, w, names, opened);
+  let fresh_of = |k: KnownModule| fresh_claims(by_module, k.name, k.index);
+  let store_warnings = proof_store.record_claims(
+    open.map(|k: KnownModule| {
+      let claimed = fresh_of(k);
+      {
+        module: k.name,
+        identity: k.identity,
+        claims: bin::encode(claimed, module_claims_bin()),
+        evidence: claimed.claims.flat_map(|claim: Claim| {
+          let keys = evidence_keys(claim);
+          [Bytes::of_hex(keys.bare), Bytes::of_hex(keys.ran)]
+        }),
+      }
+    }),
+  );
+  let current = known.fold([], |found: List<ModuleClaims>, k: KnownModule|
+    if opened.contains(k.name) { found.push({ ..fresh_of(k), claims: [] }) }
+    else { match k.claims { Some(claimed) -> found.push(claimed), None -> found } });
+  let pairs = range(0, fresh.claims.len()).fold([], |found: List<WorldClaim>, i: Int| {
+    let claim = fresh.claims.get(i);
+    if !opened.contains(names.at_or(claim.at.module, b"")) { found }
+    else { found.push({ claim: claim, obligation: built.world.obligations.get(i) }) }
+  });
+  let mine = claims_of_program(names, built.world, current, pairs);
+  Ok({
+    mine: { ..mine, warnings: mine.warnings.concat(store_warnings) },
+    statics: static_prover_of(w, mine.world, owned),
+  })
+}
 
-fn positions_in(program: Program) -> Map<Bytes, Int> / {abort.raise} =
-  range(0, program.files.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
-    found.insert(Bytes::of_string(program.files.get(i).module), i))
-
-pub type ClaimClosure = { program: Program, view: CheckedProgram }
+pub type ClaimClosure = { analysis: Analysis, placed: List<PlacedModule> }
 
 pub fn claimed_modules<| e>(
   inputs: ClaimInputs,
@@ -428,7 +338,7 @@ pub fn claimed_modules<| e>(
   } else {
     match closure(open.map(|k: KnownModule| k.name)) {
       Err(diagnostics) -> Err(diagnostics),
-      Ok(c) -> claimed_with_view(c.program, c.view, inputs.names, known, open),
+      Ok(c) -> claimed_with_view(c, inputs.names, known, open),
     }
   }
 }
@@ -440,67 +350,44 @@ pub fn claim_inputs(s: Session<ClaimReading>) -> ClaimInputs =
     texts: s.project.files.map(|f: File| f.text.blake3()),
   }
 
+fn closure_of(analysed: ClaimsProgram) -> Result<ClaimClosure, List<Diagnostic>> =
+  match analysed.outcome {
+    Rejected(ds) -> Err(ds),
+    Analysed(w) -> Ok({ analysis: w, placed: analysed.placed }),
+  }
+
 pub fn claims_closure(
   s: Session<ClaimReading>,
-  from_nothing: Bool,
   open: List<Bytes>,
-) -> Result<ClaimClosure, List<Diagnostic>> / {ProgramStore, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[abs], fs.write[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], entropy.next, time.now_ms, Derives, abort.raise} = {
-  let included = view::imports_reached(s.value.later.rollups, open);
-  let own = modules_within(s.modules, included);
-  let results = in_program_store(s.place, |_: LoadInputs| module_results(own)).value;
-  let program = program_within(s, included, results, from_nothing);
-  match program_view(program) {
-    Some(v) -> Ok({ program: program, view: v }),
-    None -> Err(program.diagnostics),
-  }
-}
+) -> Result<ClaimClosure, List<Diagnostic>> / {ProgramStore, abort.raise} =
+  closure_of(
+    in_program_store(s.place, |_: LoadInputs|
+      claims_analysed(open.map(|m: Bytes| { module: m, shipped: false, tested: true }))).value,
+  )
 
-fn program_over(
+fn closure_over(
   sources: List<Source>,
-) -> { program: Program, view: CheckedProgram } / {abort.raise} = {
-  let done = queried_results(fresh_registry(), empty_memory_store, sources);
-  let names = sources.map(|s: Source| s.name);
-  let packages = { root: b"", manifest: None, supplied: [] };
-  let loaded = assembled_load(
-    names,
-    packages,
-    done.results.fold(Map::new(), |found: Map<Bytes, ModuleShape>, a: CheckedModule|
-      found.insert(a.module, a.result.shape)),
-    done.fixing,
-    done.results.drop(sources.len()).map(|a: CheckedModule| a.module),
-    [],
-    Map::new(),
-    true,
-    false,
-    [],
-  );
-  let returned = done.results.fold(
-    Map::new(),
-    |found: Map<Bytes, ModuleResult>, a: CheckedModule| found.insert(a.module, a.result),
-  );
-  {
-    program: {
-      ..no_program,
-      files: sources.map(|s: Source|
-        {
-          path: String::of_bytes_lossy(s.name),
-          module: String::of_bytes_lossy(s.name),
-          text: s.source_text,
-          at: { label: "cwd", path: String::of_bytes_lossy(s.name) },
-        }),
-      sources: sources,
-      source_texts: sources.map(|s: Source|
-        { path: String::of_bytes_lossy(s.name), text: s.source_text }),
-      frame: Some(loaded.frame),
-      returned: returned,
-      reads: loaded.reads,
-      packages: packages,
-      modules: [{ record: b"", cached: done.fixing }],
-      prune_unreached: false,
-    },
-    view: checked_program_from_results(loaded.frame, loaded.reads, returned),
+  open: List<Bytes>,
+) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise} =
+  closure_of(
+    read_over(sources, ||
+      claims_analysed(open.map(|m: Bytes| { module: m, shipped: false, tested: true }))),
+  )
+
+fn whole_analysis(sources: List<Source>) -> Analysis / {abort.raise} =
+  match front_end(
+      sources,
+      { sources: [], unread: [], data: [], required_modules: [], dependencies: [] },
+      no_rows,
+      { root: b"", manifest: None, supplied: [] },
+      [],
+      false,
+      no_cached_hashes,
+      [],
+    ).out {
+    Analysed(w) -> w,
+    Rejected(_) -> panic("the fixture program was rejected by the checker"),
   }
-}
 
 const claimed_sources: List<Source> =
   [
@@ -533,48 +420,42 @@ fn proved_claims(w: Analysis) -> List<String> / {abort.raise} = {
     }).map(|o: Obligation| o.owner)
 }
 
-test "a claim view holds the claims of the whole program under the same keys, and no module they do not reach" {
-  let loaded = program_over(claimed_sources);
-  let whole = match front_end(
-      loaded.program.sources,
-      loaded.program.shipping,
-      rows_outside(loaded.program, Map::new()),
-      loaded.program.packages,
-      [],
-      false,
-      joined_cached_hashes(loaded.program.modules),
-      [],
-    ).out {
-    Analysed(w) -> w,
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-  };
-  match claim_view(loaded.program, loaded.view, [b"app", b"lib", b"other"]) {
-    Err(_) -> panic("the claim view of a checked program was rejected"),
-    Ok(view) -> {
-      assert(view.modules.all(|m: ParsedModule| m.name != b"other" || m.module.items.len() == 0));
-      assert_eq(claim_keys(view), claim_keys(whole));
+test "the claims of the open modules, checked by group, are the claims of the whole program and prove the same" {
+  let whole = whole_analysis(claimed_sources);
+  match closure_over(claimed_sources, [b"app", b"lib", b"other"]) {
+    Err(_) -> panic("the claims of a checked program were rejected"),
+    Ok(c) -> {
+      assert_eq(claim_keys(c.analysis), claim_keys(whole));
       assert(proved_claims(whole).contains("app.four"));
-      assert_eq(proved_claims(view), proved_claims(whole));
-      assert_eq(view.modules.map(|m: ParsedModule| m.name).take(3), [b"app", b"lib", b"other"])
+      assert_eq(proved_claims(c.analysis), proved_claims(whole));
+      assert_eq(c.analysis.modules.map(|m: ParsedModule| m.name).take(3), [
+        b"app",
+        b"lib",
+        b"other",
+      ])
     },
   }
 }
 
-test "a body that no claim reaches is blanked in place, and a body that a claim reaches is kept" {
-  let source = claimed_sources.get(0);
-  let outline = program_over(claimed_sources).view.frame.outlines.get(0);
-  let stored = Map::new().insert(b"app.four", true).insert(b"app.apart", true);
-  let cuts = unreached_cuts(outline, stored, Map::new().insert(b"app.four", true));
-  let viewed = without_bodies(source, Map::new().insert(source.name, cuts)).source_text;
-  assert(viewed.index_of(b"twice(twice(n))") != None);
-  assert(viewed.index_of(b"= n + 1") == None);
-  assert_eq(viewed.len(), source.source_text.len())
-}
-
-test "a body without a stored row stays, so the view can check it" {
-  let source = claimed_sources.get(0);
-  let outline = program_over(claimed_sources).view.frame.outlines.get(0);
-  assert_eq(unreached_cuts(outline, Map::new(), Map::new()), [])
+test "a claim checked by group keeps its place in its file" {
+  match closure_over(claimed_sources, [b"app"]) {
+    Err(_) -> panic("the claims of a checked program were rejected"),
+    Ok(c) -> {
+      let names = [b"app", b"lib", b"other"];
+      let fresh = placed_own(
+        own_claims(c.analysis, prover_input_of(c.analysis, |m: Bytes| names.contains(m))),
+        placements(c.analysis, c.placed, names),
+      );
+      let text = claimed_sources.get(0).source_text;
+      let four = fresh.claims.filter(|claim: Claim| claim.owner == "app.four");
+      assert(four.len() > 0);
+      assert(
+        four.all(|claim: Claim|
+          claim.at.module == 0 && text.slice(claim.at.start, claim.at.end).len() > 0
+            && text.slice(0, claim.at.start).index_of(b"pub fn four") != None),
+      )
+    },
+  }
 }
 
 fn modules_with_claims(size: Int, edited: Bytes) -> List<Source> =
@@ -605,8 +486,7 @@ fn claimed_over(
     texts: sources.map(|s: Source| s.source_text.blake3()),
   };
   handle {
-    claimed_modules(inputs, true, false, |open: List<Bytes>|
-      Ok(program_over(sources.filter(|s: Source| open.contains(s.name)))))
+    claimed_modules(inputs, true, false, |open: List<Bytes>| closure_over(sources, open))
   } with {
     var written = Map::new(),
     shipped.definitions() -> b"claims.own_claims 00\n",
