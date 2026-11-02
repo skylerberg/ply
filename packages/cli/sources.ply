@@ -14,7 +14,8 @@ import compiler.syntax.items (parse, unneeded_spans, is_std)
 import std.bin
 import std.random (entropy)
 import std.time (time)
-import compiler.expand.embed (EmbedResult, EmbedBytesResult, EmbedRequest, with_digests)
+import compiler.expand.embed (EmbedResult, EmbedBytesResult, EmbedRequest, EmbedSnapshot, embed_key,
+                              snapshot_embed, with_digests)
 import compiler.check.resolve.tables (Source, Diagnostic, Label, error_at)
 import builder (builder)
 import compiler.cc (toolchain)
@@ -36,6 +37,8 @@ pub type DependencyPackage = {
 }
 
 pub type VendoredPackage = { requirement: String, dir: String }
+
+pub effect set ProjectFiles = {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], EmbedSnapshot}
 
 pub type Project = {
   files: List<File>,
@@ -231,9 +234,9 @@ pub fn read_module_embed(
   k: Int,
   module: Bytes,
   want: EmbedRequest,
-) -> EmbedBytesResult / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+) -> EmbedBytesResult / {ProjectFiles, abort.raise} =
   match package_files(project, k).filter(|f: File| Bytes::of_string(f.module) == module) {
-    [f, ..] -> read_embed(f.at, want),
+    [f, ..] -> snapshotted_embed(f.at, want),
     [] -> Err(b"no file in this package has that module name"),
   }
 
@@ -258,25 +261,20 @@ pub fn embed_of(
     [] -> None,
   }
 
-pub fn embeds_parsed(
-  project: Project,
-) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+pub fn embeds_parsed(project: Project) -> List<Embed> / {ProjectFiles, abort.raise} =
   project.packages.fold(
     read_embeds(Bytes::of_string(project.root_key), project.files),
     |accumulator: List<Embed>, package: DependencyPackage|
       accumulator.concat(read_embeds(Bytes::of_string(package.root), package.files)),
   )
 
-fn read_embeds(
-  root: Bytes,
-  files: List<File>,
-) -> List<Embed> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+fn read_embeds(root: Bytes, files: List<File>) -> List<Embed> / {ProjectFiles, abort.raise} =
   files.fold([], |accumulator: List<Embed>, file: File|
     embeds_wanted(root, [{ name: Bytes::of_string(file.module), source_text: file.text }]).fold(
       accumulator,
       |a: List<Embed>, e: EmbedRecord|
         a.push({
-          embedded: { ..e, read: with_digests(read_embed(file.at, e.want)) },
+          embedded: { ..e, read: with_digests(snapshotted_embed(file.at, e.want)) },
           file: file.at,
         }),
     ))
@@ -293,6 +291,23 @@ fn embed_target(rooted: RootedPath, path: String) -> RootedPath / {abort.raise} 
 
 fn unreadable_embed(target: RootedPath, what: String) -> EmbedBytesResult =
   Err(Bytes::of_string("`" ++ displayed(target) ++ "` " ++ what))
+
+fn snapshotted_embed(
+  rooted: RootedPath,
+  want: EmbedRequest,
+) -> EmbedBytesResult / {ProjectFiles, abort.raise} = {
+  let target = embed_target(rooted, String::of_bytes_lossy(want.path));
+  snapshot_embed(
+    Bytes::concat_all([
+      Bytes::of_string(target.label),
+      b"\x00",
+      Bytes::of_string(target.path),
+      b"\x00",
+      embed_key(want),
+    ]),
+    || read_embed(rooted, want),
+  )
+}
 
 fn read_embed(
   rooted: RootedPath,
