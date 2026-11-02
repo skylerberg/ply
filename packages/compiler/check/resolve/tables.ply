@@ -97,6 +97,10 @@ derive bin for Declarations
 
 derive bin for ModuleBinding
 
+derive bin for Bindings
+
+derive bin for Scope
+
 pub type Edge = { from: Int, target: Int, span: Span }
 
 pub type ModuleEntry = { name: Bytes, at: Int }
@@ -114,30 +118,41 @@ pub type Resolution = {
 }
 
 pub effect module_names {
-  read name_bound(module: Bytes, namespace: Namespace, name: Bytes) -> Option<Binding>
   read name_declared(module: Bytes, namespace: Namespace, name: Bytes) -> Option<Declaration>
   read declarations_stored(module: Bytes) -> Option<Declarations>
   read effect_set_stored(module: Bytes, name: Bytes) -> Option<EffectSetDefinition>
   read schema_stored(module: Bytes, name: Bytes) -> Option<SchemaDefinition>
-  read names_in_scope(module: Bytes, namespace: Namespace) -> List<Binding>
+  read module_package(module: Bytes) -> Option<Int>
+  read module_scope_stored(module: Bytes) -> Option<Scope>
   read parameters_stored(name: Bytes) -> Option<Parameters>
   read modules_visible(module: Bytes) -> List<Bytes>
   read every_module() -> List<Bytes>
 }
 
+pub type LoadedModules = { declarations: Map<Bytes, Declarations>, packages: Map<Bytes, Int> }
+
 pub fn with_no_other_modules<a | e>(body: () -> a / {module_names.read | e}) -> a / e =
+  with_modules({ declarations: Map::new(), packages: Map::new() }, body)
+
+pub fn with_modules<a | e>(
+  loaded: LoadedModules,
+  body: () -> a / {module_names.read | e},
+) -> a / e =
   handle {
     body()
   } with {
-    module_names.name_bound(module, namespace, name) -> None,
-    module_names.name_declared(module, namespace, name) -> None,
-    module_names.declarations_stored(module) -> None,
+    module_names.name_declared(module, namespace, name) -> match loaded.declarations.get(module) {
+      Some(d) -> lookup_declared(d, namespace, name),
+      None -> None,
+    },
+    module_names.declarations_stored(module) -> loaded.declarations.get(module),
     module_names.effect_set_stored(module, name) -> None,
     module_names.schema_stored(module, name) -> None,
-    module_names.names_in_scope(module, namespace) -> [],
+    module_names.module_package(module) -> loaded.packages.get(module),
+    module_names.module_scope_stored(module) -> None,
     module_names.parameters_stored(name) -> None,
     module_names.modules_visible(module) -> [],
-    module_names.every_module() -> [],
+    module_names.every_module() -> loaded.packages.keys(),
   }
 
 pub fn declared_in(
@@ -176,7 +191,10 @@ pub fn bound_in(
 ) -> Option<Binding> / {module_names.read} =
   match lookup(scope.bound, namespace, name) {
     Some(b) -> Some(b),
-    None -> module_names.name_bound(scope.module, namespace, name),
+    None -> match module_names.name_declared(scope.module, namespace, name) {
+      Some(d) -> Some(binding_of(d, scope.module)),
+      None -> None,
+    },
   }
 
 pub fn implicit_binder(module: Bytes) -> Bytes = b"@".concat(module)
@@ -193,19 +211,36 @@ pub fn module_binding_in(scope: Scope, binder: Bytes) -> Option<ModuleBinding> /
     },
   }
 
+fn bindings_of_space(bound: Bindings, namespace: Namespace) -> List<Binding> =
+  match namespace {
+    ValueSpace -> bound.values,
+    TypeSpace -> bound.types,
+    EffectSpace -> bound.effects,
+    SetSpace -> bound.sets,
+  }
+
 pub fn scope_bindings(scope: Scope, namespace: Namespace) -> List<Binding> / {module_names.read} = {
-  let local = match namespace {
-    ValueSpace -> scope.bound.values,
-    TypeSpace -> scope.bound.types,
-    EffectSpace -> scope.bound.effects,
-    SetSpace -> scope.bound.sets,
+  let own = match module_names.declarations_stored(scope.module) {
+    Some(d) ->
+      declarations_in(d, namespace).map(|declared: Declaration| binding_of(declared, scope.module)),
+    None -> [],
   };
-  module_names.names_in_scope(scope.module, namespace).fold(
-    local,
+  let imported = match module_names.module_scope_stored(scope.module) {
+    Some(s) -> bindings_of_space(s.bound, namespace),
+    None -> [],
+  };
+  own.concat(imported).fold(
+    bindings_of_space(scope.bound, namespace),
     |found: List<Binding>, b: Binding|
       if found.any(|x: Binding| x.name == b.name) { found } else { found.push(b) },
   )
 }
+
+pub fn scope_modules(scope: Scope) -> List<ModuleBinding> / {module_names.read} =
+  match module_names.module_scope_stored(scope.module) {
+    Some(s) -> s.modules,
+    None -> scope.modules,
+  }
 
 pub fn effect_set_declared(
   modules: List<ParsedModule>,
@@ -254,7 +289,7 @@ pub const no_declarations: Declarations =
     by_set: Map::new(),
   }
 
-const no_bindings: Bindings =
+pub const no_bindings: Bindings =
   {
     values: [],
     types: [],
@@ -534,7 +569,7 @@ pub fn declarations_of(parsed: ParsedModule) -> Declarations =
   parsed.module.items.fold(no_declarations, |declarations: Declarations, item: Item|
     match item {
       FunctionItem(f) -> declare(declarations, ValueSpace, parsed.name, f.name, f.visibility),
-      ExternItem(f) -> if is_builtin(parsed.name, f) { declarations }
+      ExternItem(f) -> if is_builtin(parsed.name, parsed.module, f) { declarations }
       else { declare(declarations, ValueSpace, parsed.name, f.name, f.visibility) },
       EffectItem(e) -> declare(declarations, EffectSpace, parsed.name, e.name, e.visibility),
       EffectSetItem(e) -> declare(declarations, SetSpace, parsed.name, e.name, e.visibility),

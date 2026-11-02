@@ -3,34 +3,34 @@ import compiler.syntax.items (Module, Item, is_shipped, TypeItem, SumBody, Varia
                               ImportDeclaration, ModuleAlias, SelectedNames, member_name, Opaque)
 import compiler.syntax.expressions (implicitly_imported_by)
 import std.list
-import compiler.check.resolve.tables (module_names, declared_in, bound_in, module_binding_in,
-                                      binding_of, ParsedModule, Namespace, TypeSpace, ValueSpace,
-                                      Declaration, Declarations, Binding, Bindings, Scope,
-                                      Diagnostic, Edge, ModuleEntry, Resolution, namespaces,
-                                      push_declared, lookup_declared, push_binding, lookup,
-                                      find_module_binding, position, default_binder, qualify,
-                                      import_module_name, path_span, import_binder, binder_span,
-                                      error_at, error_at_and, backticked, list_names,
-                                      describe_namespace, namespace_keyword, exported_names)
+import compiler.check.resolve.tables (no_declarations, module_elsewhere, module_names, declared_in,
+                                      bound_in, module_binding_in, binding_of, ParsedModule,
+                                      Namespace, TypeSpace, ValueSpace, Declaration, Declarations,
+                                      Binding, Bindings, Scope, Diagnostic, Edge, ModuleEntry,
+                                      Resolution, namespaces, push_declared, lookup_declared,
+                                      push_binding, lookup, find_module_binding, position,
+                                      default_binder, qualify, import_module_name, path_span,
+                                      import_binder, binder_span, error_at, error_at_and,
+                                      backticked, list_names, describe_namespace, namespace_keyword,
+                                      exported_names)
+
+pub type ImportEdge = { target: Bytes, span: Span }
 
 pub type ScopeBuilder = {
   scope: Scope,
-  local: Declarations,
   imported: Declarations,
-  edges: List<Edge>,
+  edges: List<ImportEdge>,
   diagnostics: List<Diagnostic>,
 }
 
-pub type ResolutionContext = {
-  modules: List<ParsedModule>,
-  names: List<ModuleEntry>,
-  declarations: List<Declarations>,
-  declared: List<Bindings>,
+pub type ImportContext = {
+  at: Int,
+  package: Int,
   packages: List<PackageDependencies>,
-  module_packages: List<Int>,
   std: Int,
   compiler: Int,
   shipped_package_count: Int,
+  places: Map<Bytes, Int>,
 }
 
 pub type PackageDependencies = { prefix: Bytes, dependencies: List<Bytes> }
@@ -53,137 +53,134 @@ pub fn index_of(names: List<ModuleEntry>, name: Bytes) -> Option<Int> =
       None -> if e.name == name { Some(e.at) } else { None },
     })
 
-pub fn bind_import(
-  w: ResolutionContext,
-  i: Int,
-  builder: ScopeBuilder,
-  declaration: ImportDeclaration,
-) -> ScopeBuilder / {abort.raise} =
-  match import_target(w, i, builder, declaration) {
-    Found(t) -> {
-      let b2: ScopeBuilder = {
-        ..builder,
-        edges: builder.edges.push({ from: i, target: t, span: path_span(declaration) }),
-      };
-      match declaration.kind {
-        SelectedNames(names) -> {
-          let key = default_binder(import_module_name(declaration));
-          let sel = match find_module_binding(b2.scope.selected_modules, key) {
-            Some(_) -> b2.scope.selected_modules,
-            None ->
-              b2.scope.selected_modules.push({
-                binder: key,
-                target: w.modules.get(t).name,
-                span: path_span(declaration),
-              }),
-          };
-          let b3: ScopeBuilder = { ..b2, scope: { ..b2.scope, selected_modules: sel } };
-          names.fold(b3, |accumulator: ScopeBuilder, identifier: Identifier|
-            bind_name(w, i, accumulator, t, identifier))
-        },
-        ModuleAlias(a) ->
-          implicitly_imported_by(a.name).fold(
-            bind_module(w, i, b2, declaration, t),
-            |accumulator: ScopeBuilder, n: Bytes|
-              if namespaces.any(|namespace: Namespace|
-                    lookup(accumulator.scope.bound, namespace, n) != None)
-                  || !namespaces.any(|namespace: Namespace|
-                    lookup_declared(w.declarations.get(t), namespace, n) != None) { accumulator }
-              else { bind_name(w, i, accumulator, t, { name: n, span: path_span(declaration) }) },
-          ),
-        _ -> bind_module(w, i, b2, declaration, t),
-      }
+pub fn module_scope(
+  own: ParsedModule,
+  bound: Bindings,
+  w: ImportContext,
+) -> ScopeBuilder / {abort.raise, module_names.read} =
+  own.module.imports.fold(
+    {
+      scope: { module: own.name, modules: [], selected_modules: [], bound: bound },
+      imported: no_declarations,
+      edges: [],
+      diagnostics: [],
     },
-    _ -> builder,
-  }
+    |builder: ScopeBuilder, declaration: ImportDeclaration| bind_import(w, builder, declaration),
+  )
 
-type ImportTarget = | Found(Int) | Missing | Undeclared({ importer: Int, owning_package: Int })
+fn place_of(w: ImportContext, module: Bytes) -> Int =
+  match w.places.get(module) { Some(i) -> i, None -> module_elsewhere }
 
-fn import_target(
-  w: ResolutionContext,
-  i: Int,
+fn bind_found(
+  w: ImportContext,
   builder: ScopeBuilder,
   declaration: ImportDeclaration,
-) -> ImportTarget / {abort.raise} = {
-  let name = import_module_name(declaration);
+  target: Bytes,
+) -> ScopeBuilder / {abort.raise, module_names.read} = {
+  let b2: ScopeBuilder = {
+    ..builder,
+    edges: builder.edges.push({ target: target, span: path_span(declaration) }),
+  };
+  match declaration.kind {
+    SelectedNames(names) -> {
+      let key = default_binder(import_module_name(declaration));
+      let sel = match find_module_binding(b2.scope.selected_modules, key) {
+        Some(_) -> b2.scope.selected_modules,
+        None ->
+          b2.scope.selected_modules.push({
+            binder: key,
+            target: target,
+            span: path_span(declaration),
+          }),
+      };
+      let b3: ScopeBuilder = { ..b2, scope: { ..b2.scope, selected_modules: sel } };
+      names.fold(b3, |accumulator: ScopeBuilder, identifier: Identifier|
+        bind_name(w, accumulator, target, identifier))
+    },
+    ModuleAlias(a) ->
+      implicitly_imported_by(a.name).fold(
+        bind_module(w, b2, declaration, target),
+        |accumulator: ScopeBuilder, n: Bytes|
+          if namespaces.any(|namespace: Namespace|
+                bound_in(accumulator.scope, namespace, n) != None)
+              || !namespaces.any(|namespace: Namespace|
+                module_names.name_declared(target, namespace, n) != None) { accumulator }
+          else { bind_name(w, accumulator, target, { name: n, span: path_span(declaration) }) },
+      ),
+    _ -> bind_module(w, b2, declaration, target),
+  }
+}
+
+type ImportTarget = | Found(Bytes) | Missing | Undeclared({ importer: Int, owning_package: Int })
+
+fn import_target(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, module_names.read} =
   if name.len() == 0 { Missing } else {
-    let p = w.module_packages.get(i);
+    let p = w.package;
     if 0 < p && p < w.shipped_package_count && p < w.packages.len() && name.index_of(b".") == None {
-      sibling(w, i, name)
+      sibling(w, name)
     } else {
-      match sibling(w, i, name) {
+      match sibling(w, name) {
         Found(t) -> Found(t),
-        _ -> match index_of(w.names, name) {
-          Some(t) -> if w.modules.get(t).name.len() == 0 { Missing }
-          else { allowed_target(w, i, t) },
+        _ -> match module_names.module_package(name) {
+          Some(q) -> allowed_target(w, name, q),
           None -> Missing,
         },
       }
     }
   }
-}
 
-fn sibling(w: ResolutionContext, i: Int, name: Bytes) -> ImportTarget / {abort.raise} = {
-  let p = w.module_packages.get(i);
+fn sibling(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, module_names.read} = {
+  let p = w.package;
   if p == 0 || p >= w.shipped_package_count || p >= w.packages.len() { Missing } else {
     let prefix = w.packages.get(p).prefix;
     if name.starts_with(prefix.concat(b".")) { Missing } else {
-      match index_of(w.names, Bytes::concat_all([prefix, b".", name])) {
-        Some(t) -> if w.modules.get(t).name.len() == 0 { Missing } else { Found(t) },
-        None -> Missing,
-      }
+      let full = Bytes::concat_all([prefix, b".", name]);
+      match module_names.module_package(full) { Some(_) -> Found(full), None -> Missing }
     }
   }
 }
 
-fn allowed_target(w: ResolutionContext, i: Int, t: Int) -> ImportTarget / {abort.raise} = {
-  let p = w.module_packages.get(i);
-  let q = w.module_packages.get(t);
+fn allowed_target(w: ImportContext, name: Bytes, q: Int) -> ImportTarget / {abort.raise} = {
+  let p = w.package;
   if q == p || q == w.std || q == w.compiler || q >= w.shipped_package_count
-      || p >= w.shipped_package_count { Found(t) } else {
+      || p >= w.shipped_package_count { Found(name) } else {
     let prefix = w.packages.get(q).prefix;
-    if w.packages.get(p).dependencies.contains(prefix) { Found(t) }
+    if w.packages.get(p).dependencies.contains(prefix) { Found(name) }
     else { Undeclared({ importer: p, owning_package: q }) }
   }
 }
 
-fn internal_import(w: ResolutionContext, i: Int, t: Int) -> Bool / {abort.raise} = {
-  let module_name = w.modules.get(t).name;
-  (module_name == b"std.internal" || module_name.starts_with(b"std.internal."))
-    && !is_shipped(w.modules.get(i).name)
-}
+fn internal_import(importer: Bytes, target: Bytes) -> Bool =
+  (target == b"std.internal" || target.starts_with(b"std.internal.")) && !is_shipped(importer)
 
-pub fn target_or_report(
-  w: ResolutionContext,
-  i: Int,
+fn reported(builder: ScopeBuilder, diagnostic: Diagnostic) -> ScopeBuilder =
+  { ..builder, diagnostics: builder.diagnostics.push(diagnostic) }
+
+fn bind_import(
+  w: ImportContext,
   builder: ScopeBuilder,
   declaration: ImportDeclaration,
-) -> { b: ScopeBuilder, t: Option<Int> } / {abort.raise} =
-  match import_target(w, i, builder, declaration) {
-    Found(t) -> if internal_import(w, i, t) {
-      {
-        b: {
-          ..builder,
-          diagnostics: builder.diagnostics.push(
-            error_at(
-              b"E0159",
-              i,
-              path_span(declaration),
-              Bytes::concat_all([
-                b"`",
-                w.modules.get(t).name,
-                b"` is internal to the toolchain, and only the modules that ship with it can import it",
-              ]),
-              b"not importable here",
-              [
-                b"a module below `std.internal` contains code the standard library shares between its own modules, not code it offers to programs",
-              ],
-            ),
-          ),
-        },
-        t: None,
-      }
-    } else { { b: builder, t: Some(t) } },
+) -> ScopeBuilder / {abort.raise, module_names.read} =
+  match import_target(w, import_module_name(declaration)) {
+    Found(target) -> if internal_import(builder.scope.module, target) {
+      reported(
+        builder,
+        error_at(
+          b"E0159",
+          w.at,
+          path_span(declaration),
+          Bytes::concat_all([
+            b"`",
+            target,
+            b"` is internal to the toolchain, and only the modules that ship with it can import it",
+          ]),
+          b"not importable here",
+          [
+            b"a module below `std.internal` contains code the standard library shares between its own modules, not code it offers to programs",
+          ],
+        ),
+      )
+    } else { bind_found(w, builder, declaration, target) },
     Undeclared(u) -> {
       let name = import_module_name(declaration);
       let message = if u.owning_package == 0 {
@@ -203,51 +200,39 @@ pub fn target_or_report(
           b"` does not declare as a dependency",
         ])
       };
-      {
-        b: {
-          ..builder,
-          diagnostics: builder.diagnostics.push(
-            error_at(b"E0132", i, path_span(declaration), message, b"not a declared dependency", [
-              b"add it to that package's ply.pkg dependencies to import it",
-            ]),
-          ),
-        },
-        t: None,
-      }
+      reported(
+        builder,
+        error_at(b"E0132", w.at, path_span(declaration), message, b"not a declared dependency", [
+          b"add it to that package's ply.pkg dependencies to import it",
+        ]),
+      )
     },
     Missing -> {
       let name = import_module_name(declaration);
-      let near = w.names.fold([], |accumulator: List<Bytes>, e: ModuleEntry|
-        if e.name.len() > 0 && e.name.ends_with(default_binder(name)) { accumulator.push(e.name) }
-        else { accumulator });
+      let near = module_names.every_module().filter(|known: Bytes|
+        known.len() > 0 && known.ends_with(default_binder(name)));
       let note = if near.len() == 0 {
         b"a module is a file: `store/orders.ply` is `store.orders`, relative to the project root"
       } else { b"modules with that last segment: ".concat(backticked(near, b", ")) };
-      {
-        b: {
-          ..builder,
-          diagnostics: builder.diagnostics.push(
-            error_at(
-              b"E0106",
-              i,
-              path_span(declaration),
-              Bytes::concat_all([b"no module named `", name, b"` in this program"]),
-              b"not found",
-              [note],
-            ),
-          ),
-        },
-        t: None,
-      }
+      reported(
+        builder,
+        error_at(
+          b"E0106",
+          w.at,
+          path_span(declaration),
+          Bytes::concat_all([b"no module named `", name, b"` in this program"]),
+          b"not found",
+          [note],
+        ),
+      )
     },
   }
 
 fn bind_module(
-  w: ResolutionContext,
-  i: Int,
+  w: ImportContext,
   builder: ScopeBuilder,
   declaration: ImportDeclaration,
-  t: Int,
+  target: Bytes,
 ) -> ScopeBuilder / {abort.raise} =
   match import_binder(declaration) {
     None -> builder,
@@ -256,33 +241,27 @@ fn bind_module(
       match find_module_binding(builder.scope.modules, binder) {
         Some(first) -> {
           let name = import_module_name(declaration);
-          {
-            ..builder,
-            diagnostics: builder.diagnostics.push(
-              error_at_and(
-                b"E0110",
-                i,
-                s,
-                Bytes::concat_all([b"two imports bind the module name `", binder, b"`"]),
-                Bytes::concat_all([b"`", name, b"` would also be `", binder, b"`"]),
-                i,
-                first.span,
-                Bytes::concat_all([b"`", first.target, b"` is already bound as `", binder, b"`"]),
-                [Bytes::concat_all([b"rename one of them: `import ", name, b" as <other>`"])],
-              ),
+          reported(
+            builder,
+            error_at_and(
+              b"E0110",
+              w.at,
+              s,
+              Bytes::concat_all([b"two imports bind the module name `", binder, b"`"]),
+              Bytes::concat_all([b"`", name, b"` would also be `", binder, b"`"]),
+              w.at,
+              first.span,
+              Bytes::concat_all([b"`", first.target, b"` is already bound as `", binder, b"`"]),
+              [Bytes::concat_all([b"rename one of them: `import ", name, b" as <other>`"])],
             ),
-          }
+          )
         },
         None ->
           {
             ..builder,
             scope: {
               ..builder.scope,
-              modules: builder.scope.modules.push({
-                binder: binder,
-                target: w.modules.get(t).name,
-                span: s,
-              }),
+              modules: builder.scope.modules.push({ binder: binder, target: target, span: s }),
             },
           },
       }
@@ -290,69 +269,65 @@ fn bind_module(
   }
 
 fn bind_name(
-  w: ResolutionContext,
-  i: Int,
+  w: ImportContext,
   builder: ScopeBuilder,
-  t: Int,
+  target: Bytes,
   name: Identifier,
-) -> ScopeBuilder / {abort.raise} = {
-  let declarations = w.declarations.get(t);
-  let module = w.modules.get(t).name;
+) -> ScopeBuilder / {abort.raise, module_names.read} = {
   let found = namespaces.filter(|namespace: Namespace|
-    match lookup_declared(declarations, namespace, name.name) { Some(_) -> true, None -> false });
+    module_names.name_declared(target, namespace, name.name) != None);
   if found.len() == 0 {
-    let exported = exported_names(declarations);
+    let exported = match module_names.declarations_stored(target) {
+      Some(d) -> exported_names(d),
+      None -> [],
+    };
     let note = if exported.len() == 0 {
-      Bytes::concat_all([b"`", module, b"` exports nothing; mark an item `pub` to export it"])
-    } else { Bytes::concat_all([b"`", module, b"` exports: ", backticked(exported, b", ")]) };
-    {
-      ..builder,
-      diagnostics: builder.diagnostics.push(
-        error_at(
-          b"E0101",
-          i,
-          name.span,
-          Bytes::concat_all([b"module `", module, b"` declares no `", name.name, b"`"]),
-          Bytes::concat_all([b"not found in `", module, b"`"]),
-          [note],
-        ),
+      Bytes::concat_all([b"`", target, b"` exports nothing; mark an item `pub` to export it"])
+    } else { Bytes::concat_all([b"`", target, b"` exports: ", backticked(exported, b", ")]) };
+    reported(
+      builder,
+      error_at(
+        b"E0101",
+        w.at,
+        name.span,
+        Bytes::concat_all([b"module `", target, b"` declares no `", name.name, b"`"]),
+        Bytes::concat_all([b"not found in `", target, b"`"]),
+        [note],
       ),
-    }
+    )
   } else {
     let public = found.filter(|namespace: Namespace|
-      match lookup_declared(declarations, namespace, name.name) {
+      match module_names.name_declared(target, namespace, name.name) {
         Some(x) -> x.public,
         None -> false,
       });
     if public.len() == 0 {
-      let allowed_target = match lookup_declared(declarations, found.get(0), name.name) {
+      let private = match module_names.name_declared(target, found.get(0), name.name) {
         Some(x) -> x,
         None -> panic("just found"),
       };
-      {
-        ..builder,
-        diagnostics: builder.diagnostics.push(
-          match match lookup_declared(declarations, ValueSpace, name.name) {
-              Some(d) -> opaque_constructor_error(i, name.span, t, module, d),
-              None -> None,
-            } {
-            Some(closed) -> closed,
-            None ->
-              private_name_error(
-                i,
-                name.span,
-                t,
-                allowed_target.span,
-                found.get(0),
-                name.name,
-                module,
-              ),
-          },
-        ),
-      }
+      reported(
+        builder,
+        match match module_names.name_declared(target, ValueSpace, name.name) {
+            Some(d) -> opaque_constructor_error(w.at, name.span, place_of(w, target), target, d),
+            None -> None,
+          } {
+          Some(closed) -> closed,
+          None ->
+            private_name_error(
+              w.at,
+              name.span,
+              place_of(w, target),
+              private.span,
+              found.get(0),
+              name.name,
+              target,
+            ),
+        },
+      )
     } else {
       public.fold(builder, |accumulator: ScopeBuilder, namespace: Namespace|
-        bind_one(w, i, accumulator, t, name, namespace))
+        bind_one(w, accumulator, target, name, namespace))
     }
   }
 }
@@ -454,101 +429,99 @@ pub fn opaque_constructor_error(
   }
 
 fn bind_one(
-  w: ResolutionContext,
-  i: Int,
+  w: ImportContext,
   builder: ScopeBuilder,
-  t: Int,
+  target: Bytes,
   name: Identifier,
   namespace: Namespace,
-) -> ScopeBuilder / {abort.raise} = {
-  let binding = match lookup(w.declared.get(t), namespace, name.name) {
+) -> ScopeBuilder / {abort.raise, module_names.read} = {
+  let declared = match module_names.name_declared(target, namespace, name.name) {
     Some(x) -> x,
     None -> panic("a public declaration always has a binding"),
   };
-  let module = w.modules.get(t).name;
-  match lookup_declared(builder.local, namespace, name.name) {
+  match module_names.name_declared(builder.scope.module, namespace, name.name) {
     Some(local_definition) ->
-      {
-        ..builder,
-        diagnostics: builder.diagnostics.push(
+      reported(
+        builder,
+        error_at_and(
+          b"E0108",
+          w.at,
+          name.span,
+          Bytes::concat_all([
+            b"the ",
+            describe_namespace(namespace),
+            b" `",
+            name.name,
+            b"` is both imported and defined in `",
+            builder.scope.module,
+            b"`",
+          ]),
+          Bytes::concat_all([b"imported from `", target, b"` here"]),
+          w.at,
+          local_definition.span,
+          Bytes::concat_all([b"`", name.name, b"` is also defined here"]),
+          [
+            Bytes::concat_all([
+              b"remove the name from the import list, write `import ",
+              target,
+              b"`, then `",
+              default_binder(target),
+              b"::",
+              name.name,
+              b"` where you mean the imported definition",
+            ]),
+            b"neither definition wins silently, because a call site would then change which definition it calls",
+          ],
+        ),
+      ),
+    None -> match lookup_declared(builder.imported, namespace, name.name) {
+      Some(earlier_import) ->
+        reported(
+          builder,
           error_at_and(
-            b"E0108",
-            i,
+            b"E0110",
+            w.at,
             name.span,
             Bytes::concat_all([
               b"the ",
               describe_namespace(namespace),
               b" `",
               name.name,
-              b"` is both imported and defined in `",
-              builder.scope.module,
-              b"`",
+              b"` is imported twice",
             ]),
-            Bytes::concat_all([b"imported from `", module, b"` here"]),
-            i,
-            local_definition.span,
-            Bytes::concat_all([b"`", name.name, b"` is also defined here"]),
+            b"imported again here",
+            w.at,
+            earlier_import.span,
+            b"first imported here",
             [
               Bytes::concat_all([
-                b"remove the name from the import list, write `import ",
-                module,
-                b"`, then `",
-                default_binder(module),
-                b"::",
+                b"remove one import, or import the module and write `<module>::",
                 name.name,
-                b"` where you mean the imported definition",
+                b"`",
               ]),
-              b"neither definition wins silently, because a call site would then change which definition it calls",
             ],
           ),
         ),
-      },
-    None -> match lookup_declared(builder.imported, namespace, name.name) {
-      Some(earlier_import) ->
+      None ->
         {
           ..builder,
-          diagnostics: builder.diagnostics.push(
-            error_at_and(
-              b"E0110",
-              i,
-              name.span,
-              Bytes::concat_all([
-                b"the ",
-                describe_namespace(namespace),
-                b" `",
-                name.name,
-                b"` is imported twice",
-              ]),
-              b"imported again here",
-              i,
-              earlier_import.span,
-              b"first imported here",
-              [
-                Bytes::concat_all([
-                  b"remove one import, or import the module and write `<module>::",
-                  name.name,
-                  b"`",
-                ]),
-              ],
-            ),
-          ),
+          imported: push_declared(builder.imported, namespace, {
+            name: name.name,
+            qualified: declared.qualified,
+            public: true,
+            span: name.span,
+            closed_by: None,
+          }),
+          scope: {
+            ..builder.scope,
+            bound: push_binding(builder.scope.bound, namespace, {
+              name: name.name,
+              qualified: declared.qualified,
+              owner: target,
+              span: name.span,
+            }),
+          },
         },
-      None -> {
-        let imported = push_declared(builder.imported, namespace, {
-          name: name.name,
-          qualified: binding.qualified,
-          public: true,
-          span: name.span,
-          closed_by: None,
-        });
-        let bound = push_binding(builder.scope.bound, namespace, {
-          name: name.name,
-          qualified: binding.qualified,
-          owner: module,
-          span: name.span,
-        });
-        { ..builder, imported: imported, scope: { ..builder.scope, bound: bound } }
-      },
     },
   }
 }

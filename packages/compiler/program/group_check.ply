@@ -1,28 +1,24 @@
 import compiler.check.infer.checker (BodyChecking, CheckReads)
-import compiler.check.resolve (ResolveFailed, ResolveSucceeded, resolve_group)
+import compiler.check.resolve (ImportPackages, ResolveFailed, ResolveSucceeded, resolve_group)
 import compiler.check.resolve.defaults (ResolvedProgram)
-import compiler.check.resolve.tables (Diagnostic, ModuleBinding, ParsedModule, binder_span,
-                                      default_binder, find_module_binding, import_binder,
-                                      import_module_name, path_span)
-import compiler.expand.embed (EmbedRequest, EmbedResult, ModuleEmbed, embed_key, embed_requests,
-                              inline_embeds)
-import compiler.front (PulledAnalysis, may_call_embed)
-import compiler.front.diagnostics (ParsedSource, diagnostic_in_module, outside_every_module,
-                                   parse_from)
+import compiler.check.resolve.tables (Diagnostic, EffectSpace, ParsedModule, Scope, TypeSpace,
+                                      ValueSpace, bound_in, module_names)
+import compiler.expand.embed (EmbedRequest, EmbedResult, ModuleEmbed, embed_key, embed_requests)
+import compiler.front (PulledAnalysis, embeds_inlined, may_call_embed)
+import compiler.front.diagnostics (ParsedSource, outside_every_module, parse_from)
 import compiler.front.emitter_input (Rejected)
 import compiler.front.exports (Imported, OwnerSource, OwnerText, group_source_from, named_as_owned)
 import compiler.front.published (HashedProgram, checked_with_reads, no_rows)
 import compiler.store.hash (hashed_and_unused)
 import compiler.store.hash.forms (CachedNode, build_index, node_held_elsewhere)
 import compiler.store.hash.graph (Index, NameElsewhere, Node, NodeElsewhere, index_beside)
-import compiler.syntax.items (ImportDeclaration, SelectedNames, is_explicit_import, parse)
-import compiler.syntax.parsing (ParseDiagnostic)
+import compiler.syntax.items (parse)
 import std.list
 
 pub type GroupInputs = {
   source: OwnerSource,
-  imported: List<Imported>,
   elsewhere: List<NameElsewhere>,
+  tables: ImportPackages,
   embed_read: (EmbedRequest) -> EmbedResult / {abort.raise},
 }
 
@@ -37,23 +33,15 @@ fn with_embeds(
   read: (EmbedRequest) -> EmbedResult / {abort.raise},
 ) -> { parsed: ParsedSource, embeds: List<ModuleEmbed> } / {abort.raise} =
   if !may_call_embed(parsed.text) { { parsed: parsed, embeds: [] } } else {
-    let table = embed_requests(parsed.module.module).fold(
-      Map::new(),
-      |found: Map<Bytes, EmbedResult>, want: EmbedRequest|
-        found.insert(embed_key(want), read(want)),
-    );
-    let inlined = inline_embeds(parsed.module.module, table, []);
-    {
-      parsed: {
-        ..parsed,
-        module: { ..parsed.module, module: inlined.module },
-        diagnostics: parsed.diagnostics.concat(
-          inlined.diagnostics.map(|d: ParseDiagnostic| diagnostic_in_module(0, d)),
-        ),
-      },
-      embeds: table.fold([], |found: List<ModuleEmbed>, key: Bytes, read: EmbedResult|
-        found.push({ module: parsed.name, key: key, read: read })),
-    }
+    embeds_inlined(
+      parsed,
+      0,
+      embed_requests(parsed.module.module).fold(
+        Map::new(),
+        |found: Map<Bytes, EmbedResult>, want: EmbedRequest|
+          found.insert(embed_key(want), read(want)),
+      ),
+    )
   }
 
 pub fn parsed_group(source: OwnerSource) -> ParsedSource / {abort.raise} = {
@@ -68,47 +56,6 @@ pub fn parsed_group(source: OwnerSource) -> ParsedSource / {abort.raise} = {
 
 fn rejected(diagnostics: List<Diagnostic>) -> { pulled: PulledAnalysis, at: Int } =
   { pulled: { pulled: [], out: Rejected(diagnostics), shipped_views: [] }, at: 0 }
-
-fn modules_outside(own: Bytes, inputs: GroupInputs) -> List<Bytes> =
-  inputs.imported.map(|x: Imported| x.target).concat(
-    inputs.elsewhere.map(|n: NameElsewhere| n.module),
-  ).fold(Map::new(), |found: Map<Bytes, Bool>, m: Bytes|
-    if m == own || m.len() == 0 { found } else { found.insert(m, true) }).keys(
-  )
-
-fn module_bindings(imported: List<Imported>) -> List<ModuleBinding> / {abort.raise} =
-  imported.fold([], |found: List<ModuleBinding>, x: Imported|
-    match import_binder(x.declaration) {
-      Some(binder) -> match find_module_binding(found, binder) {
-        Some(_) -> found,
-        None -> found.push({ binder: binder, target: x.target, span: binder_span(x.declaration) }),
-      },
-      None -> found,
-    })
-
-fn hidden_bindings(parsed: ParsedSource) -> List<ModuleBinding> / {abort.raise} =
-  parsed.module.module.imports.filter(|d: ImportDeclaration| !is_explicit_import(d)).fold(
-    [],
-    |found: List<ModuleBinding>, d: ImportDeclaration|
-      match import_binder(d) {
-        Some(binder) ->
-          found.push({ binder: binder, target: import_module_name(d), span: binder_span(d) }),
-        None -> found,
-      },
-  )
-
-fn selected_modules(imported: List<Imported>) -> List<ModuleBinding> / {abort.raise} =
-  imported.fold([], |found: List<ModuleBinding>, x: Imported|
-    match x.declaration.kind {
-      SelectedNames(_) -> {
-        let binder = default_binder(import_module_name(x.declaration));
-        match find_module_binding(found, binder) {
-          Some(_) -> found,
-          None -> found.push({ binder: binder, target: x.target, span: path_span(x.declaration) }),
-        }
-      },
-      _ -> found,
-    })
 
 fn hashed_group(
   parsed: ParsedSource,
@@ -145,6 +92,19 @@ fn hashed_group(
   }
 }
 
+fn with_scope(n: NameElsewhere, scope: Scope) -> NameElsewhere / {module_names.read} = {
+  let namespace = if n.effect { EffectSpace }
+  else if n.declaration { TypeSpace }
+  else { ValueSpace };
+  {
+    ..n,
+    bare: match bound_in(scope, namespace, n.name) {
+      Some(b) -> b.owner == n.module,
+      None -> false,
+    },
+  }
+}
+
 pub fn checked_group(
   inputs: GroupInputs,
   walks: BodyChecking,
@@ -152,23 +112,20 @@ pub fn checked_group(
   let read = with_embeds(parsed_group(inputs.source), inputs.embed_read);
   let parsed = read.parsed;
   if parsed.diagnostics.len() > 0 { rejected(parsed.diagnostics) } else {
-    let bound = module_bindings(inputs.imported).concat(hidden_bindings(parsed));
     match resolve_group(
         parsed.module,
-        modules_outside(parsed.name, inputs),
-        bound,
-        selected_modules(inputs.imported),
+        inputs.elsewhere.map(|n: NameElsewhere| n.module),
+        inputs.tables,
       ) {
       ResolveFailed(ds) -> rejected(ds.map(outside_every_module)),
       ResolveSucceeded(x) -> {
         let built = build_index(x.modules, x.resolution);
         if built.diagnostics.len() > 0 { rejected(built.diagnostics.map(outside_every_module)) }
         else {
+          let scope = x.resolution.scopes.get(0);
           let index = index_beside(
             built.index,
-            inputs.elsewhere,
-            bound.fold(Map::new(), |found: Map<Bytes, Bytes>, b: ModuleBinding|
-              found.insert(b.binder, b.target)),
+            inputs.elsewhere.map(|n: NameElsewhere| with_scope(n, scope)),
           );
           {
             pulled: {
