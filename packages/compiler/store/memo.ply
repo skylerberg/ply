@@ -1675,40 +1675,34 @@ pub fn pack_row_key(key: Bytes) -> Bytes = pack_key(key)
 
 pub type InputRead = { value: Option<Bytes>, digest: Bytes }
 
-pub type InputSnapshot = { reads: Map<Bytes, InputRead> }
-
-pub const empty_input_snapshot: InputSnapshot = { reads: Map::new() }
-
-pub effect input_snapshot {
+pub effect session_inputs {
   read held(id: Bytes) -> Option<InputRead>
   write hold(id: Bytes, read: InputRead) -> Unit
 }
 
-pub fn with_snapshot<a | e>(
-  snapshot: InputSnapshot,
-  body: () -> a / {input_snapshot.read, input_snapshot.write | e},
-) -> { snapshot: InputSnapshot, value: a } / e =
+pub fn with_session_inputs<a | e>(
+  body: () -> a / {session_inputs.read, session_inputs.write | e},
+) -> a / e =
   handle {
     body()
   } with {
-    var held = snapshot,
-    input_snapshot.held(id) -> held.reads.get(id),
-    input_snapshot.hold(id, read) -> {
-      held = { reads: held.reads.insert(id, read) };
+    var held: Map<Bytes, InputRead> = Map::new(),
+    session_inputs.held(id) -> held.get(id),
+    session_inputs.hold(id, read) -> {
+      held = held.insert(id, read);
     },
-    return value -> { snapshot: held, value: value },
   }
 
-pub fn snapshot_read<| e>(
+pub fn session_input<| e>(
   id: Bytes,
   read: () -> Option<Bytes> / {abort.raise | e},
-) -> InputRead / {input_snapshot.read, input_snapshot.write, abort.raise | e} =
-  match input_snapshot.held(id) {
+) -> InputRead / {session_inputs.read, session_inputs.write, abort.raise | e} =
+  match session_inputs.held(id) {
     Some(x) -> x,
     None -> {
       let value = read();
       let x = { value: value, digest: digest_of(value) };
-      input_snapshot.hold(id, x);
+      session_inputs.hold(id, x);
       x
     },
   }
@@ -1766,15 +1760,14 @@ pub fn stored_outputs(store: MemoryStore) -> Map<Bytes, Bytes> =
 
 pub fn with_memory_store<a | e>(
   initial: MemoryStore,
-  snapshot: InputSnapshot,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> { store: MemoryStore, snapshot: InputSnapshot, value: a } / {abort.raise | e} = {
+) -> { store: MemoryStore, value: a } / {abort.raise | e} = {
   let looked = |held: MemoryStore, kind: Bytes, at: Bytes| {
     let id = location_id(kind, at);
-    snapshot_read(id, ||
+    session_input(id, ||
       match held.inputs.get(id) {
         Some(i) -> if i.fixed { held.outputs.get(i.digest) } else { look(kind, at) },
         None -> look(kind, at),
@@ -1785,7 +1778,7 @@ pub fn with_memory_store<a | e>(
       let found = sealed_lookup(r.pack, read, key);
       { running: { ..r, pack: found.reading }, record: found.record }
     };
-  let done = with_snapshot(snapshot, ||
+  with_session_inputs(||
     handle {
       work()
     } with {
@@ -1892,7 +1885,7 @@ pub fn with_memory_store<a | e>(
       },
       memo_store.fix_input(kind, at) -> {
         let id = location_id(kind, at);
-        match input_snapshot.held(id) {
+        match session_inputs.held(id) {
           Some({ value: Some(v), digest: d }) -> {
             store = {
               ..store,
@@ -1955,8 +1948,7 @@ pub fn with_memory_store<a | e>(
         nothing_left_waiting(running.waiting);
         { store: store, value: value }
       },
-    });
-  { store: done.value.store, snapshot: done.snapshot, value: done.value.value }
+    })
 }
 
 pub fn pack_memory_store<| e>(
@@ -2031,7 +2023,6 @@ fn fetched_in(
   let queries = plain_queries(named);
   let done = with_memory_store(
     w.store,
-    empty_input_snapshot,
     packs::no_pack,
     b"",
     |_: Bytes, at: Bytes| w.files.get(at),
@@ -2139,7 +2130,6 @@ fn input_looks(
   handle {
     with_memory_store(
       store,
-      empty_input_snapshot,
       packs::no_pack,
       b"",
       |_: Bytes, at: Bytes| {
@@ -2408,18 +2398,11 @@ test "a fact in a trusted pack is used as it is, and a project records what it u
   let qs = plain_queries(q);
   let pack = pack_memory_store(source.store, qs, b"files");
   let read = |path: String, offset: Int, len: Int| packs::frame_in(Some(pack), path, offset, len);
-  let done = with_memory_store(
-    empty_memory_store,
-    empty_input_snapshot,
-    read,
-    b"files",
-    |_: Bytes, _: Bytes| None,
-    ||
-      in_session(qs, |run: Run| {
-        let a = query_output(qs, run, b"label", b"a");
-        { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
-      }),
-  );
+  let done = with_memory_store(empty_memory_store, read, b"files", |_: Bytes, _: Bytes| None, ||
+    in_session(qs, |run: Run| {
+      let a = query_output(qs, run, b"label", b"a");
+      { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
+    }));
   assert_eq(done.value, { output: b"long 4", ran: [b"label"] });
   assert_eq(done.store.inputs.values().map(|i: StoredInput| i.kind), [b"sealed"])
 }
@@ -2434,7 +2417,7 @@ test "a fact that used a sealed fact is recomputed when a new pack changes that 
   let older = pack_of(four, b"old");
   let newer = pack_of(world_of([{ at: b"a", text: b"forty" }]), b"new");
   let run_with = |store: MemoryStore, read: (String, Int, Int) -> Option<Bytes> / {abort.raise}, files: Bytes|
-    with_memory_store(store, empty_input_snapshot, read, files, |_: Bytes, _: Bytes| None, ||
+    with_memory_store(store, read, files, |_: Bytes, _: Bytes| None, ||
       in_session_of(plain_queries(q), b"label", b"a"));
   let first = run_with(empty_memory_store, older, b"old");
   assert_eq(first.value, b"long 4");

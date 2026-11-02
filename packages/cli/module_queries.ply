@@ -1,10 +1,10 @@
+import sources (ProjectFiles)
 import std.bin
 import std.fs (fs)
 import compiler.cc (toolchain)
 import compiler.store.memo
-import compiler.store.memo (memo, Run, QueryStats, InputSnapshot, reachable_keys, missing_count,
-                            reading, in_session, query_stats, empty_memory_store,
-                            empty_input_snapshot, with_memory_store)
+import compiler.store.memo (memo, Run, QueryStats, reachable_keys, missing_count, reading,
+                            in_session, query_stats, empty_memory_store, with_memory_store)
 import compiler.store.memo_files
 import compiler.store.packs
 import compiler.unit (shipped, pack_frame)
@@ -29,10 +29,8 @@ import compiler.store.hash.forms (ModuleHashes)
 import sources (Project, File, DependencyPackage, Embed, read_module_embed, embed_of, shipped_names,
                 shipped_text)
 import compiler.check.resolve.tables (Diagnostic)
-import std.hash (blake3)
 import std.list
-import compiler.expand.embed (EmbedBytesResult, ModuleEmbed, EmbedBytes, EmbedFile, EmbedResult,
-                              EmbedRequest, request_of_key)
+import compiler.expand.embed (EmbedBytesResult, ModuleEmbed, EmbedRequest, request_of_key)
 
 fn own_file(f: File) -> PackageFile = { module: Bytes::of_string(f.module), text: f.text }
 
@@ -64,58 +62,14 @@ fn read_project_input<| e>(
     at,
   )
 
-effect embed_reads {
-  write record(files: List<EmbedBytes>) -> Unit
-}
-
-fn read_and_record_embed(
-  project: Project,
-  k: Int,
-  module: Bytes,
-  want: EmbedRequest,
-) -> EmbedBytesResult / {embed_reads.record, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} = {
-  let read = read_module_embed(project, k, module, want);
-  match read { Ok(files) -> embed_reads.record(files), Err(_) -> () };
-  read
-}
-
-fn recording_embeds<a | e>(
-  go: () -> a / {embed_reads.record, abort.raise | e},
-) -> { value: a, seen: Map<Bytes, Bytes> } / {abort.raise | e} =
-  handle {
-    go()
-  } with {
-    var seen: Map<Bytes, Bytes> = Map::new(),
-    embed_reads.record(files) -> {
-      seen = files.fold(seen, |m: Map<Bytes, Bytes>, f: EmbedBytes|
-        m.insert(blake3(f.bytes), f.bytes));
-    },
-    return v -> { value: v, seen: seen },
-  }
-
-fn seen_files(seen: Map<Bytes, Bytes>, read: EmbedResult) -> Option<List<EmbedBytes>> =
-  match read {
-    Err(_) -> None,
-    Ok(files) ->
-      files.fold(Some([]), |accumulator: Option<List<EmbedBytes>>, f: EmbedFile|
-        match ((accumulator, seen.get(f.digest))) {
-          (Some(xs), Some(b)) -> Some(xs.push({ name: f.name, bytes: b })),
-          _ -> None,
-        }),
-  }
-
 pub fn embed_inputs(
   project: Project,
   w: LoadInputs,
   embeds: List<ModuleEmbed>,
-  seen: Map<Bytes, Bytes>,
-) -> Result<Map<Bytes, Bytes>, List<Diagnostic>> / {fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+) -> Result<Map<Bytes, Bytes>, List<Diagnostic>> / {fs.read_file[shipped], ProjectFiles, abort.raise} =
   embed_inputs_of(embeds, |e: ModuleEmbed|
     match package_location_in(w, e.module) {
-      Some(p) -> match seen_files(seen, e.read) {
-        Some(files) -> Ok(files),
-        None -> read_module_embed(project, p.package, p.relative, request_of_key(e.key)),
-      },
+      Some(p) -> read_module_embed(project, p.package, p.relative, request_of_key(e.key)),
       None -> shipped_bytes(e.module, e.key, shipped_text, shipped_data),
     })
 
@@ -145,27 +99,20 @@ fn running_queries() -> CheckQueries / {fs.read_file[shipped], abort.raise} =
 pub type Opened<a> = {
   inputs: LoadInputs,
   value: a,
-  seen: Map<Bytes, Bytes>,
   tallies: List<QueryStats>,
   missing_results: Int,
   damage: Option<String>,
-  snapshot: InputSnapshot,
 }
 
 type SessionRead<a> = { value: a, tallies: List<QueryStats>, missing_results: Int }
 
-fn opened_from<a>(
-  w: LoadInputs,
-  done: { value: memo_files::StoreOutcome<SessionRead<a>>, seen: Map<Bytes, Bytes> },
-) -> Opened<a> =
+fn opened_from<a>(w: LoadInputs, done: memo_files::StoreOutcome<SessionRead<a>>) -> Opened<a> =
   {
     inputs: w,
-    value: done.value.value.value,
-    seen: done.seen,
-    tallies: done.value.value.tallies,
-    missing_results: done.value.value.missing_results,
-    damage: done.value.damage,
-    snapshot: done.value.snapshot,
+    value: done.value.value,
+    tallies: done.value.tallies,
+    missing_results: done.value.missing_results,
+    damage: done.damage,
   }
 
 fn read_session<a>(
@@ -188,28 +135,25 @@ fn read_session<a>(
 pub fn stored_session<a, [r]>(
   dir: String,
   project: Project,
-  snapshot: InputSnapshot,
   work: (LoadInputs) -> a / {SessionReads, abort.raise},
-) -> Opened<a> / {fs.read[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+) -> Opened<a> / {fs.read[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Derives, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
   opened_from(
     w,
-    recording_embeds(||
-      memo_files::with_memo_store[r](
-        dir,
-        snapshot,
-        pack_frame,
-        shipped_files(),
-        |kind: Bytes, at: Bytes|
-          read_project_input(
-            w,
-            |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
-            kind,
-            at,
-          ),
-        || with_decode_cache(|| read_session(qs, w, work)),
-      )),
+    memo_files::with_memo_store[r](
+      dir,
+      pack_frame,
+      shipped_files(),
+      |kind: Bytes, at: Bytes|
+        read_project_input(
+          w,
+          |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
+          kind,
+          at,
+        ),
+      || with_decode_cache(|| read_session(qs, w, work)),
+    ),
   )
 }
 
@@ -253,31 +197,26 @@ pub fn later_checks(
 
 pub fn temporary_session<a>(
   project: Project,
-  snapshot: InputSnapshot,
   work: (LoadInputs) -> a / {SessionReads, abort.raise},
-) -> Opened<a> / {fs.list_dir[shipped], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
+) -> Opened<a> / {fs.list_dir[shipped], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Derives, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
-  opened_from(
-    w,
-    recording_embeds(|| {
-      let done = with_memory_store(
-        empty_memory_store,
-        snapshot,
-        pack_frame,
-        shipped_files(),
-        |kind: Bytes, at: Bytes|
-          read_project_input(
-            w,
-            |k: Int, m: Bytes, want: EmbedRequest| read_and_record_embed(project, k, m, want),
-            kind,
-            at,
-          ),
-        || with_decode_cache(|| read_session(qs, w, work)),
-      );
-      { value: done.value, damage: None, snapshot: done.snapshot }
-    }),
-  )
+  opened_from(w, {
+    value: with_memory_store(
+      empty_memory_store,
+      pack_frame,
+      shipped_files(),
+      |kind: Bytes, at: Bytes|
+        read_project_input(
+          w,
+          |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
+          kind,
+          at,
+        ),
+      || with_decode_cache(|| read_session(qs, w, work)),
+    ).value,
+    damage: None,
+  })
 }
 
 pub fn shipped_results<[r]>(
@@ -290,7 +229,6 @@ pub fn shipped_results<[r]>(
     accumulator.insert(name, true));
   memo_files::with_memo_store[r](
     store_dir,
-    empty_input_snapshot,
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes|
@@ -332,7 +270,6 @@ fn query_shipped<a>(
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   with_memory_store(
     empty_memory_store,
-    empty_input_snapshot,
     pack_frame,
     shipped_files(),
     |kind: Bytes, at: Bytes|

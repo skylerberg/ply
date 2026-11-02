@@ -5,8 +5,8 @@ import std.list
 import std.fs
 import std.fs (fs)
 import compiler.store.memo
-import compiler.store.memo (memo, MemoryStore, Run, reading, empty_memory_store,
-                            empty_input_snapshot, with_memory_store, in_session, Product)
+import compiler.store.memo (memo, MemoryStore, Run, reading, empty_memory_store, with_memory_store,
+                            in_session, Product)
 import compiler.store.memo_files
 import compiler.store.packs
 import compiler.unit (definition_hash)
@@ -21,7 +21,7 @@ import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_
                              pulled_next, checked_program_over)
 import compiler.front.diagnostics (parse_all, diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
-                              request_of_key)
+                              embed_snapshot, request_of_key, snapshot_embed, with_embed_snapshot)
 import compiler.front.pkg (PackageSources, read_packages, validated_packages_bin, without_locations)
 import compiler.check.resolve.tables (placed_in)
 import compiler.check.resolve.tables (Source, Diagnostic, Edit, Fix, Label, backticked, error_at)
@@ -673,11 +673,8 @@ pub fn over_decoding<a | e>(
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {RunEffects, abort.raise},
-) -> { store: MemoryStore, value: a } / {abort.raise | e} = {
-  let done = with_memory_store(store, empty_input_snapshot, read, world, look, ||
-    with_decode_cache(work));
-  { store: done.store, value: done.value }
-}
+) -> { store: MemoryStore, value: a } / {abort.raise | e} =
+  with_memory_store(store, read, world, look, || with_decode_cache(work))
 
 pub fn queried_over(
   store: MemoryStore,
@@ -847,14 +844,12 @@ fn queried_in(
     handle {
       memo_files::with_memo_store[abs](
         "s",
-        empty_input_snapshot,
         prelude_frames,
         prelude_files,
         |kind: Bytes, at: Bytes| {
           if raced.is_first_lookup() {
             memo_files::with_memo_store[abs](
               "s",
-              empty_input_snapshot,
               prelude_frames,
               prelude_files,
               |k: Bytes, a: Bytes| lookup_input_alone(w, k, a),
@@ -1009,6 +1004,51 @@ test "changing an embedded file's bytes changes the hash of the definition that 
   assert(fixed_hash(moved, b"m.b") != fixed_hash(first, b"m.b"));
   let same = over(b"one", b"one");
   assert_eq(fixed_hash(same, b"m.a"), fixed_hash(same, b"m.b"))
+}
+
+fn embed_from_files<[r]>(
+  want: EmbedRequest,
+) -> EmbedBytesResult / {fs.read[r], embed_snapshot.read, embed_snapshot.write} =
+  snapshot_embed(want.path, ||
+    match fs.read_file[r](String::of_bytes_lossy(want.path)) {
+      Some(bytes) -> Ok([{ name: b"", bytes: bytes }]),
+      None -> Err(b"no file is there"),
+    })
+
+fn session_over_embeds<[r]>(
+  checks: Bool,
+) -> Option<Bytes> / {fs.read[r], fs.write[r], embed_snapshot.read, embed_snapshot.write, abort.raise} = {
+  let w = inputs_alone([{ name: b"m", source_text: two_embeds }]);
+  let none = |name: Bytes| None;
+  let read = |package: Int, module: Bytes, want: EmbedRequest| embed_from_files[r](want);
+  let qs = fresh_registry();
+  memo_files::with_memo_store[r](
+    "s",
+    packs::no_pack,
+    b"",
+    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
+    ||
+      with_decode_cache(||
+        if checks { fixed_hash(query_alone(qs, w).fixing, b"m.a") }
+        else { in_session(qs, |run: Run| { run: run, value: None }) }),
+  ).value
+}
+
+test "a third session in a command reads the embedded file the second session read first, and the next command reads the saved file" {
+  let files = fs::mem_of([{ path: "a.bin", body: b"one" }, { path: "b.bin", body: b"two" }]);
+  let command = fs::on_mem[abs](files, ||
+    with_embed_snapshot(|| {
+      let first = session_over_embeds[abs](false);
+      let second = session_over_embeds[abs](true);
+      fs.write_file[abs]("a.bin", b"saved");
+      { first: first, second: second, third: session_over_embeds[abs](true) }
+    }));
+  let next = fs::on_mem[abs](command.tree, ||
+    with_embed_snapshot(|| session_over_embeds[abs](true)));
+  assert_eq(command.value.first, None);
+  assert(command.value.second != None);
+  assert_eq(command.value.third, command.value.second);
+  assert(next.value != command.value.second)
 }
 
 type CheckedSources = {
