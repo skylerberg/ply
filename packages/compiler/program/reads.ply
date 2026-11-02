@@ -1,21 +1,66 @@
 import compiler.check.borrowing (mode_facts)
-import compiler.check.infer.checker (program)
-import compiler.check.resolve.tables (Binding, Declaration, Declarations, ModuleBinding, Namespace,
-                                      module_names)
+import compiler.check.infer.checker (StoredDeclarations, program, CheckReads)
+import compiler.check.resolve.tables (Binding, Declaration, Declarations, Namespace, module_names,
+                                      qualify)
 import compiler.check.termination (summary_facts)
-import compiler.program.stored (StoredDeclarations)
+import std.list
 
 pub type StoredReads<| e> = {
   declarations_of: (Bytes) -> List<StoredDeclarations> / {abort.raise | e},
   name_bound: (Namespace, Bytes) -> Option<Binding> / {abort.raise | e},
-  module_bound: (Bytes) -> Option<ModuleBinding> / {abort.raise | e},
+  names_in_scope: (Namespace) -> List<Binding> / {abort.raise | e},
   name_declared: (Bytes, Namespace, Bytes) -> Option<Declaration> / {abort.raise | e},
   module_declarations: (Bytes) -> Option<Declarations> / {abort.raise | e},
   visible_modules: () -> List<Bytes> / {abort.raise | e},
   every_module: () -> List<Bytes> / {abort.raise | e},
 }
 
+fn first_stored<a>(
+  stored: List<StoredDeclarations>,
+  pick: (StoredDeclarations) -> Option<a>,
+) -> Option<a> =
+  stored.fold(None, |found: Option<a>, s: StoredDeclarations|
+    match found { Some(_) -> found, None -> pick(s) })
+
 pub fn over_stored<a | e>(
   reads: StoredReads<| e>,
-  body: () -> a / {program.read, module_names.read, mode_facts.read, summary_facts.read, abort.raise | e},
-) -> a / {abort.raise | e} = ???
+  body: () -> a / {CheckReads, abort.raise | e},
+) -> a / {abort.raise | e} = {
+  let definition = |name: Bytes|
+    first_stored((reads.declarations_of)(name), |s: StoredDeclarations| s.definitions.get(name));
+  handle {
+    body()
+  } with {
+    program.type_named(name) ->
+      first_stored((reads.declarations_of)(name), |s: StoredDeclarations| s.types.get(name)),
+    program.effect_named(name) ->
+      first_stored((reads.declarations_of)(name), |s: StoredDeclarations| s.effects.get(name)),
+    program.constructor_named(name) ->
+      first_stored((reads.declarations_of)(name), |s: StoredDeclarations| s.constructors.get(name)),
+    program.definition_named(name) -> definition(name),
+    mode_facts.modes_named(name) -> match definition(name) { Some(d) -> d.modes, None -> None },
+    summary_facts.summary_stored(name) -> match definition(name) {
+      Some(d) -> d.summary,
+      None -> None,
+    },
+    summary_facts.ending_stored(name) -> match definition(name) {
+      Some(d) -> match d.definition { Some(x) -> Some(x.ending), None -> None },
+      None -> None,
+    },
+    module_names.name_bound(module, namespace, name) -> (reads.name_bound)(namespace, name),
+    module_names.names_in_scope(module, namespace) -> (reads.names_in_scope)(namespace),
+    module_names.name_declared(module, namespace, name) ->
+      (reads.name_declared)(module, namespace, name),
+    module_names.declarations_stored(module) -> (reads.module_declarations)(module),
+    module_names.effect_set_stored(module, name) ->
+      first_stored((reads.declarations_of)(qualify(module, name)), |s: StoredDeclarations|
+        s.sets.get(qualify(module, name))),
+    module_names.schema_stored(module, name) ->
+      first_stored((reads.declarations_of)(qualify(module, name)), |s: StoredDeclarations|
+        s.schemas.get(qualify(module, name))),
+    module_names.parameters_stored(name) ->
+      first_stored((reads.declarations_of)(name), |s: StoredDeclarations| s.parameters.get(name)),
+    module_names.modules_visible(module) -> (reads.visible_modules)(),
+    module_names.every_module() -> (reads.every_module)(),
+  }
+}

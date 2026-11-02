@@ -1,4 +1,5 @@
-import compiler.check.resolve.tables (declarations_named, module_index)
+import compiler.check.resolve.tables (declarations_named, effect_set_declared, scope_bindings,
+                                      SetSpace, no_declarations)
 import compiler.check.resolve.tables (module_names)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
@@ -13,6 +14,7 @@ import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, Name
                                     FunctionTypeExpression, RecordTypeExpression,
                                     UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
                                     EffectExpression, ReadMode, type_span, is_raise, no_generics)
+import compiler.syntax.items (ExternDefinition, names_type)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, EffectSetItem, ExternItem, is_shipped, is_builtin,
                               FnDefinition, TestDefinition, Cases, cases_form, LawDefinition,
@@ -221,11 +223,76 @@ pub fn bind_signatures(
   }
 }
 
-fn bind_externs(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise, program.read} =
-  if !is_shipped(parsed.name) { checker } else {
-    externs_of(parsed.name, parsed.module).fold(checker, |c: Checker, b: Builtin|
-      bind_builtin(c, checked_native_modes(c, b)))
+fn types_in_extern(definition: ExternDefinition) -> List<TypeExpression> =
+  definition.params.fold([definition.return_type], |found: List<TypeExpression>, p: Param|
+    match p.ty { Some(t) -> found.push(t), None -> found })
+
+type AliasSearch = { found: Map<Bytes, TypeExpression>, written: List<TypeExpression> }
+
+fn aliases_named(
+  checker: Checker,
+  declared: List<Declaration>,
+  written: List<TypeExpression>,
+) -> Map<Bytes, TypeExpression> / {abort.raise, program.read} =
+  range(0, declared.len()).fold(
+    { found: Map::new(), written: written },
+    |search: AliasSearch, _: Int| {
+      let read = declared.filter(|d: Declaration|
+        !search.found.contains(d.name)
+          && search.written.any(|t: TypeExpression| names_type(t, d.name))).fold(
+        Map::new(),
+        |bodies: Map<Bytes, TypeExpression>, d: Declaration|
+          match type_declared(checker, d.qualified) {
+            Some(t) -> match t.declared {
+              DeclaredAlias(body) -> if t.params.len() == 0 && t.labels.len() == 0 {
+                bodies.insert(d.name, body)
+              } else { bodies },
+              _ -> bodies,
+            },
+            None -> bodies,
+          },
+      );
+      {
+        found: read.fold(
+          search.found,
+          |m: Map<Bytes, TypeExpression>, name: Bytes, body: TypeExpression| m.insert(name, body),
+        ),
+        written: read.values(),
+      }
+    },
+  ).found
+
+fn bind_externs(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise, program.read, module_names.read} = {
+  let externs = parsed.module.items.fold([], |found: List<ExternDefinition>, item: Item|
+    match item {
+      ExternItem(definition) -> if is_builtin(parsed.name, definition) { found }
+      else { found.push(definition) },
+      _ -> found,
+    });
+  if !is_shipped(parsed.name) || externs.len() == 0 { checker } else {
+    let declared = match declarations_named(checker.resolved, parsed.name) {
+      Some(d) -> d,
+      None -> no_declarations,
+    };
+    externs_beside(
+      parsed.name,
+      parsed.module,
+      declared.types.concat(declared.effects).fold(
+        Map::new(),
+        |found: Map<Bytes, Bytes>, d: Declaration| found.insert(d.name, d.qualified),
+      ),
+      aliases_named(
+        checker,
+        declared.types,
+        externs.fold([], |found: List<TypeExpression>, e: ExternDefinition|
+          found.concat(types_in_extern(e))),
+      ),
+    ).fold(checker, |c: Checker, b: Builtin| bind_builtin(c, checked_native_modes(c, b)))
   }
+}
 
 fn checked_native_modes(c: Checker, b: Builtin) -> Builtin / {abort.raise, program.read} = {
   let modes = match b.scheme.ty {
@@ -245,9 +312,20 @@ fn checked_native_modes(c: Checker, b: Builtin) -> Builtin / {abort.raise, progr
   }
 }
 
-pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} = {
+pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} =
+  externs_beside(name, module, Map::new(), Map::new())
+
+fn externs_beside(
+  name: Bytes,
+  module: Module,
+  named_elsewhere: Map<Bytes, Bytes>,
+  aliased_elsewhere: Map<Bytes, TypeExpression>,
+) -> List<Builtin> / {abort.raise} = {
   let own = module.items.fold(
-    prelude_imports(module.imports),
+    named_elsewhere.fold(
+      prelude_imports(module.imports),
+      |found: Map<Bytes, Bytes>, k: Bytes, v: Bytes| found.insert(k, v),
+    ),
     |accumulator: Map<Bytes, Bytes>, item: Item|
       match item {
         TypeItem(t) -> accumulator.insert(t.name.name, qualify(name, t.name.name)),
@@ -256,7 +334,7 @@ pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} 
       },
   );
   let aliases = module.items.fold(
-    Map::new(),
+    aliased_elsewhere,
     |accumulator: Map<Bytes, TypeExpression>, item: Item|
       match item {
         TypeItem(t) -> match t.body {
@@ -269,7 +347,7 @@ pub fn externs_of(name: Bytes, module: Module) -> List<Builtin> / {abort.raise} 
   );
   module.items.fold([], |accumulator: List<Builtin>, item: Item|
     match item {
-      ExternItem(definition) -> if is_builtin(name, module, definition) { accumulator } else {
+      ExternItem(definition) -> if is_builtin(name, definition) { accumulator } else {
         accumulator.push(
           builtin_of_extern(qualify(name, definition.name.name), own, definition, aliases),
         )
@@ -2550,30 +2628,17 @@ fn set_effects_of(
   owner: Bytes,
   name: Bytes,
 ) -> Option<List<Effect>> / {abort.raise, program.read, module_names.read} =
-  match checker.modules.at(module_index(checker.resolved, owner)) {
+  match effect_set_declared(checker.modules, checker.resolved, owner, name) {
     None -> None,
-    Some(md) ->
-      md.module.items.fold(None, |found: Option<List<Effect>>, item: Item|
-        match found {
-          Some(_) -> found,
-          None -> match item {
-            EffectSetItem(d) -> if d.name.name == name {
-              let there: Checker = {
-                ..checker,
-                module: module_index(checker.resolved, owner),
-                label_params: Map::new(),
-                diagnostics: [],
-              };
-              Option::traverse(d.expansion, |a: EffectExpression| convert_effect(there, a).entry)
-            } else { None },
-            _ -> None,
-          },
-        }),
+    Some(d) -> {
+      let there: Checker = { ..checker, label_params: Map::new(), diagnostics: [] };
+      Option::traverse(d.expansion, |a: EffectExpression| convert_effect(there, a).entry)
+    },
   }
 
 fn named_sets(checker: Checker) -> List<NamedSet> / {abort.raise, program.read, module_names.read} = {
   let scope = scope_of(checker);
-  let bound = scope.bound.sets.fold([], |accumulator: List<NamedSet>, b: Binding|
+  let bound = scope_bindings(scope, SetSpace).fold([], |accumulator: List<NamedSet>, b: Binding|
     match set_effects_of(checker, b.owner, b.name) {
       Some(xs) -> accumulator.push({ name: b.name, listed: xs }),
       None -> accumulator,

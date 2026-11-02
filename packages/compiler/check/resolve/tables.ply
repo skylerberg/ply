@@ -1,11 +1,11 @@
-import compiler.syntax.parsing (span_bin)
+import compiler.syntax.parsing (span_bin, dummy_span)
 import compiler.syntax.expressions (expression_bin)
 import compiler.syntax.parsing (Span, Identifier, span_to)
 import compiler.syntax.items (Module, Item, FunctionItem, ExternItem, TypeItem, EffectItem,
                               EffectSetItem, SumBody, AliasBody, VariantDefinition, Visibility,
                               Private, ImportDeclaration, WholeModule, ModuleAlias, SelectedNames,
                               DeriveOrigin, is_pub, NominalBody, ExternBody, is_builtin,
-                              EffectSetDefinition)
+                              EffectSetDefinition, Opaque, opaque_bin, SchemaDefinition)
 import compiler.syntax.expressions (Expression)
 import std.list
 import std.bin
@@ -17,7 +17,15 @@ pub type ParsedModule = { name: Bytes, module: Module, derived: List<DeriveOrigi
 
 pub type Namespace = | ValueSpace | TypeSpace | EffectSpace | SetSpace
 
-pub type Declaration = { name: Bytes, qualified: Bytes, public: Bool, span: Span }
+pub type ClosedBy = { type_name: Bytes, opaque: Opaque }
+
+pub type Declaration = {
+  name: Bytes,
+  qualified: Bytes,
+  public: Bool,
+  span: Span,
+  closed_by: Option<ClosedBy>,
+}
 
 pub type Declarations = {
   values: List<Declaration>,
@@ -79,9 +87,13 @@ derive bin for Fix
 
 derive bin for Diagnostic
 
+derive bin for ClosedBy
+
 derive bin for Declaration
 
 derive bin for Binding
+
+derive bin for Declarations
 
 derive bin for ModuleBinding
 
@@ -103,10 +115,11 @@ pub type Resolution = {
 
 pub effect module_names {
   read name_bound(module: Bytes, namespace: Namespace, name: Bytes) -> Option<Binding>
-  read module_bound(module: Bytes, binder: Bytes) -> Option<ModuleBinding>
   read name_declared(module: Bytes, namespace: Namespace, name: Bytes) -> Option<Declaration>
   read declarations_stored(module: Bytes) -> Option<Declarations>
   read effect_set_stored(module: Bytes, name: Bytes) -> Option<EffectSetDefinition>
+  read schema_stored(module: Bytes, name: Bytes) -> Option<SchemaDefinition>
+  read names_in_scope(module: Bytes, namespace: Namespace) -> List<Binding>
   read parameters_stored(name: Bytes) -> Option<Parameters>
   read modules_visible(module: Bytes) -> List<Bytes>
   read every_module() -> List<Bytes>
@@ -117,10 +130,11 @@ pub fn with_no_other_modules<a | e>(body: () -> a / {module_names.read | e}) -> 
     body()
   } with {
     module_names.name_bound(module, namespace, name) -> None,
-    module_names.module_bound(module, binder) -> None,
     module_names.name_declared(module, namespace, name) -> None,
     module_names.declarations_stored(module) -> None,
     module_names.effect_set_stored(module, name) -> None,
+    module_names.schema_stored(module, name) -> None,
+    module_names.names_in_scope(module, namespace) -> [],
     module_names.parameters_stored(name) -> None,
     module_names.modules_visible(module) -> [],
     module_names.every_module() -> [],
@@ -132,11 +146,14 @@ pub fn declared_in(
   namespace: Namespace,
   name: Bytes,
 ) -> Option<Declaration> / {module_names.read} =
-  match resolved.positions.get(module) {
-    Some(i) -> match resolved.declarations.at(i) {
-      Some(d) -> lookup_declared(d, namespace, name),
+  match match resolved.positions.get(module) {
+      Some(i) -> match resolved.declarations.at(i) {
+        Some(d) -> lookup_declared(d, namespace, name),
+        None -> None,
+      },
       None -> None,
-    },
+    } {
+    Some(d) -> Some(d),
     None -> module_names.name_declared(module, namespace, name),
   }
 
@@ -144,9 +161,12 @@ pub fn declarations_named(
   resolved: Resolution,
   module: Bytes,
 ) -> Option<Declarations> / {module_names.read} =
-  match resolved.positions.get(module) {
-    Some(i) -> resolved.declarations.at(i),
-    None -> module_names.declarations_stored(module),
+  match module_names.declarations_stored(module) {
+    Some(d) -> Some(d),
+    None -> match resolved.positions.get(module) {
+      Some(i) -> resolved.declarations.at(i),
+      None -> None,
+    },
   }
 
 pub fn bound_in(
@@ -159,14 +179,51 @@ pub fn bound_in(
     None -> module_names.name_bound(scope.module, namespace, name),
   }
 
-pub fn module_binding_in(
-  scope: Scope,
-  binder: Bytes,
-) -> Option<ModuleBinding> / {module_names.read} =
+pub fn implicit_binder(module: Bytes) -> Bytes = b"@".concat(module)
+
+pub fn implicit_target(binder: Bytes) -> Option<Bytes> / {abort.raise} =
+  if binder.starts_with(b"@") { Some(binder.slice(1, binder.len())) } else { None }
+
+pub fn module_binding_in(scope: Scope, binder: Bytes) -> Option<ModuleBinding> / {abort.raise} =
   match find_module_binding(scope.modules, binder) {
     Some(m) -> Some(m),
-    None -> module_names.module_bound(scope.module, binder),
+    None -> match implicit_target(binder) {
+      Some(target) -> Some({ binder: binder, target: target, span: dummy_span }),
+      None -> None,
+    },
   }
+
+pub fn scope_bindings(scope: Scope, namespace: Namespace) -> List<Binding> / {module_names.read} = {
+  let local = match namespace {
+    ValueSpace -> scope.bound.values,
+    TypeSpace -> scope.bound.types,
+    EffectSpace -> scope.bound.effects,
+    SetSpace -> scope.bound.sets,
+  };
+  module_names.names_in_scope(scope.module, namespace).fold(
+    local,
+    |found: List<Binding>, b: Binding|
+      if found.any(|x: Binding| x.name == b.name) { found } else { found.push(b) },
+  )
+}
+
+pub fn effect_set_declared(
+  modules: List<ParsedModule>,
+  resolved: Resolution,
+  owner: Bytes,
+  name: Bytes,
+) -> Option<EffectSetDefinition> / {module_names.read, abort.raise} = {
+  let loaded = match resolved.positions.get(owner) {
+    Some(i) ->
+      modules.get(i).module.items.fold(None, |found: Option<EffectSetDefinition>, item: Item|
+        match item {
+          EffectSetItem(d) -> if d.name.name == name { Some(d) } else { found },
+          _ -> found,
+        }),
+    None -> None,
+  };
+  match loaded { Some(d) -> Some(d), None -> module_names.effect_set_stored(owner, name) }
+}
 
 pub fn parameters_named(
   resolved: Resolution,
@@ -177,8 +234,10 @@ pub fn parameters_named(
     None -> module_names.parameters_stored(name),
   }
 
+pub const module_elsewhere: Int = -1
+
 pub fn module_index(resolved: Resolution, name: Bytes) -> Int =
-  match resolved.positions.get(name) { Some(i) -> i, None -> 0 }
+  match resolved.positions.get(name) { Some(i) -> i, None -> module_elsewhere }
 
 pub fn binding_of(declared: Declaration, owner: Bytes) -> Binding =
   { name: declared.name, qualified: declared.qualified, owner: owner, span: declared.span }
@@ -475,7 +534,7 @@ pub fn declarations_of(parsed: ParsedModule) -> Declarations =
   parsed.module.items.fold(no_declarations, |declarations: Declarations, item: Item|
     match item {
       FunctionItem(f) -> declare(declarations, ValueSpace, parsed.name, f.name, f.visibility),
-      ExternItem(f) -> if is_builtin(parsed.name, parsed.module, f) { declarations }
+      ExternItem(f) -> if is_builtin(parsed.name, f) { declarations }
       else { declare(declarations, ValueSpace, parsed.name, f.name, f.visibility) },
       EffectItem(e) -> declare(declarations, EffectSpace, parsed.name, e.name, e.visibility),
       EffectSetItem(e) -> declare(declarations, SetSpace, parsed.name, e.name, e.visibility),
@@ -484,10 +543,17 @@ pub fn declarations_of(parsed: ParsedModule) -> Declarations =
         match t.body {
           SumBody(vs) ->
             vs.fold(d2, |accumulator: Declarations, variant: VariantDefinition|
-              declare(accumulator, ValueSpace, parsed.name, variant.name, match t.opaque {
-                Some(_) -> Private,
-                None -> t.visibility,
-              })),
+              declare(
+                accumulator,
+                ValueSpace,
+                parsed.name,
+                variant.name,
+                match t.opaque { Some(_) -> Private, None -> t.visibility },
+                match t.opaque {
+                  Some(o) -> Some({ type_name: t.name.name, opaque: o }),
+                  None -> None,
+                },
+              )),
           AliasBody(_) -> d2,
           NominalBody(_) -> d2,
           ExternBody -> d2,
@@ -502,6 +568,7 @@ fn declare(
   module: Bytes,
   name: Identifier,
   vis: Visibility,
+  closed_by: Option<ClosedBy> = None,
 ) -> Declarations =
   match lookup_declared(declarations, namespace, name.name) {
     Some(_) -> declarations,
@@ -511,6 +578,7 @@ fn declare(
         qualified: qualify(module, name.name),
         public: is_pub(vis),
         span: name.span,
+        closed_by: closed_by,
       }),
   }
 

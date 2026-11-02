@@ -1,9 +1,10 @@
-import compiler.check.resolve.tables (declared_in, declarations_named, no_declarations,
-                                      module_index)
+import compiler.check.resolve.tables (bound_in, scope_bindings, declared_in, declarations_named,
+                                      no_declarations, module_index)
 import compiler.check.resolve.tables (module_names)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
-import compiler.check.infer.checker (program, is_type_declared, is_record_declared, has_contract)
+import compiler.check.infer.checker (program, global_scheme, is_type_declared, is_record_declared,
+                                     has_contract)
 import compiler.syntax.parsing (Span, Identifier, QName, is_bare, qualified_name_text, starts_upper)
 import compiler.syntax.items (deriver_text, RequiresClause, CostClause, SpaceClause, member_name,
                               result_name)
@@ -29,7 +30,7 @@ pub fn global(
   qualified_name: QName,
 ) -> { checker: Checker, name: Option<Bytes> } / {abort.raise, program.read, module_names.read} =
   if is_bare(qualified_name) {
-    match lookup(scope_of(checker).bound, namespace, qualified_name.name.name) {
+    match bound_in(scope_of(checker), namespace, qualified_name.name.name) {
       Some(b) -> { checker: checker, name: Some(b.qualified) },
       None -> { checker: checker, name: None },
     }
@@ -165,16 +166,15 @@ fn lookup_failure(
               )
             },
             None -> {
-              let candidate = checker.resolved.names.fold(
-                None,
-                |accumulator: Option<Bytes>, e: ModuleEntry|
-                  match accumulator {
-                    Some(_) -> accumulator,
-                    None -> if e.name == binder.name || default_binder(e.name) == binder.name {
-                      Some(e.name)
-                    } else { None },
-                  },
-              );
+              let candidate = checker.resolved.names.map(|e: ModuleEntry| e.name).concat(
+                module_names.every_module(),
+              ).fold(None, |accumulator: Option<Bytes>, name: Bytes|
+                match accumulator {
+                  Some(_) -> accumulator,
+                  None -> if name == binder.name || default_binder(name) == binder.name {
+                    Some(name)
+                  } else { None },
+                });
               let note = match candidate {
                 Some(name) ->
                   Bytes::concat_all([
@@ -326,7 +326,7 @@ fn value_key_global(
   qualified_name: QName,
 ) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise, module_names.read} = {
   let name = qualified_name.name.name;
-  match lookup(scope_of(checker).bound, ValueSpace, name) {
+  match bound_in(scope_of(checker), ValueSpace, name) {
     Some(b) -> { checker: checker, key: Some(GlobalKey({ name: b.qualified, prelude: false })) },
     None -> match env_lookup(checker.env, name) {
       Some(_) -> { checker: checker, key: Some(GlobalKey({ name: name, prelude: true })) },
@@ -340,7 +340,7 @@ pub fn declared_value(
   qualified_name: QName,
 ) -> Option<Bytes> / {abort.raise, module_names.read} =
   if is_bare(qualified_name) {
-    match lookup(scope_of(checker).bound, ValueSpace, qualified_name.name.name) {
+    match bound_in(scope_of(checker), ValueSpace, qualified_name.name.name) {
       Some(b) -> Some(b.qualified),
       None -> None,
     }
@@ -398,9 +398,9 @@ pub fn exporter(
       },
   )
 
-fn nearest_name(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise} = {
+fn nearest_name(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise, module_names.read} = {
   let written = String::of_bytes_lossy(name);
-  let others = scope_of(checker).bound.values.map(|binding: Binding|
+  let others = scope_bindings(scope_of(checker), ValueSpace).map(|binding: Binding|
     String::of_bytes_lossy(binding.name)).filter(|other: String| other != written);
   match closest(written, others, name.len() / 3) {
     Some(near) -> Some(Bytes::of_string(near)),
@@ -418,23 +418,24 @@ fn private_constructor_diagnostic(
   namespace: Namespace,
   qualified_name: QName,
   owners: List<Bytes>,
-) -> Option<Diagnostic> / {abort.raise} =
+) -> Option<Diagnostic> / {abort.raise, module_names.read} =
   match namespace {
     ValueSpace ->
       owners.fold(None, |found: Option<Diagnostic>, owner: Bytes|
         match found {
           Some(_) -> found,
-          None -> match checker.resolved.positions.get(owner) {
-            None -> None,
-            Some(at) -> if at == checker.module { None } else {
-              opaque_constructor_error(
-                checker.modules,
-                checker.module,
-                qualified_name.span,
-                at,
-                qualified_name.name.name,
-              )
-            },
+          None -> if owner == scope_of(checker).module { None } else {
+            match declared_in(checker.resolved, owner, ValueSpace, qualified_name.name.name) {
+              Some(d) ->
+                opaque_constructor_error(
+                  checker.module,
+                  qualified_name.span,
+                  module_index(checker.resolved, owner),
+                  owner,
+                  d,
+                ),
+              None -> None,
+            }
           },
         }),
     _ -> None,
@@ -461,7 +462,7 @@ pub fn unknown_name_diagnostic(
 pub fn private_name_diagnostic(
   checker: Checker,
   qualified_name: QName,
-) -> Option<Diagnostic> / {abort.raise} =
+) -> Option<Diagnostic> / {abort.raise, module_names.read} =
   match qualified_name.module {
     None -> private_constructor_diagnostic(checker, ValueSpace, qualified_name, imported(checker)),
     Some(binder) -> match find_module_binding(scope_of(checker).modules, binder.name) {
@@ -523,7 +524,7 @@ pub fn language_function(
   on_value: Bool,
 ) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, program.read, module_names.read} = {
   let declared = member_name(of, name.name);
-  match lookup(scope_of(checker).bound, ValueSpace, declared) {
+  match bound_in(scope_of(checker), ValueSpace, declared) {
     Some(own) -> if own.qualified == qualify(prelude_module, declared)
         && has_contract(checker, declared) {
       Some({
@@ -554,9 +555,9 @@ fn builtin_or_home(
   name: Identifier,
   on_value: Bool,
   declared: Bytes,
-) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, module_names.read} = {
+) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, module_names.read, program.read} = {
   let takes = !on_value
-    || (match env_lookup(checker.env, declared) {
+    || (match global_scheme(checker, declared) {
       Some(scheme) -> match scheme.ty {
         FunctionType(f) -> match f.params.at(0) {
           Some(NamedType(c)) -> c.name == of,
@@ -567,7 +568,7 @@ fn builtin_or_home(
       },
       None -> false,
     });
-  if takes && env_lookup(checker.env, declared) != None {
+  if takes && global_scheme(checker, declared) != None {
     Some({
       qualified_name: { module: None, name: { name: declared, span: name.span }, span: name.span },
       callee: declared,

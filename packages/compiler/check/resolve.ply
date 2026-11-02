@@ -1,14 +1,17 @@
+import compiler.check.resolve.tables (Resolution)
 import compiler.check.resolve.tables (module_names, with_no_other_modules)
-import compiler.syntax.parsing (Span, dummy_span, span_key)
+import compiler.syntax.parsing (Span, Identifier, dummy_span, span_key)
 import compiler.syntax.type_syntax (EffectExpression, mode_text)
-import compiler.syntax.items (Item, FunctionItem, FnDefinition, ImportDeclaration, parse,
-                              dump_module)
+import compiler.syntax.items (Item, FunctionItem, FnDefinition, ImportDeclaration, ModuleAlias,
+                              SelectedNames, parse, dump_module)
+import compiler.syntax.expressions (implicitly_imported_by)
 import std.list
 import std.bytes (ascii_of_int)
 import compiler.check.resolve.tables (Source, ParsedModule, TypeSpace, ValueSpace, Binding,
                                       ModuleBinding, Scope, Label, Diagnostic, ModuleEntry,
                                       no_declarations, lookup, find_module_binding, error_at,
-                                      declarations_of, bindings_of)
+                                      declarations_of, bindings_of, Declarations, Namespace,
+                                      namespaces, push_declared, lookup_declared)
 import compiler.check.resolve.scopes (ScopeBuilder, ResolutionContext, PackageDependencies,
                                       no_packages, index_of, bind_import, target_or_report, Cycle,
                                       traverse, cycle_diagnostic)
@@ -120,14 +123,148 @@ fn resolved_with(
       positions: indexed.names.fold(Map::new(), |found: Map<Bytes, Int>, e: ModuleEntry|
         found.insert(e.name, e.at)),
     };
-    let instantiation = instantiate_laws(r, modules);
-    let sets = expand_sets(instantiation.resolution, instantiation.modules);
-    if instantiation.diagnostics.len() > 0 { ResolveFailed(instantiation.diagnostics) }
-    else if sets.diagnostics.len() > 0 { ResolveFailed(sets.diagnostics) } else {
-      let x = fill_defaults(sets.resolution, sets.modules, []);
-      if x.diagnostics.len() > 0 { ResolveFailed(x.diagnostics) } else { ResolveSucceeded(x) }
-    }
+    resolution_finished(r, modules)
   }
+}
+
+fn resolution_finished(
+  r: Resolution,
+  modules: List<ParsedModule>,
+) -> ResolveOutcome / {abort.raise, module_names.read} = {
+  let instantiation = instantiate_laws(r, modules);
+  let sets = expand_sets(instantiation.resolution, instantiation.modules);
+  if instantiation.diagnostics.len() > 0 { ResolveFailed(instantiation.diagnostics) }
+  else if sets.diagnostics.len() > 0 { ResolveFailed(sets.diagnostics) } else {
+    let x = fill_defaults(sets.resolution, sets.modules, []);
+    if x.diagnostics.len() > 0 { ResolveFailed(x.diagnostics) } else { ResolveSucceeded(x) }
+  }
+}
+
+pub type ImportPackages = {
+  packages: List<PackageDependencies>,
+  places: Map<Bytes, Int>,
+  std: Int,
+  compiler: Int,
+  other_shipped_package: Int,
+}
+
+fn selected_by(declaration: ImportDeclaration) -> List<Bytes> =
+  match declaration.kind { SelectedNames(names) -> names.map(|n: Identifier| n.name), _ -> [] }
+
+fn implicit_in(declaration: ImportDeclaration) -> List<Bytes> =
+  match declaration.kind { ModuleAlias(a) -> implicitly_imported_by(a.name), _ -> [] }
+
+fn declared_among(
+  module: Bytes,
+  selected: List<Bytes>,
+  implicit: List<Bytes>,
+) -> Declarations / {module_names.read} = {
+  let read = selected.concat(implicit).fold(no_declarations, |found: Declarations, name: Bytes|
+    namespaces.fold(found, |d: Declarations, namespace: Namespace|
+      match module_names.name_declared(module, namespace, name) {
+        Some(x) -> push_declared(d, namespace, x),
+        None -> d,
+      }));
+  let exported = |name: Bytes|
+    namespaces.any(|namespace: Namespace|
+      match lookup_declared(read, namespace, name) { Some(x) -> x.public, None -> false });
+  if selected.fold(true, |b: Bool, name: Bytes| b && exported(name)) { read }
+  else { match module_names.declarations_stored(module) { Some(whole) -> whole, None -> read } }
+}
+
+pub fn import_problems(
+  own: ParsedModule,
+  targets: List<Bytes>,
+  present: List<Bytes>,
+  others: List<Bytes>,
+  tables: ImportPackages,
+) -> List<Diagnostic> / {module_names.read, abort.raise} = {
+  let imports = own.module.imports;
+  let targeted = range(0, min(imports.len(), targets.len())).map(|i: Int|
+    { declaration: imports.get(i), target: targets.get(i) });
+  let reached = targets.filter(|t: Bytes| present.contains(t) && t != own.name).unique();
+  let empty = |name: Bytes|
+    { name: name, module: { ..own.module, doc: None, imports: [], items: [] }, derived: [] };
+  let modules = [own].concat(
+    reached.concat(others.filter(|m: Bytes| m != own.name && !reached.contains(m))).map(empty),
+  );
+  let from = |module: Bytes, names: (ImportDeclaration) -> List<Bytes>|
+    targeted.fold([], |found: List<Bytes>, x: { declaration: ImportDeclaration, target: Bytes }|
+      if x.target == module { found.concat(names(x.declaration)) } else { found });
+  let declarations = range(0, modules.len()).map(|i: Int|
+    if i == 0 {
+      declared_among(
+        own.name,
+        [],
+        imports.fold([], |found: List<Bytes>, d: ImportDeclaration|
+          found.concat(selected_by(d)).concat(implicit_in(d))),
+      )
+    } else if i <= reached.len() {
+      declared_among(
+        modules.get(i).name,
+        from(modules.get(i).name, selected_by),
+        from(modules.get(i).name, implicit_in),
+      )
+    } else { no_declarations });
+  let scope_built = build_scope_reporting(
+    {
+      modules: modules,
+      names: range(0, modules.len()).map(|i: Int| { name: modules.get(i).name, at: i }),
+      declarations: declarations,
+      declared: range(0, modules.len()).map(|i: Int|
+        bindings_of(modules.get(i).name, declarations.get(i))),
+      packages: tables.packages,
+      module_packages: modules.map(|m: ParsedModule|
+        match tables.places.get(m.name) { Some(p) -> p, None -> tables.other_shipped_package }),
+      std: tables.std,
+      compiler: tables.compiler,
+      shipped_package_count: tables.other_shipped_package,
+    },
+    0,
+  );
+  let cycles = traverse(
+    modules.map(|m: ParsedModule| if m.name == own.name { scope_built.edges } else { [] }),
+  ).cycles;
+  scope_built.diagnostics.concat(cycles.map(|c: Cycle| cycle_diagnostic(modules, c))).map(
+    |d: Diagnostic| { ..d, labels: d.labels.filter(|l: Label| l.module == 0) },
+  )
+}
+
+pub fn resolve_group(
+  own: ParsedModule,
+  elsewhere: List<Bytes>,
+  module_bindings: List<ModuleBinding>,
+  selected_modules: List<ModuleBinding>,
+) -> ResolveOutcome / {abort.raise, module_names.read} = {
+  let modules = elsewhere.fold([own], |found: List<ParsedModule>, name: Bytes|
+    found.push({
+      name: name,
+      module: { ..own.module, doc: None, imports: [], items: [] },
+      derived: [],
+    }));
+  let declarations = modules.map(declarations_of);
+  let declared = range(0, modules.len()).map(|i: Int|
+    bindings_of(modules.get(i).name, declarations.get(i)));
+  resolution_finished(
+    {
+      names: range(0, modules.len()).map(|i: Int| { name: modules.get(i).name, at: i }),
+      scopes: range(0, modules.len()).map(|i: Int|
+        {
+          module: modules.get(i).name,
+          modules: if i == 0 { module_bindings } else { [] },
+          selected_modules: if i == 0 { selected_modules } else { [] },
+          bound: declared.get(i),
+        }),
+      declarations: declarations,
+      declared: declared,
+      order: range(1, modules.len()).push(0),
+      imports: [range(1, modules.len())].concat(elsewhere.map(|_: Bytes| [])),
+      signatures: Map::new(),
+      visible_modules: [],
+      positions: Map::new().insert(own.name, 0),
+    },
+    modules,
+  )
 }
 
 fn build_scope_reporting(w: ResolutionContext, i: Int) -> ScopeBuilder / {abort.raise} = {

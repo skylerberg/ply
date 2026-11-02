@@ -1,6 +1,11 @@
+import compiler.syntax.items (effect_set_definition_bin, schema_definition_bin, SchemaDefinition,
+                              SchemaItem)
+import compiler.check.resolve.tables (parameters_bin)
+import compiler.check.guards (contract_bin)
+import compiler.check.borrowing (parameter_modes_bin)
 import compiler.syntax.type_syntax (type_expression_bin)
 import compiler.syntax.items (opaque_bin)
-import compiler.check.resolve.tables (module_names, with_no_other_modules)
+import compiler.check.resolve.tables (module_names, module_elsewhere, with_no_other_modules)
 import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, span_bin, is_bare)
 import std.bin
 import compiler.check.member (MemberTarget, member_target_bin)
@@ -9,14 +14,14 @@ import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, Name
                                     UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
                                     EffectExpression, Mode, ReadMode, WriteMode, InvalidMode,
                                     RaiseMode, is_raise, mode_bin)
-import compiler.syntax.items (Item, FunctionItem, TypeItem, ExternItem, is_shipped, is_builtin,
-                              FnDefinition, ExternDefinition, ImportDeclaration, SelectedNames,
-                              Constraint, Deriver, EqDeriver, OrderingDeriver, ShowDeriver,
-                              HashDeriver, NumericDeriver, IntegerDeriver, ConstantDeriver,
-                              is_predicate, deriver_tag, SpecKind, RequiresClause, EnsuresClause,
-                              CostClause, SpaceClause, SpecClause, DeriveOrigin, parse, ExternBody,
-                              InstanceKind, is_pub, Opaque, spec_kind_bin, deriver_bin,
-                              instance_kind_bin)
+import compiler.syntax.items (EffectSetDefinition, EffectSetItem, Item, FunctionItem, TypeItem,
+                              ExternItem, is_shipped, is_builtin, FnDefinition, ExternDefinition,
+                              ImportDeclaration, SelectedNames, Constraint, Deriver, EqDeriver,
+                              OrderingDeriver, ShowDeriver, HashDeriver, NumericDeriver,
+                              IntegerDeriver, ConstantDeriver, is_predicate, deriver_tag, SpecKind,
+                              RequiresClause, EnsuresClause, CostClause, SpaceClause, SpecClause,
+                              DeriveOrigin, parse, ExternBody, InstanceKind, is_pub, Opaque,
+                              spec_kind_bin, deriver_bin, instance_kind_bin)
 import compiler.syntax.expressions (Expression, BinaryExpression, Param, expression_span,
                                     TaggedLiteral, prelude_module)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, LiteralWide, LiteralBool,
@@ -30,16 +35,17 @@ import compiler.check.types (Resource, SingletonResource, ResourceVariable, Effe
                              unit_type, list_type, option_type, function_type, fields_sorted,
                              ints_insert, ints_union, fresh_new, fresh_type_variable, fresh_type,
                              fresh_effect_variable, fresh_effects, substitution_new, resolve_type,
-                             resolve_effects, free_variables, env_bind_global, apply_arguments,
-                             NominalType, effect_bin, effects_bin, type_bin, scheme_bin, TypeTable,
-                             owning_function_type)
+                             resolve_effects, free_variables, env_lookup, env_bind_global,
+                             apply_arguments, NominalType, effect_bin, effects_bin, type_bin,
+                             scheme_bin, TypeTable, owning_function_type)
 import compiler.check.known (BuiltinSum, builtin_types, builtin_sums, char_type, instant_type,
                              duration_type, task_type, chan_type, scoped_name, scoped_type,
                              map_parts)
 import compiler.check.termination (summary_facts, Callee, Termination, Terminates, Summary,
                                    summary_bin, termination_bin, callee_bin)
-import compiler.check.resolve.tables (ParsedModule, Resolution, Scope, Diagnostic, diagnostic_bin,
-                                      Label, error_with_labels, error_at, error_at_and)
+import compiler.check.resolve.tables (Parameters, qualify, ParsedModule, Resolution, Scope,
+                                      Diagnostic, diagnostic_bin, Label, error_with_labels,
+                                      error_at, error_at_and)
 import compiler.expand.rewrite (MemberCallee)
 import compiler.prelude_source
 import compiler.check.infer.derivability (DeriveRejection, ContainsFunction, Unconstrained,
@@ -491,13 +497,148 @@ pub type TypeFacts = {
 }
 
 pub type DefinitionFacts = {
-  definition: DefinitionInfo,
+  scheme: Scheme,
+  definition: Option<DefinitionInfo>,
   contract: Option<Contract>,
   constraints: Option<List<DefinitionConstraint>>,
   parameters: Option<List<Int>>,
   modes: Option<ParameterModes>,
   summary: Option<Summary>,
 }
+
+pub type StoredDeclarations = {
+  types: Map<Bytes, TypeFacts>,
+  effects: Map<Bytes, EffectInfo>,
+  constructors: Map<Bytes, ConstructorInfo>,
+  definitions: Map<Bytes, DefinitionFacts>,
+  sets: Map<Bytes, EffectSetDefinition>,
+  schemas: Map<Bytes, SchemaDefinition>,
+  parameters: Map<Bytes, Parameters>,
+}
+
+pub const no_stored_declarations: StoredDeclarations =
+  {
+    types: Map::new(),
+    effects: Map::new(),
+    constructors: Map::new(),
+    definitions: Map::new(),
+    sets: Map::new(),
+    schemas: Map::new(),
+    parameters: Map::new(),
+  }
+
+fn located_elsewhere(at: Location) -> Location = { ..at, module: module_elsewhere }
+
+fn constructor_elsewhere(c: ConstructorInfo) -> ConstructorInfo =
+  { ..c, at: located_elsewhere(c.at) }
+
+fn effect_elsewhere(e: EffectInfo) -> EffectInfo =
+  {
+    ..e,
+    at: located_elsewhere(e.at),
+    operations: e.operations.map(|o: OperationInfo| { ..o, at: located_elsewhere(o.at) }),
+  }
+
+pub fn declarations_checked(checker: Checker, parsed: ParsedModule) -> StoredDeclarations = {
+  let module = parsed.name;
+  let own = |name: Bytes| name.starts_with(module.concat(b"."));
+  {
+    types: checker.types.fold(
+      Map::new(),
+      |found: Map<Bytes, TypeFacts>, name: Bytes, d: TypeDeclaration|
+        if !own(name) { found } else {
+          found.insert(name, {
+            declaration: { ..d, owner: module_elsewhere },
+            constructors: checker.constructors.filter(|c: ConstructorInfo| c.type_name == name).map(
+              constructor_elsewhere,
+            ),
+            alias: checker.aliases.get(name),
+            record: checker.nominals.get(name),
+            stated: checker.stated.get(name),
+            ordered_parameters: checker.ordered_parameters.get(name),
+            numeric: checker.numeric_types.find(|n: NumericInfo| n.type_name == name),
+            instances: checker.instances.filter(|i: InstanceInfo| i.type_name == name).map(
+              |i: InstanceInfo| { ..i, at: located_elsewhere(i.at) },
+            ),
+            keyed: checker.keyed_names.contains(name),
+            release_function: checker.release_functions.get(name),
+            resource: checker.resource_types.contains(name),
+          })
+        },
+    ),
+    effects: checker.effects.fold(Map::new(), |found: Map<Bytes, EffectInfo>, e: EffectInfo|
+      if e.module == module { found.insert(e.name, effect_elsewhere(e)) } else { found }),
+    constructors: checker.constructors.fold(
+      Map::new(),
+      |found: Map<Bytes, ConstructorInfo>, c: ConstructorInfo|
+        if c.module == module { found.insert(c.name, constructor_elsewhere(c)) } else { found },
+    ),
+    definitions: checker.definitions.fold(
+      parsed.module.items.fold(Map::new(), |found: Map<Bytes, DefinitionFacts>, item: Item|
+        match item {
+          ExternItem(e) -> {
+            let name = qualify(module, e.name.name);
+            match env_lookup(checker.env, name) {
+              Some(scheme) ->
+                found.insert(name, {
+                  scheme: scheme,
+                  definition: None,
+                  contract: checker.contracts.get(name),
+                  constraints: checker.constraints.get(name),
+                  parameters: checker.function_parameters.get(name),
+                  modes: checker.parameter_modes.get(name),
+                  summary: checker.summaries.get(name),
+                }),
+              None -> found,
+            }
+          },
+          _ -> found,
+        }),
+      |found: Map<Bytes, DefinitionFacts>, d: DefinitionInfo|
+        if d.module != module { found } else {
+          found.insert(d.name, {
+            scheme: d.scheme,
+            definition: Some({ ..d, at: located_elsewhere(d.at) }),
+            contract: checker.contracts.get(d.name),
+            constraints: checker.constraints.get(d.name),
+            parameters: checker.function_parameters.get(d.name),
+            modes: checker.parameter_modes.get(d.name),
+            summary: checker.summaries.get(d.name),
+          })
+        },
+    ),
+    sets: parsed.module.items.fold(
+      Map::new(),
+      |found: Map<Bytes, EffectSetDefinition>, item: Item|
+        match item {
+          EffectSetItem(d) -> found.insert(qualify(module, d.name.name), d),
+          _ -> found,
+        },
+    ),
+    schemas: parsed.module.items.fold(
+      Map::new(),
+      |found: Map<Bytes, SchemaDefinition>, item: Item|
+        match item { SchemaItem(d) -> found.insert(qualify(module, d.name.name), d), _ -> found },
+    ),
+    parameters: checker.resolved.signatures.fold(
+      Map::new(),
+      |found: Map<Bytes, Parameters>, name: Bytes, p: Parameters|
+        if own(name) { found.insert(name, p) } else { found },
+    ),
+  }
+}
+
+derive bin for RigidParam
+
+derive bin for MapKeySite
+
+derive bin for AliasFacts
+
+derive bin for TypeFacts
+
+derive bin for DefinitionFacts
+
+derive bin for StoredDeclarations
 
 pub effect set CheckReads = {program.read, module_names.read, mode_facts.read, summary_facts.read}
 
@@ -1026,10 +1167,22 @@ pub fn effect_of(
     None -> program.effect_named(name),
   }
 
+pub fn global_scheme(checker: Checker, name: Bytes) -> Option<Scheme> / {program.read} =
+  match env_lookup(checker.env, name) {
+    Some(scheme) -> Some(scheme),
+    None -> match checker.definition_index.get(name) {
+      Some(i) -> match checker.definitions.at(i) { Some(d) -> Some(d.scheme), None -> None },
+      None -> match program.definition_named(name) {
+        Some(f) -> Some(f.scheme),
+        None -> match program.constructor_named(name) { Some(c) -> Some(c.scheme), None -> None },
+      },
+    },
+  }
+
 pub fn definition_of(checker: Checker, name: Bytes) -> Option<DefinitionInfo> / {program.read} =
   match checker.definition_index.get(name) {
     Some(i) -> checker.definitions.at(i),
-    None -> match program.definition_named(name) { Some(f) -> Some(f.definition), None -> None },
+    None -> match program.definition_named(name) { Some(f) -> f.definition, None -> None },
   }
 
 fn type_facts<a>(name: Bytes, field: (TypeFacts) -> Option<a>) -> Option<a> / {program.read} =
@@ -1652,7 +1805,7 @@ pub const builtins: List<Builtin> = {
     let imported = prelude_imports(parsed.node.imports);
     parsed.node.items.fold([], |accumulator: List<Builtin>, item: Item|
       match item {
-        ExternItem(definition) -> if is_builtin(prelude_module, parsed.node, definition) {
+        ExternItem(definition) -> if is_builtin(prelude_module, definition) {
           accumulator.push(
             builtin_of_extern(definition.name.name, imported, definition, Map::new()),
           )
