@@ -107,7 +107,7 @@ fn opened(dir: &std::path::Path) -> Option<Arc<Opened>> {
     let mut exports = units::exports_of(&defs);
     entering(&mut exports);
     let lib = units::library(dir, &units::text(&defs, &exports))?;
-    Some(Opened::open(&lib).expect("the unit opens"))
+    Some(Opened::open(std::slice::from_ref(&lib)).expect("the unit opens"))
 }
 
 fn arguments(n: u64, write: impl FnOnce(&mut Writer)) -> Vec<u8> {
@@ -279,7 +279,7 @@ fn a_call_in_test_mode_reports_how_many_objects_it_allocated_and_never_freed() {
     let Some(lib) = units::library(dir.path(), &units::text(&defs, &exports)) else {
         return;
     };
-    let opened = Opened::open(&lib).expect("the unit opens");
+    let opened = Opened::open(std::slice::from_ref(&lib)).expect("the unit opens");
     let live = |root: &str, tested: bool| {
         let run = Run { tested, ..run() };
         let o = entry::enter(&opened, root, ints(&[1]), &run, None, None);

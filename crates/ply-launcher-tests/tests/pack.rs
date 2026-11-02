@@ -177,14 +177,13 @@ fn a_bundle_digest_over_the_std_and_compiler_directories_changes_with_files_in_t
 }
 
 #[test]
-fn the_shipped_directory_name_changes_with_the_build_stage_the_file_set_name_and_the_digest() {
-    let name = ply_launcher::shipped_dir_name;
+fn a_binarys_identity_changes_with_its_stamps_its_definitions_and_its_shipped_files() {
+    let name = ply_launcher::binary_identity;
     let base = name("stamps", "definitions", &[1; 32]);
     assert_eq!(name("stamps", "definitions", &[1; 32]), base);
     assert_ne!(name("stamps", "definitions", &[2; 32]), base);
     assert_ne!(name("stamps", "other", &[1; 32]), base);
     assert_ne!(name("other", "definitions", &[1; 32]), base);
-    assert!(base.starts_with("shipped-"));
 }
 
 #[test]

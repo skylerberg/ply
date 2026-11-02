@@ -57,10 +57,6 @@ impl Drop for Library {
 
 unsafe impl Send for Library {}
 
-pub fn cache_dir() -> std::path::PathBuf {
-    super::cache_dir_for("cache", "PLY_C_CACHE")
-}
-
 impl Library {
     pub fn open(so: &std::path::Path) -> Result<Library> {
         let path = CString::new(so.to_string_lossy().as_bytes())?;

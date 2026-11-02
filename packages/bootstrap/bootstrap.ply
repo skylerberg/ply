@@ -2,11 +2,10 @@ import compiler.build
 import compiler.build (Built, timed)
 import compiler.cc
 import compiler.cc (Profile, Toolchain, compilers, memory, toolchain)
-import compiler.checkout (ShippedFile, digests_of, module_names, shipped_files, shipped_store_dir)
+import compiler.checkout (ShippedFile, digests_of, module_names, shipped_files)
 import compiler.emit.abi (runtime_of)
 import compiler.front.interface (length_prefixed)
 import compiler.front.pkg (check_workspace)
-import compiler.load (cache_relative)
 import compiler.native
 import compiler.native (PackFile)
 import compiler.store.packs
@@ -184,7 +183,7 @@ fn runtime_tool(
       work,
     ) {
     Err(reason) -> Err("the runtime's library at `" ++ library ++ "` does not link: " ++ reason),
-    Ok(exe) -> Ok(cache_relative(exe)),
+    Ok(exe) -> Ok(cc::cache_relative(exe)),
   }
 
 fn link_executable(
@@ -203,7 +202,7 @@ fn append_pack(
   exe: String,
   pack: Bytes,
 ) -> Result<String, String> / {toolchain.read, toolchain.write, abort.raise} =
-  if toolchain.append(cache_relative(exe), pack) { Ok(exe) }
+  if toolchain.append(cc::cache_relative(exe), pack) { Ok(exe) }
   else { Err("the standard library files could not be added to the end of `" ++ exe ++ "`") }
 
 fn build_pack(files: List<ShippedFile>, front: Bytes, more: List<PackFile>) -> Bytes =
@@ -277,9 +276,6 @@ fn chunked_read(path: String, step: Int) -> Option<Bytes> / {fs.read[abs], abort
     None -> None,
   }
 
-fn read_if_present(path: String) -> Option<Bytes> / {toolchain.read} =
-  if toolchain.exists(path) { toolchain.read_file(path) } else { None }
-
 const shipped_results_roots: List<Bytes> = [b"bootstrap.build_shipped_results"]
 
 fn shipped_results_cache_key(
@@ -297,7 +293,7 @@ fn shipped_results_cache_key(
       length_prefixed(gathering),
     ]),
   );
-  key.hex_of() ++ ".answers"
+  key.hex_of()
 }
 
 fn encode_shipped_results(shipped_results: List<PackFile>) -> Bytes / {abort.raise} =
@@ -314,10 +310,9 @@ fn decode_shipped_results(bytes: Bytes) -> Option<List<PackFile>> / {abort.raise
 
 fn build_shipped_results(
   ply: String,
-  work: String,
+  dir: String,
 ) -> Result<List<PackFile>, String> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
-  let dir = toolchain.cache() ++ "/" ++ work ++ "/answers";
-  let ran = toolchain.run(cache_relative(ply), ["std", "--answers", dir]);
+  let ran = toolchain.run(cc::cache_relative(ply), ["std", "--answers", dir]);
   let at = |name: String| strip_root(dir ++ "/pack/" ++ name);
   if ran.code != 0 { Err("the new `ply` did not check the shipped modules") } else {
     match ((
@@ -336,10 +331,12 @@ fn build_shipped_results(
 
 fn shipped_results(
   exe: String,
+  answers: String,
   target: Target,
   front: Bytes,
   keys: CacheKeys,
 ) -> Result<{ returned: List<PackFile>, taken: Bool }, String> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
+  let results_file = strip_root(answers ++ "/results");
   let returning = exe ++ "-answering";
   if !fs.copy[abs](strip_root(exe), strip_root(returning)) {
     Err("the new `ply` could not be copied to run from")
@@ -347,7 +344,7 @@ fn shipped_results(
     match append_pack(returning, build_pack(target.files, front, [])) {
       Err(reason) -> Err(reason),
       Ok(_) -> {
-        let results_run = toolchain.run(cache_relative(returning), ["std", "--answering"]);
+        let results_run = toolchain.run(cc::cache_relative(returning), ["std", "--answering"]);
         let cached_results = if results_run.code != 0 { None } else {
           Some(
             shipped_results_cache_key(
@@ -360,20 +357,28 @@ fn shipped_results(
         };
         let had = match cached_results {
           None -> None,
-          Some(at) -> match read_if_present(at) {
-            Some(bytes) -> decode_shipped_results(bytes),
+          Some(key) -> match fs.read_file[abs](results_file) {
+            Some(bytes) -> {
+              let head = Bytes::of_string(key ++ "\n");
+              if bytes.starts_with(head) {
+                decode_shipped_results(bytes.slice(head.len(), bytes.len()))
+              } else { None }
+            },
             None -> None,
           },
         };
         match had {
           Some(a) -> Ok({ returned: a, taken: true }),
-          None -> match build_shipped_results(returning, target.work) {
+          None -> match build_shipped_results(returning, answers) {
             Err(reason) -> Err(reason),
             Ok(files) -> match cached_results {
               None -> Ok({ returned: files, taken: false }),
-              Some(at) -> if toolchain.write_file(at, encode_shipped_results(files)) {
-                Ok({ returned: files, taken: false })
-              } else { Err("what the new `ply` returned could not be cached") },
+              Some(key) -> if fs.create_dir[abs](strip_root(answers))
+                  && fs.write_file[abs](
+                    results_file,
+                    Bytes::of_string(key ++ "\n").concat(encode_shipped_results(files)),
+                  ) { Ok({ returned: files, taken: false }) }
+              else { Err("what the new `ply` returned could not be kept") },
             },
           },
         }
@@ -406,7 +411,13 @@ fn precompile_and_install(
   phases: Bool,
 ) -> Result<Unit, String> / {Installs} = {
   let at = time.elapsed_ms();
-  match shipped_results(exe, target, built.front, keys) {
+  match shipped_results(
+      exe,
+      join(options.root, ".ply-cache/bootstrap/answers"),
+      target,
+      built.front,
+      keys,
+    ) {
     Err(reason) -> Err(reason),
     Ok(a) -> {
       timed(
@@ -467,14 +478,23 @@ fn bootstrap_ply(
                 build::build_program(
                   join(options.root, options.parts.cli),
                   options.parts.entry,
-                  shipped_store_dir(toolchain.reuse_dir()),
+                  join(options.root, ".ply-cache/bootstrap/memo"),
                   phases,
                 )) {
               None -> Err("`ply`'s C was not built"),
               Some(built) -> {
                 timed(phases, "built `ply`", at);
                 let compiling = time.elapsed_ms();
-                let objects = cc::objects[cc](t, built.sources, native::native_flags, work);
+                let objects = cc::products_in[abs](
+                  strip_root(options.root) ++ "/.ply-cache/c",
+                  ||
+                    cc::objects[cc](
+                      t,
+                      options.profile.name ++ "/ply",
+                      built.c,
+                      native::native_flags,
+                    ),
+                );
                 compiled_timed(phases, objects, compiling);
                 let linking = time.elapsed_ms();
                 match link_executable(t, objects, options.library, work) {

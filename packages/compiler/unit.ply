@@ -24,7 +24,6 @@ import compiler.emit.keys (printed, RootKey, Named, Specialisation, Generated, T
                            root_text, definition_of, site_owner, inlined_lambdas, key_types,
                            specialisation_key, module_of, modules_lowered, root_key_bin, test_key,
                            law_key, entry_name, root_name_bin, unspecialised)
-import compiler.store.records (Record)
 import compiler.emit
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
 import compiler.emit.representations (Constructors, layout_variables, has_variables, is_scalar_type,
@@ -46,7 +45,7 @@ import compiler.check.infer.definitions (Extern, extern_bin, program_natives, Ma
                                          MachineFunction, MachineUnit)
 import compiler.emit.print.unit_header (unit_header, unit_tail, bound_functions, pointer_declared)
 import compiler.cc
-import compiler.cc (part_mark, written_part, Source, WrittenPart, toolchain)
+import compiler.cc (part_mark, written_part, GeneratedC, WrittenPart)
 import compiler.emit.abi
 import compiler.emit.abi (Native, Runtime, RuntimeMismatch, runtime_mismatches, mismatch_line,
                           runtime_of, word_native, serving_runtime, Machine, machine_name,
@@ -403,18 +402,9 @@ derive bin for RequestedRoot
 
 pub type Constructor = { name: Bytes, arity: Int }
 
-pub type UnitContents = {
-  bodies: List<UnitBody>,
-  requested: List<RequestedRoot>,
-  named: Map<RootName, List<RootName>>,
-}
+pub type UnitContents = { bodies: List<UnitBody>, requested: List<RequestedRoot> }
 
-pub type UnitOutput = {
-  parts: List<WrittenPart>,
-  taken: List<RootName>,
-  made: UnitContents,
-  records: List<Record>,
-}
+pub type UnitOutput = { parts: List<WrittenPart>, taken: List<RootName>, made: UnitContents }
 
 pub type Emission = {
   produced: UnitOutput,
@@ -474,7 +464,6 @@ fn entry_defined(name: RootName, d: DefinitionSymbol) -> Bytes / {abort.raise} =
 
 fn taken_bodies(
   results: Map<RootName, Output>,
-  stored: Map<RootName, Stored>,
   taken: List<RootName>,
   foreign: Map<RootName, Prototype>,
 ) -> { bodies: List<UnitBody>, defined: Map<RootName, DefinitionSymbol> } / {abort.raise} = {
@@ -511,9 +500,8 @@ fn taken_bodies(
                   name: name,
                   text: b.text,
                   tables: b.tables,
-                  body: digest_in(stored, name, b),
-                  size: if b.text.len() > 0 { b.text.len() }
-                  else { match stored.get(name) { Some(s) -> s.size, None -> 0 } },
+                  body: body_digest(b),
+                  size: b.text.len(),
                 })
               } else { r.bodies },
               defined: r.defined.insert(name, defined_symbol(name, b.tables)),
@@ -1111,35 +1099,14 @@ fn planned(
     },
   ).parts
 
-type PartPlan = {
-  label: String,
-  keys: List<Bytes>,
-  bodies: List<{ name: Bytes, site: Bytes, body: Bytes, named: List<Bytes>, tables: Tables }>,
-  constants: List<StaticDefinition>,
-  prototypes: List<Bytes>,
-  natives: List<Bytes>,
-}
-
-derive bin for PartPlan
-
-type CachedPart = { digest: String, size: Int }
-
-derive bin for CachedPart
-
-fn part_record(key: Bytes) -> Bytes = b"part\x00".concat(key)
-
-fn part_written<| e>(
+fn part_written(
   p: Planned,
   site: (RootName) -> RootName / {abort.raise},
   taken: Map<RootName, IncludedRoot>,
   machine: List<Native>,
   constant_c: (StaticDefinition) -> Bytes / {abort.raise},
-  stored: Map<RootName, Stored>,
-  named: Map<RootName, List<RootName>>,
-  read: (Bytes) -> Option<Bytes> / e,
-  source_cached: (String) -> Bool / e,
   foreign: Map<RootName, Prototype>,
-) -> { part: WrittenPart, records: List<Record> } / {abort.raise | e} = {
+) -> WrittenPart / {abort.raise} = {
   let prototypes = sorted_unique_names(
     p.group.fold([], |accumulator: List<RootName>, m: BodyHoles|
       accumulator.concat(reachable_names(m.body.name, m.body.tables))),
@@ -1154,68 +1121,22 @@ fn part_written<| e>(
   let called = p.group.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: BodyHoles|
     m.body.tables.natives.fold(accumulator, |x: Map<Bytes, Bool>, n: Bytes| x.insert(n, true)));
   let natives = machine.filter(|n: Native| called.contains(n.name));
-  let plan = {
-    label: p.label,
-    keys: p.keys,
-    bodies: p.group.map(|m: BodyHoles|
-      {
-        name: root_text(m.body.name),
-        site: root_text(site(m.body.name)),
-        body: m.body.body,
-        named: match named.get(m.body.name) { Some(rs) -> rs.map(root_text), None -> [] },
-        tables: { ..m.body.tables, shared: [] },
-      }),
-    constants: p.constants,
-    prototypes: prototypes,
-    natives: natives.map(pointer_declared),
-  };
-  let key = blake3(bin::encode(plan, part_plan_bin()));
-  let recorded = match read(part_record(key)) {
-    Some(b) -> match bin::decode(b, cached_part_bin()) { Ok(k) -> Some(k), Err(_) -> None },
-    None -> None,
-  };
-  let reused = match recorded {
-    Some(k) -> if source_cached(k.digest) { recorded } else { None },
-    None -> None,
-  };
-  match reused {
-    Some(k) ->
-      { part: { label: p.label, digest: k.digest, size: k.size, text: None }, records: [] },
-    None -> {
-      let local = positions(p.keys);
-      let bodies = p.group.map(|m: BodyHoles| {
-        let a = resolved_text(
-          m.body.name,
-          { text: m.body.text, tables: m.body.tables },
-          stored,
-          named,
-          read,
-        );
-        placing(
-          { ..m, body: { ..m.body, text: a.text, tables: a.tables } },
-          site(m.body.name),
-          part_table(p.label),
-          local,
-        )
-      });
-      let text = part_c(
-        { label: p.label, places: p.places, bodies: bodies, constants: p.constants },
-        prototypes,
-        natives,
-        constant_c,
-      );
-      let part = written_part(unit_header, p.label, text);
-      let made = { digest: part.digest, size: part.size };
-      {
-        part: part,
-        records: if recorded == Some(made) { [] }
-        else { [{ key: part_record(key), bytes: bin::encode(made, cached_part_bin()) }] },
-      }
-    },
-  }
+  let local = positions(p.keys);
+  let bodies = p.group.map(|m: BodyHoles|
+    placing(m, site(m.body.name), part_table(p.label), local));
+  written_part(
+    unit_header,
+    p.label,
+    part_c(
+      { label: p.label, places: p.places, bodies: bodies, constants: p.constants },
+      prototypes,
+      natives,
+      constant_c,
+    ),
+  )
 }
 
-pub fn produce<| e>(
+pub fn produce(
   constructors: List<Constructor>,
   offered: List<RequestedRoot>,
   modules: Int,
@@ -1223,12 +1144,8 @@ pub fn produce<| e>(
   inputs: Map<Bytes, Bytes>,
   machine_of: (Map<Bytes, Bool>) -> List<Native> / {abort.raise},
   rule: PartRule,
-  stored: Map<RootName, Stored>,
-  named: Map<RootName, List<RootName>>,
-  read: (Bytes) -> Option<Bytes> / e,
-  source_cached: (String) -> Bool / e,
   foreign: Option<Map<RootName, Prototype>> = None,
-) -> UnitOutput / {abort.raise | e} = {
+) -> UnitOutput / {abort.raise} = {
   let linked = foreign != None;
   let outside = match foreign { Some(m) -> m, None -> Map::new() };
   let offers = offered.fold(
@@ -1241,7 +1158,7 @@ pub fn produce<| e>(
       None -> panic("every body in the compiled program must have been requested"),
     };
   let names = sorted_unique_names(offered.map(|o: RequestedRoot| o.name));
-  let s = taken_bodies(results, stored, names, outside);
+  let s = taken_bodies(results, names, outside);
   let machine = machine_called(s.bodies, machine_of);
   let published = |n: RootName|
     match s.defined.get(n) {
@@ -1342,24 +1259,8 @@ pub fn produce<| e>(
     Map::new(),
     |accumulator: Map<RootName, IncludedRoot>, t: IncludedRoot| accumulator.insert(t.name, t),
   );
-  let written = plans.fold(
-    { parts: [], records: [] },
-    |accumulator: { parts: List<WrittenPart>, records: List<Record> }, p: Planned| {
-      let w = part_written(
-        p,
-        |n: RootName| offer_of(n).site,
-        by_name,
-        machine,
-        constant_c,
-        stored,
-        named,
-        read,
-        source_cached,
-        outside,
-      );
-      { parts: accumulator.parts.push(w.part), records: accumulator.records.concat(w.records) }
-    },
-  );
+  let written = plans.map(|p: Planned|
+    part_written(p, |n: RootName| offer_of(n).site, by_name, machine, constant_c, outside));
   let tail = [
     { label: "runtime", text: unit_tail(machine) },
     {
@@ -1374,12 +1275,7 @@ pub fn produce<| e>(
   ].filter(|s: { label: String, text: Bytes }| s.text.len() > 0).map(
     |s: { label: String, text: Bytes }| written_part(unit_header, s.label, s.text),
   );
-  {
-    parts: written.parts.concat(tail),
-    taken: names,
-    made: { bodies: s.bodies, requested: offered, named: named },
-    records: written.records,
-  }
+  { parts: written.concat(tail), taken: names, made: { bodies: s.bodies, requested: offered } }
 }
 
 fn own_entries_of(pools: Pools, foreign: Map<RootName, Prototype>) -> Pools / {abort.raise} = {
@@ -1515,9 +1411,8 @@ fn produced_from_codes(
     ));
   let keys = offered.fold(Map::new(), |m: Map<RootName, RootKey>, o: RequestedRoot|
     m.insert(o.name, o.key));
-  let sharing = if foreign != None {
-    { results: results, keys: keys, coded: [], stored: Map::new() }
-  } else { compiled(results, keys, Map::new()) };
+  let sharing = if foreign != None { { results: results, keys: keys, coded: [] } }
+  else { compiled(results, keys) };
   produce(
     constructors,
     offered.concat(
@@ -1532,10 +1427,6 @@ fn produced_from_codes(
           if called.contains(n.name) { m.insert(n.name, n) } else { m })).values(
       ),
     rule,
-    Map::new(),
-    Map::new(),
-    |_: Bytes| None,
-    |_: String| false,
     foreign: foreign,
   )
 }
@@ -1575,13 +1466,7 @@ pub fn whole_program_text(
 
 const library_part_size: Int = 1 << 60
 
-pub fn cache_parts(
-  parts: List<WrittenPart>,
-) -> Result<List<Source>, String> / {toolchain.read, toolchain.write} =
-  cc::cache_sources(unit_header, parts)
-
-pub fn read_back(sources: List<Source>) -> Result<Bytes, String> / {toolchain.read, abort.raise} =
-  cc::read_back(unit_header, sources)
+pub fn generated_c(parts: List<WrittenPart>) -> GeneratedC = { head: unit_header, files: parts }
 
 pub type Program = {
   roots: Map<RootName, EmitterRoot>,
@@ -1761,32 +1646,6 @@ fn definition_scheme(dump: Dump, by: Bytes) -> Option<Scheme> =
     None -> None,
   }
 
-pub fn results_store(bodies: String, runtime: Runtime, emitter: Bytes) -> String / {abort.raise} = {
-  let id = blake3(
-    Bytes::concat_all(
-      [
-        b"ply.unit.answer.5",
-        hex(bin::shape_digest(cached_result_bin())),
-        runtime.identity,
-        emitter,
-      ].map(|b: Bytes| length_prefixed(b)),
-    ),
-  );
-  bodies ++ "/answers-" ++ id.slice(0, 16).hex_of()
-}
-
-fn body_key(m: Bytes) -> Bytes = b"body\x00".concat(m)
-
-type CachedResult = {
-  result: Output,
-  calls: List<Bytes>,
-  callees: List<Option<Bytes>>,
-  body: Bytes,
-  size: Int,
-}
-
-derive bin for CachedResult
-
 type Body = { text: Bytes, shared: List<SharedFunction> }
 
 derive bin for Body
@@ -1796,8 +1655,6 @@ fn output_body(a: Output) -> Body = { text: a.text, shared: a.tables.shared }
 fn summarised(a: Output) -> Output = { text: b"", tables: { ..a.tables, shared: [] } }
 
 fn body_digest(a: Output) -> Bytes / {abort.raise} = blake3(bin::encode(output_body(a), body_bin()))
-
-type Stored = { cache_key: Bytes, body: Bytes, size: Int }
 
 pub fn program_constructors(
   dump: Dump,
@@ -2167,10 +2024,7 @@ fn unit_finished<s>(w: UnitWalk<s>) -> LoweredUnit / {abort.raise} = {
   let finished = outputs.fold(
     Map::new(),
     |accumulator: Map<RootName, Output>, n: RootName, a: Output|
-      accumulator.insert(n, match resolved.named.get(n) {
-        Some(names) -> { ..a, text: placeholders_named(a.text, names) },
-        None -> a,
-      }),
+      accumulator.insert(n, named_output(resolved.named, n, a)),
   );
   let distinct_outputs = finished.fold(
     { seen: Map::new(), out: [] },
@@ -2523,45 +2377,22 @@ fn generic_calls_specialised(
   { results: resolved_results, named: named, unemitted: unemitted }
 }
 
-fn resolved_text<| e>(
+fn named_output(
+  named: Map<RootName, List<RootName>>,
   n: RootName,
   a: Output,
-  stored: Map<RootName, Stored>,
-  named: Map<RootName, List<RootName>>,
-  read: (Bytes) -> Option<Bytes> / e,
-) -> Output / {abort.raise | e} = {
-  let body = if a.text.len() > 0 { output_body(a) } else {
-    match stored.get(n) {
-      None -> output_body(a),
-      Some(s) -> match read(body_key(s.cache_key)) {
-        None -> panic("a cached result's body is missing from the cache"),
-        Some(b) -> match bin::decode(b, body_bin()) {
-          Ok(x) -> x,
-          Err(_) -> panic("a cached result's body could not be decoded from the cache"),
-        },
-      },
-    }
-  };
-  {
-    text: match named.get(n) {
-      Some(roots) -> placeholders_named(body.text, roots),
-      None -> body.text,
-    },
-    tables: { ..a.tables, shared: body.shared },
-  }
-}
+) -> Output / {abort.raise} =
+  match named.get(n) { Some(names) -> { ..a, text: placeholders_named(a.text, names) }, None -> a }
 
 type Compiled = {
   results: Map<RootName, Output>,
   keys: Map<RootName, RootKey>,
   coded: List<{ key: RootKey, home: Bytes }>,
-  stored: Map<RootName, Stored>,
 }
 
 fn compiled(
   results: Map<RootName, Output>,
   keys: Map<RootName, RootKey>,
-  stored: Map<RootName, Stored>,
 ) -> Compiled / {abort.raise} = {
   let sharing = results.fold(
     Map::new(),
@@ -2569,7 +2400,7 @@ fn compiled(
       match keys.get(n) {
         Some(Specialisation(spec, _)) -> if a.tables.members.len() > 0
             || a.tables.defined.any(|d: DefinitionSymbol| d.entered) { accumulator } else {
-          let k = code_of(spec.definition, n, a, digest_in(stored, n, a));
+          let k = code_of(spec.definition, n, a, body_digest(a));
           let c = root_name(k);
           accumulator.insert(c, {
             key: k,
@@ -2580,7 +2411,7 @@ fn compiled(
       },
   );
   sharing.fold(
-    { results: results, keys: keys, coded: [], stored: stored },
+    { results: results, keys: keys, coded: [] },
     |accumulator: Compiled, c: RootName, s: { key: RootKey, shared: List<RootName> }|
       match if s.shared.len() < 2 { None } else { results.get(s.shared.get(0)) } {
         None -> accumulator,
@@ -2601,21 +2432,10 @@ fn compiled(
                 0,
               ),
             }),
-            stored: s.shared.fold(
-              match stored.get(s.shared.get(0)) {
-                Some(x) -> accumulator.stored.insert(c, x),
-                None -> accumulator.stored,
-              },
-              |m: Map<RootName, Stored>, n: RootName| m.remove(n),
-            ),
           },
       },
   )
 }
-
-fn digest_in(stored: Map<RootName, Stored>, n: RootName, a: Output) -> Bytes / {abort.raise} =
-  if a.text.len() > 0 { body_digest(a) }
-  else { match stored.get(n) { Some(s) -> s.body, None -> body_digest(a) } }
 
 fn stub(a: Output, code: RootKey) -> Output / {abort.raise} =
   match a.tables.defined.at(0) {
@@ -2698,19 +2518,8 @@ pub fn code_rejections(runtime: Runtime, codes: List<UnitCode>) -> List<Diagnost
   else { [] }
 }
 
-pub fn unit_text(parts: List<WrittenPart>) -> Bytes / {abort.raise} =
-  Bytes::concat_all(
-    [unit_header].concat(
-      parts.map(|w: WrittenPart|
-        match w.text {
-          Some(t) -> t,
-          None ->
-            panic(
-              "a part's text was not loaded, so the program text cannot be written from the cache",
-            ),
-        }),
-    ),
-  )
+pub fn unit_text(parts: List<WrittenPart>) -> Bytes =
+  Bytes::concat_all([unit_header].concat(parts.map(|w: WrittenPart| w.text)))
 
 type Fresh = { text: Bytes, parts: List<WrittenPart>, taken: List<RootName>, made: UnitContents }
 
@@ -2723,19 +2532,7 @@ pub fn fresh(
   machine_of: (Map<Bytes, Bool>) -> List<Native> / {abort.raise},
   rule: PartRule,
 ) -> Fresh / {abort.raise} = {
-  let p = produce(
-    constructors,
-    offered,
-    modules,
-    results,
-    inputs,
-    machine_of,
-    rule,
-    Map::new(),
-    Map::new(),
-    |_: Bytes| None,
-    |_: String| false,
-  );
+  let p = produce(constructors, offered, modules, results, inputs, machine_of, rule);
   { text: unit_text(p.parts), parts: p.parts, taken: p.taken, made: p.made }
 }
 
@@ -2997,7 +2794,6 @@ test "a body that calls a function missing from its unit, such as a generic func
   let message = handle {
     taken_bodies(
       by_definition([{ key: b"m.main", value: calling }]),
-      Map::new(),
       [definition_root(b"m.main")],
       Map::new(),
     );
@@ -3046,7 +2842,7 @@ fn program_calling_f_at(
       at.map(calling),
     ),
   );
-  let c = compiled(had.results, had.keys, Map::new());
+  let c = compiled(had.results, had.keys);
   let s = generic_calls_specialised(
     c.results,
     c.keys,
@@ -3057,7 +2853,7 @@ fn program_calling_f_at(
   {
     coded: c.coded.map(|x: { key: RootKey, home: Bytes }| x.key),
     bodies: s.results.fold(Map::new(), |m: Map<RootName, Output>, n: RootName, a: Output|
-      m.insert(n, resolved_text(n, a, Map::new(), s.named, |_: Bytes| None))),
+      m.insert(n, named_output(s.named, n, a))),
   }
 }
 
@@ -3261,8 +3057,7 @@ const by_names: PartRule = { bits: 1, min: 0, max: 1 << 40 }
 type Cut = { label: String, text: Bytes }
 
 fn parts_in(text: Bytes) -> List<Cut> / {abort.raise} =
-  cc::split(text).parts.map(|w: WrittenPart|
-    { label: w.label, text: match w.text { Some(t) -> t, None -> b"" } })
+  cc::split(text).files.map(|w: WrittenPart| { label: w.label, text: w.text })
 
 fn parts_before_runtime(text: Bytes) -> List<Cut> / {abort.raise} =
   parts_in(text).fold(

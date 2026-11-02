@@ -107,10 +107,7 @@ fn a_set_of_libraries_fills_the_slots_of_calls_between_them_in_both_directions()
     }
     let a = linked_library(dir.path(), &first, &[two.as_str()], &one);
     let b = linked_library(dir.path(), &second, &[one.as_str()], &two);
-    let set = dir.path().join("program.plyset");
-    std::fs::write(&set, format!("{}\n{}\n", a.display(), b.display()))
-        .expect("the set is written");
-    let native = ply_compiled::c::load_from_path(&set).expect("the set loads");
+    let native = ply_compiled::c::load_libraries(&[a, b]).expect("the libraries load");
     let result = units::entered(&native, "m.one", &[]).expect("it returns");
     assert_eq!(imm_value(result), 7);
 }

@@ -60,11 +60,13 @@ impl Native {
     }
 }
 
-pub fn load_from_path(path: &std::path::Path) -> Result<Native> {
-    if path.extension().is_some_and(|e| e == SET_EXTENSION) {
-        return load_set(path);
-    }
-    finish_units(vec![Library::open(path)?])
+pub fn load_libraries(paths: &[std::path::PathBuf]) -> Result<Native> {
+    finish_units(
+        paths
+            .iter()
+            .map(|path| Library::open(path))
+            .collect::<Result<Vec<_>>>()?,
+    )
 }
 
 pub fn load_linked() -> Result<Native> {
@@ -72,16 +74,6 @@ pub fn load_linked() -> Result<Native> {
         bail!("this executable was linked with no program");
     };
     finish_units(vec![lib])
-}
-
-const SET_EXTENSION: &str = "plyset";
-
-fn load_set(path: &std::path::Path) -> Result<Native> {
-    let listed = std::fs::read_to_string(path)?;
-    let libraries = (listed.lines())
-        .map(|line| Library::open(std::path::Path::new(line)))
-        .collect::<Result<Vec<_>>>()?;
-    finish_units(libraries)
 }
 
 fn descriptor_of(lib: &Library) -> Result<&'static Descriptor> {

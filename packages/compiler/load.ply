@@ -12,7 +12,7 @@ import compiler.store.hash.encoding (hex)
 import compiler.front.interface (imported)
 import compiler.store.memo
 import compiler.store.memo (Run, in_session, reading, memo)
-import compiler.front.checking.units (NoCode, PartCode, codes_of_part, entries_of, program_code,
+import compiler.front.checking.units (NoCode, entries_of, program_code, reached_codes,
                                       roots_of_modules, unit_of_root)
 import compiler.store.memo_files
 import compiler.front.checking (CheckedModule, OwnPackage, LoadInputs, query_load, entry_hash,
@@ -472,9 +472,9 @@ fn code_loaded(
   {
     results: results,
     codes: if rejected_first(results.results).len() > 0 { [] } else {
-      program_code(
-        entries_of(wanted(w).filter(|k: RootKey| unit_of_root(k, false) != NoCode)),
-      ).parts.flat_map(|p: PartCode| codes_of_part(p.part))
+      reached_codes(
+        program_code(entries_of(wanted(w).filter(|k: RootKey| unit_of_root(k, false) != NoCode))),
+      )
     },
   }
 }
@@ -885,7 +885,7 @@ fn run_derivation(
       derivation_run_of(
         ask,
         shipped.run_root(
-          toolchain.cache() ++ "/" ++ library,
+          library,
           String::of_bytes(derived_root(name)),
           ask.declaration,
           unit::entered_timeout_ms,
@@ -906,20 +906,17 @@ fn deriver_library(
   name: Bytes,
   modules: List<DeriverModule>,
 ) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
-  let library_record = "derivers/" ++ String::of_bytes(hex(deriver));
-  match toolchain.read_file(library_record) {
-    Some(library) -> {
-      let path = String::of_bytes(library);
-      if toolchain.exists(path) { Ok(path) }
-      else { compile_deriver(module, library_record, name, modules) }
-    },
-    None -> compile_deriver(module, library_record, name, modules),
+  let wanted = { owner: "derivers/" ++ String::of_bytes(module), key: deriver };
+  match cc::found_libraries[cc](cc::development(), [wanted]) {
+    Err(reason) -> Err({ result: unran(b"E0155", Bytes::of_string(reason), []), keep: false }),
+    Ok(found) -> if found.get(0).built { Ok(found.get(0).path) }
+    else { compile_deriver(module, found.get(0), name, modules) },
   }
 }
 
 fn compile_deriver(
   module: Bytes,
-  library_record: String,
+  at: cc::FoundLibrary,
   name: Bytes,
   modules: List<DeriverModule>,
 ) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
@@ -953,16 +950,11 @@ fn compile_deriver(
     Ok(written) -> if compilers.find[cc]() == None {
       unkept(b"no C compiler is found to run the deriver", [])
     } else {
-      match match unit::cache_parts(written.parts) {
-          Err(reason) -> Err(reason),
-          Ok(sources) -> cc::library[cc](cc::development(), sources),
-        } {
+      match cc::built_libraries[cc](cc::development(), [
+          { wanted: at.wanted, c: unit::generated_c(written.parts) },
+        ]) {
         Err(reason) -> unkept(b"the deriver's program did not compile", [Bytes::of_string(reason)]),
-        Ok(l) -> {
-          let library = cache_relative(l);
-          if toolchain.write_file(library_record, Bytes::of_string(library)) { Ok(library) }
-          else { unkept(b"the deriver's program could not be saved in the toolchain's cache", []) }
-        },
+        Ok(_) -> Ok(at.path),
       }
     },
   }
@@ -997,11 +989,6 @@ fn written_in_memory(
       reading(qs, run, || code_loaded(w, |_: LoadInputs| roots)),
   );
   with_no_files(|| written_from[memory](p, loaded, false))
-}
-
-pub fn cache_relative(path: String) -> String / {toolchain.read, abort.raise} = {
-  let cache = toolchain.cache();
-  if path.starts_with(cache ++ "/") { path.slice(cache.len() + 1, path.len()) } else { path }
 }
 
 fn derivation_run_of(ask: DeriverRequest, returned: Option<Bytes>) -> DerivationRun = {

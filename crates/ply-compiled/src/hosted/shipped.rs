@@ -207,7 +207,7 @@ fn open_cached(library: &Path) -> Result<Arc<Opened>, String> {
     if let Some(opened) = units.lock().unwrap_or_else(|e| e.into_inner()).get(library) {
         return Ok(Arc::clone(opened));
     }
-    let opened = Opened::open(library)?;
+    let opened = Opened::open(&[library.to_path_buf()])?;
     let mut held = units.lock().unwrap_or_else(|e| e.into_inner());
     Ok(Arc::clone(
         held.entry(library.to_path_buf()).or_insert(opened),

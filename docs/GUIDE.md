@@ -127,8 +127,10 @@ A run that crashes, or that races another run, can make a later run redo work, b
 wrong result.
 
 Each project has its own database. `ply cache copy CHECKOUT` starts a new checkout with the database
-of another one. Compiled code, test passes and proofs are stored once per user under the content
-they came from, so every checkout reuses them with no copying.
+of another one. The project's compiled code is kept in `.ply-cache/c/`, one library per part of the
+program, and a new build of a part replaces the old one. The standard library's compiled code belongs
+to the `ply` binary: it is kept in a directory for that binary, which a later run of any `ply`
+removes once the binary is deleted or replaced.
 
 A command updates the database for the files that changed, then reads its answer from the database.
 So the work follows the edit, not the size of the program, and no command keeps a result of its own.
@@ -2480,8 +2482,7 @@ whose `TERM` is not `dumb`.
 | `PLY_ATTESTERS` | public key files that `ply resolve` trusts to vouch for packages, separated as in `PATH` |
 | `PLY_TRUST` | PEM files, separated by `:`, whose certificates `ply`'s own HTTPS connections also trust |
 | `PLY_CC` | the C compiler to run instead of `cc` |
-| `PLY_C_CACHE` | where compiled code is cached (default `ply/cache` in the user's cache directory) |
-| `PLY_C_CACHE_MAX` | a size limit for that cache, in bytes; the least recently used entries go first |
+| `PLY_C_CACHE` | where each `ply` binary keeps its own directory (default `ply/binaries` in the user's cache directory) |
 | `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `TERM` | color (§17.1) |
 
 ### 17.3 Commands

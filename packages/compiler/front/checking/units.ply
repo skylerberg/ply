@@ -653,20 +653,20 @@ const copy_buckets: Int = 16
 fn part_at(
   w: ReachWalk,
   unit: CodeUnit,
-) -> { walk: ReachWalk, part: { module: Bytes, label: Bytes } } / {memo.read, abort.raise} =
+) -> { walk: ReachWalk, part: { module: Bytes, label: Bytes }, members: List<CodeUnit> } / {memo.read, abort.raise} =
   match unit {
     OfGroup(g) -> {
       let m = match w.modules.get(g.module) {
         Some(x) -> x,
         None -> module_units_of(module_key_of(g)),
       };
+      let label = m.groups.fold(b"", |found: Bytes, x: GroupRoots|
+        if x.group.owners == g.owners { x.chunk } else { found });
       {
         walk: { ..w, modules: w.modules.insert(g.module, m) },
-        part: {
-          module: g.module,
-          label: m.groups.fold(b"", |found: Bytes, x: GroupRoots|
-            if x.group.owners == g.owners { x.chunk } else { found }),
-        },
+        part: { module: g.module, label: label },
+        members: m.groups.filter(|x: GroupRoots| x.chunk == label).map(|x: GroupRoots|
+          OfGroup(x.group)),
       }
     },
     OfRoot(r) ->
@@ -678,8 +678,9 @@ fn part_at(
             "copies " ++ (root_id(root_text(root_name(r.key))) % copy_buckets).to_string(),
           ),
         },
+        members: [unit],
       },
-    NoCode -> { walk: w, part: { module: b"", label: b"" } },
+    NoCode -> { walk: w, part: { module: b"", label: b"" }, members: [] },
   }
 
 fn roots_called(summary: UnitSummary, k: RootKey) -> List<RootKey> =
@@ -697,11 +698,11 @@ fn with_part(
 ) -> PartsBuilt / {memo.read, abort.raise} = {
   let placed = part_at(built.walk, unit);
   let key = Bytes::concat_all([placed.part.module, b"\x00", placed.part.label]);
-  let had = match built.parts.get(key) {
-    Some(p) -> p,
-    None -> { module: placed.part.module, label: placed.part.label, units: [] },
+  let part = match built.parts.get(key) {
+    Some(p) -> match unit { OfGroup(_) -> p, _ -> { ..p, units: p.units.concat(placed.members) } },
+    None -> { module: placed.part.module, label: placed.part.label, units: placed.members },
   };
-  { walk: placed.walk, parts: built.parts.insert(key, { ..had, units: had.units.push(unit) }) }
+  { walk: placed.walk, parts: built.parts.insert(key, part) }
 }
 
 pub fn reachable_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
@@ -926,6 +927,26 @@ fn unit_digests(code: ProgramCode) -> Map<Bytes, Bytes> / {abort.raise} =
   code.parts.fold(Map::new(), |found: Map<Bytes, Bytes>, p: PartCode|
     range(0, p.part.units.len()).fold(found, |m: Map<Bytes, Bytes>, i: Int|
       m.insert(bin::encode(p.part.units.get(i), code_unit_bin()), p.made.codes.get(i))))
+
+pub fn reached_digests(code: ProgramCode) -> List<Bytes> / {abort.raise} = {
+  let digests = unit_digests(code);
+  code.links.fold(
+    { seen: Map::new(), found: [] },
+    |s: { seen: Map<Bytes, Bool>, found: List<Bytes> }, l: RootLink|
+      if s.seen.contains(l.unit) { s } else {
+        {
+          seen: s.seen.insert(l.unit, true),
+          found: match digests.get(l.unit) { Some(d) -> s.found.push(d), None -> s.found },
+        }
+      },
+  ).found
+}
+
+pub fn reached_codes(code: ProgramCode) -> List<UnitCode> / {memo.read, abort.raise} =
+  code.links.map(|l: RootLink| l.unit).unique().fold([], |found: List<UnitCode>, at: Bytes| {
+    let unit = decoded(at, code_unit_bin(), "a unit of code");
+    if unit == NoCode { found } else { found.push(unit_code_of(unit)) }
+  })
 
 pub fn closure_codes(code: ProgramCode) -> Map<RootName, Bytes> / {abort.raise} = {
   let links = code.links;

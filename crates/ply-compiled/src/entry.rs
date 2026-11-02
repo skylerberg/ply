@@ -22,9 +22,9 @@ unsafe impl Send for Opened {}
 unsafe impl Sync for Opened {}
 
 impl Opened {
-    pub fn open(library: &std::path::Path) -> Result<Arc<Opened>, String> {
+    pub fn open(libraries: &[std::path::PathBuf]) -> Result<Arc<Opened>, String> {
         let started = Instant::now();
-        let native = crate::c::load_from_path(library).map_err(|e| format!("{e:#}"))?;
+        let native = crate::c::load_libraries(libraries).map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(Opened {
             native,
             nanos: elapsed_nanos(started),
@@ -546,12 +546,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    let library = unsafe { borrowed(p, n) };
+    let libraries = unsafe { borrowed(p, n) };
     let mut w = Writer::new();
-    match std::str::from_utf8(library)
-        .map_err(|_| "the library's path is not UTF-8".to_string())
-        .and_then(|path| Opened::open(std::path::Path::new(path)))
-    {
+    match std::str::from_utf8(libraries)
+        .map_err(|_| "a library's path is not UTF-8".to_string())
+        .and_then(|paths| {
+            Opened::open(
+                &paths
+                    .lines()
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>(),
+            )
+        }) {
         Ok(opened) => {
             let (roots, nanos) = (opened.roots() as u64, opened.nanos());
             let unit = units().keep(opened);

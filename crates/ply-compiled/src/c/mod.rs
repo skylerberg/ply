@@ -1,3 +1,4 @@
+pub mod binary;
 mod build;
 pub mod described;
 pub mod descriptor;
@@ -6,14 +7,12 @@ pub mod exports;
 pub mod linked;
 mod load;
 mod prelude;
-pub mod stage;
-pub mod sweep;
 pub mod tables;
 
-pub use build::{Native, load_from_path, load_linked};
+pub use build::{Native, load_libraries, load_linked};
 pub use described::described;
 pub use exports::{Exports, RuntimeMismatch};
-pub use load::{Library, cache_dir};
+pub use load::Library;
 pub(crate) use prelude::runtime_native;
 pub use prelude::{MachineNative, builtin_helper_name, helpers, runtime_helpers, runtime_natives};
 
@@ -21,12 +20,16 @@ pub fn semantics_digest() -> &'static str {
     env!("PLY_SEMANTICS_DIGEST")
 }
 
+pub fn cache_dir() -> std::path::PathBuf {
+    binary::binary_dir().join("c")
+}
+
 pub fn bodies_dir() -> std::path::PathBuf {
-    load::cache_dir().join("bodies")
+    binary::binary_dir().join("bodies")
 }
 
 pub fn cache_dirs() -> Vec<std::path::PathBuf> {
-    vec![load::cache_dir(), stage::stage_root()]
+    vec![binary::binary_dir().to_path_buf()]
 }
 
 pub(crate) fn cache_dir_for(kind: &str, named: &str) -> std::path::PathBuf {

@@ -36,7 +36,7 @@ fn unit_entered() -> c_int {
             return 2;
         }
     };
-    let opened = match Opened::open(std::path::Path::new(library)) {
+    let opened = match Opened::open(&[std::path::PathBuf::from(library)]) {
         Ok(opened) => opened,
         Err(reason) => {
             eprintln!("ply: `{library}` does not load: {reason}");

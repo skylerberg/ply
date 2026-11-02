@@ -1,5 +1,4 @@
 mod stage;
-mod sweep;
 
 use crate::units::{self, def};
 use ply_compiled::c::exports::HelperShape;

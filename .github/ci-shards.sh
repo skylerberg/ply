@@ -1009,21 +1009,11 @@ cmd_verify() {
     fi
   fi
 
-  local sweep_rs="$root/crates/ply-compiled/src/c/sweep.rs" swept cut
-  swept=$(sed -n 's/^const BY_FILE: \[&str; [0-9]*\] = \[\(.*\)\];$/\1/p' "$sweep_rs" | tr -d ' ' | tr ',' '\n' |
-    while read -r name; do sed -n "s/^pub const $name: &str = \"\\(.*\\)\";$/\\1/p" "$sweep_rs"; done | LC_ALL=C sort)
-  cut=$(sed -n 's/^ *\([a-z| ]*\)) find "\$dir" -type f ! -newer "\$mark" -delete ;;$/\1/p' "$root/.github/ci-warm.sh" |
-    tr -d ' ' | tr '|' '\n' | LC_ALL=C sort)
-  if [[ -z $swept || $swept != "$cut" ]]; then
-    echo "FAIL: the sweep takes '$(echo $swept)' file by file and ci-warm.sh cuts '$(echo $cut)' file by file" >&2
-    failures=$((failures + 1))
-  fi
-  local stores_rs stores_warm stores_ply
-  stores_rs=$(sed -n 's/^pub const STORES: &str = "\(.*\)";$/\1/p' "$sweep_rs")
+  local stores_warm stores_ply
   stores_warm=$(sed -n 's/^stores=\$cache\/\(.*\)$/\1/p' "$root/.github/ci-warm.sh")
   stores_ply=$(sed -n 's/^stores=ply-c-cache\/\(.*\)$/\1/p' "$root/.github/ci-ply.sh")
-  if [[ -z $stores_rs || $stores_rs != "$stores_warm" || $stores_rs != "$stores_ply" ]]; then
-    echo "FAIL: the sweep takes the stores below '$stores_rs' whole, ci-warm.sh those below '$stores_warm' and ci-ply.sh those below '$stores_ply'" >&2
+  if [[ -z $stores_warm || $stores_warm != "$stores_ply" ]]; then
+    echo "FAIL: ci-warm.sh keeps the stores below '$stores_warm' and ci-ply.sh those below '$stores_ply'" >&2
     failures=$((failures + 1))
   fi
 

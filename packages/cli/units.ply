@@ -10,16 +10,20 @@ import compiler.cc
 import compiler.cc (compilers, toolchain)
 import compiler.syntax.parsing (no_module, dummy_span)
 import compiler.unit
-import compiler.unit (shipped, shipped_runtime, cache_parts, code_rejections, whole_program_text)
+import compiler.unit (shipped, shipped_runtime, generated_c, code_rejections, whole_program_text)
 import compiler.emit.keys (RootKey, EntryPoint)
 import compiler.front.checking (LoadInputs)
-import compiler.front.checking.units (Entries, PartCode, ProgramCode, codes_of_part, decoded_code,
-                                      encoded_code, entries_of, part_text, program_code)
+import compiler.front.checking.units (Entries, PartCode, PartMembers, ProgramCode, CodeUnit,
+                                      OfGroup, codes_of_part, decoded_code, encoded_code,
+                                      entries_of, part_text, program_code, reached_digests)
+import compiler.unit (UnitCode)
 import compiler.store.memo (memo)
 import compiler.store.memo_files
 import compiler.front.facts (CheckedProgram, ProgramListing)
 import compiler.check.infer.checker (ConstructorInfo)
 import std.bytes (u32_be)
+import std.hash (blake3)
+import paths
 import program (ProgramPlace, Session, TimedLoad, in_program_store, loaded_analysis, store_of)
 import std.env (env)
 import sources
@@ -43,8 +47,8 @@ pub type Emitted = {
 
 pub effect emit {
   read code(program: CodeProgram, roots: List<RootKey>) -> Emitted
-  read compiled(sources: List<cc::Source>, profile: cc::Profile) -> Result<String, List<Diagnostic>>
-  read libraries(emitted: Emitted, profile: cc::Profile) -> Result<String, List<Diagnostic>>
+  read compiled(owner: String, text: Bytes, profile: cc::Profile) -> Result<String, List<Diagnostic>>
+  read libraries(emitted: Emitted, profile: cc::Profile) -> Result<List<String>, List<Diagnostic>>
 }
 
 pub effect set Emits = {shipped.runtime, shipped.definitions, toolchain.bodies_dir, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.report_view_used, Derives}
@@ -79,7 +83,7 @@ pub fn code_program_of<a>(
 pub fn library_of(
   emitted: Option<Emitted>,
   profile: cc::Profile,
-) -> Result<Option<String>, List<Diagnostic>> / {emit.libraries} =
+) -> Result<Option<List<String>>, List<Diagnostic>> / {emit.libraries} =
   match emitted {
     None -> Ok(None),
     Some(e) -> match emit.libraries(e, profile) {
@@ -95,23 +99,32 @@ pub fn emitting<a | e>(
     body()
   } with {
     emit.code(program, roots) -> code_of(program, roots),
-    emit.compiled(sources, profile) -> compiled_of(sources, profile),
+    emit.compiled(owner, text, profile) -> if by_tcc(profile) {
+      library_of_text[tcc](owner, text, profile)
+    } else { library_of_text[cc](owner, text, profile) },
     emit.libraries(emitted, profile) -> if by_tcc(profile) { part_libraries[tcc](emitted, profile) }
     else { part_libraries[cc](emitted, profile) },
   }
 
-pub fn library(
-  sources: List<cc::Source>,
-  profile: cc::Profile,
-) -> Result<String, List<Diagnostic>> / {emit.compiled} = emit.compiled(sources, profile)
-
-pub fn cached_library(
+pub fn artifact_library(
+  path: String,
   text: Bytes,
   profile: cc::Profile,
-) -> Result<String, List<Diagnostic>> / {emit.compiled, toolchain.read, toolchain.write, abort.raise} =
-  match cc::cache_text(text) {
+) -> Result<String, List<Diagnostic>> / {emit.compiled, abort.raise} =
+  emit.compiled(
+    profile.name ++ "/artifacts/" ++ blake3(Bytes::of_string(path)).slice(0, 8).hex_of(),
+    text,
+    profile,
+  )
+
+fn library_of_text<[c]>(
+  owner: String,
+  text: Bytes,
+  profile: cc::Profile,
+) -> Result<String, List<Diagnostic>> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
+  match cc::library[c](profile, owner, cc::split(text)) {
     Err(reason) -> Err([unbuildable(reason)]),
-    Ok(sources) -> library(sources, profile),
+    Ok(path) -> Ok(path),
   }
 
 fn with_codes(
@@ -164,7 +177,7 @@ pub fn whole_text(
   roots: List<RootKey>,
 ) -> Result<Bytes, List<Diagnostic>> / {emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, abort.raise} = {
   let e = emit.code(program.code, roots);
-  let digests = e.code.parts.fold([], |all: List<Bytes>, p: PartCode| all.concat(p.made.codes));
+  let digests = reached_digests(e.code);
   let stored = stored_codes(e, digests);
   let codes = digests.map(|digest: Bytes|
     match stored.get(digest) {
@@ -177,85 +190,81 @@ pub fn whole_text(
   }
 }
 
-type KnownPart = { part: PartCode, library: Option<String> }
+fn shipped_part(p: PartMembers) -> Bool =
+  p.units.fold(true, |all: Bool, u: CodeUnit|
+    all && (match u { OfGroup(g) -> g.shipped && !g.tested, _ -> false }))
 
-fn part_sources(
+fn part_owner(profile: cc::Profile, p: PartMembers) -> String / {abort.raise} =
+  profile.name ++ "/" ++ String::of_bytes_lossy(p.module) ++ "/"
+    ++ blake3(p.label).slice(0, 8).hex_of()
+
+fn codes_of(e: Emitted, stored: Map<Bytes, Bytes>, p: PartCode) -> List<UnitCode> / {abort.raise} =
+  p.made.codes.map(|digest: Bytes|
+    match stored.get(digest) {
+      Some(b) -> decoded_code(b),
+      None -> panic("a part's code is missing from the database that listed it"),
+    })
+
+fn libraries_of_parts<[c]>(
   e: Emitted,
-  stored: Map<Bytes, Bytes>,
-  p: PartCode,
-) -> Result<List<cc::Source>, String> / {toolchain.read, toolchain.write, abort.raise} =
-  cache_parts(
-    part_text(
-      p.made,
-      p.made.codes.map(|digest: Bytes|
-        match stored.get(digest) {
-          Some(b) -> decoded_code(b),
-          None -> panic("a part's code is missing from the database that listed it"),
-        }),
-      e.inputs,
-    ),
-  )
-
-fn set_of_libraries(
-  paths: List<String>,
-) -> Result<String, List<Diagnostic>> / {toolchain.read, toolchain.write, abort.raise} =
-  match cc::library_set(paths) { Ok(set) -> Ok(set), Err(reason) -> Err([unbuildable(reason)]) }
+  profile: cc::Profile,
+  parts: List<PartCode>,
+) -> Result<List<String>, List<Diagnostic>> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, shipped.runtime, fs.read[cwd], fs.read[abs], abort.raise} = {
+  let wanted = parts.map(|p: PartCode|
+    { owner: part_owner(profile, p.part), key: p.made.identity });
+  match cc::found_libraries[c](profile, wanted) {
+    Err(reason) -> Err([unbuildable(reason)]),
+    Ok(found) -> {
+      let paths = found.map(|k: cc::FoundLibrary| k.path);
+      let missing = range(0, parts.len()).filter(|i: Int| !found.get(i).built);
+      if missing.len() == 0 { Ok(paths) } else {
+        let stored = stored_codes(
+          e,
+          missing.fold([], |all: List<Bytes>, i: Int| all.concat(parts.get(i).made.codes)),
+        );
+        match code_rejections(shipped_runtime(), stored.values().map(decoded_code)) {
+          [] -> match cc::built_libraries[c](
+              profile,
+              missing.map(|i: Int|
+                {
+                  wanted: wanted.get(i),
+                  c: generated_c(
+                    part_text(parts.get(i).made, codes_of(e, stored, parts.get(i)), e.inputs),
+                  ),
+                }),
+            ) {
+            Err(reason) -> Err([unbuildable(reason)]),
+            Ok(_) -> Ok(paths),
+          },
+          rejected -> Err(rejected),
+        }
+      }
+    },
+  }
+}
 
 fn part_libraries<[c]>(
   e: Emitted,
   profile: cc::Profile,
-) -> Result<String, List<Diagnostic>> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, shipped.runtime, fs.read[cwd], fs.read[abs], abort.raise} = {
-  let known = e.code.parts.map(|p: PartCode|
-    { part: p, library: cc::known_part_library[c](profile, p.made.identity) });
-  let missing = known.filter(|k: KnownPart| k.library == None).map(|k: KnownPart| k.part);
-  if missing.len() == 0 {
-    set_of_libraries(
-      known.fold([], |paths: List<String>, k: KnownPart|
-        match k.library { Some(l) -> paths.push(l), None -> paths }),
-    )
-  } else {
-    let digests = missing.fold([], |all: List<Bytes>, p: PartCode| all.concat(p.made.codes));
-    let stored = stored_codes(e, digests);
-    match code_rejections(shipped_runtime(), stored.values().map(decoded_code)) {
-      [] -> {
-        let sources = missing.fold(
-          Ok([]),
-          |done: Result<List<List<cc::Source>>, String>, p: PartCode|
-            match done {
-              Err(reason) -> Err(reason),
-              Ok(sets) -> match part_sources(e, stored, p) {
-                Err(reason) -> Err(reason),
-                Ok(s) -> Ok(sets.push(s)),
-              },
-            },
-        );
-        match sources {
-          Err(reason) -> Err([unbuildable(reason)]),
-          Ok(sets) -> match cc::libraries[c](profile, sets) {
-            Err(reason) -> Err([unbuildable(reason)]),
-            Ok(paths) -> {
-              let made = range(0, missing.len()).fold(
-                Map::new(),
-                |m: Map<Bytes, String>, i: Int| {
-                  let identity = missing.get(i).made.identity;
-                  cc::remember_part_library[c](profile, identity, paths.get(i));
-                  m.insert(identity, paths.get(i))
-                },
-              );
-              set_of_libraries(
-                known.map(|k: KnownPart|
-                  match k.library {
-                    Some(l) -> l,
-                    None -> match made.get(k.part.made.identity) { Some(l) -> l, None -> "" },
-                  }),
-              )
-            },
-          },
-        }
-      },
-      rejected -> Err(rejected),
-    }
-  }
+) -> Result<List<String>, List<Diagnostic>> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, shipped.runtime, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, abort.raise} = {
+  let shipped_parts = e.code.parts.filter(|p: PartCode| shipped_part(p.part));
+  let own_parts = e.code.parts.filter(|p: PartCode| !shipped_part(p.part));
+  let own = || libraries_of_parts[c](e, profile, own_parts);
+  let built = match libraries_of_parts[c](e, profile, shipped_parts) {
+    Err(diagnostics) -> Err(diagnostics),
+    Ok(shipped) -> match match e.place.store {
+        None -> own(),
+        Some(r) -> {
+          let dir = paths::in_root(r, ".ply-cache/c").path;
+          if r.label == "cwd" { cc::products_in[cwd](dir, own) }
+          else { cc::products_in[abs](dir, own) }
+        },
+      } {
+      Err(diagnostics) -> Err(diagnostics),
+      Ok(project) -> Ok({ shipped: shipped, project: project }),
+    },
+  };
+  match built { Err(diagnostics) -> Err(diagnostics), Ok(b) -> Ok(b.shipped.concat(b.project)) }
 }
 
 fn by_tcc(
@@ -268,12 +277,3 @@ fn unbuildable(reason: String) -> Diagnostic =
   error_at(b"E0450", no_module, dummy_span, Bytes::of_string(reason), b"", [
     b"the C backend shells out to `cc`; `PLY_CC` names another compiler",
   ])
-
-fn compiled_of(
-  sources: List<cc::Source>,
-  profile: cc::Profile,
-) -> Result<String, List<Diagnostic>> / {compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, env.variable, abort.raise} = {
-  let built = if by_tcc(profile) { cc::library[tcc](profile, sources) }
-  else { cc::library[cc](profile, sources) };
-  match built { Ok(path) -> Ok(path), Err(reason) -> Err([unbuildable(reason)]) }
-}

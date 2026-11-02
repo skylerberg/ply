@@ -9,12 +9,11 @@ const ENTRY_HEADER: &[u8] = b"ply entry 1\n";
 pub struct Program {
     pub entry: String,
     pub definitions: String,
-    pub stage: String,
 }
 
 pub fn linked_program() -> Result<Program, Diagnostic> {
     let pack = ply_pack::installed();
-    let (Some(bytes), Some(digest)) = (pack.bytes(FRONT), pack.digest_of(FRONT)) else {
+    let Some(bytes) = pack.bytes(FRONT) else {
         return Err(link_failure(format!("its pack carries no `{FRONT}`")));
     };
     let Some(rest) = bytes.strip_prefix(ENTRY_HEADER) else {
@@ -25,11 +24,9 @@ pub fn linked_program() -> Result<Program, Diagnostic> {
     let text =
         std::str::from_utf8(rest).map_err(|_| link_failure(format!("`{FRONT}` is not UTF-8")))?;
     let (entry, definitions) = text.split_once('\n').unwrap_or((text, ""));
-    let stage: String = digest[..8].iter().map(|b| format!("{b:02x}")).collect();
     Ok(Program {
         entry: entry.to_string(),
         definitions: definitions.to_string(),
-        stage: format!("native-{stage}"),
     })
 }
 
@@ -117,25 +114,25 @@ pub fn stamps() -> String {
     )
 }
 
-pub fn shipped_dir_name(stamps: &str, definitions: &str, files: &ply_pack::Digest) -> String {
+pub fn binary_identity(stamps: &str, definitions: &str, files: &ply_pack::Digest) -> String {
     let mut laid = blake3::Hasher::new();
     laid.update(stamps.as_bytes());
     laid.update(&[0]);
     laid.update(definitions.as_bytes());
     laid.update(&[0]);
     laid.update(files);
-    format!("shipped-{}", &laid.finalize().to_hex()[..16])
+    laid.finalize().to_hex()[..16].to_string()
 }
 
-pub fn shipped_modules(stage: &str, definitions: &str) -> Result<PathBuf, Diagnostic> {
+pub fn shipped_modules(definitions: &str) -> Result<PathBuf, Diagnostic> {
     let stamps = stamps();
-    let dir = ply_compiled::c::stage::stage_dir(stage).join(shipped_dir_name(
+    let dir = ply_compiled::c::binary::claim(&binary_identity(
         &stamps,
         definitions,
         &ply_privileged::shipped_modules::digest(),
-    ));
+    ))
+    .join("shipped");
     if dir.join(SHIPPED_MARKER).exists() {
-        ply_compiled::c::sweep::used(&ply_compiled::c::stage::stage_dir(stage));
         return Ok(dir);
     }
     lay_out(&dir, &stamps, definitions).map_err(|e| {
@@ -207,10 +204,9 @@ impl RunOutcome {
 }
 
 pub fn run(program: Program, root: &Path, argv: Vec<String>) -> RunOutcome {
-    ply_compiled::c::sweep::once();
     ply_privileged::binder::install();
     let definitions = program.definitions;
-    let shipped = match shipped_modules(&program.stage, &definitions) {
+    let shipped = match shipped_modules(&definitions) {
         Ok(shipped) => shipped,
         Err(rejected) => return RunOutcome::rejected(rejected),
     };
