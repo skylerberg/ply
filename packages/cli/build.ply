@@ -9,8 +9,9 @@ import std.path (normalize)
 import builder (LoadedProgram, Rejection)
 import builder (builder)
 import artifact_builder (LibraryUnit, BuiltArtifact, Named, PreviousArtifact, Dependencies,
-                         artifacts, with_artifacts)
-import units (emit)
+                         PrintedProgram, artifacts, with_artifacts)
+import units
+import units (EmbeddedFiles, WholeProgram, emit)
 import compiler.unit (emitter_identity, shipped)
 import compiler.store.hash.encoding (hex)
 import config_schema
@@ -27,21 +28,23 @@ import compiler.check.resolve.tables (Diagnostic, Label, error_with_labels, erro
 import compiler.check.types (FunctionType)
 import diagnostic (SourceText, all_to_json, all_to_text)
 import entry (Main, Module, entry_point, span_label)
-import sources (File, Project)
+import sources (DependencyPackage, File, Project)
+import compiler.front.checking (LoadInputs)
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
-import compiler.front.checking.view (LaterReading, Modules)
-import program (Program, Session, TimedLoad, loaded_analysis, no_loaded_analysis, no_program,
-                session, timed_load, timed_uncached, program_view)
+import compiler.front.checking.view (LaterReading, Modules, NamedRollup)
+import program (ProgramStore, Session, in_program_store, manifest_of, pins_of, places_of, session,
+                session_over)
 import plyz
-import report (CommandOutput, indent, ok_code, count_of, rejected, reported)
+import report (CommandOutput, indent, ok_code, count_of, rejected, reported, reuse_members)
 import std.fs (fs, Missing)
 import std.time (time)
 import std.list
 import std.json (Json, Null, Str, Bool, Number, Array, object, to_string, int, string_or_null,
                  strings, int_or_null)
 import std.pkg (Manifest, render_version)
-import compiler.front.facts (CheckedProgram, is_shipped_module)
+import compiler.front.facts (ProgramListing, listing_of)
+import compiler.front.pkg (LockedPackage)
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of, no_module_span)
 import compiler.front.published (analyse)
 import compiler.front.rows (ModuleSpan)
@@ -128,13 +131,9 @@ fn definition_of(definition_info: DefinitionInfo) -> Definition =
     arity: match definition_info.scheme.ty { FunctionType(f) -> f.params.len(), _ -> 0 },
   }
 
-pub fn definitions_of(view: CheckedProgram) -> List<Definition> =
-  view.checked.definitions.filter(|definition_info: DefinitionInfo|
-    !is_shipped_module(
-      view.frame.packages,
-      view.frame.module_packages,
-      definition_info.at.module,
-    )).map(
+pub fn definitions_of(listing: ProgramListing) -> List<Definition> =
+  listing.checked.definitions.filter(|definition_info: DefinitionInfo|
+    definition_info.at.module < listing.own).map(
     definition_of,
   ).sort_by(|a: Definition, b: Definition|
     a.at.module < b.at.module || (a.at.module == b.at.module && a.at.start <= b.at.start))
@@ -212,12 +211,12 @@ fn entry_of(
   }
 
 fn startup_of(
-  view: CheckedProgram,
+  listing: ProgramListing,
   schema: Option<String>,
 ) -> Result<List<String>, Diagnostic> / {abort.raise} =
   match schema {
     None -> Ok([]),
-    Some(named) -> match config_schema::resolve_schema(view.checked.definitions, named) {
+    Some(named) -> match config_schema::resolve_schema(listing.checked.definitions, named) {
       Err(d) -> Err(d),
       Ok(name) -> Ok([name]),
     },
@@ -393,6 +392,7 @@ fn built_json(
     { key: "artifact_bytes", value: int(sealed.bytes.len()) },
     { key: "binary_bytes", value: int_or_null(loaded.binary_bytes) },
     { key: "signed_by", value: string_or_null(signer) },
+    { key: "printed_program", value: object(reuse_members(made.checked, 0)) },
     { key: "diagnostics", value: all_to_json([], loaded.places) },
   ])
 
@@ -715,44 +715,37 @@ fn has_diff(flags: Flags) -> Bool = match flags.diff { Some(_) -> true, None -> 
 fn assemble(
   style: Style,
   flags: Flags,
-  loaded: LoadedProgram,
-  front: LoadedAnalysis,
-  hashes: HashOutput,
+  input: BuildInput,
   entry: String,
   startup: List<String>,
 ) -> CommandOutput / {artifact_written.stored, artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
-  match artifacts.made(front, hashes, entry, startup, has_diff(flags)) {
-    Err(reason) -> reported(style, "build", reason.diagnostics, loaded.places),
+  match artifacts.made(input.listing, entry, startup, has_diff(flags)) {
+    Err(reason) -> reported(style, "build", reason.diagnostics, input.loaded.places),
     Ok(m) -> match seal(encode(m.head, m.sections)) {
-      Err(reason) -> reported(style, "build", reason.diagnostics, loaded.places),
-      Ok(x) -> deliver(style, flags, loaded, m, x),
+      Err(reason) -> reported(style, "build", reason.diagnostics, input.loaded.places),
+      Ok(x) -> deliver(style, flags, input.loaded, m, x),
     },
   }
 
 fn build_entry(
   style: Style,
   flags: Flags,
-  loaded: Program,
-  p: LoadedProgram,
-  front: LoadedAnalysis,
-  hashes: HashOutput,
-  definitions: List<Definition>,
-  startup: Result<List<String>, Diagnostic>,
+  input: BuildInput,
 ) -> CommandOutput / {artifact_written.stored, artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
-  match entry_of(p, definitions, flags) {
-    Err(d) -> if flags.entry == None && p.mains.len() == 0 {
-      build_library(style, flags, loaded, p, front, definitions, d)
-    } else { reported(style, "build", [d], p.places) },
-    Ok(entry) -> match startup {
-      Err(d) -> reported(style, "build", [d], p.places),
-      Ok(roots) -> assemble(style, flags, p, front, hashes, entry, roots),
+  match entry_of(input.loaded, input.definitions, flags) {
+    Err(d) -> if flags.entry == None && input.loaded.mains.len() == 0 {
+      build_library(style, flags, input, d)
+    } else { reported(style, "build", [d], input.loaded.places) },
+    Ok(entry) -> match input.startup {
+      Err(d) -> reported(style, "build", [d], input.loaded.places),
+      Ok(roots) -> assemble(style, flags, input, entry, roots),
     },
   }
 
 pub fn run(
   flags: Flags,
   schema: Option<String>,
-) -> CommandOutput / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {shipped.version, shipped.binary_size, toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], emit.code, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   build_from_sources(flags, schema)
 }
 
@@ -823,14 +816,18 @@ fn remember_build(
 fn build_from_sources(
   flags: Flags,
   schema: Option<String>,
-) -> CommandOutput / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {shipped.version, shipped.binary_size, toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], emit.code, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   match session(
       flags.paths,
       flags.verify_dependencies,
-      !reuses_output(flags),
+      flags.digest,
       |modules: Modules, _: ProgramSummary|
-        { digest: view::program_digest(modules), later: view::later_reading(modules) },
+        {
+          digest: view::program_digest(modules),
+          later: view::later_reading(modules),
+          listing: if flags.digest { Some(view::listed(modules)) } else { None },
+        },
     ) {
     Err(r) -> rejected(s, "build", r.diagnostics, r.places),
     Ok(opened) -> {
@@ -847,42 +844,142 @@ fn build_from_sources(
   }
 }
 
-type BuildReading = { digest: Bytes, later: LaterReading }
+type BuildReading = { digest: Bytes, later: LaterReading, listing: Option<ProgramListing> }
+
+type BuildInput = {
+  loaded: LoadedProgram,
+  project: Project,
+  definitions: List<Definition>,
+  startup: Result<List<String>, Diagnostic>,
+  listing: ProgramListing,
+  program: Result<WholeProgram, List<Diagnostic>>,
+  committed: List<String>,
+}
+
+fn listing_read(s: Session<BuildReading>) -> ProgramListing / {ProgramStore, abort.raise} =
+  match s.value.listing {
+    Some(listing) -> listing,
+    None -> in_program_store(s.place, |_: LoadInputs| view::listed(s.modules)).value,
+  }
+
+fn printed_project(real: Project, files: List<SourceFile>) -> Project / {abort.raise} = {
+  let places = real.packages.fold(real.files, |all: List<File>, p: DependencyPackage|
+    all.concat(p.files)).fold(Map::new(), |found: Map<String, RootedPath>, f: File|
+    found.insert(f.module, f.at));
+  let own = files.map(|f: SourceFile|
+    {
+      path: f.path,
+      module: f.name,
+      text: f.text,
+      at: places.get(f.name).unwrap_or(paths::rooted_path(f.path)),
+    });
+  {
+    files: own,
+    sources: own.map(|f: File| { name: Bytes::of_string(f.module), source_text: f.text }),
+    diagnostics: [],
+    manifest: None,
+    packages: [],
+    root_key: "",
+  }
+}
+
+fn printed_store(root: ResolvedPath) -> ResolvedPath =
+  { ..root, root_path: paths::in_root(root, ".ply-cache/build").path }
+
+fn printed_program<a>(
+  s: Session<a>,
+  files: List<SourceFile>,
+) -> Result<PrintedProgram, List<Diagnostic>> / {ProgramStore, shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, time.now_ms, entropy.next, EmbeddedFiles, abort.raise} = {
+  let store = match s.place.store { Some(r) -> [printed_store(r)], None -> [] };
+  match session_over(
+      store,
+      printed_project(s.project, files),
+      time.elapsed_ms(),
+      false,
+      s.place.store == None,
+      |modules: Modules, _: ProgramSummary|
+        { listing: view::listed(modules), rollups: view::rollups(modules) },
+    ) {
+    Err(r) -> Err(r.diagnostics),
+    Ok(checked) -> match units::code_program_of(checked, checked.value.rollups) {
+      Err(diagnostics) -> Err(diagnostics),
+      Ok(code) ->
+        Ok({
+          listing: checked.value.listing,
+          code: units::whole_program(code, checked.value.listing),
+          runnable: entries::runnable_from_rollups(checked.value.rollups),
+          tallies: checked.tallies,
+        }),
+    },
+  }
+}
+
+fn loaded_from(
+  flags: Flags,
+  s: Session<BuildReading>,
+  places: List<SourceText>,
+  pins: List<LockedPackage>,
+) -> LoadedProgram / {shipped.binary_size, shipped.version, abort.raise} = {
+  let offered = entries::entries_over(s.value.later.rollups, s.modules.root, places);
+  {
+    root: normalize(root_of(flags).machine),
+    mains: offered.mains,
+    modules: offered.modules,
+    places: places,
+    pins: lock::from_front(pins),
+    binary_bytes: shipped.binary_size(),
+    version: shipped.version(),
+  }
+}
+
+fn library_program(
+  flags: Flags,
+  s: Session<BuildReading>,
+  listing: ProgramListing,
+  mains: List<Main>,
+) -> Result<WholeProgram, List<Diagnostic>> / {EmbeddedFiles, abort.raise} =
+  if flags.entry != None || mains.len() > 0 { Err([]) } else {
+    match units::code_program_of(s, s.value.later.rollups) {
+      Err(diagnostics) -> Err(diagnostics),
+      Ok(code) -> Ok(units::whole_program(code, listing)),
+    }
+  }
 
 fn fresh_build(
   s: Style,
   flags: Flags,
   schema: Option<String>,
   opened: Session<BuildReading>,
-) -> { output: CommandOutput, written: Option<StoredArtifact> } / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, builder.git[vcs], builder.loaded[build], emit.unit, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let t: TimedLoad = if reuses_output(flags) { timed_load(flags.paths, flags.verify_dependencies) }
-  else { timed_uncached(flags.paths, flags.verify_dependencies) };
-  handle {
-    match program_view(t.program) {
-      None -> rejected(s, "build", t.program.diagnostics, t.program.source_texts),
-      Some(w) -> match measure_errors(opened.place).concat(
-          site_errors(opened, opened.value.later, t.program.source_texts),
-        ) {
-        [] ->
-          with_artifacts(||
-            build_program(
-              s,
-              flags,
-              t.program,
-              definitions_of(w),
-              startup_of(w, schema),
-              loaded_analysis(t, w),
-              w.frame.hashes,
-            )),
-        literals -> rejected(s, "build", literals, t.program.source_texts),
+) -> { output: CommandOutput, written: Option<StoredArtifact> } / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, emit.code, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_view_used, shipped.binary_size, shipped.version} = {
+  let places = places_of(opened);
+  match measure_errors(opened.place).concat(site_errors(opened, opened.value.later, places)) {
+    [] -> match pins_of(opened.project) {
+      Err(r) -> { output: rejected(s, "build", r.diagnostics, r.places), written: None },
+      Ok(pinned) -> {
+        let listing = listing_read(opened);
+        let loaded = loaded_from(flags, opened, places, pinned.pins);
+        let input = {
+          loaded: loaded,
+          project: opened.project,
+          definitions: definitions_of(listing),
+          startup: startup_of(listing, schema),
+          listing: listing,
+          program: library_program(flags, opened, listing, loaded.mains),
+          committed: lock::committed_packages(pinned.packages),
+        };
+        handle {
+          with_artifacts(|files: List<SourceFile>| printed_program(opened, files), ||
+            build_program(s, flags, input))
+        } with {
+          var written = None,
+          artifact_written.stored(artifact) -> {
+            written = Some(artifact);
+          },
+          return output -> { output: output, written: written },
+        }
       },
-    }
-  } with {
-    var written = None,
-    artifact_written.stored(artifact) -> {
-      written = Some(artifact);
     },
-    return output -> { output: output, written: written },
+    literals -> { output: rejected(s, "build", literals, places), written: None },
   }
 }
 
@@ -908,28 +1005,18 @@ fn read_back(
 fn build_program(
   style: Style,
   flags: Flags,
-  loaded: Program,
-  definitions: List<Definition>,
-  startup: Result<List<String>, Diagnostic>,
-  front: LoadedAnalysis,
-  hashes: HashOutput,
-) -> CommandOutput / {artifact_written.stored, builder.loaded[build], artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
+  input: BuildInput,
+) -> CommandOutput / {artifact_written.stored, artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} = {
   let r = root_of(flags);
-  let locked: Result<Option<lock::Lock>, String> = lock::read(r);
-  match builder.loaded[build](root_of(flags).machine, front) {
-    Err(reason) -> rejected(style, "build", reason.diagnostics, reason.places),
-    Ok(p) -> match locked {
-      Err(reason) -> reported(style, "build", [lock::unreadable_lock(r, reason)], p.places),
-      Ok(existing) -> {
-        let committed = lock::committed_packages(loaded.packages);
-        match lock_rejection(r, existing, p, committed) {
-          Some(d) -> reported(style, "build", [d], p.places),
-          None -> {
-            let result = build_entry(style, flags, loaded, p, front, hashes, definitions, startup);
-            if result.code == ok_code { write_lock_file(r, existing, p, committed) };
-            result
-          },
-        }
+  match lock::read(r) {
+    Err(reason) ->
+      reported(style, "build", [lock::unreadable_lock(r, reason)], input.loaded.places),
+    Ok(existing) -> match lock_rejection(r, existing, input.loaded, input.committed) {
+      Some(d) -> reported(style, "build", [d], input.loaded.places),
+      None -> {
+        let result = build_entry(style, flags, input);
+        if result.code == ok_code { write_lock_file(r, existing, input.loaded, input.committed) };
+        result
       },
     },
   }
@@ -958,38 +1045,36 @@ fn library_output(flags: Flags, name: String) -> String =
 fn build_library(
   style: Style,
   flags: Flags,
-  loaded: Program,
-  p: LoadedProgram,
-  front: LoadedAnalysis,
-  definitions: List<Definition>,
+  input: BuildInput,
   rejected: Diagnostic,
 ) -> CommandOutput / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
-  match loaded.frame {
-    None -> reported(style, "build", [rejected], p.places),
-    Some(v) -> match v.manifest {
-      None -> reported(style, "build", [rejected], p.places),
-      Some(m) -> if m.entry != None { reported(style, "build", [rejected], p.places) }
-      else { write_library(style, flags, p, loaded, front, definitions, m) },
-    },
+  match manifest_of(input.project) {
+    None -> reported(style, "build", [rejected], input.loaded.places),
+    Some(m) -> if m.entry != None { reported(style, "build", [rejected], input.loaded.places) }
+    else { write_library(style, flags, input, m) },
   }
 
 pub type LibraryArchive = { own: List<Definition>, unit: LibraryUnit, sealed: SealedArtifact }
 
 pub fn pack_library(
-  front: LoadedAnalysis,
-  loaded: Program,
+  program: Result<WholeProgram, List<Diagnostic>>,
+  files: List<File>,
+  manifest: Bytes,
   definitions: List<Definition>,
 ) -> Result<LibraryArchive, Rejection> / {artifacts.unit, abort.raise} = {
-  let owned = loaded.files.map(|file: File| file.module);
+  let owned = files.map(|file: File| file.module);
   let own = definitions.filter(|definition: Definition| owned.contains(definition.module));
-  match artifacts.unit(front, own.map(|definition: Definition| definition.name)) {
+  let unit = match program {
+    Err(diagnostics) -> Err({ diagnostics: diagnostics, places: [] }),
+    Ok(p) -> artifacts.unit(p, own.map(|definition: Definition| definition.name)),
+  };
+  match unit {
     Err(reason) -> Err(reason),
     Ok(compiled) -> {
-      let manifest = match loaded.packages.manifest { Some(text) -> text, None -> b"" };
       let container = encode_named(
         library_magic,
         compiled.head,
-        plyz::sections(loaded.files, manifest, compiled),
+        plyz::sections(files, manifest, compiled),
       );
       match seal_in_domain(container, library_domain) {
         Err(reason) -> Err(reason),
@@ -1002,13 +1087,12 @@ pub fn pack_library(
 fn write_library(
   style: Style,
   flags: Flags,
-  p: LoadedProgram,
-  loaded: Program,
-  front: LoadedAnalysis,
-  definitions: List<Definition>,
+  input: BuildInput,
   manifest: Manifest,
-) -> CommandOutput / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} =
-  match pack_library(front, loaded, definitions) {
+) -> CommandOutput / {fs.create_dir[cwd], fs.create_dir[abs], artifacts.unit, fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], abort.raise} = {
+  let p = input.loaded;
+  let text = match input.project.manifest { Some(f) -> f.text, None -> b"" };
+  match pack_library(input.program, input.project.files, text, input.definitions) {
     Err(reason) -> reported(style, "build", reason.diagnostics, p.places),
     Ok(k) -> {
       let out = library_output(flags, manifest.name);
@@ -1031,7 +1115,7 @@ fn write_library(
                     library_lines(
                       style,
                       manifest,
-                      loaded.files.len(),
+                      input.project.files.len(),
                       k.own,
                       k.unit,
                       k.sealed,
@@ -1048,6 +1132,7 @@ fn write_library(
       }
     },
   }
+}
 
 fn library_lines(
   style: Style,
@@ -1145,6 +1230,7 @@ const an_artifact: BuiltArtifact =
     definitions: 1,
     names: [{ name: "m.main", hash: "aa" }],
     closures: [],
+    checked: [],
   }
 
 fn flags_of(json: Bool) -> Flags = { ..no_flags, json: json }
@@ -1201,11 +1287,11 @@ test "a simple name two modules declare says which two" {
   }
 }
 
-const a_view: CheckedProgram = {
+const a_view: ProgramListing = {
   let source = b"type Key = { name: String }\ntype ConfigSpec = { keys: List<Key> }\npub fn spec() -> ConfigSpec = { keys: [] }\nfn main() -> Int = 1\nfn serve(port: Int) -> Int = port\n";
   match analyse(parse_all([{ name: b"m", source_text: source }])) {
     Rejected(_) -> panic("the fixture checks"),
-    Analysed(w) -> checked_program_of(w),
+    Analysed(w) -> listing_of(checked_program_of(w)),
   }
 }
 
@@ -1296,26 +1382,31 @@ test "`diff_lines` prints added, changed and dropped rows, the unchanged count, 
   ])
 }
 
+fn no_listing() -> ProgramListing / {abort.raise} =
+  view::listing_from({ root: 0, own: [], pulled: [] }, [], [])
+
+const no_project: Project =
+  { files: [], sources: [], diagnostics: [], manifest: None, packages: [], root_key: "" }
+
 fn build_with(
   flags: Flags,
-  p: Result<LoadedProgram, Rejection>,
+  p: LoadedProgram,
   m: Result<BuiltArtifact, Rejection>,
   was: Result<PreviousArtifact, Rejection>,
   stores: Bool,
 ) -> CommandOutput / {abort.raise} =
   handle {
-    build_program(
-      style_of(flags),
-      flags,
-      no_program,
-      some_definitions,
-      Ok([]),
-      no_loaded_analysis,
-      no_hashes,
-    )
+    build_program(style_of(flags), flags, {
+      loaded: p,
+      project: no_project,
+      definitions: some_definitions,
+      startup: Ok([]),
+      listing: no_listing(),
+      program: Err([]),
+      committed: [],
+    })
   } with {
-    builder.loaded[build](root, front) -> p,
-    artifacts.made(front, hashes, entry, startup, reachable) -> m,
+    artifacts.made(listing, entry, startup, reachable) -> m,
     artifacts.previous(path, bytes) -> was,
     fs.read_file[cwd](path) -> lockfile(path),
     fs.read_file[abs](path) -> lockfile(path),
@@ -1326,7 +1417,7 @@ fn build_with(
     fs.write_file[cwd](path, body) -> stores || path.ends_with("ply.lock"),
     fs.write_file[abs](path, body) -> stores || path.ends_with("ply.lock"),
     fs.kind[abs](path) -> Missing,
-    artifacts.unit(front, names) -> no_unit,
+    artifacts.unit(program, names) -> no_unit,
     artifact_written.stored(_) -> (),
   }
 
@@ -1337,7 +1428,7 @@ fn lockfile(path: String) -> Option<Bytes> = None
 const no_rejection: Rejection = { diagnostics: [], places: [] }
 
 fn a_build(flags: Flags) -> CommandOutput / {abort.raise} =
-  build_with(flags, Ok(a_load), Ok(an_artifact), Err(no_rejection), true)
+  build_with(flags, a_load, Ok(an_artifact), Err(no_rejection), true)
 
 test "a build prints the entry and digest, the artifact's path and size, and the `ply` binary's version and size" {
   let result = a_build(flags_of(false));
@@ -1374,7 +1465,7 @@ test "`-o` names the file, and the entry's module names it otherwise" {
 test "`--digest` writes the one line a deployment pins and nothing else" {
   let result = build_with(
     { ..no_flags, digest: true },
-    Ok(a_load),
+    a_load,
     Ok(an_artifact),
     Err(no_rejection),
     false,
@@ -1391,7 +1482,7 @@ test "`--diff` reports against a deployed artifact and writes no file" {
   };
   let result = build_with(
     { ..no_flags, diff: Some("old.plyx"), json: true },
-    Ok(a_load),
+    a_load,
     Ok(an_artifact),
     Ok(was),
     false,
@@ -1405,38 +1496,10 @@ test "`--diff` reports against a deployed artifact and writes no file" {
   assert(text.contains("\"dropped\":[\"m.helper\"]"))
 }
 
-test "a program that fails to load reports the load's own errors and the error count, and the build exits with code 2" {
-  let reason: Rejection = {
-    diagnostics: [
-      {
-        code: b"E0201",
-        notes: 0,
-        labels: [],
-        text: b"",
-        message: b"type mismatch",
-        notes_text: [],
-        severity: b"error",
-        fixes: [],
-      },
-    ],
-    places: [],
-  };
-  let result = build_with(
-    flags_of(false),
-    Err(reason),
-    Err(no_rejection),
-    Err(no_rejection),
-    false,
-  );
-  assert_eq(result.code, 2);
-  assert_eq(result.lines, []);
-  assert_eq(result.errs, ["Error[E0201]: type mismatch", indent ++ "compilation failed (1 error)"])
-}
-
 test "an artifact that cannot be written is exit 2 with no tally" {
   let result = build_with(
     { ..flags_of(false), out: Some("dist/m.plyx") },
-    Ok(a_load),
+    a_load,
     Ok(an_artifact),
     Err(no_rejection),
     false,
@@ -1449,7 +1512,7 @@ test "an artifact that cannot be written is exit 2 with no tally" {
 test "a build fails with exit code 2 before writing anything when `--entry` names a definition that takes an argument" {
   let result = build_with(
     { ..no_flags, entry: Some("serve") },
-    Ok(a_load),
+    a_load,
     Err(no_rejection),
     Err(no_rejection),
     false,

@@ -10,10 +10,8 @@ import compiler.cc
 import compiler.cc (compilers, toolchain, WrittenPart)
 import compiler.syntax.parsing (no_module, dummy_span)
 import compiler.unit
-import compiler.unit (Emission, LevelTally, UnitContents, WholeLowering, shipped, shipped_runtime,
-                      results_store, emitted, emitter_identity, unit_parts, cache_parts,
-                      code_rejections, entry_rejections, lowered_whole)
-import compiler.store.records (Record, record_store, with_record_store)
+import compiler.unit (WholeLowering, shipped, shipped_runtime, cache_parts, code_rejections,
+                      entry_rejections, lowered_whole, whole_program_text)
 import compiler.emit.keys (RootKey, Named, EntryPoint)
 import compiler.front.checking (LoadInputs)
 import compiler.front.checking.units (Entries, PartCode, ProgramCode, codes_of_part, decoded_code,
@@ -22,7 +20,8 @@ import compiler.front.checking.units (Entries, PartCode, ProgramCode, codes_of_p
 import compiler.front.checking.world (decode_cache)
 import compiler.store.memo (memo)
 import compiler.store.memo_files
-import compiler.front.facts (CheckedProgram)
+import compiler.front.facts (CheckedProgram, ProgramListing)
+import compiler.check.infer.checker (ConstructorInfo)
 import program (ProgramPlace, Session, TimedLoad, in_program_store, loaded_analysis, store_of,
                 whole_front)
 import std.env (env)
@@ -34,8 +33,6 @@ import std.time (time)
 import std.path (strip_root)
 import proof.obligation (plural)
 import report (indent)
-
-pub type WholeUnit = { sources: List<cc::Source>, contents: UnitContents }
 
 pub type CodeProgram = {
   place: ProgramPlace,
@@ -51,121 +48,23 @@ pub type Emitted = {
 }
 
 pub effect emit {
-  read unit(front: LoadedAnalysis, offered: List<RootKey>, entered: Option<List<RootKey>>) -> Result<WholeUnit, List<Diagnostic>>
   read code(program: CodeProgram, roots: List<RootKey>) -> Result<Emitted, List<Diagnostic>>
   read compiled(sources: List<cc::Source>, profile: cc::Profile) -> Result<String, List<Diagnostic>>
   read libraries(emitted: Emitted, profile: cc::Profile) -> Result<String, List<Diagnostic>>
 }
 
-fn emitted_of(
-  front: LoadedAnalysis,
-  emission: Result<Emission, Bytes>,
-) -> Result<WholeUnit, List<Diagnostic>> / {toolchain.read, toolchain.write, abort.raise} =
-  match unit_parts(front.dump, emission) {
-    Err(diagnostics) -> Err(diagnostics),
-    Ok(parts) -> match cache_parts(parts) {
-      Err(reason) -> Err([unbuildable(reason)]),
-      Ok(sources) ->
-        Ok({
-          sources: sources,
-          contents: match emission {
-            Ok(e) -> e.produced.made,
-            Err(_) -> { bodies: [], requested: [], named: Map::new() },
-          },
-        }),
-    },
-  }
-
 pub effect set Emits = {shipped.runtime, shipped.definitions, toolchain.bodies_dir, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.report_view_used, Derives}
-
-fn cache_dir() -> String / {toolchain.bodies_dir, abort.raise} = strip_root(toolchain.bodies_dir())
 
 fn texts(front: LoadedAnalysis) -> List<Bytes> =
   front.files.map(|f: { path: String, name: String, text: Bytes }| f.text)
 
-fn report_emission(
-  emission: Result<Emission, Bytes>,
-  identity: Bytes,
-  ms: Int,
-) -> Unit / {env.variable, process.err[proc], abort.raise} =
-  match emission {
-    Err(_) -> (),
-    Ok(e) -> if env.variable("PLY_C_PHASES") != None {
-      let parts = e.produced.parts;
-      process.err[proc](
-        "phases: emitter " ++ String::of_bytes(identity) ++ ", " ++ e.cached.to_string()
-          ++ " cached results reused, "
-          ++ e.emitter_requests.to_string()
-          ++ " results requested in total, "
-          ++ parts.filter(|w: WrittenPart| w.text == None).len().to_string()
-          ++ " of "
-          ++ parts.len().to_string()
-          ++ " parts taken back, "
-          ++ ms.to_string()
-          ++ "ms",
-      )
-    },
-  }
-
-fn level_line(level: LevelTally) -> Option<String> / {abort.raise} =
-  if level.emitter_requests == 0 { None } else {
-    Some(
-      indent ++ "generated C for " ++ level.emitter_requests.to_string() ++ " "
-        ++ plural(level.emitter_requests, "function")
-        ++ ", level "
-        ++ (level.place + 1).to_string()
-        ++ " of "
-        ++ level.places.to_string(),
-    )
-  }
-
-fn report_level(level: LevelTally) -> Unit / {process.err[proc], abort.raise} =
-  match level_line(level) { Some(line) -> process.err[proc](line), None -> () }
-
-fn unit_of(
-  front: LoadedAnalysis,
-  offered: List<RootKey>,
-  entered: Option<List<RootKey>>,
-  reports_levels: Bool,
-) -> Result<WholeUnit, List<Diagnostic>> / {shipped.runtime, shipped.definitions, toolchain.bodies_dir, env.variable, fs.read[abs], fs.write[abs], time.elapsed_ms, process.err[proc], toolchain.read, toolchain.write, abort.raise} = {
-  let identity = emitter_identity(shipped.definitions());
-  let runtime = shipped_runtime();
-  let started = time.elapsed_ms();
-  let emission = with_record_store[abs, ans](results_store(cache_dir(), runtime, identity), ||
-    emitted(
-      runtime,
-      front.dump,
-      texts(front),
-      front.inputs,
-      offered,
-      |key: Bytes| record_store.get[ans](key),
-      |rs: List<Record>| record_store.put[ans](rs),
-      phases: if reports_levels { Some({ now: || time.elapsed_ms(), outcome: report_level }) }
-      else { None },
-      entered: entered,
-      source_cached: Some(|digest: String| cc::is_source_cached(digest)),
-    ));
-  report_emission(emission, identity, time.elapsed_ms() - started);
-  emitted_of(front, emission)
-}
-
-pub fn text_of(
-  r: Result<WholeUnit, List<Diagnostic>>,
-) -> Result<Bytes, List<Diagnostic>> / {toolchain.read, abort.raise} =
-  match r {
-    Err(diagnostics) -> Err(diagnostics),
-    Ok(e) -> match unit::read_back(e.sources) {
-      Err(reason) -> Err([unbuildable(reason)]),
-      Ok(text) -> Ok(text),
-    },
-  }
-
 pub effect set EmbeddedFiles = {fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs]}
 
-pub fn code_program(timed: TimedLoad, view: CheckedProgram) -> CodeProgram / {abort.raise} = {
-  let front = loaded_analysis(timed, view);
-  { place: timed.program.place, inputs: front.inputs, roots: machine::roots_of(front.dump) }
-}
+pub fn code_program(timed: TimedLoad, view: CheckedProgram) -> CodeProgram / {abort.raise} =
+  code_program_over(timed.program.place, loaded_analysis(timed, view))
+
+pub fn code_program_over(place: ProgramPlace, front: LoadedAnalysis) -> CodeProgram =
+  { place: place, inputs: front.inputs, roots: machine::roots_of(front.dump) }
 
 pub fn code_program_of<a>(
   s: Session<a>,
@@ -205,13 +104,11 @@ pub fn library_of(
   }
 
 pub fn emitting<a | e>(
-  reports_levels: Bool,
-  body: () -> a / {emit.unit, emit.code, emit.compiled, emit.libraries | e},
+  body: () -> a / {emit.code, emit.compiled, emit.libraries | e},
 ) -> a / {abort.raise, Emits | e} =
   handle {
     body()
   } with {
-    emit.unit(front, offered, entered) -> unit_of(front, offered, entered, reports_levels),
     emit.code(program, roots) -> code_of(program, roots),
     emit.compiled(sources, profile) -> compiled_of(sources, profile),
     emit.libraries(emitted, profile) -> if by_tcc(profile) { part_libraries[tcc](emitted, profile) }
@@ -317,6 +214,36 @@ fn stored_codes(
     else { memo_files::outputs_by_digest[abs](store_of(r), digests) },
   }
 
+pub type WholeProgram = { code: CodeProgram, constructors: List<Bytes>, modules: Int }
+
+pub fn whole_program(code: CodeProgram, listing: ProgramListing) -> WholeProgram =
+  {
+    code: code,
+    constructors: listing.checked.constructors.map(|c: ConstructorInfo| c.name),
+    modules: listing.outlines.len(),
+  }
+
+pub fn whole_text(
+  program: WholeProgram,
+  roots: List<RootKey>,
+) -> Result<Bytes, List<Diagnostic>> / {emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, abort.raise} =
+  match emit.code(program.code, roots) {
+    Err(diagnostics) -> Err(diagnostics),
+    Ok(e) -> {
+      let digests = e.code.parts.fold([], |all: List<Bytes>, p: PartCode| all.concat(p.made.codes));
+      let stored = stored_codes(e, digests);
+      let codes = digests.map(|digest: Bytes|
+        match stored.get(digest) {
+          Some(b) -> decoded_code(b),
+          None -> panic("a part's code is missing from the database that listed it"),
+        });
+      match code_rejections(shipped_runtime(), codes) {
+        [] -> Ok(whole_program_text(codes, program.constructors, program.modules, e.inputs)),
+        rejected -> Err(rejected),
+      }
+    },
+  }
+
 type KnownPart = { part: PartCode, library: Option<String> }
 
 fn part_sources(
@@ -416,19 +343,4 @@ fn compiled_of(
   let built = if by_tcc(profile) { cc::library[tcc](profile, sources) }
   else { cc::library[cc](profile, sources) };
   match built { Ok(path) -> Ok(path), Err(reason) -> Err([unbuildable(reason)]) }
-}
-
-test "a level with no emitter work prints nothing, and any other level prints the run's progress" {
-  let level = {
-    place: 2,
-    places: 5,
-    roots: 4,
-    cached: 1,
-    emitter_requests: 3,
-    steps: 9,
-    began: 0,
-    ended: 1,
-  };
-  assert(level_line(level).unwrap_or("").ends_with("level 3 of 5"), None);
-  assert(level_line({ ..level, emitter_requests: 0 }) == None, None)
 }
