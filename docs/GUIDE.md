@@ -121,9 +121,8 @@ and flag.
 
 ### 1.5 The cache
 
-`ply` stores its work in `.ply-cache/` at the project root: a database of checked modules, a second
-database for the source `ply build` prints, saved baselines for `ply review` and fetched
-dependencies. Add it to `.gitignore`. Deleting it is always safe, and `ply cache clear` empties it.
+`ply` stores its work in `.ply-cache/` at the project root: a database of checked modules, saved
+baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is always safe, and `ply cache clear` empties it.
 A run that crashes, or that races another run, can make a later run redo work, but never gives a
 wrong result.
 

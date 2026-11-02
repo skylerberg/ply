@@ -5,11 +5,12 @@ import args (Flags, no_flags, style_of, root_of)
 import literals (evaluation, site_errors)
 import update_costs (measure_errors, cost_checker)
 import entries
+import entries (Runnable)
 import std.path (normalize)
 import builder (LoadedProgram, Rejection)
 import builder (builder)
 import artifact_builder (LibraryUnit, BuiltArtifact, Named, PreviousArtifact, Dependencies,
-                         PrintedProgram, artifacts, with_artifacts)
+                         artifacts, with_artifacts)
 import units
 import units (EmbeddedFiles, WholeProgram, emit)
 import compiler.unit (emitter_identity, shipped)
@@ -392,7 +393,6 @@ fn built_json(
     { key: "artifact_bytes", value: int(sealed.bytes.len()) },
     { key: "binary_bytes", value: int_or_null(loaded.binary_bytes) },
     { key: "signed_by", value: string_or_null(signer) },
-    { key: "printed_program", value: object(reuse_members(made.checked, 0)) },
     { key: "diagnostics", value: all_to_json([], loaded.places) },
   ])
 
@@ -719,11 +719,21 @@ fn assemble(
   entry: String,
   startup: List<String>,
 ) -> CommandOutput / {artifact_written.stored, artifacts.made, artifacts.previous, fs.read_file[cwd], fs.read_file[abs], fs.read_secret[cwd], fs.read_secret[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.write_file[cwd], fs.write_file[abs], fs.kind[abs], abort.raise} =
-  match artifacts.made(input.listing, entry, startup, has_diff(flags)) {
-    Err(reason) -> reported(style, "build", reason.diagnostics, input.loaded.places),
-    Ok(m) -> match seal(encode(m.head, m.sections)) {
+  match input.program {
+    Err(diagnostics) -> reported(style, "build", diagnostics, input.loaded.places),
+    Ok(program) -> match artifacts.made(
+        input.listing,
+        program,
+        input.runnable,
+        entry,
+        startup,
+        has_diff(flags),
+      ) {
       Err(reason) -> reported(style, "build", reason.diagnostics, input.loaded.places),
-      Ok(x) -> deliver(style, flags, input.loaded, m, x),
+      Ok(m) -> match seal(encode(m.head, m.sections)) {
+        Err(reason) -> reported(style, "build", reason.diagnostics, input.loaded.places),
+        Ok(x) -> deliver(style, flags, input.loaded, m, x),
+      },
     },
   }
 
@@ -853,6 +863,7 @@ type BuildInput = {
   startup: Result<List<String>, Diagnostic>,
   listing: ProgramListing,
   program: Result<WholeProgram, List<Diagnostic>>,
+  runnable: Runnable,
   committed: List<String>,
 }
 
@@ -861,58 +872,6 @@ fn listing_read(s: Session<BuildReading>) -> ProgramListing / {ProgramStore, abo
     Some(listing) -> listing,
     None -> in_program_store(s.place, |_: LoadInputs| view::listed(s.modules)).value,
   }
-
-fn printed_project(real: Project, files: List<SourceFile>) -> Project / {abort.raise} = {
-  let places = real.packages.fold(real.files, |all: List<File>, p: DependencyPackage|
-    all.concat(p.files)).fold(Map::new(), |found: Map<String, RootedPath>, f: File|
-    found.insert(f.module, f.at));
-  let own = files.map(|f: SourceFile|
-    {
-      path: f.path,
-      module: f.name,
-      text: f.text,
-      at: places.get(f.name).unwrap_or(paths::rooted_path(f.path)),
-    });
-  {
-    files: own,
-    sources: own.map(|f: File| { name: Bytes::of_string(f.module), source_text: f.text }),
-    diagnostics: [],
-    manifest: None,
-    packages: [],
-    root_key: "",
-  }
-}
-
-fn printed_store(root: ResolvedPath) -> ResolvedPath =
-  { ..root, root_path: paths::in_root(root, ".ply-cache/build").path }
-
-fn printed_program<a>(
-  s: Session<a>,
-  files: List<SourceFile>,
-) -> Result<PrintedProgram, List<Diagnostic>> / {ProgramStore, shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], time.elapsed_ms, time.now_ms, entropy.next, EmbeddedFiles, abort.raise} = {
-  let store = match s.place.store { Some(r) -> [printed_store(r)], None -> [] };
-  match session_over(
-      store,
-      printed_project(s.project, files),
-      time.elapsed_ms(),
-      false,
-      s.place.store == None,
-      |modules: Modules, _: ProgramSummary|
-        { listing: view::listed(modules), rollups: view::rollups(modules) },
-    ) {
-    Err(r) -> Err(r.diagnostics),
-    Ok(checked) -> match units::code_program_of(checked, checked.value.rollups) {
-      Err(diagnostics) -> Err(diagnostics),
-      Ok(code) ->
-        Ok({
-          listing: checked.value.listing,
-          code: units::whole_program(code, checked.value.listing),
-          runnable: entries::runnable_from_rollups(checked.value.rollups),
-          tallies: checked.tallies,
-        }),
-    },
-  }
-}
 
 fn loaded_from(
   flags: Flags,
@@ -932,17 +891,13 @@ fn loaded_from(
   }
 }
 
-fn library_program(
-  flags: Flags,
+fn project_program(
   s: Session<BuildReading>,
   listing: ProgramListing,
-  mains: List<Main>,
 ) -> Result<WholeProgram, List<Diagnostic>> / {EmbeddedFiles, abort.raise} =
-  if flags.entry != None || mains.len() > 0 { Err([]) } else {
-    match units::code_program_of(s, s.value.later.rollups) {
-      Err(diagnostics) -> Err(diagnostics),
-      Ok(code) -> Ok(units::whole_program(code, listing)),
-    }
+  match units::code_program_of(s, s.value.later.rollups) {
+    Err(diagnostics) -> Err(diagnostics),
+    Ok(code) -> Ok(units::whole_program(code, listing)),
   }
 
 fn fresh_build(
@@ -950,7 +905,7 @@ fn fresh_build(
   flags: Flags,
   schema: Option<String>,
   opened: Session<BuildReading>,
-) -> { output: CommandOutput, written: Option<StoredArtifact> } / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, shipped.read_pack, emit.code, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_view_used, shipped.binary_size, shipped.version} = {
+) -> { output: CommandOutput, written: Option<StoredArtifact> } / {toolchain.reuse_dir, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], shipped.read_pack, emit.code, shipped.names, shipped.module, shipped.definitions, shipped.runtime, fs.read_file[cwd], fs.read_file[abs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], cost_checker.report, evaluation.verdicts, evaluation.statements, Derives, abort.raise, shipped.report_view_used, shipped.binary_size, shipped.version} = {
   let places = places_of(opened);
   match measure_errors(opened.place).concat(site_errors(opened, opened.value.later, places)) {
     [] -> match pins_of(opened.project) {
@@ -964,12 +919,12 @@ fn fresh_build(
           definitions: definitions_of(listing),
           startup: startup_of(listing, schema),
           listing: listing,
-          program: library_program(flags, opened, listing, loaded.mains),
+          program: project_program(opened, listing),
+          runnable: entries::runnable_from_rollups(opened.value.later.rollups),
           committed: lock::committed_packages(pinned.packages),
         };
         handle {
-          with_artifacts(|files: List<SourceFile>| printed_program(opened, files), ||
-            build_program(s, flags, input))
+          with_artifacts(|| build_program(s, flags, input))
         } with {
           var written = None,
           artifact_written.stored(artifact) -> {
@@ -1230,7 +1185,6 @@ const an_artifact: BuiltArtifact =
     definitions: 1,
     names: [{ name: "m.main", hash: "aa" }],
     closures: [],
-    checked: [],
   }
 
 fn flags_of(json: Bool) -> Flags = { ..no_flags, json: json }
@@ -1403,10 +1357,11 @@ fn build_with(
       startup: Ok([]),
       listing: no_listing(),
       program: Err([]),
+      runnable: { roots: [], declared: [], performed: [] },
       committed: [],
     })
   } with {
-    artifacts.made(listing, entry, startup, reachable) -> m,
+    artifacts.made(listing, program, runnable, entry, startup, reachable) -> m,
     artifacts.previous(path, bytes) -> was,
     fs.read_file[cwd](path) -> lockfile(path),
     fs.read_file[abs](path) -> lockfile(path),

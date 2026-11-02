@@ -1,6 +1,6 @@
 import builder (Rejection)
 import entries
-import entries (Runnable, runnable_bin)
+import entries (RootSpan, Runnable, runnable_bin)
 import std.bin
 import units
 import units (WholeProgram, emit)
@@ -9,8 +9,8 @@ import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
 import compiler.front.facts (ProgramListing, listing_of)
 import compiler.front.published (analyse)
-import compiler.store.memo (QueryStats)
-import compiler.front.rows (Outline, OutlineItem, OutlinedEffect, OutlinedFunction, OutlinedType)
+import compiler.front.rows (DeclaredEffect, ModuleSpan, Outline, OutlineItem, OutlinedEffect,
+                            OutlinedFunction, OutlinedType)
 import compiler.store.hash.forms (ClosureEntry, HashOutput, by_name, build_closure, walk)
 import compiler.store.hash.printer (Printed, Unprintable, print_bodies)
 import compiler.store.hash (body_key)
@@ -20,6 +20,7 @@ import compiler.store.plyx (Header, SectionLocation, Section, decode, digest_of,
                             domain)
 import compiler.store.segments (read_u32)
 import compiler.check.infer.checker (DefinitionInfo)
+import compiler.check.types (Effect, effect_list_text)
 import compiler.check.resolve.tables (Diagnostic, error_at, qualify)
 import compiler.unit (compiler_roots, identity_of, shipped)
 import compiler.emit.abi (Native)
@@ -46,7 +47,6 @@ pub type BuiltArtifact = {
   definitions: Int,
   names: List<Named>,
   closures: List<Dependencies>,
-  checked: List<QueryStats>,
 }
 
 pub type LibraryUnit = { head: Header, count: Int, payload: Bytes }
@@ -76,29 +76,21 @@ fn source_digest(payload_of: (Bytes) -> Bytes) -> Bytes =
   )
 
 pub effect artifacts {
-  read made(listing: ProgramListing, entry: String, startup: List<String>, reaches: Bool) -> Result<BuiltArtifact, Rejection>
+  read made(listing: ProgramListing, program: WholeProgram, runnable: Runnable, entry: String, startup: List<String>, reaches: Bool) -> Result<BuiltArtifact, Rejection>
   read previous(path: String, bytes: Option<Bytes>) -> Result<PreviousArtifact, Rejection>
   read unit(program: WholeProgram, names: List<String>) -> Result<LibraryUnit, Rejection>
-}
-
-pub type PrintedProgram = {
-  listing: ProgramListing,
-  code: WholeProgram,
-  runnable: Runnable,
-  tallies: List<QueryStats>,
 }
 
 pub type PreviousArtifact = { digest: String, names: List<Named> }
 
 pub fn with_artifacts<a | e>(
-  printed: (List<SourceFile>) -> Result<PrintedProgram, List<Diagnostic>> / e,
   body: () -> a / {artifacts.made, artifacts.previous, artifacts.unit | e},
 ) -> a / {abort.raise, emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, shipped.names, shipped.definitions | e} =
   handle {
     body()
   } with {
-    artifacts.made(listing, entry, startup, include_closures) ->
-      build_artifact(listing, printed, entry, startup, include_closures),
+    artifacts.made(listing, program, runnable, entry, startup, include_closures) ->
+      build_artifact(listing, program, runnable, entry, startup, include_closures),
     artifacts.previous(path, bytes) -> previous(path, bytes),
     artifacts.unit(program, names) -> library_unit(program, names),
   }
@@ -326,44 +318,6 @@ fn printed_files(
   }
 }
 
-fn printed_as(files: List<SourceFile>, name: Bytes) -> List<Bytes> / {abort.raise} = {
-  let module = module_of(name);
-  let simple = name.slice(module.len() + 1, name.len());
-  let heads = [
-    b"pub fn ",
-    b"pub const ",
-    b"pub type ",
-    b"pub opaque type ",
-    b"pub effect ",
-    b"pub nondet effect ",
-  ].map(|h: Bytes| h.concat(simple));
-  let declares = |item: Bytes|
-    heads.any(|h: Bytes|
-      item.len() > h.len() && item.starts_with(h) && [40, 60, 32, 58].contains(item.at(h.len())));
-  files.fold([], |accumulator: List<Bytes>, f: SourceFile|
-    if Bytes::of_string(f.name) != module { accumulator } else {
-      f.text.split(b"\n\n").fold(accumulator, |a: List<Bytes>, item: Bytes|
-        if declares(item) { a.push(b"printed as:\n".concat(item)) } else { a })
-    })
-}
-
-fn first_mismatch(
-  pairs: List<NamedHash>,
-  bodies: Map<Bytes, Bytes>,
-  again: HashOutput,
-) -> Option<Bytes> / {abort.raise} = {
-  let definitions = by_name(again.definitions);
-  let declarations = by_name(again.declarations);
-  let rebuilt = bodies_of(again, pairs);
-  let hashed = |pair: NamedHash|
-    definitions.get(pair.name) == Some(pair.hash) || declarations.get(pair.name) == Some(pair.hash);
-  match pairs.filter(|pair: NamedHash|
-      !hashed(pair) || rebuilt.get(pair.hash) != bodies.get(pair.hash)) {
-    [pair, ..] -> Some(pair.name),
-    [] -> None,
-  }
-}
-
 fn names_of_pairs(pairs: List<NamedHash>) -> List<Bytes> =
   pairs.fold(Map::new(), |accumulator: Map<Bytes, Bool>, pair: NamedHash|
     accumulator.insert(pair.name, true)).keys(
@@ -442,13 +396,14 @@ fn closure_section(files: List<SourceFile>) -> Section =
     ),
   }
 
-pub fn build_artifact<| e>(
+pub fn build_artifact(
   listing: ProgramListing,
-  printed: (List<SourceFile>) -> Result<PrintedProgram, List<Diagnostic>> / e,
+  program: WholeProgram,
+  runnable: Runnable,
   entry: String,
   startup: List<String>,
   include_closures: Bool,
-) -> Result<BuiltArtifact, Rejection> / {emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, shipped.names, shipped.definitions, abort.raise | e} = {
+) -> Result<BuiltArtifact, Rejection> / {emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, shipped.names, shipped.definitions, abort.raise} = {
   let hashes = listing.hashes;
   let definitions = by_name(hashes.definitions);
   let roots = startup.push(entry).map(Bytes::of_string);
@@ -467,70 +422,44 @@ pub fn build_artifact<| e>(
           ),
         [] -> match printed_files(listing.outlines, closure, bodies) {
           Err(d) -> Err(rejection([d])),
-          Ok(files) -> match printed(files) {
-            Err(diagnostics) ->
-              Err(
-                rejection([
-                  internal_error(
-                    "the source regenerated from the stored definitions fails the compiler's checks",
-                    diagnostics.take(1).map(|d: Diagnostic|
-                      Bytes::concat_all([d.code, b": ", d.message])),
-                  ),
-                ]),
-              ),
-            Ok(again) -> match first_mismatch(pairs, bodies, again.listing.hashes) {
-              Some(n) ->
-                Err(
-                  rejection([
-                    internal_error(
-                      "the source printed back from the stored definitions defines `"
-                        ++ String::of_bytes(n)
-                        ++ "` differently from the original program",
-                      printed_as(files, n),
-                    ),
-                  ]),
-                ),
-              None -> match whole_unit(again, closure) {
-                Err(diagnostics) -> Err(rejection(diagnostics)),
-                Ok(unit) -> {
-                  let entry_hash = match definitions.get(Bytes::of_string(entry)) {
-                    Some(h) -> h,
-                    None -> b"",
-                  };
-                  let sections = named_sections(pairs).push(closure_section(files));
-                  let runnable = bin::encode(
-                    {
-                      entry: entry,
-                      made_from: source_digest(|name: Bytes|
-                        match sections.find(|s: Section| s.name == name) {
-                          Some(s) -> s.payload,
-                          None -> b"",
-                        }),
-                      runnable: again.runnable,
-                    },
-                    runnable_section_bin(),
-                  );
-                  Ok({
-                    entry: entry,
-                    entry_hash: entry_hash.hex_of(),
-                    startup: startup,
-                    head: header_of(entry_hash),
-                    sections: flatten([
-                      [bodies_section(bodies)],
-                      sections,
-                      [
-                        { name: b"runnable", count: 1, payload: runnable },
-                        { name: b"unit", count: 1, payload: gzip::gzip(unit) },
-                      ],
-                    ]),
-                    definitions: bodies.keys().len(),
-                    names: pairs.map(|pair: NamedHash|
-                      { name: String::of_bytes(pair.name), hash: pair.hash.hex_of() }),
-                    closures: if include_closures { closures_of(closure) } else { [] },
-                    checked: again.tallies,
-                  })
+          Ok(files) -> match closure_unit(listing, program, closure) {
+            Err(diagnostics) -> Err(rejection(diagnostics)),
+            Ok(unit) -> {
+              let entry_hash = match definitions.get(Bytes::of_string(entry)) {
+                Some(h) -> h,
+                None -> b"",
+              };
+              let sections = named_sections(pairs).push(closure_section(files));
+              let runnable_section = bin::encode(
+                {
+                  entry: entry,
+                  made_from: source_digest(|name: Bytes|
+                    match sections.find(|s: Section| s.name == name) {
+                      Some(s) -> s.payload,
+                      None -> b"",
+                    }),
+                  runnable: closure_runnable(runnable, listing, closure),
                 },
-              },
+                runnable_section_bin(),
+              );
+              Ok({
+                entry: entry,
+                entry_hash: entry_hash.hex_of(),
+                startup: startup,
+                head: header_of(entry_hash),
+                sections: flatten([
+                  [bodies_section(bodies)],
+                  sections,
+                  [
+                    { name: b"runnable", count: 1, payload: runnable_section },
+                    { name: b"unit", count: 1, payload: gzip::gzip(unit) },
+                  ],
+                ]),
+                definitions: bodies.keys().len(),
+                names: pairs.map(|pair: NamedHash|
+                  { name: String::of_bytes(pair.name), hash: pair.hash.hex_of() }),
+                closures: if include_closures { closures_of(closure) } else { [] },
+              })
             },
           },
         },
@@ -539,17 +468,58 @@ pub fn build_artifact<| e>(
   }
 }
 
-fn whole_unit(
-  again: PrintedProgram,
+fn reached_names(closure: List<ClosureEntry>) -> Map<Bytes, Bool> =
+  closure.fold(Map::new(), |found: Map<Bytes, Bool>, x: ClosureEntry| found.insert(x.name, true))
+
+fn closure_unit(
+  listing: ProgramListing,
+  program: WholeProgram,
   closure: List<ClosureEntry>,
 ) -> Result<Bytes, List<Diagnostic>> / {emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, abort.raise} = {
-  let defined = again.listing.checked.definitions.fold(
+  let reached = reached_names(closure);
+  let names = listing.checked.definitions.fold(
     Map::new(),
-    |found: Map<Bytes, Bool>, d: DefinitionInfo| found.insert(d.name, true),
+    |found: Map<Bytes, Bool>, d: DefinitionInfo|
+      if reached.contains(d.name) { found.insert(d.name, true) } else { found },
   );
-  let names = closure.fold(Map::new(), |found: Map<Bytes, Bool>, x: ClosureEntry|
-    if x.declaration || !defined.contains(x.name) { found } else { found.insert(x.name, true) });
-  units::whole_text(again.code, names.keys().map(|n: Bytes| keys::Named(n)))
+  let modules = closure.fold(Map::new(), |found: Map<Bytes, Bool>, x: ClosureEntry|
+    found.insert(module_of(x.name), true));
+  units::whole_text(
+    { ..program, modules: modules.keys().len() },
+    names.keys().map(|n: Bytes| keys::Named(n)),
+  )
+}
+
+const no_place: ModuleSpan = { module: 0, start: 0, end: 0 }
+
+fn closure_runnable(
+  whole: Runnable,
+  listing: ProgramListing,
+  closure: List<ClosureEntry>,
+) -> Runnable / {abort.raise} = {
+  let reached = reached_names(closure);
+  {
+    roots: whole.roots.fold(Map::new(), |found: Map<Bytes, RootSpan>, r: RootSpan|
+      if reached.contains(keys::definition_of_root(r.root)) {
+        found.insert(r.root, { ..r, at: no_place })
+      } else { found }).values(
+    ),
+    declared: whole.declared.fold(
+      Map::new(),
+      |found: Map<Bytes, DeclaredEffect>, e: DeclaredEffect|
+        if reached.contains(e.name) { found.insert(e.name, { ..e, at: no_place }) } else { found },
+    ).values(
+    ),
+    performed: listing.checked.definitions.fold(
+      Map::new(),
+      |found: Map<Bytes, Effect>, d: DefinitionInfo|
+        if !reached.contains(d.name) { found } else {
+          d.effects.fold(found, |f: Map<Bytes, Effect>, e: Effect|
+            f.insert(effect_list_text([e], b","), e))
+        },
+    ).values(
+    ),
+  }
 }
 
 fn flatten<a>(parts: List<List<a>>) -> List<a> =
@@ -1000,19 +970,20 @@ test "`path_of` maps a module name to its source file path, and `module_of` maps
   assert_eq(module_of(b"app.orders.total"), b"app.orders")
 }
 
-test "`printed_as` returns the source text of a definition from the file of the module that declares it, and from no other file" {
-  let files = [
-    {
-      path: "app/orders.ply",
-      name: "app.orders",
-      text: b"import lib\n\npub fn total(_l0: Int) -> Int = _l0\n\npub fn totals() -> Int = 1\n\npub type Total = { n: Int }\n",
-    },
-    { path: "app.ply", name: "app", text: b"pub fn total() -> Int = 2\n" },
-  ];
-  assert_eq(printed_as(files, b"app.orders.total"), [
-    b"printed as:\npub fn total(_l0: Int) -> Int = _l0",
-  ]);
-  assert_eq(printed_as(files, b"app.orders.Total"), [b"printed as:\npub type Total = { n: Int }\n"])
+fn listing_over(source: Bytes) -> ProgramListing / {abort.raise} =
+  match analyse(parse_all([{ name: b"m", source_text: source }])) {
+    Rejected(_) -> panic("the fixture checks"),
+    Analysed(w) -> listing_of(checked_program_of(w)),
+  }
+
+fn printed_from(listing: ProgramListing) -> List<SourceFile> / {abort.raise} = {
+  let closure = build_closure(listing.hashes, [b"m.main"]);
+  let printed = handle {
+    printed_files(listing.outlines, closure, bodies_of(listing.hashes, pairs_of(closure)))
+  } with {
+    shipped.names() -> [],
+  };
+  match printed { Ok(files) -> files, Err(_) -> panic("the fixture prints") }
 }
 
 fn printed_lines(body: Bytes) -> List<Bytes> / {abort.raise} = {
@@ -1021,23 +992,54 @@ fn printed_lines(body: Bytes) -> List<Bytes> / {abort.raise} = {
     body,
     b"\n\npub fn main() -> Int = kept() + edited()\n",
   ]);
-  match analyse(parse_all([{ name: b"m", source_text: source }])) {
-    Rejected(_) -> panic("the fixture checks"),
-    Analysed(w) -> {
-      let listing = listing_of(checked_program_of(w));
-      let closure = build_closure(listing.hashes, [b"m.main"]);
-      let printed = handle {
-        printed_files(listing.outlines, closure, bodies_of(listing.hashes, pairs_of(closure)))
-      } with {
-        shipped.names() -> [],
-      };
-      match printed {
-        Ok(files) ->
-          files.fold([], |lines: List<Bytes>, f: SourceFile| lines.concat(f.text.split(b"\n"))),
-        Err(_) -> panic("the fixture prints"),
-      }
-    },
-  }
+  printed_from(listing_over(source)).fold([], |lines: List<Bytes>, f: SourceFile|
+    lines.concat(f.text.split(b"\n")))
+}
+
+test "the printed source defines each definition exactly as the program does" {
+  let listing = listing_over(
+    Bytes::of_string(
+      \\type T = | A(Int, Int) | B(Int, Int) | C
+      \\
+      \\effect log {
+      \\  write emit(n: Int) -> Unit
+      \\}
+      \\
+      \\fn swapped(t: T) -> Int = match t { A(x, y) | B(y, x) -> x * 10 + y, C -> 0 }
+      \\
+      \\fn first(xs: List<Int>) -> Int = {
+      \\  let [x, ..] = xs else { 0 - 1 };
+      \\  x
+      \\}
+      \\
+      \\fn made(n: Int) -> List<Int>
+      \\  returns fresh
+      \\= [n, n]
+      \\
+      \\fn noted<| e>(n: Int, f: (Int) -> Int / e) -> Int / {log.write bounded | e bounded} = {
+      \\  log.emit(n);
+      \\  f(n)
+      \\}
+      \\
+      \\fn digit(b: Int) -> Int = match b { b'0'..=b'9' -> b - b'0', _ -> 0 - 1 }
+      \\
+      \\pub fn main() -> Int =
+      \\  swapped(A(1, 2)) + first(made(7)) + digit(b'4')
+      \\    + (handle { noted(3, |n: Int| n * 100) } with { log.emit(n) -> () })
+    ),
+  );
+  let again = match printed_from(listing) {
+    [file] -> listing_over(file.text),
+    _ -> panic("the fixture prints one module"),
+  };
+  let definitions = by_name(again.hashes.definitions);
+  let declarations = by_name(again.hashes.declarations);
+  assert_eq(
+    pairs_of(build_closure(listing.hashes, [b"m.main"])).filter(|pair: NamedHash|
+      definitions.get(pair.name) != Some(pair.hash)
+        && declarations.get(pair.name) != Some(pair.hash)).map(|pair: NamedHash| pair.name),
+    [],
+  )
 }
 
 test "a body edit leaves every other line of the printed program alone" {
