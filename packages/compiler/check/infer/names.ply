@@ -1,3 +1,6 @@
+import compiler.check.resolve.tables (declared_in, declarations_named, no_declarations,
+                                      module_index)
+import compiler.check.resolve.tables (module_names)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
 import compiler.check.infer.checker (program, is_type_declared, is_record_declared, has_contract)
@@ -24,7 +27,7 @@ pub fn global(
   checker: Checker,
   namespace: Namespace,
   qualified_name: QName,
-) -> { checker: Checker, name: Option<Bytes> } / {abort.raise, program.read} =
+) -> { checker: Checker, name: Option<Bytes> } / {abort.raise, program.read, module_names.read} =
   if is_bare(qualified_name) {
     match lookup(scope_of(checker).bound, namespace, qualified_name.name.name) {
       Some(b) -> { checker: checker, name: Some(b.qualified) },
@@ -52,13 +55,14 @@ pub fn unresolved_in_derived(
   checker: Checker,
   qualified_name: QName,
   what: Bytes,
-) -> Checker / {abort.raise} = report(checker, derived_unresolved(checker, qualified_name, what))
+) -> Checker / {abort.raise, module_names.read} =
+  report(checker, derived_unresolved(checker, qualified_name, what))
 
 fn derived_unresolved(
   checker: Checker,
   qualified_name: QName,
   what: Bytes,
-) -> Diagnostic / {abort.raise} = {
+) -> Diagnostic / {abort.raise, module_names.read} = {
   let d = match checker.derived {
     Some(d) -> d,
     None ->
@@ -85,17 +89,7 @@ fn derived_unresolved(
     ]),
     match exported {
       Some(i) ->
-        [
-          Bytes::concat_all([
-            b"module `",
-            module_name(checker, i),
-            b"` exports it: add `import ",
-            module_name(checker, i),
-            b" (",
-            n,
-            b")`",
-          ]),
-        ],
+        [Bytes::concat_all([b"module `", i, b"` exports it: add `import ", i, b" (", n, b")`"])],
       None ->
         [
           Bytes::concat_all([
@@ -119,7 +113,7 @@ fn lookup_failure(
   checker: Checker,
   namespace: Namespace,
   qualified_name: QName,
-) -> Checker / {abort.raise, program.read} =
+) -> Checker / {abort.raise, program.read, module_names.read} =
   match qualified_name.module {
     None -> checker,
     Some(binder) -> if namespace == ValueSpace
@@ -127,18 +121,15 @@ fn lookup_failure(
       no_function_of(checker, binder.name, qualified_name.name)
     } else {
       let scope = scope_of(checker);
-      match scope.modules.fold(
-          None,
-          |accumulator: Option<Int>, binding: { binder: Bytes, target: Int, span: Span }|
-            match accumulator {
-              Some(_) -> accumulator,
-              None -> if binding.binder == binder.name { Some(binding.target) } else { None },
-            },
-        ) {
+      match scope.modules.fold(None, |accumulator: Option<Bytes>, binding: ModuleBinding|
+          match accumulator {
+            Some(_) -> accumulator,
+            None -> if binding.binder == binder.name { Some(binding.target) } else { None },
+          }) {
         None -> {
           let selective = scope.selected_modules.fold(
             None,
-            |accumulator: Option<{ binder: Bytes, target: Int, span: Span }>, binding: { binder: Bytes, target: Int, span: Span }|
+            |accumulator: Option<ModuleBinding>, binding: ModuleBinding|
               match accumulator {
                 Some(_) -> accumulator,
                 None -> if binding.binder == binder.name { Some(binding) } else { None },
@@ -148,7 +139,7 @@ fn lookup_failure(
           let label = b"not a module imported by this file";
           match selective {
             Some(sel) -> {
-              let module = checker.resolved.scopes.get(sel.target).module;
+              let module = sel.target;
               report_error_with_labels(
                 checker,
                 b"E0106",
@@ -213,8 +204,11 @@ fn lookup_failure(
           }
         },
         Some(owner) -> {
-          let declarations = checker.resolved.declarations.get(owner);
-          let module = checker.resolved.scopes.get(owner).module;
+          let declarations = match declarations_named(checker.resolved, owner) {
+            Some(d) -> d,
+            None -> no_declarations,
+          };
+          let module = owner;
           match lookup_declared(declarations, namespace, qualified_name.name.name) {
             None -> {
               let exported = declarations_in(declarations, namespace).fold(
@@ -260,7 +254,7 @@ fn lookup_failure(
                     private_name_error(
                       checker.module,
                       qualified_name.span,
-                      owner,
+                      module_index(checker.resolved, owner),
                       d.span,
                       namespace,
                       qualified_name.name.name,
@@ -281,7 +275,7 @@ pub fn local_at(checker: Checker, qualified_name: QName) -> Option<Int> =
 pub fn value_key(
   checker: Checker,
   qualified_name: QName,
-) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise, program.read} =
+) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise, program.read, module_names.read} =
   if !is_bare(qualified_name) {
     match look_up_language_type(checker, qualified_name) {
       Found(m) ->
@@ -314,7 +308,7 @@ pub type LanguageTypeLookup =
 pub fn look_up_language_type(
   checker: Checker,
   qualified_name: QName,
-) -> LanguageTypeLookup / {abort.raise, program.read} =
+) -> LanguageTypeLookup / {abort.raise, program.read, module_names.read} =
   match qualified_name.module {
     None -> NotLanguageType,
     Some(of) -> if !starts_upper(of.name) || method_binder_module(of.name) != None
@@ -330,7 +324,7 @@ pub fn look_up_language_type(
 fn value_key_global(
   checker: Checker,
   qualified_name: QName,
-) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise} = {
+) -> { checker: Checker, key: Option<ValueKey> } / {abort.raise, module_names.read} = {
   let name = qualified_name.name.name;
   match lookup(scope_of(checker).bound, ValueSpace, name) {
     Some(b) -> { checker: checker, key: Some(GlobalKey({ name: b.qualified, prelude: false })) },
@@ -341,7 +335,10 @@ fn value_key_global(
   }
 }
 
-pub fn declared_value(checker: Checker, qualified_name: QName) -> Option<Bytes> / {abort.raise} =
+pub fn declared_value(
+  checker: Checker,
+  qualified_name: QName,
+) -> Option<Bytes> / {abort.raise, module_names.read} =
   if is_bare(qualified_name) {
     match lookup(scope_of(checker).bound, ValueSpace, qualified_name.name.name) {
       Some(b) -> Some(b.qualified),
@@ -365,7 +362,7 @@ fn prelude_constructor(checker: Checker, qualified_name: QName) -> Option<Bytes>
 pub fn constructor_name(
   checker: Checker,
   qualified_name: QName,
-) -> { checker: Checker, name: Option<Bytes> } / {abort.raise, program.read} = {
+) -> { checker: Checker, name: Option<Bytes> } / {abort.raise, program.read, module_names.read} = {
   let g: WithName = global(checker, ValueSpace, qualified_name);
   match g.name {
     Some(n) -> g,
@@ -376,7 +373,7 @@ pub fn constructor_name(
 pub fn covered_constructor(
   checker: Checker,
   qualified_name: QName,
-) -> Option<Bytes> / {abort.raise, program.read} =
+) -> Option<Bytes> / {abort.raise, program.read, module_names.read} =
   match declared_value(checker, qualified_name) {
     Some(n) -> Some(n),
     None -> prelude_constructor(checker, qualified_name),
@@ -386,17 +383,20 @@ pub fn exporter(
   checker: Checker,
   namespace: Namespace,
   name: Bytes,
-) -> Option<Int> / {abort.raise} =
-  range(0, checker.resolved.declarations.len()).fold(None, |accumulator: Option<Int>, i: Int|
-    match accumulator {
-      Some(_) -> accumulator,
-      None -> if i == checker.module { None } else {
-        match lookup_declared(checker.resolved.declarations.get(i), namespace, name) {
-          Some(d) -> if d.public { Some(i) } else { None },
-          None -> None,
-        }
+) -> Option<Bytes> / {abort.raise, module_names.read} =
+  checker.resolved.names.map(|e: ModuleEntry| e.name).concat(module_names.every_module()).fold(
+    None,
+    |accumulator: Option<Bytes>, module: Bytes|
+      match accumulator {
+        Some(_) -> accumulator,
+        None -> if module == scope_of(checker).module { None } else {
+          match declared_in(checker.resolved, module, namespace, name) {
+            Some(d) -> if d.public { Some(module) } else { None },
+            None -> None,
+          }
+        },
       },
-    })
+  )
 
 fn nearest_name(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise} = {
   let written = String::of_bytes_lossy(name);
@@ -408,7 +408,7 @@ fn nearest_name(checker: Checker, name: Bytes) -> Option<Bytes> / {abort.raise} 
   }
 }
 
-fn imported(checker: Checker) -> List<Int> / {abort.raise} = {
+fn imported(checker: Checker) -> List<Bytes> / {abort.raise} = {
   let scope = scope_of(checker);
   scope.selected_modules.concat(scope.modules).map(|binding: ModuleBinding| binding.target)
 }
@@ -417,33 +417,39 @@ fn private_constructor_diagnostic(
   checker: Checker,
   namespace: Namespace,
   qualified_name: QName,
-  owners: List<Int>,
+  owners: List<Bytes>,
 ) -> Option<Diagnostic> / {abort.raise} =
   match namespace {
     ValueSpace ->
-      owners.fold(None, |found: Option<Diagnostic>, owner: Int|
+      owners.fold(None, |found: Option<Diagnostic>, owner: Bytes|
         match found {
           Some(_) -> found,
-          None -> if owner == checker.module { None } else {
-            opaque_constructor_error(
-              checker.modules,
-              checker.module,
-              qualified_name.span,
-              owner,
-              qualified_name.name.name,
-            )
+          None -> match checker.resolved.positions.get(owner) {
+            None -> None,
+            Some(at) -> if at == checker.module { None } else {
+              opaque_constructor_error(
+                checker.modules,
+                checker.module,
+                qualified_name.span,
+                at,
+                qualified_name.name.name,
+              )
+            },
           },
         }),
     _ -> None,
   }
 
-pub fn unknown_name(checker: Checker, qualified_name: QName) -> Checker / {abort.raise} =
+pub fn unknown_name(
+  checker: Checker,
+  qualified_name: QName,
+) -> Checker / {abort.raise, module_names.read} =
   report(checker, unknown_name_diagnostic(checker, qualified_name))
 
 pub fn unknown_name_diagnostic(
   checker: Checker,
   qualified_name: QName,
-) -> Diagnostic / {abort.raise} =
+) -> Diagnostic / {abort.raise, module_names.read} =
   match checker.derived {
     Some(_) -> derived_unresolved(checker, qualified_name, b"definition"),
     None -> match private_name_diagnostic(checker, qualified_name) {
@@ -465,7 +471,10 @@ pub fn private_name_diagnostic(
     },
   }
 
-fn unknown_name_here(checker: Checker, qualified_name: QName) -> Diagnostic / {abort.raise} = {
+fn unknown_name_here(
+  checker: Checker,
+  qualified_name: QName,
+) -> Diagnostic / {abort.raise, module_names.read} = {
   let n = qualified_name.name.name;
   let result = if !is_bare(qualified_name) || n != result_name { [] } else {
     match checker.spec_kind {
@@ -492,15 +501,7 @@ fn unknown_name_here(checker: Checker, qualified_name: QName) -> Diagnostic / {a
     match exporter(checker, ValueSpace, n) {
       Some(i) ->
         near.push(
-          Bytes::concat_all([
-            b"module `",
-            module_name(checker, i),
-            b"` exports it: add `import ",
-            module_name(checker, i),
-            b" (",
-            n,
-            b")`",
-          ]),
+          Bytes::concat_all([b"module `", i, b"` exports it: add `import ", i, b" (", n, b")`"]),
         ),
       None -> near,
     }
@@ -520,7 +521,7 @@ pub fn language_function(
   of: Bytes,
   name: Identifier,
   on_value: Bool,
-) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, program.read} = {
+) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, program.read, module_names.read} = {
   let declared = member_name(of, name.name);
   match lookup(scope_of(checker).bound, ValueSpace, declared) {
     Some(own) -> if own.qualified == qualify(prelude_module, declared)
@@ -553,7 +554,7 @@ fn builtin_or_home(
   name: Identifier,
   on_value: Bool,
   declared: Bytes,
-) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise} = {
+) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, module_names.read} = {
   let takes = !on_value
     || (match env_lookup(checker.env, declared) {
       Some(scheme) -> match scheme.ty {
@@ -578,14 +579,14 @@ fn home_function(
   checker: Checker,
   of: Bytes,
   name: Identifier,
-) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise} = {
+) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, module_names.read} = {
   let home = home_module(of);
   let seen = match checker.resolved.visible_modules.at(checker.module) {
-    Some(ks) -> ks,
+    Some(ks) -> ks.map(|k: Int| checker.resolved.scopes.get(k).module),
     None -> [],
   };
-  if !seen.fold(false, |found: Bool, k: Int|
-      found || checker.resolved.scopes.get(k).module == home) { None } else {
+  if !seen.contains(home)
+      && !module_names.modules_visible(scope_of(checker).module).contains(home) { None } else {
     let qualified_name = {
       module: Some({ name: method_binder(home), span: name.span }),
       name: { name: member_name(of, name.name), span: name.span },

@@ -26,7 +26,8 @@ import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, 
                               SpecClause, RequiresClause, EnsuresClause, CostClause, SpaceClause,
                               ReturnsParam, Binder, ImportDeclaration, SelectedNames, result_name,
                               test_run, test_listing, case_params)
-import compiler.check.resolve.tables (Resolution, Namespace, ValueSpace, TypeSpace, EffectSpace,
+import compiler.check.resolve.tables (with_no_other_modules, module_names, module_binding_in,
+                                      Resolution, Namespace, ValueSpace, TypeSpace, EffectSpace,
                                       SetSpace, Binding, find_module_binding, lookup_declared,
                                       namespaces)
 import compiler.check.resolve.scopes (find)
@@ -36,7 +37,7 @@ pub type Refers =
   | Local(Int)
   | Definition({ qualified: Bytes, namespace: Namespace })
   | Operation({ effect: Bytes, name: Bytes })
-  | ModuleQualifier(Int)
+  | ModuleQualifier(Bytes)
   | Unbound
 
 pub type Reference = {
@@ -60,8 +61,8 @@ pub type FieldOf = | RecordAt(Int) | RecordFields(List<Bytes>) | TypeNamed(Bytes
 pub type Written = { references: List<Reference>, members: List<Member> }
 
 type Walk = {
-  find: (Namespace, QName) -> Option<Binding> / {abort.raise},
-  module_named: (Bytes) -> Option<Int> / {abort.raise},
+  find: (Namespace, QName) -> Option<Binding> / {abort.raise, module_names.read},
+  module_named: (Bytes) -> Option<Bytes> / {abort.raise, module_names.read},
   scopes: List<Map<Bytes, Refers>>,
   found: Map<Int, Reference>,
   members: Option<Map<Int, Member>>,
@@ -72,7 +73,7 @@ fn walk_of(resolved: Resolution, index: Int) -> Walk =
     find: |namespace: Namespace, qualified_name: QName|
       find(resolved, index, namespace, qualified_name),
     module_named: |name: Bytes|
-      match find_module_binding(resolved.scopes.get(index).modules, name) {
+      match module_binding_in(resolved.scopes.get(index), name) {
         Some(m) -> Some(m.target),
         None -> None,
       },
@@ -151,13 +152,17 @@ fn binder(w: Walk, name: Identifier, shorthand: Bool, again: Bool) -> Walk / {ab
     record_reference(scoped(w, name.name, Local(site)), name, Local(site), shorthand)
   }
 
-fn definition(w: Walk, namespace: Namespace, qualified_name: QName) -> Refers / {abort.raise} =
+fn definition(
+  w: Walk,
+  namespace: Namespace,
+  qualified_name: QName,
+) -> Refers / {abort.raise, module_names.read} =
   match (w.find)(namespace, qualified_name) {
     Some(b) -> Definition({ qualified: b.qualified, namespace: namespace }),
     None -> Unbound,
   }
 
-fn qualifier(w: Walk, qualified_name: QName) -> Walk / {abort.raise} =
+fn qualifier(w: Walk, qualified_name: QName) -> Walk / {abort.raise, module_names.read} =
   match qualified_name.module {
     None -> w,
     Some(q) -> match (w.module_named)(q.name) {
@@ -169,7 +174,11 @@ fn qualifier(w: Walk, qualified_name: QName) -> Walk / {abort.raise} =
     },
   }
 
-fn value_named(w: Walk, qualified_name: QName, shorthand: Bool) -> Walk / {abort.raise} = {
+fn value_named(
+  w: Walk,
+  qualified_name: QName,
+  shorthand: Bool,
+) -> Walk / {abort.raise, module_names.read} = {
   let refers = match qualified_name.module {
     None -> match find_local(w, qualified_name.name.name) {
       Some(r) -> r,
@@ -189,7 +198,11 @@ fn pun(field: Identifier, name: Identifier) -> Bool =
 fn labelled(w: Walk, field: Identifier, punned: Bool, at: Span, of: FieldOf) -> Walk =
   if !punned && made_field(field, at) { w } else { member(w, field, FieldName(of)) }
 
-fn walk_fields(w: Walk, fields: List<RecordLiteralField>, of: FieldOf) -> Walk / {abort.raise} =
+fn walk_fields(
+  w: Walk,
+  fields: List<RecordLiteralField>,
+  of: FieldOf,
+) -> Walk / {abort.raise, module_names.read} =
   fields.fold(w, |accumulator: Walk, field: RecordLiteralField|
     match field.value {
       NameExpression(v) -> {
@@ -203,7 +216,11 @@ fn walk_fields(w: Walk, fields: List<RecordLiteralField>, of: FieldOf) -> Walk /
         ),
     })
 
-fn named_in(w: Walk, namespace: Namespace, qualified_name: QName) -> Walk / {abort.raise} =
+fn named_in(
+  w: Walk,
+  namespace: Namespace,
+  qualified_name: QName,
+) -> Walk / {abort.raise, module_names.read} =
   record_reference(
     qualifier(w, qualified_name),
     qualified_name.name,
@@ -211,13 +228,17 @@ fn named_in(w: Walk, namespace: Namespace, qualified_name: QName) -> Walk / {abo
     false,
   )
 
-fn receives_value(w: Walk, name: QName) -> Bool / {abort.raise} =
+fn receives_value(w: Walk, name: QName) -> Bool / {abort.raise, module_names.read} =
   (w.find)(EffectSpace, name) == None && (w.find)(ValueSpace, name) != None
 
-fn effect_of(w: Walk, eff: QName) -> Bytes / {abort.raise} =
+fn effect_of(w: Walk, eff: QName) -> Bytes / {abort.raise, module_names.read} =
   match (w.find)(EffectSpace, eff) { Some(b) -> b.qualified, None -> eff.name.name }
 
-fn operation(w: Walk, eff: QName, operation_name: Identifier) -> Walk / {abort.raise} =
+fn operation(
+  w: Walk,
+  eff: QName,
+  operation_name: Identifier,
+) -> Walk / {abort.raise, module_names.read} =
   record_reference(
     named_in(w, EffectSpace, eff),
     operation_name,
@@ -225,7 +246,7 @@ fn operation(w: Walk, eff: QName, operation_name: Identifier) -> Walk / {abort.r
     false,
   )
 
-fn walk_type(w: Walk, t: TypeExpression) -> Walk / {abort.raise} =
+fn walk_type(w: Walk, t: TypeExpression) -> Walk / {abort.raise, module_names.read} =
   match t {
     NamedTypeExpression(c) ->
       c.effect_arguments.fold(c.args.fold(named_in(w, TypeSpace, c.name), walk_type), walk_effects),
@@ -246,18 +267,18 @@ fn walk_record_type(
   w: Walk,
   fields: List<{ name: Identifier, ty: TypeExpression }>,
   of: FieldOf,
-) -> Walk / {abort.raise} =
+) -> Walk / {abort.raise, module_names.read} =
   fields.fold(w, |accumulator: Walk, field: { name: Identifier, ty: TypeExpression }|
     walk_type(labelled(accumulator, field.name, false, type_span(field.ty), of), field.ty))
 
-fn walk_effects(w: Walk, r: EffectsExpression) -> Walk / {abort.raise} =
+fn walk_effects(w: Walk, r: EffectsExpression) -> Walk / {abort.raise, module_names.read} =
   walk_effect_list(w, r.listed, r.aliases)
 
 fn walk_effect_list(
   w: Walk,
   effects: List<EffectExpression>,
   sets: List<QName>,
-) -> Walk / {abort.raise} =
+) -> Walk / {abort.raise, module_names.read} =
   sets.fold(
     effects.fold(w, |accumulator: Walk, a: EffectExpression|
       match a.operation {
@@ -267,13 +288,17 @@ fn walk_effect_list(
     |accumulator: Walk, set: QName| named_in(accumulator, SetSpace, set),
   )
 
-fn walk_optional_effects(w: Walk, r: Option<EffectsExpression>) -> Walk / {abort.raise} =
-  match r { Some(x) -> walk_effects(w, x), None -> w }
+fn walk_optional_effects(
+  w: Walk,
+  r: Option<EffectsExpression>,
+) -> Walk / {abort.raise, module_names.read} = match r { Some(x) -> walk_effects(w, x), None -> w }
 
-fn walk_optional_type(w: Walk, t: Option<TypeExpression>) -> Walk / {abort.raise} =
-  match t { Some(x) -> walk_type(w, x), None -> w }
+fn walk_optional_type(
+  w: Walk,
+  t: Option<TypeExpression>,
+) -> Walk / {abort.raise, module_names.read} = match t { Some(x) -> walk_type(w, x), None -> w }
 
-fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise} =
+fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise, module_names.read} =
   match p {
     PatternVariable(v) -> binder(w, v.name, false, again),
     PatternConstructor(c) ->
@@ -318,7 +343,7 @@ fn walk_pattern(w: Walk, p: Pattern, again: Bool) -> Walk / {abort.raise} =
     _ -> w,
   }
 
-fn walk_params(w: Walk, ps: List<Param>) -> Walk / {abort.raise} =
+fn walk_params(w: Walk, ps: List<Param>) -> Walk / {abort.raise, module_names.read} =
   ps.fold(
     ps.fold(pushed(w), |accumulator: Walk, p: Param| bound(accumulator, p.name)),
     |accumulator: Walk, p: Param| {
@@ -327,7 +352,11 @@ fn walk_params(w: Walk, ps: List<Param>) -> Walk / {abort.raise} =
     },
   )
 
-fn walk_default(w: Walk, default: Expression, ty: Option<TypeExpression>) -> Walk / {abort.raise} =
+fn walk_default(
+  w: Walk,
+  default: Expression,
+  ty: Option<TypeExpression>,
+) -> Walk / {abort.raise, module_names.read} =
   match ((default, ty)) {
     (RecordExpression(r), Some(RecordTypeExpression(t))) ->
       walk_fields(
@@ -342,7 +371,7 @@ fn walk_default(w: Walk, default: Expression, ty: Option<TypeExpression>) -> Wal
     _ -> walk_expression(w, default),
   }
 
-fn walk_spec(w: Walk, ps: List<Param>, s: SpecClause) -> Walk / {abort.raise} = {
+fn walk_spec(w: Walk, ps: List<Param>, s: SpecClause) -> Walk / {abort.raise, module_names.read} = {
   let named = |of: (Param) -> Option<Identifier>|
     ps.fold(pushed(w), |accumulator: Walk, p: Param|
       match of(p) { Some(k) -> bound(accumulator, k), None -> accumulator });
@@ -355,7 +384,7 @@ fn walk_spec(w: Walk, ps: List<Param>, s: SpecClause) -> Walk / {abort.raise} = 
   popped(walk_expression(scope, s.expression))
 }
 
-fn walk_statement(w: Walk, s: Statement) -> Walk / {abort.raise} =
+fn walk_statement(w: Walk, s: Statement) -> Walk / {abort.raise, module_names.read} =
   match s {
     LetStatement(l) ->
       walk_pattern(walk_optional_type(walk_expression(w, l.value), l.ty), l.pattern, false),
@@ -381,7 +410,7 @@ fn walk_clause(
   w: Walk,
   handler_variables: List<HandlerStateVariable>,
   c: HandleClause,
-) -> Walk / {abort.raise} = {
+) -> Walk / {abort.raise, module_names.read} = {
   let with_params = c.params.fold(
     in_scope(operation(w, c.effect_name, c.operation), handler_variables),
     bound,
@@ -391,7 +420,7 @@ fn walk_clause(
   popped(walk_expression(with_resume, c.body))
 }
 
-fn walk_expression(w: Walk, e: Expression) -> Walk / {abort.raise} =
+fn walk_expression(w: Walk, e: Expression) -> Walk / {abort.raise, module_names.read} =
   match e {
     NameExpression(v) -> value_named(w, v.name, false),
     BinaryExpression(b) -> walk_expression(walk_expression(w, b.left_operand), b.right_operand),
@@ -491,7 +520,7 @@ fn walk_expression(w: Walk, e: Expression) -> Walk / {abort.raise} =
     _ -> w,
   }
 
-fn walk_function(w: Walk, f: FnDefinition) -> Walk / {abort.raise} = {
+fn walk_function(w: Walk, f: FnDefinition) -> Walk / {abort.raise, module_names.read} = {
   let params = walk_params(named_in(w, ValueSpace, bare(f.name)), f.params);
   let typed = walk_optional_effects(walk_optional_type(params, f.return_type), f.effects);
   let returned = match f.returns {
@@ -510,14 +539,14 @@ fn walk_quantified(
   binders: List<Binder>,
   guard: Option<Expression>,
   body: Expression,
-) -> Walk / {abort.raise} = {
+) -> Walk / {abort.raise, module_names.read} = {
   let bound_all = binders.fold(pushed(w), |accumulator: Walk, b: Binder|
     bound(walk_type(accumulator, b.ty), b.name));
   let guarded = match guard { Some(g) -> walk_expression(bound_all, g), None -> bound_all };
   popped(walk_expression(guarded, body))
 }
 
-fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise} =
+fn walk_item(w: Walk, item: Item) -> Walk / {abort.raise, module_names.read} =
   match item {
     FunctionItem(f) -> walk_function(w, f),
     ExternItem(x) -> {
@@ -619,27 +648,36 @@ fn declared_in(resolved: Resolution, module: Int, name: Bytes) -> Refers / {abor
       _ -> r,
     })
 
-pub fn item_binders(resolved: Resolution, index: Int, item: Item) -> Map<Int, Int> / {abort.raise} =
+pub fn item_binders(
+  resolved: Resolution,
+  index: Int,
+  item: Item,
+) -> Map<Int, Int> / {abort.raise, module_names.read} =
   binders_of(walk_item(walk_of(resolved, index), item).found)
 
 pub fn expression_binders(
   resolved: Resolution,
   index: Int,
   expression: Expression,
-) -> Map<Int, Int> / {abort.raise} =
+) -> Map<Int, Int> / {abort.raise, module_names.read} =
   binders_of(walk_expression(walk_of(resolved, index), expression).found)
 
 pub fn body_binders(params: List<Identifier>, body: Expression) -> Map<Int, Int> / {abort.raise} =
-  binders_of(walk_expression(params.fold(pushed(empty_walk()), bound), body).found)
+  with_no_other_modules(||
+    binders_of(walk_expression(params.fold(pushed(empty_walk()), bound), body).found))
 
 pub fn item_locals(item: Item) -> Map<Int, Int> / {abort.raise} =
-  binders_of(walk_item(empty_walk(), item).found)
+  with_no_other_modules(|| binders_of(walk_item(empty_walk(), item).found))
 
 fn binders_of(found: Map<Int, Reference>) -> Map<Int, Int> =
   found.fold(Map::new(), |binders: Map<Int, Int>, site: Int, r: Reference|
     match r.target { Local(b) -> binders.insert(site, b), _ -> binders })
 
-pub fn written(resolved: Resolution, index: Int, module: Module) -> List<Written> / {abort.raise} =
+pub fn written(
+  resolved: Resolution,
+  index: Int,
+  module: Module,
+) -> List<Written> / {abort.raise, module_names.read} =
   module.items.fold(
     [{ references: import_references(resolved, index, module), members: [] }],
     |accumulator: List<Written>, item: Item| {

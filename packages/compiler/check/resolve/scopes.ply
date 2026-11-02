@@ -3,12 +3,13 @@ import compiler.syntax.items (Module, Item, is_shipped, TypeItem, SumBody, Varia
                               ImportDeclaration, ModuleAlias, SelectedNames, member_name, Opaque)
 import compiler.syntax.expressions (implicitly_imported_by)
 import std.list
-import compiler.check.resolve.tables (ParsedModule, Namespace, TypeSpace, ValueSpace, Declarations,
-                                      Binding, Bindings, Scope, Diagnostic, Edge, ModuleEntry,
-                                      Resolution, namespaces, push_declared, lookup_declared,
-                                      push_binding, lookup, find_module_binding, position,
-                                      default_binder, qualify, import_module_name, path_span,
-                                      import_binder, binder_span, error_at, error_at_and,
+import compiler.check.resolve.tables (module_names, declared_in, bound_in, module_binding_in,
+                                      binding_of, ParsedModule, Namespace, TypeSpace, ValueSpace,
+                                      Declarations, Binding, Bindings, Scope, Diagnostic, Edge,
+                                      ModuleEntry, Resolution, namespaces, push_declared,
+                                      lookup_declared, push_binding, lookup, find_module_binding,
+                                      position, default_binder, qualify, import_module_name,
+                                      path_span, import_binder, binder_span, error_at, error_at_and,
                                       backticked, list_names, describe_namespace, namespace_keyword,
                                       exported_names)
 
@@ -72,7 +73,7 @@ pub fn bind_import(
             None ->
               b2.scope.selected_modules.push({
                 binder: key,
-                target: t,
+                target: w.modules.get(t).name,
                 span: path_span(declaration),
               }),
           };
@@ -266,13 +267,7 @@ fn bind_module(
                 Bytes::concat_all([b"`", name, b"` would also be `", binder, b"`"]),
                 i,
                 first.span,
-                Bytes::concat_all([
-                  b"`",
-                  w.modules.get(first.target).name,
-                  b"` is already bound as `",
-                  binder,
-                  b"`",
-                ]),
+                Bytes::concat_all([b"`", first.target, b"` is already bound as `", binder, b"`"]),
                 [Bytes::concat_all([b"rename one of them: `import ", name, b" as <other>`"])],
               ),
             ),
@@ -283,7 +278,11 @@ fn bind_module(
             ..builder,
             scope: {
               ..builder.scope,
-              modules: builder.scope.modules.push({ binder: binder, target: t, span: s }),
+              modules: builder.scope.modules.push({
+                binder: binder,
+                target: w.modules.get(t).name,
+                span: s,
+              }),
             },
           },
       }
@@ -558,7 +557,7 @@ fn bind_one(
         let bound = push_binding(builder.scope.bound, namespace, {
           name: name.name,
           qualified: binding.qualified,
-          owner: t,
+          owner: module,
           span: name.span,
         });
         { ..builder, imported: imported, scope: { ..builder.scope, bound: bound } }
@@ -685,27 +684,20 @@ pub fn find(
   module: Int,
   namespace: Namespace,
   qualified_name: QName,
-) -> Option<Binding> / {abort.raise} = {
+) -> Option<Binding> / {abort.raise, module_names.read} = {
   let scope = resolved.scopes.get(module);
+  let name = qualified_name.name.name;
   match qualified_name.module {
-    None -> lookup(scope.bound, namespace, qualified_name.name.name),
-    Some(binder) -> match find_module_binding(scope.modules, binder.name) {
+    None -> bound_in(scope, namespace, name),
+    Some(binder) -> match module_binding_in(scope, binder.name) {
       None -> match namespace {
         ValueSpace -> match method_binder_module(binder.name) {
-          Some(home) -> find_in_module(resolved, module, home, qualified_name.name.name),
-          None -> find_method(resolved, module, binder.name, qualified_name.name.name),
+          Some(home) -> find_in_module(resolved, scope, home, namespace, name),
+          None -> find_method(resolved, module, binder.name, name),
         },
         _ -> None,
       },
-      Some(mb) -> match lookup_declared(
-          resolved.declarations.get(mb.target),
-          namespace,
-          qualified_name.name.name,
-        ) {
-        None -> None,
-        Some(d) -> if !d.public && mb.target != module { None }
-        else { lookup(resolved.declared.get(mb.target), namespace, qualified_name.name.name) },
-      },
+      Some(mb) -> find_in_module(resolved, scope, mb.target, namespace, name),
     },
   }
 }
@@ -718,49 +710,43 @@ pub fn method_binder_module(binder: Bytes) -> Option<Bytes> =
 
 fn find_in_module(
   resolved: Resolution,
-  module: Int,
+  scope: Scope,
   home: Bytes,
+  namespace: Namespace,
   name: Bytes,
-) -> Option<Binding> / {abort.raise} =
-  range(0, resolved.scopes.len()).fold(None, |found: Option<Binding>, k: Int|
-    match found {
-      Some(_) -> found,
-      None -> if resolved.scopes.get(k).module != home { None } else {
-        match lookup_declared(resolved.declarations.get(k), ValueSpace, name) {
-          None -> None,
-          Some(d) -> if !d.public && k != module { None }
-          else { lookup(resolved.declared.get(k), ValueSpace, name) },
-        }
-      },
-    })
+) -> Option<Binding> / {module_names.read} =
+  match declared_in(resolved, home, namespace, name) {
+    None -> None,
+    Some(d) -> if !d.public && home != scope.module { None } else { Some(binding_of(d, home)) },
+  }
 
 pub fn find_method(
   resolved: Resolution,
   module: Int,
   of: Bytes,
   name: Bytes,
-) -> Option<Binding> / {abort.raise} =
+) -> Option<Binding> / {abort.raise, module_names.read} =
   match locate_type(resolved, module, of) {
     None -> None,
-    Some(t) -> {
-      let member = member_name(t.simple, name);
-      match lookup_declared(resolved.declarations.get(t.owner), ValueSpace, member) {
-        None -> None,
-        Some(d) -> if !d.public && t.owner != module { None }
-        else { lookup(resolved.declared.get(t.owner), ValueSpace, member) },
-      }
-    },
+    Some(t) ->
+      find_in_module(
+        resolved,
+        resolved.scopes.get(module),
+        t.owner,
+        ValueSpace,
+        member_name(t.simple, name),
+      ),
   }
 
 pub fn locate_type(
   resolved: Resolution,
   module: Int,
   of: Bytes,
-) -> Option<{ owner: Int, simple: Bytes }> / {abort.raise} = {
+) -> Option<{ owner: Bytes, simple: Bytes }> / {abort.raise, module_names.read} = {
   let split = |qualified: Bytes|
     range(0, qualified.len()).fold(None, |last: Option<Int>, i: Int|
       if qualified.at(i) == 46 { Some(i) } else { last });
-  match lookup(resolved.scopes.get(module).bound, TypeSpace, of) {
+  match bound_in(resolved.scopes.get(module), TypeSpace, of) {
     Some(b) ->
       Some({
         owner: b.owner,
@@ -773,16 +759,9 @@ pub fn locate_type(
       None -> None,
       Some(i) -> {
         let home = of.slice(0, i);
-        range(0, resolved.scopes.len()).fold(
-          None,
-          |found: Option<{ owner: Int, simple: Bytes }>, k: Int|
-            match found {
-              Some(_) -> found,
-              None -> if resolved.scopes.get(k).module == home {
-                Some({ owner: k, simple: of.slice(i + 1, of.len()) })
-              } else { None },
-            },
-        )
+        if resolved.positions.contains(home) || module_names.every_module().contains(home) {
+          Some({ owner: home, simple: of.slice(i + 1, of.len()) })
+        } else { None }
       },
     },
   }

@@ -1,3 +1,4 @@
+import compiler.check.resolve.tables (module_names)
 import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, is_bare, span_between)
 import compiler.syntax.node_ids (numbered_missing)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
@@ -25,11 +26,11 @@ import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, Patt
                                  PatternOr, PatternInvalid)
 import std.list
 import std.bytes (ascii_of_int)
-import compiler.check.resolve.tables (ParsedModule, EffectSpace, SetSpace, ValueSpace, Declaration,
-                                      Binding, ModuleBinding, Scope, Label, Diagnostic, Resolution,
-                                      lookup_declared, lookup, find_module_binding, position,
-                                      qualify, label_at, error_with_labels, error_at, error_at_and,
-                                      backticked)
+import compiler.check.resolve.tables (module_index, ParsedModule, EffectSpace, SetSpace, ValueSpace,
+                                      Declaration, Binding, ModuleBinding, Scope, Label, Diagnostic,
+                                      Resolution, lookup_declared, lookup, find_module_binding,
+                                      position, qualify, label_at, error_with_labels, error_at,
+                                      error_at_and, backticked)
 import compiler.check.resolve.scopes (private_name_error, find)
 import compiler.expand.rewrite.shared (bare_names_read)
 
@@ -158,7 +159,7 @@ fn set_named(
   let name = qualified_name.name.name;
   match qualified_name.module {
     None -> match lookup(scope.bound, SetSpace, name) {
-      Some(b) -> match table.by_module.get(b.owner).get(name) {
+      Some(b) -> match table.by_module.get(module_index(resolved, b.owner)).get(name) {
         Some(id) -> Ok(id),
         None -> Err(unknown_set(resolved, m, qualified_name)),
       },
@@ -177,10 +178,11 @@ fn set_named(
           ),
         ),
       Some(mb) -> {
-        let module = resolved.scopes.get(mb.target).module;
-        match lookup_declared(resolved.declarations.get(mb.target), SetSpace, name) {
+        let target = module_index(resolved, mb.target);
+        let module = mb.target;
+        match lookup_declared(resolved.declarations.get(target), SetSpace, name) {
           None -> {
-            let exported = resolved.declarations.get(mb.target).sets.filter(|d: Declaration|
+            let exported = resolved.declarations.get(target).sets.filter(|d: Declaration|
               d.public).map(|d: Declaration| d.name);
             Err(
               error_at(
@@ -205,12 +207,10 @@ fn set_named(
               ),
             )
           },
-          Some(d) -> if !d.public && mb.target != m {
-            Err(
-              private_name_error(m, qualified_name.span, mb.target, d.span, SetSpace, name, module),
-            )
+          Some(d) -> if !d.public && target != m {
+            Err(private_name_error(m, qualified_name.span, target, d.span, SetSpace, name, module))
           } else {
-            match table.by_module.get(mb.target).get(name) {
+            match table.by_module.get(target).get(name) {
               Some(id) -> Ok(id),
               None -> Err(unknown_set(resolved, m, qualified_name)),
             }
@@ -354,17 +354,18 @@ fn effect_owner(
   match qualified_name.module {
     Some(b) -> match find_module_binding(scope.modules, b.name) {
       Some(mb) -> match lookup_declared(
-          resolved.declarations.get(mb.target),
+          resolved.declarations.get(module_index(resolved, mb.target)),
           EffectSpace,
           qualified_name.name.name,
         ) {
-        Some(_) -> Some({ target: mb.target, name: qualified_name.name.name }),
+        Some(_) ->
+          Some({ target: module_index(resolved, mb.target), name: qualified_name.name.name }),
         None -> None,
       },
       None -> None,
     },
     None -> match lookup(scope.bound, EffectSpace, qualified_name.name.name) {
-      Some(b) -> Some({ target: b.owner, name: b.name }),
+      Some(b) -> Some({ target: module_index(resolved, b.owner), name: b.name }),
       None -> None,
     },
   }
@@ -510,7 +511,7 @@ fn localize_member(
                 span: span,
               },
             },
-            bind: Some({ binder: binder, target: o.target, span: dummy_span }),
+            bind: Some({ binder: binder, target: module, span: dummy_span }),
           }
         }
       },
@@ -1215,12 +1216,12 @@ fn instantiate_law(
   d: LawDefinition,
   i: SchemaInstance,
   diagnostics: List<Diagnostic>,
-) -> Instantiation / {abort.raise} =
+) -> Instantiation / {abort.raise, module_names.read} =
   match find(r, m, ValueSpace, i.schema) {
     None -> { r: r, law: d, diagnostics: diagnostics },
     Some(b) -> {
       let name = i.schema.name.name;
-      let home = modules.get(b.owner);
+      let home = modules.get(module_index(r, b.owner));
       let args = match d.body { CallExpression(a) -> a.args, _ -> [] };
       match schema_named(home.module, name) {
         None ->
@@ -1234,7 +1235,7 @@ fn instantiate_law(
                 i.schema.span,
                 Bytes::concat_all([b"`", name, b"` is not a law schema"]),
                 b"a law instantiates a schema",
-                b.owner,
+                module_index(r, b.owner),
                 b.span,
                 b"declared here",
                 [
@@ -1267,7 +1268,7 @@ fn instantiate_law(
                   b", found ",
                   ascii_of_int(args.len()),
                 ]),
-                b.owner,
+                module_index(r, b.owner),
                 schema.name.span,
                 b"this is the schema being instantiated",
                 [],
@@ -1351,7 +1352,7 @@ type LawInstantiation = {
 pub fn instantiate_laws(
   r: Resolution,
   modules: List<ParsedModule>,
-) -> LawInstantiation / {abort.raise} =
+) -> LawInstantiation / {abort.raise, module_names.read} =
   range(0, modules.len()).fold(
     { resolution: r, modules: [], diagnostics: [] },
     |accumulator: LawInstantiation, m: Int| {
@@ -1417,7 +1418,7 @@ pub fn add_module_binding(
   resolved: Resolution,
   module: Int,
   binder: Bytes,
-  target: Int,
+  target: Bytes,
 ) -> Resolution / {abort.raise} = {
   let scope: Scope = resolved.scopes.get(module);
   match find_module_binding(scope.modules, binder) {

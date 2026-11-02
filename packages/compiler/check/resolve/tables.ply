@@ -2,7 +2,8 @@ import compiler.syntax.parsing (Span, Identifier, span_to)
 import compiler.syntax.items (Module, Item, FunctionItem, ExternItem, TypeItem, EffectItem,
                               EffectSetItem, SumBody, AliasBody, VariantDefinition, Visibility,
                               Private, ImportDeclaration, WholeModule, ModuleAlias, SelectedNames,
-                              DeriveOrigin, is_pub, NominalBody, ExternBody, is_builtin)
+                              DeriveOrigin, is_pub, NominalBody, ExternBody, is_builtin,
+                              EffectSetDefinition)
 import compiler.syntax.expressions (Expression)
 import std.list
 import std.bin
@@ -27,7 +28,7 @@ pub type Declarations = {
   by_set: Map<Bytes, Declaration>,
 }
 
-pub type Binding = { name: Bytes, qualified: Bytes, owner: Int, span: Span }
+pub type Binding = { name: Bytes, qualified: Bytes, owner: Bytes, span: Span }
 
 pub type Bindings = {
   values: List<Binding>,
@@ -40,7 +41,7 @@ pub type Bindings = {
   by_set: Map<Bytes, Binding>,
 }
 
-pub type ModuleBinding = { binder: Bytes, target: Int, span: Span }
+pub type ModuleBinding = { binder: Bytes, target: Bytes, span: Span }
 
 pub type Scope = {
   module: Bytes,
@@ -89,7 +90,90 @@ pub type Resolution = {
   imports: List<List<Int>>,
   signatures: Map<Bytes, Parameters>,
   visible_modules: List<List<Int>>,
+  positions: Map<Bytes, Int>,
 }
+
+pub effect module_names {
+  read name_bound(module: Bytes, namespace: Namespace, name: Bytes) -> Option<Binding>
+  read module_bound(module: Bytes, binder: Bytes) -> Option<ModuleBinding>
+  read name_declared(module: Bytes, namespace: Namespace, name: Bytes) -> Option<Declaration>
+  read declarations_stored(module: Bytes) -> Option<Declarations>
+  read effect_set_stored(module: Bytes, name: Bytes) -> Option<EffectSetDefinition>
+  read parameters_stored(name: Bytes) -> Option<Parameters>
+  read modules_visible(module: Bytes) -> List<Bytes>
+  read every_module() -> List<Bytes>
+}
+
+pub fn with_no_other_modules<a | e>(body: () -> a / {module_names.read | e}) -> a / e =
+  handle {
+    body()
+  } with {
+    module_names.name_bound(module, namespace, name) -> None,
+    module_names.module_bound(module, binder) -> None,
+    module_names.name_declared(module, namespace, name) -> None,
+    module_names.declarations_stored(module) -> None,
+    module_names.effect_set_stored(module, name) -> None,
+    module_names.parameters_stored(name) -> None,
+    module_names.modules_visible(module) -> [],
+    module_names.every_module() -> [],
+  }
+
+pub fn declared_in(
+  resolved: Resolution,
+  module: Bytes,
+  namespace: Namespace,
+  name: Bytes,
+) -> Option<Declaration> / {module_names.read} =
+  match resolved.positions.get(module) {
+    Some(i) -> match resolved.declarations.at(i) {
+      Some(d) -> lookup_declared(d, namespace, name),
+      None -> None,
+    },
+    None -> module_names.name_declared(module, namespace, name),
+  }
+
+pub fn declarations_named(
+  resolved: Resolution,
+  module: Bytes,
+) -> Option<Declarations> / {module_names.read} =
+  match resolved.positions.get(module) {
+    Some(i) -> resolved.declarations.at(i),
+    None -> module_names.declarations_stored(module),
+  }
+
+pub fn bound_in(
+  scope: Scope,
+  namespace: Namespace,
+  name: Bytes,
+) -> Option<Binding> / {module_names.read} =
+  match lookup(scope.bound, namespace, name) {
+    Some(b) -> Some(b),
+    None -> module_names.name_bound(scope.module, namespace, name),
+  }
+
+pub fn module_binding_in(
+  scope: Scope,
+  binder: Bytes,
+) -> Option<ModuleBinding> / {module_names.read} =
+  match find_module_binding(scope.modules, binder) {
+    Some(m) -> Some(m),
+    None -> module_names.module_bound(scope.module, binder),
+  }
+
+pub fn parameters_named(
+  resolved: Resolution,
+  name: Bytes,
+) -> Option<Parameters> / {module_names.read} =
+  match resolved.signatures.get(name) {
+    Some(p) -> Some(p),
+    None -> module_names.parameters_stored(name),
+  }
+
+pub fn module_index(resolved: Resolution, name: Bytes) -> Int =
+  match resolved.positions.get(name) { Some(i) -> i, None -> 0 }
+
+pub fn binding_of(declared: Declaration, owner: Bytes) -> Binding =
+  { name: declared.name, qualified: declared.qualified, owner: owner, span: declared.span }
 
 pub const no_declarations: Declarations =
   {
@@ -422,13 +506,13 @@ fn declare(
       }),
   }
 
-pub fn bindings_of(owner: Int, declarations: Declarations) -> Bindings =
+pub fn bindings_of(owner: Bytes, declarations: Declarations) -> Bindings =
   namespaces.fold(no_bindings, |bindings: Bindings, namespace: Namespace|
     with_space_bindings(
       bindings,
       namespace,
       declarations_in(declarations, namespace).map(|declared: Declaration|
-        { name: declared.name, qualified: declared.qualified, owner: owner, span: declared.span }),
+        binding_of(declared, owner)),
     ))
 
 pub type ParamInfo = { name: Bytes, default: Option<Expression>, imports: List<ModuleBinding> }
