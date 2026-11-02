@@ -1777,12 +1777,12 @@ the limit does not fail. It *timed out* (`W0612`), and `ply test` lists it separ
 failures and does not count it as a failure. It runs again the next time. A run in which any test
 timed out is not a success.
 
-A test can crash the process that runs the tests, for example by a bug in Ply or by killing it. Each test
-that passed before the crash stays recorded as passing. The next run reports each test that was running when
-the process died as a failure (`E0505`), without running it, and runs the other tests as usual. The
-run after that runs those tests again. When several tests were running at the time, each one's
-failure names the others; `-j 1` runs one test at a time, so the next crash names the test that
-caused it.
+A test can crash the process that runs the tests, for example by a bug in Ply or by killing it. Each
+test that passed before the crash stays recorded as passing. The next run reports each test that was
+running when the process died as a failure (`E0505`), without running it, and runs the other tests
+as usual. The run after that runs those tests again. When several tests were running at the time,
+each one's failure names the others; `-j 1` runs one test at a time, so the next crash names the
+test that caused it.
 
 ### 10.5 When a test fails
 
@@ -2625,6 +2625,12 @@ Error[E0201]: type mismatch: function body type
 The first line has the severity, the code and the message. Then each label shows where it points,
 the source line, and marks under the span. A note follows as a `  = ` line. Color never changes the
 text.
+
+A command reports every error it can find in one run, in every module, not only the first. An
+error stays where it is written: other definitions are still checked against the signature the
+broken one declares, and a module that imports a module with errors is still checked. An import
+that fails is reported once, at the import; the names it would bring in produce no further errors
+where they are used.
 
 `E` codes are errors, and so is `X0001` (a character that cannot appear in source). `W` codes are
 warnings, which never mean the program is wrong. `ply explain CODE` describes a code, and `ply
