@@ -820,20 +820,68 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       Some(o) -> owner_checks::encode_group(blocked_group_result(key, o)),
       None -> if alone {
         let imported = imports_of(key);
-        owners_check(named, members, imported, false, always_entire);
+        direct_reads(named, key.owners, mentions_of(members), imported);
         match memo.offered() {
           Some(o) -> o,
           None ->
             owner_checks::encode_group(
               checked_group_result(
                 key.module,
-                unit_checked(named, members, imported, always_entire, no_bodies),
+                unit_checked(named, members, imported, always_entire, no_bodies, direct: true),
               ),
             ),
         }
       } else { owner_checks::encode_group(finalize_group(named, key, members)) },
     }
   }
+}
+
+fn mentions_of(members: List<OwnerFacts>) -> List<Mention> =
+  members.fold([], |found: List<Mention>, f: OwnerFacts| found.concat(f.mentions))
+
+fn direct_reads(
+  named: ModuleKey,
+  owners: List<Bytes>,
+  mentions: List<Mention>,
+  imported: List<Imported>,
+) -> Unit / {memo.read, abort.raise} = {
+  memo.fetch(setting_query, bin::encode(named, module_key_bin()));
+  let targets = imported.map(|x: Imported| x.target).push(named.module);
+  let written = imported.fold(mentions, |found: List<Mention>, x: Imported|
+    match x.declaration.kind {
+      SelectedNames(ns) -> found.concat(ns.map(|n: Identifier| { module: x.target, name: n.name })),
+      _ -> found,
+    });
+  let called = written.fold(Map::new(), |found: Map<Bytes, Bool>, m: Mention|
+    if m.module == b"" { found.insert(m.name, true) } else { found });
+  let reached = called.keys().fold(written, |found: List<Mention>, n: Bytes|
+    found.concat(called_of(value_call_modules(named, n), [n])));
+  let modules = reached.fold(Map::new(), |found: Map<Bytes, Bool>, m: Mention|
+    if m.module == b"" { found } else if m.module == named.module {
+      if !owners.contains(m.name) {
+        siblings_named(named, owners, m).fold((), |_: Unit, o: Bytes| {
+          memo.output_digest(
+            owner_interface_query,
+            bin::encode(
+              { module: named.module, shipped: named.shipped, tested: named.tested, owner: o },
+              owner_key_bin(),
+            ),
+          );
+          ()
+        })
+      };
+      found
+    } else {
+      let entries = owner_interface_bytes_of(named.shipped, m.module, m.name);
+      if entries.len() == 0 && !targets.contains(m.module) && !m.name.starts_with(b"::") {
+        owner_interface_bytes_of(named.shipped, m.module, b"");
+        ()
+      };
+      if entries.len() == 0 && m.name.starts_with(b"::") { found }
+      else { found.insert(m.module, true) }
+    });
+  module_origins_of(named.shipped, modules.keys());
+  ()
 }
 
 fn rejected_sibling(
@@ -913,9 +961,18 @@ pub fn unit_checked(
   sibling: (Bytes) -> Sibling,
   body_supplier: BodySupplier,
   also: List<Mention> = [],
+  direct: Bool = false,
 ) -> UnitCheck / {QueryEffects, abort.raise} = {
   let checked_of = |published: Bool| {
-    let c = owners_check(named, members, imported, published, sibling, also: also);
+    let c = owners_check(
+      named,
+      members,
+      imported,
+      published,
+      sibling,
+      also: also,
+      direct: direct && !published,
+    );
     let source = group_source_from(named.module, c.reads, c.imported, c.needed);
     {
       texts: c.reads,
@@ -1240,6 +1297,7 @@ pub fn owners_check(
   sibling: (Bytes) -> Sibling,
   reached: (Bytes, Bytes) -> Bool = no_body_reached,
   also: List<Mention> = [],
+  direct: Bool = false,
 ) -> GroupCheck / {QueryEffects, abort.raise} = {
   let key = {
     module: named.module,
@@ -1285,10 +1343,11 @@ pub fn owners_check(
           },
       )
     } else { owner_interfaces_of(asker, module, n).map(|e: OwnerInterface| read_in(module, e)) };
+  if direct { memo.recording(false) };
   let needed = group_needs(
     key.module,
     reads,
-    members.fold(also, |accumulator: List<Mention>, f: OwnerFacts| accumulator.concat(f.mentions)),
+    also.concat(mentions_of(members)),
     imported,
     entries,
     interface_header_of,
@@ -1297,13 +1356,9 @@ pub fn owners_check(
       else { published_mentions_of(key.shipped, key.module, module, owner) },
     |n: Bytes| value_call_modules(named, n),
   );
-  {
-    needed: needed,
-    imported: imported,
-    places: module_origins_of(asker, needed.keys().filter(|m: Bytes| m != key.module)),
-    setting: setting,
-    reads: reads,
-  }
+  let places = module_origins_of(asker, needed.keys().filter(|m: Bytes| m != key.module));
+  if direct { memo.recording(true) };
+  { needed: needed, imported: imported, places: places, setting: setting, reads: reads }
 }
 
 pub fn current(g: GroupKey) -> Bool / {memo.read, abort.raise} =
