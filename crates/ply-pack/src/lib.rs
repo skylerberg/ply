@@ -78,7 +78,7 @@ impl Pack {
         } else {
             offset.checked_add(len)?
         };
-        zstd::stream::decode_all(file.get(offset..end)?).ok()
+        file.get(offset..end).map(<[u8]>::to_vec)
     }
 
     pub fn text(&self, path: &str) -> Option<&str> {
