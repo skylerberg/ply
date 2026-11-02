@@ -26,8 +26,15 @@ const verdicts_table: Int = 18
 const statement_checks_table: Int = 19
 const claims_table: Int = 20
 const listings_table: Int = 21
+const code_records_table: Int = 22
 
-pub type PassRecord = { test_hash: Bytes, era: Bytes, walk_start: Bytes, case: Bool }
+pub type PassRecord = {
+  test_hash: Bytes,
+  era: Bytes,
+  walk_start: Bytes,
+  case: Bool,
+  passes: List<Bytes>,
+}
 
 type Named<a> = { name: Bytes, value: a }
 
@@ -52,6 +59,7 @@ pub const schema: Bytes =
     bin::shape_digest(named_bin(review_bin())),
     bin::shape_digest(named_bin(module_claims_bin())),
     bin::shape_digest(named_bin(case_listing_bin())),
+    bin::shape_digest(named_bin(bin::list_bin(bin::bytes_bin()))),
     bin::shape_digest(stamps_bin()),
     bin::shape_digest(bin::bytes_bin()),
     bin::shape_digest(bin::string_bin()),
@@ -87,7 +95,7 @@ fn groups(was: Stamps, now: Stamps) -> List<Group> =
       what: "the passing test results recorded for the code that was tested",
       stored_stamp: was.code,
       now: now.code,
-      tables: [code_passes_table],
+      tables: [code_passes_table, code_records_table],
     },
   ]
 
@@ -325,6 +333,15 @@ pub fn put_pass_record(cache: Cache, key: Bytes, record: PassRecord) -> Cache / 
     value: record,
   })
 
+pub fn put_code_record(cache: Cache, key: Bytes, codes: List<Bytes>) -> Cache / {abort.raise} =
+  write_if_changed(
+    cache,
+    code_records_table,
+    named_key(key),
+    named_bin(bin::list_bin(bin::bytes_bin())),
+    { name: key, value: codes },
+  )
+
 pub fn knows_definition(cache: Cache, hash: Bytes) -> Bool / {abort.raise} =
   contains_key(cache.store, seen_table, hash)
 
@@ -439,6 +456,7 @@ pub fn counts(cache: Cache) -> Counts / {abort.raise} =
 type PassesBySnapshot = {
   eras: Map<Bytes, List<{ key: Bytes, case: Bool }>>,
   tests: Map<Bytes, Bool>,
+  passes: Map<Bytes, Bool>,
   cache: Cache,
 }
 
@@ -451,7 +469,7 @@ type Live = {
 
 pub fn prune(cache: Cache) -> Cache / {abort.raise} = {
   let passed = keys(cache.store, pass_records_table).fold(
-    { eras: Map::new(), tests: Map::new(), cache: cache },
+    { eras: Map::new(), tests: Map::new(), passes: Map::new(), cache: cache },
     |accumulator: PassesBySnapshot, k: Bytes| {
       let got = read(
         accumulator.cache,
@@ -470,6 +488,8 @@ pub fn prune(cache: Cache) -> Cache / {abort.raise} = {
               tests.push({ key: n.value.walk_start, case: n.value.case }),
             ),
             tests: accumulator.tests.insert(n.value.test_hash, true),
+            passes: n.value.passes.fold(accumulator.passes, |m: Map<Bytes, Bool>, k: Bytes|
+              m.insert(k, true)),
             cache: got.cache,
           }
         },
@@ -525,6 +545,26 @@ pub fn prune(cache: Cache) -> Cache / {abort.raise} = {
       }
     },
   );
+  let coded = keys(claimed.cache.store, code_records_table).fold(
+    { keys: Map::new(), cache: claimed.cache },
+    |found: { keys: Map<Bytes, Bool>, cache: Cache }, k: Bytes| {
+      let got = read(
+        found.cache,
+        code_records_table,
+        k,
+        named_bin(bin::list_bin(bin::bytes_bin())),
+        "code record",
+      );
+      {
+        keys: match got.value {
+          Some(n) ->
+            n.value.fold(found.keys, |m: Map<Bytes, Bool>, key: Bytes| m.insert(key, true)),
+          None -> found.keys,
+        },
+        cache: got.cache,
+      }
+    },
+  );
   let swept = |c: Cache, t: Int, keep: (Bytes) -> Bool|
     {
       ..c,
@@ -536,7 +576,9 @@ pub fn prune(cache: Cache) -> Cache / {abort.raise} = {
     { table: modules_table, keep: |k: Bytes| live.modules.contains(k) },
     { table: t_texts, keep: |k: Bytes| live.hashes.contains(k) || passed.tests.contains(k) },
     { table: evidence_table, keep: |k: Bytes| claimed.evidence.contains(k) },
-  ].fold(claimed.cache, |c: Cache, t: { table: Int, keep: (Bytes) -> Bool }|
+    { table: passed_table, keep: |k: Bytes| passed.passes.contains(k) },
+    { table: code_passes_table, keep: |k: Bytes| coded.keys.contains(k) },
+  ].fold(coded.cache, |c: Cache, t: { table: Int, keep: (Bytes) -> Bool }|
     swept(c, t.table, t.keep))
 }
 
@@ -560,7 +602,13 @@ fn module_record_with_names(names: List<String>) -> Bytes / {abort.raise} =
   )
 
 fn record_in(modules: List<Bytes>) -> PassRecord =
-  { test_hash: name_key("t"), era: snapshot_digest(modules), walk_start: b"m.t", case: false }
+  {
+    test_hash: name_key("t"),
+    era: snapshot_digest(modules),
+    walk_start: b"m.t",
+    case: false,
+    passes: [name_key("result")],
+  }
 
 test "every table round-trips through a flush and a reopen" {
   let m = module_record_with_names(["m.f"]);
@@ -651,6 +699,33 @@ test "`prune` deletes cached texts, snapshots and module records that no passing
   assert_eq(run.value.modules, [true, false])
 }
 
+test "`prune` deletes test passes that no pass record lists, and keeps the passes they list" {
+  let run = run_in_memory(mem_empty(), || {
+    let m = module_record_with_names(["m.f"]);
+    let c0 = put_snapshot(put_module_record(open_cache[mem]("cache", test_stamps), m), [
+      record_digest(m),
+    ]);
+    let c1 = put_pass_record(c0, b"m.t", record_in([record_digest(m)]));
+    let c2 = put_code_record(put_passed_code(c1, name_key("code"), b""), b"m.t", [
+      name_key("code"),
+    ]);
+    let c3 = put_passed_code(
+      put_passed(put_passed(c2, name_key("result"), b""), name_key("stale"), b""),
+      name_key("old code"),
+      b"",
+    );
+    let flushed = flush_cache[mem](c3);
+    let r = open_cache[mem]("cache", test_stamps);
+    [
+      passed(r, name_key("result")).value,
+      passed(r, name_key("stale")).value,
+      passed_code(r, name_key("code")).value,
+      passed_code(r, name_key("old code")).value,
+    ]
+  });
+  assert_eq(run.value, [Some(true), Some(false), Some(true), Some(false)])
+}
+
 test "`prune` deletes proof evidence that no module's claims list, and keeps the evidence they list" {
   let run = run_in_memory(mem_empty(), || {
     let c0 = put_module_claims(open_cache[mem]("cache", test_stamps), b"m", {
@@ -693,7 +768,11 @@ test "a passing result saved with its test's code is still found after the runti
   let run = run_in_memory(mem_empty(), || {
     let a = open_cache[mem]("cache", test_stamps);
     let _recorded = flush_cache[mem](
-      put_passed_code(put_passed(a, name_key("result"), b""), name_key("code"), b""),
+      put_code_record(
+        put_passed_code(put_passed(a, name_key("result"), b""), name_key("code"), b""),
+        b"m.t",
+        [name_key("code")],
+      ),
     );
     let moved = open_cache[mem]("cache", { ..test_stamps, runtime_digest: "another" });
     let recoded = open_cache[mem]("cache", {
@@ -712,10 +791,14 @@ test "a passing result saved with its test's code is still found after the runti
 
 test "cache entries written by a different build are discarded with a single warning, and the next open does not warn again" {
   let run = run_in_memory(mem_empty(), || {
-    let c0 = put_passed_code(
-      put_passed(open_cache[mem]("cache", test_stamps), name_key("t"), b""),
-      name_key("code"),
-      b"",
+    let c0 = put_code_record(
+      put_passed_code(
+        put_passed(open_cache[mem]("cache", test_stamps), name_key("t"), b""),
+        name_key("code"),
+        b"",
+      ),
+      b"m.t",
+      [name_key("code")],
     );
     let c1 = put_review(c0, b"m.f", { definition: name_key("m.f"), specs: [] });
     let written = flush_cache[mem](c1);
