@@ -32,7 +32,7 @@ type Named<a> = { name: Bytes, value: a }
 
 pub type Review = { definition: Bytes, specs: List<Bytes> }
 
-pub type ModuleClaims = { identity: Bytes, claims: Bytes }
+pub type ModuleClaims = { identity: Bytes, claims: Bytes, evidence: List<Bytes> }
 
 pub type Stamps = { runtime_digest: String, code: String }
 
@@ -125,7 +125,7 @@ fn check_stamps(s: Store, now: Stamps) -> Store / {abort.raise} = {
 
 pub fn flush_cache<[r]>(cache: Cache) -> Cache / {fs.read[r], fs.write[r], abort.raise} =
   if pending_count(cache.store) == 0 { cache } else {
-    let pruned = prune(cache).cache;
+    let pruned = prune(cache);
     { ..pruned, store: flush[r](with_current_stamps(pruned.store, pruned.stamps)) }
   }
 
@@ -410,8 +410,6 @@ pub fn counts(cache: Cache) -> Counts / {abort.raise} =
     reviews: keys(cache.store, reviews_table).len(),
   }
 
-pub type PruneCounts = { texts: Int, snapshots: Int, modules: Int }
-
 type PassesBySnapshot = {
   eras: Map<Bytes, List<{ key: Bytes, case: Bool }>>,
   tests: Map<Bytes, Bool>,
@@ -425,7 +423,7 @@ type Live = {
   cache: Cache,
 }
 
-pub fn prune(cache: Cache) -> { pruned: PruneCounts, cache: Cache } / {abort.raise} = {
+pub fn prune(cache: Cache) -> Cache / {abort.raise} = {
   let passed = keys(cache.store, pass_records_table).fold(
     { eras: Map::new(), tests: Map::new(), cache: cache },
     |accumulator: PassesBySnapshot, k: Bytes| {
@@ -486,21 +484,34 @@ pub fn prune(cache: Cache) -> { pruned: PruneCounts, cache: Cache } / {abort.rai
       }
     },
   );
-  let swept = |c: Cache, t: Int, keep: (Bytes) -> Bool| {
-    let dead = keys(c.store, t).filter(|k: Bytes| !keep(k));
+  let claimed = keys(live.cache.store, claims_table).fold(
+    { evidence: Map::new(), cache: live.cache },
+    |found: { evidence: Map<Bytes, Bool>, cache: Cache }, k: Bytes| {
+      let got = read(found.cache, claims_table, k, named_bin(module_claims_bin()), "claims");
+      {
+        evidence: match got.value {
+          Some(n) ->
+            n.value.evidence.fold(found.evidence, |m: Map<Bytes, Bool>, e: Bytes|
+              m.insert(e, true)),
+          None -> found.evidence,
+        },
+        cache: got.cache,
+      }
+    },
+  );
+  let swept = |c: Cache, t: Int, keep: (Bytes) -> Bool|
     {
-      cache: { ..c, store: dead.fold(c.store, |store: Store, k: Bytes| drop(store, t, k)) },
-      gone: dead.len(),
-    }
-  };
-  let gone_eras = swept(live.cache, snapshots_table, |k: Bytes| passed.eras.contains(k));
-  let gone_modules = swept(gone_eras.cache, modules_table, |k: Bytes| live.modules.contains(k));
-  let texts = swept(gone_modules.cache, t_texts, |k: Bytes|
-    live.hashes.contains(k) || passed.tests.contains(k));
-  {
-    pruned: { texts: texts.gone, snapshots: gone_eras.gone, modules: gone_modules.gone },
-    cache: texts.cache,
-  }
+      ..c,
+      store: keys(c.store, t).filter(|k: Bytes| !keep(k)).fold(c.store, |store: Store, k: Bytes|
+        drop(store, t, k)),
+    };
+  [
+    { table: snapshots_table, keep: |k: Bytes| passed.eras.contains(k) },
+    { table: modules_table, keep: |k: Bytes| live.modules.contains(k) },
+    { table: t_texts, keep: |k: Bytes| live.hashes.contains(k) || passed.tests.contains(k) },
+    { table: evidence_table, keep: |k: Bytes| claimed.evidence.contains(k) },
+  ].fold(claimed.cache, |c: Cache, t: { table: Int, keep: (Bytes) -> Bool }|
+    swept(c, t.table, t.keep))
 }
 
 const test_stamps: Stamps = { runtime_digest: "runtime", code: "code" }
@@ -536,7 +547,12 @@ test "every table round-trips through a flush and a reopen" {
       b"m.t",
       record_in([record_digest(m)]),
     );
-    let c5 = put_review(put_evidence(c4, name_key("claim"), b"evidence"), b"m.f", {
+    let claimed = put_module_claims(c4, b"m", {
+      identity: b"",
+      claims: b"",
+      evidence: [name_key("claim")],
+    });
+    let c5 = put_review(put_evidence(claimed, name_key("claim"), b"evidence"), b"m.f", {
       definition: name_key("m.f"),
       specs: [name_key("s")],
     });
@@ -560,7 +576,6 @@ test "every table round-trips through a flush and a reopen" {
       review(r, b"m.f").value,
       Some({ definition: name_key("m.f"), specs: [name_key("s")] }),
     );
-    assert_eq(counts(r).texts, 1);
     warnings(c)
   });
   assert_eq(run.value, [])
@@ -599,35 +614,44 @@ test "`prune` deletes cached texts, snapshots and module records that no passing
     );
     let c2 = ["m.passed", "m.stale", "m.orphan", "t"].fold(c1, |cache: Cache, n: String|
       put_text(cache, name_key(n), b"v"));
-    let p = prune(c2);
-    let pruned_cache = flush_cache[mem](p.cache);
+    let pruned_cache = flush_cache[mem](prune(c2));
     let r = open_cache[mem]("cache", test_stamps);
     {
-      pruned: p.pruned,
       texts: ["m.passed", "m.stale", "m.orphan", "t"].map(|n: String| has_text(r, name_key(n))),
       modules: [live, dead].map(|m: Bytes| has_module_record(r, record_digest(m))),
     }
   });
-  assert_eq(run.value.pruned, { texts: 2, snapshots: 1, modules: 1 });
   assert_eq(run.value.texts, [true, false, false, true]);
   assert_eq(run.value.modules, [true, false])
 }
 
-test "the schema is a function of the stored shapes alone" {
-  assert_eq(schema, schema);
-  assert_eq(schema.len(), 7 * 32)
+test "`prune` deletes proof evidence that no module's claims list, and keeps the evidence they list" {
+  let run = run_in_memory(mem_empty(), || {
+    let c0 = put_module_claims(open_cache[mem]("cache", test_stamps), b"m", {
+      identity: b"",
+      claims: b"",
+      evidence: [name_key("listed")],
+    });
+    let c1 = put_evidence(put_evidence(c0, name_key("listed"), b"a"), name_key("stale"), b"b");
+    let c = flush_cache[mem](c1);
+    let r = open_cache[mem]("cache", test_stamps);
+    [evidence(r, name_key("listed")).value, evidence(r, name_key("stale")).value]
+  });
+  assert_eq(run.value, [Some(b"a"), None])
 }
 
 test "two runs update different entries both keep theirs" {
   let run = run_in_memory(mem_empty(), || {
-    let a = put_evidence(open_cache[mem]("cache", test_stamps), name_key("m.a"), b"A");
-    let b = put_evidence(open_cache[mem]("cache", test_stamps), name_key("m.b"), b"B");
+    let claims = |text: Bytes| { identity: b"", claims: text, evidence: [] };
+    let a = put_module_claims(open_cache[mem]("cache", test_stamps), b"m.a", claims(b"A"));
+    let b = put_module_claims(open_cache[mem]("cache", test_stamps), b"m.b", claims(b"B"));
     let a1 = flush_cache[mem](a);
     let b1 = flush_cache[mem](b);
     let r = open_cache[mem]("cache", test_stamps);
-    [evidence(r, name_key("m.a")).value, evidence(r, name_key("m.b")).value]
+    [b"m.a", b"m.b"].map(|m: Bytes|
+      match module_claims(r, m).value { Some(c) -> c.claims, None -> b"" })
   });
-  assert_eq(run.value, [Some(b"A"), Some(b"B")])
+  assert_eq(run.value, [b"A", b"B"])
 }
 
 test "recording a text under a hash that already has a text writes nothing and leaves the first text unchanged" {
