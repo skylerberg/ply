@@ -23,55 +23,121 @@ fn first_stored<a>(
   stored.fold(None, |found: Option<a>, s: StoredDeclarations|
     match found { Some(_) -> found, None -> pick(s) })
 
+fn namespace_tag(namespace: Option<Namespace>) -> Bytes =
+  match namespace {
+    None -> b"*",
+    Some(ValueSpace) -> b"v",
+    Some(TypeSpace) -> b"t",
+    Some(EffectSpace) -> b"e",
+    Some(SetSpace) -> b"s",
+  }
+
+type Looked = { found: List<StoredDeclarations>, cache: Map<Bytes, List<StoredDeclarations>> }
+
+fn looked_up<| e>(
+  reads: StoredReads<| e>,
+  cache: Map<Bytes, List<StoredDeclarations>>,
+  name: Bytes,
+  namespace: Option<Namespace>,
+) -> Looked / {abort.raise | e} = {
+  let key = Bytes::concat_all([namespace_tag(namespace), b" ", name]);
+  match cache.get(key) {
+    Some(found) -> { found: found, cache: cache },
+    None -> {
+      let found = (reads.declarations_of)(name, namespace);
+      { found: found, cache: cache.insert(key, found) }
+    },
+  }
+}
+
 pub fn over_stored<a | e>(
   reads: StoredReads<| e>,
   body: () -> a / {CheckReads, abort.raise | e},
-) -> a / {abort.raise | e} = {
-  let definition = |name: Bytes|
-    first_stored((reads.declarations_of)(name, Some(ValueSpace)), |s: StoredDeclarations|
-      s.definitions.get(name));
+) -> a / {abort.raise | e} =
   handle {
     body()
   } with {
-    program.type_named(name) ->
-      first_stored((reads.declarations_of)(name, Some(TypeSpace)), |s: StoredDeclarations|
-        s.types.get(name)),
-    program.effect_named(name) ->
-      first_stored((reads.declarations_of)(name, Some(EffectSpace)), |s: StoredDeclarations|
-        s.effects.get(name)),
-    program.constructor_named(name) ->
-      first_stored((reads.declarations_of)(name, Some(ValueSpace)), |s: StoredDeclarations|
-        s.constructors.get(name)),
-    program.definition_named(name) -> definition(name),
-    program.host_named(name) ->
-      first_stored((reads.declarations_of)(name, None), |s: StoredDeclarations| s.hosts.get(name)),
-    mode_facts.modes_named(name) -> match definition(name) { Some(d) -> d.modes, None -> None },
-    summary_facts.summary_stored(name) -> match definition(name) {
-      Some(d) -> d.summary,
-      None -> None,
+    var cache: Map<Bytes, List<StoredDeclarations>> = Map::new(),
+    var names: Map<Bytes, Option<Declaration>> = Map::new(),
+    program.type_named(name) -> {
+      let l = looked_up(reads, cache, name, Some(TypeSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.types.get(name))
     },
-    summary_facts.ending_stored(name) -> match definition(name) {
-      Some(d) -> match d.definition { Some(x) -> Some(x.ending), None -> None },
-      None -> None,
+    program.effect_named(name) -> {
+      let l = looked_up(reads, cache, name, Some(EffectSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.effects.get(name))
+    },
+    program.constructor_named(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.constructors.get(name))
+    },
+    program.definition_named(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name))
+    },
+    program.host_named(name) -> {
+      let l = looked_up(reads, cache, name, None);
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.hosts.get(name))
+    },
+    mode_facts.modes_named(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      match first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name)) {
+        Some(d) -> d.modes,
+        None -> None,
+      }
+    },
+    summary_facts.summary_stored(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      match first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name)) {
+        Some(d) -> d.summary,
+        None -> None,
+      }
+    },
+    summary_facts.ending_stored(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      match first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name)) {
+        Some(d) -> match d.definition { Some(x) -> Some(x.ending), None -> None },
+        None -> None,
+      }
     },
     module_names.module_package(module) -> (reads.module_package)(module),
     module_names.module_scope_stored(module) -> (reads.module_scope)(module),
-    module_names.name_declared(module, namespace, name) ->
-      (reads.name_declared)(module, namespace, name),
+    module_names.name_declared(module, namespace, name) -> {
+      let key = Bytes::concat_all([namespace_tag(Some(namespace)), b" ", qualify(module, name)]);
+      match names.get(key) {
+        Some(found) -> found,
+        None -> {
+          let found = (reads.name_declared)(module, namespace, name);
+          names = names.insert(key, found);
+          found
+        },
+      }
+    },
     module_names.declarations_stored(module) -> (reads.module_declarations)(module),
-    module_names.effect_set_stored(module, name) ->
-      first_stored(
-        (reads.declarations_of)(qualify(module, name), Some(SetSpace)),
-        |s: StoredDeclarations| s.sets.get(qualify(module, name)),
-      ),
-    module_names.schema_stored(module, name) ->
-      first_stored((reads.declarations_of)(qualify(module, name), None), |s: StoredDeclarations|
-        s.schemas.get(qualify(module, name))),
-    module_names.parameters_stored(name) ->
-      first_stored((reads.declarations_of)(name, Some(ValueSpace)), |s: StoredDeclarations|
-        s.parameters.get(name)),
+    module_names.effect_set_stored(module, name) -> {
+      let l = looked_up(reads, cache, qualify(module, name), Some(SetSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.sets.get(qualify(module, name)))
+    },
+    module_names.schema_stored(module, name) -> {
+      let l = looked_up(reads, cache, qualify(module, name), None);
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.schemas.get(qualify(module, name)))
+    },
+    module_names.parameters_stored(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.parameters.get(name))
+    },
     module_names.modules_visible(module) -> (reads.visible_modules)(),
     module_names.every_module() -> (reads.every_module)(),
     module_names.shipped_modules() -> (reads.shipped_modules)(),
   }
-}
