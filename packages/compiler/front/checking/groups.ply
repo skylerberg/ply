@@ -1081,6 +1081,9 @@ fn stored_reads(
 
 fn names_in_stored(stored: StoredDeclarations) -> List<Bytes> = stored.definitions.keys()
 
+fn declared_extern(qualified: Bytes) -> Bool / {program.read} =
+  match program.definition_named(qualified) { Some(f) -> f.definition == None, None -> false }
+
 fn name_elsewhere(
   named: ModuleKey,
   own: Map<Bytes, Bool>,
@@ -1148,7 +1151,7 @@ fn name_elsewhere(
             },
           ]
         },
-        None ->
+        None -> if declared_extern(qualified) { [] } else {
           [
             {
               module: mention.module,
@@ -1159,20 +1162,40 @@ fn name_elsewhere(
               constructor_of: None,
               bare: bare(ValueSpace),
             },
-          ],
+          ]
+        },
       },
       None -> [],
     };
     of_type.concat(of_effect).concat(of_value)
   }
 
-fn members_named(named: ModuleKey, name: Bytes) -> List<Mention> / {memo.read, abort.raise} =
+fn members_in(
+  named: ModuleKey,
+  inside: List<Bytes>,
+  module: Bytes,
+  name: Bytes,
+) -> List<Mention> / {memo.read, abort.raise} =
+  owners_declaring(named, module, any_module_name(name)).filter(|at: OwnerKey|
+    !(module == named.module && inside.contains(at.owner))).fold(
+    [],
+    |found: List<Mention>, at: OwnerKey|
+      names_in_stored(stored_declarations_of(at, BySignature)).fold(
+        found,
+        |f: List<Mention>, q: Bytes|
+          if q.ends_with(b"::".concat(name)) {
+            f.push({ module: module, name: q.slice(module.len() + 1, q.len()) })
+          } else { f },
+      ),
+  )
+
+fn members_named(
+  named: ModuleKey,
+  inside: List<Bytes>,
+  name: Bytes,
+) -> List<Mention> / {memo.read, abort.raise} =
   value_call_modules(named, name).fold([], |found: List<Mention>, module: Bytes|
-    owners_declaring(named, module, name).fold(found, |f: List<Mention>, at: OwnerKey|
-      names_in_stored(stored_declarations_of(at, Entire)).fold(f, |g: List<Mention>, q: Bytes|
-        if q.ends_with(b"::".concat(name)) || q == qualify(module, name) {
-          g.push({ module: module, name: q.slice(module.len() + 1, q.len()) })
-        } else { g })))
+    found.concat(members_in(named, inside, module, name)))
 
 fn no_embed_read(_: EmbedRequest) -> EmbedResult = Ok([])
 
@@ -1201,20 +1224,26 @@ fn group_checked(
     embed_read_of(named.module, setting.embeds, setting.wanted_texts, setting.data)
   };
   over_stored(stored_reads(named, texts.map(|o: OwnerText| o.owner), sibling, all), || {
+    let inside = texts.map(|o: OwnerText| o.owner);
     let mentions = mentions_of(members).fold([], |found: List<Mention>, m: Mention|
-      if m.module.len() == 0 { found.concat(members_named(named, m.name)) } else { found.push(m) });
+      if m.module.len() == 0 { found.concat(members_named(named, inside, m.name)) }
+      else if m.name.starts_with(any_module_name(b"")) {
+        found.concat(members_in(named, inside, m.module, m.name.slice(2, m.name.len())))
+      } else { found.push(m) });
     let seen = mentions.fold(Map::new(), |found: Map<Bytes, Mention>, m: Mention|
       found.insert(qualify(m.module, m.name), m));
     let elsewhere = seen.values().fold([], |found: List<NameElsewhere>, m: Mention|
       found.concat(name_elsewhere(named, own, m)));
-    let unique = elsewhere.fold(Map::new(), |found: Map<Bytes, NameElsewhere>, n: NameElsewhere|
-      found.insert(
-        Bytes::concat_all([
-          qualify(n.module, n.name),
-          if n.effect { b"#e" } else if n.declaration { b"#t" } else { b"#v" },
-        ]),
-        n,
-      ));
+    let unique = elsewhere.fold(Map::new(), |found: Map<Bytes, NameElsewhere>, n: NameElsewhere| {
+      let key = Bytes::concat_all([
+        qualify(n.module, n.name),
+        if n.effect { b"#e" } else if n.declaration { b"#t" } else { b"#v" },
+      ]);
+      found.insert(key, match found.get(key) {
+        Some(first) -> { ..n, bare: n.bare || first.bare, public: n.public && first.public },
+        None -> n,
+      })
+    });
     {
       texts: texts,
       source: source,
