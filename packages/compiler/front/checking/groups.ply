@@ -820,7 +820,7 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       Some(o) -> owner_checks::encode_group(blocked_group_result(key, o)),
       None -> if alone {
         let imported = imports_of(key);
-        direct_reads(named, key.owners, mentions_of(members), imported);
+        direct_reads(named, key.owners, mentions_of(members), imported, always_entire);
         match memo.offered() {
           Some(o) -> o,
           None ->
@@ -839,11 +839,28 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
 fn mentions_of(members: List<OwnerFacts>) -> List<Mention> =
   members.fold([], |found: List<Mention>, f: OwnerFacts| found.concat(f.mentions))
 
+fn sibling_read(named: ModuleKey, owner: Bytes, how: Sibling) -> Unit / {memo.read, abort.raise} = {
+  let at = bin::encode(
+    { module: named.module, shipped: named.shipped, tested: named.tested, owner: owner },
+    owner_key_bin(),
+  );
+  match how {
+    Entire -> memo.output_digest(owner_interface_query, at),
+    BySignature -> memo.output_digest(signature_query, at),
+    ByGroupResult -> {
+      memo.output_digest(shown_query, at);
+      memo.output_digest(signature_query, at)
+    },
+  };
+  ()
+}
+
 fn direct_reads(
   named: ModuleKey,
   owners: List<Bytes>,
   mentions: List<Mention>,
   imported: List<Imported>,
+  sibling: (Bytes) -> Sibling,
 ) -> Unit / {memo.read, abort.raise} = {
   memo.fetch(setting_query, bin::encode(named, module_key_bin()));
   let targets = imported.map(|x: Imported| x.target).push(named.module);
@@ -859,16 +876,8 @@ fn direct_reads(
   let modules = reached.fold(Map::new(), |found: Map<Bytes, Bool>, m: Mention|
     if m.module == b"" { found } else if m.module == named.module {
       if !owners.contains(m.name) {
-        siblings_named(named, owners, m).fold((), |_: Unit, o: Bytes| {
-          memo.output_digest(
-            owner_interface_query,
-            bin::encode(
-              { module: named.module, shipped: named.shipped, tested: named.tested, owner: o },
-              owner_key_bin(),
-            ),
-          );
-          ()
-        })
+        siblings_named(named, owners, m).fold((), |_: Unit, o: Bytes|
+          sibling_read(named, o, sibling(o)))
       };
       found
     } else {
@@ -1149,7 +1158,7 @@ pub fn signatures_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = 
       context.imports,
       context.targets,
     );
-    owners_check(named, members, imported, false, by_signature);
+    direct_reads(named, key.owners, mentions_of(members), imported, by_signature);
     match memo.offered() {
       Some(o) -> o,
       None ->
@@ -1157,7 +1166,14 @@ pub fn signatures_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = 
           owner_checks::signature_check_of(
             checked_group_result(
               key.module,
-              unit_checked(named, members, imported, by_signature, inferring_only([])),
+              unit_checked(
+                named,
+                members,
+                imported,
+                by_signature,
+                inferring_only([]),
+                direct: true,
+              ),
             ),
           ),
           owner_checks::signature_check_bin(),
@@ -1238,12 +1254,14 @@ pub fn typed_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       context.imports,
       context.targets,
     );
+    direct_reads(named, [key.owner], facts.mentions, imported, by_signature);
     let c = unit_checked(
       named,
       [facts],
       imported,
       by_signature,
       inferring_only(facts.text.names.map(|n: Bytes| qualify(key.module, n))),
+      direct: true,
     );
     bin::encode(
       owner_checks::inference_result(
