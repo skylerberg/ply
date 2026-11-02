@@ -37,7 +37,7 @@ import compiler.front.emitter_input (KnownConstructors, Analysed, Rejected, modu
                                      module_rollup_bin)
 import compiler.front (PulledAnalysis, embed_read_of, may_call_embed, published, shipped_wants_bin)
 import compiler.front.pkg (Package)
-import compiler.front.published (encode_rows, no_rows)
+import compiler.front.published (encode_rows, decode_rows, no_rows)
 import compiler.emit.representations (type_names)
 import compiler.check.infer (types_joined)
 import compiler.front.facts (compiler_package, std_package, ModuleShape, ModuleTables, effect_hosts,
@@ -854,6 +854,19 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       input,
       bin::encode(summary_of_group(result), group_summary_bin()),
     );
+    memo.provide(
+      group_rows_query,
+      input,
+      bin::encode(
+        result.members.map(|m: owner_checks::MemberResult| encode_rows(m.result.rows)),
+        bin::list_bin(bin::bytes_bin()),
+      ),
+    );
+    memo.provide(
+      group_forms_query,
+      input,
+      formed(members.map(|f: OwnerFacts| f.text), result.forms),
+    );
     range(0, key.owners.len()).fold((), |_: Unit, i: Int| {
       let owner = {
         module: key.module,
@@ -876,7 +889,7 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
         ),
       )
     });
-    owner_checks::encode_group(owner_checks::rest_of_group(result))
+    owner_checks::encode_group(owner_checks::facts_of_group(result))
   }
 }
 
@@ -1695,18 +1708,40 @@ pub fn known_of_types(names: List<Bytes>) -> KnownConstructors / {CheckReads, ab
 
 pub fn stored_rows(g: GroupKey) -> Rows / {memo.read, abort.raise} =
   if g.owners.len() == 0 { no_rows } else {
-    group_rest_of(g).members.fold(no_rows, |rows: Rows, m: owner_checks::MemberResult|
+    member_rows(g).fold(no_rows, |rows: Rows, r: Rows|
       {
         ..rows,
-        definitions: rows.definitions.concat(m.result.rows.definitions),
-        types: types_joined(rows.types, m.result.rows.types),
+        definitions: rows.definitions.concat(r.definitions),
+        types: types_joined(rows.types, r.types),
       })
   }
 
-pub fn group_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
-  owner_checks::joined_group(group_listing_of(g), group_rest_of(g))
+pub const group_rows_query: Bytes = b"group rows"
 
-pub fn group_rest_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
+pub fn group_rows_result(input: Bytes) -> Bytes / {memo.write, abort.raise} =
+  match memo.written_by(group_query, input) {
+    Some(o) -> o,
+    None -> bin::encode([], bin::list_bin(bin::bytes_bin())),
+  }
+
+fn member_rows(g: GroupKey) -> List<Rows> / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(group_rows_query, bin::encode(g, group_key_bin())),
+    bin::list_bin(bin::bytes_bin()),
+    "a group's rows",
+  ).map(
+    decode_rows,
+  )
+
+pub fn group_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
+  owner_checks::joined_group(
+    group_listing_of(g),
+    group_facts_of(g),
+    group_forms_of(g).forms,
+    member_rows(g),
+  )
+
+fn group_facts_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
   owner_checks::decode_group(
     decoded(
       memo.fetch(group_query, bin::encode(g, group_key_bin())),
@@ -2139,11 +2174,17 @@ pub fn group_hash_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 pub fn group_hash_inputs(
   key: GroupKey,
 ) -> { forms: HashInput, fixed: List<CachedNode>, functions: Map<Bytes, Bytes> } / {memo.read, abort.raise} = {
-  let g = decoded(
-    memo.fetch(group_forms_query, bin::encode(key, group_key_bin())),
-    group_forms_bin(),
-    "a group's forms",
+  let parts = (if key.owners.len() < 2 { [key.owners] } else { cycles_of(key) }).map(
+    |g: List<Bytes>| group_forms_of({ ..key, owners: g }),
   );
+  let g = {
+    forms: match parts {
+      [one] -> one.forms,
+      _ -> joined_forms(parts.map(|p: GroupForms| p.forms)),
+    },
+    functions: parts.fold(Map::new(), |found: Map<Bytes, Bytes>, p: GroupForms|
+      p.functions.fold(found, |m: Map<Bytes, Bytes>, n: Bytes, o: Bytes| m.insert(n, o))),
+  };
   let forms = g.forms;
   let fixed = forms.nodes.fold([], |accumulator: List<CachedNode>, s: HashNode|
     match s.form {
@@ -2179,37 +2220,22 @@ type GroupForms = { forms: HashInput, functions: Map<Bytes, Bytes> }
 
 derive bin for GroupForms
 
-pub fn group_forms_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let key = decoded(input, group_key_bin(), "a group's names");
-  let named = { module: key.module, shipped: key.shipped, tested: key.tested };
-  if !current_unit(key) {
-    bin::encode({ forms: owner_checks::no_group.forms, functions: Map::new() }, group_forms_bin())
-  } else if key.owners.len() < 2 {
-    forms_of(
-      key.owners.map(|o: Bytes| owner_facts(named, o).text),
-      decoded(
-        memo.fetch(group_query, input),
-        owner_checks::encoded_group_bin(),
-        "a group's result",
-      ).rest,
-    )
-  } else {
-    formed(
-      key.owners.map(|o: Bytes| owner_facts(named, o).text),
-      joined_forms(
-        cycles_of(key).map(|g: List<Bytes>|
-          decoded(
-            memo.fetch(group_query, bin::encode({ ..key, owners: g }, group_key_bin())),
-            owner_checks::encoded_group_bin(),
-            "a group's result",
-          ).rest.forms),
+pub fn group_forms_result(input: Bytes) -> Bytes / {memo.write, abort.raise} =
+  match memo.written_by(group_query, input) {
+    Some(o) -> o,
+    None ->
+      bin::encode(
+        { forms: owner_checks::no_group.forms, functions: Map::new() },
+        group_forms_bin(),
       ),
-    )
   }
-}
 
-fn forms_of(reads: List<OwnerText>, a: owner_checks::GroupResult) -> Bytes / {abort.raise} =
-  formed(reads, a.forms)
+fn group_forms_of(g: GroupKey) -> GroupForms / {memo.read, abort.raise} =
+  decoded(
+    memo.fetch(group_forms_query, bin::encode(g, group_key_bin())),
+    group_forms_bin(),
+    "a group's forms",
+  )
 
 fn formed(reads: List<OwnerText>, forms: HashInput) -> Bytes / {abort.raise} =
   bin::encode(
@@ -2564,6 +2590,11 @@ pub fn queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Byte
       name: group_summary_query,
       definition: b"compiler.front.checking.groups.group_summary_result",
       body: group_summary_result,
+    },
+    {
+      name: group_rows_query,
+      definition: b"compiler.front.checking.groups.group_rows_result",
+      body: group_rows_result,
     },
     {
       name: group_listing_query,
