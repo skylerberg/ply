@@ -15,12 +15,16 @@ import compiler.store.hash.graph (Index, NameElsewhere, Node, NodeElsewhere, ind
 import compiler.syntax.items (parse)
 import std.list
 
-pub type GroupInputs = {
+pub type LoadedSource = {
   source: OwnerSource,
-  elsewhere: List<NameElsewhere>,
   tables: ImportPackages,
-  shipped: Bool,
   embed_read: (EmbedRequest) -> EmbedResult / {abort.raise},
+}
+
+pub type GroupInputs = {
+  loaded: List<LoadedSource>,
+  elsewhere: List<NameElsewhere>,
+  shipped: Bool,
 }
 
 pub fn source_of_group(
@@ -29,14 +33,17 @@ pub fn source_of_group(
   imported: List<Imported>,
 ) -> OwnerSource / {abort.raise} = group_source_from(module, members, imported, Map::new())
 
+type ReadSource = { parsed: ParsedSource, embeds: List<ModuleEmbed> }
+
 fn with_embeds(
   parsed: ParsedSource,
+  at: Int,
   read: (EmbedRequest) -> EmbedResult / {abort.raise},
-) -> { parsed: ParsedSource, embeds: List<ModuleEmbed> } / {abort.raise} =
+) -> ReadSource / {abort.raise} =
   if !may_call_embed(parsed.text) { { parsed: parsed, embeds: [] } } else {
     embeds_inlined(
       parsed,
-      0,
+      at,
       embed_requests(parsed.module.module).fold(
         Map::new(),
         |found: Map<Bytes, EmbedResult>, want: EmbedRequest|
@@ -45,10 +52,10 @@ fn with_embeds(
     )
   }
 
-pub fn parsed_group(source: OwnerSource) -> ParsedSource / {abort.raise} = {
+pub fn parsed_group(source: OwnerSource, at: Int) -> ParsedSource / {abort.raise} = {
   let raw = parse(source.source.source_text);
   parse_from(
-    0,
+    at,
     source.source,
     { ..raw, node: named_as_owned(raw.node, source) },
     derivations: source.derived,
@@ -59,14 +66,16 @@ fn rejected(diagnostics: List<Diagnostic>) -> { pulled: PulledAnalysis, at: Int 
   { pulled: { pulled: [], out: Rejected(diagnostics), shipped_views: [] }, at: 0 }
 
 fn hashed_group(
-  parsed: ParsedSource,
-  embeds: List<ModuleEmbed>,
+  read: List<ReadSource>,
   x: ResolvedProgram,
   index: Index,
   inputs: GroupInputs,
 ) -> HashedProgram / {abort.raise, module_names.read} = {
   let module_packages = x.modules.map(|m: ParsedModule|
-    match module_names.module_package(m.name) { Some(p) -> p, None -> inputs.tables.package });
+    match module_names.module_package(m.name) {
+      Some(p) -> p,
+      None -> inputs.loaded.get(0).tables.package,
+    });
   let fixed = index.nodes.fold([], |found: List<CachedNode>, n: Node|
     match n.body {
       NodeElsewhere(e) -> found.push(node_held_elsewhere(n.name, e.declaration)),
@@ -85,23 +94,24 @@ fn hashed_group(
     packages: [],
     module_packages: module_packages,
     root_count: if inputs.shipped { 0 } else { 1 },
-    embeds: embeds,
-    texts: [parsed.text],
+    embeds: read.flat_map(|r: ReadSource| r.embeds),
+    texts: read.map(|r: ReadSource| r.parsed.text),
     cuts: Map::new(),
     embed_items: Map::new(),
   }
 }
 
-fn with_scope(n: NameElsewhere, scope: Scope) -> NameElsewhere / {module_names.read} = {
+fn with_scopes(n: NameElsewhere, scopes: List<Scope>) -> NameElsewhere / {module_names.read} = {
   let namespace = if n.effect { EffectSpace }
   else if n.declaration { TypeSpace }
   else { ValueSpace };
   {
     ..n,
-    bare: match bound_in(scope, namespace, n.name) {
-      Some(b) -> b.owner == n.module,
-      None -> false,
-    },
+    bare: scopes.any(|scope: Scope|
+      match bound_in(scope, namespace, n.name) {
+        Some(b) -> b.owner == n.module,
+        None -> false,
+      }),
   }
 }
 
@@ -109,29 +119,32 @@ pub fn checked_group(
   inputs: GroupInputs,
   walks: BodyChecking,
 ) -> { pulled: PulledAnalysis, at: Int } / {CheckReads, abort.raise} = {
-  let read = with_embeds(parsed_group(inputs.source), inputs.embed_read);
-  let parsed = read.parsed;
-  if parsed.diagnostics.len() > 0 { rejected(parsed.diagnostics) } else {
+  let read = range(0, inputs.loaded.len()).map(|i: Int| {
+    let l = inputs.loaded.get(i);
+    with_embeds(parsed_group(l.source, i), i, l.embed_read)
+  });
+  let problems = read.flat_map(|r: ReadSource| r.parsed.diagnostics);
+  if problems.len() > 0 { rejected(problems) } else {
     match resolve_group(
-        parsed.module,
+        range(0, read.len()).map(|i: Int|
+          { module: read.get(i).parsed.module, tables: inputs.loaded.get(i).tables }),
         inputs.elsewhere.map(|n: NameElsewhere| n.module),
-        inputs.tables,
       ) {
       ResolveFailed(ds) -> rejected(ds.map(outside_every_module)),
       ResolveSucceeded(x) -> {
         let built = build_index(x.modules, x.resolution);
         if built.diagnostics.len() > 0 { rejected(built.diagnostics.map(outside_every_module)) }
         else {
-          let scope = x.resolution.scopes.get(0);
+          let scopes = x.resolution.scopes.take(read.len());
           let index = index_beside(
             built.index,
-            inputs.elsewhere.map(|n: NameElsewhere| with_scope(n, scope)),
+            inputs.elsewhere.map(|n: NameElsewhere| with_scopes(n, scopes)),
           );
           {
             pulled: {
               pulled: [],
               out: checked_with_reads(
-                hashed_group(parsed, read.embeds, x, index, inputs),
+                hashed_group(read, x, index, inputs),
                 no_rows,
                 walks,
               ),

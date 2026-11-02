@@ -9,7 +9,7 @@ import compiler.check.resolve.tables (Binding, Declaration, Declarations, Effect
                                       SetSpace, TypeSpace, ValueSpace, binding_of, declarations_of,
                                       lookup_declared, module_names, module_of_name,
                                       no_declarations)
-import compiler.program.group_check (GroupInputs, checked_group, source_of_group)
+import compiler.program.group_check (GroupInputs, LoadedSource, checked_group, source_of_group)
 import compiler.program.reads (StoredReads, over_stored)
 import compiler.program.stored (decoded_declarations, encoded_declarations)
 import compiler.store.hash.graph (NameElsewhere)
@@ -1082,10 +1082,13 @@ fn import_packages(named: ModuleKey) -> ImportPackages / {memo.read, abort.raise
   }
 }
 
+fn is_loaded(inside: Map<Bytes, Bool>, module: Bytes, owner: Bytes) -> Bool =
+  inside.contains(mention_key({ module: module, name: owner }))
+
 fn stored_reads(
   named: ModuleKey,
   tables: ImportPackages,
-  inside: List<Bytes>,
+  inside: Map<Bytes, Bool>,
   sibling: keep (Bytes) -> Sibling,
 ) -> StoredReads<| {decode_cache.read, decode_cache.write, memo.read, memo.write}> =
   {
@@ -1093,14 +1096,14 @@ fn stored_reads(
       let module = module_of_name(qualified);
       if module.len() == 0 { [] } else {
         owners_declaring(named, module, qualified.slice(module.len() + 1, qualified.len())).filter(
-          |at: OwnerKey| !(module == named.module && inside.contains(at.owner)),
+          |at: OwnerKey| !is_loaded(inside, module, at.owner),
         ).map(|at: OwnerKey|
           stored_declarations_of(at, if module == named.module { sibling(at.owner) }
           else { Entire }))
       }
     },
     module_package: |module: Bytes| package_of_module(named, tables, module),
-    module_scope: || Some(module_header(named).scope),
+    module_scope: |module: Bytes| Some(module_header(module_key_of(owner_key_in(named, module, b""))).scope),
     name_declared: |module: Bytes, namespace: Namespace, name: Bytes|
       declared_name_of(named, module, namespace, name),
     module_declarations: |module: Bytes| {
@@ -1117,11 +1120,10 @@ fn declared_extern(qualified: Bytes) -> Bool / {program.read} =
   match program.definition_named(qualified) { Some(f) -> f.definition == None, None -> false }
 
 fn name_elsewhere(
-  named: ModuleKey,
   own: Map<Bytes, Bool>,
   mention: Mention,
 ) -> List<NameElsewhere> / {CheckReads, abort.raise} =
-  if mention.module == named.module && own.contains(mention.name) { [] } else {
+  if own.contains(mention_key(mention)) { [] } else {
     let qualified = qualify(mention.module, mention.name);
     let of_type = match module_names.name_declared(mention.module, TypeSpace, mention.name) {
       Some(d) ->
@@ -1199,12 +1201,12 @@ fn name_elsewhere(
 
 fn members_in(
   named: ModuleKey,
-  inside: List<Bytes>,
+  inside: Map<Bytes, Bool>,
   module: Bytes,
   name: Bytes,
 ) -> List<Mention> / {QueryEffects, abort.raise} =
   owners_declaring(named, module, any_module_name(name)).filter(|at: OwnerKey|
-    !(module == named.module && inside.contains(at.owner))).fold(
+    !is_loaded(inside, module, at.owner)).fold(
     [],
     |found: List<Mention>, at: OwnerKey|
       names_in_stored(stored_declarations_of(at, BySignature)).fold(
@@ -1218,7 +1220,7 @@ fn members_in(
 
 fn members_named(
   named: ModuleKey,
-  inside: List<Bytes>,
+  inside: Map<Bytes, Bool>,
   name: Bytes,
 ) -> List<Mention> / {QueryEffects, abort.raise} =
   value_call_modules(named, name).fold([], |found: List<Mention>, module: Bytes|
@@ -1235,32 +1237,67 @@ fn setting_of(named: ModuleKey) -> Setting / {memo.read, abort.raise} =
 
 pub type GroupRead = { inputs: GroupInputs, walks: BodyChecking, mentioned: List<Mention> }
 
-pub fn with_group_read<a>(
+pub type GroupSource = { named: ModuleKey, members: List<OwnerFacts>, imported: List<Imported> }
+
+fn loaded_source(g: GroupSource, tables: ImportPackages) -> LoadedSource / {QueryEffects, abort.raise} = {
+  let source = source_of_group(g.named.module, g.members.map(|f: OwnerFacts| f.text), g.imported);
+  {
+    source: source,
+    tables: tables,
+    embed_read: if !may_call_embed(source.source.source_text) { no_embed_read } else {
+      let setting = setting_of(g.named);
+      embed_read_of(g.named.module, setting.embeds, setting.wanted_texts, setting.data)
+    },
+  }
+}
+
+fn names_loaded(g: GroupSource) -> List<Bytes> =
+  g.members.fold([], |found: List<Bytes>, f: OwnerFacts|
+    found.concat(f.text.names.push(f.text.owner).map(|n: Bytes|
+      mention_key({ module: g.named.module, name: n }))))
+
+fn owners_loaded(g: GroupSource) -> List<Bytes> =
+  g.members.map(|f: OwnerFacts| mention_key({ module: g.named.module, name: f.text.owner }))
+
+fn mentions_read(
   named: ModuleKey,
-  members: List<OwnerFacts>,
-  imported: List<Imported>,
+  inside: Map<Bytes, Bool>,
+  mentions: List<Mention>,
+) -> List<Mention> / {CheckReads, QueryEffects, abort.raise} =
+  mentions.fold([], |found: List<Mention>, m: Mention|
+    if m.module.len() == 0 { found.concat(members_named(named, inside, m.name)) }
+    else if m.name.starts_with(any_module_name(b"")) {
+      found.concat(members_in(named, inside, m.module, m.name.slice(2, m.name.len())))
+    } else { found.push(m) })
+
+pub fn with_group_read<a>(
+  groups: List<GroupSource>,
   sibling: keep (Bytes) -> Sibling,
   body_supplier: BodySupplier,
   also: List<Mention>,
   body: (GroupRead) -> a / {CheckReads, QueryEffects, abort.raise},
 ) -> a / {QueryEffects, abort.raise} = {
-  let texts = members.map(|f: OwnerFacts| f.text);
-  let source = source_of_group(named.module, texts, imported);
-  let own = texts.fold(Map::new(), |found: Map<Bytes, Bool>, o: OwnerText|
-    o.names.push(o.owner).fold(found, |f: Map<Bytes, Bool>, n: Bytes| f.insert(n, true)));
-  let walks = match body_supplier(source) { Some(at) -> at(0), None -> CheckEvery };
-  let embed_read = if !may_call_embed(source.source.source_text) { no_embed_read } else {
-    let setting = setting_of(named);
-    embed_read_of(named.module, setting.embeds, setting.wanted_texts, setting.data)
-  };
+  let first = groups.get(0);
+  let named = first.named;
   let tables = import_packages(named);
-  let inside = texts.map(|o: OwnerText| o.owner);
+  let loaded = groups.map(|g: GroupSource| loaded_source(g, import_packages(g.named)));
+  let own = groups.flat_map(names_loaded).fold(Map::new(), |found: Map<Bytes, Bool>, n: Bytes|
+    found.insert(n, true));
+  let inside = groups.flat_map(owners_loaded).fold(Map::new(), |found: Map<Bytes, Bool>, n: Bytes|
+    found.insert(n, true));
+  let walks = match body_supplier(loaded.get(0).source) {
+    Some(at) -> at(0),
+    None -> CheckEvery,
+  };
   over_stored(stored_reads(named, tables, inside, sibling), || {
-    let mentions = mentions_of(members).concat(also).fold([], |found: List<Mention>, m: Mention|
-      if m.module.len() == 0 { found.concat(members_named(named, inside, m.name)) }
-      else if m.name.starts_with(any_module_name(b"")) {
-        found.concat(members_in(named, inside, m.module, m.name.slice(2, m.name.len())))
-      } else { found.push(m) });
+    let mentions = range(0, groups.len()).fold([], |found: List<Mention>, i: Int|
+      found.concat(
+        mentions_read(
+          groups.get(i).named,
+          inside,
+          mentions_of(groups.get(i).members).concat(if i == 0 { also } else { [] }),
+        ),
+      ));
     let in_defaults = mentions.fold([], |found: List<Mention>, m: Mention|
       match module_names.parameters_stored(qualify(m.module, m.name)) {
         Some(p) -> found.concat(names_in_defaults(p)),
@@ -1271,7 +1308,7 @@ pub fn with_group_read<a>(
       |found: Map<Bytes, Mention>, m: Mention| found.insert(qualify(m.module, m.name), m),
     );
     let elsewhere = seen.values().fold([], |found: List<NameElsewhere>, m: Mention|
-      found.concat(name_elsewhere(named, own, m)));
+      found.concat(name_elsewhere(own, m)));
     let unique = elsewhere.fold(Map::new(), |found: Map<Bytes, NameElsewhere>, n: NameElsewhere| {
       let key = Bytes::concat_all([
         qualify(n.module, n.name),
@@ -1283,16 +1320,9 @@ pub fn with_group_read<a>(
       })
     });
     body({
-      inputs: {
-        source: source,
-        elsewhere: unique.values(),
-        tables: tables,
-        shipped: named.shipped,
-        embed_read: embed_read,
-      },
+      inputs: { loaded: loaded, elsewhere: unique.values(), shipped: named.shipped },
       walks: walks,
-      mentioned: seen.values().filter(|m: Mention|
-        !(m.module == named.module && own.contains(m.name))),
+      mentioned: seen.values().filter(|m: Mention| !own.contains(mention_key(m))),
     })
   })
 }
@@ -1305,12 +1335,18 @@ pub fn group_checked(
   body_supplier: BodySupplier,
   also: List<Mention> = [],
 ) -> UnitCheck / {QueryEffects, abort.raise} =
-  with_group_read(named, members, imported, sibling, body_supplier, also, |read: GroupRead|
-    {
-      texts: members.map(|f: OwnerFacts| f.text),
-      source: read.inputs.source,
-      out: checked_group(read.inputs, read.walks),
-    })
+  with_group_read(
+    [{ named: named, members: members, imported: imported }],
+    sibling,
+    body_supplier,
+    also,
+    |read: GroupRead|
+      {
+        texts: members.map(|f: OwnerFacts| f.text),
+        source: read.inputs.loaded.get(0).source,
+        out: checked_group(read.inputs, read.walks),
+      },
+  )
 
 fn checked_group_result(module: Bytes, c: UnitCheck) -> owner_checks::GroupResult / {abort.raise} =
   owner_checks::group_result(
@@ -2268,7 +2304,7 @@ pub fn header_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       None -> empty_header(key.module),
       Some(written) -> {
         let tables = import_packages(key);
-        over_stored(stored_reads(key, tables, [], always_entire), ||
+        over_stored(stored_reads(key, tables, Map::new(), always_entire), ||
           import_problems({ name: key.module, module: written, derived: [] }, tables))
       },
     },

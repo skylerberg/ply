@@ -206,25 +206,32 @@ pub fn import_problems(
   }
 }
 
+pub type LoadedModule = { module: ParsedModule, tables: ImportPackages }
+
 pub fn resolve_group(
-  own: ParsedModule,
+  own: List<LoadedModule>,
   mentioned: List<Bytes>,
-  tables: ImportPackages,
 ) -> ResolveOutcome / {abort.raise, module_names.read} = {
-  let own_declared = declarations_of(own);
-  let built = module_scope(
-    own,
-    bindings_of(own.name, own_declared),
-    import_context(tables, Map::new()),
-  );
-  if built.diagnostics.len() > 0 { ResolveFailed(built.diagnostics) } else {
-    let targets = built.edges.map(|e: ImportEdge| e.target);
-    let elsewhere = targets.concat(mentioned).unique().filter(|m: Bytes|
-      m != own.name && m.len() > 0);
-    let modules = elsewhere.fold([own], |found: List<ParsedModule>, name: Bytes|
+  let loaded = own.map(|m: LoadedModule| m.module);
+  let names = loaded.map(|m: ParsedModule| m.name);
+  let built = range(0, own.len()).map(|i: Int| {
+    let m = loaded.get(i);
+    module_scope(m, bindings_of(m.name, declarations_of(m)), {
+      ..import_context(own.get(i).tables, Map::new()),
+      at: i,
+    })
+  });
+  let problems = built.flat_map(|b: ScopeBuilder| b.diagnostics);
+  if problems.len() > 0 { ResolveFailed(problems) } else {
+    let targets = built.map(|b: ScopeBuilder| b.edges.map(|e: ImportEdge| e.target));
+    let elsewhere = targets.flat_map(|ts: List<Bytes>| ts).concat(mentioned).unique().filter(
+      |m: Bytes| !names.contains(m) && m.len() > 0,
+    );
+    let first = loaded.get(0);
+    let modules = elsewhere.fold(loaded, |found: List<ParsedModule>, name: Bytes|
       found.push({
         name: name,
-        module: { ..own.module, doc: None, imports: [], items: [] },
+        module: { ..first.module, doc: None, imports: [], items: [] },
         derived: [],
       }));
     let places = range(0, modules.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
@@ -232,11 +239,17 @@ pub fn resolve_group(
     let declarations = modules.map(declarations_of);
     let declared = range(0, modules.len()).map(|i: Int|
       bindings_of(modules.get(i).name, declarations.get(i)));
+    let imported = targets.map(|ts: List<Bytes>|
+      ts.fold([], |found: List<Int>, t: Bytes|
+        match places.get(t) { Some(i) -> found.push(i), None -> found }));
+    let edges = range(0, own.len()).map(|i: Int|
+      imported.get(i).filter(|t: Int| t < own.len()).map(|t: Int|
+        { from: i, target: t, span: dummy_span }));
     resolution_finished(
       {
         names: range(0, modules.len()).map(|i: Int| { name: modules.get(i).name, at: i }),
         scopes: range(0, modules.len()).map(|i: Int|
-          if i == 0 { built.scope } else {
+          if i < own.len() { built.get(i).scope } else {
             {
               module: modules.get(i).name,
               modules: [],
@@ -246,13 +259,8 @@ pub fn resolve_group(
           }),
         declarations: declarations,
         declared: declared,
-        order: range(1, modules.len()).push(0),
-        imports: [
-          targets.fold([], |found: List<Int>, t: Bytes|
-            match places.get(t) { Some(i) -> found.push(i), None -> found }),
-        ].concat(
-          elsewhere.map(|_: Bytes| []),
-        ),
+        order: range(own.len(), modules.len()).concat(traverse(edges).order),
+        imports: imported.concat(elsewhere.map(|_: Bytes| [])),
         signatures: Map::new(),
         visible_modules: [],
         positions: places,

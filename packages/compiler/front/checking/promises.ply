@@ -1,31 +1,30 @@
 import std.bin
 import std.list
 import compiler.store.memo (memo)
-import compiler.front (PulledAnalysis)
-import compiler.front.emitter_input (Analysed, Rejected)
+import compiler.check.infer.checker (CheckReads, DefinitionInfo, EffectInfo, program)
+import compiler.front.emitter_input (AnalysisOutcome, Analysed, KnownConstructors, Rejected,
+                                     joined_constructors)
+import compiler.front.facts (Analysis)
 import compiler.front.rows (OutlineItem, OutlinedFunction)
-import compiler.front.exports (Imported, ItemAt, Mention, ModuleOrigin, OwnerSource, OwnerText,
-                               checked_owner, group_imports, group_source_from, hash_entry_bin,
-                               item_at_bin, item_layout, mention_key, module_origin_bin, named_node,
-                               owner_source_bin)
+import compiler.front.exports (Imported, ItemAt, Mention, OwnerSource, OwnerText, group_imports,
+                               hash_entry_bin, item_layout, mention_key, named_node)
 import compiler.emit.costs (GroupWalk, ParamSharing, ReturnOwnership, FreshReturn, WalkedBody,
-                            cost_input_of, demands_of, group_walk_bin, module_costs,
-                            module_demands_bin, parameters_bin, parameters_of, report_bin,
-                            return_ownership_bin, walked_group)
+                            demands_of, group_walk_bin, module_costs, module_demands_bin,
+                            parameters_bin, parameters_of, report_bin, return_ownership_bin,
+                            walked_group)
 import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, item_span)
 import compiler.check.resolve.tables (ParsedModule, qualify)
 import compiler.check.infer (item_owner)
 import compiler.store.hash.forms (CachedNode, NodeRef)
 import compiler.front.checking.units (code_of_group)
 import compiler.program.group_check (checked_group)
-import compiler.front.checking.world (ModuleKey, Setting, QueryEffects, context_once, decoded,
-                                      interface_key_bin, module_key_bin, module_origin_lookup,
-                                      own_modules_kind, package_location_of, setting_bin,
-                                      shipped_for)
-import compiler.front.checking.groups (GroupKey, OwnerFacts, OwnerKey, OwnersResult, UnitCheck,
-                                       always_entire, declared_of, group_key_bin, layout_of,
-                                       placed_facts, group_keys, module_key_of, no_bodies,
-                                       owner_facts, owner_hash_query, owner_key_bin, owners_check,
+import compiler.front.checking.world (ModuleKey, QueryEffects, context_once, decoded,
+                                      interface_key_bin, module_key_bin, own_modules_kind,
+                                      package_location_of, shipped_for)
+import compiler.front.checking.groups (GroupKey, GroupSource, OwnerFacts, OwnerKey, OwnersResult,
+                                       always_entire, constructors_reached_from, declared_of,
+                                       group_key_bin, layout_of, placed_facts, group_keys,
+                                       no_bodies, owner_facts, owner_hash_query, owner_key_bin,
                                        owners_result_of, with_group_read, GroupRead, unit_key_of)
 
 pub const cost_walk_query: Bytes = b"cost walk"
@@ -40,7 +39,7 @@ pub const module_parameters_query: Bytes = b"module parameters"
 
 pub const module_costs_query: Bytes = b"module costs"
 
-pub const body_program_query: Bytes = b"body program"
+pub const measure_query: Bytes = b"measure"
 
 pub const measures_query: Bytes = b"measures"
 
@@ -139,16 +138,14 @@ pub fn cost_walk_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let u = decoded(input, group_key_bin(), "a unit's names");
   let members = unit_members(u);
   let read = with_group_read(
-    module_of_unit(u),
-    members,
-    imports_for_unit(u, members),
+    [{ named: module_of_unit(u), members: members, imported: imports_for_unit(u, members) }],
     always_entire,
     no_bodies,
     [],
     |group: GroupRead|
       {
         out: checked_group(group.inputs, group.walks),
-        source: group.inputs.source,
+        source: group.inputs.loaded.get(0).source,
         elsewhere: code_of_group(group, u.tested),
       },
   );
@@ -293,31 +290,106 @@ fn functions_used_by(o: OwnerKey) -> List<OwnerKey> / {memo.read, abort.raise} =
 
 fn body_key(o: OwnerKey) -> Bytes = mention_key({ module: o.module, name: o.owner })
 
-fn bodies_reached(start: List<OwnerKey>) -> Map<Bytes, Bool> / {memo.read, abort.raise} =
+fn bodies_reached(start: List<OwnerKey>) -> Map<Bytes, OwnerKey> / {memo.read, abort.raise} =
   iterate(
     { seen: Map::new(), work: start },
     1000000,
-    |s: { seen: Map<Bytes, Bool>, work: List<OwnerKey> }|
+    |s: { seen: Map<Bytes, OwnerKey>, work: List<OwnerKey> }|
       match s.work {
         [] -> Stop(s.seen),
         [o, ..rest] -> if s.seen.contains(body_key(o)) { Continue({ ..s, work: rest }) }
         else if !in_root(o.module) && !states_clauses(o) { Continue({ ..s, work: rest }) } else {
           Continue({
-            seen: s.seen.insert(body_key(o), true),
+            seen: s.seen.insert(body_key(o), o),
             work: if in_root(o.module) { rest.concat(functions_used_by(o)) } else { rest },
           })
         },
       },
   )
 
-pub type BodyProgram = {
-  source: OwnerSource,
-  places: Map<Bytes, ModuleOrigin>,
-  setting: Setting,
-  measured: List<Bytes>,
+fn groups_reached(u: GroupKey) -> List<GroupKey> / {memo.read, abort.raise} = {
+  let by_module = bodies_reached(u.owners.map(|o: Bytes| owner_at(u, o))).values().fold(
+    Map::new(),
+    |found: Map<Bytes, GroupKey>, o: OwnerKey|
+      found.insert(o.module, match found.get(o.module) {
+        Some(g) -> { ..g, owners: g.owners.push(o.owner) },
+        None -> { module: o.module, shipped: o.shipped, tested: o.tested, owners: [o.owner] },
+      }),
+  );
+  [match by_module.get(u.module) { Some(g) -> g, None -> u }].concat(
+    by_module.values().filter(|g: GroupKey| g.module != u.module),
+  )
 }
 
-derive bin for BodyProgram
+fn source_of_unit(u: GroupKey) -> GroupSource / {QueryEffects, abort.raise} = {
+  let members = unit_members(u);
+  { named: module_of_unit(u), members: members, imported: imports_for_unit(u, members) }
+}
+
+fn with_stored_tables(
+  a: Analysis,
+  mentioned: List<Mention>,
+  known: KnownConstructors,
+) -> Analysis / {CheckReads, abort.raise} = {
+  let read = mentioned.fold(
+    { definitions: a.checked.definitions, effects: a.checked.effects },
+    |found: { definitions: List<DefinitionInfo>, effects: List<EffectInfo> }, m: Mention| {
+      let name = qualify(m.module, m.name);
+      {
+        definitions: match program.definition_named(name) {
+          Some(facts) -> match facts.definition {
+            Some(d) -> found.definitions.push(d),
+            None -> found.definitions,
+          },
+          None -> found.definitions,
+        },
+        effects: match program.effect_named(name) {
+          Some(e) -> found.effects.push(e),
+          None -> found.effects,
+        },
+      }
+    },
+  );
+  {
+    ..a,
+    checked: {
+      ..a.checked,
+      definitions: read.definitions,
+      effects: read.effects,
+      constructors: known.constructors,
+      instances: known.instances,
+      numeric_types: known.numeric,
+    },
+  }
+}
+
+pub type MeasureProgram = {
+  outcome: AnalysisOutcome,
+  measured: List<Bytes>,
+  offset: Int,
+  owned: List<Bytes>,
+}
+
+pub fn measure_program(u: GroupKey) -> MeasureProgram / {QueryEffects, abort.raise} = {
+  let groups = groups_reached(u);
+  let known = joined_constructors(
+    groups.map(|g: GroupKey| constructors_reached_from(module_of_unit(g))),
+  );
+  let measured = measured_in(u, owners_result_of(module_of_unit(u)));
+  let owned = groups.map(|g: GroupKey| g.module).filter(|m: Bytes| m == u.module || in_root(m));
+  with_group_read(groups.map(source_of_unit), always_entire, no_bodies, [], |group: GroupRead| {
+    let checked = checked_group(group.inputs, group.walks);
+    {
+      outcome: match checked.pulled.out {
+        Rejected(ds) -> Rejected(ds),
+        Analysed(a) -> Analysed(with_stored_tables(a, group.mentioned, known)),
+      },
+      measured: measured,
+      offset: group.inputs.loaded.get(0).source.offset,
+      owned: owned,
+    }
+  })
+}
 
 fn measured_in(u: GroupKey, read: OwnersResult) -> List<Bytes> =
   read.shape.outline.items.fold([], |found: List<Bytes>, item: OutlineItem|
@@ -330,42 +402,7 @@ fn measured_in(u: GroupKey, read: OwnersResult) -> List<Bytes> =
       _ -> found,
     })
 
-pub fn body_program_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
-  let u = decoded(input, group_key_bin(), "a unit's names");
-  let members = unit_members(u);
-  let reached = bodies_reached(u.owners.map(|o: Bytes| owner_at(u, o)));
-  let c = owners_check(
-    module_of_unit(u),
-    members,
-    imports_for_unit(u, members),
-    true,
-    always_entire,
-    |module: Bytes, owner: Bytes| reached.contains(mention_key({ module: module, name: owner })),
-  );
-  bin::encode(
-    {
-      source: group_source_from(u.module, c.reads, c.imported, c.needed),
-      places: c.places,
-      setting: c.setting,
-      measured: measured_in(u, owners_result_of(module_of_unit(u))),
-    },
-    body_program_bin(),
-  )
-}
-
-pub fn body_program_checked(p: BodyProgram) -> { pulled: PulledAnalysis, at: Int } / {abort.raise} =
-  checked_owner(p.source, p.setting.origin, module_origin_lookup(p.places), {
-    packages: p.setting.packages,
-    checked_packages: p.setting.resolved_packages,
-    tested: p.setting.tested,
-    unread: p.setting.unread,
-    all_sources: p.setting.wanted_texts,
-    data: p.setting.data,
-    embeds: p.setting.embeds,
-    given: [],
-  })
-
-pub type MeasureEntry = { unit: GroupKey, program: Bytes, items: List<ItemAt> }
+pub type MeasureEntry = { unit: GroupKey, items: List<ItemAt> }
 
 derive bin for MeasureEntry
 
@@ -380,7 +417,6 @@ pub fn measures_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
         u.owners.any(|o: Bytes| measured.contains(o))).map(|u: GroupKey|
         {
           unit: u,
-          program: memo.output_digest(body_program_query, bin::encode(u, group_key_bin())),
           items: item_layout(
             u.owners.fold([], |texts: List<OwnerText>, o: Bytes|
               match facts.get(o) { Some(f) -> texts.push(f.text), None -> texts }),
@@ -422,11 +458,6 @@ pub fn promise_queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes)
       name: module_costs_query,
       definition: b"compiler.front.checking.promises.module_costs_result",
       body: module_costs_result,
-    },
-    {
-      name: body_program_query,
-      definition: b"compiler.front.checking.promises.body_program_result",
-      body: body_program_result,
     },
     {
       name: measures_query,

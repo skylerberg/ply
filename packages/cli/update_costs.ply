@@ -1,32 +1,24 @@
 import compiler.emit.costs (Report, Costed, Site, ReturnMismatch, placed_span, report_of)
-import compiler.front.checking.promises (BodyProgram, MeasureEntry, body_program_checked,
-                                         cost_walk_query)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.exports (InRoot)
-import compiler.front.published (checked_bodies)
-import compiler.store.hash.encoding (hex)
+import compiler.front.checking.promises (MeasureEntry, cost_walk_query)
 import compiler.check.resolve.tables (Source, Diagnostic, error_at, error_at_and)
 import compiler.syntax.parsing (Span, no_module, dummy_span, span_between)
-import compiler.unit (identity_of, shipped)
-import compiler.store.records (record_store, with_record_store)
+import compiler.unit (shipped)
 import compiler.load (Derives)
 import diagnostic (SourceText, position_of)
 import compiler.cc (toolchain)
-import program (ProgramPlace, Session, in_program_store)
-import module_queries (PromiseFacts, promise_facts, body_programs)
+import program (ProgramPlace, ProgramStore, Session, in_program_store)
+import module_queries (PromiseFacts, promise_facts)
+import measures (MeasureFailure, measure_failures, proof_queries)
 import compiler.front.checking (LoadInputs, fresh_registry, inputs_alone, lookup_input_alone,
                                 over_decoding, prelude_files, prelude_frames)
 import compiler.store.memo (QueryStats, Run, empty_memory_store, in_session, reading)
-import proof.static_prover (UnprovedMeasure, unproved_measures)
 import report (indent)
 import std.term (Style, bold, dim, red, green, yellow, plain)
 import std.bin
 import std.fs (fs)
-import std.hash (blake3)
 import std.string
 import std.list
 import proof.obligation (plural)
-import std.path (strip_root)
 
 const location_width: Int = 22
 
@@ -93,38 +85,6 @@ pub fn reuse_violations<a>(
 pub fn measure_errors(place: ProgramPlace) -> List<Diagnostic> / {cost_checker.report} =
   promises_of(place, false, true).unproved
 
-type MeasureFailure = { owner: Bytes, start: Int, end: Int, reason: List<String>, descends: Bool }
-
-derive bin for MeasureFailure
-
-fn measure_failures(p: BodyProgram) -> List<MeasureFailure> / {abort.raise} = {
-  let own_module = p.source.source.name;
-  let owned = |m: Bytes| m == own_module || p.places.get(m) == Some(InRoot);
-  let c = body_program_checked(p);
-  match c.pulled.out {
-    Rejected(ds) ->
-      p.measured.map(|name: Bytes|
-        {
-          owner: name,
-          start: 0,
-          end: 0,
-          reason: ds.map(|d: Diagnostic| String::of_bytes_lossy(d.message)),
-          descends: false,
-        }),
-    Analysed(w) ->
-      unproved_measures(w, owned, Some(checked_bodies(w)), Some(p.measured)).map(
-        |u: UnprovedMeasure|
-          {
-            owner: Bytes::of_string(u.measure.owner),
-            start: u.measure.at.start - p.source.offset,
-            end: u.measure.at.end - p.source.offset,
-            reason: u.reason,
-            descends: u.descends,
-          },
-      ),
-  }
-}
-
 fn measure_diagnostic(e: MeasureEntry, module: Int, f: MeasureFailure) -> Diagnostic =
   error_at(
     b"E0467",
@@ -143,76 +103,18 @@ fn measure_diagnostic(e: MeasureEntry, module: Int, f: MeasureFailure) -> Diagno
     }),
   )
 
-const prover_roots: List<Bytes> = [b"update_costs.with_cost_cache"]
-
-fn verdict_key(prover: Bytes, program: Bytes) -> Bytes / {abort.raise} =
-  hex(
-    blake3(
-      Bytes::concat_all([
-        b"ply.measure.1\x00",
-        hex(bin::shape_digest(bin::list_bin(measure_failure_bin()))),
-        b"\x00",
-        prover,
-        b"\x00",
-        program,
-      ]),
-    ),
-  )
-
-type KnownVerdict = { entry: MeasureEntry, key: Bytes, failures: Option<List<MeasureFailure>> }
-
-fn decoded_verdict(bytes: Option<Bytes>) -> Option<List<MeasureFailure>> / {abort.raise} =
-  match bytes {
-    None -> None,
-    Some(b) -> match bin::decode(b, bin::list_bin(measure_failure_bin())) {
-      Ok(failures) -> Some(failures),
-      Err(_) -> None,
-    },
-  }
-
 fn measures_settled(
   place: ProgramPlace,
   modules: List<Bytes>,
   entries: List<MeasureEntry>,
-) -> List<Diagnostic> / {shipped.definitions, toolchain.bodies_dir, fs.read[abs], fs.write[abs], toolchain.read, fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read_file[shipped], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], shipped.read_pack, Derives, abort.raise} = {
-  let prover = identity_of(shipped.definitions(), prover_roots);
-  let store = strip_root(toolchain.bodies_dir()) ++ "/measures-"
-    ++ String::of_bytes(prover.slice(0, 16));
-  with_record_store[abs, proofs](store, || {
-    let known = entries.map(|e: MeasureEntry| {
-      let key = verdict_key(prover, e.program);
-      { entry: e, key: key, failures: decoded_verdict(record_store.get[proofs](key)) }
-    });
-    let open = known.filter(|k: KnownVerdict| k.failures == None);
-    let proved = if open.len() == 0 { [] } else {
-      in_program_store(place, |_: LoadInputs|
-        body_programs(open.map(|k: KnownVerdict| k.entry.unit))).value.map(
-        measure_failures,
-      )
-    };
-    if open.len() > 0 {
-      record_store.put[proofs](
-        range(0, open.len()).map(|i: Int|
-          {
-            key: open.get(i).key,
-            bytes: bin::encode(proved.get(i), bin::list_bin(measure_failure_bin())),
-          }),
-      )
-    };
-    let by_key = range(0, open.len()).fold(
-      Map::new(),
-      |accumulator: Map<Bytes, List<MeasureFailure>>, i: Int|
-        accumulator.insert(open.get(i).key, proved.get(i)),
-    );
-    known.fold([], |accumulator: List<Diagnostic>, k: KnownVerdict| {
-      let module = range(0, modules.len()).fold(0, |found: Int, i: Int|
-        if modules.get(i) == k.entry.unit.module { i } else { found });
-      let failures = match k.failures {
-        Some(fs) -> fs,
-        None -> match by_key.get(k.key) { Some(fs) -> fs, None -> [] },
-      };
-      accumulator.concat(failures.map(|f: MeasureFailure| measure_diagnostic(k.entry, module, f)))
-    })
+) -> List<Diagnostic> / {ProgramStore, abort.raise} = {
+  let failures = in_program_store(place, |_: LoadInputs|
+    entries.map(|e: MeasureEntry| measure_failures(e.unit))).value;
+  range(0, entries.len()).fold([], |accumulator: List<Diagnostic>, i: Int| {
+    let e = entries.get(i);
+    let module = range(0, modules.len()).fold(0, |found: Int, k: Int|
+      if modules.get(k) == e.unit.module { k } else { found });
+    accumulator.concat(failures.get(i).map(|f: MeasureFailure| measure_diagnostic(e, module, f)))
   })
 }
 
@@ -434,7 +336,7 @@ pub fn report_reuse_violations(report: Report) -> List<Diagnostic> =
 
 fn failures_over(sources: List<Source>) -> List<MeasureFailure> / {abort.raise} = {
   let w = inputs_alone(sources);
-  let qs = fresh_registry();
+  let qs = fresh_registry(proof_queries());
   over_decoding(
     empty_memory_store,
     prelude_frames,
@@ -444,10 +346,10 @@ fn failures_over(sources: List<Source>) -> List<MeasureFailure> / {abort.raise} 
       in_session(qs, |run: Run|
         reading(qs, run, || {
           let listed = promise_facts(sources.map(|s: Source| s.name), false, true);
-          body_programs(listed.measures.map(|e: MeasureEntry| e.unit))
+          listed.measures.fold([], |accumulator: List<MeasureFailure>, e: MeasureEntry|
+            accumulator.concat(measure_failures(e.unit)))
         })),
-  ).value.fold([], |accumulator: List<MeasureFailure>, p: BodyProgram|
-    accumulator.concat(measure_failures(p)))
+  ).value
 }
 
 fn measure_failures_in(source: Bytes) -> List<MeasureFailure> / {abort.raise} =
