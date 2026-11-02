@@ -1,15 +1,13 @@
-import compiler.check.infer.checker (BodyChecking, CheckReads, StoredDeclarations,
-                                     no_stored_declarations)
+import compiler.check.infer.checker (BodyPlan, CheckReads, StoredDeclarations)
 import compiler.check.resolve (ImportPackages, ResolveFailed, ResolveSucceeded, resolve_group)
 import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.check.resolve.tables (Diagnostic, EffectSpace, ParsedModule, Scope, TypeSpace,
                                       ValueSpace, bound_in, module_names)
 import compiler.expand.embed (EmbedRequest, EmbedResult, ModuleEmbed, embed_key, embed_requests)
-import compiler.front (PulledAnalysis, embeds_inlined, may_call_embed)
+import compiler.front (embeds_inlined, may_call_embed)
 import compiler.front.diagnostics (ParsedSource, outside_every_module, parse_from)
-import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.exports (Imported, OwnerSource, OwnerText, group_source_from, named_as_owned)
-import compiler.front.published (HashedProgram, checked_with_reads)
+import compiler.front.published (GroupCheck, ResolvedGroup, resolved_facts, type_check, unresolved)
 import compiler.front.rows (Rows)
 import compiler.store.hash (hashed_and_unused)
 import compiler.store.hash.forms (CachedNode, build_index, node_held_elsewhere)
@@ -65,21 +63,12 @@ pub fn parsed_group(source: OwnerSource, at: Int) -> ParsedSource / {abort.raise
   )
 }
 
-pub type GroupChecked = { pulled: PulledAnalysis, at: Int, declared: StoredDeclarations }
-
-fn rejected(diagnostics: List<Diagnostic>) -> GroupChecked =
-  {
-    pulled: { pulled: [], out: Rejected(diagnostics), shipped_views: [] },
-    at: 0,
-    declared: no_stored_declarations,
-  }
-
 fn hashed_group(
   read: List<ReadSource>,
   x: ResolvedProgram,
   index: Index,
   inputs: GroupInputs,
-) -> HashedProgram / {abort.raise, module_names.read} = {
+) -> ResolvedGroup / {abort.raise, module_names.read} = {
   let module_packages = x.modules.map(|m: ParsedModule|
     match module_names.module_package(m.name) {
       Some(p) -> p,
@@ -93,20 +82,16 @@ fn hashed_group(
   let hashed = hashed_and_unused(index, { nodes: fixed, tests: [], laws: [] }, module_packages);
   {
     modules: x.modules,
-    r: x.resolution,
-    unimported: x.modules.map(|_: ParsedModule| []),
+    resolution: x.resolution,
     index: index,
     hashes: hashed.hashes,
     unused: hashed.unused,
     uses: hashed.uses,
-    closure: { packages: [], modules: [], diagnostics: [] },
-    packages: [],
     module_packages: module_packages,
     root_count: if inputs.shipped { 0 } else { 1 },
     embeds: read.flat_map(|r: ReadSource| r.embeds),
     texts: read.map(|r: ReadSource| r.parsed.text),
-    cuts: Map::new(),
-    embed_items: Map::new(),
+    problems: x.diagnostics.map(outside_every_module),
   }
 }
 
@@ -123,28 +108,28 @@ fn with_scopes(n: NameElsewhere, scopes: List<Scope>) -> NameElsewhere / {module
 
 pub fn checked_group(
   inputs: GroupInputs,
-  walks: BodyChecking,
-) -> GroupChecked / {CheckReads, abort.raise} =
+  body_plan: BodyPlan,
+) -> GroupCheck / {CheckReads, abort.raise} =
   match resolved_group(inputs) {
-    Err(ds) -> rejected(ds),
-    Ok(r) -> {
-      let checked = checked_with_reads(r.program, inputs.rows, walks);
-      {
-        pulled: {
-          pulled: [],
-          out: match checked.outcome {
-            Rejected(ds) -> Rejected(r.problems.concat(ds)),
-            Analysed(a) -> if r.problems.len() > 0 { Rejected(r.problems) } else { Analysed(a) },
-          },
-          shipped_views: [],
-        },
-        at: 0,
-        declared: checked.declared,
-      }
-    },
+    Err(ds) -> unresolved(ds),
+    Ok(group) -> type_check(group, inputs.rows, body_plan),
   }
 
-pub type ResolvedGroup = { program: HashedProgram, problems: List<Diagnostic> }
+pub fn rejected_group(
+  inputs: GroupInputs,
+  diagnostics: List<Diagnostic>,
+  declared: StoredDeclarations,
+) -> GroupCheck / {module_names.read, abort.raise} =
+  match resolved_group(inputs) {
+    Err(ds) -> unresolved(ds),
+    Ok(group) ->
+      {
+        resolved: resolved_facts(group),
+        declared: declared,
+        checked: None,
+        diagnostics: diagnostics,
+      },
+  }
 
 pub fn resolved_group(
   inputs: GroupInputs,
@@ -169,10 +154,7 @@ pub fn resolved_group(
             built.index,
             inputs.elsewhere.map(|n: NameElsewhere| with_scopes(n, scopes)),
           );
-          Ok({
-            program: hashed_group(read, x, index, inputs),
-            problems: x.diagnostics.map(outside_every_module),
-          })
+          Ok(hashed_group(read, x, index, inputs))
         }
       },
     }

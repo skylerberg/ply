@@ -1,4 +1,5 @@
-import compiler.check.infer.checker (with_no_other_definitions, CheckReads, StoredDeclarations)
+import compiler.check.infer.checker (with_no_other_definitions, CheckReads, StoredDeclarations,
+                                     no_stored_declarations)
 import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, dummy_span, moved_by,
                                 parse_diagnostic, parse_label, start)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, TestItem, LawItem, SumBody,
@@ -35,9 +36,8 @@ import compiler.check.infer (CheckOutput, BodyFacts, types_joined, types_named, 
                              no_body_facts, elaborate, terminating_definitions,
                              measured_definitions, bodies_with, bodies_read, check_output_with,
                              EmitFacts)
-import compiler.check.infer.checker (DefinitionInfo, TestInfo, CachedFacts, BodyChecking,
-                                     CheckEvery, WitnessOrder, MemberSite, witness_params, Builtin,
-                                     builtins)
+import compiler.check.infer.checker (DefinitionInfo, TestInfo, CachedFacts, BodyPlan, CheckEvery,
+                                     WitnessOrder, MemberSite, witness_params, Builtin, builtins)
 import compiler.check.infer.definitions (natives_of)
 import compiler.emit.keys (test_owner, test_key, law_owner)
 import compiler.check.termination (Terminates, TerminatesByDecreases)
@@ -501,23 +501,50 @@ fn std_squats(
     )
   }
 
-pub type HashedProgram = {
+pub type ResolvedGroup = {
   modules: List<ParsedModule>,
-  r: Resolution,
-  unimported: List<List<Bytes>>,
+  resolution: Resolution,
   index: Index,
   hashes: HashOutput,
   unused: List<Diagnostic>,
   uses: List<UseNode>,
-  closure: Closure,
-  packages: List<PackageDependencies>,
   module_packages: List<Int>,
   root_count: Int,
   embeds: List<ModuleEmbed>,
   texts: List<Bytes>,
+  problems: List<Diagnostic>,
+}
+
+pub type HashedProgram = {
+  resolved: ResolvedGroup,
+  unimported: List<List<Bytes>>,
+  closure: Closure,
+  packages: List<PackageDependencies>,
   cuts: Map<Bytes, List<Cut>>,
   embed_items: Map<Bytes, List<ItemEmbeds>>,
 }
+
+pub type ResolvedFacts = { uses: List<UseNode>, embeds: List<ModuleEmbed> }
+
+pub const no_resolved_facts: ResolvedFacts = { uses: [], embeds: [] }
+
+pub fn resolved_facts(group: ResolvedGroup) -> ResolvedFacts =
+  { uses: group.uses, embeds: group.embeds }
+
+pub type GroupCheck = {
+  resolved: ResolvedFacts,
+  declared: StoredDeclarations,
+  checked: Option<Analysis>,
+  diagnostics: List<Diagnostic>,
+}
+
+pub fn unresolved(diagnostics: List<Diagnostic>) -> GroupCheck =
+  {
+    resolved: no_resolved_facts,
+    declared: no_stored_declarations,
+    checked: None,
+    diagnostics: diagnostics,
+  }
 
 pub fn hashed_closure(
   parsed: List<ParsedSource>,
@@ -536,23 +563,26 @@ pub fn hashed_closure(
       let x = resolved.program;
       let hashed = hashed_and_unused(resolved.index, fixed, resolved.tables.module_packages);
       Ok({
-        modules: x.modules,
-        r: x.resolution,
+        resolved: {
+          modules: x.modules,
+          resolution: x.resolution,
+          index: resolved.index,
+          hashes: hashed.hashes,
+          unused: hashed.unused.filter(|diagnostic: Diagnostic|
+            diagnostic.labels.any(
+              |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+                l.primary && l.module < root_count,
+            )),
+          uses: hashed.uses,
+          module_packages: resolved.tables.module_packages,
+          root_count: root_count,
+          embeds: embeds,
+          texts: parsed.map(|p: ParsedSource| p.text),
+          problems: [],
+        },
         unimported: unimported_in(x.modules, x.resolution, unimported),
-        index: resolved.index,
-        hashes: hashed.hashes,
-        unused: hashed.unused.filter(|diagnostic: Diagnostic|
-          diagnostic.labels.any(
-            |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
-              l.primary && l.module < root_count,
-          )),
-        uses: hashed.uses,
         closure: clo,
         packages: resolved.tables.packages,
-        module_packages: resolved.tables.module_packages,
-        root_count: root_count,
-        embeds: embeds,
-        texts: parsed.map(|p: ParsedSource| p.text),
         cuts: cuts.fold(Map::new(), |accumulator: Map<Bytes, List<Cut>>, c: StubCuts|
           accumulator.insert(c.name, c.cuts)),
         embed_items: Map::new(),
@@ -609,36 +639,49 @@ pub fn resolved_closure(
 
 pub fn checked_closure(
   h: HashedProgram,
-  rows: Rows,
-  walks: BodyChecking,
-) -> AnalysisOutcome / {abort.raise} =
-  with_no_other_definitions(|| checked_with_reads(h, rows, walks).outcome)
+  known: Rows,
+  body_plan: BodyPlan,
+) -> AnalysisOutcome / {abort.raise} = {
+  let check = with_no_other_definitions(|| type_check(h.resolved, known, body_plan));
+  match check.checked {
+    None -> Rejected(check.diagnostics),
+    Some(a) ->
+      Analysed({
+        ..a,
+        unimported: h.unimported,
+        manifest: match h.closure.packages.at(0) { Some(p) -> p.manifest, None -> None },
+        packages: h.packages,
+        locked_packages: pins_of(h.closure, h.resolved.embeds),
+        stub_cuts: h.cuts,
+        embed_items: h.embed_items,
+      }),
+  }
+}
 
-pub type ReadCheck = { outcome: AnalysisOutcome, declared: StoredDeclarations }
-
-pub fn checked_with_reads(
-  h: HashedProgram,
-  rows: Rows,
-  walks: BodyChecking,
-) -> ReadCheck / {abort.raise, CheckReads} = {
-  let out = check_output_with(h.r, h.modules, {
-    ..cache_from_rows(rows, h.root_count),
-    body_checking: walks,
+pub fn type_check(
+  group: ResolvedGroup,
+  known: Rows,
+  body_plan: BodyPlan,
+) -> GroupCheck / {abort.raise, CheckReads} = {
+  let out = check_output_with(group.resolution, group.modules, {
+    ..cache_from_rows(known, group.root_count),
+    body_plan: body_plan,
   });
   let checked: CheckOutput = out.checked;
   {
+    resolved: resolved_facts(group),
     declared: out.declared,
-    outcome: if !checked.ok { Rejected(checked.diagnostics.map(outside_every_module)) } else {
-      Analysed({
-        modules: h.modules,
-        r: h.r,
-        unimported: h.unimported,
+    checked: if !checked.ok || group.problems.len() > 0 { None } else {
+      Some({
+        modules: group.modules,
+        r: group.resolution,
+        unimported: group.modules.map(|_: ParsedModule| []),
         checked: checked,
-        index: h.index,
+        index: group.index,
         hashes: {
-          let cached_sites = cached_member_sites(h.modules, checked);
+          let cached_sites = cached_member_sites(group.modules, checked);
           checked_hashes(
-            h.hashes,
+            group.hashes,
             checked.facts.members.concat(cached_sites.sites),
             cached_sites.unread,
             checked.tests.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: TestInfo|
@@ -647,19 +690,20 @@ pub fn checked_with_reads(
               } else { accumulator }),
           )
         },
-        warnings: h.unused.map(outside_every_module).concat(checked.warnings),
-        uses: h.uses,
-        manifest: match h.closure.packages.at(0) { Some(p) -> p.manifest, None -> None },
-        packages: h.packages,
-        locked_packages: pins_of(h.closure, h.embeds),
-        module_packages: h.module_packages,
-        stub_cuts: h.cuts,
-        embeds: h.embeds,
-        embed_items: h.embed_items,
+        warnings: group.unused.map(outside_every_module).concat(checked.warnings),
+        uses: group.uses,
+        manifest: None,
+        packages: [],
+        locked_packages: [],
+        module_packages: group.module_packages,
+        stub_cuts: Map::new(),
+        embeds: group.embeds,
+        embed_items: Map::new(),
         bodies: out.bodies,
         declared: out.declared,
       })
     },
+    diagnostics: group.problems.concat(checked.diagnostics.map(outside_every_module)),
   }
 }
 
@@ -735,19 +779,20 @@ fn prune_prelude(
   h: HashedProgram,
 ) -> Option<List<ParsedSource>> / {abort.raise} = {
   let own = |name: Bytes| module_of_name(name) == prelude_module;
-  let roots = h.hashes.definitions.fold(
+  let resolved = h.resolved;
+  let roots = resolved.hashes.definitions.fold(
     [],
     |accumulator: List<Subject>, d: { name: Bytes, hash: Bytes }|
       if own(d.name) { accumulator } else { accumulator.push(FunctionNamed(d.name)) },
   ).concat(
-    h.index.nodes.fold([], |accumulator: List<Subject>, n: Node|
+    resolved.index.nodes.fold([], |accumulator: List<Subject>, n: Node|
       match n.body { NodeFn(_) -> accumulator, _ -> accumulator.push(DeclarationNamed(n.name)) }),
   ).concat(
-    h.index.tests.map(|t: TestNode| ItemKeyed(t.key)),
+    resolved.index.tests.map(|t: TestNode| ItemKeyed(t.key)),
   ).concat(
-    h.index.laws.map(|l: LawNode| ItemKeyed(l.key)),
+    resolved.index.laws.map(|l: LawNode| ItemKeyed(l.key)),
   );
-  let reach = reachable_functions(h.hashes, roots);
+  let reach = reachable_functions(resolved.hashes, roots);
   let is_reachable = |p: ParsedSource, item: Item|
     match item { FunctionItem(d) -> reach.contains(qualify(p.name, d.name.name)), _ -> true };
   if !parsed.any(|p: ParsedSource|

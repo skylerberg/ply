@@ -4,15 +4,16 @@ import compiler.check.resolve (ImportPackages, ModuleHeader, empty_header, impor
 import compiler.check.resolve.tables (declarations_bin, declarations_in, unplaced_declarations)
 import compiler.check.resolve.tables (declaration_bin)
 import compiler.check.infer.checker (CheckEvery, CheckReads, ConstructorInfo, StoredDeclarations,
-                                     TypeFacts, no_stored_declarations, program)
+                                     TypeFacts, declarations_joined, no_stored_declarations,
+                                     program)
 import compiler.check.resolve.tables (implicit_target)
 import compiler.syntax.type_syntax (EffectExpression)
 import compiler.check.resolve.tables (Binding, Declaration, Declarations, EffectSpace, Namespace,
                                       SetSpace, TypeSpace, ValueSpace, binding_of, declarations_of,
                                       lookup_declared, module_names, module_of_name,
                                       no_declarations)
-import compiler.program.group_check (GroupChecked, GroupInputs, LoadedSource, ResolvedGroup,
-                                     checked_group, resolved_group, source_of_group)
+import compiler.program.group_check (GroupInputs, LoadedSource, checked_group, rejected_group,
+                                     resolved_group, source_of_group)
 import compiler.program.reads (NameDeclarations, StoredReads, name_declarations_bin, over_stored,
                                first_stored)
 import compiler.program.stored (decoded_declarations, encoded_declarations)
@@ -35,12 +36,12 @@ import compiler.front.exports (OwnerInterface, HashEntry, ModuleOrigin, InRoot, 
                                any_module_name, signature_text, owner_tokens, signature_tokens,
                                call_cycles)
 import compiler.front.owner_checks
-import compiler.front.emitter_input (KnownConstructors, Analysed, Rejected, module_rollup,
-                                     module_rollup_bin, GroupLowering, group_lowering,
-                                     group_lowering_bin, no_group_lowering)
-import compiler.front (PulledAnalysis, embed_read_of, may_call_embed, published, shipped_wants_bin)
+import compiler.front.emitter_input (KnownConstructors, module_rollup, module_rollup_bin,
+                                     GroupLowering, group_lowering, group_lowering_bin,
+                                     no_group_lowering)
+import compiler.front (embed_read_of, may_call_embed, published, shipped_wants_bin)
 import compiler.front.pkg (Package)
-import compiler.front.published (encode_rows, decode_rows, no_rows)
+import compiler.front.published (GroupCheck, ResolvedGroup, encode_rows, decode_rows, no_rows)
 import compiler.emit.representations (type_names)
 import compiler.emit.lower.module_context (stated_functions)
 import compiler.check.infer (types_joined)
@@ -61,7 +62,7 @@ import compiler.check.resolve.tables (Source, Diagnostic, Label, backticked, dia
                                       error_at, import_binder, import_module_name, qualify)
 import compiler.syntax.parsing (Identifier, dummy_span)
 import compiler.check.infer.definitions (checked_functions, check_order)
-import compiler.check.infer.checker (BodyChecking, CheckOnly)
+import compiler.check.infer.checker (BodyPlan, CheckOnly)
 import compiler.check.types (Effect, FunctionType)
 import compiler.store.hash.forms (CachedNode, CachedTest, CachedLaw, CachedHashes, NodeRef,
                                   HashInput, HashNode, hash_forms, cached_hashes_bin,
@@ -871,11 +872,7 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
         encoded_declarations(
           with_module_opaque(
             named,
-            declared_by(
-              if result.rejected.len() > 0 { signature_declared(owner) } else { result.declared },
-              key.module,
-              members.get(i).text.names.push(owner.owner),
-            ),
+            declared_by(result.declared, key.module, members.get(i).text.names.push(owner.owner)),
           ),
         ),
       )
@@ -907,11 +904,11 @@ pub fn always_entire(_: Bytes) -> Sibling = Entire
 
 fn by_signature(_: Bytes) -> Sibling = BySignature
 
-pub type UnitCheck = { texts: List<OwnerText>, source: OwnerSource, out: GroupChecked }
+pub type UnitCheck = { texts: List<OwnerText>, source: OwnerSource, out: GroupCheck }
 
-pub type BodySupplier = (OwnerSource) -> Option<(Int) -> BodyChecking / {abort.raise}> / {abort.raise}
+pub type BodySupplier = (OwnerSource) -> Option<(Int) -> BodyPlan / {abort.raise}> / {abort.raise}
 
-pub fn no_bodies(_: OwnerSource) -> Option<(Int) -> BodyChecking / {abort.raise}> = None
+pub fn no_bodies(_: OwnerSource) -> Option<(Int) -> BodyPlan / {abort.raise}> = None
 
 fn inferring_only(walked: List<Bytes>) -> BodySupplier =
   |_: OwnerSource| Some(|_: Int| CheckOnly(walked))
@@ -1264,7 +1261,7 @@ fn setting_of(named: ModuleKey) -> Setting / {memo.read, abort.raise} =
     "a module's setting",
   )
 
-pub type GroupRead = { inputs: GroupInputs, walks: BodyChecking, mentioned: List<Mention> }
+pub type GroupRead = { inputs: GroupInputs, body_plan: BodyPlan, mentioned: List<Mention> }
 
 pub type GroupSource = { named: ModuleKey, members: List<OwnerFacts>, imported: List<Imported> }
 
@@ -1335,7 +1332,10 @@ pub fn with_group_read<a | e>(
     Map::new(),
     |found: Map<Bytes, Bool>, n: Bytes| found.insert(n, true),
   );
-  let walks = match body_supplier(loaded.get(0).source) { Some(at) -> at(0), None -> CheckEvery };
+  let body_plan = match body_supplier(loaded.get(0).source) {
+    Some(at) -> at(0),
+    None -> CheckEvery,
+  };
   over_stored(stored_reads(named, named.shipped && also.len() == 0, tables, inside, sibling), || {
     let mentions = range(0, groups.len()).fold([], |found: List<Mention>, i: Int|
       found.concat(
@@ -1371,7 +1371,7 @@ pub fn with_group_read<a | e>(
     });
     body({
       inputs: { loaded: loaded, elsewhere: unique.values(), shipped: named.shipped, rows: no_rows },
-      walks: walks,
+      body_plan: body_plan,
       mentioned: seen.values().filter(|m: Mention| !own.contains(mention_key(m))),
     })
   })
@@ -1415,21 +1415,13 @@ pub fn group_checked(
       {
         texts: members.map(|f: OwnerFacts| f.text),
         source: read.inputs.loaded.get(0).source,
-        out: checked_group(read.inputs, read.walks),
+        out: checked_group(read.inputs, read.body_plan),
       },
   )
 
 fn checked_group_result(module: Bytes, c: UnitCheck) -> owner_checks::GroupResult / {abort.raise} =
-  owner_checks::group_result(
-    c.out.pulled.out,
-    c.out.declared,
-    c.out.at,
-    c.source.source.source_text,
-    module,
-    c.texts,
-    c.source.items,
-    |x: ItemAt| c.source.offset + x.from,
-  )
+  owner_checks::group_result(c.out, module, c.texts, c.source.items, |x: ItemAt|
+    c.source.offset + x.from)
 
 pub fn imports_of(key: GroupKey) -> List<Imported> / {memo.read, abort.raise} =
   decoded(
@@ -1459,7 +1451,7 @@ fn sibling_for_called(called: List<Bytes>) -> (Bytes) -> Sibling =
 type CheckedGroup = { result: owner_checks::GroupResult, lowering: Option<GroupLowering> }
 
 fn lowering_of(c: UnitCheck) -> Option<GroupLowering> / {abort.raise} =
-  match c.out.pulled.out { Analysed(w) -> Some(group_lowering(w)), Rejected(_) -> None }
+  match c.out.checked { Some(w) -> Some(group_lowering(w)), None -> None }
 
 fn finalize_group(
   named: ModuleKey,
@@ -1467,21 +1459,30 @@ fn finalize_group(
   members: List<OwnerFacts>,
 ) -> CheckedGroup / {QueryEffects, abort.raise} = {
   let walked = key.owners.map(|o: Bytes| { owner: o, typed: inference_of(named, o) });
-  let rejected = owner_checks::inference_errors(
-    walked,
-    item_layout(members.map(|f: OwnerFacts| f.text)),
-  );
-  if rejected.len() > 0 {
-    { result: { ..owner_checks::no_group, rejected: rejected }, lowering: None }
-  } else {
-    let c = group_checked(
-      named,
-      members,
-      imports_of(key),
-      sibling_for_called(called_in(key, walked)),
-      |source: OwnerSource|
-        Some(owner_checks::supplied_bodies(walked, source.items, source.offset)),
+  let sibling = sibling_for_called(called_in(key, walked));
+  if walked.any(|w: owner_checks::OwnerInference| w.typed.rejected.len() > 0) {
+    let c = with_group_read(
+      [{ named: named, members: members, imported: imports_of(key) }],
+      sibling,
+      no_bodies,
+      [],
+      |read: GroupRead| {
+        let source = read.inputs.loaded.get(0).source;
+        {
+          texts: members.map(|f: OwnerFacts| f.text),
+          source: source,
+          out: rejected_group(
+            read.inputs,
+            owner_checks::inference_errors(walked, source.items, source.offset),
+            signature_declarations(key),
+          ),
+        }
+      },
     );
+    { result: checked_group_result(key.module, c), lowering: None }
+  } else {
+    let c = group_checked(named, members, imports_of(key), sibling, |source: OwnerSource|
+      Some(owner_checks::supplied_bodies(walked, source.items, source.offset)));
     {
       result: owner_checks::finalized_result(
         checked_group_result(key.module, c),
@@ -1492,6 +1493,18 @@ fn finalize_group(
     }
   }
 }
+
+fn signature_declarations(key: GroupKey) -> StoredDeclarations / {memo.read, abort.raise} =
+  key.owners.fold(no_stored_declarations, |found: StoredDeclarations, o: Bytes|
+    declarations_joined(
+      found,
+      signature_declared({
+        module: key.module,
+        shipped: key.shipped,
+        tested: key.tested,
+        owner: o,
+      }),
+    ))
 
 type GroupProgram = { source: GroupSource, sibling: (Bytes) -> Sibling }
 
@@ -1623,15 +1636,8 @@ pub fn typed_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       inferring_only(facts.text.names.map(|n: Bytes| qualify(key.module, n))),
     );
     bin::encode(
-      owner_checks::inference_result(
-        c.out.pulled.out,
-        c.out.at,
-        c.source.source.source_text,
-        key.module,
-        facts.text,
-        c.source.items,
-        |x: ItemAt| c.source.offset + x.from,
-      ),
+      owner_checks::inference_result(c.out, key.module, facts.text, c.source.items, |x: ItemAt|
+        c.source.offset + x.from),
       owner_checks::inference_result_bin(),
     )
   }
@@ -2454,10 +2460,7 @@ pub fn module_summary_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise
       rejected: read.problems.len() > 0 || header.len() > 0
         || summaries.any(|g: GroupSummary| g.rejected),
       warned: summaries.any(|g: GroupSummary| g.warned)
-        || (owner_checks::unused_reported(
-          reports_unused(read),
-          summaries.any(|g: GroupSummary| g.rejected),
-        )
+        || (reports_unused(read)
         && any_unreached(
           summaries.fold([], |accumulator: List<UseLink>, g: GroupSummary|
             accumulator.concat(g.uses)),

@@ -25,7 +25,7 @@ import compiler.store.hash.forms (build_index, CachedHashes, by_name, reachable_
 import compiler.store.hash.template (emitted_code)
 import compiler.store.hash (hash_index, body_key)
 import compiler.store.hash.encoding (hex)
-import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, BodyChecking, CheckEvery,
+import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, BodyPlan, CheckEvery,
                                      Builtin, builtins)
 import compiler.emit.keys (LawPart, LawGuard, LawBody, root_name, root_text, test_owner, law_key)
 import compiler.check.infer (encode_facts, no_body_facts, measured_definitions, bodies_read)
@@ -1072,13 +1072,13 @@ pub fn resolved_with_shipped(
   }
 }
 
-fn first_shipped_slot(h: HashedProgram) -> Int = h.root_count + h.closure.modules.len()
+fn first_shipped_slot(h: HashedProgram) -> Int = h.resolved.root_count + h.closure.modules.len()
 
 fn shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} =
-  range(first_shipped_slot(h), h.modules.len()).fold(
+  range(first_shipped_slot(h), h.resolved.modules.len()).fold(
     Map::new(),
     |accumulator: Map<Bytes, Bool>, i: Int| {
-      let m = h.modules.get(i);
+      let m = h.resolved.modules.get(i);
       m.module.items.fold(accumulator, |a: Map<Bytes, Bool>, item: Item|
         match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name), true), _ -> a })
     },
@@ -1088,33 +1088,40 @@ fn used_shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} 
   let first = first_shipped_slot(h);
   let candidates = shipped_functions(h);
   let imported = range(0, first).fold([], |accumulator: List<Subject>, i: Int|
-    h.modules.get(i).module.imports.fold(accumulator, |a: List<Subject>, d: ImportDeclaration|
-      match d.kind {
-        SelectedNames(names) -> {
-          let module = Bytes::join(d.path.map(|part: Identifier| part.name), b".");
-          names.fold(a, |b: List<Subject>, n: Identifier| {
-            let name = qualify(module, n.name);
-            if h.hashes.refs.declared.contains(name) { b } else { b.push(FunctionNamed(name)) }
-          })
+    h.resolved.modules.get(i).module.imports.fold(
+      accumulator,
+      |a: List<Subject>, d: ImportDeclaration|
+        match d.kind {
+          SelectedNames(names) -> {
+            let module = Bytes::join(d.path.map(|part: Identifier| part.name), b".");
+            names.fold(a, |b: List<Subject>, n: Identifier| {
+              let name = qualify(module, n.name);
+              if h.resolved.hashes.refs.declared.contains(name) { b }
+              else { b.push(FunctionNamed(name)) }
+            })
+          },
+          _ -> a,
         },
-        _ -> a,
-      }));
-  let stated = range(first, h.modules.len()).fold([], |accumulator: List<Subject>, i: Int| {
-    let m = h.modules.get(i);
-    m.module.items.fold(accumulator, |a: List<Subject>, item: Item|
-      match item {
-        TypeItem(t) -> a.push(DeclarationNamed(qualify(m.name, t.name.name))),
-        EffectItem(e) -> a.push(DeclarationNamed(qualify(m.name, e.name.name))),
-        _ -> match target_type(item) {
-          Some(target) -> a.push(DeclarationNamed(qualify(m.name, target.name))),
-          None -> a,
-        },
-      })
-  });
+    ));
+  let stated = range(first, h.resolved.modules.len()).fold(
+    [],
+    |accumulator: List<Subject>, i: Int| {
+      let m = h.resolved.modules.get(i);
+      m.module.items.fold(accumulator, |a: List<Subject>, item: Item|
+        match item {
+          TypeItem(t) -> a.push(DeclarationNamed(qualify(m.name, t.name.name))),
+          EffectItem(e) -> a.push(DeclarationNamed(qualify(m.name, e.name.name))),
+          _ -> match target_type(item) {
+            Some(target) -> a.push(DeclarationNamed(qualify(m.name, target.name))),
+            None -> a,
+          },
+        })
+    },
+  );
   reachable_functions(
-    h.hashes,
-    h.index.nodes.fold(
-      h.hashes.definitions.fold(
+    h.resolved.hashes,
+    h.resolved.index.nodes.fold(
+      h.resolved.hashes.definitions.fold(
         [],
         |accumulator: List<Subject>, d: { name: Bytes, hash: Bytes }|
           if candidates.contains(d.name) { accumulator }
@@ -1127,9 +1134,10 @@ fn used_shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} 
           else { accumulator },
         },
     ).concat(
-      h.index.tests.filter(|t: TestNode| t.module < first).map(|t: TestNode|
+      h.resolved.index.tests.filter(|t: TestNode| t.module < first).map(|t: TestNode|
         ItemKeyed(t.key)).concat(
-        h.index.laws.filter(|l: LawNode| l.module < first).map(|l: LawNode| ItemKeyed(l.key)),
+        h.resolved.index.laws.filter(|l: LawNode| l.module < first).map(|l: LawNode|
+          ItemKeyed(l.key)),
       ),
     ).concat(
       imported.concat(stated),
@@ -1145,8 +1153,11 @@ fn cut_to_reach(
   let first = first_shipped_slot(h);
   let candidates = shipped_functions(h);
   let wanted = |name: Bytes| !candidates.contains(name) || reach.contains(name);
-  let declared = h.index.nodes.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Node|
-    match n.body { NodeFn(_) -> accumulator, _ -> accumulator.insert(n.name, true) });
+  let declared = h.resolved.index.nodes.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, Bool>, n: Node|
+      match n.body { NodeFn(_) -> accumulator, _ -> accumulator.insert(n.name, true) },
+  );
   let is_retained = |p: ParsedSource, item: Item|
     match item {
       FunctionItem(d) -> wanted(qualify(p.name, d.name.name)),
@@ -1205,25 +1216,28 @@ fn shipped_views_of(
 ) -> List<ShippedModuleSummary> / {abort.raise} = {
   let first = first_shipped_slot(h);
   let candidates = shipped_functions(h);
-  let definitions = h.hashes.definitions.fold(
+  let definitions = h.resolved.hashes.definitions.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
       accumulator.insert(d.name, d.hash),
   );
-  let declarations = h.hashes.declarations.fold(
+  let declarations = h.resolved.hashes.declarations.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
       accumulator.insert(d.name, d.hash),
   );
-  let nodes = h.index.nodes.fold(Map::new(), |accumulator: Map<Int, List<Node>>, n: Node|
-    if n.module < first { accumulator } else {
-      accumulator.insert(
-        n.module,
-        List::push(match accumulator.get(n.module) { Some(ns) -> ns, None -> [] }, n),
-      )
-    });
-  range(first, h.modules.len()).map(|i: Int| {
-    let m = h.modules.get(i);
+  let nodes = h.resolved.index.nodes.fold(
+    Map::new(),
+    |accumulator: Map<Int, List<Node>>, n: Node|
+      if n.module < first { accumulator } else {
+        accumulator.insert(
+          n.module,
+          List::push(match accumulator.get(n.module) { Some(ns) -> ns, None -> [] }, n),
+        )
+      },
+  );
+  range(first, h.resolved.modules.len()).map(|i: Int| {
+    let m = h.resolved.modules.get(i);
     let own = match nodes.get(i) { Some(ns) -> ns, None -> [] };
     let hash_of = |table: Map<Bytes, Bytes>, name: Bytes|
       match table.get(name) { Some(hash) -> hash, None -> b"" };
@@ -1246,7 +1260,7 @@ fn shipped_views_of(
     );
     {
       module: m.name,
-      text: hex(blake3(h.texts.get(i))),
+      text: hex(blake3(h.resolved.texts.get(i))),
       form: hex(blake3(Bytes::join(shape, b"\n"))),
       definitions: own.fold([], |accumulator: List<{ name: Bytes, hash: Bytes }>, n: Node|
         match n.body {
@@ -1288,7 +1302,7 @@ pub fn shipped_views(
 pub fn checked_staged(
   staged: StagedLoad,
   rows: Rows,
-  walks: BodyChecking = CheckEvery,
+  walks: BodyPlan = CheckEvery,
 ) -> PulledAnalysis / {abort.raise} =
   {
     pulled: staged.pulled,

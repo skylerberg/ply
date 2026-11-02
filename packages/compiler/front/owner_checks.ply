@@ -3,12 +3,12 @@ import compiler.check.infer.checker (StoredDeclarations, stored_declarations_bin
 import std.bin
 import std.list
 import std.bytes
-import compiler.front.published (no_rows, rows_of)
+import compiler.front.published (GroupCheck, no_rows, rows_of)
 import compiler.front.facts (Analysis, ModuleFacts, read_outline, module_tables_bin,
                              tagged_site_bin, statement_site_bin, typed_const_bin, ModuleShape,
                              ModuleTables, TaggedSite, StatementSite, TypedConst, module_facts,
                              no_module_tables)
-import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, types_of_rows)
+import compiler.front.emitter_input (Analysed, Rejected, types_of_rows)
 import compiler.front.rows (EffectSetRow, OutlineItem, OutlinedLaw, OutlinedTest, LawOutline,
                             rows_bin, effect_set_row_bin, law_outline_bin, Rows, KnownDefinitionRow,
                             KnownLawRow, is_declared_in)
@@ -23,7 +23,7 @@ import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, LawBinde
                                      OperationInfo, ConstructorInfo, InstanceInfo, NumericInfo,
                                      Location, SpecInfo, WitnessOrder, MemberSite, CachedFacts,
                                      CheckedBody, ReusedBody, relocated_body, checked_body_bin,
-                                     cached_facts_bin, spec_info_bin, BodyChecking, ReuseBodies,
+                                     cached_facts_bin, spec_info_bin, BodyPlan, ReuseBodies,
                                      OwnCall)
 import compiler.emit.keys (test_owner, law_owner)
 import compiler.check.infer.definitions (checked_functions, check_order)
@@ -148,9 +148,9 @@ fn group_offset(spots: List<ItemRange>, p: Int) -> Int =
 fn owner_result(
   module_check: ModuleCheck,
   share: OwnerPart,
+  uses: List<UseNode>,
   spots: List<ItemRange>,
 ) -> OwnerResult / {abort.raise} = {
-  let slot = module_check.slot;
   let t = module_check.facts.tables;
   let owner_tables = {
     ..t,
@@ -165,7 +165,7 @@ fn owner_result(
     cached: share.cached,
   };
   let back = { from: 0, to: 0, by: |p: Int| group_offset(spots, p) };
-  let own_labels = |d: Diagnostic| in_own_slot(d, slot, spots);
+  let own_labels = |d: Diagnostic| in_own_slot(d, 0, spots);
   let lowest = |xs: List<Int>|
     xs.fold(0 - 1, |accumulator: Int, k: Int|
       if accumulator < 0 || k < accumulator { k } else { accumulator });
@@ -193,16 +193,7 @@ fn owner_result(
       consts: share.consts,
       sets: share.sets,
       laws: share.law_outlines,
-      uses: share.uses.map(|r: UseNode|
-        {
-          ..r,
-          module: 0,
-          span: moved_at(r.span, back),
-          unused: match r.unused {
-            Some(d) -> Some(moved_diagnostic(own_labels(d), back)),
-            None -> None,
-          },
-        }),
+      uses: uses,
     },
     if first_test < 0 { 0 } else { 0 - first_test },
     if first_law < 0 { 0 } else { 0 - first_law },
@@ -226,7 +217,6 @@ type OwnerPart = {
   consts: List<TypedConst>,
   sets: List<EffectSetRow>,
   law_outlines: List<LawOutline>,
-  uses: List<UseNode>,
 }
 
 pub fn relocated_result(a: OwnerResult, items: List<ItemAt>) -> OwnerResult = {
@@ -409,38 +399,101 @@ pub fn item_ranges(
   items.filter(|x: ItemAt| x.owner == owner).map(|x: ItemAt| { at: at(x), len: x.len, rel: x.from })
 
 pub fn group_result(
-  out: AnalysisOutcome,
-  declared: StoredDeclarations,
-  slot: Int,
-  text: Bytes,
+  check: GroupCheck,
   module: Bytes,
   members: List<OwnerText>,
   items: List<ItemAt>,
-  at: (ItemAt) -> Int / {abort.raise},
+  item_position: (ItemAt) -> Int / {abort.raise},
 ) -> GroupResult / {abort.raise} = {
-  let spots = items.map(|x: ItemAt| { at: at(x), len: x.len, rel: x.from });
+  let spots = items.map(|x: ItemAt| { at: item_position(x), len: x.len, rel: x.from });
   let back = { from: 0, to: 0, by: |p: Int| group_offset(spots, p) };
-  match out {
-    Rejected(ds) ->
+  let placed = placement(items, item_position);
+  let uses = List::group_by(check.resolved.uses, |r: UseNode|
+    owner_placed(placed, r.module, r.span));
+  let resolved = {
+    members: members.map(|o: OwnerText|
       {
-        members: [],
-        rejected: ds.map(|d: Diagnostic| moved_diagnostic(in_own_slot(d, slot, spots), back)),
-        forms: { nodes: [], order: [], tests: [], laws: [] },
-        embeds: [],
-        declared: declared,
+        owner: o.owner,
+        result: {
+          ..no_owner_result,
+          uses: relocated_uses(share_in(uses, o.owner), item_ranges(items, o.owner, item_position)),
+        },
+      }),
+    rejected: check.diagnostics.map(|d: Diagnostic|
+      moved_diagnostic(in_own_slot(d, 0, spots), back)),
+    forms: no_group.forms,
+    embeds: embeds_wanted(check.resolved.embeds, module, members),
+    declared: check.declared,
+  };
+  match check.checked {
+    None -> resolved,
+    Some(w) ->
+      {
+        ..resolved,
+        members: checked_members(
+          module_check_of(w),
+          module,
+          resolved.members,
+          members,
+          items,
+          item_position,
+          placed,
+        ),
+        forms: checked_forms(w, module, members),
       },
-    Analysed(w) ->
-      group_results(
-        module_check_of(w, slot, text),
-        module,
-        [{ members: members, items: items }],
-        at,
-      ).at_or(
-        0,
-        no_group,
-      ),
   }
 }
+
+fn embeds_wanted(
+  embeds: List<ModuleEmbed>,
+  module: Bytes,
+  members: List<OwnerText>,
+) -> List<ModuleEmbed> / {abort.raise} = {
+  let text = Bytes::join(
+    members.fold([], |accumulator: List<Bytes>, o: OwnerText| accumulator.concat(o.texts)),
+    b"\n\n",
+  );
+  let wanted = if !may_call_embed(text) { Map::new() } else {
+    embed_requests(parse(text).node).fold(
+      Map::new(),
+      |accumulator: Map<Bytes, Bool>, want: EmbedRequest| accumulator.insert(embed_key(want), true),
+    )
+  };
+  embeds.filter(|x: ModuleEmbed| x.module == module && wanted.contains(x.key))
+}
+
+fn relocated_uses(uses: List<UseNode>, spots: List<ItemRange>) -> List<UseNode> = {
+  let back = { from: 0, to: 0, by: |p: Int| group_offset(spots, p) };
+  uses.map(|r: UseNode|
+    {
+      ..r,
+      module: 0,
+      span: moved_at(r.span, back),
+      unused: match r.unused {
+        Some(d) -> Some(moved_diagnostic(in_own_slot(d, 0, spots), back)),
+        None -> None,
+      },
+    })
+}
+
+type Placement = Map<Int, { end: Int, owner: Bytes }>
+
+fn placement(
+  items: List<ItemAt>,
+  item_position: (ItemAt) -> Int / {abort.raise},
+) -> Placement / {abort.raise} =
+  items.fold(Map::new(), |accumulator: Placement, x: ItemAt| {
+    let p = item_position(x);
+    accumulator.insert(p, { end: p + x.len, owner: x.owner })
+  })
+
+fn owner_placed(placed: Placement, module: Int, s: Span) -> Bytes =
+  if module != 0 { b"" } else {
+    match placed.floor(s.start) {
+      Some(f) -> if s.end <= f.value.end { f.value.owner } else { b"" },
+      None -> b"",
+    }
+  }
 
 pub type Clauses = { name: Bytes, spec: List<SpecInfo> }
 
@@ -471,47 +524,23 @@ fn inference_result_from(result: OwnerResult, bodies: List<CheckedBody>) -> Infe
   }
 
 pub fn inference_result(
-  out: AnalysisOutcome,
-  slot: Int,
-  text: Bytes,
+  check: GroupCheck,
   module: Bytes,
   member: OwnerText,
   items: List<ItemAt>,
   at: (ItemAt) -> Int / {abort.raise},
 ) -> InferenceResult / {abort.raise} = {
-  let cut = group_result(out, no_stored_declarations, slot, text, module, [member], items, at);
-  match ((out, cut.members)) {
-    (Analysed(w), [m, ..]) -> {
+  let cut = group_result(check, module, [member], items, at);
+  match check.checked {
+    None -> { ..no_inference_result, rejected: cut.rejected },
+    Some(w) -> {
       let spots = item_ranges(items, member.owner, at);
       inference_result_from(
-        m.result,
+        cut.members.get(0).result,
         w.bodies.map(|b: CheckedBody| relocated_body(b, 0, |p: Int| group_offset(spots, p))),
       )
     },
-    _ -> { ..inference_result_from(no_owner_result, []), rejected: cut.rejected },
   }
-}
-
-pub fn inference_results(
-  module_check: ModuleCheck,
-  module: Bytes,
-  members: List<OwnerText>,
-  item_offset: (ItemAt) -> Int / {abort.raise},
-) -> List<InferenceResult> / {abort.raise} = {
-  let alone = members.map(|o: OwnerText| { members: [o], items: item_layout([o]) });
-  let cut = group_results(module_check, module, alone, item_offset);
-  range(0, members.len()).map(|i: Int| {
-    let o = members.get(i);
-    let result = match cut.get(i).members { [m, ..] -> m.result, [] -> no_owner_result };
-    let spots = item_ranges(alone.get(i).items, o.owner, item_offset);
-    let own = result.tables.definitions.map(|d: DefinitionInfo| d.name);
-    inference_result_from(
-      result,
-      module_check.analysis.bodies.filter(|b: CheckedBody| own.contains(b.name)).map(
-        |b: CheckedBody| relocated_body(b, 0, |p: Int| group_offset(spots, p)),
-      ),
-    )
-  })
 }
 
 const no_owner_result: OwnerResult =
@@ -551,9 +580,13 @@ derive bin for SignatureCheck
 pub fn signature_check_of(result: GroupResult) -> SignatureCheck =
   { rejected: result.rejected, declared: result.declared }
 
-pub fn inference_errors(members: List<OwnerInference>, items: List<ItemAt>) -> List<Diagnostic> =
+pub fn inference_errors(
+  members: List<OwnerInference>,
+  items: List<ItemAt>,
+  offset: Int,
+) -> List<Diagnostic> =
   members.fold([], |accumulator: List<Diagnostic>, w: OwnerInference| {
-    let base = base_of(items, w.owner);
+    let base = offset + base_of(items, w.owner);
     accumulator.concat(
       w.typed.rejected.map(|d: Diagnostic|
         moved_diagnostic(d, { from: 0, to: 0, by: |p: Int| base + p })),
@@ -570,7 +603,7 @@ pub fn supplied_bodies(
   members: List<OwnerInference>,
   items: List<ItemAt>,
   offset: Int,
-) -> (Int) -> BodyChecking / {abort.raise} =
+) -> (Int) -> BodyPlan / {abort.raise} =
   |slot: Int| {
     let combined = members.fold(
       { bodies: Map::new(), sites: [] },
@@ -644,29 +677,23 @@ pub fn finalized_result(
       }),
   }
 
-pub type ModuleCheck = { analysis: Analysis, slot: Int, facts: ModuleFacts, rows: Rows }
+pub type ModuleCheck = { analysis: Analysis, facts: ModuleFacts, rows: Rows }
 
-pub fn module_check_of(w: Analysis, slot: Int, text: Bytes) -> ModuleCheck / {abort.raise} =
-  { analysis: w, slot: slot, facts: module_facts(w, slot), rows: rows_of(w) }
+pub fn module_check_of(w: Analysis) -> ModuleCheck / {abort.raise} =
+  { analysis: w, facts: module_facts(w, 0), rows: rows_of(w) }
 
-pub type GroupLayout = { members: List<OwnerText>, items: List<ItemAt> }
-
-pub fn group_results(
+fn checked_members(
   module_check: ModuleCheck,
   module: Bytes,
-  groups: List<GroupLayout>,
+  resolved: List<MemberResult>,
+  members: List<OwnerText>,
+  items: List<ItemAt>,
   item_position: (ItemAt) -> Int / {abort.raise},
-) -> List<GroupResult> / {abort.raise} = {
+  placed: Placement,
+) -> List<MemberResult> / {abort.raise} = {
   let w = module_check.analysis;
-  let slot = module_check.slot;
-  let prefix = module.concat(b".");
   let t = module_check.facts.tables;
   let shape = module_check.facts.shape;
-  let members = groups.fold(
-    [],
-    |accumulator: List<OwnerText>, g: { members: List<OwnerText>, items: List<ItemAt> }|
-      accumulator.concat(g.members),
-  );
   let declared = members.fold(Map::new(), |accumulator: Map<Bytes, List<Bytes>>, o: OwnerText|
     o.names.push(o.owner).fold(accumulator, |a: Map<Bytes, List<Bytes>>, n: Bytes|
       a.insert(n, share_in(a, n).push_unique(o.owner))));
@@ -675,24 +702,8 @@ pub fn group_results(
     xs.fold(Map::new(), |accumulator: Map<Bytes, List<EffectSetRow>>, x: EffectSetRow|
       names_of(x).fold(accumulator, |a: Map<Bytes, List<EffectSetRow>>, o: Bytes|
         a.insert(o, share_in(a, o).push(x))));
-  let starts = groups.fold(
-    [],
-    |accumulator: List<ItemAt>, g: { members: List<OwnerText>, items: List<ItemAt> }|
-      accumulator.concat(g.items),
-  ).fold(Map::new(), |accumulator: Map<Int, { end: Int, owner: Bytes }>, x: ItemAt| {
-    let p = item_position(x);
-    accumulator.insert(p, { end: p + x.len, owner: x.owner })
-  });
-  let owning = |m: Int, here: Int, s: Span|
-    if m != here { b"" } else {
-      match starts.floor(s.start) {
-        Some(f) -> if s.end <= f.value.end { f.value.owner } else { b"" },
-        None -> b"",
-      }
-    };
-  let placed = |m: Int, s: Span| owning(m, 0, s);
-  let definitions = List::group_by(t.definitions, |d: DefinitionInfo|
-    placed(d.at.module, d.at.span));
+  let at = |m: Int, s: Span| owner_placed(placed, m, s);
+  let definitions = List::group_by(t.definitions, |d: DefinitionInfo| at(d.at.module, d.at.span));
   let definition_owner = definitions.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, o: Bytes, ds: List<DefinitionInfo>|
@@ -700,14 +711,14 @@ pub fn group_results(
   );
   let definition_named = |name: Bytes|
     match definition_owner.get(name) { Some(o) -> o, None -> b"" };
-  let tests = List::group_by(t.tests, |x: TestInfo| placed(x.at.module, x.at.span));
+  let tests = List::group_by(t.tests, |x: TestInfo| at(x.at.module, x.at.span));
   let test_owned = tests.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, o: Bytes, ts: List<TestInfo>|
       ts.fold(accumulator, |a: Map<Bytes, Bytes>, x: TestInfo|
         a.insert(test_owner(x.module, x.name), o)),
   );
-  let laws = List::group_by(t.laws, |l: LawInfo| placed(l.at.module, l.at.span));
+  let laws = List::group_by(t.laws, |l: LawInfo| at(l.at.module, l.at.span));
   let law_owned = laws.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, o: Bytes, ls: List<LawInfo>|
@@ -719,11 +730,11 @@ pub fn group_results(
       Some(o) -> o,
       None -> match law_owned.get(name) { Some(o) -> o, None -> definition_named(name) },
     };
-  let effects = List::group_by(t.effects, |x: EffectInfo| placed(x.at.module, x.at.span));
+  let effects = List::group_by(t.effects, |x: EffectInfo| at(x.at.module, x.at.span));
   let constructors = List::group_by(t.constructors, |c: ConstructorInfo|
-    placed(c.at.module, c.at.span));
-  let instances = List::group_by(t.instances, |x: InstanceInfo| placed(x.at.module, x.at.span));
-  let numeric = List::group_by(t.numeric, |x: NumericInfo| placed(x.at.module, x.at.span));
+    at(c.at.module, c.at.span));
+  let instances = List::group_by(t.instances, |x: InstanceInfo| at(x.at.module, x.at.span));
+  let numeric = List::group_by(t.numeric, |x: NumericInfo| at(x.at.module, x.at.span));
   let pure = List::group_by(t.facts.pure, definition_named);
   let owned = |m: Int, owner: Bytes| if m != 0 { b"" } else { owner_of_cached(owner) };
   let bodies = List::group_by(t.facts.bodies, |x: TypedBody<Bytes>| owned(x.module, x.owner));
@@ -738,13 +749,13 @@ pub fn group_results(
     |accumulator: Map<Bytes, List<Diagnostic>>, d: Diagnostic|
       d.labels.fold([], |os: List<Bytes>, l: Label|
         if !l.primary { os } else {
-          let o = owning(l.module, slot, span_between(l.start, l.end));
+          let o = at(l.module, span_between(l.start, l.end));
           if o.len() == 0 || os.contains(o) { os } else { os.push(o) }
         }).fold(accumulator, |a: Map<Bytes, List<Diagnostic>>, o: Bytes|
         a.insert(o, List::push(match a.get(o) { Some(ds) -> ds, None -> [] }, d))),
   );
-  let tagged = List::group_by(shape.tagged, |x: TaggedSite| placed(x.module, x.span));
-  let statements = List::group_by(shape.statements, |x: StatementSite| placed(x.module, x.span));
+  let tagged = List::group_by(shape.tagged, |x: TaggedSite| at(x.module, x.span));
+  let statements = List::group_by(shape.statements, |x: StatementSite| at(x.module, x.span));
   let consts = List::group_by(shape.consts, |x: TypedConst| definition_named(x.name));
   let sets = shared_by(shape.outline.sets, |x: EffectSetRow| whose(x.name));
   let outlined = shape.outline.items.fold(
@@ -759,84 +770,65 @@ pub fn group_results(
         _ -> accumulator,
       },
   );
-  let uses = List::group_by(w.uses, |r: UseNode| owning(r.module, slot, r.span));
-  let share_of = |o: Bytes|
+  resolved.map(|m: MemberResult| {
+    let o = m.owner;
     {
-      definitions: share_in(definitions, o),
-      tests: share_in(tests, o),
-      laws: share_in(laws, o),
-      effects: share_in(effects, o),
-      constructors: share_in(constructors, o),
-      instances: share_in(instances, o),
-      numeric: share_in(numeric, o),
-      facts: {
-        pure: share_in(pure, o),
-        orders: share_in(orders, o),
-        members: share_in(member_sites, o),
-        types: types_named(t.facts.types, share_in(bodies, o)),
-        bodies: share_in(bodies, o),
-      },
-      cached: share_in(cached, o),
-      rows: share_in(rows, o),
-      warnings: share_in(warnings, o),
-      tagged: share_in(tagged, o),
-      statements: share_in(statements, o),
-      consts: share_in(consts, o),
-      sets: share_in(sets, o),
-      law_outlines: share_in(outlined, o),
-      uses: share_in(uses, o),
-    };
-  let chosen = {
-    ..module_selection(w.index, slot),
-    called: Some(called_at(w.checked.facts.members)),
-  };
-  groups.map(|g: { members: List<OwnerText>, items: List<ItemAt> }| {
-    {
-      members: g.members.map(|o: OwnerText|
+      owner: o,
+      result: owner_result(
+        module_check,
         {
-          owner: o.owner,
-          result: owner_result(
-            module_check,
-            share_of(o.owner),
-            item_ranges(g.items, o.owner, item_position),
-          ),
-        }),
-      rejected: [],
-      forms: {
-        let set = |pick: (OwnerText) -> List<Bytes> / {abort.raise}|
-          g.members.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: OwnerText|
-            pick(o).fold(accumulator, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)));
-        let labelled = |kind: Bytes, o: OwnerText|
-          if o.owner.starts_with(kind) { [o.owner.slice(kind.len(), o.owner.len())] } else { [] };
-        let among = |m: Map<Bytes, Bool>|
-          |name: Bytes|
-            name.starts_with(prefix) && m.contains(name.slice(prefix.len(), name.len()));
-        let node_kept = among(set(|o: OwnerText| o.names));
-        let test_kept = among(set(|o: OwnerText| labelled(b"test ", o)));
-        let law_kept = among(set(|o: OwnerText| labelled(b"law ", o)));
-        selection_forms(w.index, w.module_packages, {
-          own: chosen.own.filter(|v: Int| node_kept(w.index.nodes.get(v).name)),
-          tests: chosen.tests.filter(|x: TestNode| test_kept(x.key)),
-          laws: chosen.laws.filter(|x: LawNode| law_kept(x.key)),
-          called: chosen.called,
-        })
-      },
-      declared: w.declared,
-      embeds: {
-        let text = Bytes::join(
-          g.members.fold([], |accumulator: List<Bytes>, o: OwnerText| accumulator.concat(o.texts)),
-          b"\n\n",
-        );
-        let wanted = if !may_call_embed(text) { Map::new() } else {
-          embed_requests(parse(text).node).fold(
-            Map::new(),
-            |accumulator: Map<Bytes, Bool>, want: EmbedRequest|
-              accumulator.insert(embed_key(want), true),
-          )
-        };
-        w.embeds.filter(|x: ModuleEmbed| x.module == module && wanted.contains(x.key))
-      },
+          definitions: share_in(definitions, o),
+          tests: share_in(tests, o),
+          laws: share_in(laws, o),
+          effects: share_in(effects, o),
+          constructors: share_in(constructors, o),
+          instances: share_in(instances, o),
+          numeric: share_in(numeric, o),
+          facts: {
+            pure: share_in(pure, o),
+            orders: share_in(orders, o),
+            members: share_in(member_sites, o),
+            types: types_named(t.facts.types, share_in(bodies, o)),
+            bodies: share_in(bodies, o),
+          },
+          cached: share_in(cached, o),
+          rows: share_in(rows, o),
+          warnings: share_in(warnings, o),
+          tagged: share_in(tagged, o),
+          statements: share_in(statements, o),
+          consts: share_in(consts, o),
+          sets: share_in(sets, o),
+          law_outlines: share_in(outlined, o),
+        },
+        m.result.uses,
+        item_ranges(items, o, item_position),
+      ),
     }
+  })
+}
+
+fn checked_forms(
+  w: Analysis,
+  module: Bytes,
+  members: List<OwnerText>,
+) -> HashInput / {abort.raise} = {
+  let prefix = module.concat(b".");
+  let chosen = { ..module_selection(w.index, 0), called: Some(called_at(w.checked.facts.members)) };
+  let set = |pick: (OwnerText) -> List<Bytes> / {abort.raise}|
+    members.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: OwnerText|
+      pick(o).fold(accumulator, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)));
+  let labelled = |kind: Bytes, o: OwnerText|
+    if o.owner.starts_with(kind) { [o.owner.slice(kind.len(), o.owner.len())] } else { [] };
+  let among = |m: Map<Bytes, Bool>|
+    |name: Bytes| name.starts_with(prefix) && m.contains(name.slice(prefix.len(), name.len()));
+  let node_wanted = among(set(|o: OwnerText| o.names));
+  let test_wanted = among(set(|o: OwnerText| labelled(b"test ", o)));
+  let law_wanted = among(set(|o: OwnerText| labelled(b"law ", o)));
+  selection_forms(w.index, w.module_packages, {
+    own: chosen.own.filter(|v: Int| node_wanted(w.index.nodes.get(v).name)),
+    tests: chosen.tests.filter(|x: TestNode| test_wanted(x.key)),
+    laws: chosen.laws.filter(|x: LawNode| law_wanted(x.key)),
+    called: chosen.called,
   })
 }
 
@@ -881,9 +873,6 @@ fn gathered<a>(owners: List<OwnerResult>, pick: (OwnerResult) -> List<a>) -> Lis
 fn diagnostic_start(d: Diagnostic) -> Int =
   d.labels.fold(0 - 1, |accumulator: Int, l: Label|
     if accumulator < 0 && l.primary { l.start } else { accumulator })
-
-pub fn unused_reported(reports_unused: Bool, any_rejected: Bool) -> Bool =
-  reports_unused && !any_rejected
 
 pub fn assembled(
   module: Bytes,
@@ -1039,11 +1028,9 @@ pub fn assembled(
         types_joined(accumulator, a.rows.types)),
     },
     warnings: ranked(
-      gathered(owners, |a: OwnerResult| a.warnings).concat(
-        if unused_reported(unused, groups.any(|g: PositionedGroup| g.result.rejected.len() > 0)) {
-          unreached(gathered(owners, |a: OwnerResult| a.uses))
-        } else { [] },
-      ),
+      gathered(owners, |a: OwnerResult| a.warnings).concat(if unused {
+        unreached(gathered(owners, |a: OwnerResult| a.uses))
+      } else { [] }),
       diagnostic_start,
     ),
     rejected: ranked(
@@ -1084,18 +1071,18 @@ test "a definition's check result lists the files embedded by that definition on
     Analysed(w) -> w,
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
   };
-  let module_check = module_check_of(w, 0, source);
+  let check = {
+    resolved: { uses: w.uses, embeds: w.embeds },
+    declared: w.declared,
+    checked: Some(w),
+    diagnostics: [],
+  };
   let reads = owner_texts(w.modules.get(0), parse(source).node, source);
   let embed_keys = |owner: Bytes| {
     let members = reads.filter(|o: OwnerText| o.owner == owner);
-    group_results(
-      module_check,
-      b"m",
-      [{ members: members, items: item_layout(members) }],
-      |x: ItemAt| x.to,
-    ).get(
-      0,
-    ).embeds.map(|e: ModuleEmbed| e.key)
+    group_result(check, b"m", members, item_layout(members), |x: ItemAt| x.to).embeds.map(
+      |e: ModuleEmbed| e.key,
+    )
   };
   assert_eq(embed_keys(b"a"), [b"file:x.txt"]);
   assert_eq(embed_keys(b"b"), [b"file:y.txt"]);
