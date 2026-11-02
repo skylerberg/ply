@@ -25,6 +25,7 @@ import compiler.emit.typed_ir (Variable, Arg, VariableOperand, BoolOperand, AsIn
                                Member)
 import compiler.emit.lower (root_lowered)
 import compiler.emit.lower.module_context (ModuleContext, Root, module_context_in)
+import compiler.emit.reads (over_analysis)
 import compiler.emit.print (printed_function)
 import compiler.emit.print.text (PrintOutput)
 import compiler.emit.own (insert_reference_counts)
@@ -37,13 +38,7 @@ pub fn program_of(source: Bytes) -> Result<Program, Bytes> / {abort.raise} =
     Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
     Analysed(a) -> match module_context_in(a, b"m") {
       Err(reason) -> Err(reason),
-      Ok(s) ->
-        Ok({
-          source: source,
-          analysis: a,
-          setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
-          roots: s.roots,
-        }),
+      Ok(s) -> Ok({ source: source, analysis: a, setting: s.setting, roots: s.roots }),
     },
   }
 
@@ -80,13 +75,7 @@ pub fn scheduled_program_of(source: Bytes) -> Result<Program, Bytes> / {abort.ra
     Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
     Analysed(a) -> match module_context_in(a, b"m") {
       Err(reason) -> Err(reason),
-      Ok(s) ->
-        Ok({
-          source: source,
-          analysis: a,
-          setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
-          roots: s.roots,
-        }),
+      Ok(s) -> Ok({ source: source, analysis: a, setting: s.setting, roots: s.roots }),
     },
   }
 }
@@ -98,7 +87,7 @@ fn lowered_at(p: Program, key: RootKey) -> Function / {abort.raise} =
   match p.roots.find(|r: Root| r.key == key) {
     None ->
       panic(String::of_bytes_lossy(b"no such definition: ".concat(root_text(root_name(key))))),
-    Some(r) -> root_lowered(p.setting, r),
+    Some(r) -> over_analysis(p.analysis, || root_lowered(p.setting, r)),
   }
 
 pub fn shipped_lowered(
@@ -114,12 +103,7 @@ pub fn shipped_lowered(
       Err(reason) -> panic(String::of_bytes_lossy(reason)),
       Ok(s) ->
         lowered_at(
-          {
-            source: source,
-            analysis: a,
-            setting: { ..s.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
-            roots: s.roots,
-          },
+          { source: source, analysis: a, setting: s.setting, roots: s.roots },
           Named(qualify(module, name)),
         ),
     },
@@ -161,7 +145,7 @@ pub fn printed_by_ir(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort.r
   match checked(p, name) { Err(reason) -> Err(reason), Ok(form) -> Ok(printed_text(p, form)) }
 
 pub fn printed_in(p: Program, f: Function) -> PrintOutput / {abort.raise} =
-  printed_function(f, p.setting.constructors)
+  over_analysis(p.analysis, || printed_function(f))
 
 pub fn build_failure(p: Program, f: Function) -> Option<Bytes> = {
   let counted = built_form(f);
@@ -217,40 +201,17 @@ pub fn built_c(
   let root = root_name(key);
   match analyse_pulling_std_with([{ name: b"m", source_text: source }], shipped, no_rows).out {
     Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
-    Analysed(a) -> match module_context_in(a, b"m") {
-      Err(reason) -> Err(reason),
-      Ok(s) -> {
-        let d = dump_of(Analysed(a));
-        let texts = shipped.fold(
-          Map::new().insert(b"m", source).insert(prelude_module, prelude_source::text),
-          |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, source_text: Bytes }|
-            accumulator.insert(x.name, x.source_text),
-        );
-        let order = d.modules.fold(Map::new(), |accumulator: Map<Int, Bytes>, row: ModuleRow|
-          accumulator.insert(row.index, row.name));
-        let names = range(0, order.len()).map(|i: Int|
-          match order.get(i) { Some(n) -> n, None -> b"" });
-        handle {
-          match emit_root_results(
-              names,
-              names.map(|n: Bytes| match texts.get(n) { Some(t) -> t, None -> b"" }),
-              s.setting.constructors,
-              [key],
-              [],
-              [],
-              d.embeds,
-              d.rows,
-              d.effects,
-              d.inferred_facts,
-            ).fold(None, |accumulator: Option<RootOutput>, r: RootOutput|
-              if r.name == root { Some(r) } else { accumulator }) {
-            Some(r) -> Ok(own_written(r)),
-            None -> Err(b"the program has no definition with that name"),
-          }
-        } with {
-          abort.raise(m) -> Err(Bytes::of_string(m)),
-        }
-      },
+    Analysed(a) -> handle {
+      match emit_root_results(a, [key]).fold(
+          None,
+          |accumulator: Option<RootOutput>, r: RootOutput|
+            if r.name == root { Some(r) } else { accumulator },
+        ) {
+        Some(r) -> Ok(own_written(r)),
+        None -> Err(b"the program has no definition with that name"),
+      }
+    } with {
+      abort.raise(m) -> Err(Bytes::of_string(m)),
     },
   }
 }

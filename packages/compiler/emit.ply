@@ -16,15 +16,19 @@ import compiler.check.infer.definitions (Extern, MachineCall, parsed_natives, ma
 import compiler.check.types (Type, NamedType, VariableType, FunctionType, Scheme, Effect, int_type,
                              bool_type, bytes_type, unit_type, function_type, monomorphic,
                              no_effects, read_effects)
-import compiler.emit.lower.module_context (CodeElsewhere, HostHandler, nothing_elsewhere,
-                                           definitions_beside, natives_with, ModuleContext,
-                                           declared_schemes, decode_inferred_facts, definitions_in,
-                                           resolved_imports, declared_effects, recorded_annotations,
-                                           param_type, scheduler_imported, published_operations,
-                                           root_body, resolved_at, root_params, body_code)
+import compiler.emit.lower.module_context (HostHandler, ModuleContext, resolved_imports,
+                                           recorded_annotations, param_type, scheduler_imported,
+                                           root_body, resolved_at, root_params, body_code,
+                                           definition_called, definition_written, definition_rooted,
+                                           scheme_called, host_called, stated_functions_of,
+                                           stated_functions)
 import compiler.check.typed
 import compiler.check.typed (BodyPart, WholeBody, ClauseBody, TestRun, CaseListing)
-import compiler.emit.lower.calling (known_body, lambdas_of, named_in, definition_in)
+import compiler.emit.lower.calling (known_body, lambdas_of, named_in)
+import compiler.emit.reads (over_analysis)
+import compiler.front.facts (Analysis)
+import compiler.front.published (rows_of, inferred_facts)
+import compiler.front.emitter_input (InferredFacts)
 import compiler.emit.lower.scalars (is_walked_container, is_columns_type)
 import compiler.emit.typing (SiteAnnotations)
 import compiler.front.rows (Rows, KnownDefinitionRow, KnownTestRow, ModuleDerivations, EffectRow,
@@ -48,11 +52,11 @@ import compiler.emit.output (EmittedRoot, RootOutput, PublishedSignature)
 import compiler.emit.typed_ir
 import compiler.emit.typed_ir (Function)
 import compiler.emit.borrow_inference (OwnershipSignature, InferenceResult, infer_signatures,
-                                       inference_targets_of, declared_borrows, signatures_from,
+                                       inference_targets_of, called_definitions, signatures_from,
                                        inferred_function)
-import compiler.emit.representations (Constructors, SumConstructor, BytesShape, OpenShape,
-                                      Definition, Imported, EffectName, EmitParam, BoundLambda,
-                                      kind_of, boxed, at_args, substituted)
+import compiler.emit.representations (SumConstructor, BytesShape, OpenShape, Definition, Imported,
+                                      EmitParam, BoundLambda, kind_of, boxed, at_args, substituted,
+                                      EmitReads, code_facts)
 import compiler.emit.generated (GeneratedRoot, MarshalledSums, container_code,
                                 container_operation_generated, marshal_root, is_marshal_operation,
                                 runtime_entry_code, is_marshallable, equality_code, compared_code,
@@ -105,224 +109,117 @@ fn written_wanted(
 
 pub type LoweredProgram = {
   roots: List<Function>,
-  stated: Map<Bytes, List<Bytes>>,
-  constructors: Constructors,
-  borrowed: Map<RootName, List<Int>>,
   ownership_signatures: Map<RootName, OwnershipSignature>,
 }
 
 pub fn emit_program(
-  given: List<Source>,
-  constructors: Constructors,
+  a: Analysis,
   release: Bool,
   roots: List<RootKey>,
-  packages: List<PackageDependencies>,
-  placed: List<Int>,
-  embeds: List<ModuleEmbed>,
-  rows: Rows,
-  effects: List<EffectRow>,
-  walked: Bytes,
   published: List<PublishedSignature> = [],
-) -> List<EmittedRoot> / {abort.raise} =
-  emitted_program(
-    lowered_program(
-      given,
-      constructors,
-      release,
-      roots,
-      packages,
-      placed,
-      embeds,
-      rows,
-      effects,
-      walked,
-      published,
-    ),
-  )
+) -> List<EmittedRoot> / {EmitReads} =
+  emitted_program(lowered_program(a, release, roots, published))
 
-pub fn emitted_program(w: LoweredProgram) -> List<EmittedRoot> / {abort.raise} = {
+pub fn emitted_program(w: LoweredProgram) -> List<EmittedRoot> / {EmitReads} = {
+  let declared = declared_borrows_of(w.roots);
   let resolved = infer_signatures(
-    inference_targets_of(w.borrowed, w.roots),
+    inference_targets_of(declared, w.roots),
     w.ownership_signatures,
-    w.borrowed,
+    declared,
   );
-  roots_emitted(w.roots, resolved, w.stated, w.constructors, 0, w.roots.len(), 64)
+  roots_emitted(w.roots, resolved, 0, w.roots.len(), 64)
 }
+
+pub fn declared_borrows_of(roots: List<Function>) -> Map<RootName, List<Int>> / {EmitReads} =
+  roots.map(|f: Function| root_name(f.key)).concat(
+    called_definitions(inference_targets_of(Map::new(), roots)),
+  ).fold(Map::new(), |found: Map<RootName, List<Int>>, n: RootName|
+    if found.contains(n) { found } else {
+      match definition_called(root_text(n)) {
+        Some(d) -> if d.borrowed.len() == 0 || root_name(d.root) != n { found }
+        else { found.insert(n, d.borrowed) },
+        None -> found,
+      }
+    })
 
 fn roots_emitted(
   roots: List<Function>,
   resolved: InferenceResult,
-  stated: Map<Bytes, List<Bytes>>,
-  constructors: Constructors,
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<EmittedRoot> / {abort.raise} =
-  if hi - lo <= 1 {
-    match roots.at(lo) { Some(r) -> [root_emitted(r, resolved, stated, constructors)], None -> [] }
-  } else if depth_left <= 0 {
+) -> List<EmittedRoot> / {EmitReads} =
+  if hi - lo <= 1 { match roots.at(lo) { Some(r) -> [root_emitted(r, resolved)], None -> [] } }
+  else if depth_left <= 0 {
     panic(
       "internal compiler error: dividing the list of roots in two for parallel work recursed too deep",
     )
   } else {
     let mid = lo + (hi - lo) / 2;
     let both = parallel {
-      roots_emitted(roots, resolved, stated, constructors, lo, mid, depth_left - 1),
-      roots_emitted(roots, resolved, stated, constructors, mid, hi, depth_left - 1),
+      roots_emitted(roots, resolved, lo, mid, depth_left - 1),
+      roots_emitted(roots, resolved, mid, hi, depth_left - 1),
     };
     both._0.concat(both._1)
   }
 
-fn root_emitted(
-  f: Function,
-  resolved: InferenceResult,
-  stated: Map<Bytes, List<Bytes>>,
-  constructors: Constructors,
-) -> EmittedRoot / {abort.raise} = {
+fn root_emitted(f: Function, resolved: InferenceResult) -> EmittedRoot / {EmitReads} = {
   let l = inferred_function(f, resolved);
-  let e = with_instance_calls(stated, tags_in(l.form), emitted_of(l.form, constructors));
+  let e = with_instance_calls(tags_in(l.form), emitted_of(l.form));
   { ..e, tables: { ..e.tables, handings: l.own_signatures, assumed: l.assumed, group: l.group } }
 }
 
 fn lowered_program(
-  given: List<Source>,
-  constructors: Constructors,
+  a: Analysis,
   release: Bool,
   roots: List<RootKey>,
-  packages: List<PackageDependencies>,
-  placed: List<Int>,
-  embeds: List<ModuleEmbed>,
-  rows: Rows,
-  effects: List<EffectRow>,
-  walked: Bytes,
   published: List<PublishedSignature>,
-) -> LoweredProgram / {abort.raise} =
-  lowered_in(
-    scope_of(given, constructors, release, roots, packages, placed, embeds, rows, effects, walked),
-    roots,
-    signatures_from(published),
-  )
+) -> LoweredProgram / {EmitReads} =
+  lowered_in(scope_of(a, release, roots), roots, signatures_from(published))
 
 pub type Scope = {
   modules: List<ParsedModule>,
   places: Map<Bytes, Int>,
   module_scopes: List<ModuleScope>,
-  resolved: Resolution,
-  schemes: Map<Bytes, Scheme>,
   owned: Map<Bytes, BodyFacts>,
   reading: Map<Bytes, Bool>,
-  declared_operations: Map<Bytes, List<Bytes>>,
-  constructors: Constructors,
-  builtins: List<Bytes>,
-  machine: Map<Bytes, MachineCall>,
-  natives: List<Extern>,
   release_build: Bool,
-  declared: Map<Bytes, Scheme>,
-  borrowed: Map<RootName, List<Int>>,
-  hosts: Map<Bytes, HostHandler>,
   test_effects: Map<Bytes, List<Effect>>,
 }
 
-pub type ModuleScope = {
-  here: List<Definition>,
-  imports: List<Imported>,
-  effects: List<EffectName>,
-}
+pub type ModuleScope = { imports: List<Imported> }
 
 pub fn root_outputs(
   s: Scope,
   roots: List<RootKey>,
   ownership_signatures: Map<RootName, OwnershipSignature>,
   lent: Option<Map<RootName, Option<BoundLambda>>> = None,
-) -> List<RootOutput> / {abort.raise} = results_of(lowered_in(s, roots, ownership_signatures, lent))
+) -> List<RootOutput> / {EmitReads} = results_of(lowered_in(s, roots, ownership_signatures, lent))
 
-pub fn scope_of(
-  given: List<Source>,
-  constructors: Constructors,
-  release: Bool,
-  roots: List<RootKey>,
-  packages: List<PackageDependencies>,
-  placed: List<Int>,
-  embeds: List<ModuleEmbed>,
-  rows: Rows,
-  effects: List<EffectRow>,
-  walked: Bytes,
-  derived: List<ModuleDerivations> = [],
-) -> Scope / {abort.raise} = {
-  let sources = with_prelude_source(given);
-  let module_packages = if sources.len() == given.len() || packages.len() == 0 { placed }
-  else { placed.push(packages.len()) };
-  let tables = embed_tables(embeds);
-  let parsed = range(0, sources.len()).map(|i: Int| {
-    let s = match sources.at(i) { Some(x) -> x, None -> { name: b"", source_text: b"" } };
-    let taken = match derived.find(|m: ModuleDerivations| m.module == s.name) {
-      Some(m) -> m.derivations,
-      None -> [],
-    };
-    let p = parse_from(i, s, parse(s.source_text), derivations: taken);
-    let e = inline_embeds_by_name(tables, s.name, p.module.module);
-    if p.diagnostics.len() > 0 { unread(diagnostics_text(p.diagnostics)) }
-    else if e.diagnostics.len() > 0 { unread(parse_diagnostics_text(e.diagnostics)) }
-    else { { ..p.module, module: e.module } }
-  });
-  let packaged = if packages.len() == 0 { no_packages(parsed) } else {
-    {
-      packages: packages,
-      module_packages: module_packages,
-      std: packages.len() - 2,
-      compiler: packages.len() - 1,
-      other_shipped_package: packages.len(),
-    }
-  };
-  let x = match resolve_packaged(
-      parsed,
-      packaged.packages,
-      packaged.module_packages,
-      packaged.std,
-      packaged.compiler,
-      packaged.other_shipped_package,
-    ) {
-    ResolveFailed(diagnostics) -> unread(diagnostics_text(diagnostics)),
-    ResolveSucceeded(x) -> x,
-  };
+pub fn scope_of(a: Analysis, release: Bool, roots: List<RootKey>) -> Scope / {abort.raise} = {
+  let tables = embed_tables(a.embeds);
   scope_over(
-    x.modules,
-    x.resolution,
-    constructors,
+    a.modules.map(|m: ParsedModule| {
+      let e = inline_embeds_by_name(tables, m.name, m.module);
+      if e.diagnostics.len() > 0 { unread(parse_diagnostics_text(e.diagnostics)) }
+      else { { ..m, module: e.module } }
+    }),
+    a.r,
     release,
     roots,
-    rows,
-    effects,
-    walked,
-    nothing_elsewhere,
+    rows_of(a),
+    inferred_facts(a),
   )
 }
 
 pub fn scope_over(
   modules: List<ParsedModule>,
   resolution: Resolution,
-  constructors: Constructors,
   release: Bool,
   roots: List<RootKey>,
   rows: Rows,
-  effects: List<EffectRow>,
-  walked: Bytes,
-  elsewhere: CodeElsewhere,
+  w: InferredFacts,
 ) -> Scope / {abort.raise} = {
-  let schemes = rows.definitions.fold(
-    elsewhere.schemes,
-    |accumulator: Map<Bytes, Scheme>, row: KnownDefinitionRow|
-      accumulator.insert(row.name, row.scheme),
-  );
-  let w = match decode_inferred_facts(walked) {
-    Some(w) -> w,
-    None ->
-      unread(
-        b"the check result could not be decoded, so the inferred types and effects are missing",
-      ),
-  };
-  let pure = w.pure.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
-    accumulator.insert(n, true));
   let reading = owners_to_read(rows, roots);
   let every = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
     accumulator.insert(m.name, true));
@@ -330,9 +227,6 @@ pub fn scope_over(
     Ok(f) -> f,
     Err(reason) -> unread(reason),
   };
-  let values = constant_values(rows);
-  let program = definitions_beside(modules, pure, schemes, values, elsewhere);
-  let definitions_of = |path: Bytes| match program.get(path) { Some(ds) -> ds, None -> [] };
   let members = facts.members.fold(
     Map::new(),
     |accumulator: Map<Int, List<MemberSite>>, s: MemberSite|
@@ -341,10 +235,6 @@ pub fn scope_over(
         List::push(match accumulator.get(s.module) { Some(xs) -> xs, None -> [] }, s),
       ),
   );
-  let natives = natives_with(modules, elsewhere);
-  let declared = declared_effects(resolution, published_operations(effects)).concat(
-    elsewhere.effects,
-  );
   {
     modules: modules,
     places: range(0, modules.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
@@ -352,45 +242,17 @@ pub fn scope_over(
     module_scopes: range(0, modules.len()).map(|i: Int| {
       let m = modules.get(i);
       {
-        here: definitions_of(m.name),
-        imports: resolved_imports(
-          resolution,
-          i,
-          modules,
-          m.module,
-          definitions_of,
-          match members.get(i) { Some(xs) -> xs, None -> [] },
-        ).concat(
-          scheduler_imported(definitions_of),
+        imports: resolved_imports(resolution, i, modules, m.module, match members.get(i) {
+          Some(xs) -> xs,
+          None -> [],
+        }).push(
+          scheduler_imported,
         ),
-        effects: declared,
       }
     }),
-    resolved: resolution,
-    schemes: schemes,
     owned: facts_by_owner(facts),
     reading: reading,
-    declared_operations: stated_by_tag(modules).merge(elsewhere.stated),
-    constructors: {
-      ..constructors,
-      keyed: keyed_tags(modules).fold(constructors.keyed, |accumulator: List<Bytes>, k: Bytes|
-        if accumulator.contains(k) { accumulator } else { accumulator.push(k) }),
-    },
-    builtins: natives.map(|e: Extern| e.name),
-    machine: machine_calls(natives),
-    natives: natives,
     release_build: release,
-    declared: declared_schemes,
-    borrowed: program.fold(
-      Map::new(),
-      |m: Map<RootName, List<Int>>, module: Bytes, definitions: List<Definition>|
-        declared_borrows(m, module, definitions),
-    ),
-    hosts: elsewhere.hosts.fold(
-      with_prelude_handlers(host_handlers(modules, definitions_of), definitions_of),
-      |found: Map<Bytes, HostHandler>, effect_name: Bytes, host: HostHandler|
-        found.insert(effect_name, host),
-    ),
     test_effects: rows.tests.fold(Map::new(), |m: Map<Bytes, List<Effect>>, r: KnownTestRow|
       match read_effects(r.effects) { Some(xs) -> m.insert(r.key, xs), None -> m }),
   }
@@ -403,81 +265,24 @@ fn unread<a>(reason: Bytes) -> a / {abort.raise} =
     ),
   )
 
-fn host_handlers(
-  modules: List<ParsedModule>,
-  definitions_of: (Bytes) -> List<Definition>,
-) -> Map<Bytes, HostHandler> / {abort.raise} =
-  modules.fold(Map::new(), |accumulator: Map<Bytes, HostHandler>, m: ParsedModule|
-    m.module.items.fold(accumulator, |handlers: Map<Bytes, HostHandler>, item: Item|
-      match item {
-        InstanceItem(d) -> if d.kind != HostInstance { handlers } else {
-          let served = qualify(m.name, d.target.name);
-          match definitions_of(m.name).find(|definition: Definition|
-              definition.name == d.function.name) {
-            None ->
-              unread(
-                Bytes::concat_all([
-                  b"the host handler `",
-                  d.function.name,
-                  b"` of `",
-                  served,
-                  b"` is no definition",
-                ]),
-              ),
-            Some(definition) ->
-              handlers.insert(served, {
-                call: qualify(m.name, d.function.name),
-                import: { name: served, module: m.name, definitions: [definition], whole: true },
-              }),
-          }
-        },
-        _ -> handlers,
-      }))
-
-fn with_prelude_handlers(
-  hosts: Map<Bytes, HostHandler>,
-  definitions_of: (Bytes) -> List<Definition>,
-) -> Map<Bytes, HostHandler> =
-  prelude_hosts.fold(
-    hosts,
-    |accumulator: Map<Bytes, HostHandler>, h: { effect: Bytes, module: Bytes, by: Bytes }|
-      match definitions_of(h.module).find(|d: Definition| d.name == h.by) {
-        None -> accumulator,
-        Some(definition) ->
-          accumulator.insert(h.effect, {
-            call: qualify(h.module, h.by),
-            import: {
-              name: qualify(h.module, h.effect),
-              module: h.module,
-              definitions: [definition],
-              whole: true,
-            },
-          }),
-      },
-  )
-
 fn handlers_for(
-  hosts: Map<Bytes, HostHandler>,
   effects: List<Bytes>,
-) -> List<{ effect: Bytes, hosting: HostHandler }> =
+) -> List<{ effect: Bytes, hosting: HostHandler }> / {EmitReads} =
   effects.fold([], |accumulator: List<Bytes>, e: Bytes|
-    if accumulator.contains(e) || !hosts.contains(e) { accumulator }
-    else { accumulator.push(e) }).sort_by(|a: Bytes, b: Bytes|
-    match compare_values(a, b) { Greater -> false, _ -> true }).fold(
-    [],
-    |accumulator: List<{ effect: Bytes, hosting: HostHandler }>, e: Bytes|
-      match hosts.get(e) {
-        Some(h) -> accumulator.push({ effect: e, hosting: h }),
-        None -> accumulator,
-      },
-  )
+    if accumulator.contains(e) { accumulator } else { accumulator.push(e) }).sort_by(
+    |a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true },
+  ).fold([], |accumulator: List<{ effect: Bytes, hosting: HostHandler }>, e: Bytes|
+    match host_called(e) {
+      Some(h) -> accumulator.push({ effect: e, hosting: h }),
+      None -> accumulator,
+    })
 
 pub fn lowered_in(
   s: Scope,
   roots: List<RootKey>,
   ownership_signatures: Map<RootName, OwnershipSignature>,
   lent: Option<Map<RootName, Option<BoundLambda>>> = None,
-) -> LoweredProgram / {abort.raise} = {
+) -> LoweredProgram / {EmitReads} = {
   let wanted = wanted_names(roots);
   let touched = roots.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: RootKey|
     match definition_root(k) { Some(d) -> accumulator.insert(d, true), None -> accumulator });
@@ -510,9 +315,6 @@ pub fn lowered_in(
     match s.modules.at(i) { Some(m) -> lowered.contains(m.name), None -> false });
   {
     roots: modules_formed(forming, lowering, 0, lowering.len(), 64),
-    stated: s.declared_operations,
-    constructors: s.constructors,
-    borrowed: s.borrowed,
     ownership_signatures: ownership_signatures,
   }
 }
@@ -532,7 +334,7 @@ fn modules_formed(
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<Function> / {abort.raise} =
+) -> List<Function> / {EmitReads} =
   if hi - lo <= 1 { match lowering.at(lo) { Some(i) -> module_at_formed(f, i), None -> [] } }
   else if depth_left <= 0 {
     panic(
@@ -547,7 +349,7 @@ fn modules_formed(
     both._0.concat(both._1)
   }
 
-fn module_at_formed(f: FormInputs, i: Int) -> List<Function> / {abort.raise} =
+fn module_at_formed(f: FormInputs, i: Int) -> List<Function> / {EmitReads} =
   match f.scope.modules.at(i) {
     None -> [],
     Some(m) -> {
@@ -556,13 +358,8 @@ fn module_at_formed(f: FormInputs, i: Int) -> List<Function> / {abort.raise} =
         m.module,
         {
           module: m.name,
-          definitions: tab.here,
+          definitions: [],
           imports: tab.imports,
-          constructors: f.scope.constructors,
-          builtins: f.scope.builtins,
-          declared: f.scope.declared,
-          machine: f.scope.machine,
-          effects: tab.effects,
           release_build: f.scope.release_build,
         },
         f,
@@ -576,14 +373,14 @@ fn module_at_formed(f: FormInputs, i: Int) -> List<Function> / {abort.raise} =
   }
 
 fn module_scope(s: Scope, i: Int) -> ModuleScope =
-  match s.module_scopes.at(i) { Some(t) -> t, None -> { here: [], imports: [], effects: [] } }
+  match s.module_scopes.at(i) { Some(t) -> t, None -> { imports: [] } }
 
 fn lambda_in(
   s: Scope,
   borrowed_by: Map<RootName, Option<BoundLambda>>,
   owner: RootKey,
   nth: Int,
-) -> Option<BoundLambda> / {abort.raise} =
+) -> Option<BoundLambda> / {EmitReads} =
   match match borrowed_by.get(root_name(owner)) { Some(o) -> o, None -> owner_lambdas(s, owner) } {
     None -> None,
     Some(o) -> match o.written.at(nth) {
@@ -592,9 +389,8 @@ fn lambda_in(
     },
   }
 
-pub fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.raise} = {
+pub fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {EmitReads} = {
   let modules = s.modules;
-  let schemes = s.schemes;
   let module_at = |i: Int| module_scope(s, i);
   let recorded_of = |o: Bytes| recorded_annotations(s.owned, o);
   let of = match owner {
@@ -607,7 +403,12 @@ pub fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.r
   let borrowed = |i: Int, m: ParsedModule, code: Code, base: Int| {
     let tab = module_at(i);
     let emitted = known_body(root_text(root_name(owner)), [], code);
-    let written = lambdas_of(emitted).concat(named_in(m.name, tab.here, tab.imports, emitted));
+    let written = lambdas_of(emitted).concat(
+      named_in(
+        { module: m.name, definitions: [], imports: tab.imports, release_build: s.release_build },
+        emitted,
+      ),
+    );
     match written.at(0) {
       Some(first) ->
         Some({
@@ -615,9 +416,7 @@ pub fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {abort.r
           nth: 0,
           code: first,
           module: m.name,
-          module_definitions: tab.here,
           imports: tab.imports,
-          effects: tab.effects,
           base: base,
           written: written,
         }),
@@ -686,53 +485,6 @@ fn definition_root(k: RootKey) -> Option<Bytes> =
     _ -> None,
   }
 
-fn keyed_tags(modules: List<ParsedModule>) -> List<Bytes> =
-  modules.fold([], |accumulator: List<Bytes>, m: ParsedModule|
-    m.module.items.fold(accumulator, |a: List<Bytes>, item: Item|
-      match item {
-        InstanceItem(d) -> if d.kind != KeyInstance { a }
-        else { a.concat(with_stated(m, Map::new(), d.target.name, [d.function.name]).keys()) },
-        _ -> a,
-      }))
-
-fn stated_by_tag(modules: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
-  modules.fold(Map::new(), |accumulator: Map<Bytes, List<Bytes>>, m: ParsedModule|
-    m.module.items.fold(accumulator, |a: Map<Bytes, List<Bytes>>, item: Item|
-      match item {
-        InstanceItem(d) -> if d.kind == InvariantInstance || d.kind == HostInstance { a }
-        else { with_stated(m, a, d.target.name, [d.function.name]) },
-        NumericItem(d) ->
-          with_stated(m, a, d.target.name, d.operations.map(|x: NumericOperation| x.by.name)),
-        _ -> a,
-      }))
-
-fn with_stated(
-  m: ParsedModule,
-  stated: Map<Bytes, List<Bytes>>,
-  target: Bytes,
-  functions: List<Bytes>,
-) -> Map<Bytes, List<Bytes>> =
-  m.module.items.fold(stated, |b: Map<Bytes, List<Bytes>>, other: Item|
-    match other {
-      TypeItem(t) -> if t.name.name != target { b } else {
-        match t.body {
-          SumBody(variants) ->
-            variants.fold(b, |c: Map<Bytes, List<Bytes>>, v: VariantDefinition| {
-              let tag = qualify(m.name, v.name.name);
-              c.insert(
-                tag,
-                functions.fold(
-                  match c.get(tag) { Some(fs) -> fs, None -> [] },
-                  |fs: List<Bytes>, f: Bytes| fs.push(qualify(m.name, f)),
-                ),
-              )
-            }),
-          _ -> b,
-        }
-      },
-      _ -> b,
-    })
-
 fn tags_in(f: Function) -> List<Bytes> =
   f.lambdas.fold(block_tags([], f.body), |accumulator: List<Bytes>, l: typed_ir::Lambda|
     match l {
@@ -760,25 +512,15 @@ fn block_tags(accumulator: List<Bytes>, b: typed_ir::Block) -> List<Bytes> =
       _ -> a,
     })
 
-fn with_instance_calls(
-  stated: Map<Bytes, List<Bytes>>,
-  tags: List<Bytes>,
-  e: EmittedRoot,
-) -> EmittedRoot =
-  if stated.len() == 0 { e } else {
-    {
-      ..e,
-      tables: {
-        ..e.tables,
-        calls: tags.fold(e.tables.calls, |accumulator: List<RootKey>, tag: Bytes|
-          match stated.get(tag) {
-            None -> accumulator,
-            Some(fs) ->
-              fs.fold(accumulator, |calls: List<RootKey>, f: Bytes|
-                if calls.contains(Named(f)) { calls } else { calls.push(Named(f)) }),
-          }),
-      },
-    }
+fn with_instance_calls(tags: List<Bytes>, e: EmittedRoot) -> EmittedRoot / {EmitReads} =
+  {
+    ..e,
+    tables: {
+      ..e.tables,
+      calls: tags.fold(e.tables.calls, |accumulator: List<RootKey>, tag: Bytes|
+        stated_functions_of(tag).fold(accumulator, |calls: List<RootKey>, f: Bytes|
+          if calls.contains(Named(f)) { calls } else { calls.push(Named(f)) })),
+    },
   }
 
 fn module_formed(
@@ -786,9 +528,8 @@ fn module_formed(
   s: ModuleContext,
   f: FormInputs,
   written_roots: List<{ key: RootKey, operation: TypeOperation, ty: Type }>,
-) -> List<Function> / {abort.raise} = {
+) -> List<Function> / {EmitReads} = {
   let module = s.module;
-  let here = s.definitions;
   let definitions = module_tree.items.fold(Map::new(), |m: Map<Bytes, FnDefinition>, item: Item|
     match item { FunctionItem(d) -> m.insert(qualify(module, d.name.name), d), _ -> m });
   let order = module_tree.items.fold(Map::new(), |m: Map<Bytes, Int>, item: Item|
@@ -827,7 +568,7 @@ fn written_at_once(
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<Function> / {abort.raise} =
+) -> List<Function> / {EmitReads} =
   if hi - lo <= 1 { match roots.at(lo) { Some(w) -> written_formed(x, w), None -> [] } }
   else if depth_left <= 0 {
     panic(
@@ -845,7 +586,7 @@ fn written_at_once(
 fn written_formed(
   x: WrittenFormInputs,
   w: { key: RootKey, operation: TypeOperation, ty: Type },
-) -> List<Function> / {abort.raise} =
+) -> List<Function> / {EmitReads} =
   naming(root_text(root_name(w.key)), || {
     let s = x.module_context;
     let module = s.module;
@@ -853,7 +594,7 @@ fn written_formed(
     let module_tree = { items: x.items };
     let check_calls_loaded = || {
       let unreached = emitted_code.calls.filter(|n: Bytes|
-        match definition_in(module, here, s.imports, n) { Some(_) -> false, None -> true });
+        match definition_written(s, n) { Some(_) -> false, None -> true });
       if unreached.len() > 0 {
         panic(
           String::of_bytes_lossy(
@@ -887,27 +628,27 @@ fn written_formed(
     if is_plain_written(w.operation) {
       [
         match w.operation {
-          keys::OnWordForm(_) -> serialization_function(s.constructors, w.key),
-          _ -> generated(s.constructors, w.key),
+          keys::OnWordForm(_) -> serialization_function(w.key),
+          _ -> generated(w.key),
         },
       ]
     } else if is_marshal_operation(w.operation) {
       if is_walked_container(r.ty) { check_calls_loaded() };
-      [written_root(r.key, marshal_root(module, s.constructors, r.key))]
+      [written_root(r.key, marshal_root(module, r.key))]
     } else if contained {
       check_calls_loaded();
-      [written_root(r.key, container_code(module, s.constructors, r.operation, r.ty))]
+      [written_root(r.key, container_code(module, r.operation, r.ty))]
     } else if w.operation == keys::ReleaseResource {
-      [written_root(r.key, release_resource_code(module, s.constructors, here, r.key, r.ty))]
+      [written_root(r.key, release_resource_code(module, r.key, r.ty))]
     } else if w.operation == ContainerWalk(b"let_go_items") {
-      [written_root(r.key, release_items_code(module, s.constructors, r.key, r.ty))]
+      [written_root(r.key, release_items_code(module, r.key, r.ty))]
     } else if w.operation == keys::Equal || w.operation == Order {
       let representation = kind_of(w.ty);
       let param = |n: Bytes|
         { name: n, kind: representation.kind, ty: representation.ty, of: Some(w.ty), lambda: None };
       let formed = |code: Code| [root_from_code(s, 0, w.key, [param(b"a"), param(b"b")], code)];
-      match built_in_cases(s.constructors, w.ty) {
-        None -> if is_sum(s.constructors, w.ty) { [] } else {
+      match built_in_cases(w.ty) {
+        None -> if is_sum(w.ty) { [] } else {
           formed(if w.operation == keys::Equal { compared_code(w.ty) } else { ordered_code(w.ty) })
         },
         Some(cs) ->
@@ -915,18 +656,8 @@ fn written_formed(
           else { ordering_code(w.ty, cs) }),
       }
     } else if !reflective { [] } else {
-      let code = if r.operation == b"digest" {
-        digest_code(module, s.constructors, here, module_tree.items, r.ty)
-      } else {
-        reflection_code(
-          module,
-          s.constructors,
-          here,
-          module_tree.items,
-          r.operation == b"shown",
-          r.ty,
-        )
-      };
+      let code = if r.operation == b"digest" { digest_code(module, module_tree.items, r.ty) }
+      else { reflection_code(module, module_tree.items, r.operation == b"shown", r.ty) };
       let representation = kind_of(r.ty);
       [
         root_from_code(
@@ -948,13 +679,13 @@ fn written_formed(
     }
   })
 
-fn is_sum(constructors: Constructors, ty: Type) -> Bool =
-  match ty { NamedType(c) -> constructors.sums.get(c.name) != None, _ -> false }
+fn is_sum(ty: Type) -> Bool / {EmitReads} =
+  match ty { NamedType(c) -> code_facts.sum_named(c.name) != None, _ -> false }
 
-fn built_in_cases(constructors: Constructors, ty: Type) -> Option<List<SumConstructor>> =
+fn built_in_cases(ty: Type) -> Option<List<SumConstructor>> / {EmitReads} =
   match ty {
     NamedType(c) -> if c.name.index_of(b".") != None { None } else {
-      match constructors.sums.get(c.name) {
+      match code_facts.sum_named(c.name) {
         Some(declared) ->
           Some(if c.args.len() == 0 { declared } else {
             declared.map(|k: SumConstructor|
@@ -1005,7 +736,7 @@ fn items_formed(
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<Function> / {abort.raise} =
+) -> List<Function> / {EmitReads} =
   if hi - lo <= 4 {
     range(lo, hi).fold({ out: [] }, |accumulator: RootForms, i: Int|
       match x.module_tree.items.at(i) {
@@ -1025,18 +756,17 @@ fn items_formed(
     both._0.concat(both._1)
   }
 
-fn item_formed(x: ItemFormInputs, accumulator: RootForms, item: Item) -> RootForms / {abort.raise} =
+fn item_formed(x: ItemFormInputs, accumulator: RootForms, item: Item) -> RootForms / {EmitReads} =
   naming(item_owner(x.s.module, item), || add_item_forms(x, accumulator, item))
 
 fn add_item_forms(
   x: ItemFormInputs,
   accumulator: RootForms,
   item: Item,
-) -> RootForms / {abort.raise} = {
+) -> RootForms / {EmitReads} = {
   let s = x.s;
   let f = x.f;
   let module = s.module;
-  let schemes = f.scope.schemes;
   let wanted = f.wanted;
   let touched = f.touched;
   let specialised = f.specialised;
@@ -1063,7 +793,7 @@ fn add_item_forms(
     let keys = tail_loop_of(s, order, read_of, key);
     if keys.len() < 2 { None }
     else if out.any(|r: Function| root_name(r.key) == root_name(keys.get(0))) { Some(out) }
-    else { Some(out.concat(tail_loop_lowered(s, schemes, definitions, read_of, keys))) }
+    else { Some(out.concat(tail_loop_lowered(s, definitions, read_of, keys))) }
   };
   match item {
     FunctionItem(d) -> if !touched.contains(qualify(module, d.name.name)) { accumulator } else {
@@ -1088,12 +818,11 @@ fn add_item_forms(
         }
       };
       clause_roots(
-        { out: with_entry(s, wanted, f.scope.hosts, Named(p.full), schemes.get(p.full), out) },
+        { out: with_entry(s, wanted, Named(p.full), scheme_called(p.full), out) },
         d,
         s,
         wanted,
         p.recorded,
-        schemes,
       )
     },
     TestItem(t) -> {
@@ -1138,7 +867,6 @@ fn add_item_forms(
       let run = with_entry(
         s,
         wanted,
-        f.scope.hosts,
         tested,
         Some(monomorphic(function_type(ps.map(param_type), unit_type, performs))),
         if !wants_root(wanted, tested) { accumulator.out }
@@ -1151,7 +879,6 @@ fn add_item_forms(
           with_entry(
             s,
             wanted,
-            f.scope.hosts,
             listing,
             Some(monomorphic(function_type([], listing_type, no_effects))),
             if !wants_root(wanted, listing) { run }
@@ -1202,7 +929,7 @@ fn add_item_forms(
             _ -> accumulator2,
           },
       );
-      match s.constructors.sums.get(named) {
+      match code_facts.sum_named(named) {
         None -> accumulator,
         Some(declared) ->
           type_forms.fold(
@@ -1240,13 +967,7 @@ fn add_item_forms(
                   else { [param(b"a", compared), param(b"b", compared)] };
                   formed(
                     ps,
-                    match numeric_instance(
-                        module,
-                        here,
-                        module_tree.items,
-                        compared,
-                        function_name,
-                      ) {
+                    match numeric_instance(module, module_tree.items, compared, function_name) {
                       Some(f) -> instance_code(f, ps.map(param_type)),
                       None ->
                         panic(
@@ -1259,7 +980,7 @@ fn add_item_forms(
                   let eq = d.operation == keys::Equal;
                   formed(
                     [param(b"a", compared), param(b"b", compared)],
-                    match key_instance(module, here, module_tree.items, compared) {
+                    match key_instance(module, module_tree.items, compared) {
                       Some(k) -> key_comparison_code(k, eq, compared),
                       None -> if eq { equality_code(compared, cs) }
                       else { ordering_code(compared, cs) },
@@ -1303,11 +1024,11 @@ fn int_arguments(type_variables: List<Int>) -> List<Type> =
 fn with_entry(
   s: ModuleContext,
   wanted: Map<RootName, Bool>,
-  hosts: Map<Bytes, HostHandler>,
   root: RootKey,
   scheme: Option<Scheme>,
   out: List<Function>,
-) -> List<Function> / {abort.raise} = {
+  hosted_here: Bool = true,
+) -> List<Function> / {EmitReads} = {
   let key = EntryPoint(root);
   if !wants_root(wanted, key) { out } else {
     match scheme {
@@ -1324,7 +1045,8 @@ fn with_entry(
             _ ->
               { callee: instantiated_callee(root, scheme.type_variables.len()), at: [], rows: [] },
           };
-          let hosted = handlers_for(hosts, f.effects.listed.map(|a: Effect| a.effect));
+          let hosted = if hosted_here { handlers_for(f.effects.listed.map(|a: Effect| a.effect)) }
+          else { [] };
           let e = runtime_entry_code(
             s.module,
             root,
@@ -1336,17 +1058,11 @@ fn with_entry(
             f.effects,
             hosted.map(|h: { effect: Bytes, hosting: HostHandler }|
               { call: h.hosting.call, effect: h.effect, adds: added_by(h.hosting) }),
-            pure: s.definitions.any(|d: Definition| d.root == called.callee && d.pure),
+            pure: match definition_rooted(s, called.callee) { Some(d) -> d.pure, None -> false },
           );
           out.push(
             root_from_code(
-              {
-                ..s,
-                definitions: s.definitions.concat(e.definitions),
-                imports: s.imports.concat(
-                  hosted.map(|h: { effect: Bytes, hosting: HostHandler }| h.hosting.import),
-                ),
-              },
+              { ..s, definitions: s.definitions.concat(e.definitions) },
               0,
               key,
               e.params,
@@ -1362,15 +1078,11 @@ fn with_entry(
   }
 }
 
-fn added_by(h: HostHandler) -> List<Effect> =
-  h.import.definitions.fold([], |accumulator: List<Effect>, d: Definition|
-    match d.scheme {
-      Some(scheme) -> match scheme.ty {
-        FunctionType(f) -> accumulator.concat(f.effects.listed),
-        _ -> accumulator,
-      },
-      None -> accumulator,
-    })
+fn added_by(h: HostHandler) -> List<Effect> / {EmitReads} =
+  match scheme_called(h.call) {
+    Some(scheme) -> match scheme.ty { FunctionType(f) -> f.effects.listed, _ -> [] },
+    None -> [],
+  }
 
 fn instantiated_callee(root: RootKey, type_variable_count: Int) -> RootKey =
   if type_variable_count == 0 { root } else {
@@ -1390,17 +1102,17 @@ fn with_claim_entry(
   params: List<EmitParam>,
   type_variables: List<Int>,
   out: List<Function>,
-) -> List<Function> / {abort.raise} =
+) -> List<Function> / {EmitReads} =
   with_entry(
     s,
     wanted,
-    Map::new(),
     root,
     Some({
       ..monomorphic(function_type(params.map(param_type), bool_type, no_effects)),
       type_variables: type_variables,
     }),
     out,
+    hosted_here: false,
   )
 
 fn labels_of(d: FnDefinition) -> List<Bytes> = d.generics.labels.map(|i: Identifier| i.name)
@@ -1411,10 +1123,9 @@ fn clause_roots(
   s: ModuleContext,
   wanted: Map<RootName, Bool>,
   recorded: SiteAnnotations,
-  schemes: Map<Bytes, Scheme>,
-) -> RootForms / {abort.raise} = {
+) -> RootForms / {EmitReads} = {
   let full = qualify(s.module, definition.name.name);
-  let type_variables = match schemes.get(full) {
+  let type_variables = match scheme_called(full) {
     Some(scheme) -> scheme.type_variables,
     None -> [],
   };
@@ -1462,62 +1173,20 @@ fn clause_roots(
 }
 
 pub fn emit_root_results(
-  names: List<Bytes>,
-  sources: List<Bytes>,
-  constructors: Constructors,
+  a: Analysis,
   wanted: List<RootKey>,
-  packages: List<PackageDependencies>,
-  module_packages: List<Int>,
-  embeds: List<ModuleEmbed>,
-  rows: Rows,
-  effects: List<EffectRow>,
-  walked: Bytes,
   published: List<PublishedSignature> = [],
 ) -> List<RootOutput> / {abort.raise} =
-  results_of(
-    lowered_roots(
-      names,
-      sources,
-      constructors,
-      wanted,
-      packages,
-      module_packages,
-      embeds,
-      rows,
-      effects,
-      walked,
-      published,
-    ),
-  )
+  over_analysis(a, || results_of(lowered_program(a, true, wanted, published)))
 
 pub fn lowered_roots(
-  names: List<Bytes>,
-  sources: List<Bytes>,
-  constructors: Constructors,
+  a: Analysis,
   wanted: List<RootKey>,
-  packages: List<PackageDependencies>,
-  module_packages: List<Int>,
-  embeds: List<ModuleEmbed>,
-  rows: Rows,
-  effects: List<EffectRow>,
-  walked: Bytes,
   published: List<PublishedSignature> = [],
 ) -> LoweredProgram / {abort.raise} =
-  lowered_program(
-    zip_sources(names, sources),
-    constructors,
-    true,
-    wanted,
-    packages,
-    module_packages,
-    embeds,
-    rows,
-    effects,
-    walked,
-    published,
-  )
+  over_analysis(a, || lowered_program(a, true, wanted, published))
 
-pub fn results_of(w: LoweredProgram) -> List<RootOutput> / {abort.raise} =
+pub fn results_of(w: LoweredProgram) -> List<RootOutput> / {EmitReads} =
   emitted_program(w).map(result_of)
 
 fn result_of(e: EmittedRoot) -> RootOutput =
@@ -1529,21 +1198,3 @@ pub fn zip_sources(names: List<Bytes>, sources: List<Bytes>) -> List<Source> =
       name: match names.at(i) { Some(n) -> n, None -> b"" },
       source_text: match sources.at(i) { Some(t) -> t, None -> b"" },
     })
-
-test "`host_handlers` aborts with a diagnostic when an effect's host handler function is not defined" {
-  let fact = {
-    name: b"std.fact",
-    module: parse(b"pub effect fact {\n  read get() -> Int\n}\nhost for fact by served\n").node,
-    derived: [],
-  };
-  let diagnostics_text = handle {
-    host_handlers([fact], |_: Bytes| []);
-    b""
-  } with {
-    abort.raise(m) -> Bytes::of_string(m),
-  };
-  assert(
-    diagnostics_text.contains(b"the host handler `served` of `std.fact.fact` is no definition"),
-    None,
-  )
-}

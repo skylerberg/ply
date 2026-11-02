@@ -14,9 +14,10 @@ import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, folded_constant, is_bitwise)
 import std.bytes (ascii_of_int)
-import compiler.emit.representations (Constructors, SumConstructor, has_variables, type_variables,
-                                      compared_by_root, keyed_sum, numeric_sum, nullary_sum,
-                                      generic_sum, written_sum, at_args, release_effects)
+import compiler.emit.representations (EmitReads, ShapeReads, code_facts, SumConstructor,
+                                      has_variables, type_variables, compared_by_root, keyed_sum,
+                                      numeric_sum, nullary_sum, generic_sum, written_sum, at_args,
+                                      release_effects)
 import compiler.check.infer.expression (retained_type)
 import compiler.emit.output (Exact, Scalar, float_literal_bits)
 import compiler.emit.keys
@@ -48,7 +49,7 @@ pub fn literal(
   st: Lowering,
   l: SourceLiteral,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match l {
     LiteralInt(n) -> { st: st, arg: IntOperand(n) },
     LiteralBool(b) -> { st: st, arg: BoolOperand(b) },
@@ -71,7 +72,7 @@ fn width_literal(
   name: Bytes,
   bits: Int,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match width_named(name) {
     Some(w) -> if w.bits <= 64 { { st: st, arg: FixedOperand({ width: w, bits: bits }) } }
     else { bound(context, st, named_type(name), Literal(l), at) },
@@ -89,7 +90,7 @@ pub fn unary(
   o: LoweredValue,
   operator: Bytes,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   if operator == b"not" {
     let b = represented_as(o, AsBool, at);
     bound(
@@ -106,7 +107,7 @@ pub fn unary(
     if ty == unknown_type {
       unreachable(b"an operator over an operand of no known type: ".concat(operator))
     } else {
-      match class_of(context.setting.constructors, ty) {
+      match class_of(ty) {
         IntOperands -> unary_primitive(context, o, operator, AsInt, ty, at),
         WidthOperands(w) -> unary_primitive(context, o, operator, width_representation(w), ty, at),
         FloatOperands -> if operator == b"neg" {
@@ -119,11 +120,11 @@ pub fn unary(
           deferred_to_specialisation(
             note_exact_types(o.st, t),
             ty,
-            representation_of(context.setting, ty),
+            representation_of(ty),
             read_only([o.arg]),
             at,
           ),
-        SumOperands(t) -> if operator == b"neg" && numeric_sum(context.setting.constructors, t) {
+        SumOperands(t) -> if operator == b"neg" && numeric_sum(t) {
           numeric_function_call(context, o.st, operator, [o.arg], [t], t, at)
         } else { fail_missing_operator(o.st, operator) },
         _ -> fail_missing_operator(o.st, operator),
@@ -137,35 +138,25 @@ pub fn binary(
   r: LoweredValue,
   operator: Bytes,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let ty = match l.arg { IntOperand(_) -> type_of(r.arg), _ -> type_of(l.arg) };
   if operator == b"concat" { concatenated(context, r.st, l.arg, r.arg, ty, at) }
   else if !comparison(operator) && !is_arithmetic(operator) && !shift(operator)
       && !is_bitwise(operator) { unreachable(b"an operator: ".concat(operator)) }
   else if ty == unknown_type {
     unreachable(b"an operator over operands of no known type: ".concat(operator))
-  } else if (operator == b"eq" || operator == b"ne")
-      && representation_of(context.setting, ty) == AsUnit {
+  } else if (operator == b"eq" || operator == b"ne") && representation_of(ty) == AsUnit {
     { st: r.st, arg: BoolOperand(operator == b"eq") }
   } else {
     let eq = operator == b"eq" || operator == b"ne";
-    let equal = match class_of(context.setting.constructors, ty) {
+    let equal = match class_of(ty) {
       RecordOperands(fs) -> if eq { Some(fields_equal(context, r.st, fs, l.arg, r.arg, at)) }
       else { None },
       _ -> None,
     };
     match equal {
       Some(e) -> if operator == b"ne" { negation(context, e, at) } else { e },
-      None ->
-        binary_by_class(
-          context,
-          l,
-          r,
-          operator,
-          ty,
-          class_of(context.setting.constructors, ty),
-          at,
-        ),
+      None -> binary_by_class(context, l, r, operator, ty, class_of(ty), at),
     }
   }
 }
@@ -178,7 +169,7 @@ fn binary_by_class(
   ty: Type,
   c: OperatorClass,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let eq = operator == b"eq" || operator == b"ne";
   let truth = bool_type;
   let result = if comparison(operator) { truth } else { ty };
@@ -210,13 +201,12 @@ fn binary_by_class(
         )
       } else { fail_missing_operator(r.st, operator) },
       NullaryOperands(_) -> if eq {
-        match representation_of(context.setting, ty) {
+        match representation_of(ty) {
           AsSum(k) -> binary_primitive(context, l, r, operator, AsSum(k), truth, at),
           _ -> fail_missing_operator(r.st, operator),
         }
       } else { compared_by_order(context, l, r, operator, ty, at) },
-      SumOperands(t) -> if !eq && numeric_sum(context.setting.constructors, t)
-          && is_arithmetic(operator) {
+      SumOperands(t) -> if !eq && numeric_sum(t) && is_arithmetic(operator) {
         numeric_function_call(context, r.st, operator, [l.arg, r.arg], [t, t], t, at)
       } else if eq {
         equal_by(
@@ -315,7 +305,7 @@ fn fields_equal(
   a: Arg,
   b: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   fields_with_values(context, fs).fold(
     { out: { st: st, arg: BoolOperand(true) }, first: true },
     |accumulator: { out: LoweredValue, first: Bool }, f: Field| {
@@ -333,16 +323,7 @@ fn fields_equal(
       let e = match f.ty {
         RecordType(gs) -> fields_equal(context, y.st, gs, x.arg, y.arg, at),
         NominalType(n) -> fields_equal(context, y.st, n.fields, x.arg, y.arg, at),
-        _ ->
-          binary_by_class(
-            context,
-            xs,
-            y,
-            b"eq",
-            f.ty,
-            class_of(context.setting.constructors, f.ty),
-            at,
-          ),
+        _ -> binary_by_class(context, xs, y, b"eq", f.ty, class_of(f.ty), at),
       };
       {
         out: if accumulator.first { e }
@@ -359,7 +340,7 @@ fn fields_order(
   a: Arg,
   b: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   fields_with_values(context, fs).fold(
     { out: { st: st, arg: IntOperand(0) }, first: true },
     |accumulator: { out: LoweredValue, first: Bool }, f: Field| {
@@ -386,15 +367,15 @@ fn fields_order(
     },
   ).out
 
-fn fields_with_values(context: Context, fs: List<Field>) -> List<Field> =
-  fs.filter(|f: Field| representation_of(context.setting, f.ty) != AsUnit)
+fn fields_with_values(context: Context, fs: List<Field>) -> List<Field> / {ShapeReads} =
+  fs.filter(|f: Field| representation_of(f.ty) != AsUnit)
 
 fn first_nonzero_sign(
   context: Context,
   l: LoweredValue,
   r: LoweredValue,
   at: Span,
-) -> LoweredValue = {
+) -> LoweredValue / {EmitReads} = {
   let j = fresh(exit_block(l.st, r.st), int_type, AsInt);
   let c = bound(
     context,
@@ -421,7 +402,7 @@ pub fn scalar_builtin_call(
   name: Bytes,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match args.at(0) {
     None -> unreachable(b"a builtin was called with no arguments: ".concat(name)),
     Some(a) -> {
@@ -516,7 +497,7 @@ fn decimal_converted(
   name: Bytes,
   a: Arg,
   at: Span,
-) -> LoweredValue =
+) -> LoweredValue / {EmitReads} =
   if name == b"Decimal::of_int" {
     let x = represented_as({ st: st, arg: a }, AsInt, at);
     bound(
@@ -538,12 +519,12 @@ fn decimal_converted(
   }
 
 fn builtin_return_type(context: Context, name: Bytes, ty: Type, known: Type) -> Type =
-  match declared_call_types(context.setting, name, [ty]) { Some(t) -> t.result_type, None -> known }
+  match declared_call_types(name, [ty]) { Some(t) -> t.result_type, None -> known }
 
-fn witness_value(context: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue / {abort.raise} =
+fn witness_value(context: Context, st: Lowering, a: Arg, at: Span) -> LoweredValue / {EmitReads} =
   match read_literal(st, a) {
     None -> unreachable(b"the type argument of a witness must be a literal"),
-    Some(s) -> if !context.setting.constructors.named.contains(s.name) {
+    Some(s) -> if code_facts.sum_of_constructor(s.name) == None {
       unreachable(b"the type argument of a witness is not the name of any constructor")
     } else {
       let tag = bound(context, s.st, int_type, Tag(s.name), at);
@@ -575,8 +556,8 @@ fn read_literal(st: Lowering, a: Arg) -> Option<{ st: Lowering, name: Bytes }> =
     _ -> None,
   }
 
-pub fn numeric_in_place(constructors: Constructors, ty: Type) -> Bool =
-  match class_of(constructors, ty) {
+pub fn numeric_in_place(ty: Type) -> Bool / {ShapeReads} =
+  match class_of(ty) {
     IntOperands -> true,
     FloatOperands -> true,
     DecimalOperands -> true,
@@ -590,7 +571,7 @@ pub fn numeric_converted(
   n: Arg,
   ty: Type,
   at: Span,
-) -> LoweredValue = {
+) -> LoweredValue / {EmitReads} = {
   let x = represented_as({ st: st, arg: n }, AsInt, at);
   let converted = |primitive_name: Bytes|
     bound(
@@ -600,7 +581,7 @@ pub fn numeric_converted(
       Primitive({ operation: primitive_name, on: AsInt, args: [x.arg] }),
       at,
     );
-  match class_of(context.setting.constructors, ty) {
+  match class_of(ty) {
     FloatOperands -> converted(b"to_float"),
     DecimalOperands -> converted(b"to_decimal"),
     WidthOperands(_) -> converted(b"of_int"),
@@ -622,20 +603,20 @@ type OperatorClass =
   | RecordOperands(List<Field>)
   | WordOperands(Type)
 
-pub fn comparison_built(constructors: Constructors, t: Type, order: Bool) -> Bool / {abort.raise} =
+pub fn comparison_built(t: Type, order: Bool) -> Bool / {EmitReads} =
   iterate({ todo: [t], seen: [] }, 1 << 24, |s: { todo: List<Type>, seen: List<Bytes> }|
     match s.todo {
       [] -> Stop(true),
       [x, ..rest] -> match x {
         FunctionType(_) -> if order { Stop(false) } else { Continue({ ..s, todo: rest }) },
-        _ -> match class_of(constructors, x) {
+        _ -> match class_of(x) {
           RecordOperands(fs) -> Continue({ ..s, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
           ContainerOperands(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
           SumOperands(w) -> match w {
-            NamedType(c) -> if s.seen.contains(c.name) || keyed_sum(constructors, c.name) {
+            NamedType(c) -> if s.seen.contains(c.name) || keyed_sum(c.name) {
               Continue({ ..s, todo: rest })
             } else {
-              let cs = match constructors.sums.get(c.name) { Some(found) -> found, None -> [] };
+              let cs = match code_facts.sum_named(c.name) { Some(found) -> found, None -> [] };
               Continue({
                 todo: rest.concat(
                   cs.fold([], |accumulator: List<Type>, k: SumConstructor|
@@ -656,7 +637,7 @@ pub fn comparison_built(constructors: Constructors, t: Type, order: Bool) -> Boo
 
 fn type_args(t: Type) -> List<Type> = match t { NamedType(c) -> c.args, _ -> [] }
 
-fn class_of(constructors: Constructors, ty: Type) -> OperatorClass =
+fn class_of(ty: Type) -> OperatorClass / {ShapeReads} =
   match ty {
     RecordType(fs) -> if fs.len() > 0 && !has_variables(ty) { RecordOperands(fs) }
     else { WordOperands(ty) },
@@ -665,18 +646,17 @@ fn class_of(constructors: Constructors, ty: Type) -> OperatorClass =
     NamedType(c) -> if c.args.len() > 0 {
       if is_walked_container(ty) || is_columns_type(ty) || is_result(ty)
           || (is_option(ty) && !has_variables(ty)) { ContainerOperands(ty) }
-      else if generic_sum(constructors, ty) { SumOperands(ty) }
+      else if generic_sum(ty) { SumOperands(ty) }
       else { WordOperands(ty) }
     } else if is_int(ty) { IntOperands }
     else if is_bool(ty) { BoolOperands }
     else if is_float(ty) { FloatOperands }
     else if is_decimal(ty) { DecimalOperands }
     else if is_char(ty) { CharOperands }
-    else if is_string(ty) || is_bytes(ty) { TextOperands }
-    else if compared_by_root(constructors, c.name) {
-      if nullary_sum(match constructors.sums.get(c.name) { Some(cs) -> cs, None -> [] })
-          && !keyed_sum(constructors, c.name)
-          && !numeric_sum(constructors, ty) { NullaryOperands(ty) }
+    else if is_string(ty) || is_bytes(ty) { TextOperands } else if compared_by_root(c.name) {
+      if nullary_sum(match code_facts.sum_named(c.name) { Some(cs) -> cs, None -> [] })
+          && !keyed_sum(c.name)
+          && !numeric_sum(ty) { NullaryOperands(ty) }
       else { SumOperands(ty) }
     } else { match width_named(c.name) { Some(w) -> WidthOperands(w), None -> WordOperands(ty) } },
     _ -> WordOperands(ty),
@@ -689,7 +669,7 @@ fn unary_primitive(
   on: Representation,
   ty: Type,
   at: Span,
-) -> LoweredValue = {
+) -> LoweredValue / {EmitReads} = {
   let a = represented_as(o, on, at);
   bound(context, a.st, ty, Primitive({ operation: operator, on: on, args: [a.arg] }), at)
 }
@@ -702,7 +682,7 @@ fn binary_primitive(
   on: Representation,
   result: Type,
   at: Span,
-) -> LoweredValue = {
+) -> LoweredValue / {EmitReads} = {
   let a = represented_as({ st: r.st, arg: l.arg }, on, at);
   let b = if has_count_operand(operator) { { st: a.st, arg: r.arg } }
   else { represented_as({ st: a.st, arg: r.arg }, on, at) };
@@ -717,7 +697,7 @@ fn equal_by(
   ty: Type,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue = {
+) -> LoweredValue / {EmitReads} = {
   let e = root_call(context, st, key, args, [ty, ty], bool_type, at);
   if operator == b"ne" { negation(context, e, at) } else { e }
 }
@@ -730,7 +710,7 @@ pub fn numeric_function_call(
   types: List<Type>,
   ty: Type,
   at: Span,
-) -> LoweredValue =
+) -> LoweredValue / {EmitReads} =
   root_call(
     context,
     st,
@@ -748,7 +728,7 @@ fn compared_by_order(
   operator: Bytes,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match if comparison(operator) { root_order(context, r.st, ty, l.arg, r.arg, at) } else { None } {
     None -> if operator != b"eq" && operator != b"ne" { fail_missing_operator(r.st, operator) }
     else if is_function(ty) { functions_compared(r.st, at) } else {
@@ -756,7 +736,7 @@ fn compared_by_order(
       deferred_to_specialisation(
         note_exact_types(r.st, ty),
         truth,
-        representation_of(context.setting, truth),
+        representation_of(truth),
         read_only([l.arg, r.arg]),
         at,
       )
@@ -787,7 +767,8 @@ fn root_call(
   types: List<Type>,
   result: Type,
   at: Span,
-) -> LoweredValue = root_call_with_words(context, st, key, args, types, result, at, false)
+) -> LoweredValue / {EmitReads} =
+  root_call_with_words(context, st, key, args, types, result, at, false)
 
 fn root_call_with_words(
   context: Context,
@@ -799,22 +780,14 @@ fn root_call_with_words(
   at: Span,
   stops: Bool,
   words: { count: Int, args: List<Arg> } = { count: 0, args: [] },
-) -> LoweredValue = {
-  let conv = with_evidence_parameters(
-    typed_convention(context.setting.constructors, types, result),
-    0,
-    words.count,
-  );
+) -> LoweredValue / {EmitReads} = {
+  let conv = with_evidence_parameters(typed_convention(types, result), 0, words.count);
   let given = range(0, args.len()).fold(
     { st: st, args: [] },
     |accumulator: { st: Lowering, args: List<Arg> }, i: Int|
       match ((args.at(i), types.at(i))) {
         (Some(x), Some(t)) -> {
-          let h = represented_as(
-            { st: accumulator.st, arg: x },
-            representation_of(context.setting, t),
-            at,
-          );
+          let h = represented_as({ st: accumulator.st, arg: x }, representation_of(t), at);
           { st: h.st, args: accumulator.args.push(h.arg) }
         },
         _ -> accumulator,
@@ -834,7 +807,7 @@ fn root_call_with_words(
   )
 }
 
-fn negation(context: Context, b: LoweredValue, at: Span) -> LoweredValue =
+fn negation(context: Context, b: LoweredValue, at: Span) -> LoweredValue / {EmitReads} =
   bound(context, b.st, bool_type, Primitive({ operation: b"not", on: AsBool, args: [b.arg] }), at)
 
 fn ordered(
@@ -844,7 +817,7 @@ fn ordered(
   a: Arg,
   b: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let ty = match a { IntOperand(_) -> type_of(b), _ -> type_of(a) };
   let order = builtin_return_type(context, name, ty, ordering_type);
   let made = |s: LoweredValue|
@@ -858,7 +831,7 @@ fn ordered(
   if has_unknown_part(ty) { open_at(context, st, ty, [a, b], order, at) } else {
     match root_order(context, st, ty, a, b, at) {
       Some(o) -> o,
-      None -> match class_of(context.setting.constructors, ty) {
+      None -> match class_of(ty) {
         RecordOperands(fs) -> made(fields_order(context, st, fs, a, b, at)),
         _ -> made(order_sign(context, { st: st, arg: a }, { st: st, arg: b }, ty, at)),
       },
@@ -873,11 +846,11 @@ fn open_at(
   args: List<Arg>,
   result: Type,
   at: Span,
-) -> LoweredValue =
+) -> LoweredValue / {EmitReads} =
   deferred_to_specialisation(
     note_exact_types(st, ty),
     result,
-    representation_of(context.setting, result),
+    representation_of(result),
     read_only(args),
     at,
   )
@@ -905,9 +878,9 @@ fn min_or_max(
   a: Arg,
   b: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let ty = match a { IntOperand(_) -> type_of(b), _ -> type_of(a) };
-  let s = match class_of(context.setting.constructors, ty) {
+  let s = match class_of(ty) {
     RecordOperands(fs) -> fields_order(context, st, fs, b, a, at),
     _ -> order_sign(context, { st: st, arg: b }, { st: st, arg: a }, ty, at),
   };
@@ -939,7 +912,7 @@ fn root_order(
   a: Arg,
   b: Arg,
   at: Span,
-) -> Option<LoweredValue> = {
+) -> Option<LoweredValue> / {EmitReads} = {
   let order = ordering_type;
   let at_root = |operation: TypeOperation, t: Type|
     Some(
@@ -953,7 +926,7 @@ fn root_order(
         at,
       ),
     );
-  match class_of(context.setting.constructors, ty) {
+  match class_of(ty) {
     NullaryOperands(t) -> at_root(Order, t),
     SumOperands(t) -> at_root(Order, t),
     ContainerOperands(t) -> at_root(ContainerWalk(b"ordered"), t),
@@ -970,7 +943,7 @@ fn order_sign(
   r: LoweredValue,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let int = int_type;
   let signed = |o: LoweredValue|
     bound(
@@ -984,7 +957,7 @@ fn order_sign(
   else {
     match root_order(context, r.st, ty, l.arg, r.arg, at) {
       Some(o) -> signed(o),
-      None -> match class_of(context.setting.constructors, ty) {
+      None -> match class_of(ty) {
         IntOperands -> binary_primitive(context, l, r, b"order", AsInt, int, at),
         BoolOperands -> binary_primitive(context, l, r, b"order", AsBool, int, at),
         CharOperands -> binary_primitive(context, l, r, b"order", AsImmediate, int, at),
@@ -1003,16 +976,15 @@ fn order_sign(
             at,
           )
         },
-        _ -> if representation_of(context.setting, ty) == AsUnit {
-          { st: r.st, arg: IntOperand(0) }
-        } else if ty == retained_type { handle_order(r.st, l.arg, r.arg, at) }
+        _ -> if representation_of(ty) == AsUnit { { st: r.st, arg: IntOperand(0) } }
+        else if ty == retained_type { handle_order(r.st, l.arg, r.arg, at) }
         else { unreachable(b"no ordering is defined for the type: ".concat(encode_type(ty))) },
       },
     }
   }
 }
 
-fn total_key(context: Context, f: LoweredValue, at: Span) -> LoweredValue = {
+fn total_key(context: Context, f: LoweredValue, at: Span) -> LoweredValue / {EmitReads} = {
   let int = int_type;
   let x = represented_as(f, AsFloat, at);
   let bits = bound(
@@ -1051,7 +1023,7 @@ fn reflect_to_value(
   name: Bytes,
   a: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let ty = type_of(a);
   let value_type = named_type(b"std.value.Value");
   let operation = if name == b"shown" { Show } else { Reflect };
@@ -1060,7 +1032,7 @@ fn reflect_to_value(
     constructed_as(context, st, constructor, [], value_type, at);
   let none = ||
     unreachable(b"no `std.value` description is defined for the type: ".concat(encode_type(ty)));
-  if !context.setting.constructors.named.contains(b"std.value.VUnit") {
+  if code_facts.sum_of_constructor(b"std.value.VUnit") == None {
     unreachable(b"a type was converted to a value, but the program does not contain `std.value`")
   } else {
     match ty {
@@ -1078,9 +1050,9 @@ fn reflect_to_value(
       NamedType(c) -> if c.name == scoped_name { unary_primitive(b"std.value.VHold") }
       else if c.name == secret_name { unary_primitive(b"std.value.VSecret") }
       else if has_unknown_part(ty) { open_at(context, st, ty, [a], value_type, at) }
-      else if written_sum(context.setting.constructors, c) || is_walked_container(ty)
-          || is_columns_type(ty) { type_operation_call(context, st, operation, ty, a, at) }
-      else if c.args.len() > 0 { none() }
+      else if written_sum(c) || is_walked_container(ty) || is_columns_type(ty) {
+        type_operation_call(context, st, operation, ty, a, at)
+      } else if c.args.len() > 0 { none() }
       else if is_int(ty) { value(b"std.value.VInt") }
       else if is_bool(ty) { value(b"std.value.VBool") }
       else if is_float(ty) { value(b"std.value.VFloat") }
@@ -1108,7 +1080,7 @@ fn width_reflected(
   a: Arg,
   value_type: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let int = int_type;
   let u128 = width_type({ bits: 128, signed: false });
   let made = |s: Lowering, lo: Arg, hi: Arg|
@@ -1146,7 +1118,7 @@ fn encoded(
   hashed: Bool,
   a: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let ty = type_of(a);
   let bytes = builtin_return_type(
     context,
@@ -1155,9 +1127,7 @@ fn encoded(
     bytes_type,
   );
   let rooted_by = match ty {
-    NamedType(c) ->
-      written_sum(context.setting.constructors, c) || is_walked_container(ty)
-        || is_columns_type(ty),
+    NamedType(c) -> written_sum(c) || is_walked_container(ty) || is_columns_type(ty),
     RecordType(_) -> true,
     NominalType(_) -> true,
     _ -> false,
@@ -1178,7 +1148,7 @@ fn type_operation_call(
   ty: Type,
   a: Arg,
   at: Span,
-) -> LoweredValue =
+) -> LoweredValue / {EmitReads} =
   root_call(
     context,
     st,
@@ -1194,13 +1164,13 @@ pub fn release_value(
   st: Lowering,
   a: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let ty = type_of(a);
   if has_variables(ty) {
     deferred_to_specialisation(
       note_exact_types(st, ty),
       unit_type,
-      representation_of(context.setting, unit_type),
+      representation_of(unit_type),
       read_only([a]),
       at,
     )
@@ -1227,7 +1197,7 @@ pub fn unwound(
   st: Lowering,
   a: Arg,
   at: Span,
-) -> { st: Lowering, unwound: Unwinding } / {abort.raise} = {
+) -> { st: Lowering, unwound: Unwinding } / {EmitReads} = {
   let ty = type_of(a);
   let h = release_function_evidence(context, ty);
   let w = passed_evidence_arguments(note_exact_types(st, ty), h, at);
@@ -1237,11 +1207,7 @@ pub fn unwound(
       arg: a,
       words: w.args,
       callee: release_function_root(context, ty),
-      convention: with_evidence_parameters(
-        typed_convention(context.setting.constructors, [ty], unit_type),
-        0,
-        h.words.len(),
-      ),
+      convention: with_evidence_parameters(typed_convention([ty], unit_type), 0, h.words.len()),
     },
   }
 }
@@ -1249,14 +1215,10 @@ pub fn unwound(
 fn release_function_root(context: Context, ty: Type) -> RootKey =
   keys::generated_key(ReleaseResource, ty, context.setting.module)
 
-fn release_function_evidence(context: Context, ty: Type) -> EvidenceArguments / {abort.raise} =
+fn release_function_evidence(context: Context, ty: Type) -> EvidenceArguments / {EmitReads} =
   scheme_evidence_arguments(
     context,
-    Some(
-      monomorphic(
-        function_type([ty], unit_type, release_effects(context.setting.constructors, ty)),
-      ),
-    ),
+    Some(monomorphic(function_type([ty], unit_type, release_effects(ty)))),
     [],
     [],
   )
@@ -1267,13 +1229,13 @@ fn width_arithmetic(
   name: Bytes,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let a = match args.at(0) { Some(x) -> x, None -> IntOperand(0) };
   let b = match args.at(1) { Some(x) -> x, None -> IntOperand(0) };
   let ty = match a { IntOperand(_) -> type_of(b), _ -> type_of(a) };
   let checked = name.starts_with(b"checked_");
   let result = builtin_return_type(context, name, ty, if checked { option_type(ty) } else { ty });
-  match class_of(context.setting.constructors, ty) {
+  match class_of(ty) {
     WidthOperands(w) -> if w.bits > 64 {
       if checked {
         checked_operation(
@@ -1342,7 +1304,7 @@ fn to_int_call(
   st: Lowering,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match args {
     [_, x] -> {
       let ty = type_of(x);
@@ -1350,7 +1312,7 @@ fn to_int_call(
       let option = builtin_return_type(context, b"to_int", ty, option_type(int));
       let some = |l: LoweredValue|
         constructed_as(context, l.st, some_constructor, [l.arg], option, at);
-      match class_of(context.setting.constructors, ty) {
+      match class_of(ty) {
         IntOperands -> some(represented_as({ st: st, arg: x }, AsInt, at)),
         WidthOperands(w) -> if w.bits < 64 || (w.bits == 64 && w.signed) {
           some(unary_primitive(context, { st: st, arg: x }, b"to_int", AsFixed(w), int, at))
@@ -1403,7 +1365,7 @@ fn indexed_numeric_operator(
   name: Bytes,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let scalar = |t: Type|
     match t { VariableType(v) -> with_need(st, { var: v, reads: Scalar }), _ -> st };
   match args {
@@ -1459,7 +1421,7 @@ fn checked_width(
   w: Width,
   option: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let ty = width_type(w);
   let neg = name == b"checked_neg";
   let unsigned = !w.signed && name == b"checked_mul";
@@ -1518,7 +1480,7 @@ fn checked_operation(
   k: { ty: Type, held: Representation, on: Representation },
   option: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let neg = name == b"checked_neg";
   let x = represented_as({ st: st, arg: a }, k.held, at);
   let y = if neg { x } else { represented_as({ st: x.st, arg: b }, k.held, at) };
@@ -1551,7 +1513,7 @@ fn some_if(
   value: LoweredValue,
   option: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let some = constructed_as(context, value.st, some_constructor, [value.arg], option, at);
   let none = constructed_as(
     context,
@@ -1561,7 +1523,7 @@ fn some_if(
     option,
     at,
   );
-  let j = fresh(exit_block(fits.st, none.st), option, representation_of(context.setting, option));
+  let j = fresh(exit_block(fits.st, none.st), option, representation_of(option));
   let t = set_join(j.st, some, j.var, at);
   let e = set_join(t.st, none, j.var, at);
   {
@@ -1579,7 +1541,7 @@ fn least(w: Width) -> Int = if w.signed { 0 - (1 << w.bits - 1) } else { 0 }
 
 fn most(w: Width) -> Int = if w.signed { (1 << w.bits - 1) - 1 } else { (1 << w.bits) - 1 }
 
-fn fail_missing_operator(st: Lowering, operator: Bytes) -> LoweredValue / {abort.raise} =
+fn fail_missing_operator(st: Lowering, operator: Bytes) -> LoweredValue / {EmitReads} =
   unreachable(b"the operand type does not support the operator: ".concat(operator))
 
 fn note_exact_types(st: Lowering, ty: Type) -> Lowering =
@@ -1615,7 +1577,7 @@ fn float_computed(
   name: Bytes,
   a: Arg,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match float_exact(name) {
     None ->
       unreachable(
@@ -1640,7 +1602,7 @@ fn float_called(
   name: Bytes,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match float_function(name) {
     None -> unreachable(b"no Float function: ".concat(name)),
     Some(f) -> float_native_called(st, f, args, at),
@@ -1651,7 +1613,7 @@ fn float_native_called(
   f: FloatFunction,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let given = args.fold(
     { st: st, bits: [] },
     |accumulator: { st: Lowering, bits: List<Arg> }, a: Arg| {

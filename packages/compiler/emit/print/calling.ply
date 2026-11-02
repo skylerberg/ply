@@ -4,7 +4,8 @@ import compiler.syntax.parsing (span_between)
 import compiler.check.types (Type, NamedType, FunctionType, VariableType, no_effects, int_type,
                              string_type)
 import compiler.emit.c (int_literal)
-import compiler.emit.representations (Constructors, word_type, resumption, known_layout)
+import compiler.emit.representations (word_type, resumption, known_layout, ShapeReads, code_facts,
+                                      with_no_shapes)
 import compiler.emit.roots (symbol_of, root_id)
 import compiler.emit.keys (Callee, Root, Generic, Named, Share, Keep, TypeOperation, has_entry)
 import compiler.emit.layout (header_bytes, words, max_flat_words)
@@ -26,7 +27,7 @@ import compiler.emit.typed_ir.calling (CallingOperation, ConstantRead, BlackBox)
 import compiler.emit.release (BlockPart, Part, BlockContents, WordBlock, WordAt, ThroughDescriptor,
                               drop_of, form_parts, root_of, block_parts_at)
 import compiler.emit.lower.representation (passing, ByValue, ByReference, return_buffer_words,
-                                           value_words, c_values_of, representation_with)
+                                           value_words, c_values_of, representation_of)
 import compiler.emit.print.text (Printing, InstructionContext, empty_printing, function_body, line,
                                  pad, temp, named, name_of, arg_text, source_position, slot, check,
                                  failing_return, part_names, unsupported, nth)
@@ -48,7 +49,7 @@ pub fn call(
   printing: Printing,
   into: Option<Variable>,
   c: { callee: Callee, args: List<Arg>, convention: Convention, suspends: Bool },
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   invoked(
     p,
     printing,
@@ -59,7 +60,7 @@ pub fn call(
     |q: Printing| call_noted(q, c.callee, c.convention),
   )
 
-fn call_noted(printing: Printing, callee: Callee, conv: Convention) -> Printing / {abort.raise} = {
+fn call_noted(printing: Printing, callee: Callee, conv: Convention) -> Printing / {ShapeReads} = {
   let c = called(printing, callee);
   {
     ..c,
@@ -77,8 +78,8 @@ fn invoked(
   to: { callee: List<Piece>, first: List<Bytes> },
   args: List<Arg>,
   conv: Convention,
-  noting: (Printing) -> Printing / {abort.raise},
-) -> Printing / {abort.raise} = {
+  noting: (Printing) -> Printing / {ShapeReads},
+) -> Printing / {ShapeReads} = {
   let prepared_arguments = call_arguments(printing, p.depth, args, reps_of(conv));
   let result = conv.result;
   let named_as = match into {
@@ -128,7 +129,7 @@ fn call_arguments(
   depth: Int,
   args: List<Arg>,
   reps: List<Representation>,
-) -> { printing: Printing, args: List<Bytes> } / {abort.raise} =
+) -> { printing: Printing, args: List<Bytes> } / {ShapeReads} =
   range(0, args.len()).fold(
     { printing: printing, args: [] },
     |accumulator: { printing: Printing, args: List<Bytes> }, i: Int| {
@@ -182,16 +183,13 @@ fn destination(
   depth: Int,
   into: Option<Variable>,
   conv: Convention,
-) -> { printing: Printing, args: List<Bytes> } =
+) -> { printing: Printing, args: List<Bytes> } / {ShapeReads} =
   if !conv.destination_passing { { printing: printing, args: [] } } else {
     match into {
       Some(v) -> if printing.placing.results.contains(v.id) { { printing: printing, args: [b"d"] } }
       else if printing.placing.slots.contains(v.id) {
         let t = temp(printing);
-        let n = match known_layout(printing.constructors, v.ty) {
-          Some(l) -> 1 + words(l),
-          None -> 1,
-        };
+        let n = match known_layout(v.ty) { Some(l) -> 1 + words(l), None -> 1 };
         {
           printing: line(
             t.printing,
@@ -238,7 +236,7 @@ pub fn applied(
   printing: Printing,
   into: Option<Variable>,
   c: { f: Arg, args: List<Arg>, convention: Convention, suspends: Bool, closure: Option<Int> },
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let f = arg_text(printing, c.f);
   if uses_typed_entry(c.f) {
     let entry = match c.closure {
@@ -282,7 +280,7 @@ pub fn closure_made(
   printing: Printing,
   into: Option<Variable>,
   m: { made: Allocation, args: List<Arg>, reuse: Option<Variable> },
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match base_allocation(m.made) {
     ClosureAllocation(c) -> {
       let sub = lambda_symbol(p.u.symbol, c.nth);
@@ -390,7 +388,7 @@ pub fn calling_operation(
   operation: CallingOperation,
   args: List<Arg>,
   uses: OperationSignature,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match operation {
     ConstantRead(c) -> {
       let entry = in_code_table(called(source_position(p, printing), c.callee), [
@@ -446,10 +444,9 @@ pub fn calling_operation(
 fn keep_function(
   printing: Printing,
   t: Type,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} =
-  if form_parts(printing.constructors, t).len() == 0 {
-    { printing: printing, out: [Text(identity_function)] }
-  } else { root_function(printing, root_of(Keep, t), AsWord) }
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} =
+  if form_parts(t).len() == 0 { { printing: printing, out: [Text(identity_function)] } }
+  else { root_function(printing, root_of(Keep, t), AsWord) }
 
 pub fn restarted(p: InstructionContext, printing: Printing, args: List<Arg>) -> Printing = {
   let moved = range(0, args.len()).fold(
@@ -517,7 +514,7 @@ pub fn entered_member(
   printing: Printing,
   member: Int,
   args: List<Arg>,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match p.u.group {
     None ->
       unsupported(
@@ -723,7 +720,7 @@ pub fn loop_done(
   arg: Arg,
 ) -> Printing = line(set_parts(printing, p.depth, result, arg), p.depth, b"break;")
 
-pub fn lambda_names(l: Lambda, nth: Int) -> Map<Int, Bytes> / {abort.raise} =
+pub fn lambda_names(l: Lambda, nth: Int) -> Map<Int, Bytes> / {ShapeReads} =
   match l {
     Closure(c) ->
       range(0, c.body.params.len()).fold(Map::new(), |m: Map<Int, Bytes>, i: Int|
@@ -736,7 +733,7 @@ pub fn lambda_text(
   nth: Int,
   l: Lambda,
   printing: Printing,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} =
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} =
   match l {
     Closure(c) -> {
       let name = lambda_symbol(symbol, nth);
@@ -761,7 +758,7 @@ pub fn lambda_text(
         parts: caps.parts.fold(
           [],
           |accumulator: List<BlockPart>, h: { at: Int, ty: Type, representation: Representation }|
-            accumulator.concat(block_parts_at(printing.constructors, h.ty, h.representation, h.at)),
+            accumulator.concat(block_parts_at(h.ty, h.representation, h.at)),
         ),
         words: caps.at,
       });
@@ -859,7 +856,7 @@ fn uniform_wrapper(
   printing: Printing,
   name: Bytes,
   e: EntrySignature,
-) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} = {
+) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {ShapeReads} = {
   let h = signature_types(e.convention);
   let typed = Bytes::concat_all([
     b"((",
@@ -882,7 +879,7 @@ fn shared_function(
   own: Bytes,
   params: Bytes,
   body: List<Piece>,
-) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} =
+) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {ShapeReads} =
   if !body.all(same_in_every_root) {
     {
       printing: printing,
@@ -994,7 +991,7 @@ fn captures_read(
   parts: List<{ at: Int, ty: Type, representation: Representation }>,
   takes: Bool,
   bytes: Int,
-) -> CaptureLoad / {abort.raise} = {
+) -> CaptureLoad / {ShapeReads} = {
   let read = range(0, parts.len()).fold(
     { printing: printing, reads: [], dups: [], names: [] },
     |accumulator: { printing: Printing, reads: List<Bytes>, dups: List<Piece>, names: List<List<Bytes>> }, i: Int|
@@ -1058,7 +1055,7 @@ fn release_entry(
   printing: Printing,
   name: Bytes,
   block: BlockContents,
-) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} =
+) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {ShapeReads} =
   match block {
     WordBlock(b) -> {
       let go = each_counted_slot(
@@ -1091,7 +1088,7 @@ fn walk_entry(
   name: Bytes,
   operation: TypeOperation,
   block: BlockContents,
-) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {abort.raise} = {
+) -> { printing: Printing, out: List<Piece>, symbol: Bytes } / {ShapeReads} = {
   let of = { id: 0, ty: word_type, representation: AsWord };
   let into = { id: 1, ty: word_type, representation: AsWord };
   let walk = walk_block(
@@ -1156,7 +1153,7 @@ pub fn runtime_entry(
   printing: Printing,
   name: Bytes,
   e: EntrySignature,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} =
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} =
   entry_text(
     printing,
     Bytes::concat_all([b"Word ", name, b"_entry(PlyCtx *ctx, const Word *args)"]),
@@ -1173,7 +1170,7 @@ fn entry_text(
   prep: List<Piece>,
   first: List<Bytes>,
   e: EntrySignature,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} = {
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} = {
   let c = e.convention;
   let effects_arg = |t: Type|
     if t == effects_descriptor_type { { text: [], arg: b"ed" } }
@@ -1280,7 +1277,7 @@ pub fn group_wrapper(
   f: Function,
   i: Int,
   printing: Printing,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} =
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} =
   match f.members.at(i) {
     None -> { printing: printing, out: [] },
     Some(m) -> {
@@ -1321,11 +1318,8 @@ pub fn group_wrapper(
       let returned = if m.convention.destination_passing && m.convention.returned == OwnedResult {
         result_into_destination(words.printing, call, f.result_type)
       } else { { printing: words.printing, out: group_result(call, result) } };
-      let entered = if !has_entry(
-          m.key,
-          declared_arity(m.params),
-          words.printing.constructors.stated,
-        ) { { printing: returned.printing, out: [] } } else {
+      let entered = if !has_entry(m.key, declared_arity(m.params), |n: Bytes|
+          code_facts.stated_function(n)) { { printing: returned.printing, out: [] } } else {
         runtime_entry(returned.printing, name, {
           convention: m.convention,
           types: m.params.map(|v: Variable| v.ty),
@@ -1365,8 +1359,8 @@ fn result_into_destination(
   printing: Printing,
   call: Bytes,
   ty: Type,
-) -> { printing: Printing, out: List<Piece> } / {abort.raise} =
-  match known_layout(printing.constructors, ty) {
+) -> { printing: Printing, out: List<Piece> } / {ShapeReads} =
+  match known_layout(ty) {
     Some(l) -> {
       let moved = write_inline(printing, b"*(Word *)d", b"ply_words(d)", b"r", l);
       {
@@ -1444,14 +1438,11 @@ pub fn typed_convention(plain: Convention) -> Convention =
 pub fn typed_callee(f: Bytes, c: Convention) -> Bytes =
   Bytes::concat_all([b"((", entry_type(c), b")", descriptor_of(f), b"->typed)"])
 
-pub fn convention_of(
-  constructors: Constructors,
-  t: { params: List<Type>, result_type: Type },
-) -> Convention = {
-  let reps = t.params.map(|x: Type| representation_with(constructors, x));
+pub fn convention_of(t: { params: List<Type>, result_type: Type }) -> Convention / {ShapeReads} = {
+  let reps = t.params.map(|x: Type| representation_of(x));
   {
     params: owned_params(reps),
-    result: representation_with(constructors, t.result_type),
+    result: representation_of(t.result_type),
     destination_passing: false,
     returned: OwnedResult,
   }

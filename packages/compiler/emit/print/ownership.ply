@@ -15,7 +15,7 @@ import compiler.emit.layout (SumLayout, WordIs, WordOutside, LowBits, Nullary, I
                              head_words, text_head, list_head, node_head, array_head,
                              text_block_bytes, ValueLayout, InlineRecord)
 import compiler.emit.lower.representation (c_values_of, leaf_values, passing, ByValue, ByReference,
-                                           return_buffer_words, representation_with)
+                                           return_buffer_words, representation_of)
 import compiler.emit.typed_ir (placeholder_var, param_ownerships, param_rep, Representation, AsInt,
                                AsWord, AsFlattened, AsReuseToken, AsSum, Leaf, Variable,
                                Instruction, Increment, Decrement, Reset, Free, Destructure,
@@ -25,7 +25,8 @@ import compiler.emit.typed_ir (placeholder_var, param_ownerships, param_rep, Rep
 import compiler.emit.c (int_literal)
 import compiler.emit.print.matching (switch_value, case_label, empty_arms)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, pieces_text)
-import compiler.emit.representations (Constructors, constructors_of, inside_layout, known_layout)
+import compiler.emit.representations (inside_layout, known_layout, ShapeReads, SumConstructor,
+                                      over_code_facts, table_sources, with_no_shapes)
 import compiler.emit.release (Part, WordAt, ByCase, CountedWord, Object, CaseBox, SumWord,
                               ScalarWord, ThroughDescriptor, RuntimeHandle, BlockContents,
                               WordBlock, ScopedContents, BytesBlock, ListOf, MapOf, MapNodeOf,
@@ -155,7 +156,7 @@ fn resource_cleanup_jump(
   }
 }
 
-fn resource_released(printing: Printing, u: Unwinding) -> Fragment / {abort.raise} = {
+fn resource_released(printing: Printing, u: Unwinding) -> Fragment / {ShapeReads} = {
   let k = u.callee;
   let noted = if printing.calls.contains(k) { printing } else {
     {
@@ -219,7 +220,7 @@ pub fn block_closed(
   outer: Int,
   depth: Int,
   falls: Bool,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let here = match printing.tails.by_block.get(printing.block) {
     Some(ks) -> ks.reverse(),
     None -> [],
@@ -280,12 +281,12 @@ pub fn block_closed(
 
 pub type Fragment = { printing: Printing, out: List<Piece> }
 
-fn slot_released(printing: Printing, name: Bytes, ty: Type) -> Fragment / {abort.raise} =
-  match known_layout(printing.constructors, ty) {
+fn slot_released(printing: Printing, name: Bytes, ty: Type) -> Fragment / {ShapeReads} =
+  match known_layout(ty) {
     Some(l) ->
       parts_released(
         printing,
-        layout_parts(printing.constructors, ty, l, 0),
+        layout_parts(ty, l, 0),
         range(0, words(l)).map(|k: Int| slot(name, k)),
       ),
     None -> unsupported(b"a record field whose type has no known size in memory", name),
@@ -295,7 +296,7 @@ pub fn count_printed(
   p: InstructionContext,
   printing: Printing,
   i: Instruction,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match i {
     Increment(n) -> {
       let once = duped(
@@ -331,8 +332,8 @@ pub fn count_printed(
         p.depth,
         r.token,
         r.of,
-        block_contents(printing.constructors, r.of.ty, r.of.representation),
-        root_of_representation(Drop, printing.constructors, r.of.ty, r.of.representation),
+        block_contents(r.of.ty, r.of.representation),
+        root_of_representation(Drop, r.of.ty, r.of.representation),
       ),
     Free(r) -> {
       let t = name_of(printing, r.of);
@@ -357,7 +358,7 @@ pub fn count_printed(
             p.depth,
             o.of,
             o.words,
-            block_contents(printing.constructors, o.of.ty, o.of.representation),
+            block_contents(o.of.ty, o.of.representation),
           ),
         None -> opened_sum(printing, p.depth, o.of, o.words),
       },
@@ -367,7 +368,7 @@ pub fn count_printed(
           p.depth,
           o.of,
           o.words,
-          block_contents(printing.constructors, o.of.ty, o.of.representation),
+          block_contents(o.of.ty, o.of.representation),
         ),
     },
     _ -> printing,
@@ -447,14 +448,14 @@ pub fn released(
   ty: Type,
   r: Representation,
   values: List<Bytes>,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   match r {
     AsReuseToken(n) -> {
       let t = nth_or_zero(values, 0);
       { printing: printing, out: [Text(Bytes::concat_all([b"if (", t, b") ", freed(t, n)]))] }
     },
     _ -> {
-      let each = counted_parts(printing.constructors, ty, r);
+      let each = counted_parts(ty, r);
       let vs = per_part(r, values);
       let by_word = range(0, each.len()).fold(
         { printing: printing, out: [] },
@@ -493,8 +494,8 @@ pub fn duped(
   ty: Type,
   r: Representation,
   values: List<Bytes>,
-) -> Fragment / {abort.raise} = {
-  let each = counted_parts(printing.constructors, ty, r);
+) -> Fragment / {ShapeReads} = {
+  let each = counted_parts(ty, r);
   let vs = per_part(r, values);
   let d = Bytes::join(
     range(0, each.len()).fold([], |accumulator: List<Bytes>, k: Int|
@@ -534,11 +535,11 @@ fn count_root(
   ty: Type,
   r: Representation,
   values: List<Bytes>,
-) -> Option<RootKey> / {abort.raise} =
+) -> Option<RootKey> / {ShapeReads} =
   if printing.count_root_type == Some(ty) || values.all(|v: Bytes| v == b"0") { None }
-  else { counted_through(operation, printing.constructors, ty, r) }
+  else { counted_through(operation, ty, r) }
 
-fn shorter(by_word: Fragment, call: Fragment) -> Fragment / {abort.raise} =
+fn shorter(by_word: Fragment, call: Fragment) -> Fragment / {ShapeReads} =
   if pieces_text(call.out).len() < pieces_text(by_word.out).len() { call } else { by_word }
 
 fn count_root_call(
@@ -765,7 +766,7 @@ pub fn opened_block(
   o: Variable,
   ws: List<Variable>,
   opening: BlockContents,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let x = name_of(printing, o);
   let read = |parts: List<BlockPart>|
     range(0, ws.len()).fold(printing, |q: Printing, i: Int|
@@ -826,7 +827,7 @@ fn contents_released(
   printing: Printing,
   x: Bytes,
   opening: BlockContents,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   match opening {
     BytesBlock ->
       {
@@ -939,7 +940,7 @@ fn item_read_at(
   x: Bytes,
   from: Int,
   stride: Int,
-) -> { names: List<Bytes>, read: Bytes } / {abort.raise} =
+) -> { names: List<Bytes>, read: Bytes } / {ShapeReads} =
   run_read(x, b"ply_w", from, stride, stride)
 
 fn run_read(
@@ -948,7 +949,7 @@ fn run_read(
   from: Int,
   stride: Int,
   count: Int,
-) -> { names: List<Bytes>, read: Bytes } / {abort.raise} = {
+) -> { names: List<Bytes>, read: Bytes } / {ShapeReads} = {
   let slots = run_slots(x, from, stride, count);
   let names = if count == 1 { [prefix] }
   else { range(0, count).map(|j: Int| prefix.concat(ascii_of_int(j))) };
@@ -980,7 +981,7 @@ pub fn walk_value(
   into: Option<Variable>,
   of: Variable,
   operation: TypeOperation,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match into {
     None ->
       unsupported(
@@ -995,21 +996,13 @@ pub fn walk_value(
           n,
           of,
           operation,
-          block_contents(q.constructors, of.ty, of.representation),
-          root_of_representation(Drop, q.constructors, of.ty, of.representation),
+          block_contents(of.ty, of.representation),
+          root_of_representation(Drop, of.ty, of.representation),
         );
       match of.representation {
         AsSum(s) -> match sole_boxed_payload(s.layout) {
           Some(_) -> whole(printing),
-          None ->
-            walk_sum(
-              printing,
-              p.depth,
-              n,
-              of,
-              operation,
-              case_blocks(printing.constructors, of.ty, s.layout),
-            ),
+          None -> walk_sum(printing, p.depth, n, of, operation, case_blocks(of.ty, s.layout)),
         },
         _ -> whole(printing),
       }
@@ -1024,7 +1017,7 @@ pub fn walk_block(
   operation: TypeOperation,
   opening: BlockContents,
   dropped: RootKey,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let x = name_of(printing, of);
   let n = named(printing, into);
   let a = n.name;
@@ -1082,7 +1075,7 @@ pub fn walk_block(
         out: [Text(Bytes::concat_all([b"Word ", a, b" = 1; "]))].concat(marked.out),
       })
     },
-    Keep -> if contains_unkeepable_value(n.printing.constructors, opening) {
+    Keep -> if contains_unkeepable_value(opening) {
       line(n.printing, depth, Bytes::concat_all([b"Word ", a, b" = 0;"]))
     } else {
       match opening {
@@ -1178,7 +1171,7 @@ pub fn walk_sum(
   of: Variable,
   operation: TypeOperation,
   blocks: List<{ case: Int, ty: Type, representation: Representation, opening: BlockContents }>,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match of.representation {
     AsSum(s) -> {
       let n = named(printing, into);
@@ -1187,7 +1180,7 @@ pub fn walk_sum(
           && blocks.fold(
             false,
             |any: Bool, b: { case: Int, ty: Type, representation: Representation, opening: BlockContents }|
-              any || contains_unkeepable_value(printing.constructors, b.opening),
+              any || contains_unkeepable_value(b.opening),
           ) { line(n.printing, depth, Bytes::concat_all([b"Word ", a, b" = 0;"])) }
       else { walk_sum_cases(n.printing, depth, a, of, s, operation, blocks) }
     },
@@ -1202,7 +1195,7 @@ fn walk_sum_cases(
   s: { layout: SumLayout, cases: List<Bytes> },
   operation: TypeOperation,
   blocks: List<{ case: Int, ty: Type, representation: Representation, opening: BlockContents }>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let x = name_of(printing, of);
   let untagged = match s.layout.classes { [Pointer] -> true, _ -> false };
   let target = if operation == Keep { b"*ply_into" } else { a };
@@ -1327,7 +1320,7 @@ fn walk_case(
   ty: Type,
   rep: Representation,
   o: BlockContents,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   match ((operation, uses_root_call(rep, o))) {
     (Keep, true) -> {
       let c = root_call(printing, root_of(Keep, ty), AsWord, b"ply_b");
@@ -1578,8 +1571,8 @@ pub fn each_counted_slot(
   printing: Printing,
   b: Bytes,
   o: BlockContents,
-  act: (Printing, List<Part>, List<Bytes>) -> Fragment / {abort.raise},
-) -> Fragment / {abort.raise} = {
+  act: (Printing, List<Part>, List<Bytes>) -> Fragment / {ShapeReads},
+) -> Fragment / {ShapeReads} = {
   let node = |k: RootKey| [WordAt({ at: 0, masked: false, how: Object(k) })];
   let each = |q: Printing, parts: List<{ ps: List<Part>, ws: List<Bytes> }>|
     parts.fold(
@@ -1594,10 +1587,9 @@ pub fn each_counted_slot(
       each(
         printing,
         x.parts.map(|h: BlockPart|
-          { ps: stored_parts(printing.constructors, h), ws: slots_of(b, h.at, h.representation) }),
+          { ps: stored_parts(h), ws: slots_of(b, h.at, h.representation) }),
       ),
-    ScopedContents(h) ->
-      each(printing, [{ ps: stored_parts(printing.constructors, h), ws: [slot(b, h.at)] }]),
+    ScopedContents(h) -> each(printing, [{ ps: stored_parts(h), ws: [slot(b, h.at)] }]),
     ListOf(l) -> {
       let laid = container_layouts.list;
       let items = act(printing, l.item, item_slots_at(b, laid.items, l.stride));
@@ -1674,7 +1666,7 @@ fn shared_parts(
   a: Bytes,
   parts: List<Part>,
   ws: List<Bytes>,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   each_word(printing, parts, ws, |q: Printing, w: Bytes, how: CountedWord| {
     let rejected = Bytes::concat_all([b") ", a, b" = 0;"]);
     match how {
@@ -1721,7 +1713,7 @@ fn persisted_parts(
   printing: Printing,
   parts: List<Part>,
   ws: List<Bytes>,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   each_word(printing, parts, ws, |q: Printing, w: Bytes, how: CountedWord|
     match how {
       ThroughDescriptor -> unsupported(b"cannot store a function value inside another value", w),
@@ -1745,8 +1737,8 @@ fn each_word(
   printing: Printing,
   parts: List<Part>,
   ws: List<Bytes>,
-  act: (Printing, Bytes, CountedWord) -> Fragment / {abort.raise},
-) -> Fragment / {abort.raise} =
+  act: (Printing, Bytes, CountedWord) -> Fragment / {ShapeReads},
+) -> Fragment / {ShapeReads} =
   parts.fold({ printing: printing, out: [] }, |accumulator: Fragment, p: Part| {
     let s = match p {
       WordAt(w) -> if w.masked { unsupported_walk(nth_or_zero(ws, w.at)) }
@@ -1784,13 +1776,13 @@ fn each_word(
     { printing: s.printing, out: spaced(accumulator.out, s.out) }
   })
 
-fn unsupported_walk(w: Bytes) -> Fragment / {abort.raise} =
+fn unsupported_walk(w: Bytes) -> Fragment / {ShapeReads} =
   unsupported(
     b"copying or dropping a value whose case is stored in its pointer is not supported",
     w,
   )
 
-fn walk_root(operation: TypeOperation, how: CountedWord) -> RootKey / {abort.raise} =
+fn walk_root(operation: TypeOperation, how: CountedWord) -> RootKey / {ShapeReads} =
   match how {
     Object(k) -> retargeted(k, operation),
     SumWord(k) -> retargeted(k, operation),
@@ -1800,7 +1792,7 @@ fn walk_root(operation: TypeOperation, how: CountedWord) -> RootKey / {abort.rai
       unsupported(b"no code exists to copy or drop this kind of value", operation_name(operation)),
   }
 
-fn retargeted(k: RootKey, operation: TypeOperation) -> RootKey / {abort.raise} =
+fn retargeted(k: RootKey, operation: TypeOperation) -> RootKey / {ShapeReads} =
   match k {
     Generated(_, _) -> keys::with_operation(k, operation),
     _ ->
@@ -1824,7 +1816,7 @@ pub fn opened_sum(
   depth: Int,
   o: Variable,
   ws: List<Variable>,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match ((o.representation, ws)) {
     (AsSum(s), [b]) -> {
       let x = name_of(printing, o);
@@ -1848,7 +1840,7 @@ pub fn reset_boxed(
   of: Variable,
   opening: BlockContents,
   dropped: RootKey,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match opening {
     WordBlock(b) -> {
       let x = name_of(printing, of);
@@ -1858,7 +1850,7 @@ pub fn reset_boxed(
         |accumulator: Fragment, h: BlockPart| {
           let s = parts_released(
             accumulator.printing,
-            stored_parts(printing.constructors, h),
+            stored_parts(h),
             slots_of(x, h.at, h.representation),
           );
           { printing: s.printing, out: spaced(accumulator.out, s.out) }
@@ -1900,8 +1892,8 @@ pub fn updated(
   printing: Printing,
   into: Option<Variable>,
   u: { of: Variable, sets: List<FieldWrite> },
-) -> Printing / {abort.raise} =
-  match ((into, block_contents(printing.constructors, u.of.ty, u.of.representation))) {
+) -> Printing / {ShapeReads} =
+  match ((into, block_contents(u.of.ty, u.of.representation))) {
     (Some(v), WordBlock(_)) -> {
       let x = name_of(printing, u.of);
       let n = named(printing, v);
@@ -1915,7 +1907,7 @@ pub fn updated(
               let first = Bytes::concat_all([b"&", slot(o, s.at + 1)]);
               let old = parts_released(
                 accumulator.printing,
-                layout_parts(printing.constructors, s.ty, l, 0),
+                layout_parts(s.ty, l, 0),
                 range(0, words(l)).map(|k: Int| slot(o, s.at + 1 + k)),
               );
               let source = nth_or_zero(arg_parts(old.printing, s.arg), 0);
@@ -1964,7 +1956,7 @@ pub fn updated(
       let opened = if !printing.placing.results.contains(v.id) {
         { printing: written.printing, out: reused }
       } else {
-        match known_layout(printing.constructors, u.of.ty) {
+        match known_layout(u.of.ty) {
           Some(l) -> {
             let moved = write_inline(written.printing, b"*(Word *)d", b"ply_words(d)", x, l);
             {
@@ -2008,15 +2000,15 @@ pub fn updated(
       ),
   }
 
-fn inline_layout(printing: Printing, ty: Type) -> Option<ValueLayout> =
-  match inside_layout(printing.constructors, ty) { Some(InlineRecord(l)) -> Some(l), _ -> None }
+fn inline_layout(printing: Printing, ty: Type) -> Option<ValueLayout> / {ShapeReads} =
+  match inside_layout(ty) { Some(InlineRecord(l)) -> Some(l), _ -> None }
 
 pub fn last_of(
   p: InstructionContext,
   printing: Printing,
   into: Option<Variable>,
   v: Variable,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match into {
     None ->
       unsupported(b"a check for the last reference whose result is never used", variable_text(v)),
@@ -2068,10 +2060,10 @@ const fake_instruction_context: InstructionContext =
     depth: 0,
   }
 
-fn printed(printing: Printing, i: Instruction) -> Bytes / {abort.raise} =
+fn printed(printing: Printing, i: Instruction) -> Bytes / {ShapeReads} =
   pieces_text(count_printed(fake_instruction_context, printing, i).out)
 
-fn failure_exit_text(printing: Printing, unwind: List<Variable>) -> Bytes / {abort.raise} = {
+fn failure_exit_text(printing: Printing, unwind: List<Variable>) -> Bytes / {ShapeReads} = {
   let x = failure_exit({ ..printing, out: [] }, unwind, b"return 0;");
   Bytes::concat_all([x.leave, b"\n", pieces_text(block_closed(x.printing, 0, 0, false).out)])
 }
@@ -2087,7 +2079,7 @@ fn int() -> Type = int_type
 
 fn text_local(id: Int) -> Variable = { id: id, ty: string(), representation: AsWord }
 
-fn drop_symbol_text(ty: Type) -> Bytes / {abort.raise} = root_symbol_text(drop_of(ty))
+fn drop_symbol_text(ty: Type) -> Bytes / {ShapeReads} = root_symbol_text(drop_of(ty))
 
 test "incrementing or releasing a value's reference count applies to each reference-counted word in the value, incrementing once per requested amount" {
   let record_type = RecordType([{ name: b"a", ty: int() }, { name: b"b", ty: string() }]);
@@ -2256,17 +2248,17 @@ test "the release code for a value is placed at the end of the block where the v
 
 fn dropping_of(name: Bytes) -> RootKey = drop_of(NamedType({ name: name, args: [] }))
 
-fn root_symbol_text(k: RootKey) -> Bytes / {abort.raise} = pieces_text([Hole(Symbol(Root(k)))])
+fn root_symbol_text(k: RootKey) -> Bytes / {ShapeReads} = pieces_text([Hole(Symbol(Root(k)))])
 
 fn released_fragment(
   parts: List<Part>,
   ws: List<Bytes>,
-) -> { text: Bytes, calls: List<RootKey>, expects: Int } / {abort.raise} = {
+) -> { text: Bytes, calls: List<RootKey>, expects: Int } / {ShapeReads} = {
   let s = parts_released(empty_printing(Map::new()), parts, ws);
   { text: paired(pieces_text(s.out)), calls: s.printing.calls, expects: s.printing.expects.len() }
 }
 
-fn paired(text: Bytes) -> Bytes / {abort.raise} = {
+fn paired(text: Bytes) -> Bytes / {ShapeReads} = {
   assert(
     text.split(b"(").len() == text.split(b")").len()
       && text.split(b"{").len() == text.split(b"}").len(),
@@ -2501,11 +2493,7 @@ test "releasing an array loops over its elements using the length in its header,
     Some(String::of_bytes_lossy(text)),
   );
   assert_eq(opened.calls, [item]);
-  let units = block_contents(
-    empty_printing(Map::new()).constructors,
-    array_type(unit_type),
-    AsWord,
-  );
+  let units = block_contents(array_type(unit_type), AsWord);
   assert_eq(units, ArrayOf({ element: [], stride: 1 }));
   let none_counted = pieces_text(
     opened_block(
@@ -2522,9 +2510,7 @@ test "releasing an array loops over its elements using the length in its header,
 test "releasing the heap block of a 128-bit integer frees the block by its byte size, the same way the type's release function does" {
   let wide = { ..placeholder_var(0, AsWord), ty: width_type({ bits: 128, signed: false }) };
   let printing = empty_printing(Map::new().insert(0, b"p0"));
-  let text = pieces_text(
-    opened_block(printing, 0, wide, [], block_contents(printing.constructors, wide.ty, AsWord)).out,
-  );
+  let text = pieces_text(opened_block(printing, 0, wide, [], block_contents(wide.ty, AsWord)).out);
   assert(
     text.contains(
       call_text(release_box_function, [b"ctx", b"p0", ascii_of_int(header_bytes + 16)]),
@@ -2596,98 +2582,88 @@ fn strings_record(n: Int) -> Type =
     }),
   )
 
-fn wide_sums(n: Int) -> Constructors =
-  constructors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(b"m.Many", [
-      {
-        name: b"m.Many",
-        index: 0,
-        fields: range(0, n).map(|_: Int| string()).push(int()),
-        params: [],
-      },
-    ]).insert(b"m.Sparse", [
-      {
-        name: b"m.Sparse",
-        index: 0,
-        fields: [string(), string()].concat(range(0, 20).map(|_: Int| int())),
-        params: [],
-      },
-    ]),
-  )
+fn wide_sums(n: Int) -> Map<Bytes, List<SumConstructor>> =
+  Map::new().insert(b"m.Many", [
+    {
+      name: b"m.Many",
+      index: 0,
+      fields: range(0, n).map(|_: Int| string()).push(int()),
+      params: [],
+    },
+  ]).insert(b"m.Sparse", [
+    {
+      name: b"m.Sparse",
+      index: 0,
+      fields: [string(), string()].concat(range(0, 20).map(|_: Int| int())),
+      params: [],
+    },
+  ])
 
 test "a value of many counted words is incremented or released by one call of its type's function, which handles each word itself" {
   let record_type = NamedType({ name: b"m.Many", args: [] });
-  let printing = { ..empty_printing(Map::new()), constructors: wide_sums(24) };
-  let representation = representation_with(printing.constructors, record_type);
-  let values = part_names(b"t1", representation);
-  let release = root_of(keys::Unboxed(keys::Release), record_type);
-  let dup = root_of(keys::Unboxed(Dup), record_type);
-  let let_go = released(printing, record_type, representation, values);
-  let more = duped(printing, record_type, representation, values);
-  let one_call = |s: Fragment, k: RootKey| {
-    let text = pieces_text(s.out);
-    occurrences(text, root_symbol_text(k)) == 1
-      && values.take(24).all(|v: Bytes| text.contains(v.concat(b",")))
-      && !releases(text, b"t1_0")
-      && !text.contains(duplicate_function.concat(b"("))
-  };
-  assert(
-    one_call(let_go, release) && one_call(more, dup),
-    Some(String::of_bytes_lossy(pieces_text(let_go.out.concat(more.out)))),
-  );
-  assert_eq([let_go.printing.calls, more.printing.calls], [[release], [dup]]);
-  let head_of = |k: RootKey| [signature_types(generated(printing.constructors, k).convention)];
-  assert_eq(let_go.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(release));
-  assert_eq(more.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(dup));
-  let inside = { ..printing, count_root_type: Some(record_type) };
-  let own = pieces_text(released(inside, record_type, representation, values).out);
-  let own_more = pieces_text(duped(inside, record_type, representation, values).out);
-  assert(
-    releases(own, b"t1_0") && releases(own, b"t1_23") && !own.contains(b"t1_24")
-      && own_more.contains(called(duplicate_function, [b"t1_0"]))
-      && own_more.contains(called(duplicate_function, [b"t1_23"]))
-      && !own_more.contains(b"t1_24"),
-    Some(String::of_bytes_lossy(own.concat(own_more))),
-  );
-  let pair = strings_record(2);
-  let pair_held = representation_with(printing.constructors, pair);
-  let pair_values = part_names(b"t4", pair_held);
-  assert(
-    released(printing, pair, pair_held, pair_values).printing.calls
-      == [root_of(keys::Unboxed(keys::Release), pair)]
-      && duped(printing, pair, pair_held, pair_values).printing.calls == [],
-    None,
-  );
-  let single = strings_record(1);
-  let lone = released(printing, single, representation_with(printing.constructors, single), [
-    b"t2_0",
-    b"t2_1",
-  ]);
-  assert(
-    releases(pieces_text(lone.out), b"t2_0") && lone.printing.calls == [drop_of(string())],
-    None,
-  );
-  let sparse = NamedType({ name: b"m.Sparse", args: [] });
-  let thin_held = representation_with(printing.constructors, sparse);
-  let thin = released(printing, sparse, thin_held, part_names(b"t3", thin_held));
-  assert(
-    releases(pieces_text(thin.out), b"t3_0") && releases(pieces_text(thin.out), b"t3_1")
-      && thin.printing.calls == [drop_of(string())],
-    Some(String::of_bytes_lossy(pieces_text(thin.out))),
-  )
+  over_code_facts(table_sources(wide_sums(24)), || {
+    let printing = empty_printing(Map::new());
+    let representation = representation_of(record_type);
+    let values = part_names(b"t1", representation);
+    let release = root_of(keys::Unboxed(keys::Release), record_type);
+    let dup = root_of(keys::Unboxed(Dup), record_type);
+    let let_go = released(printing, record_type, representation, values);
+    let more = duped(printing, record_type, representation, values);
+    let one_call = |s: Fragment, k: RootKey| {
+      let text = pieces_text(s.out);
+      occurrences(text, root_symbol_text(k)) == 1
+        && values.take(24).all(|v: Bytes| text.contains(v.concat(b",")))
+        && !releases(text, b"t1_0")
+        && !text.contains(duplicate_function.concat(b"("))
+    };
+    assert(
+      one_call(let_go, release) && one_call(more, dup),
+      Some(String::of_bytes_lossy(pieces_text(let_go.out.concat(more.out)))),
+    );
+    assert_eq([let_go.printing.calls, more.printing.calls], [[release], [dup]]);
+    let head_of = |k: RootKey| [signature_types(generated(k).convention)];
+    assert_eq(let_go.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(release));
+    assert_eq(more.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(dup));
+    let inside = { ..printing, count_root_type: Some(record_type) };
+    let own = pieces_text(released(inside, record_type, representation, values).out);
+    let own_more = pieces_text(duped(inside, record_type, representation, values).out);
+    assert(
+      releases(own, b"t1_0") && releases(own, b"t1_23") && !own.contains(b"t1_24")
+        && own_more.contains(called(duplicate_function, [b"t1_0"]))
+        && own_more.contains(called(duplicate_function, [b"t1_23"]))
+        && !own_more.contains(b"t1_24"),
+      Some(String::of_bytes_lossy(own.concat(own_more))),
+    );
+    let pair = strings_record(2);
+    let pair_held = representation_of(pair);
+    let pair_values = part_names(b"t4", pair_held);
+    assert(
+      released(printing, pair, pair_held, pair_values).printing.calls
+        == [root_of(keys::Unboxed(keys::Release), pair)]
+        && duped(printing, pair, pair_held, pair_values).printing.calls == [],
+      None,
+    );
+    let single = strings_record(1);
+    let lone = released(printing, single, representation_of(single), [b"t2_0", b"t2_1"]);
+    assert(
+      releases(pieces_text(lone.out), b"t2_0") && lone.printing.calls == [drop_of(string())],
+      None,
+    );
+    let sparse = NamedType({ name: b"m.Sparse", args: [] });
+    let thin_held = representation_of(sparse);
+    let thin = released(printing, sparse, thin_held, part_names(b"t3", thin_held));
+    assert(
+      releases(pieces_text(thin.out), b"t3_0") && releases(pieces_text(thin.out), b"t3_1")
+        && thin.printing.calls == [drop_of(string())],
+      Some(String::of_bytes_lossy(pieces_text(thin.out))),
+    )
+  })
 }
 
 test "a failure releases a value of several counted words with one call of its type's release function" {
   let record_type = strings_record(3);
   let printing = empty_printing(Map::new().insert(0, b"p0").insert(1, b"t1"));
-  let flat = {
-    id: 1,
-    ty: record_type,
-    representation: representation_with(printing.constructors, record_type),
-  };
+  let flat = { id: 1, ty: record_type, representation: representation_of(record_type) };
   let unwinding = failure_exit_text(printing, [text_local(0), flat]);
   let release = root_symbol_text(root_of(keys::Unboxed(keys::Release), record_type));
   assert(
@@ -2701,7 +2677,7 @@ test "the generated code to release a value of many counted words grows by one v
   let site = |n: Int| {
     let record_type = strings_record(n);
     let printing = empty_printing(Map::new());
-    let representation = representation_with(printing.constructors, record_type);
+    let representation = representation_of(record_type);
     let s = released(printing, record_type, representation, part_names(b"t1", representation));
     pieces_text(s.out).len()
       - root_symbol_text(root_of(keys::Unboxed(keys::Release), record_type)).len()
@@ -2764,7 +2740,7 @@ fn walk_fragment(
   operation: TypeOperation,
   o: BlockContents,
   dropped: RootKey,
-) -> { text: Bytes, calls: List<RootKey> } / {abort.raise} = {
+) -> { text: Bytes, calls: List<RootKey> } / {ShapeReads} = {
   let printing = empty_printing(Map::new().insert(0, b"p0"));
   let w = walk_block(
     printing,
@@ -2993,7 +2969,7 @@ test "making permanent a runtime handle, a scoped value, a function value, or a 
       ],
       words: 2,
     }),
-    block_contents(empty_printing(Map::new()).constructors, outer, AsWord),
+    block_contents(outer, AsWord),
     closures,
   ].fold((), |_: Unit, o: BlockContents| {
     let permanent = walk_fragment(Keep, o, dropped);

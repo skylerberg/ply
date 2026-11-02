@@ -5,7 +5,7 @@ import compiler.emit.pieces (Piece, Text, merged, pieces_text)
 import compiler.emit.layout (header_bytes)
 import compiler.emit.keys (Root, Named, Unboxed, Release, root_name, root_text)
 import compiler.emit.roots (symbol_of)
-import compiler.emit.representations (constructors_of)
+import compiler.emit.representations (ShapeReads, over_code_facts, table_sources, with_no_shapes)
 import compiler.emit.release (root_of)
 import compiler.emit.typed_ir (local_var, Representation, AsInt, AsWord, AsFlattened, AsReuseToken,
                                Variable, Rvalue, Call, Primitive, Native, Block, Do, Increment,
@@ -16,7 +16,7 @@ import compiler.emit.print.text (Printing, InstructionContext, empty_printing, f
                                  named, name_of, part_names)
 import compiler.emit.print.ownership (count_printed)
 import compiler.emit.print.value_printing (c_type)
-import compiler.emit.lower.representation (c_values_of, representation_with)
+import compiler.emit.lower.representation (c_values_of, representation_of)
 import compiler.emit.print.count_functions (free_function, call_text, call_start)
 
 pub type FrameLink = { printing: Printing, leave: Bytes, record: Option<Bytes> }
@@ -30,7 +30,7 @@ pub fn site_linked(
   printing: Printing,
   unwind: List<Variable>,
   value: Rvalue,
-) -> FrameLink / {abort.raise} =
+) -> FrameLink / {ShapeReads} =
   if !may_suspend(value) { { printing: printing, leave: p.exit_statement, record: None } } else {
     let s = slots_of(printing, unwind);
     let l = linked(p, printing, b"ply_fr", s);
@@ -48,7 +48,7 @@ pub fn handle_linked(
   body: Block,
   site: HandleSite,
   unwind: List<Variable>,
-) -> FrameLink / {abort.raise} =
+) -> FrameLink / {ShapeReads} =
   if !handle_suspends(body, site) { { printing: printing, leave: p.exit_statement, record: None } }
   else {
     let record = b"ply_fh".concat(ascii_of_int(label));
@@ -140,7 +140,7 @@ fn linked(
   printing: Printing,
   record: Bytes,
   s: Slots,
-) -> FrameLink / {abort.raise} =
+) -> FrameLink / {ShapeReads} =
   if s.tokens.len() == 0 && s.words.len() == 0 {
     { printing: printing, leave: p.exit_statement, record: None }
   } else {
@@ -207,7 +207,7 @@ fn each_named(
   p: InstructionContext,
   printing: Printing,
   counted_variables: List<Variable>,
-) -> { printing: Printing, name: Bytes } / {abort.raise} = {
+) -> { printing: Printing, name: Bytes } / {ShapeReads} = {
   let laid = range(0, counted_variables.len()).fold(
     { at: 0, names: Map::new(), loads: [], vars: [] },
     |accumulator: { at: Int, names: Map<Int, Bytes>, loads: List<Bytes>, vars: List<Variable> }, i: Int| {
@@ -357,10 +357,7 @@ test "a frame record's cleanup function releases every value stored in the recor
   let l = site_linked(place, h.printing, unwind, call_of(true));
   let each = pieces_text(each_functions_printed(b"m_f", l.printing));
   let slots = [{ ..h.s, id: 0 }, { ..h.flat, id: 1 }];
-  let named = {
-    ..empty_printing(Map::new().insert(0, b"x0").insert(1, b"x1")),
-    constructors: h.printing.constructors,
-  };
+  let named = empty_printing(Map::new().insert(0, b"x0").insert(1, b"x1"));
   let down = pieces_text(
     slots.fold(named, |q: Printing, v: Variable| count_printed(place, q, Decrement(v))).out,
   );
@@ -381,19 +378,14 @@ test "a frame record's cleanup function releases every value stored in the recor
 test "a frame record's cleanup function releases a value through its type's release function, and for wide sums and records with `Int` fields it loads only the counted words" {
   let string = string_type;
   let wide = NamedType({ name: b"m.Wide", args: [] });
-  let constructors = constructors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(b"m.Wide", [
-      {
-        name: b"m.Wide",
-        index: 0,
-        fields: range(0, 6).map(|_: Int| string).concat(range(0, 3).map(|_: Int| int_type)),
-        params: [],
-      },
-    ]),
-  );
+  let sums = Map::new().insert(b"m.Wide", [
+    {
+      name: b"m.Wide",
+      index: 0,
+      fields: range(0, 6).map(|_: Int| string).concat(range(0, 3).map(|_: Int| int_type)),
+      params: [],
+    },
+  ]);
   let record = RecordType(
     fields_sorted([
       { name: b"s0", ty: string },
@@ -401,33 +393,34 @@ test "a frame record's cleanup function releases a value through its type's rele
       { name: b"n0", ty: int_type },
     ]),
   );
-  [wide, record].fold((), |_: Unit, ty: Type| {
-    let representation = representation_with(constructors, ty);
-    let flat = { id: 1, ty: ty, representation: representation };
-    let printing = named(
-      { ..empty_printing(Map::new().insert(0, b"p0")), constructors: constructors },
-      flat,
-    ).printing;
-    let each = pieces_text(
-      each_functions_printed(b"m_f", site_linked(place, printing, [flat], call_of(true)).printing),
-    );
-    let name = |k: Int| b"x0_".concat(ascii_of_int(k));
-    let named_at = |k: Int|
-      [b",", b")", b"}", b";"].any(|end: Bytes| contains_bytes(each, name(k).concat(end)));
-    let loaded = |k: Int| contains_bytes(each, name(k).concat(b" = s["));
-    let message = Some(String::of_bytes_lossy(each));
-    assert(
-      contains_bytes(
-        each,
-        symbol_of(root_text(root_name(root_of(Unboxed(Release), ty)))).concat(b"(ctx, "),
-      ),
-      message,
-    );
-    assert_eq(
-      range(0, c_values_of(representation).len()).filter(|k: Int| named_at(k) && !loaded(k)),
-      [],
-    )
-  })
+  over_code_facts(table_sources(sums), ||
+    [wide, record].fold((), |_: Unit, ty: Type| {
+      let representation = representation_of(ty);
+      let flat = { id: 1, ty: ty, representation: representation };
+      let printing = named(empty_printing(Map::new().insert(0, b"p0")), flat).printing;
+      let each = pieces_text(
+        each_functions_printed(
+          b"m_f",
+          site_linked(place, printing, [flat], call_of(true)).printing,
+        ),
+      );
+      let name = |k: Int| b"x0_".concat(ascii_of_int(k));
+      let named_at = |k: Int|
+        [b",", b")", b"}", b";"].any(|end: Bytes| contains_bytes(each, name(k).concat(end)));
+      let loaded = |k: Int| contains_bytes(each, name(k).concat(b" = s["));
+      let message = Some(String::of_bytes_lossy(each));
+      assert(
+        contains_bytes(
+          each,
+          symbol_of(root_text(root_name(root_of(Unboxed(Release), ty)))).concat(b"(ctx, "),
+        ),
+        message,
+      );
+      assert_eq(
+        range(0, c_values_of(representation).len()).filter(|k: Int| named_at(k) && !loaded(k)),
+        [],
+      )
+    }))
 }
 
 test "a call that cannot pause, a value that cannot fail, and a call with no counted value live after it each link no frame record" {

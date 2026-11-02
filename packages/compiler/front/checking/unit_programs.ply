@@ -52,7 +52,18 @@ pub fn compiled_program(
   user: List<Source>,
   shipped: List<Source>,
   wanted: Option<List<RootKey>> = None,
-) -> Compiled / {abort.raise} = {
+) -> Compiled / {abort.raise} =
+  match program_reached(user, shipped, wanted) {
+    Ok(c) -> c,
+    Err(failed) ->
+      panic(String::of_bytes_lossy(Bytes::join(failed.map(|d: Diagnostic| d.message), b"\n"))),
+  }
+
+fn program_reached(
+  user: List<Source>,
+  shipped: List<Source>,
+  wanted: Option<List<RootKey>>,
+) -> Result<Compiled, List<Diagnostic>> / {abort.raise} = {
   let w = inputs_alone(user);
   let qs = fresh_registry();
   over_decoding(
@@ -66,12 +77,16 @@ pub fn compiled_program(
           query_load(w.own, [], false, listed_module);
           let roots = match wanted { Some(rs) -> rs, None -> roots_of_modules(w.own) };
           let code = program_code(entries_of(roots));
-          let codes = reached_codes(code);
-          let output = program_output(codes, constructors_named(codes), 1, Map::new());
-          {
-            output: output,
-            codes: codes,
-            roots: code.roots.filter(|k: RootKey| output.taken.contains(root_name(k))),
+          match reached_codes(code) {
+            Err(failed) -> Err(failed),
+            Ok(codes) -> {
+              let output = program_output(codes, constructors_named(codes), 1, Map::new());
+              Ok({
+                output: output,
+                codes: codes,
+                roots: code.roots.filter(|k: RootKey| output.taken.contains(root_name(k))),
+              })
+            },
           }
         })),
   ).value
@@ -102,10 +117,12 @@ fn unit_against_runtime(
   shipped: List<Source>,
   natives: List<Native>,
 ) -> Result<Bytes, List<Diagnostic>> / {abort.raise} = {
-  let program = compiled_program(user, shipped);
-  match code_rejections({ ..a_runtime(b"r"), natives: natives }, program.codes) {
-    [] -> Ok(unit_text(program.output.parts)),
-    rejected -> Err(rejected),
+  match program_reached(user, shipped, None) {
+    Err(failed) -> Err(failed),
+    Ok(program) -> match code_rejections({ ..a_runtime(b"r"), natives: natives }, program.codes) {
+      [] -> Ok(unit_text(program.output.parts)),
+      rejected -> Err(rejected),
+    },
   }
 }
 
@@ -191,6 +208,55 @@ test "a `try` that handles an effect another module declares compiles, though th
   match roots_built([lib, m]) {
     Ok(roots) -> assert(roots.contains(Named(b"m.safe"))),
     Err(reason) -> panic(String::of_bytes_lossy(reason)),
+  }
+}
+
+test "a value whose type comes from a callee is released by its type's release function, though the function's module never names the type or its module" {
+  let s = {
+    name: b"s",
+    source_text: b"pub opaque type Conn = | Conn(Int)\nrelease for Conn by close\nfn close(c: keep Conn) -> Unit = match c { Conn(n) -> () }\npub fn open() -> Conn = Conn(1)\n",
+  };
+  let g = { name: b"g", source_text: b"import s\npub fn opened() -> s::Conn = s::open()\n" };
+  let m = { name: b"m", source_text: b"import g\nfn used() -> Int = { let c = g::opened(); 1 }\n" };
+  let results = compiled_program([s, g, m], []).codes.flat_map(|c: UnitCode| c.results);
+  let calls_of = |k: RootKey|
+    match results.find(|r: RootOutput| r.name == root_name(k)) {
+      Some(r) -> r.result.tables.calls,
+      None -> [],
+    };
+  let released = calls_of(Named(b"m.used"));
+  assert(
+    released.contains(Named(b"s.close"))
+      || released.any(|k: RootKey| calls_of(k).contains(Named(b"s.close"))),
+    Some(String::of_bytes_lossy(Bytes::join(released.map(printed), b", "))),
+  )
+}
+
+test "every unit whose code cannot be lowered is reported with its own reason" {
+  let native = {
+    name: b"std.native",
+    source_text: b"pub extern fn counted(x: { n: Int }) -> Int\n",
+  };
+  let caller = |module: Bytes|
+    {
+      name: module,
+      source_text: b"import std.native (counted)\nfn f() -> Int = counted({ n: 2 })\n",
+    };
+  match unit_against_runtime(
+      [caller(b"a"), caller(b"b")],
+      [native],
+      declared_natives.map(declared_signature),
+    ) {
+    Ok(_) -> assert(false, Some("code that cannot be lowered compiled")),
+    Err(rejected) -> {
+      let reasons = rejected.filter(|d: Diagnostic| d.code == b"E0505").map(|d: Diagnostic|
+        d.message);
+      assert(
+        reasons.any(|r: Bytes| r.contains(b"`a.f`"))
+          && reasons.any(|r: Bytes| r.contains(b"`b.f`")),
+        Some(String::of_bytes_lossy(Bytes::join(reasons, b"\n"))),
+      )
+    },
   }
 }
 
