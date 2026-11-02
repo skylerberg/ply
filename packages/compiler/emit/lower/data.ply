@@ -404,81 +404,128 @@ fn leaves_read(
 fn leaf_representation(ls: List<Leaf>, k: Int) -> Representation =
   match ls.at(k) { Some(l) -> l.representation, None -> AsWord }
 
-pub fn record_update(
+type RebuiltPart = { part: RecordPart, copied: Option<Arg> }
+
+pub type UpdatePlan =
+  | UnitUpdate
+  | WrittenInPlace(Variable)
+  | Rebuilt({ leaves: List<Leaf>, representation: Representation, parts: List<RebuiltPart> })
+  | Specialised(Variable)
+
+pub type StartedUpdate = { st: Lowering, plan: UpdatePlan }
+
+pub fn holds_base(plan: UpdatePlan) -> Bool =
+  match plan { WrittenInPlace(_) -> true, Specialised(_) -> true, _ -> false }
+
+pub fn update_started(
   context: Context,
   st: Lowering,
   base: Arg,
   copies: List<Bytes>,
-  sets: List<{ name: Bytes, arg: Arg }>,
+  set_names: List<Bytes>,
   ty: Type,
   at: Span,
-) -> LoweredValue / {EmitReads} =
+) -> StartedUpdate / {EmitReads} =
   match base {
     VariableOperand(b) -> {
       let rep = representation_of(ty);
-      if rep == AsUnit { { st: st, arg: ZeroOperand(AsUnit) } } else {
+      if rep == AsUnit { { st: st, plan: UnitUpdate } } else {
         match layout_leaves(ty) {
           Some(ls) -> {
-            let given = sets.fold(Map::new(), |m: Map<Bytes, Arg>, f: { name: Bytes, arg: Arg }|
-              m.insert(f.name, f.arg));
+            let written = set_names.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes|
+              m.insert(n, true));
             let copied_names = copies.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes|
               m.insert(n, true));
-            let lay = field_layout(context, b);
             let parts_of_type = record_parts(ty);
             let in_place = rep == AsWord && b.representation == AsWord
               && record_fields(b.ty) == record_fields(ty)
               && parts_of_type.all(|p: RecordPart|
-                given.contains(p.name) || copied_names.contains(p.name));
-            if in_place { box_fields_written(context, st, b, ty, sets, at) } else {
-              let parts = parts_of_type.fold(
-                { st: st, parts: [], missing: false },
-                |accumulator: { st: Lowering, parts: List<Arg>, missing: Bool }, p: RecordPart| {
-                  match given.get(p.name) {
-                    Some(a) -> {
-                      let h = represented_as({ st: accumulator.st, arg: a }, p.representation, at);
-                      { ..accumulator, st: h.st, parts: accumulator.parts.push(h.arg) }
-                    },
-                    None -> if !copied_names.contains(p.name) { { ..accumulator, missing: true } }
-                    else {
-                      match read_field(
-                          context,
-                          accumulator.st,
-                          b,
-                          lay,
-                          p.name,
-                          p.ty,
-                          p.representation,
-                          at,
-                        ) {
-                        None -> { ..accumulator, missing: true },
-                        Some(r) ->
-                          { ..accumulator, st: r.st, parts: accumulator.parts.push(r.arg) },
-                      }
-                    },
-                  }
-                },
+                written.contains(p.name) || copied_names.contains(p.name));
+            if in_place { { st: st, plan: WrittenInPlace(b) } } else {
+              let lay = field_layout(context, b);
+              let copied = parts_of_type.fold(
+                { st: st, parts: [] },
+                |accumulator: { st: Lowering, parts: List<RebuiltPart> }, p: RecordPart|
+                  if written.contains(p.name) {
+                    { ..accumulator, parts: accumulator.parts.push({ part: p, copied: None }) }
+                  } else if !copied_names.contains(p.name) { missing_field() } else {
+                    match read_field(
+                        context,
+                        accumulator.st,
+                        b,
+                        lay,
+                        p.name,
+                        p.ty,
+                        p.representation,
+                        at,
+                      ) {
+                      Some(r) ->
+                        {
+                          st: r.st,
+                          parts: accumulator.parts.push({ part: p, copied: Some(r.arg) }),
+                        },
+                      None -> missing_field(),
+                    }
+                  },
               );
-              if parts.missing {
-                unreachable(
-                  b"a record update sets a field that the base record does not have in its memory layout",
-                )
-              } else { record_built(parts.st, ty, ls, rep, parts.parts, at) }
+              {
+                st: copied.st,
+                plan: Rebuilt({ leaves: ls, representation: rep, parts: copied.parts }),
+              }
             }
           },
-          None ->
-            deferred_to_specialisation(
-              note_open_layouts(context, note_open_layouts(context, st, b.ty), ty),
-              ty,
-              AsWord,
-              [{ arg: VariableOperand(b), takes: true }].concat(
-                takes_except_records(sets.map(|f: { name: Bytes, arg: Arg }| f.arg)),
-              ),
-              at,
-            ),
+          None -> { st: st, plan: Specialised(b) },
         }
       }
     },
     _ -> unreachable(b"a record update on a value that is not a record"),
+  }
+
+fn missing_field<a>() -> a / {EmitReads} =
+  unreachable(
+    b"a record update sets a field that the base record does not have in its memory layout",
+  )
+
+pub fn update_finished(
+  context: Context,
+  st: Lowering,
+  plan: UpdatePlan,
+  sets: List<{ name: Bytes, arg: Arg }>,
+  ty: Type,
+  at: Span,
+) -> LoweredValue / {EmitReads} =
+  match plan {
+    UnitUpdate -> { st: st, arg: ZeroOperand(AsUnit) },
+    WrittenInPlace(b) -> box_fields_written(context, st, b, ty, sets, at),
+    Rebuilt(r) -> {
+      let given = sets.fold(Map::new(), |m: Map<Bytes, Arg>, f: { name: Bytes, arg: Arg }|
+        m.insert(f.name, f.arg));
+      let parts = r.parts.fold(
+        { st: st, parts: [] },
+        |accumulator: { st: Lowering, parts: List<Arg> }, x: RebuiltPart|
+          match x.copied {
+            Some(a) -> { ..accumulator, parts: accumulator.parts.push(a) },
+            None -> match given.get(x.part.name) {
+              Some(a) -> {
+                let h = represented_as({ st: accumulator.st, arg: a }, x.part.representation, at);
+                { st: h.st, parts: accumulator.parts.push(h.arg) }
+              },
+              None -> missing_field(),
+            },
+          },
+      );
+      record_built(parts.st, ty, r.leaves, r.representation, parts.parts, at)
+    },
+    Specialised(b) ->
+      deferred_to_specialisation(
+        note_open_layouts(context, note_open_layouts(context, st, b.ty), ty),
+        ty,
+        AsWord,
+        [{ arg: VariableOperand(b), takes: true }].concat(
+          takes_except_records(sets.map(|f: { name: Bytes, arg: Arg }| f.arg)),
+        ),
+        at,
+      ),
   }
 
 fn box_fields_written(
