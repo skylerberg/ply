@@ -23,7 +23,7 @@ pub effect recent_reads {
   write lookups_in(name: Bytes) -> Int
 }
 
-pub type Tree = | Facts | Dependents | Inputs | Codes
+pub type Tree = | Facts | Dependents | Inputs | Codes | Records
 
 pub type LogEntry = { offset: Int, changes: List<Bytes> }
 
@@ -61,7 +61,7 @@ fn row_width(table: Int) -> Int = key_width(table) + 12
 const current_snapshot: Bytes = b"current snapshot".blake3()
 
 fn tree_number(tree: Tree) -> Int =
-  match tree { Facts -> 1, Dependents -> 3, Inputs -> 4, Codes -> 5 }
+  match tree { Facts -> 1, Dependents -> 3, Inputs -> 4, Codes -> 5, Records -> 6 }
 
 fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
@@ -257,6 +257,9 @@ pub fn open<[r]>(
 }
 
 pub fn close<[r]>(db: Database) -> Unit / {fs.write[r]} = segments::end_run[r](db.run)
+
+pub fn unreadable<[r]>(dir: String) -> Bool / {fs.read[r], abort.raise} =
+  segments::unreadable[r](dir, schema)
 
 fn pending_in(db: Database, tree: Int) -> Map<Bytes, Option<Bytes>> =
   match db.pending.get(tree) { Some(entries) -> entries, None -> Map::new() }
@@ -785,44 +788,7 @@ fn tree_nodes<[r]>(
       },
   )
 
-pub type Compaction = { bytes_before: Int, bytes_after: Int }
-
 fn store_bytes(m: Manifest) -> Int = m.segments.fold(0, |n: Int, seg: Segment| n + seg.size)
-
-pub fn compact<[r]>(
-  db: Database,
-  live_results: Map<Bytes, Bool>,
-) -> Compaction / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
-  let m = segments::manifest[r](db.dir, schema);
-  let nodes = tree_nodes[r](db, db.snapshot.values());
-  let done = m.segments.len() == 0
-    || rewritten_segments[r](
-      { ..db, manifest: m },
-      m,
-      0,
-      segments::segment_token(db.run, m.generation, 3),
-      |table: Int, key: Bytes|
-        if table == nodes_table { nodes.contains(key) }
-        else if table == results_table { live_results.contains(key) }
-        else { true },
-    );
-  let after = segments::manifest[r](db.dir, schema);
-  match db.run { Some(run) -> segments::sweep[r](db.dir, schema, run), None -> () };
-  {
-    bytes_before: store_bytes(m),
-    bytes_after: if done { store_bytes(after) } else { store_bytes(m) },
-  }
-}
-
-pub fn unreferenced_bytes<[r]>(
-  db: Database,
-  live_results: Map<Bytes, Bool>,
-) -> Int / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  located_rows[r](db, db.manifest.segments, results_table).fold(
-    0,
-    |bytes: Int, key: Bytes, at: Located|
-      if live_results.contains(key) { bytes } else { bytes + at.size },
-  )
 
 pub fn store_size(db: Database) -> { segments: Int, bytes: Int } =
   { segments: db.manifest.segments.len(), bytes: store_bytes(db.manifest) }
@@ -1017,12 +983,20 @@ test "a snapshot that returns to an earlier state writes no tree nodes, because 
   assert(size_of(back) - size_of(two) < 400)
 }
 
-test "a compaction drops what the snapshot no longer uses, and keeps every value it uses" {
-  let tree = fs::on_mem[abs](after_first(fs::mem_of([])), ||
-    in_store[abs](|db: Database| committed[abs](second_edit(db)))).tree;
-  let squeezed = fs::on_mem[abs](tree, ||
-    in_store[abs](|db: Database| compact[abs](db, Map::new())));
-  assert(squeezed.value.bytes_after <= squeezed.value.bytes_before);
-  assert_eq(value_stored(squeezed.tree, key_of("second")), Some(b"two"));
-  assert_eq(log_stored(squeezed.tree, 0).len(), 2)
+test "a commit that replaces a result drops the old one when its merge reaches the oldest segment" {
+  let old = key_of("old");
+  let new = key_of("new");
+  let wrote = |tree: fs::MemFs, digest: Bytes, value: Bytes|
+    fs::on_mem[abs](tree, ||
+      in_store[abs](|db: Database|
+        match commit[abs](with_result[abs](db, digest, value), |_: Database|
+            Map::new().insert(digest, true)) {
+          Committed(_) -> (),
+          other -> panic("the commit failed: " ++ show(other)),
+        })).tree;
+  let tree = wrote(wrote(fs::mem_of([]), old, b"old"), new, b"new");
+  let read = |digest: Bytes|
+    fs::on_mem[abs](tree, || in_store[abs](|db: Database| result_of[abs](db, digest))).value;
+  assert_eq(read(old), None);
+  assert_eq(read(new), Some(b"new"))
 }

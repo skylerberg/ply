@@ -27,7 +27,6 @@ import std.bytes
 import std.fs (fs)
 import std.random (entropy)
 import std.time (time)
-import store.engine
 import store.tables
 import compiler.store.hash.forms (by_name)
 import compiler.store.hash.encoding (hex)
@@ -55,7 +54,6 @@ pub type Rejection = {
 pub type Stats = {
   directory: String,
   warnings: List<Diagnostic>,
-  format: Int,
   root: String,
   open_us: Int,
   results: Int,
@@ -63,22 +61,7 @@ pub type Stats = {
   obligations: Int,
   reviews: Int,
   texts: Int,
-  segments: Int,
-  data_bytes: Int,
-  garbage_bytes: Int,
   memo: memo_files::Usage,
-}
-
-pub type PruneCounts = { texts: Int }
-
-pub type CompactResult = {
-  directory: String,
-  warnings: List<Diagnostic>,
-  dropped: PruneCounts,
-  memo: memo_files::Compaction,
-  bytes_before: Int,
-  bytes_after: Int,
-  results: Int,
 }
 
 pub type ClearResult = { directory: String, warnings: List<Diagnostic>, cleared: Int }
@@ -128,10 +111,6 @@ fn size_text(n: Int) -> String = size(n, digits: 2, rounding: HalfUp)
 fn share(part: Int, whole: Int, per: Int) -> Int =
   if whole == 0 { 0 } else { (part * per + whole / 2) / whole }
 
-fn compact_suggested(stats: Stats) -> Bool =
-  (stats.data_bytes > 0 && stats.garbage_bytes * 2 > stats.data_bytes)
-    || (stats.memo.bytes > 0 && stats.memo.reclaimable_bytes * 2 > stats.memo.bytes)
-
 fn failure_output(
   style: Style,
   action: String,
@@ -174,23 +153,11 @@ fn no_match(query: String) -> Diagnostic =
     fixes: [],
   }
 
-fn store_json(stats: Stats) -> Json = {
-  let ratio = decimal(fixed_point(share(stats.garbage_bytes, stats.data_bytes, 1000000), 6));
-  object([
-    { key: "segments", value: int(stats.segments) },
-    { key: "data_bytes", value: int(stats.data_bytes) },
-    { key: "garbage_bytes", value: int(stats.garbage_bytes) },
-    { key: "garbage_ratio", value: ratio },
-    { key: "compact_suggested", value: Bool(compact_suggested(stats)) },
-  ])
-}
-
 fn memo_json(u: memo_files::Usage) -> Json =
   object([
     { key: "facts", value: int(u.records) },
     { key: "results", value: int(u.results) },
     { key: "result_bytes", value: int(u.output_bytes) },
-    { key: "reclaimable_bytes", value: int(u.reclaimable_bytes) },
     { key: "segments", value: int(u.segments) },
     { key: "bytes", value: int(u.bytes) },
     {
@@ -212,7 +179,6 @@ fn stats_json(stats: Stats) -> Json / {abort.raise} =
     { key: "action", value: Str("stats") },
     { key: "ok", value: Bool(true) },
     { key: "exit_code", value: int(ok_code) },
-    { key: "format", value: int(stats.format) },
     { key: "root", value: Str(stats.root) },
     { key: "directory", value: Str(stats.directory) },
     { key: "open_ms", value: decimal(fixed_point(stats.open_us, 3)) },
@@ -221,25 +187,15 @@ fn stats_json(stats: Stats) -> Json / {abort.raise} =
     { key: "obligations", value: int(stats.obligations) },
     { key: "reviews", value: int(stats.reviews) },
     { key: "history", value: object([{ key: "texts", value: int(stats.texts) }]) },
-    { key: "store", value: store_json(stats) },
     { key: "memo", value: memo_json(stats.memo) },
     { key: "warnings", value: all_to_json(stats.warnings, []) },
   ])
-
-fn reclaimable(style: Style, stats: Stats) -> String =
-  dim(
-    style,
-    size_text(stats.garbage_bytes) ++ " ("
-      ++ share(stats.garbage_bytes, stats.data_bytes, 100).to_string()
-      ++ "%)",
-  )
 
 fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
   let opened = fixed_point(share(stats.open_us, 1000, 100), 2) ++ "ms";
   let head = [
     indent ++ dim(style, stats.directory),
     indent ++ "opened in " ++ bold(style, opened),
-    indent ++ "store format " ++ stats.format.to_string(),
     indent ++ "results · " ++ bold(style, stats.results.to_string()) ++ " cached "
       ++ plural(stats.results, "result")
       ++ " · "
@@ -253,10 +209,6 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
       ++ plural(stats.reviews, "review"),
     indent ++ "history · " ++ bold(style, stats.texts.to_string()) ++ " definition "
       ++ plural(stats.texts, "text"),
-    indent ++ "  " ++ count_of(stats.segments, "segment") ++ " "
-      ++ dim(style, size_text(stats.data_bytes))
-      ++ " · reclaimable "
-      ++ reclaimable(style, stats),
     indent ++ "memo · " ++ bold(style, stats.memo.records.to_string()) ++ " "
       ++ plural(stats.memo.records, "record")
       ++ " · "
@@ -264,23 +216,15 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
     indent ++ "  " ++ count_of(stats.memo.segments, "segment") ++ " "
       ++ dim(style, size_text(stats.memo.bytes))
       ++ " · results "
-      ++ dim(style, size_text(stats.memo.output_bytes))
-      ++ " · reclaimable "
-      ++ dim(style, size_text(stats.memo.reclaimable_bytes)),
+      ++ dim(style, size_text(stats.memo.output_bytes)),
   ].concat(
     stats.memo.kinds.sort_by(|a: KindUsage, b: KindUsage| a.bytes >= b.bytes).map(|k: KindUsage|
       indent ++ "  " ++ String::of_bytes_lossy(k.query) ++ " · " ++ count_of(k.facts, "fact")
         ++ " "
         ++ dim(style, size_text(k.bytes))),
   );
-  let advised = if compact_suggested(stats) {
+  if stats.results == 0 { head } else {
     head.push(
-      indent ++ "  "
-        ++ yellow(style, "more than half of what is kept is unreachable; run `ply cache compact`"),
-    )
-  } else { head };
-  if stats.results == 0 { advised } else {
-    advised.push(
       indent ++ "  "
         ++ dim(
           style,
@@ -288,49 +232,6 @@ fn stats_lines(style: Style, stats: Stats) -> List<String> / {abort.raise} = {
         ),
     )
   }
-}
-
-fn reclaimed(c: CompactResult) -> Int =
-  if c.bytes_before > c.bytes_after { c.bytes_before - c.bytes_after } else { 0 }
-
-fn compact_json(c: CompactResult) -> Json / {abort.raise} =
-  object([
-    { key: "command", value: Str("cache") },
-    { key: "action", value: Str("compact") },
-    { key: "ok", value: Bool(true) },
-    { key: "exit_code", value: int(ok_code) },
-    { key: "directory", value: Str(c.directory) },
-    { key: "dropped", value: object([{ key: "texts", value: int(c.dropped.texts) }]) },
-    { key: "bytes_before", value: int(c.bytes_before) },
-    { key: "bytes_after", value: int(c.bytes_after) },
-    { key: "reclaimed_bytes", value: int(reclaimed(c)) },
-    { key: "results", value: int(c.results) },
-    { key: "warnings", value: all_to_json(c.warnings, []) },
-  ])
-
-fn compact_lines(style: Style, c: CompactResult) -> List<String> / {abort.raise} = {
-  let d = c.dropped;
-  let head = [indent ++ green(style, "compacted") ++ " " ++ dim(style, c.directory)];
-  let pruned = if d.texts == 0 { head } else {
-    head.push(
-      indent ++ "  dropped " ++ count_of(d.texts, "cached source text")
-        ++ " that no check or build used",
-    )
-  };
-  let sized = if reclaimed(c) == 0 {
-    pruned.push(
-      indent ++ "  " ++ size_text(c.bytes_after) ++ " · " ++ dim(style, "nothing to reclaim"),
-    )
-  } else {
-    pruned.push(
-      indent ++ "  " ++ size_text(c.bytes_before) ++ " → " ++ size_text(c.bytes_after) ++ " ("
-        ++ bold(style, size_text(reclaimed(c)))
-        ++ " reclaimed)",
-    )
-  };
-  sized.push(
-    indent ++ "  " ++ dim(style, "compacting keeps every test result, so no test runs again"),
-  )
 }
 
 fn clear_json(c: ClearResult) -> Json / {abort.raise} =
@@ -556,21 +457,6 @@ fn stats_result(style: Style, result: Result<Stats, Rejection>) -> CommandOutput
       },
   }
 
-fn compact_result(
-  style: Style,
-  result: Result<CompactResult, Rejection>,
-) -> CommandOutput / {abort.raise} =
-  match result {
-    Err(reason) -> failure_output(style, "compact", reason),
-    Ok(c) ->
-      {
-        json: compact_json(c),
-        lines: warning_lines(style, c.warnings).concat(compact_lines(style, c)),
-        errs: [],
-        code: ok_code,
-      },
-  }
-
 fn clear_result(
   style: Style,
   result: Result<ClearResult, Rejection>,
@@ -653,48 +539,21 @@ fn stats_of<[r]>(
   let started = time.elapsed_us();
   let c = tables::open_cache[r](place.dir, place.stamps);
   let open_us = time.elapsed_us() - started;
-  let u = tables::usage(c);
+  let counts = tables::counts(c);
   {
     directory: display_path(place, ""),
     warnings: project_store::diagnostics_of(tables::warnings(c)),
-    format: engine::format_version,
     root: paths::displayed({
       label: place.label,
       path: if place.label == "cwd" { place.root } else { place.root.slice(1, place.root.len()) },
     }),
     open_us: open_us,
-    results: u.counts.passed,
-    definitions_seen: u.counts.seen,
-    obligations: u.counts.evidence,
-    reviews: u.counts.reviews,
-    texts: u.counts.texts,
-    segments: u.segments,
-    data_bytes: u.data_bytes,
-    garbage_bytes: if u.data_bytes > u.live_bytes { u.data_bytes - u.live_bytes } else { 0 },
+    results: counts.passed,
+    definitions_seen: counts.seen,
+    obligations: counts.evidence,
+    reviews: counts.reviews,
+    texts: counts.texts,
     memo: memo_files::usage[r](memo_dir(place)),
-  }
-}
-
-fn disk_bytes<[r]>(place: project_store::StoreLocation) -> Int / {fs.read[r], abort.raise} =
-  engine::disk_usage[r](place.dir) + memo_files::usage[r](memo_dir(place)).bytes
-
-fn compact_store<[r]>(
-  place: project_store::StoreLocation,
-  current: Map<Bytes, Bool>,
-) -> CompactResult / {fs.read[r], fs.write[r], abort.raise} = {
-  let before = disk_bytes[r](place);
-  let c = tables::open_cache[r](place.dir, place.stamps);
-  let pruned = tables::prune[r](c);
-  let done = tables::compact_cache[r](pruned.cache);
-  let memo = memo_files::compact[r](memo_dir(place));
-  {
-    directory: display_path(place, ""),
-    warnings: project_store::diagnostics_of(tables::warnings(done)),
-    dropped: { texts: pruned.pruned.texts },
-    memo: memo,
-    bytes_before: before,
-    bytes_after: disk_bytes[r](place),
-    results: tables::counts(done).passed,
   }
 }
 
@@ -703,9 +562,7 @@ fn clear_store<[r]>(
 ) -> Result<ClearResult, Rejection> / {fs.read[r], fs.write[r], abort.raise} = {
   let c = tables::open_cache[r](place.dir, place.stamps);
   let before = tables::counts(c).passed;
-  let stored = engine::clear_dir[r](place.dir);
-  let removed = |dir: String| !fs.exists[r](dir) || fs.remove_tree[r](dir);
-  let gone = removed(memo_dir(place)) && stored;
+  let gone = !fs.exists[r](memo_dir(place)) || fs.remove_tree[r](memo_dir(place));
   let warnings = project_store::diagnostics_of(tables::warnings(c));
   if gone { Ok({ directory: display_path(place, ""), warnings: warnings, cleared: before }) } else {
     Err({
@@ -899,7 +756,7 @@ fn inspect_store<[r]>(
       let proven = w.frame.hashes.tests.values().fold(
         Map::new(),
         |accumulator: Map<Bytes, Bool>, h: Bytes|
-          if tables::passed[r](c, h).value == Some(true) { accumulator.insert(h, true) }
+          if tables::passed(c, h).value == Some(true) { accumulator.insert(h, true) }
           else { accumulator },
       );
       Ok({
@@ -922,12 +779,6 @@ pub fn run(
       s,
       Ok(if cwd { stats_of[cwd](place, current) } else { stats_of[abs](place, current) }),
     )
-  } else if flags.action == "compact" {
-    let current = module_queries::current_hashes();
-    compact_result(
-      s,
-      Ok(if cwd { compact_store[cwd](place, current) } else { compact_store[abs](place, current) }),
-    )
   } else if flags.action == "clear" {
     clear_result(s, if cwd { clear_store[cwd](place) } else { clear_store[abs](place) })
   } else if flags.action == "copy" { copied_result(s, flags) } else {
@@ -941,7 +792,6 @@ const no_stats: Stats =
   {
     directory: "/p/.ply-cache",
     warnings: [],
-    format: 1,
     root: "/p",
     open_us: 0,
     results: 0,
@@ -949,18 +799,7 @@ const no_stats: Stats =
     obligations: 0,
     reviews: 0,
     texts: 0,
-    segments: 0,
-    data_bytes: 0,
-    garbage_bytes: 0,
-    memo: {
-      records: 0,
-      results: 0,
-      output_bytes: 0,
-      reclaimable_bytes: 0,
-      kinds: [],
-      segments: 0,
-      bytes: 0,
-    },
+    memo: { records: 0, results: 0, output_bytes: 0, kinds: [], segments: 0, bytes: 0 },
   }
 
 const an_entry: Entry =
@@ -985,25 +824,7 @@ test "`size_text` shows bytes exactly and larger sizes in KiB or MiB with two de
   assert_eq(size_text(1048575), "1.00 MiB")
 }
 
-test "`compact_suggested` is true only when more than half of a store's bytes are garbage that compaction would remove" {
-  let half: Stats = { ..no_stats, data_bytes: 1000, garbage_bytes: 400 };
-  assert(!compact_suggested(half));
-  assert(compact_suggested({ ..half, garbage_bytes: 501 }));
-  assert(!compact_suggested({ ..half, data_bytes: 0, garbage_bytes: 0 }));
-  let results = {
-    records: 2,
-    results: 2,
-    output_bytes: 1000,
-    reclaimable_bytes: 601,
-    kinds: [],
-    segments: 1,
-    bytes: 1200,
-  };
-  assert(compact_suggested({ ..half, memo: results }));
-  assert(!compact_suggested({ ..half, memo: { ..results, reclaimable_bytes: 600 } }))
-}
-
-test "`stats_lines` prints the cache directory, open time, format and counts, followed by lines for the store and result sizes" {
+test "`stats_lines` prints the cache directory, open time and counts, followed by lines for the database's sizes" {
   let st: Stats = {
     ..no_stats,
     open_us: 1234,
@@ -1012,14 +833,10 @@ test "`stats_lines` prints the cache directory, open time, format and counts, fo
     obligations: 1,
     reviews: 0,
     texts: 4,
-    segments: 2,
-    data_bytes: 1000,
-    garbage_bytes: 250,
     memo: {
       records: 3,
       results: 5,
       output_bytes: 2048,
-      reclaimable_bytes: 1024,
       kinds: [{ query: b"parse", facts: 1, bytes: 16 }, { query: b"group", facts: 2, bytes: 32 }],
       segments: 2,
       bytes: 4096,
@@ -1028,52 +845,17 @@ test "`stats_lines` prints the cache directory, open time, format and counts, fo
   let lines = stats_lines(plain, st);
   assert_eq(lines.at_or(0, ""), "   /p/.ply-cache");
   assert_eq(lines.at_or(1, ""), "   opened in 1.23ms");
-  assert_eq(lines.at_or(2, ""), "   store format 1");
-  assert_eq(lines.at_or(3, ""), "   results · 2 cached results · 3 definitions seen");
-  assert_eq(lines.at_or(4, ""), "   prover · 1 discharged obligation · 0 accepted reviews");
-  assert_eq(lines.at_or(5, ""), "   history · 4 definition texts");
-  assert_eq(lines.at_or(6, ""), "     2 segments 1000 B · reclaimable 250 B (25%)");
-  assert_eq(lines.at_or(7, ""), "   memo · 3 records · 5 longer results");
+  assert_eq(lines.at_or(2, ""), "   results · 2 cached results · 3 definitions seen");
+  assert_eq(lines.at_or(3, ""), "   prover · 1 discharged obligation · 0 accepted reviews");
+  assert_eq(lines.at_or(4, ""), "   history · 4 definition texts");
+  assert_eq(lines.at_or(5, ""), "   memo · 3 records · 5 longer results");
+  assert_eq(lines.at_or(6, ""), "     2 segments 4.00 KiB · results 2.00 KiB");
+  assert_eq(lines.at_or(7, ""), "     group · 2 facts 32 B");
+  assert_eq(lines.at_or(8, ""), "     parse · 1 fact 16 B");
   assert_eq(
-    lines.at_or(8, ""),
-    "     2 segments 4.00 KiB · results 2.00 KiB · reclaimable 1.00 KiB",
-  );
-  assert_eq(lines.at_or(9, ""), "     group · 2 facts 32 B");
-  assert_eq(lines.at_or(10, ""), "     parse · 1 fact 16 B");
-  assert_eq(
-    lines.at_or(11, ""),
+    lines.at_or(9, ""),
     "     the cache stores one result per test per version of its code, so a test can have several results",
   )
-}
-
-test "an empty store has nothing to reclaim and no note about what an entry counts" {
-  let lines = stats_lines(plain, { ..no_stats, segments: 1, data_bytes: 2 });
-  assert_eq(lines.at_or(6, ""), "     1 segment 2 B · reclaimable 0 B (0%)");
-  assert_eq(lines.len(), 9)
-}
-
-test "compaction that dropped nothing and reclaimed nothing still says what it did" {
-  let c: CompactResult = {
-    directory: "/p/.ply-cache",
-    warnings: [],
-    dropped: { texts: 0 },
-    memo: { bytes: 0 },
-    bytes_before: 900,
-    bytes_after: 900,
-    results: 2,
-  };
-  assert_eq(compact_lines(plain, c), [
-    "   compacted /p/.ply-cache",
-    "     900 B · nothing to reclaim",
-    "     compacting keeps every test result, so no test runs again",
-  ]);
-  let swept: CompactResult = { ..c, dropped: { texts: 2 }, memo: { bytes: 300 }, bytes_after: 400 };
-  assert_eq(compact_lines(plain, swept), [
-    "   compacted /p/.ply-cache",
-    "     dropped 2 cached source texts that no check or build used",
-    "     900 B → 400 B (500 B reclaimed)",
-    "     compacting keeps every test result, so no test runs again",
-  ])
 }
 
 test "clearing names the count it discarded and where from" {
@@ -1178,12 +960,10 @@ fn run_with(
   flags: Flags,
   result: Result<Stats, Rejection>,
   hits: Result<Matches, Rejection>,
-  swept: Result<CompactResult, Rejection>,
   emptied: Result<ClearResult, Rejection>,
 ) -> CommandOutput / {abort.raise} = {
   let s: Style = style_of(flags);
   if flags.action == "stats" { stats_result(s, result) }
-  else if flags.action == "compact" { compact_result(s, swept) }
   else if flags.action == "clear" { clear_result(s, emptied) }
   else { inspect_result(s, flags.query, hits) }
 }
@@ -1194,19 +974,17 @@ fn flags_of(action: String, query: String, json: Bool) -> Flags =
   { ..no_flags, action: action, query: query, json: json }
 
 fn only_stats(flags: Flags, stats: Stats) -> CommandOutput / {abort.raise} =
-  run_with(flags, Ok(stats), Err(no_rejection), Err(no_rejection), Err(no_rejection))
+  run_with(flags, Ok(stats), Err(no_rejection), Err(no_rejection))
 
 test "the `action` flag selects the cache subcommand, and the JSON output contains `command` and `action`" {
-  let result = only_stats(flags_of("stats", "", true), { ..no_stats, results: 2, data_bytes: 8 });
+  let result = only_stats(flags_of("stats", "", true), { ..no_stats, results: 2 });
   assert_eq(result.code, 0);
   assert_eq(result.errs, []);
   let text = to_string(result.json);
   assert(text.contains("\"command\":\"cache\""));
   assert(text.contains("\"action\":\"stats\""));
   assert(text.contains("\"exit_code\":0"));
-  assert(text.contains("\"entries\":2"));
-  assert(text.contains("\"compact_suggested\":false"));
-  assert(text.contains("\"format\":1"))
+  assert(text.contains("\"entries\":2"))
 }
 
 test "a cache store that cannot be opened exits with code 2 and its JSON output has no cache directory" {
@@ -1226,13 +1004,7 @@ test "a cache store that cannot be opened exits with code 2 and its JSON output 
     ],
     warnings: [],
   };
-  let result = run_with(
-    flags_of("clear", "", false),
-    Err(reason),
-    Err(reason),
-    Err(reason),
-    Err(reason),
-  );
+  let result = run_with(flags_of("clear", "", false), Err(reason), Err(reason), Err(reason));
   assert_eq(result.code, 2);
   assert_eq(result.lines, []);
   assert_eq(result.errs, ["Error[E0502]: could not open a cache under `/p`"]);
@@ -1248,7 +1020,7 @@ test "a rejection after the store opened names the cache and carries its warning
         notes: 0,
         labels: [],
         text: b"",
-        message: b"could not compact the cache at `/p/.ply-cache`",
+        message: b"could not clear the cache at `/p/.ply-cache`",
         notes_text: [],
         severity: b"error",
         fixes: [],
@@ -1267,17 +1039,11 @@ test "a rejection after the store opened names the cache and carries its warning
       },
     ],
   };
-  let result = run_with(
-    flags_of("compact", "", false),
-    Err(reason),
-    Err(reason),
-    Err(reason),
-    Err(reason),
-  );
+  let result = run_with(flags_of("clear", "", false), Err(reason), Err(reason), Err(reason));
   assert_eq(result.code, 2);
   assert_eq(result.lines, ["   warning: the store was discarded"]);
   let text = to_string(result.json);
-  assert(text.contains("\"action\":\"compact\""));
+  assert(text.contains("\"action\":\"clear\""));
   assert(text.contains("\"directory\":\"/p/.ply-cache\""));
   assert(text.contains("\"W0603\""))
 }
@@ -1288,7 +1054,6 @@ test "inspecting a name the program does not define is E0101 and exits two" {
     flags_of("inspect", "no_such_thing", false),
     Err(no_rejection),
     Ok(empty),
-    Err(no_rejection),
     Err(no_rejection),
   );
   assert_eq(result.code, 2);
@@ -1305,7 +1070,6 @@ test "a match is one object under `matches`, with the hash shortened and the typ
     flags_of("inspect", "active", true),
     Err(no_rejection),
     Ok(hits),
-    Err(no_rejection),
     Err(no_rejection),
   );
   assert_eq(result.code, 0);

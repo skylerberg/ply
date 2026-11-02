@@ -142,9 +142,7 @@ its callers only if what they can see of it changed, such as whether it returns.
 cached result only if it would compute exactly that result itself. It recomputes results that a
 different `ply` cached (`W0603`).
 
-`PLY_CACHE_UPSTREAM=DIR` adds a second cache that several checkouts or machines share. Test results
-and proofs found there are used, and new ones are written there. `PLY_CACHE_UPSTREAM_READONLY=1`
-only reads it. `--no-cache` ignores both caches.
+`--no-cache` ignores the cache.
 
 ## 2. A tour of Ply
 
@@ -2477,7 +2475,6 @@ whose `TERM` is not `dumb`.
 
 | variable | meaning |
 | --- | --- |
-| `PLY_CACHE_UPSTREAM`, `PLY_CACHE_UPSTREAM_READONLY` | a shared second cache (§1.5) |
 | `PLY_REGISTRY`, `PLY_REGISTRY_TOKEN` | the package registry and its publishing token (§16) |
 | `PLY_ATTESTERS` | public key files that `ply resolve` trusts to vouch for packages, separated as in `PATH` |
 | `PLY_TRUST` | PEM files, separated by `:`, whose certificates `ply`'s own HTTPS connections also trust |
@@ -2520,7 +2517,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply attest NAME VERSION` | checks, tests and proves a published version; `--sign KEY` |
 | `ply contracts NAME FROM TO` | what changed in the public interface between two published versions |
 | `ply keygen PATH` | writes an Ed25519 key pair |
-| `ply cache clear\|stats\|compact [path]` | empties the cache, reports its size, or reclaims unused space |
+| `ply cache clear\|stats [path]` | empties the cache, or reports its size |
 | `ply cache copy CHECKOUT [path]` | copies another checkout's database into this project |
 | `ply cache inspect DEF [path]` | what the cache stores for a definition or test |
 | `ply work [path]` | the packages `ply.work` lists |

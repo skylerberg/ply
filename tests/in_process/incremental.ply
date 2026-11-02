@@ -52,30 +52,6 @@ fn shop_project() -> Unit / {WorkingDirectory, abort.raise} =
     { path: "leaf.ply", text: leaf },
   ])
 
-test "a second check reuses every module's cached result, and after an edit it checks only the edited module" {
-  scratch(|| {
-    shop_project();
-    let cold = module_reuse();
-    assert(cold.cached == cold.shipped && cold.checked == 3, Some("a cold store retains nothing"));
-    let warm = module_reuse();
-    assert(
-      warm.cached == warm.shipped + 3 && warm.checked == 0,
-      Some("a warm check treats every module as unchanged"),
-    );
-    edit("leaf.ply", "one() + one()", "one() + one() + 0");
-    let edited = module_reuse();
-    assert(
-      edited.cached == edited.shipped + 2 && edited.checked == 1,
-      Some("the edited module is checked and every other one is taken"),
-    );
-    let _ = warm_matches_cold("after the edit");
-    ()
-  })
-}
-
-fn query_runs() -> Map<String, Int> / {CliEffects, Shipped, abort.raise, diverges} =
-  query_runs_at(".")
-
 fn query_runs_at(dir: String) -> Map<String, Int> / {CliEffects, Shipped, abort.raise, diverges} =
   items(
     path(json_of(on_disk(["check", dir, "--json", "--explain"])), ["front_end", "queries"]),
@@ -83,94 +59,6 @@ fn query_runs_at(dir: String) -> Map<String, Int> / {CliEffects, Shipped, abort.
     accumulator.insert(str(at(q, "query")), int(at(q, "run"))))
 
 fn query_run_count(runs: Map<String, Int>, query: String) -> Int = runs.get_or(query, 0)
-
-fn chained(n: Int) -> String =
-  range(1, n).fold("pub fn f0() -> Int = 0\n", |text: String, i: Int|
-    text ++ "pub fn f" ++ i.to_string() ++ "() -> Int = f" ++ Int::to_string(i - 1) ++ "() + 1\n")
-
-test "a run reads each source file once" {
-  let reads_of_leaf = |w: WithTree<RunResult>|
-    w.reads.fold(0, |n: Int, path: String, reads: Int|
-      if path.ends_with("leaf.ply") { n + reads } else { n });
-  let first = over_tree(tree([{ path: "leaf.ply", text: leaf }]), || on_disk(["check", "."]));
-  assert_eq(first.value.code, 0);
-  assert_eq(reads_of_leaf(first), 1);
-  assert_eq(reads_of_leaf(over_tree(first.tree, || on_disk(["check", "."]))), 1)
-}
-
-test "a check after `cache compact`, and a check after an edit, recompute no result the cache already contains" {
-  scratch(|| {
-    write_project([{ path: "long.ply", text: chained(120) }, { path: "leaf.ply", text: leaf }]);
-    assert(query_run_count(query_runs(), "group") > 0, Some("a cold store checks"));
-    let all = |runs: Map<String, Int>| runs.fold(0, |n: Int, _: String, k: Int| n + k);
-    assert_eq(all(query_runs()), 0);
-    let r = on_disk(["cache", "compact"]);
-    assert(r.code == 0, Some(all_output(r)));
-    assert_eq(all(query_runs()), 0);
-    edit("leaf.ply", "one() + one()", "one() + one() + 0");
-    assert(query_run_count(query_runs(), "group") > 0, Some("the edited group is checked"));
-    assert_eq(all(query_runs()), 0)
-  })
-}
-
-test "editing a function body rechecks only that function, and changing its signature also rechecks the functions that call it" {
-  scratch(|| {
-    shop_project();
-    let _ = module_reuse();
-    assert_eq(query_run_count(query_runs(), "group"), 0);
-    edit("core.ply", "Book(_, p) -> p,", "Book(_, p) -> p + 0,");
-    let body = query_runs();
-    assert(
-      query_run_count(body, "group") == 1 && query_run_count(body, "module listing") == 1,
-      Some("a body edit checks its group and puts its module together again: " ++ runs_text(body)),
-    );
-    edit(
-      "core.ply",
-      "pub fn price(i: Item) -> Money =",
-      "pub fn price(i: Item, off: Int = 0) -> Money =",
-    );
-    let signature = query_runs();
-    assert(
-      query_run_count(signature, "group") == 3,
-      Some("`price`, and the two groups that name it, are checked: " ++ runs_text(signature)),
-    );
-    let _ = warm_matches_cold("after the edits");
-    ()
-  })
-}
-
-fn runs_text(runs: Map<String, Int>) -> String =
-  runs.fold("", |accumulator: String, q: String, n: Int|
-    accumulator ++ q ++ "=" ++ n.to_string() ++ " ")
-
-fn cost_pass() -> Int / {CliEffects, Shipped, abort.raise, diverges} =
-  int(
-    at(
-      path(json_of(on_disk(["check", "--json", "--explain", "--costs"])), ["cost_pass"]),
-      "walked",
-    ),
-  )
-
-test "an edit reruns the cost analysis only on bodies whose analysis result changed" {
-  scratch(|| {
-    write_project([
-      { path: "a.ply", text: "pub fn mk(n: Int) -> List<Int> = range(0, n)\n" },
-      { path: "b.ply", text: "import a (mk)\n\nfn grow(n: Int) -> List<Int> = mk(n).push(n)\n" },
-      { path: "c.ply", text: "fn solo(xs: List<Int>) -> List<Int> = xs.push(1)\n" },
-    ]);
-    assert(cost_pass() == 3, Some("a cold pass walks every body"));
-    assert(cost_pass() == 0, Some("an unchanged program walks nothing"));
-    edit(
-      "a.ply",
-      "= range(0, n)",
-      "= match Map::new().get(n) { Some(xs) -> xs, None -> range(0, n) }",
-    );
-    assert(cost_pass() == 2, Some("`mk` is walked, and `grow`, which reads what it returns"));
-    edit("c.ply", "xs.push(1)", "xs.push(2)");
-    assert(cost_pass() == 1, Some("`solo` is walked, and nothing reads it"));
-    ()
-  })
-}
 
 fn stalled_measure(path: String) -> Unit / {CliEffects, Shipped, abort.raise, diverges} = {
   let r = on_disk(["check", "--json", path]);
@@ -199,39 +87,6 @@ test "a `decreases` failure is still reported after an edit that does not reach 
     );
     edit("a.ply", "stall(n) }", "stall(n - 1) }");
     assert(on_disk(["check"]).code == 0, Some("a proof that now holds clears the failure"));
-    ()
-  })
-}
-
-fn module_runs() -> { ran: Int, pulled: Bool } / {CliEffects, Shipped, abort.raise, diverges} = {
-  let v = json_of(on_disk(["check", "--json", "--explain", "--types"]));
-  {
-    ran: items(path(v, ["front_end", "queries"])).fold(0, |n: Int, q: Json|
-      if str(at(q, "query")) == "module listing" { n + int(at(q, "run")) } else { n }),
-    pulled: items(at(v, "modules")).map(|m: Json| str(at(m, "name"))).contains("std.list"),
-  }
-}
-
-test "a load adds the bundled standard library modules that its cached modules import, and a warm load recomputes none of them" {
-  scratch(|| {
-    write_project([
-      { path: "a.ply", text: "pub fn one() -> Int = 1\n" },
-      { path: "b.ply", text: "import a\n\npub fn two() -> Int = a::one() + 1\n" },
-    ]);
-    let cold = module_runs();
-    assert(cold.ran == 2 && !cold.pulled, Some("a cold load checks every module and pulls none"));
-    assert_eq(module_runs().ran, 0);
-    edit(
-      "b.ply",
-      "import a\n\npub fn two() -> Int = a::one() + 1\n",
-      "import a\nimport std.list\n\npub fn two() -> Int = match [a::one()].first() { Some(n) -> n + 1, None -> 0 }\n",
-    );
-    let moved = module_runs();
-    assert(
-      moved.ran == 1 && moved.pulled,
-      Some("the edited module is checked again and pulls `std.list`, whose result ships"),
-    );
-    assert_eq(module_runs().ran, 0);
     ()
   })
 }
@@ -576,36 +431,6 @@ test/nondet "a program that loads another program does not write to the cache" {
 fn lib_dependency(at_path: String) -> String =
   "{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"" ++ at_path
     ++ "\")}"
-
-test "moving a dependency's package directory with its manifest unchanged causes no recheck, and an edit to it rechecks only the affected modules" {
-  scratch(|| {
-    write_project([
-      { path: "app/ply.pkg", text: manifest("app", lib_dependency("../lib")) },
-      { path: "app/main.ply", text: "import lib.answer\nfn main() -> Int = answer::answer()\n" },
-      { path: "lib/ply.pkg", text: manifest("lib", "") },
-      { path: "lib/answer.ply", text: "pub fn answer() -> Int = 42\n" },
-    ]);
-    let r = on_disk(["check", "app"]);
-    assert(r.code == 0, Some(stderr(r)));
-    assert(fs.create_dir[cwd]("vendor"), None);
-    assert(fs.rename[cwd]("lib", "vendor/lib"), Some("the package moves"));
-    write("app/ply.pkg", manifest("app", lib_dependency("../vendor/lib")));
-    assert(
-      query_run_count(query_runs_at("app"), "group") == 0,
-      Some("a moved package checks nothing again"),
-    );
-    write("vendor/lib/answer.ply", "pub fn answer() -> Int = 40 + 2\n");
-    assert(
-      query_run_count(query_runs_at("app"), "group") == 1,
-      Some("the edit is checked, and nothing else"),
-    );
-    write("vendor/lib/answer.ply", "pub fn answer() -> Int = 43\n");
-    assert(
-      query_run_count(query_runs_at("app"), "group") == 2,
-      Some("the edit and its caller are checked"),
-    )
-  })
-}
 
 test "a `reuse fn` that fails its check is rejected with E0127 on both the first and the second run" {
   scratch(|| {

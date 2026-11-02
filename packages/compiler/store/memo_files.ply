@@ -3,7 +3,7 @@ import std.fs
 import std.fs (fs)
 import std.list
 import compiler.store.fact_store
-import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, fact_damage,
+import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, fact_damage,
                                   recent_reads, with_recent_reads)
 import compiler.store.memo
 import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, deferred_kind, digest_of,
@@ -13,7 +13,7 @@ import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, defer
                             stored_fact_bin, stored_input_bin, with_mark, without_mark)
 import compiler.store.packs
 import compiler.store.segments
-import compiler.store.segments (Committed)
+import compiler.store.segments (Committed, LockHeld, StoreChanged, WriteFailed)
 
 type StoreRun = {
   db: Database,
@@ -370,6 +370,43 @@ pub fn with_memo_store<a, [r] | e>(
     value
   })
 
+pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
+
+pub fn records<[r]>(dir: String) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], abort.raise} =
+  if fact_store::unreadable[r](dir) { Err("its manifest does not read") } else {
+    with_recent_reads(||
+      handle {
+        Ok(fact_store::entries_under[r](fact_store::read_only[r](dir), Records, b""))
+      } with {
+        fact_damage.damaged(reason) -> Err(reason),
+      })
+  }
+
+pub fn records_written<[r]>(
+  dir: String,
+  puts: Map<Bytes, Bytes>,
+  deleted: Map<Bytes, Bool>,
+) -> Result<Unit, String> / {fs.read[r], fs.write[r], abort.raise} =
+  with_recent_reads(||
+    handle {
+      let db = fact_store::open[r](dir);
+      let written = puts.fold(
+        deleted.fold(db, |d: Database, key: Bytes, _: Bool|
+          fact_store::without_value(d, Records, key)),
+        |d: Database, key: Bytes, value: Bytes| fact_store::with_value(d, Records, key, value),
+      );
+      let outcome = fact_store::commit[r](written, |current: Database| live_results[r](current));
+      fact_store::close[r](db);
+      match outcome {
+        Committed(_) -> Ok(()),
+        LockHeld -> Err("another `ply` was writing the store"),
+        StoreChanged -> Err("another `ply` changed the store at the same time"),
+        WriteFailed -> Err("the store could not be written"),
+      }
+    } with {
+      fact_damage.damaged(reason) -> Err("the store is damaged (" ++ reason ++ ")"),
+    })
+
 pub fn copy_database<[r]>(from: String, to: String) -> Unit / {fs.read[r], fs.write[r]} = {
   fs.create_dir[r](to);
   (match fs::listed_names(fs.list_dir[r](from)) { Some(names) -> names, None -> [] }).filter(
@@ -390,7 +427,6 @@ pub type Usage = {
   records: Int,
   results: Int,
   output_bytes: Int,
-  reclaimable_bytes: Int,
   kinds: List<KindUsage>,
   segments: Int,
   bytes: Int,
@@ -424,7 +460,6 @@ pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} =
         records: facts.len(),
         results: live_results[r](db).len(),
         output_bytes: output_bytes,
-        reclaimable_bytes: fact_store::unreferenced_bytes[r](db, live_results[r](db)),
         kinds: kinds.values(),
         segments: size.segments,
         bytes: size.bytes,
@@ -443,17 +478,6 @@ pub fn outputs_by_digest<[r]>(
           Some(output) -> found.insert(digest, output),
           None -> found,
         })
-    }))
-
-pub type Compaction = { bytes: Int }
-
-pub fn compact<[r]>(dir: String) -> Compaction / {fs.read[r], fs.write[r], abort.raise} =
-  with_recent_reads(||
-    fact_store::undamaged(|| {
-      let db = fact_store::open[r](dir);
-      let done = fact_store::compact[r](db, live_results[r](db));
-      fact_store::close[r](db);
-      { bytes: done.bytes_before - done.bytes_after }
     }))
 
 type PackBuild = {
@@ -589,35 +613,18 @@ test "a stored value that fails its checksum makes the run start over from nothi
   assert_eq(torn.value.output, b"\"four\"")
 }
 
-test "a compaction keeps every fact the snapshot uses" {
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
-  let moved = fs::on_mem[abs](first.tree, || quoted_over[abs](b"forty"));
-  let small = fs::on_mem[abs](moved.tree, || compact[abs]("s"));
-  assert_eq(fs::on_mem[abs](small.tree, || quoted_over[abs](b"forty")).value, {
-    output: b"\"forty\"",
-    ran: 0,
-  })
-}
-
-test "many edits and a compaction leave a store the size of one with the same facts" {
-  let edited = range(0, 40).fold(
-    fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"zero")).tree,
-    |tree: fs::MemFs, i: Int|
-      fs::on_mem[abs](tree, || quoted_over[abs](Bytes::of_string(i.to_string()))).tree,
+test "records survive a reopen beside the facts, and a dropped record is gone" {
+  let facts = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
+  let written = fs::on_mem[abs](facts.tree, ||
+    records_written[abs]("s", Map::new().insert(b"a", b"1").insert(b"b", b"2"), Map::new()));
+  let dropped = fs::on_mem[abs](written.tree, ||
+    records_written[abs]("s", Map::new(), Map::new().insert(b"a", true)));
+  assert_eq(
+    fs::on_mem[abs](dropped.tree, || records[abs]("s")).value,
+    Ok(Map::new().insert(b"b", b"2")),
   );
-  let fewer = range(38, 40).fold(
-    fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"zero")).tree,
-    |tree: fs::MemFs, i: Int|
-      fs::on_mem[abs](tree, || quoted_over[abs](Bytes::of_string(i.to_string()))).tree,
-  );
-  let size_of = |tree: fs::MemFs|
-    fs::on_mem[abs](tree, || {
-      compact[abs]("s");
-      usage[abs]("s").output_bytes
-    }).value;
-  assert_eq(size_of(edited), size_of(fewer))
+  assert_eq(fs::on_mem[abs](dropped.tree, || quoted_over[abs](b"four")).value.ran, 0)
 }
-
 test "a copied database is correct for its new place, and an edit there runs what it changes" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_in[abs]("one", b"four"));
   assert_eq(first.value.ran, 2);

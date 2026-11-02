@@ -7,7 +7,10 @@ import compiler.syntax.lexer (utf8_len)
 import compiler.syntax.parsing (Span, span_between)
 import compiler.check.resolve.tables (Diagnostic, error_at)
 import compiler.unit (shipped, shipped_runtime, compiler_roots, entered_timeout_ms, identity_of)
-import compiler.store.records (Record, record_store, with_record_store)
+import store.tables
+import project_store
+import paths
+import semantics (semantics)
 import diagnostic (SourceText, diagnostic_of, shown)
 import compiler.cc
 import compiler.cc (toolchain)
@@ -27,7 +30,7 @@ import std.time (time)
 import std.value (Value, VCtor, VInt, VList, VRecord, VStr, render, field_named)
 import compiler.emit.keys (Named)
 import module_queries (LaterChecks)
-import program (Session)
+import program (ProgramPlace, Session)
 import units
 import units (CodeProgram, EmbeddedFiles, emit)
 import update_costs (cost_checker, reuse_violations)
@@ -364,76 +367,96 @@ const toolchain_roots: List<Bytes> = compiler_roots.push(b"literals.with_evaluat
 
 type KeyedRequest = { request: EvaluationRequest, key: Bytes, cached: Option<Verdict> }
 
+type Judging = { cache: Option<tables::Cache>, label: String }
+
+fn judging_store(
+  place: ProgramPlace,
+) -> Judging / {fs.read[cwd], fs.read[abs], fs.read_file[shipped], semantics.cached, abort.raise} =
+  match place.store {
+    None -> { cache: None, label: "" },
+    Some(r) -> {
+      let dir = paths::in_root(r, ".ply-cache").path;
+      let stamps = project_store::shipped_stamps();
+      {
+        cache: Some(if r.label == "cwd" { tables::open_cache[cwd](dir, stamps) }
+        else { tables::open_cache[abs](dir, stamps) }),
+        label: r.label,
+      }
+    },
+  }
+
+fn judged(j: Judging, kind: tables::Judged, key: Bytes) -> Option<Bytes> / {abort.raise} =
+  match j.cache { Some(c) -> tables::judgement(c, kind, key), None -> None }
+
+fn judgements_kept(
+  j: Judging,
+  kind: tables::Judged,
+  kept: Map<Bytes, Bytes>,
+) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+  match j.cache {
+    None -> (),
+    Some(c) -> {
+      let replaced = tables::judgements_replaced(c, kind, kept);
+      if j.label == "cwd" { tables::flush_cache[cwd](replaced) }
+      else { tables::flush_cache[abs](replaced) };
+      ()
+    },
+  }
+
+fn toolchain_now() -> Bytes / {shipped.definitions, shipped.runtime, shipped.version, abort.raise} =
+  toolchain_key(shipped.definitions(), shipped_runtime().identity, shipped.version())
+
 pub fn with_evaluation_cache<a | e>(
   body: () -> a / {evaluation.verdicts, evaluation.statements | e},
-) -> a / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, toolchain.bodies_dir, shipped.version, fs.read[abs], fs.write[abs], abort.raise | e} =
+) -> a / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, shipped.version, semantics.cached, fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise | e} =
   handle {
     body()
   } with {
-    evaluation.statements(program, checks) -> {
-      let bodies = strip_root(toolchain.bodies_dir());
-      let toolchain = toolchain_key(
-        shipped.definitions(),
-        shipped_runtime().identity,
-        shipped.version(),
-      );
-      with_record_store[abs, lit](literals_store(bodies, toolchain), ||
-        judgements(toolchain, program, checks))
-    },
+    evaluation.statements(program, checks) ->
+      judgements(toolchain_now(), judging_store(program.place), program, checks),
     evaluation.verdicts(program, requests) -> {
-      let bodies = strip_root(toolchain.bodies_dir());
-      let toolchain = toolchain_key(
-        shipped.definitions(),
-        shipped_runtime().identity,
-        shipped.version(),
-      );
-      with_record_store[abs, lit](literals_store(bodies, toolchain), || {
-        let sought = requests.map(|a: EvaluationRequest| {
-          let key = verdict_key(toolchain, a);
-          {
-            request: a,
-            key: key,
-            cached: match record_store.get[lit](key) {
-              None -> None,
-              Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
-                Ok(v) -> Some(v),
-                Err(_) -> None,
-              },
+      let toolchain = toolchain_now();
+      let j = judging_store(program.place);
+      let sought = requests.map(|a: EvaluationRequest| {
+        let key = verdict_key(toolchain, a);
+        {
+          request: a,
+          key: key,
+          cached: match judged(j, tables::Verdicts, key) {
+            None -> None,
+            Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
+              Ok(v) -> Some(v),
+              Err(_) -> None,
             },
-          }
-        });
-        let open = sought.filter(|s: KeyedRequest| s.cached == None);
-        if open.len() == 0 { Ok(merge_verdicts(sought, [])) }
-        else { evaluate_and_cache(program, sought, open) }
-      })
+          },
+        }
+      });
+      let open = sought.filter(|s: KeyedRequest| s.cached == None);
+      match if open.len() == 0 { Ok([]) }
+        else { evaluate(program, open.map(|s: KeyedRequest| s.request)) } {
+        Err(diagnostics) -> Err(diagnostics),
+        Ok(found) -> {
+          let cached = sought.fold(Map::new(), |kept: Map<Bytes, Bytes>, s: KeyedRequest|
+            match s.cached {
+              Some(v) -> kept.insert(s.key, bin::encode(v, verdict_bin())),
+              None -> kept,
+            });
+          judgements_kept(
+            j,
+            tables::Verdicts,
+            range(0, open.len()).fold(cached, |kept: Map<Bytes, Bytes>, i: Int|
+              match found.at(i) {
+                Some(v) -> if cacheable(v) {
+                  kept.insert(open.get(i).key, bin::encode(v, verdict_bin()))
+                } else { kept },
+                None -> kept,
+              }),
+          );
+          Ok(merge_verdicts(sought, found))
+        },
+      }
     },
   }
-
-fn literals_store(bodies: String, toolchain: Bytes) -> String / {abort.raise} =
-  bodies ++ "/literals-" ++ blake3(toolchain).slice(0, 8).hex_of()
-
-fn evaluate_and_cache(
-  program: CodeProgram,
-  sought: List<KeyedRequest>,
-  open: List<KeyedRequest>,
-) -> Result<List<Verdict>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.put[lit], abort.raise} = {
-  let requests = open.map(|s: KeyedRequest| s.request);
-  match evaluate(program, requests) {
-    Err(diagnostics) -> Err(diagnostics),
-    Ok(found) -> {
-      record_store.put[lit](
-        range(0, open.len()).fold([], |accumulator: List<Record>, i: Int|
-          match found.at(i) {
-            Some(v) -> if cacheable(v) {
-              accumulator.push({ key: open.get(i).key, bytes: bin::encode(v, verdict_bin()) })
-            } else { accumulator },
-            None -> accumulator,
-          }),
-      );
-      Ok(merge_verdicts(sought, found))
-    },
-  }
-}
 
 fn cacheable(v: Verdict) -> Bool = match v { TimedOut -> false, _ -> true }
 
@@ -445,60 +468,61 @@ type KeyedStatement = {
 
 fn judgements(
   toolchain: Bytes,
+  j: Judging,
   program: CodeProgram,
   checks: List<statements::StatementCheck>,
-) -> Result<List<CheckResult>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, record_store.get[lit], record_store.put[lit], abort.raise} = {
+) -> Result<List<CheckResult>, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} = {
   let keyed = checks.map(|a: statements::StatementCheck| {
     let key = check_result_key(toolchain, a);
     {
       request: a,
       key: key,
-      cached: match record_store.get[lit](key) {
+      cached: match judged(j, tables::StatementChecks, key) {
         None -> None,
         Some(bytes) -> match bin::decode(bytes, check_result_bin()) {
-          Ok(j) -> Some(j),
+          Ok(r) -> Some(r),
           Err(_) -> None,
         },
       },
     }
   });
   let open = keyed.filter(|k: KeyedStatement| k.cached == None);
-  if open.len() == 0 {
-    Ok(keyed.map(|k: KeyedStatement| match k.cached { Some(j) -> j, None -> Unchecked }))
-  } else {
-    match check_statements(program, open.map(|k: KeyedStatement| k.request)) {
-      Err(diagnostics) -> Err(diagnostics),
-      Ok(found) -> {
-        record_store.put[lit](
-          range(0, open.len()).fold([], |accumulator: List<Record>, i: Int|
-            match found.at(i) {
-              Some(Some(j)) ->
-                accumulator.push({
-                  key: open.get(i).key,
-                  bytes: bin::encode(j, check_result_bin()),
-                }),
-              _ -> accumulator,
-            }),
-        );
-        Ok(
-          keyed.fold(
-            { out: [], next: 0 },
-            |accumulator: { out: List<CheckResult>, next: Int }, k: KeyedStatement|
-              match k.cached {
-                Some(j) -> { out: accumulator.out.push(j), next: accumulator.next },
-                None ->
-                  {
-                    out: accumulator.out.push(match found.at(accumulator.next) {
-                      Some(Some(j)) -> j,
-                      _ -> Unchecked,
-                    }),
-                    next: accumulator.next + 1,
-                  },
-              },
-          ).out,
-        )
-      },
-    }
+  match if open.len() == 0 { Ok([]) }
+    else { check_statements(program, open.map(|k: KeyedStatement| k.request)) } {
+    Err(diagnostics) -> Err(diagnostics),
+    Ok(found) -> {
+      let cached = keyed.fold(Map::new(), |kept: Map<Bytes, Bytes>, k: KeyedStatement|
+        match k.cached {
+          Some(r) -> kept.insert(k.key, bin::encode(r, check_result_bin())),
+          None -> kept,
+        });
+      judgements_kept(
+        j,
+        tables::StatementChecks,
+        range(0, open.len()).fold(cached, |kept: Map<Bytes, Bytes>, i: Int|
+          match found.at(i) {
+            Some(Some(r)) -> kept.insert(open.get(i).key, bin::encode(r, check_result_bin())),
+            _ -> kept,
+          }),
+      );
+      Ok(
+        keyed.fold(
+          { out: [], next: 0 },
+          |accumulator: { out: List<CheckResult>, next: Int }, k: KeyedStatement|
+            match k.cached {
+              Some(r) -> { out: accumulator.out.push(r), next: accumulator.next },
+              None ->
+                {
+                  out: accumulator.out.push(match found.at(accumulator.next) {
+                    Some(Some(r)) -> r,
+                    _ -> Unchecked,
+                  }),
+                  next: accumulator.next + 1,
+                },
+            },
+        ).out,
+      )
+    },
   }
 }
 
