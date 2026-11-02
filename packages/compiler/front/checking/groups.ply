@@ -27,7 +27,7 @@ import compiler.front.exports (OwnerInterface, HashEntry, ModuleOrigin, InRoot, 
                                imported_mentions_in, owner_interface_bin, hash_entry_bin,
                                module_origin_bin, mention_bin, owner_text_bin, module_scope,
                                owner_texts, owner_mentions, owner_groups, group_source_from,
-                               mention_key, unplaced_imports, item_layout, called_of,
+                               value_owners, mention_key, unplaced_imports, item_layout, called_of,
                                any_module_name, signature_text, owner_tokens, signature_tokens,
                                call_cycles)
 import compiler.front.owner_checks
@@ -84,6 +84,7 @@ pub type OwnersResult = {
   groups: List<List<Bytes>>,
   signing: List<List<Bytes>>,
   declared: Map<Bytes, List<Bytes>>,
+  values: Map<Bytes, List<Bytes>>,
   declarations: Declarations,
   context: Context,
   shape: ModuleShape,
@@ -95,6 +96,8 @@ pub type OwnersResult = {
 }
 
 pub type GroupHashes = { entries: Map<Bytes, HashEntry>, fixing: CachedHashes }
+
+pub type DeclaredOwners = { owners: List<Bytes>, values: List<Bytes> }
 
 pub type OwnerPlace = { owner: Bytes, starts: List<Int> }
 
@@ -111,6 +114,8 @@ derive bin for OwnerFacts
 derive bin for OwnersResult
 
 derive bin for GroupHashes
+
+derive bin for DeclaredOwners
 
 derive bin for OwnerPlace
 
@@ -211,6 +216,7 @@ fn unread_module(module: Bytes) -> OwnersResult =
     groups: [],
     signing: [],
     declared: Map::new(),
+    values: Map::new(),
     declarations: no_declarations,
     context: no_context,
     shape: no_shape(module),
@@ -286,6 +292,7 @@ pub fn owners_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
         groups: owner_groups(module, scope, reads.map(|o: OwnerText| o.owner), mentions),
         signing: owner_groups(module, scope, reads.map(|o: OwnerText| o.owner), shape_mentions),
         declared: scope.written.owners,
+        values: value_owners(m.raw, m.parsed),
         declarations: unplaced_declarations(declarations_of(m.parsed)),
         context: {
           imports: unplaced_imports(m.raw),
@@ -657,10 +664,8 @@ pub fn declared_result(input: Bytes) -> Bytes / {memo.read, memo.write, abort.ra
   match written_by_owners(named) {
     Some(o) -> o,
     None -> if key.name != b"" && !names_of(named).contains(key.name) {
-      bin::encode([], bin::list_bin(bin::bytes_bin()))
-    } else {
-      bin::encode(declared_in(owners_result_of(named), key.name), bin::list_bin(bin::bytes_bin()))
-    },
+      bin::encode({ owners: [], values: [] }, declared_owners_bin())
+    } else { bin::encode(declared_in(owners_result_of(named), key.name), declared_owners_bin()) },
   }
 }
 
@@ -692,9 +697,13 @@ fn signing_with(read: OwnersResult, owner: Bytes) -> List<Bytes> =
   read.signing.fold([], |accumulator: List<Bytes>, g: List<Bytes>|
     if g.contains(owner) { g } else { accumulator })
 
-fn declared_in(read: OwnersResult, name: Bytes) -> List<Bytes> =
-  if name == b"" { read.owners }
-  else { match read.declared.get(name) { Some(os) -> os, None -> [] } }
+fn declared_in(read: OwnersResult, name: Bytes) -> DeclaredOwners =
+  if name == b"" { { owners: read.owners, values: [] } } else {
+    {
+      owners: match read.declared.get(name) { Some(os) -> os, None -> [] },
+      values: match read.values.get(name) { Some(os) -> os, None -> [] },
+    }
+  }
 
 fn prefill_projections(
   named: ModuleKey,
@@ -772,7 +781,7 @@ fn prefill_declared(named: ModuleKey, read: OwnersResult) -> Unit / {memo.write,
         { module: named.module, shipped: named.shipped, full_text: named.tested, name: name },
         interface_key_bin(),
       ),
-      bin::encode(declared_in(read, name), bin::list_bin(bin::bytes_bin())),
+      bin::encode(declared_in(read, name), declared_owners_bin()),
     ))
 
 pub fn declared_of(
@@ -780,7 +789,14 @@ pub fn declared_of(
   shipped: Bool,
   tested: Bool,
   name: Bytes,
-) -> List<Bytes> / {memo.read, abort.raise} =
+) -> List<Bytes> / {memo.read, abort.raise} = owners_of_name(module, shipped, tested, name).owners
+
+fn owners_of_name(
+  module: Bytes,
+  shipped: Bool,
+  tested: Bool,
+  name: Bytes,
+) -> DeclaredOwners / {memo.read, abort.raise} =
   decoded(
     memo.fetch(
       declared_query,
@@ -789,7 +805,7 @@ pub fn declared_of(
         interface_key_bin(),
       ),
     ),
-    bin::list_bin(bin::bytes_bin()),
+    declared_owners_bin(),
     "a name's owners",
   )
 
@@ -924,9 +940,23 @@ fn owners_declaring(
   asker: Bool,
   module: Bytes,
   name: Bytes,
+) -> List<OwnerKey> / {memo.read, abort.raise} =
+  owners_declaring_in(named, asker, module, name, None)
+
+fn owners_declaring_in(
+  named: ModuleKey,
+  asker: Bool,
+  module: Bytes,
+  name: Bytes,
+  namespace: Option<Namespace>,
 ) -> List<OwnerKey> / {memo.read, abort.raise} = {
   let at = owner_key_in(named, asker, module, b"");
-  declared_of(module, at.shipped, at.tested, name).map(|o: Bytes| { ..at, owner: o })
+  let found = owners_of_name(module, at.shipped, at.tested, name);
+  (match namespace {
+    None -> found.owners,
+    Some(ValueSpace) -> found.values,
+    Some(_) -> found.owners.filter(|o: Bytes| o == name),
+  }).map(|o: Bytes| { ..at, owner: o })
 }
 
 fn declared_name_of(
@@ -1002,14 +1032,15 @@ fn stored_reads(
   sibling: keep (Bytes) -> Sibling,
 ) -> StoredReads<| {decode_cache.read, decode_cache.write, memo.read, memo.write}> =
   {
-    declarations_of: |qualified: Bytes| {
+    declarations_of: |qualified: Bytes, namespace: Option<Namespace>| {
       let module = module_of_name(qualified);
       if module.len() == 0 { [] } else {
-        owners_declaring(
+        owners_declaring_in(
           named,
           asker,
           module,
           qualified.slice(module.len() + 1, qualified.len()),
+          namespace,
         ).filter(|at: OwnerKey| !is_loaded(inside, module, at.owner)).map(|at: OwnerKey|
           stored_declarations_of(at, if module == named.module { sibling(at.owner) }
           else { Entire }))
