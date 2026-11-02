@@ -33,10 +33,6 @@ fn read(bytes: &[u8]) -> Result<Option<ply_pack::Pack>, String> {
     ply_pack::Pack::of_binary(file.path())
 }
 
-fn framed(bytes: &[u8]) -> Vec<u8> {
-    zstd::stream::encode_all(bytes, 3).expect("compressed")
-}
-
 #[test]
 fn a_binary_with_a_bundle_of_files_appended_after_its_code_lets_each_bundled_file_be_read_back() {
     let pack = read(&binary(
@@ -94,17 +90,13 @@ fn a_bundle_of_files_lists_the_module_files_and_the_data_files_under_a_given_dir
 }
 
 #[test]
-fn a_cached_result_is_the_length_prefixed_record_at_an_offset_and_length_within_a_bundled_cache_file()
- {
-    let one = framed(b"one record");
-    let two = framed(b"another");
+fn a_cached_result_is_the_bytes_at_an_offset_and_length_within_a_bundled_cache_file() {
+    let one = b"one record".to_vec();
+    let two = b"another".to_vec();
     let store = [one.clone(), two.clone()].concat();
     let pack = read(&binary(
         b"",
-        &[
-            ("answers/store", &store),
-            ("answers/index", &framed(b"index")),
-        ],
+        &[("answers/store", &store), ("answers/index", b"index")],
     ))
     .expect("the pack reads")
     .expect("the binary carries one");
@@ -117,7 +109,7 @@ fn a_cached_result_is_the_length_prefixed_record_at_an_offset_and_length_within_
         Some(b"another".to_vec())
     );
     assert_eq!(pack.result("index", 0, 0), Some(b"index".to_vec()));
-    assert_eq!(pack.result("store", 1, one.len()), None);
+    assert_eq!(pack.result("store", store.len(), 1), None);
     assert_eq!(pack.result("store", one.len(), two.len() + 1), None);
     assert_eq!(pack.result("records", 0, 0), None);
 }

@@ -36,10 +36,10 @@ import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, Mod
                                       shipped_kind, shipped_exists_kind, data_kind,
                                       embedded_file_kind, derived_kind, deriver_kind,
                                       shipped_names_kind, own_modules_kind, QueryEffects,
-                                      RunEffects, SessionReads, CheckQuery, with_decode_cache,
-                                      decoded, prefix_in, module_query, imports_query, ImportOf,
-                                      imports_of_bin, absent, hash_result_bin, context_query,
-                                      shipped_names_listed)
+                                      RunEffects, SessionReads, CheckQuery, CheckQueries,
+                                      check_queries, with_decode_cache, decoded, prefix_in,
+                                      module_query, imports_query, ImportOf, imports_of_bin, absent,
+                                      hash_result_bin, context_query, shipped_names_listed)
 import compiler.front.checking.promises (promise_queries, cost_walk_query, cost_return_query,
                                          cost_demands_query, cost_parameters_query,
                                          module_parameters_query, module_costs_query, measure_query,
@@ -203,36 +203,41 @@ pub fn registry(
   definitions: Bytes,
   evaluator: Bytes,
   more: List<QueryDefinition> = [],
-) -> Map<Bytes, CheckQuery> / {abort.raise} =
-  every_query().concat(more).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CheckQuery>, q: QueryDefinition|
-      accumulator.insert(q.name, {
-        name: q.name,
-        hash: match definition_hash(definitions, q.definition) {
-          Some(h) -> blake3(Bytes::concat_all([h, b"\x00", evaluator])),
-          None ->
-            panic(
-              "the program contains no definition `" ++ String::of_bytes_lossy(q.definition) ++ "`",
-            ),
-        },
-        body: q.body,
-        persistent: !digest_only_queries.contains(q.name),
-        product: product_of(q.name),
-      }),
+) -> CheckQueries / {abort.raise} =
+  check_queries(
+    every_query().concat(more).fold(
+      Map::new(),
+      |accumulator: Map<Bytes, CheckQuery>, q: QueryDefinition|
+        accumulator.insert(q.name, {
+          name: q.name,
+          hash: match definition_hash(definitions, q.definition) {
+            Some(h) -> blake3(Bytes::concat_all([h, b"\x00", evaluator])),
+            None ->
+              panic(
+                "the program contains no definition `" ++ String::of_bytes_lossy(q.definition)
+                  ++ "`",
+              ),
+          },
+          body: q.body,
+          persistent: !digest_only_queries.contains(q.name),
+          product: product_of(q.name),
+        }),
+    ),
   )
 
-pub fn fresh_registry(more: List<QueryDefinition> = []) -> Map<Bytes, CheckQuery> =
-  every_query().concat(more).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CheckQuery>, q: QueryDefinition|
-      accumulator.insert(q.name, {
-        name: q.name,
-        hash: q.name,
-        body: q.body,
-        persistent: true,
-        product: product_of(q.name),
-      }),
+pub fn fresh_registry(more: List<QueryDefinition> = []) -> CheckQueries =
+  check_queries(
+    every_query().concat(more).fold(
+      Map::new(),
+      |accumulator: Map<Bytes, CheckQuery>, q: QueryDefinition|
+        accumulator.insert(q.name, {
+          name: q.name,
+          hash: q.name,
+          body: q.body,
+          persistent: true,
+          product: product_of(q.name),
+        }),
+    ),
   )
 
 pub type CheckedModule = { module: Bytes, result: ModuleResult }
@@ -425,14 +430,16 @@ pub const digest_only_queries: List<Bytes> =
 pub fn check_shipped_modules(
   shipped: List<Bytes>,
 ) -> List<CheckedModule> / {memo.read, abort.raise} = {
-  let rejected = dependencies_first(
+  let rejected = dependency_levels(
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
-  ).order.fold([], |accumulator: List<CheckedModule>, named: ModuleKey| {
+  ).levels.fold([], |accumulator: List<CheckedModule>, level: List<ModuleKey>| {
+    let inputs = level.map(|named: ModuleKey| bin::encode(named, module_key_bin()));
     [hashes_query, wanted_files_query, module_listing_query].fold((), |_: Unit, query: Bytes| {
-      memo.fetch(query, bin::encode(named, module_key_bin()));
+      memo.fetch_all(query, inputs);
       ()
     });
-    if module_rejected(named) { accumulator.push(module_of(named)) } else { accumulator }
+    level.fold(accumulator, |found: List<CheckedModule>, named: ModuleKey|
+      if module_rejected(named) { found.push(module_of(named)) } else { found })
   });
   declaring_in(b"std");
   rejected
@@ -480,30 +487,38 @@ fn imports_of_key(named: ModuleKey) -> List<ImportOf> / {memo.read, abort.raise}
 fn dependencies_first(
   modules: List<ModuleKey>,
 ) -> { order: List<ModuleKey>, edges: Map<Bytes, List<Bytes>> } / {memo.read, abort.raise} = {
+  let levelled = dependency_levels(modules);
+  { order: levelled.levels.flat_map(|level: List<ModuleKey>| level), edges: levelled.edges }
+}
+
+fn dependency_levels(
+  modules: List<ModuleKey>,
+) -> { levels: List<List<ModuleKey>>, edges: Map<Bytes, List<Bytes>> } / {memo.read, abort.raise} = {
   let edges = modules.fold(Map::new(), |accumulator: Map<Bytes, List<Bytes>>, n: ModuleKey|
     accumulator.insert(n.module, imports_of_key(n).map(|i: ImportOf| i.named.module)));
   let among = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: ModuleKey|
     accumulator.insert(n.module, true));
-  let order = iterate(
+  let levels = iterate(
     { placed: Map::new(), left: modules, out: [] },
     modules.len() + 2,
-    |x: { placed: Map<Bytes, Bool>, left: List<ModuleKey>, out: List<ModuleKey> }| {
+    |x: { placed: Map<Bytes, Bool>, left: List<ModuleKey>, out: List<List<ModuleKey>> }| {
       let ready = x.left.filter(|n: ModuleKey|
         List::fold(
           match edges.get(n.module) { Some(es) -> es, None -> [] },
           true,
           |b: Bool, m: Bytes| b && (m == n.module || !among.contains(m) || x.placed.contains(m)),
         ));
-      if ready.len() == 0 { Stop(x.out.concat(x.left)) } else {
+      if ready.len() == 0 { Stop(if x.left.len() == 0 { x.out } else { x.out.push(x.left) }) }
+      else {
         let placed = ready.fold(x.placed, |accumulator: Map<Bytes, Bool>, n: ModuleKey|
           accumulator.insert(n.module, true));
         let left = x.left.filter(|n: ModuleKey| !placed.contains(n.module));
-        if left.len() == 0 { Stop(x.out.concat(ready)) }
-        else { Continue({ placed: placed, left: left, out: x.out.concat(ready) }) }
+        if left.len() == 0 { Stop(x.out.push(ready)) }
+        else { Continue({ placed: placed, left: left, out: x.out.push(ready) }) }
       }
     },
   );
-  { order: order, edges: edges }
+  { levels: levels, edges: edges }
 }
 
 pub fn packages_rejected(
@@ -685,7 +700,7 @@ pub fn queried_over(
   queried_under(fresh_registry(), store, sources)
 
 pub fn queried_results(
-  qs: Map<Bytes, CheckQuery>,
+  qs: CheckQueries,
   store: MemoryStore,
   sources: List<Source>,
 ) -> { store: MemoryStore, run: Run, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
@@ -701,7 +716,7 @@ pub fn queried_results(
 }
 
 pub fn queried_under(
-  qs: Map<Bytes, CheckQuery>,
+  qs: CheckQueries,
   store: MemoryStore,
   sources: List<Source>,
 ) -> { store: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
@@ -784,7 +799,7 @@ fn hashed_load(
 }
 
 fn query_alone(
-  qs: Map<Bytes, CheckQuery>,
+  qs: CheckQueries,
   w: LoadInputs,
 ) -> { run: Run, results: List<CheckedModule>, fixing: CachedHashes } / {RunEffects, abort.raise} =
   in_session(qs, |run: Run| {
@@ -828,14 +843,18 @@ fn queried_in(
   nth: Int,
 ) -> { tree: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes } / {abort.raise} = {
   let w = inputs_alone(sources);
-  let qs = if company != Turns { fresh_registry() } else {
-    fresh_registry().insert(b"spare", {
-      name: b"spare",
-      hash: if nth % 2 == 1 { b"odd" } else { b"even" },
-      body: |input: Bytes| input,
-      persistent: true,
-      product: None,
-    })
+  let fresh = fresh_registry();
+  let qs = if company != Turns { fresh } else {
+    {
+      ..fresh,
+      named: fresh.named.insert(b"spare", {
+        name: b"spare",
+        hash: if nth % 2 == 1 { b"odd" } else { b"even" },
+        body: |input: Bytes| input,
+        persistent: true,
+        product: None,
+      }),
+    }
   };
   let done = fs::on_mem[abs](tree, ||
     handle {
@@ -1031,7 +1050,7 @@ pub fn check_with_pack(
   check_under(fresh_registry(), store, packed, sources, shipped, derived)
 
 pub fn check_under(
-  qs: Map<Bytes, CheckQuery>,
+  qs: CheckQueries,
   store: MemoryStore,
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
