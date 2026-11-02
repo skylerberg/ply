@@ -7,8 +7,8 @@ import compiler.checkout (module_files)
 import std.path (normalize)
 import walk (Failure)
 import sources
-import program (ParsedSources, Program, load_mentioning, program_view, renamed_resolution,
-                resolution_of, unchecked_program)
+import program (ParsedSources, modules_within, narrowed_project, read_paths, renamed_resolution,
+                session_over)
 import diagnostic (errors_text)
 import builder (builder)
 import std.random (entropy)
@@ -16,7 +16,10 @@ import std.time (time)
 import compiler.cc (toolchain)
 import compiler.load (Derives)
 import compiler.unit (shipped)
-import compiler.front.facts (CheckedProgram)
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.front.checking.view
+import compiler.front.checking.view (CheckedOwner, Modules)
+import compiler.store.memo (memo)
 import compiler.front (ShippedInputs)
 import compiler.check.resolve.defaults (ResolvedProgram)
 import compiler.check.resolve.tables (ParsedModule, Diagnostic, Declarations, Resolution, Scope,
@@ -155,20 +158,10 @@ fn shipped_files(
     None -> Map::new(),
   }
 
-fn calls_by_module(
-  view: CheckedProgram,
-) -> Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>> / {abort.raise} =
-  view.checked.facts.members.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>, s: MemberSite| {
-      let name = view.frame.outlines.get(s.module).name;
-      let module = accumulator.get(name).unwrap_or(Map::new());
-      accumulator.insert(
-        name,
-        module.insert(s.owner, module.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee)),
-      )
-    },
-  )
+fn calls_of(owners: List<CheckedOwner>) -> Map<Bytes, Map<Int, MemberTarget>> =
+  owners.fold(Map::new(), |found: Map<Bytes, Map<Int, MemberTarget>>, o: CheckedOwner|
+    o.facts.members.fold(found, |into: Map<Bytes, Map<Int, MemberTarget>>, s: MemberSite|
+      into.insert(s.owner, into.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee))))
 
 fn record_in(types: TypeTable, key: Bytes) -> Option<Record> =
   match types.get(key) {
@@ -240,27 +233,21 @@ fn body_records(
       },
   )
 
-fn records_by_owner(view: CheckedProgram) -> Map<Bytes, Map<Int, Record>> / {abort.raise} = {
-  let types = view.checked.facts.types;
-  let with_body = |accumulator: Map<Bytes, Map<Int, Record>>, owner: Bytes, body: TypedBody<Bytes>|
-    accumulator.insert(
-      owner,
-      body_records(accumulator.get(owner).unwrap_or(Map::new()), types, body),
-    );
-  view.checked.cached.fold(
-    view.checked.facts.bodies.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
-        with_body(accumulator, b.owner, b),
-    ),
-    |accumulator: Map<Bytes, Map<Int, Record>>, k: CachedFacts|
-      match decode_facts(k.facts, 0, k.name) {
-        Some(f) ->
-          f.bodies.fold(accumulator, |into: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
-            with_body(into, k.name, b)),
-        None -> accumulator,
-      },
-  )
+fn records_of(owners: List<CheckedOwner>) -> Map<Bytes, Map<Int, Record>> / {abort.raise} = {
+  let with_body = |found: Map<Bytes, Map<Int, Record>>, types: TypeTable, owner: Bytes, body: TypedBody<Bytes>|
+    found.insert(owner, body_records(found.get(owner).unwrap_or(Map::new()), types, body));
+  owners.fold(Map::new(), |found: Map<Bytes, Map<Int, Record>>, o: CheckedOwner|
+    o.cached.fold(
+      o.facts.bodies.fold(found, |into: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
+        with_body(into, o.facts.types, b.owner, b)),
+      |into: Map<Bytes, Map<Int, Record>>, k: CachedFacts|
+        match decode_facts(k.facts, 0, k.name) {
+          Some(f) ->
+            f.bodies.fold(into, |all: Map<Bytes, Map<Int, Record>>, b: TypedBody<Bytes>|
+              with_body(all, f.types, k.name, b)),
+          None -> into,
+        },
+    ))
 }
 
 fn variant_records(name: Bytes, variants: List<VariantDefinition>) -> List<DeclaredRecord> =
@@ -388,44 +375,68 @@ fn under(at: RootedPath, root: RootedPath) -> Bool =
     || at.path.starts_with(root.path ++ "/"))
 
 type ProgramLoad = {
-  program: Program,
+  files: List<sources::File>,
+  read_at: List<RootedPath>,
+  shipping: ShippedInputs,
   resolved: Result<ResolvedProgram, List<Diagnostic>>,
   parses: ParsedSources,
   calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
   owner_records: Map<Bytes, Map<Int, Record>>,
 }
 
-fn checked_load(
-  path: ResolvedPath,
-  parses: ParsedSources,
+type RenameReading = {
+  included: Map<Bytes, Bool>,
+  calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
+  owner_records: Map<Bytes, Map<Int, Record>>,
+}
+
+fn rename_reading(
+  project: sources::Project,
+  modules: Modules,
   mentions: (sources::File) -> Bool / {abort.raise},
-) -> ProgramLoad / {time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
-  let program = load_mentioning([path], mentions);
-  let resolution = resolution_of(program, parses);
-  let load = {
-    program: program,
-    resolved: resolution.resolved,
-    parses: resolution.parses,
-    calls: Map::new(),
-    owner_records: Map::new(),
-  };
-  match ((resolution.resolved, program_view(program))) {
-    (Err(_), _) -> load,
-    (_, None) -> { ..load, resolved: Err(program.diagnostics) },
-    (Ok(_), Some(view)) ->
-      { ..load, calls: calls_by_module(view), owner_records: records_by_owner(view) },
+) -> RenameReading / {memo.read, abort.raise} = {
+  let start = project.files.filter(mentions).map(|f: sources::File| Bytes::of_string(f.module));
+  let included = view::imports_reached(view::rollups(modules), if start.len() > 0 { start }
+  else { modules.own.take(1) });
+  let checked = modules_within(modules, included).fold(
+    Map::new(),
+    |found: Map<Bytes, List<CheckedOwner>>, m: Bytes|
+      found.insert(m, view::checked_owners({ module: m, shipped: false, tested: false })),
+  );
+  {
+    included: included,
+    calls: checked.fold(
+      Map::new(),
+      |found: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>, m: Bytes, owners: List<CheckedOwner>|
+        found.insert(m, calls_of(owners)),
+    ),
+    owner_records: checked.fold(
+      Map::new(),
+      |found: Map<Bytes, Map<Int, Record>>, _: Bytes, owners: List<CheckedOwner>|
+        records_of(owners).fold(
+          found,
+          |all: Map<Bytes, Map<Int, Record>>, owner: Bytes, sites: Map<Int, Record>|
+            all.insert(owner, sites),
+        ),
+    ),
   }
 }
 
-fn unchecked_load(
-  path: ResolvedPath,
+fn resolved_load(
+  project: sources::Project,
   shipping: ShippedInputs,
   parses: ParsedSources,
-) -> ProgramLoad / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise, diverges} = {
-  let program = unchecked_program([path], shipping);
-  let resolution = renamed_resolution([path], program.shipping, parses);
+  included: Option<Map<Bytes, Bool>>,
+) -> ProgramLoad / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise} = {
+  let narrowed = match included {
+    Some(names) -> narrowed_project(project, names),
+    None -> project,
+  };
+  let resolution = renamed_resolution(narrowed, shipping, parses);
   {
-    program: program,
+    files: narrowed.files,
+    read_at: read_paths(narrowed),
+    shipping: shipping,
     resolved: match resolution.resolved {
       Ok(resolved) -> Ok(resolved),
       Err(u) -> Err(u.diagnostics),
@@ -436,12 +447,47 @@ fn unchecked_load(
   }
 }
 
+fn checked_load(
+  path: ResolvedPath,
+  parses: ParsedSources,
+  mentions: (sources::File) -> Bool / {abort.raise},
+) -> ProgramLoad / {time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, abort.raise, diverges} = {
+  let project = sources::load_resolved([path]);
+  match session_over(
+      [path],
+      project,
+      time.elapsed_ms(),
+      false,
+      false,
+      |modules: Modules, _: ProgramSummary| rename_reading(project, modules, mentions),
+    ) {
+    Err(r) ->
+      {
+        ..resolved_load(project, sources::shipping_of([]), parses, None),
+        resolved: Err(r.diagnostics),
+      },
+    Ok(s) ->
+      {
+        ..resolved_load(project, sources::shipping_of(s.modules.pulled), parses, Some(s.value.included)),
+        calls: s.value.calls,
+        owner_records: s.value.owner_records,
+      },
+  }
+}
+
+fn unchecked_load(
+  path: ResolvedPath,
+  shipping: ShippedInputs,
+  parses: ParsedSources,
+) -> ProgramLoad / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Derives, abort.raise, diverges} =
+  resolved_load(sources::load_resolved([path]), shipping, parses, None)
+
 pub fn loads_of(
   given: List<ResolvedPath>,
   pwd: String,
   checked: Bool,
   mentions: (sources::File) -> Bool / {abort.raise},
-) -> { loads: List<Loaded>, failures: List<Failure> } / {time.elapsed_ms, fs.resolved_kind[abs], shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} = {
+) -> { loads: List<Loaded>, failures: List<Failure> } / {time.elapsed_ms, fs.resolved_kind[abs], shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, abort.raise, diverges} = {
   let roots = given.map(rooted);
   let shipping = sources::shipping_of(if checked { [] } else { sources::shipped_names() });
   let done = given.fold(
@@ -453,7 +499,6 @@ pub fn loads_of(
       } else {
         let load = if checked { checked_load(path, accumulator.parses, mentions) }
         else { unchecked_load(path, shipping, accumulator.parses) };
-        let program = load.program;
         let library_files = shipped_files(path);
         match load.resolved {
           Err(ds) ->
@@ -475,15 +520,15 @@ pub fn loads_of(
               loads: accumulator.loads.push({
                 path: path,
                 root: displayed(root),
-                files: program.files.map(|f: sources::File| f.at),
+                files: load.files.map(|f: sources::File| f.at),
                 names: resolved.modules.map(|m: ParsedModule| m.name),
                 indices: positions(resolved.modules.map(|m: ParsedModule| m.name)),
-                module_files: program.read_at.map(|at: RootedPath| file_of(pwd, library_files, at)),
+                module_files: load.read_at.map(|at: RootedPath| file_of(pwd, library_files, at)),
                 declarations: resolved.resolution.declarations,
                 scopes: resolved.resolution.scopes,
                 visible_modules: resolved.resolution.visible_modules,
-                shipping: program.shipping,
-                reads: program.files.filter(|f: sources::File|
+                shipping: load.shipping,
+                reads: load.files.filter(|f: sources::File|
                   roots.any(|r: RootedPath| under(f.at, r))
                     && !read_before.contains(absolute(pwd, f.at))).fold(
                   [],
@@ -493,7 +538,7 @@ pub fn loads_of(
                       None -> reads,
                     },
                 ),
-                unrenamed: program.files.filter(|f: sources::File|
+                unrenamed: load.files.filter(|f: sources::File|
                   !roots.any(|r: RootedPath| under(f.at, r))).fold(
                   [],
                   |reads: List<Read>, f: sources::File|
