@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
-stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
-stores=$cache/bodies
+stage=${PLY_CI_STAGE:-/tmp/ply-c-stage}
 
 megabytes() { du -sm "$@" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
 
@@ -29,29 +28,6 @@ laid() {
 }
 
 case "${1:-}" in
-  used)
-    mark=${2:?usage: ci-warm.sh used MARK}
-    [ -f "$mark" ] || { echo "nothing is marked at $mark" >&2; exit 2; }
-    before=$(megabytes "$cache" "$stage")
-    for dir in "$stores"/*/; do
-      [ -d "$dir" ] || continue
-      [ "$dir.used" -nt "$mark" ] || [ "$dir" -nt "$mark" ] || rm -rf "$dir"
-    done
-    [ -d "$cache" ] && find "$cache" -path "$stores/*" -type d -prune -o -type f ! -newer "$mark" -print0 |
-      xargs -0 rm -f --
-    if [ -d "$stage" ]; then
-      for dir in "$stage"/*/; do
-        [ -d "$dir" ] || continue
-        case "$(basename "$dir")" in
-          answered | reused) find "$dir" -type f ! -newer "$mark" -delete ;;
-          *) [ -n "$(find "$dir" -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
-        esac
-      done
-    fi
-    [ -d "$stage" ] && find "$stage" -maxdepth 1 -type f ! -name '.*' ! -newer "$mark" -delete
-    find "$cache" "$stage" -mindepth 1 -type d -empty -delete 2>/dev/null || true
-    echo "the C cache and stages kept $(megabytes "$cache" "$stage") MB of $before MB"
-    ;;
   pack)
     tar=${2:?usage: ci-warm.sh pack TAR}
     dir=$(mktemp -d)
@@ -78,12 +54,8 @@ case "${1:-}" in
       echo "could not download the stage $name: this job starts from the cache"
     fi
     ;;
-  foreign)
-    [ -d "$stage" ] && find "$stage" -mindepth 1 -maxdepth 1 ! -name memo-std -exec rm -rf {} +
-    echo "kept $(megabytes "$cache") MB of the C cache and $(megabytes "$stage") MB of the std records from another toolchain, and deleted its stages"
-    ;;
   *)
-    echo "usage: ci-warm.sh used MARK | pack TAR | shared NAME | this-run NAME | foreign" >&2
+    echo "usage: ci-warm.sh pack TAR | shared NAME | this-run NAME" >&2
     exit 2
     ;;
 esac

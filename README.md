@@ -23,7 +23,6 @@ These environment variables help when working on `ply` itself:
 
 | variable | effect |
 | --- | --- |
-| `PLY_C_STAGE=DIR` | the directory where the compiler stores the intermediate programs it builds in stages when it compiles itself (default `ply/stage`, beside the directory where `ply` caches the generated C) |
 | `PLY_C_PHASES=1` | print what each build phase did and how long it took |
 | `PLY_HEAP_POISON=1` | fill freed memory with a pattern, and fail on any read of it |
 | `PLY_HEAP_DELAY=N` | reuse freed memory only after `N` more frees |

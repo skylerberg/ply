@@ -20,9 +20,11 @@ import compiler.front.checking (CheckedModule, OwnPackage, LoadInputs, query_loa
                                 nothing_derived, reject_embed, packages_rejected, rejected_first,
                                 registry, root_warnings, checked_program_from_results,
                                 load_inputs_of, package_location_in)
-import compiler.front.checking.world (CheckQuery, RunEffects, ModuleResult, with_decode_cache)
+import compiler.front.checking.world (CheckQuery, RunEffects, ModuleResult, with_decode_cache,
+                                      derived_kind, deriver_kind)
 import compiler.expand.derive (DeriverRequest, DeriverResponse, Rejection, Generated, Declined,
-                               Failed, import_path, deriver_request_bin, deriver_response_bin)
+                               Failed, Unavailable, import_path, derivation_at_bin,
+                               deriver_response_bin)
 import compiler.syntax.items (header, parse, is_shipped)
 import compiler.cc
 import compiler.cc (compilers, toolchain, WrittenPart)
@@ -371,7 +373,7 @@ effect set ReadsShipped = {shipped.names, shipped.module, shipped.read_pack}
 fn looking_up<| e>(
   w: LoadInputs,
   read_embed: keep (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {ReadsShipped, abort.raise | e},
-  derived: keep (Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e},
+  derived: keep (Bytes, Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e},
 ) -> (Bytes, Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e} =
   |kind: Bytes, at: Bytes|
     lookup_input(
@@ -388,7 +390,7 @@ fn looking_up<| e>(
 fn in_temporary_store<a | e>(
   w: LoadInputs,
   read_embed: keep (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {ReadsShipped, abort.raise | e},
-  derived: keep (Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e},
+  derived: keep (Bytes, Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e},
   work: (Map<Bytes, CheckQuery>, Run) -> { run: Run, value: a } / {RunEffects, abort.raise},
 ) -> a / {ReadsShipped, shipped.digests, shipped.stamps, shipped.definitions, abort.raise | e} = {
   let qs = query_registry();
@@ -407,7 +409,7 @@ fn open_memo_store<a, [r], [s]>(
 ) -> a / {Derives, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
   let w = world_for(p);
   let read_embed = |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want);
-  let derived = |ask: Bytes| derivation_response(w, ask);
+  let derived = |kind: Bytes, at: Bytes| derivation_response(w, kind, at);
   if dir == "" {
     in_temporary_store(w, read_embed, derived, |qs: Map<Bytes, CheckQuery>, run: Run|
       work(qs, w, run))
@@ -423,11 +425,17 @@ fn open_memo_store<a, [r], [s]>(
   }
 }
 
-pub fn derivation_response(w: LoadInputs, at: Bytes) -> Option<Bytes> / {Derives, abort.raise} =
-  match bin::decode(at, deriver_request_bin()) {
-    Ok(ask) -> if value::decode(ask.declaration) == None { None }
-    else { Some(bin::encode(derivation_result(ask, w.texts), deriver_response_bin())) },
-    Err(_) -> None,
+pub fn derivation_response(
+  w: LoadInputs,
+  kind: Bytes,
+  at: Bytes,
+) -> Option<Bytes> / {Derives, abort.raise} =
+  if kind == deriver_kind { Some(deriver_key(at, deriver_modules(at, w.texts))) } else {
+    match bin::decode(at, derivation_at_bin()) {
+      Ok(a) -> if value::decode(a.request.declaration) == None { None }
+      else { Some(bin::encode(derivation_result(a.request, w.texts), deriver_response_bin())) },
+      Err(_) -> None,
+    }
   }
 
 fn query_registry() -> Map<Bytes, CheckQuery> / {shipped.definitions, shipped.stamps, abort.raise} =
@@ -530,7 +538,7 @@ fn fresh_check_with<a, [s]>(
   in_temporary_store(
     w,
     |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want),
-    |ask: Bytes| derivation_response(w, ask),
+    |kind: Bytes, at: Bytes| derivation_response(w, kind, at),
     |qs: Map<Bytes, CheckQuery>, run: Run| work(qs, w, run),
   )
 }
@@ -798,22 +806,7 @@ pub fn derivation_result(
   own: Map<Bytes, Bytes>,
 ) -> DeriverResponse / {Derives, abort.raise} = {
   let modules = deriver_modules(ask.module, own);
-  let deriver = deriver_key(ask.module, modules);
-  let path = "derived/" ++ String::of_bytes(hex(blake3(deriver.concat(ask.declaration))));
-  match match toolchain.read_file(path) {
-      Some(b) -> match bin::decode(b, deriver_response_bin()) { Ok(a) -> Some(a), Err(_) -> None },
-      None -> None,
-    } {
-    Some(a) -> a,
-    None -> {
-      let ran = run_derivation(ask, deriver, modules);
-      if ran.keep {
-        let _ = toolchain.write_file(path, bin::encode(ran.result, deriver_response_bin()));
-        ()
-      };
-      ran.result
-    },
-  }
+  run_derivation(ask, deriver_key(ask.module, modules), modules)
 }
 
 fn deriver_key(module: Bytes, modules: List<DeriverModule>) -> Bytes / {Derives, abort.raise} =
@@ -864,10 +857,11 @@ fn derivation_source(deriver: Bytes) -> Bytes =
     b" as deriver\n\npub fn derived(declaration: derive::Declaration) -> Result<String, derive::Refused> / {abort.raise} =\n  deriver::derive(declaration)\n",
   ])
 
-type DerivationRun = { result: DeriverResponse, keep: Bool }
-
 fn unran(code: Bytes, message: Bytes, notes: List<Bytes>) -> DeriverResponse =
   Failed({ code: code, message: message, notes: notes })
+
+fn unavailable(message: Bytes, notes: List<Bytes>) -> DeriverResponse =
+  Unavailable({ code: b"E0155", message: message, notes: notes })
 
 fn diagnostic_line(d: Diagnostic) -> Bytes = Bytes::concat_all([d.code, b": ", d.message])
 
@@ -875,7 +869,7 @@ fn run_derivation(
   ask: DeriverRequest,
   deriver: Bytes,
   modules: List<DeriverModule>,
-) -> DerivationRun / {Derives, abort.raise} = {
+) -> DeriverResponse / {Derives, abort.raise} = {
   let name = derivation_name(modules);
   match deriver_library(ask.module, deriver, name, modules) {
     Err(ran) -> ran,
@@ -903,10 +897,10 @@ fn deriver_library(
   deriver: Bytes,
   name: Bytes,
   modules: List<DeriverModule>,
-) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
+) -> Result<String, DeriverResponse> / {Derives, abort.raise} = {
   let wanted = { owner: "derivers/" ++ String::of_bytes(module), key: deriver };
   match cc::found_libraries[cc](cc::development(), [wanted]) {
-    Err(reason) -> Err({ result: unran(b"E0155", Bytes::of_string(reason), []), keep: false }),
+    Err(reason) -> Err(unavailable(Bytes::of_string(reason), [])),
     Ok(found) -> if found.get(0).built { Ok(found.get(0).path) }
     else { compile_deriver(module, found.get(0), name, modules) },
   }
@@ -917,7 +911,7 @@ fn compile_deriver(
   at: cc::FoundLibrary,
   name: Bytes,
   modules: List<DeriverModule>,
-) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
+) -> Result<String, DeriverResponse> / {Derives, abort.raise} = {
   let files = modules.map(|r: DeriverModule|
     {
       path: String::of_bytes(r.name) ++ ".ply",
@@ -929,8 +923,8 @@ fn compile_deriver(
     text: derivation_source(module),
   });
   let rejected = |diagnostics: List<Diagnostic>|
-    Err({
-      result: unran(
+    Err(
+      unran(
         b"E0160",
         Bytes::concat_all([b"`", module, b"` cannot be run by `derive`"]),
         [
@@ -939,10 +933,8 @@ fn compile_deriver(
           diagnostics.map(diagnostic_line),
         ),
       ),
-      keep: true,
-    });
-  let unkept = |reason: Bytes, notes: List<Bytes>|
-    Err({ result: unran(b"E0155", reason, notes), keep: false });
+    );
+  let unkept = |reason: Bytes, notes: List<Bytes>| Err(unavailable(reason, notes));
   match written_in_memory(files, [Named(derived_root(name))]) {
     Err(u) -> rejected(u.diagnostics),
     Ok(written) -> if compilers.find[cc]() == None {
@@ -982,36 +974,37 @@ fn written_in_memory(
   let loaded = in_temporary_store(
     w,
     |k: Int, name: Bytes, want: EmbedRequest| reject_embed(k, name, want),
-    |ask: Bytes| nothing_derived(ask),
+    nothing_derived,
     |qs: Map<Bytes, CheckQuery>, run: Run|
       reading(qs, run, || code_loaded(w, |_: LoadInputs| roots)),
   );
   with_no_files(|| written_from[memory](p, loaded, false))
 }
 
-fn derivation_run_of(ask: DeriverRequest, returned: Option<Bytes>) -> DerivationRun = {
-  let failed = {
-    result: unran(
-      b"E0155",
-      Bytes::concat_all([b"the deriver `", ask.module, b"` raised or did not finish in time"]),
-      [
-        Bytes::concat_all([
-          b"a deriver has ",
-          Bytes::of_string(unit::entered_timeout_ms.to_string()),
-          b" ms of wall clock, and a deriver that raises produces no output",
-        ]),
-      ],
-    ),
-    keep: returned != None,
-  };
-  match returned.and_then(value::decode) {
-    Some(VCtor(c, [VStr(text)])) -> if value::constructor_name(c) == "Ok" {
-      { result: Generated(Bytes::of_string(text)), keep: true }
-    } else { failed },
-    Some(VCtor(c, [VRecord(fields)])) -> if value::constructor_name(c) != "Err" { failed } else {
-      match rejected_of(fields) { Some(r) -> { result: Declined(r), keep: true }, None -> failed }
+fn derivation_run_of(ask: DeriverRequest, returned: Option<Bytes>) -> DeriverResponse = {
+  let message = Bytes::concat_all([
+    b"the deriver `",
+    ask.module,
+    b"` raised or did not finish in time",
+  ]);
+  let notes = [
+    Bytes::concat_all([
+      b"a deriver has ",
+      Bytes::of_string(unit::entered_timeout_ms.to_string()),
+      b" ms of wall clock, and a deriver that raises produces no output",
+    ]),
+  ];
+  let failed = unran(b"E0155", message, notes);
+  match returned {
+    None -> unavailable(message, notes),
+    Some(bytes) -> match value::decode(bytes) {
+      Some(VCtor(c, [VStr(text)])) -> if value::constructor_name(c) == "Ok" {
+        Generated(Bytes::of_string(text))
+      } else { failed },
+      Some(VCtor(c, [VRecord(fields)])) -> if value::constructor_name(c) != "Err" { failed }
+      else { match rejected_of(fields) { Some(r) -> Declined(r), None -> failed } },
+      _ -> failed,
     },
-    _ -> failed,
   }
 }
 
@@ -1071,7 +1064,12 @@ test "a derivation request naming a declaration that is not a value returns noth
   let w = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   let ask = { module: b"std.derive.map", declaration: b"no value" };
   assert_eq(
-    forbid_derivers(|| derivation_response(w, bin::encode(ask, deriver_request_bin()))),
+    forbid_derivers(||
+      derivation_response(
+        w,
+        derived_kind,
+        bin::encode({ deriver: b"", request: ask }, derivation_at_bin()),
+      )),
     None,
   )
 }

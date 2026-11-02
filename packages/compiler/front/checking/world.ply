@@ -13,8 +13,8 @@ import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_sha
 import compiler.syntax.items (Module, ImportDeclaration, header, parse, parse_started,
                               import_declaration_bin, read_without_import, homes_declaring,
                               unimported_of)
-import compiler.expand.derive (DeriverRequest, DeriverResponse, Failed, import_path,
-                               deriver_request_bin, deriver_response_bin)
+import compiler.expand.derive (DeriverRequest, DeriverResponse, Failed, Unavailable, import_path,
+                               derivation_at_bin, deriver_response_bin)
 import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.syntax.expressions (prelude_module)
 import compiler.front.interface (imported)
@@ -75,11 +75,21 @@ pub const shipped_names_kind: Bytes = b"shipped names"
 
 pub const derived_kind: Bytes = b"derived"
 
+pub const deriver_kind: Bytes = b"deriver"
+
 pub const own_modules_kind: Bytes = b"own modules"
 
-fn derived_read(at: Bytes) -> DeriverResponse / {memo.read, abort.raise} =
+fn derivation_of(ask: DeriverRequest) -> DeriverResponse / {memo.read, memo.write, abort.raise} = {
+  let at = bin::encode(
+    { deriver: memo.external(deriver_kind, ask.module).unwrap_or(b""), request: ask },
+    derivation_at_bin(),
+  );
   match memo.external(derived_kind, at) {
-    Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
+    Some(b) -> {
+      let response = decoded(b, deriver_response_bin(), "a derivation");
+      match response { Unavailable(_) -> (), _ -> memo.fix(derived_kind, at) };
+      response
+    },
     None ->
       Failed({
         code: b"E0155",
@@ -87,6 +97,7 @@ fn derived_read(at: Bytes) -> DeriverResponse / {memo.read, abort.raise} =
         notes: [b"this command reads modules without running `derive` generators"],
       }),
   }
+}
 
 pub fn embed_at(root: Bytes, module: Bytes, key: Bytes) -> Bytes =
   Bytes::concat_all([root, b"\x00", module, b"\x00", key])
@@ -107,7 +118,7 @@ pub type ParsedText = {
   lexed: ParseStart,
   raw: Module,
   given: ParsedSource,
-  requested: List<Bytes>,
+  requested: List<DeriverRequest>,
 }
 
 pub effect set QueryEffects = {memo.read, memo.write, decode_cache.read, decode_cache.write}
@@ -168,7 +179,6 @@ test "a second read of a parsed text reads the same derivations again" {
     },
     memo.fetch(query, input) -> b"",
     memo.output_digest(query, input) -> b"",
-    memo.is_cached(query, input) -> false,
     return done -> read,
   };
   assert(kinds.len() > 0);
@@ -179,40 +189,39 @@ pub fn text_key(source: Source) -> Bytes =
   Bytes::concat_all([source.name, b"\x00", blake3(source.source_text)])
 
 effect derivations {
-  write requested(at: Bytes) -> Unit
+  write requested(ask: DeriverRequest) -> Unit
 }
 
 fn expanded(
   source: Source,
   parsed: ParseOutput<Module>,
-) -> { given: ParsedSource, requested: List<Bytes> } / {memo.read, abort.raise} =
+) -> { given: ParsedSource, requested: List<DeriverRequest> } / {memo.read, memo.write, abort.raise} =
   handle {
     parse_from(
       0,
       source,
       parsed,
       library: Some(|ask: DeriverRequest| {
-        let at = bin::encode(ask, deriver_request_bin());
-        derivations.requested(at);
-        derived_read(at)
+        derivations.requested(ask);
+        derivation_of(ask)
       }),
     )
   } with {
-    var requested: List<Bytes> = [],
-    derivations.requested(at) -> {
-      requested = requested.push(at);
+    var requested: List<DeriverRequest> = [],
+    derivations.requested(ask) -> {
+      requested = requested.push(ask);
     },
     return given -> { given: given, requested: requested },
   }
 
 pub fn read_once(
   source: Source,
-) -> ParsedText / {memo.read, decode_cache.read, decode_cache.write, abort.raise} = {
+) -> ParsedText / {memo.read, memo.write, decode_cache.read, decode_cache.write, abort.raise} = {
   let key = text_key(source);
   match decode_cache.text_read(key) {
     Some(r) -> {
-      r.requested.fold((), |_: Unit, at: Bytes| {
-        memo.external(derived_kind, at);
+      r.requested.fold((), |_: Unit, ask: DeriverRequest| {
+        derivation_of(ask);
         ()
       });
       r

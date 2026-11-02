@@ -85,7 +85,25 @@ fn results_of_facts(
 fn live_results<[r]>(
   db: Database,
 ) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  results_of_facts(Map::new(), fact_store::entries_under[r](db, Facts, b"").values())
+  fact_store::entries_under[r](db, Inputs, b"").values().fold(
+    results_of_facts(Map::new(), fact_store::entries_under[r](db, Facts, b"").values()),
+    |live: Map<Bytes, Bool>, b: Bytes| {
+      let i = undecoded(b, stored_input_bin());
+      if i.fixed { live.insert(result_key(i.digest), true) } else { live }
+    },
+  )
+
+fn fixed_input<[r]>(
+  db: Database,
+  id: Bytes,
+) -> Option<StoredInput> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match fact_store::value_of[r](db, Inputs, id) {
+    Some(b) -> {
+      let i = undecoded(b, stored_input_bin());
+      if i.fixed { Some(i) } else { None }
+    },
+    None -> None,
+  }
 
 fn cursor_of<[r]>(
   db: Database,
@@ -115,7 +133,10 @@ fn over_database<a, [r] | e>(
     match o.looked.get(id) {
       Some(x) -> { open: o, looked: x },
       None -> {
-        let value = look(kind, at);
+        let value = match fixed_input[r](o.db, id) {
+          Some(i) -> fact_store::result_of[r](o.db, result_key(i.digest)),
+          None -> look(kind, at),
+        };
         let x = { value: value, digest: digest_of(value) };
         { open: { ..o, looked: o.looked.insert(id, x) }, looked: x }
       },
@@ -268,8 +289,32 @@ fn over_database<a, [r] | e>(
     memo_store.put_input(input) -> {
       let id = input_id(input);
       let encoded = bin::encode(input, stored_input_bin());
-      if fact_store::value_of[r](st.db, Inputs, id) != Some(encoded) {
+      let held = fact_store::value_of[r](st.db, Inputs, id);
+      if held != Some(encoded) && fixed_input[r](st.db, id) == None {
         st = { ..st, db: fact_store::with_value(st.db, Inputs, id, encoded) };
+      };
+    },
+    memo_store.fix_input(kind, at) -> {
+      let id = location_id(kind, at);
+      match if fixed_input[r](st.db, id) == None { st.looked.get(id) } else { None } {
+        Some({ value: Some(v), digest: d }) -> {
+          let stored = stored_output[r](st, d, v);
+          st = {
+            ..stored,
+            db: fact_store::with_value(
+              stored.db,
+              Inputs,
+              id,
+              bin::encode({ kind: kind, at: at, digest: d, fixed: true }, stored_input_bin()),
+            ),
+          };
+        },
+        _ -> (),
+      };
+    },
+    memo_store.delete_input(id) -> {
+      if fact_store::value_of[r](st.db, Inputs, id) != None {
+        st = { ..st, db: fact_store::without_value(st.db, Inputs, id) };
       };
     },
     memo_store.put_code(name, hash) -> {
