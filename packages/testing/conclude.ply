@@ -128,6 +128,68 @@ fn group_of(groups: List<List<Int>>) -> Map<Int, Int> =
       None -> accumulator,
     })
 
+pub type Recorded = { record: Option<Record>, update: StoreUpdate }
+
+pub const nothing_stored: StoreUpdate = { passes: [], code_passes: [], records: [] }
+
+pub fn recorded_pass<d>(
+  r: TestResult<d>,
+  declared: Test,
+  era: Bytes,
+  chosen: RunSelection,
+) -> Recorded =
+  match r.trace {
+    None -> { record: Some(Untraced), update: nothing_stored },
+    Some(trace) -> match chosen.recorded.get(r.index) {
+      None -> { record: None, update: nothing_stored },
+      Some(keys) -> {
+        let record = record_under(keys, declared.seeded, r.searched);
+        let written = match record { WrittenUnder(under) -> under, _ -> [] };
+        let coded = match chosen.codes.get(r.index) {
+          Some(cs) -> if is_written(record) { cs } else { [] },
+          None -> [],
+        };
+        {
+          record: Some(record),
+          update: {
+            passes: written.map(|k: Bytes| { key: k, trace: trace }),
+            code_passes: coded.map(|k: Bytes| { key: k, trace: trace }),
+            records: match declared.hash {
+              Some(hash) -> if is_written(record) {
+                [
+                  {
+                    key: declared.key,
+                    record: {
+                      test: hash,
+                      era: era,
+                      start: declared.start,
+                      case: declared.case,
+                      passes: written,
+                      codes: coded,
+                    },
+                  },
+                ]
+              } else { [] },
+              None -> [],
+            },
+          },
+        }
+      },
+    },
+  }
+
+pub fn stored_by<d>(
+  r: TestResult<d>,
+  declared: Test,
+  era: Bytes,
+  chosen: RunSelection,
+) -> StoreUpdate =
+  match r.failure {
+    Some(_) -> nothing_stored,
+    None -> if r.status == "timed_out" { nothing_stored }
+    else { recorded_pass(r, declared, era, chosen).update },
+  }
+
 fn tally_result<d>(
   t: Tally<d>,
   r: TestResult<d>,
@@ -164,52 +226,19 @@ fn tally_result<d>(
             changes: changes(declared.key),
           }),
         },
-      None -> match r.trace {
-        None -> { ..t, outcomes: t.outcomes.push(outcome(Some(Untraced))), passed: t.passed + 1 },
-        Some(trace) -> match chosen.recorded.get(r.index) {
-          None -> { ..t, outcomes: t.outcomes.push(outcome(None)), passed: t.passed + 1 },
-          Some(keys) -> {
-            let record = record_under(keys, declared.seeded, r.searched);
-            let noticed = match record {
-              Unobserved -> t.notices.push(UnobservedSearch(declared.key)),
-              _ -> t.notices,
-            };
-            let written = match record { WrittenUnder(under) -> under, _ -> [] };
-            let coded = match chosen.codes.get(r.index) {
-              Some(cs) -> if is_written(record) { cs } else { [] },
-              None -> [],
-            };
-            let passes = written.fold(t.passes, |accumulator: List<Pass>, k: Bytes|
-              accumulator.push({ key: k, trace: trace }));
-            let codes = coded.fold(t.codes, |accumulator: List<Pass>, k: Bytes|
-              accumulator.push({ key: k, trace: trace }));
-            let records = match declared.hash {
-              Some(hash) -> if is_written(record) {
-                t.records.push({
-                  key: declared.key,
-                  record: {
-                    test: hash,
-                    era: era,
-                    start: declared.start,
-                    case: declared.case,
-                    passes: written,
-                    codes: coded,
-                  },
-                })
-              } else { t.records },
-              None -> t.records,
-            };
-            {
-              ..t,
-              outcomes: t.outcomes.push(outcome(Some(record))),
-              passed: t.passed + 1,
-              notices: noticed,
-              passes: passes,
-              codes: codes,
-              records: records,
-            }
-          },
-        },
+      None -> {
+        let recorded = recorded_pass(r, declared, era, chosen);
+        {
+          ..t,
+          outcomes: t.outcomes.push(outcome(recorded.record)),
+          passed: t.passed + 1,
+          notices: if recorded.record == Some(Unobserved) {
+            t.notices.push(UnobservedSearch(declared.key))
+          } else { t.notices },
+          passes: t.passes.concat(recorded.update.passes),
+          codes: t.codes.concat(recorded.update.code_passes),
+          records: t.records.concat(recorded.update.records),
+        }
       },
     }
   }
@@ -375,6 +404,16 @@ test "`conclude_run` stores a passing test under its test key and code key with 
     },
   ]);
   assert_eq(c.outcomes.map(|o: Outcome<String>| o.recorded), [Some(WrittenUnder([b"t0"])), None])
+}
+
+test "`stored_by` stores what `conclude_run` stores for one result, and nothing for a failure or a timeout" {
+  let chosen = select_all(two_tests);
+  let one = |r: TestResult<String>| stored_by(r, a_test(r.index, b"adds"), snapshot, chosen);
+  let whole = |r: TestResult<String>|
+    conclude_run([a_test(r.index, b"adds")], snapshot, chosen, no_changes, [r]).store_update;
+  assert_eq(one(passing(0)), whole(passing(0)));
+  assert_eq(one(failing(0)), nothing_stored);
+  assert_eq(one({ ..passing(0), status: "timed_out" }), nothing_stored)
 }
 
 test "`conclude_run` writes the pass record of a test case with the key of its parent test and marks it as a case" {
