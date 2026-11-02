@@ -45,7 +45,7 @@ import compiler.front.facts (compiler_package, std_package, ModuleShape, ModuleT
                              named_imports, pulled_next)
 import compiler.syntax.expressions (prelude_module)
 import compiler.front.rows (Rows, Outline, OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw,
-                            outline_bin, unplaced_outline)
+                            LawOutline, outline_bin, unplaced_outline)
 import compiler.syntax.items (Module, Item, TypeItem, LawItem, ImportDeclaration, SelectedNames,
                               header, header_of, parse, is_explicit_import, InstanceItem,
                               NumericItem, NumericOperation, KeyInstance, ShowInstance, SumBody)
@@ -66,7 +66,7 @@ import compiler.store.hash.forms (CachedNode, CachedTest, CachedLaw, CachedHashe
 import compiler.front.pages (Page, module_pages, pages_bin)
 import compiler.front.checking.world (build_packages, shipped_module_exists, ModuleKey,
                                       ModuleResult, module_key_bin, interface_key_bin,
-                                      module_result_bin, shipped_names_kind, own_modules_kind,
+                                      module_result_bin, shipped_names_listed, own_modules_kind,
                                       decode_cache, QueryEffects, text_key, read_once, context_once,
                                       decoded, package_location_of, shipped_for, module_query,
                                       ModuleRead, module_origin_of, text_of, module_read,
@@ -422,10 +422,7 @@ pub fn declarers_input(name: Bytes) -> Bytes / {abort.raise} =
 
 pub fn symbols_result(input: Bytes) -> Bytes / {memo.read, memo.write, abort.raise} = {
   let shipped = input == symbols_input(true);
-  let listed = match memo.external(shipped_names_kind, b"") {
-    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
-    None -> [],
-  };
+  let listed = shipped_names_listed();
   let own = if shipped { [] } else {
     match memo.external(own_modules_kind, b"") {
       Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the program's modules"),
@@ -537,11 +534,14 @@ pub fn cycles_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let named = { module: key.module, shipped: key.shipped, tested: key.tested };
   bin::encode(
     if !current_unit(key) { [] }
-    else if key.owners.len() < 2 { [key.owners] }
+    else if key.owners.len() < 2 || signatures_rejected_in(key) { [key.owners] }
     else { call_cycles(key.owners, key.owners.map(|o: Bytes| calls_of(named, o))) },
     bin::list_bin(bin::list_bin(bin::bytes_bin())),
   )
 }
+
+fn signatures_rejected_in(key: GroupKey) -> Bool / {memo.read, abort.raise} =
+  key.owners.any(|o: Bytes| signature_rejected({ ..at_key(key), owner: o }))
 
 fn cycles_of(unit: GroupKey) -> List<List<Bytes>> / {memo.read, abort.raise} =
   decoded(
@@ -865,10 +865,13 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
         declarations_query,
         bin::encode(owner, owner_key_bin()),
         encoded_declarations(
-          declared_by(
-            if result.rejected.len() > 0 { signature_declared(owner) } else { result.declared },
-            key.module,
-            members.get(i).text.names.push(owner.owner),
+          with_module_opaque(
+            named,
+            declared_by(
+              if result.rejected.len() > 0 { signature_declared(owner) } else { result.declared },
+              key.module,
+              members.get(i).text.names.push(owner.owner),
+            ),
           ),
         ),
       )
@@ -1089,6 +1092,7 @@ fn stored_reads(
     },
     visible_modules: || visible_modules_of(named),
     every_module: || visible_modules_of(named),
+    shipped_modules: shipped_names_listed,
   }
 
 fn names_in_stored(stored: StoredDeclarations) -> List<Bytes> = stored.definitions.keys()
@@ -1402,6 +1406,18 @@ fn sibling_for_called(called: List<Bytes>) -> (Bytes) -> Sibling =
   |o: Bytes| if called.contains(o) { ByGroupResult } else { BySignature }
 
 fn finalize_group(
+  named: ModuleKey,
+  key: GroupKey,
+  members: List<OwnerFacts>,
+) -> owner_checks::GroupResult / {QueryEffects, abort.raise} =
+  if signatures_rejected_in(key) {
+    checked_group_result(
+      key.module,
+      group_checked(named, members, imports_of(key), always_entire, no_bodies),
+    )
+  } else { finalized_from_owners(named, key, members) }
+
+fn finalized_from_owners(
   named: ModuleKey,
   key: GroupKey,
   members: List<OwnerFacts>,
@@ -1722,6 +1738,41 @@ fn declared_by(
   }
 }
 
+fn with_module_opaque(
+  named: ModuleKey,
+  stored: StoredDeclarations,
+) -> StoredDeclarations / {memo.read, abort.raise} =
+  {
+    ..stored,
+    types: stored.types.fold(
+      Map::new(),
+      |found: Map<Bytes, TypeFacts>, name: Bytes, facts: TypeFacts|
+        found.insert(name, match facts.declaration.opaque {
+          None -> facts,
+          Some(written) -> match declared_name_of(
+              named,
+              named.shipped,
+              named.module,
+              TypeSpace,
+              name.slice(named.module.len() + 1, name.len()),
+            ) {
+            Some(d) -> match d.closed_by {
+              Some(c) ->
+                {
+                  ..facts,
+                  declaration: {
+                    ..facts.declaration,
+                    opaque: Some({ ..written, result: c.opaque.result, take: c.opaque.take }),
+                  },
+                },
+              None -> facts,
+            },
+            None -> facts,
+          },
+        }),
+    ),
+  }
+
 fn signature_declared(key: OwnerKey) -> StoredDeclarations / {memo.read, abort.raise} =
   decoded(
     memo.fetch(signatures_query, bin::encode(signature_unit_of(key), group_key_bin())),
@@ -1740,7 +1791,12 @@ pub fn declarations_result(input: Bytes) -> Bytes / {memo.read, memo.write, abor
 pub fn signature_declarations_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   let key = decoded(input, owner_key_bin(), "an owner's name");
   let text = owner_facts(module_key_of(key), key.owner).text;
-  encoded_declarations(declared_by(signature_declared(key), key.module, text.names.push(key.owner)))
+  encoded_declarations(
+    with_module_opaque(
+      module_key_of(key),
+      declared_by(signature_declared(key), key.module, text.names.push(key.owner)),
+    ),
+  )
 }
 
 pub fn name_declaration_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
@@ -1840,12 +1896,10 @@ pub fn module_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       else if read.problems.len() > 0 { read.problems }
       else { a.rejected };
       if rejected.len() > 0 {
-        rejected_for(
-          named.module,
-          read,
-          rejected,
-          header.len() > 0 || signatures_unreadable(named, read),
-        )
+        {
+          ..rejected_for(named.module, read, rejected, header.len() > 0 || signatures_unreadable(named, read)),
+          warnings: if header.len() > 0 || read.problems.len() > 0 { [] } else { a.warnings },
+        }
       } else {
         {
           imports: read.context.present,
@@ -1902,6 +1956,22 @@ pub fn group_listing_result(input: Bytes) -> Bytes / {memo.write, abort.raise} =
     Some(o) -> o,
     None -> owner_checks::encode_group(owner_checks::no_group),
   }
+
+pub fn checked_law_outline(
+  named: ModuleKey,
+  written: LawOutline,
+) -> LawOutline / {memo.read, abort.raise} = {
+  let owner = {
+    module: named.module,
+    shipped: named.shipped,
+    tested: named.tested,
+    owner: b"law ".concat(written.name),
+  };
+  group_listing_of(group_key_of(owner)).members.flat_map(|m: owner_checks::MemberResult|
+    m.result.laws).find(|l: LawOutline| l.name == written.name).unwrap_or(
+    written,
+  )
+}
 
 fn group_listing_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
   owner_checks::decode_group(
@@ -2182,7 +2252,7 @@ pub fn hashes_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
 
 pub const hashes_query: Bytes = b"hashes"
 
-pub type TestHash = { key: Bytes, hash: Bytes }
+pub type TestHash = { key: Bytes, hash: Bytes, listing: Bytes }
 
 pub type HashSummary = { record: Bytes, tests: List<TestHash> }
 
@@ -2197,7 +2267,8 @@ pub fn hash_summary_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
   bin::encode(
     {
       record: hashed.record,
-      tests: hashed.fixing.tests.map(|t: CachedTest| { key: t.key, hash: t.hash }),
+      tests: hashed.fixing.tests.map(|t: CachedTest|
+        { key: t.key, hash: t.hash, listing: t.listing_hash }),
     },
     hash_summary_bin(),
   )
@@ -2376,10 +2447,8 @@ pub fn program_summary_result(input: Bytes) -> Bytes / {memo.read, abort.raise} 
     let mine = own.map(|m: Bytes| summary_of({ module: m, shipped: false, tested: false }));
     let flagged = |pick: (ModuleSummary) -> Bool|
       range(0, own.len()).filter(|i: Int| pick(mine.get(i))).map(|i: Int| own.get(i));
-    let listed = (match memo.external(shipped_names_kind, b"") {
-      Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
-      None -> [],
-    }).fold(Map::new(), |found: Map<Bytes, Bool>, n: Bytes| found.insert(n, true));
+    let listed = shipped_names_listed().fold(Map::new(), |found: Map<Bytes, Bool>, n: Bytes|
+      found.insert(n, true));
     let written = range(0, own.len()).fold(Map::new(), |found: Map<Bytes, List<Bytes>>, i: Int|
       found.insert(own.get(i), mine.get(i).written));
     let pulled = iterate(
@@ -2427,10 +2496,7 @@ pub fn program_summary_result(input: Bytes) -> Bytes / {memo.read, abort.raise} 
 pub const declaring_query: Bytes = b"declaring"
 
 pub fn documenting_modules_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let shipped = match memo.external(shipped_names_kind, b"") {
-    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
-    None -> [],
-  };
+  let shipped = shipped_names_listed();
   let under = input.concat(b".");
   bin::encode(
     shipped.filter(|m: Bytes| m == input || m.starts_with(under)).fold(

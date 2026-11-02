@@ -17,7 +17,8 @@ import testing.select (Pass)
 import claims (proof_store, AcceptResult, ClaimsEntry)
 import std.env (env)
 import proof.obligation (ClaimSnapshot)
-import tester (result_cache, LastPass, StoreResult)
+import tester (result_cache, LastPass, StoreResult, ListingRequest, CasesListed, ListedCase,
+               listed_case_bin)
 import sources
 import std.path (strip_root)
 import semantics (semantics)
@@ -202,7 +203,7 @@ fn cache_warnings(cache: tables::Cache) -> List<Diagnostic> =
 
 pub fn with_result_cache<a | e>(
   opened_store: Option<OpenStore>,
-  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results | e},
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
   handle {
     go()
@@ -274,7 +275,49 @@ pub fn with_result_cache<a | e>(
         { unflushed: None, warnings: cache_warnings(c) }
       },
     },
+    result_cache.listings(requests) -> match store_state {
+      None -> requests.map(|r: ListingRequest| None),
+      Some(k) -> {
+        let o = listings_over(k.cache, requests);
+        store_state = Some({ ..k, cache: o.cache });
+        o.value
+      },
+    },
+    result_cache.keep_listings(listed) -> match store_state {
+      None -> (),
+      Some(k) -> {
+        store_state = Some({
+          ..k,
+          cache: listed.fold(k.cache, |c: tables::Cache, l: CasesListed|
+            tables::put_case_listing(c, l.test, {
+              listing: l.listing,
+              cases: bin::encode(l.cases, bin::list_bin(listed_case_bin())),
+            })),
+        });
+      },
+    },
   }
+
+fn listings_over(
+  c0: tables::Cache,
+  requests: List<ListingRequest>,
+) -> StoreRead<List<Option<List<ListedCase>>>> / {abort.raise} =
+  requests.fold(
+    { value: [], cache: c0 },
+    |read: StoreRead<List<Option<List<ListedCase>>>>, r: ListingRequest| {
+      let got = tables::case_listing(read.cache, r.test);
+      let cases = match got.value {
+        Some(l) -> if l.listing != r.listing { None } else {
+          match bin::decode(l.cases, bin::list_bin(listed_case_bin())) {
+            Ok(listed) -> Some(listed),
+            Err(_) -> None,
+          }
+        },
+        None -> None,
+      };
+      { value: read.value.push(cases), cache: got.cache }
+    },
+  )
 
 fn cached_over(cache: tables::Cache, keys: List<String>) -> List<Option<Bytes>> / {abort.raise} =
   keys.map(|key: String| tables::evidence(cache, Bytes::of_hex(key)).value)
@@ -473,6 +516,7 @@ const a_module: ModuleHashes = {
         refs: [{ name: b"m.f", declaration: false }],
         runs: [],
         listing: [],
+        listing_hash: b"",
       },
     ],
     laws: [],
@@ -500,7 +544,7 @@ const an_update: StoreUpdate =
 const some_stamps: tables::Stamps = { runtime_digest: "runtime", code: "code" }
 
 const original_definition: { hash: Bytes, text: Bytes } =
-  { hash: hashed("old f"), text: b"fn f() -> Int = 1\n" }
+  { hash: blake3(b"m.f"), text: b"fn f() -> Int = 1\n" }
 
 fn read_back(
   f: StoreUpdate,

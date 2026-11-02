@@ -51,7 +51,7 @@ import compiler.store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, Node, 
                                   type_target, effect_target, is_cyclic)
 import compiler.store.hash.encoding (Choice, CallSite, Known, CallResolution, Pending,
                                      call_resolution_bin, spec_tag)
-import compiler.store.hash.stored (Template, template_bin)
+import compiler.store.hash.stored (Template, TestOf, template_bin)
 import compiler.store.hash.template (node_template, test_template, law_template, spec_template,
                                      expression_template, renumbered, emitted_code)
 import compiler.store.hash.fill (Substitution, blank, FilledForm, fill, references,
@@ -383,6 +383,7 @@ pub type HashOutput = {
   test_runs: Map<Bytes, List<Int>>,
   law_refs: Map<Bytes, List<Int>>,
   component_members: List<List<Int>>,
+  listing_hashes: Map<Bytes, Bytes>,
 }
 
 pub type Refs = {
@@ -442,7 +443,7 @@ pub type NodeForm = {
 
 pub type ClauseForm = { kind: Int, form: Template }
 
-pub type ItemForm = { form: Template, case_refs: List<Int>, listing: List<Int> }
+pub type ItemForm = { form: Template, case_refs: List<Int>, listing: Option<Template> }
 
 pub type HashItem = { key: Bytes, form: Option<ItemForm> }
 
@@ -639,6 +640,7 @@ type HashTables = {
   enumerations: List<List<Int>>,
   clauses: List<List<Int>>,
   test_listings: List<List<Int>>,
+  test_listing_hashes: List<Bytes>,
 }
 
 type TestHashes = {
@@ -648,6 +650,7 @@ type TestHashes = {
   refs: List<List<Int>>,
   runs: List<List<Int>>,
   listings: List<List<Int>>,
+  listing_hashes: List<Bytes>,
 }
 
 type ComponentKeys = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, computed: Map<Int, Bytes> }
@@ -712,13 +715,20 @@ fn test_form(
     ),
     case_refs: listed_refs(index, t),
     listing: match t.definition.cases {
-      Some(c) -> expression_references(expression_template(index, t.module, [], test_listing(c))),
-      None -> [],
+      Some(c) ->
+        Some(
+          TestOf({
+            nondet: false,
+            cases: None,
+            body: expression_template(index, t.module, [], test_listing(c)),
+          }),
+        ),
+      None -> None,
     },
   }
 
 fn law_form(index: Index, l: LawNode) -> ItemForm / {abort.raise} =
-  { form: law_template(index, l.module, l.definition), case_refs: [], listing: [] }
+  { form: law_template(index, l.module, l.definition), case_refs: [], listing: None }
 
 type Shaped = { shapes: HashInput, first: List<FirstPass> }
 
@@ -916,6 +926,7 @@ pub type CachedTest = {
   refs: List<NodeRef>,
   runs: List<NodeRef>,
   listing: List<NodeRef>,
+  listing_hash: Bytes,
 }
 
 pub type CachedLaw = { key: Bytes, hash: Bytes, text: Bytes, refs: List<NodeRef> }
@@ -1074,7 +1085,7 @@ pub fn hash_all(
   let contracts = contracts_of(over, cached, hashes);
   let checks = check_key_components(over, contracts, cached, hashes);
   let tests = shapes.tests.fold(
-    { hashes: [], bodies: [], texts: [], refs: [], runs: [], listings: [] },
+    { hashes: [], bodies: [], texts: [], refs: [], runs: [], listings: [], listing_hashes: [] },
     |accumulator: TestHashes, t: HashItem|
       match t.form {
         None -> match held_tests.get(t.key) {
@@ -1086,6 +1097,7 @@ pub fn hash_all(
               refs: accumulator.refs.push(present(x.refs)),
               runs: accumulator.runs.push(present(x.runs)),
               listings: accumulator.listings.push(present(x.listing)),
+              listing_hashes: accumulator.listing_hashes.push(x.listing_hash),
             },
           None -> panic("a test has no template to hash and no cached hash"),
         },
@@ -1102,7 +1114,17 @@ pub fn hash_all(
               form.case_refs.fold(referenced, |rs: List<Int>, r: Int| rs.push_unique(r)),
             ),
             runs: accumulator.runs.push(referenced),
-            listings: accumulator.listings.push(form.listing),
+            listings: accumulator.listings.push(match form.listing {
+              Some(l) -> references(l),
+              None -> [],
+            }),
+            listing_hashes: accumulator.listing_hashes.push(match form.listing {
+              Some(l) ->
+                blake3(
+                  filled_under(over, l, hashes, slots_under(over, references(l)), false).bytes,
+                ),
+              None -> b"",
+            }),
           }
         },
       },
@@ -1181,6 +1203,7 @@ pub fn hash_all(
           None -> match cached.get(v) { Some(f) -> present(f.clauses), None -> [] },
         }),
       test_listings: tests.listings,
+      test_listing_hashes: tests.listing_hashes,
     },
   }
 }
@@ -1455,8 +1478,10 @@ pub fn selection_forms(
   let test_forms = tests.map(|t: TestNode| test_form(index, t, chosen.called));
   let law_forms = laws.map(|l: LawNode| law_form(index, l));
   let item_nodes = |accumulator: NodeOrder, x: ItemForm|
-    x.case_refs.concat(x.listing).fold(form_nodes(x.form, accumulator), |a: NodeOrder, v: Int|
-      add_node(a, v));
+    x.case_refs.fold(
+      optional_form_nodes(x.listing, form_nodes(x.form, accumulator)),
+      |a: NodeOrder, v: Int| add_node(a, v),
+    );
   let table = law_forms.fold(
     test_forms.fold(
       forms.fold(
@@ -1476,7 +1501,7 @@ pub fn selection_forms(
     {
       form: renumber(x.form, ids),
       case_refs: x.case_refs.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
-      listing: x.listing.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
+      listing: x.listing.map(|l: Template| renumber(l, ids)),
     };
   {
     nodes: range(0, table.order.len()).map(|k: Int| {
@@ -1546,7 +1571,7 @@ pub fn joined_forms(parts: List<HashInput>) -> HashInput / {abort.raise} = {
               form: renumber(f.form, ids.get(k)),
               case_refs: f.case_refs.map(|v: Int|
                 match ids.get(k).get(v) { Some(w) -> w, None -> v }),
-              listing: f.listing.map(|v: Int| match ids.get(k).get(v) { Some(w) -> w, None -> v }),
+              listing: f.listing.map(|l: Template| renumber(l, ids.get(k))),
             }),
         },
       };
@@ -1678,6 +1703,7 @@ pub fn hash_forms(forms: HashInput, fixed: List<CachedNode>) -> CachedHashes / {
         refs: refs(h.test_refs.get(i)),
         runs: refs(h.test_runs.get(i)),
         listing: refs(h.test_listings.get(i)),
+        listing_hash: h.test_listing_hashes.get(i),
       }),
     laws: range(0, forms.laws.len()).map(|i: Int|
       {
@@ -1803,6 +1829,7 @@ pub fn cached_hashes_of(
           refs: refs(of_key(hashes.test_refs, t.key)),
           runs: refs(of_key(hashes.test_runs, t.key)),
           listing: refs(match hashes.refs.listings.get(t.key) { Some(xs) -> xs, None -> [] }),
+          listing_hash: of_key(hashes.listing_hashes, t.key),
         })
       }
     }),
@@ -1936,6 +1963,7 @@ pub fn assemble(
     test_runs: by_key(tests, h.test_runs),
     law_refs: by_key(sk.laws, h.law_refs),
     component_members: h.enumerations,
+    listing_hashes: by_key(tests, h.test_listing_hashes),
   };
   sk.order.fold(
     { out: empty, dependencies_at: Map::new() },
@@ -2061,6 +2089,7 @@ pub fn hashes_from_cache(sk: HashLayout, fixing: CachedHashes) -> HashOutput / {
       clauses: range(0, sk.nodes.len()).map(|v: Int|
         match cached_by_node.get(v) { Some(f) -> ids(f.clauses), None -> [] }),
       test_listings: tested.map(|t: CachedTest| ids(t.listing)),
+      test_listing_hashes: tested.map(|t: CachedTest| t.listing_hash),
     },
   )
 }
