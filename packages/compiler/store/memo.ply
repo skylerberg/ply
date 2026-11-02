@@ -14,9 +14,7 @@ pub effect memo {
   write fix(kind: Bytes, at: Bytes) -> Unit
 }
 
-pub type Dependency =
-  | ExternalDependency(Bytes, Bytes, Bytes)
-  | QueryDependency(Bytes, Bytes, Bytes)
+pub type Dependency = | ExternalDependency(Bytes, Bytes, Bytes) | QueryDependency(Bytes, Bytes)
 
 pub type StoredFact = { output: Bytes, details: Bytes, depth: Int, written_by: Bytes }
 
@@ -149,8 +147,12 @@ pub fn queries_id<| e>(queries: Map<Bytes, Query<| e>>) -> Bytes =
     ),
   )
 
-pub fn details_digest(d: FactDetails) -> Bytes / {abort.raise} =
-  blake3(bin::encode(d, fact_details_bin()))
+pub type EncodedDetails = { details: FactDetails, encoded: Bytes, digest: Bytes }
+
+pub fn encoded_details(d: FactDetails) -> EncodedDetails / {abort.raise} = {
+  let encoded = bin::encode(d, fact_details_bin());
+  { details: d, encoded: encoded, digest: blake3(encoded) }
+}
 
 const sealed_kind: Bytes = b"sealed"
 
@@ -169,7 +171,7 @@ pub effect memo_store {
   read external_digest(kind: Bytes, at: Bytes) -> Bytes
   read is_out_of_date(key: Bytes) -> Bool
   read next_out_of_date() -> Option<Waited>
-  write put(key: Bytes, fact: StoredFact, details: FactDetails, output: Bytes, lasting: Bool) -> Unit
+  write put(key: Bytes, fact: StoredFact, details: FactDetails, encoded_details: Bytes, output: Bytes, lasting: Bool) -> Unit
   write keep_output(digest: Bytes, output: Bytes, lasting: Bool) -> Unit
   write put_fact(key: Bytes, fact: StoredFact) -> Unit
   write delete(key: Bytes) -> Unit
@@ -215,7 +217,7 @@ fn marked_dependents(key: Bytes) -> Unit / {memo_store.read, memo_store.write} =
 
 fn dependency_id(r: Dependency) -> Bytes / {abort.raise} =
   match r {
-    QueryDependency(name, input, _) -> fact_key(name, input),
+    QueryDependency(key, _) -> key,
     ExternalDependency(kind, at, _) -> location_id(kind, at),
   }
 
@@ -476,13 +478,12 @@ pub fn query_output<| e>(
 ) -> QueryResult / {memo_store.read, memo_store.write, abort.raise | e} = {
   let q = query_of(queries, name);
   let ready = match q.product { Some(p) -> product_caught_up(queries, run, p), None -> run };
-  let a = fetched(queries, ready, q, key_of(q, input), input, 100000);
+  let key = key_of(q, input);
+  let a = fetched(queries, ready, q, key, input, 100000);
   {
     run: {
       ..a.run,
-      requested_dependencies: a.run.requested_dependencies.push(
-        QueryDependency(name, input, a.at.digest),
-      ),
+      requested_dependencies: a.run.requested_dependencies.push(QueryDependency(key, a.at.digest)),
     },
     output: a.output,
   }
@@ -661,11 +662,14 @@ fn reads_still_hold<| e>(
         match r {
           ExternalDependency(kind, at, digest) ->
             { run: sofar.run, same: memo_store.external_digest(kind, at) == digest },
-          QueryDependency(name, input, digest) -> match queries.get(name) {
+          QueryDependency(key, digest) -> match details_before(memo_store.fact(key)) {
             None -> { run: sofar.run, same: false },
-            Some(aq) -> {
-              let a = settled(queries, sofar.run, aq, key_of(aq, input), input, left - 1);
-              { run: a.run, same: a.at.digest == digest }
+            Some(d) -> match queries.get(d.query) {
+              None -> { run: sofar.run, same: false },
+              Some(aq) -> {
+                let a = settled(queries, sofar.run, aq, key, d.input, left - 1);
+                { run: a.run, same: a.at.digest == digest }
+              },
             },
           },
         }
@@ -719,40 +723,25 @@ fn written_fact<| e>(
   let key = key_of(q, input);
   let digest = digest_of(Some(output));
   let stored = memo_store.fact(key);
-  let details = { query: name, code: q.hash, input: input, reads: [], wrote: [] };
+  let written = encoded_details({ query: name, code: q.hash, input: input, reads: [], wrote: [] });
+  let put = ||
+    memo_store.put(
+      key,
+      { output: digest, details: written.digest, depth: s.depth + 1, written_by: writer },
+      written.details,
+      written.encoded,
+      output,
+      q.persistent,
+    );
   match stored {
     Some(f) -> if f.output == digest && f.written_by == writer {
       memo_store.keep_output(digest, output, q.persistent)
     } else {
       edges_updated(key, reads_in(details_before(stored)), []);
       if f.output != digest { marked_dependents(key) };
-      memo_store.put(
-        key,
-        {
-          output: digest,
-          details: details_digest(details),
-          depth: s.depth + 1,
-          written_by: writer,
-        },
-        details,
-        output,
-        q.persistent,
-      )
+      put()
     },
-    None -> {
-      memo_store.put(
-        key,
-        {
-          output: digest,
-          details: details_digest(details),
-          depth: s.depth + 1,
-          written_by: writer,
-        },
-        details,
-        output,
-        q.persistent,
-      )
-    },
+    None -> put(),
   };
   { ..s, wrote: s.wrote.push({ key: key, output: digest }) }
 }
@@ -777,8 +766,14 @@ fn recorded<| e>(
   } else {
     {
       let before = details_before(stored);
-      let details = { query: q.name, code: q.hash, input: input, reads: s.reads, wrote: s.wrote };
-      let d = details_digest(details);
+      let details = encoded_details({
+        query: q.name,
+        code: q.hash,
+        input: input,
+        reads: s.reads,
+        wrote: s.wrote,
+      });
+      let d = details.digest;
       edges_updated(key, reads_in(before), s.reads);
       let written = s.wrote.fold(Map::new(), |found: Map<Bytes, Bool>, w: WrittenFact|
         found.insert(w.key, true));
@@ -791,7 +786,8 @@ fn recorded<| e>(
         memo_store.put(
           key,
           { output: digest, details: d, depth: depth, written_by: b"" },
-          details,
+          details.details,
+          details.encoded,
           output,
           q.persistent,
         )
@@ -838,14 +834,14 @@ fn execute<| e>(
         found: found,
       }
     };
-    let used = |s: Execution, read: Bytes, name: Bytes, query_input: Bytes, at: Settled| {
+    let used = |s: Execution, read: Bytes, at: Settled| {
       if at.sealed {
         memo_store.put_input({ kind: sealed_kind, at: read, digest: at.digest, fixed: false })
       };
       if s.query_reads.contains(read) { { ..s, depth: max(s.depth, at.depth) } } else {
         {
           ..s,
-          reads: s.reads.push(QueryDependency(name, query_input, at.digest)),
+          reads: s.reads.push(QueryDependency(read, at.digest)),
           query_reads: s.query_reads.insert(read, true),
           depth: max(s.depth, at.depth),
         }
@@ -864,14 +860,14 @@ fn execute<| e>(
         let aq = query_of(queries, name);
         let read = key_of(aq, query_input);
         let a = fetched(queries, st.run, aq, read, query_input, left - 1);
-        st = used({ ..st, run: a.run }, read, name, query_input, a.at);
+        st = used({ ..st, run: a.run }, read, a.at);
         a.output
       },
       memo.output_digest(name, query_input) -> {
         let aq = query_of(queries, name);
         let read = key_of(aq, query_input);
         let a = settled(queries, st.run, aq, read, query_input, left - 1);
-        st = used({ ..st, run: a.run }, read, name, query_input, a.at);
+        st = used({ ..st, run: a.run }, read, a.at);
         a.at.digest
       },
       memo.stored_output(digest) -> memo_store.output(digest),
@@ -896,10 +892,10 @@ fn execute<| e>(
     { run: ran.st.run, at: at }
   }
 
-fn reads_moved(s: Execution) -> Bool / {abort.raise} =
+fn reads_moved(s: Execution) -> Bool =
   s.reads.any(|r: Dependency|
     match r {
-      QueryDependency(name, input, digest) -> match s.run.resolved.get(fact_key(name, input)) {
+      QueryDependency(key, digest) -> match s.run.resolved.get(key) {
         Some(at) -> at.digest != digest,
         None -> false,
       },
@@ -921,10 +917,7 @@ pub fn reachable_keys<| e>(
 ) -> List<Bytes> / {memo_store.read, abort.raise} = {
   let query_keys = |reads: List<Dependency>|
     reads.fold([], |keys: List<Bytes>, r: Dependency|
-      match r {
-        QueryDependency(name, input, _) -> keys.push(fact_key(name, input)),
-        ExternalDependency(_, _, _) -> keys,
-      });
+      match r { QueryDependency(key, _) -> keys.push(key), ExternalDependency(_, _, _) -> keys });
   iterate(
     { seen: Map::new(), work: query_keys(run.requested_dependencies), next: 0, keys: [] },
     1099511627776,
@@ -1177,7 +1170,7 @@ pub fn with_memory_store<a | e>(
       store = { ..store, facts: store.facts.insert(key, fact) };
     },
     memo_store.next_out_of_date() -> first_waiting(running.waiting),
-    memo_store.put(key, fact, details, output, lasting) -> {
+    memo_store.put(key, fact, details, _, output, lasting) -> {
       let persisted = lasting || inline_output(output) != None;
       running = if persisted { running }
       else { { ..running, transient: running.transient.insert(fact.output, output) } };
