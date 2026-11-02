@@ -600,17 +600,8 @@ pub fn group_imports_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise}
   let key = decoded(input, group_key_bin(), "a group's names");
   if !current(key) { bin::encode([], bin::list_bin(imported_bin())) } else {
     let named = { module: key.module, shipped: key.shipped, tested: key.tested };
-    let context = context_once(named);
-    let members = key.owners.map(|o: Bytes| owner_facts(named, o));
     bin::encode(
-      group_imports(
-        key.module,
-        members.map(|f: OwnerFacts| f.text),
-        members.fold([], |accumulator: List<Mention>, f: OwnerFacts|
-          accumulator.concat(f.mentions)),
-        context.imports,
-        context.targets,
-      ),
+      imports_of_members(named, key.owners.map(|o: Bytes| owner_facts(named, o))),
       bin::list_bin(imported_bin()),
     )
   }
@@ -866,9 +857,7 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
         group_checked(named, members, imports_of(key), always_entire, no_bodies),
       )
     } else { finalize_group(named, key, members) };
-    let result = if checked.rejected.len() > 0 && reads_rejected_signature(key, members) {
-      owner_checks::no_group
-    } else { checked };
+    let result = checked_reading_rejected(named, key, members, checked);
     memo.provide(
       group_listing_query,
       input,
@@ -944,20 +933,77 @@ fn signature_rejected(at: OwnerKey) -> Bool / {memo.read, abort.raise} =
     "whether a signature was rejected",
   )
 
-fn reads_rejected_signature(
+fn rejected_reads(
   key: GroupKey,
   members: List<OwnerFacts>,
-) -> Bool / {memo.read, abort.raise} = {
+) -> List<OwnerKey> / {memo.read, abort.raise} = {
   let named = { module: key.module, shipped: key.shipped, tested: key.tested };
   let unit = unit_key_of({ ..at_key(key), owner: key.owners.at_or(0, b"") }).owners;
   mentions_of(members).filter(|m: Mention| m.module.len() > 0).fold(
     Map::new(),
     |found: Map<Bytes, Mention>, m: Mention| found.insert(mention_key(m), m),
   ).values(
-  ).any(|m: Mention|
-    owners_declaring(named, named.shipped, m.module, m.name).any(|at: OwnerKey|
+  ).flat_map(|m: Mention|
+    owners_declaring(named, named.shipped, m.module, m.name).filter(|at: OwnerKey|
       !(at.module == key.module && unit.contains(at.owner)) && signature_rejected(at)))
 }
+
+fn imports_of_members(
+  named: ModuleKey,
+  members: List<OwnerFacts>,
+) -> List<Imported> / {SessionReads, abort.raise} = {
+  let context = context_once(named);
+  group_imports(
+    named.module,
+    members.map(|f: OwnerFacts| f.text),
+    members.fold([], |accumulator: List<Mention>, f: OwnerFacts| accumulator.concat(f.mentions)),
+    context.imports,
+    context.targets,
+  )
+}
+
+fn checked_beside(
+  named: ModuleKey,
+  key: GroupKey,
+  members: List<OwnerFacts>,
+  beside: List<Bytes>,
+) -> owner_checks::GroupResult / {QueryEffects, abort.raise} = {
+  let all = members.concat(beside.map(|o: Bytes| owner_facts(named, o)));
+  let c = group_checked(named, all, imports_of_members(named, all), always_entire, no_bodies);
+  let own = owner_checks::group_result(
+    c.out.pulled.out,
+    c.out.at,
+    c.source.source.source_text,
+    key.module,
+    members.map(|f: OwnerFacts| f.text),
+    c.source.items.filter(|x: ItemAt| key.owners.contains(x.owner)),
+    |x: ItemAt| c.source.offset + x.from,
+  );
+  { ..own, rejected: own.rejected.filter(|d: Diagnostic| d.labels.len() > 0) }
+}
+
+fn checked_reading_rejected(
+  named: ModuleKey,
+  key: GroupKey,
+  members: List<OwnerFacts>,
+  checked: owner_checks::GroupResult,
+) -> owner_checks::GroupResult / {QueryEffects, abort.raise} =
+  if checked.rejected.len() == 0 { checked } else {
+    match rejected_reads(key, members) {
+      [] -> checked,
+      rejected -> if rejected.any(|at: OwnerKey| at.module != key.module) { owner_checks::no_group }
+      else {
+        checked_beside(
+          named,
+          key,
+          members,
+          rejected.flat_map(|at: OwnerKey| signature_unit_of(at).owners).unique().filter(
+            |o: Bytes| !key.owners.contains(o),
+          ),
+        )
+      },
+    }
+  }
 
 fn at_key(key: GroupKey) -> OwnerKey =
   { module: key.module, shipped: key.shipped, tested: key.tested, owner: b"" }
