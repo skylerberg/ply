@@ -33,8 +33,8 @@ import compiler.check.types (Resource, SingletonResource, ResourceVariable, Effe
 import compiler.check.known (BuiltinSum, builtin_types, builtin_sums, char_type, instant_type,
                              duration_type, task_type, chan_type, scoped_name, scoped_type,
                              map_parts)
-import compiler.check.termination (Callee, Termination, Summary, summary_bin, termination_bin,
-                                   callee_bin)
+import compiler.check.termination (summary_facts, Callee, Termination, Terminates, Summary,
+                                   summary_bin, termination_bin, callee_bin)
 import compiler.check.resolve.tables (ParsedModule, Resolution, Scope, Diagnostic, diagnostic_bin,
                                       Label, error_with_labels, error_at, error_at_and)
 import compiler.expand.rewrite (MemberCallee)
@@ -46,7 +46,7 @@ import std.bytes (ascii_of_int)
 import std.option
 import std.string
 import compiler.check.guards (Guards, Contract, Clause)
-import compiler.check.borrowing (ParameterMode, ParameterModes, parameter_mode)
+import compiler.check.borrowing (ParameterMode, ParameterModes, mode_facts, parameter_mode)
 import compiler.check.infer.walked (WalkedNode, WalkedTree)
 import compiler.check.typed (TypedRelease)
 
@@ -464,6 +464,53 @@ pub type BodyChecking =
 
 pub type ReusedBody = { body: CheckedBody, facts: Bytes }
 
+pub type AliasFacts = { t: Type, keys: List<MapKeySite> }
+
+pub type TypeFacts = {
+  declaration: TypeDeclaration,
+  constructors: List<ConstructorInfo>,
+  alias: Option<AliasFacts>,
+  record: Option<RecordDeclaration>,
+  stated: Option<List<DefinitionConstraint>>,
+  ordered_parameters: Option<List<Int>>,
+  numeric: Option<NumericInfo>,
+  instances: List<InstanceInfo>,
+  keyed: Bool,
+  release_function: Option<Bytes>,
+  resource: Bool,
+}
+
+pub type DefinitionFacts = {
+  definition: DefinitionInfo,
+  contract: Option<Contract>,
+  constraints: Option<List<DefinitionConstraint>>,
+  parameters: Option<List<Int>>,
+  modes: Option<ParameterModes>,
+  summary: Option<Summary>,
+}
+
+pub effect program {
+  read type_named(name: Bytes) -> Option<TypeFacts>
+  read effect_named(name: Bytes) -> Option<EffectInfo>
+  read constructor_named(name: Bytes) -> Option<ConstructorInfo>
+  read definition_named(name: Bytes) -> Option<DefinitionFacts>
+}
+
+pub fn with_no_other_definitions<a | e>(
+  body: () -> a / {program.read, mode_facts.read, summary_facts.read | e},
+) -> a / e =
+  handle {
+    body()
+  } with {
+    program.type_named(name) -> None,
+    program.effect_named(name) -> None,
+    program.constructor_named(name) -> None,
+    program.definition_named(name) -> None,
+    mode_facts.modes_named(name) -> None,
+    summary_facts.summary_stored(name) -> None,
+    summary_facts.ending_stored(name) -> None,
+  }
+
 pub type Checker = {
   resolved: Resolution,
   modules: List<ParsedModule>,
@@ -494,7 +541,7 @@ pub type Checker = {
   parameter_modes: Map<Bytes, ParameterModes>,
   auto_type_params: Bool,
   alias_stack: List<Bytes>,
-  aliases: Map<Bytes, { t: Type, keys: List<MapKeySite> }>,
+  aliases: Map<Bytes, AliasFacts>,
   nominals: Map<Bytes, RecordDeclaration>,
   rejected_effects: List<Location>,
   performs: List<PerformSite>,
@@ -945,8 +992,11 @@ pub fn add_constructor(checker: Checker, info: ConstructorInfo) -> Checker =
     constructor_index: checker.constructor_index.insert(info.name, checker.constructors.len()),
   }
 
-pub fn constructor_of(checker: Checker, name: Bytes) -> Option<ConstructorInfo> =
-  match checker.constructor_index.get(name) { Some(i) -> checker.constructors.at(i), None -> None }
+pub fn constructor_of(checker: Checker, name: Bytes) -> Option<ConstructorInfo> / {program.read} =
+  match checker.constructor_index.get(name) {
+    Some(i) -> checker.constructors.at(i),
+    None -> program.constructor_named(name),
+  }
 
 pub fn add_effect(checker: Checker, info: EffectInfo) -> Checker =
   {
@@ -955,11 +1005,139 @@ pub fn add_effect(checker: Checker, info: EffectInfo) -> Checker =
     effect_index: checker.effect_index.insert(info.name, checker.effects.len()),
   }
 
-pub fn effect_of(checker: Checker, name: Bytes) -> Option<EffectInfo> / {abort.raise} =
-  match checker.effect_index.get(name) { Some(i) -> Some(checker.effects.get(i)), None -> None }
+pub fn effect_of(
+  checker: Checker,
+  name: Bytes,
+) -> Option<EffectInfo> / {program.read, abort.raise} =
+  match checker.effect_index.get(name) {
+    Some(i) -> Some(checker.effects.get(i)),
+    None -> program.effect_named(name),
+  }
 
-pub fn definition_of(checker: Checker, name: Bytes) -> Option<DefinitionInfo> =
-  match checker.definition_index.get(name) { Some(i) -> checker.definitions.at(i), None -> None }
+pub fn definition_of(checker: Checker, name: Bytes) -> Option<DefinitionInfo> / {program.read} =
+  match checker.definition_index.get(name) {
+    Some(i) -> checker.definitions.at(i),
+    None -> match program.definition_named(name) { Some(f) -> Some(f.definition), None -> None },
+  }
+
+fn type_facts<a>(name: Bytes, field: (TypeFacts) -> Option<a>) -> Option<a> / {program.read} =
+  match program.type_named(name) { Some(f) -> field(f), None -> None }
+
+fn definition_facts<a>(
+  name: Bytes,
+  field: (DefinitionFacts) -> Option<a>,
+) -> Option<a> / {program.read} =
+  match program.definition_named(name) { Some(f) -> field(f), None -> None }
+
+pub fn type_declared(checker: Checker, name: Bytes) -> Option<TypeDeclaration> / {program.read} =
+  match checker.types.get(name) {
+    Some(t) -> Some(t),
+    None -> type_facts(name, |f: TypeFacts| Some(f.declaration)),
+  }
+
+pub fn is_type_declared(checker: Checker, name: Bytes) -> Bool / {program.read} =
+  type_declared(checker, name) != None
+
+pub fn record_declared(
+  checker: Checker,
+  name: Bytes,
+) -> Option<RecordDeclaration> / {program.read} =
+  match checker.nominals.get(name) {
+    Some(r) -> Some(r),
+    None -> type_facts(name, |f: TypeFacts| f.record),
+  }
+
+pub fn is_record_declared(checker: Checker, name: Bytes) -> Bool / {program.read} =
+  record_declared(checker, name) != None
+
+pub fn alias_declared(checker: Checker, name: Bytes) -> Option<AliasFacts> / {program.read} =
+  match checker.aliases.get(name) {
+    Some(a) -> Some(a),
+    None -> type_facts(name, |f: TypeFacts| f.alias),
+  }
+
+pub fn stated_of(
+  checker: Checker,
+  name: Bytes,
+) -> Option<List<DefinitionConstraint>> / {program.read} =
+  match checker.stated.get(name) {
+    Some(s) -> Some(s),
+    None -> type_facts(name, |f: TypeFacts| f.stated),
+  }
+
+pub fn ordered_parameters_of(checker: Checker, name: Bytes) -> Option<List<Int>> / {program.read} =
+  match checker.ordered_parameters.get(name) {
+    Some(p) -> Some(p),
+    None -> type_facts(name, |f: TypeFacts| f.ordered_parameters),
+  }
+
+pub fn release_function_of(checker: Checker, name: Bytes) -> Option<Bytes> / {program.read} =
+  match checker.release_functions.get(name) {
+    Some(by) -> Some(by),
+    None -> type_facts(name, |f: TypeFacts| f.release_function),
+  }
+
+pub fn has_release_function(checker: Checker, name: Bytes) -> Bool / {program.read} =
+  release_function_of(checker, name) != None
+
+pub fn declared_resource(checker: Checker, name: Bytes) -> Bool / {program.read} =
+  checker.resource_types.contains(name)
+    || type_facts(name, |f: TypeFacts| if f.resource { Some(true) } else { None }) != None
+
+pub fn is_keyed(checker: Checker, name: Bytes) -> Bool / {program.read} =
+  checker.keyed_names.contains(name)
+    || type_facts(name, |f: TypeFacts| if f.keyed { Some(true) } else { None }) != None
+
+pub fn constructors_of_type(
+  checker: Checker,
+  name: Bytes,
+) -> List<ConstructorInfo> / {program.read} = {
+  let local = checker.constructors.filter(|c: ConstructorInfo| c.type_name == name);
+  if local.len() > 0 { local }
+  else { match program.type_named(name) { Some(f) -> f.constructors, None -> [] } }
+}
+
+pub fn contract_named(checker: Checker, name: Bytes) -> Option<Contract> / {program.read} =
+  match checker.contracts.get(name) {
+    Some(k) -> Some(k),
+    None -> definition_facts(name, |f: DefinitionFacts| f.contract),
+  }
+
+pub fn has_contract(checker: Checker, name: Bytes) -> Bool / {program.read} =
+  contract_named(checker, name) != None
+
+pub fn modes_of(checker: Checker, name: Bytes) -> Option<ParameterModes> / {mode_facts.read} =
+  match checker.parameter_modes.get(name) {
+    Some(m) -> Some(m),
+    None -> mode_facts.modes_named(name),
+  }
+
+pub fn parameters_of(checker: Checker, name: Bytes) -> Option<List<Int>> / {program.read} =
+  match checker.function_parameters.get(name) {
+    Some(p) -> Some(p),
+    None -> definition_facts(name, |f: DefinitionFacts| f.parameters),
+  }
+
+pub fn constraints_of(
+  checker: Checker,
+  name: Bytes,
+) -> Option<List<DefinitionConstraint>> / {program.read} =
+  match checker.constraints.get(name) {
+    Some(c) -> Some(c),
+    None -> definition_facts(name, |f: DefinitionFacts| f.constraints),
+  }
+
+pub fn ending_named(checker: Checker, name: Bytes) -> Termination / {summary_facts.read} =
+  match checker.definition_index.get(name) {
+    Some(i) -> match checker.definitions.at(i) { Some(d) -> d.ending, None -> Terminates },
+    None -> match summary_facts.ending_stored(name) { Some(e) -> e, None -> Terminates },
+  }
+
+pub fn summary_named(checker: Checker, name: Bytes) -> Option<Summary> / {summary_facts.read} =
+  match checker.summaries.get(name) {
+    Some(k) -> Some(k),
+    None -> summary_facts.summary_stored(name),
+  }
 
 pub fn set_definition(checker: Checker, info: DefinitionInfo) -> Checker / {abort.raise} =
   match checker.definition_index.get(info.name) {

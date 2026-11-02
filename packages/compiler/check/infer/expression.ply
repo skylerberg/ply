@@ -1,3 +1,8 @@
+import compiler.check.borrowing (mode_facts)
+import compiler.check.termination (summary_facts)
+import compiler.check.infer.checker (program)
+import compiler.check.infer.checker (type_declared, is_type_declared, contract_named, parameters_of,
+                                     constraints_of)
 import compiler.syntax.parsing (Span, Identifier, QName, span_to, is_bare, qualified_name_text,
                                 bare, prelude_binder, synthetic_span_at, synthetic_span,
                                 role_member_receiver, role_member_callee, role_scope_acquire,
@@ -122,7 +127,7 @@ import compiler.check.infer.walked (WalkedExpression, WalkedNode, WalkedLiteral,
                                     handle_of, assign_of, WalkedField, WalkedHandle, WalkedCall,
                                     WalkedRecord, WalkedLambda, WalkedLet, WalkedBlock, WalkedList)
 
-fn reader_of(checker: Checker) -> Reader =
+fn reader_of(checker: Checker) -> Reader<| {program.read}> =
   {
     name: |q: QName|
       match local_at(checker, q) {
@@ -139,13 +144,17 @@ fn reader_of(checker: Checker) -> Reader =
         Some(name) -> name,
         None -> b"",
       },
-    contract: |name: Bytes| checker.contracts.get(name),
+    contract: |name: Bytes| contract_named(checker, name),
   }
 
 fn builtin_key(checker: Checker, at: Span) -> Bytes =
   Bytes::concat_all([checker.current_definition, b"#", ascii_of_int(at.site)])
 
-fn assume_condition(checker: Checker, cond: Expression, truth: Bool) -> Checker / {abort.raise} =
+fn assume_condition(
+  checker: Checker,
+  cond: Expression,
+  truth: Bool,
+) -> Checker / {abort.raise, program.read} =
   { ..checker, guards: guards::assume(reader_of(checker), checker.guards, cond, truth) }
 
 fn restore_guards(checker: Checker, before: Guards) -> Checker =
@@ -156,7 +165,7 @@ fn bind_guarded_value(
   bound: Checker,
   pattern: Pattern,
   value: Expression,
-) -> Checker / {abort.raise} =
+) -> Checker / {abort.raise, program.read} =
   match pattern {
     PatternVariable(v) -> match env_local(bound.env, v.name.span.site) {
       None -> bound,
@@ -178,7 +187,7 @@ fn ranged_lambda(
   checker: Checker,
   builtin: Bytes,
   args: List<Expression>,
-) -> Option<RangeArgument> / {abort.raise} =
+) -> Option<RangeArgument> / {abort.raise, program.read} =
   match prelude_callback_use(builtin) {
     None -> None,
     Some(it) -> match ((it.iterated_parameters, it.params.last())) {
@@ -202,8 +211,8 @@ fn requires_shown(
   builtin: Bytes,
   args: List<Expression>,
   span: Span,
-) -> { checker: Checker, shown: Bool } / {abort.raise} =
-  match checker.contracts.get(builtin) {
+) -> { checker: Checker, shown: Bool } / {abort.raise, program.read} =
+  match contract_named(checker, builtin) {
     None -> { checker: checker, shown: false },
     Some(st) -> if st.requires.len() == 0 { { checker: checker, shown: false } } else {
       let o = guards::unproved_requirement(reader_of(checker), checker.guards, st, args);
@@ -277,7 +286,7 @@ fn key_named(keys: List<OperationKey>, entry: Effect) -> Bool =
       || (k.effect == entry.effect && resource_covers(k.resource, entry.resource)
       && Some(k.operation) == entry.operation))
 
-fn mode_operations(checker: Checker, entry: Effect) -> List<Effect> / {abort.raise} = {
+fn mode_operations(checker: Checker, entry: Effect) -> List<Effect> / {abort.raise, program.read} = {
   let named = match entry.resource {
     NamedResource(_) -> true,
     ResourceVariable(_) -> true,
@@ -304,7 +313,7 @@ fn clause_discharges(
   handled: List<Effect>,
   keys: List<OperationKey>,
   a: Effect,
-) -> Bool / {abort.raise} =
+) -> Bool / {abort.raise, program.read} =
   match a.operation {
     Some(_) -> key_named(keys, a),
     None ->
@@ -334,7 +343,7 @@ fn join(
   span: Span,
   a: Effects,
   b: Effects,
-) -> { checker: Checker, effects: Effects } / {abort.raise} =
+) -> { checker: Checker, effects: Effects } / {abort.raise, program.read} =
   match a.variable {
     Some(x) -> match b.variable {
       Some(y) -> if x != y {
@@ -364,7 +373,7 @@ pub fn report_unify(
   error: UnifyError,
   span: Span,
   context: Bytes,
-) -> Checker / {abort.raise} =
+) -> Checker / {abort.raise, program.read} =
   match error {
     Mismatch(m) -> {
       let expected = resolve(checker, m.expected);
@@ -481,8 +490,8 @@ fn scope_mismatch_notes(expected: Effects, found: Effects) -> List<Bytes> / {abo
 fn opaque_owner(
   checker: Checker,
   name: Bytes,
-) -> Option<{ home: Bytes, opaque: Opaque }> / {abort.raise} =
-  match checker.types.get(name) {
+) -> Option<{ home: Bytes, opaque: Opaque }> / {abort.raise, program.read} =
+  match type_declared(checker, name) {
     None -> None,
     Some(declaration) -> match declaration.opaque {
       None -> None,
@@ -495,7 +504,7 @@ fn nominal_mismatch_notes(
   checker: Checker,
   expected: Type,
   found: Type,
-) -> List<Bytes> / {abort.raise} = {
+) -> List<Bytes> / {abort.raise, program.read} = {
   let apart = |name: Bytes|
     Bytes::concat_all([
       b"`",
@@ -573,7 +582,7 @@ pub fn expect(
   expected: Type,
   found: Type,
   context: Bytes,
-) -> { checker: Checker, ok: Bool } / {abort.raise} = {
+) -> { checker: Checker, ok: Bool } / {abort.raise, program.read} = {
   let u = unify(checker.substitution, checker.fresh, expected, found);
   let c = with_unified(checker, u);
   match u.error {
@@ -888,7 +897,7 @@ fn infer_args(
   met: Equations,
   ranged: Option<RangeArgument>,
   first: Option<Type> = None,
-) -> { checker: Checker, types: List<Type>, effects: Effects, nodes: List<Option<WalkedExpression>> } / {abort.raise} = {
+) -> { checker: Checker, types: List<Type>, effects: Effects, nodes: List<Option<WalkedExpression>> } / {abort.raise, program.read} = {
   let before = match first { Some(_) -> 1, None -> 0 };
   let walked = range(before, before + expressions.len()).fold(
     {
@@ -979,7 +988,7 @@ pub fn infer_whole(
   checker: Checker,
   expression: Expression,
   hint: Option<Hint> = None,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let o: Inference = infer(checker, expression, hint);
   let typed = o.checker.copied_defaults.fold(
     { checker: { ..o.checker, copied_defaults: [] }, copied_fields: [] },
@@ -1013,7 +1022,7 @@ fn callee_repeats(
   checker: Checker,
   function: Expression,
   args: List<Expression>,
-) -> { params: List<Int>, waits: Option<Bytes> } / {abort.raise} = {
+) -> { params: List<Int>, waits: Option<Bytes> } / {abort.raise, program.read} = {
   let builtin = prelude_name_of(checker, function);
   if builtin != b"" {
     {
@@ -1038,8 +1047,8 @@ fn callee_repeats(
 fn callback_parameters_of(
   checker: Checker,
   name: Bytes,
-) -> { checker: Checker, params: List<Int> } / {abort.raise} =
-  match checker.function_parameters.get(name) {
+) -> { checker: Checker, params: List<Int> } / {abort.raise, program.read} =
+  match parameters_of(checker, name) {
     Some(params) -> { checker: checker, params: params },
     None -> {
       let params = match env_lookup(checker.env, name) {
@@ -1060,7 +1069,7 @@ fn callback_parameters_of(
     },
   }
 
-fn fixed_size(checker: Checker, e: Expression) -> Bool / {abort.raise} =
+fn fixed_size(checker: Checker, e: Expression) -> Bool / {abort.raise, program.read} =
   match e {
     LiteralExpression(_) -> true,
     ListExpression(_) -> true,
@@ -1162,7 +1171,7 @@ fn infer_all(
   checker: Checker,
   expressions: List<Expression>,
   span: Span,
-) -> { checker: Checker, types: List<Type>, effects: Effects } / {abort.raise} =
+) -> { checker: Checker, types: List<Type>, effects: Effects } / {abort.raise, program.read} =
   expressions.fold(
     { checker: checker, types: [], effects: no_effects },
     |accumulator: { checker: Checker, types: List<Type>, effects: Effects }, expression: Expression| {
@@ -1204,13 +1213,13 @@ fn infer(
   checker: Checker,
   expression: Expression,
   hint: Option<Hint> = None,
-) -> Inference / {abort.raise} = infer_here(checker, expression, hint)
+) -> Inference / {abort.raise, program.read} = infer_here(checker, expression, hint)
 
 fn infer_here(
   checker: Checker,
   expression: Expression,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} =
+) -> Inference / {abort.raise, program.read} =
   match expression {
     LiteralExpression(l) ->
       {
@@ -1798,7 +1807,7 @@ fn tag_function(
   callee: QName,
   takes: List<Type>,
   results: Type,
-) -> { checker: Checker, effects: Effects, name: Bytes, callee: Option<WalkedExpression> } / {abort.raise} = {
+) -> { checker: Checker, effects: Effects, name: Bytes, callee: Option<WalkedExpression> } / {abort.raise, program.read} = {
   let f: Inference = infer_variable(checker, callee, callee.span);
   let named: Checker = mark_called(f.checker, callee.span);
   match declared_value(named, callee) {
@@ -1865,7 +1874,7 @@ fn tag_function(
   }
 }
 
-fn infer_tagged(checker: Checker, t: TaggedLiteral) -> Inference / {abort.raise} = {
+fn infer_tagged(checker: Checker, t: TaggedLiteral) -> Inference / {abort.raise, program.read} = {
   let holed = t.holes.len() > 0;
   let value: WithType = new_type(checker);
   let parsed = tag_function(
@@ -1949,7 +1958,7 @@ fn tagged_literal_node(
   result: Type,
   value: Type,
   fill: Option<{ callee: Option<WalkedExpression>, holes: List<Option<WalkedExpression>>, hole: Type, result: Type }>,
-) -> Option<WalkedNode> =
+) -> Option<WalkedNode> / {program.read} =
   match ((parser, constructor_of(checker, b"Ok"))) {
     (Some(parse), Some(ok)) -> {
       let at = |role: Int| synthetic_span(t.span, role);
@@ -2025,7 +2034,7 @@ fn infer_parallel(
   checker: Checker,
   span: Span,
   branches: List<Expression>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let out = range(0, branches.len()).fold(
     { checker: checker, fs: [], effects: no_effects, branch_effects: [], branches: [] },
     |accumulator: { checker: Checker, fs: List<Field>, effects: Effects, branch_effects: List<{ span: Span, effects: Effects }>, branches: List<{ body: Option<WalkedExpression>, effects: Effects }> }, i: Int| {
@@ -2067,8 +2076,8 @@ fn reject_opaque_record(
   span: Span,
   name: Bytes,
   how: Bytes,
-) -> Option<Checker> / {abort.raise} =
-  match checker.types.get(name) {
+) -> Option<Checker> / {abort.raise, program.read} =
+  match type_declared(checker, name) {
     None -> None,
     Some(declaration) -> match declaration.opaque {
       None -> None,
@@ -2113,7 +2122,7 @@ fn infer_nominal(
   written: List<RecordLiteralField>,
   n: { name: Bytes, args: List<Type>, fields: List<Field> },
   met: Equations,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let known = backticked(n.fields.map(|field: Field| field.name), b", ");
   let walked = written.fold(
     { checker: checker, effects: no_effects, values: [] },
@@ -2193,7 +2202,7 @@ fn infer_record_update(
   span: Span,
   base: Expression,
   written: List<RecordLiteralField>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let b: Inference = infer(checker, base);
   let known = match record_fields(shallow_resolve(b.checker.substitution, b.ty)) {
     Some(fs) -> fs,
@@ -2256,7 +2265,7 @@ fn update_fields(
   fs: List<Field>,
   written: List<UpdateField>,
   is_new_record: Bool,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let known = backticked(fs.map(|field: Field| field.name), b", ");
   written.fold(checker, |c: Checker, w: UpdateField|
     match field_get(fs, w.name) {
@@ -2282,7 +2291,7 @@ fn update_shape(
   base_span: Span,
   base: Type,
   written: List<UpdateField>,
-) -> WithType / {abort.raise} =
+) -> WithType / {abort.raise, program.read} =
   match base {
     RecordType(fs) -> {
       let checked: Checker = update_fields(checker, base_span, fs, written, false);
@@ -2336,7 +2345,7 @@ fn update_shape(
       ),
   }
 
-pub fn check_updates(checker: Checker) -> Checker / {abort.raise} = {
+pub fn check_updates(checker: Checker) -> Checker / {abort.raise, program.read} = {
   let entries = checker.updates;
   entries.fold({ ..checker, updates: [] }, |c: Checker, entry: UpdateSite| {
     let in_module: Checker = { ..c, module: entry.module, current_definition: entry.owner };
@@ -2358,7 +2367,11 @@ pub fn check_updates(checker: Checker) -> Checker / {abort.raise} = {
   })
 }
 
-fn infer_variable(checker: Checker, qualified_name: QName, at: Span) -> Inference / {abort.raise} = {
+fn infer_variable(
+  checker: Checker,
+  qualified_name: QName,
+  at: Span,
+) -> Inference / {abort.raise, program.read} = {
   let k: WithKey = value_key(checker, qualified_name);
   match k.key {
     None -> unknown_read(k.checker),
@@ -2384,7 +2397,7 @@ fn read_local(
   at: Span,
   binder: Int,
   scheme: Scheme,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let instantiated = instantiate_with(scheme, checker.fresh);
   let c: Checker = record_marshalling(
     { ..checker, fresh: instantiated.fresh },
@@ -2407,7 +2420,7 @@ fn read_global(
   at: Span,
   g: { name: Bytes, prelude: Bool },
   scheme: Scheme,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let instantiated = instantiate_with(scheme, checker.fresh);
   let c: Checker = { ..checker, fresh: instantiated.fresh };
   let constrained: Checker = note_constraints(
@@ -2606,7 +2619,7 @@ fn infer_binary(
   operation: Bytes,
   left: Expression,
   right: Expression,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let l: Inference = infer(checker, left);
   let r: Inference = if operation == b"and" || operation == b"or" {
     let o: Inference = infer(
@@ -2761,7 +2774,7 @@ fn infer_statement(
   checker: Checker,
   statement: Statement,
   hint: Option<Hint>,
-) -> StatementResult / {abort.raise} =
+) -> StatementResult / {abort.raise, program.read} =
   match statement {
     ExpressionStatement(e) -> {
       let o: Inference = infer(checker, e);
@@ -2895,10 +2908,10 @@ type LetBinding = {
   value: Option<WalkedExpression>,
 }
 
-fn refutable(checker: Checker, pattern: Pattern) -> Bool / {abort.raise} =
+fn refutable(checker: Checker, pattern: Pattern) -> Bool / {abort.raise, program.read} =
   uncovered(checker, [[coverage_pattern(checker, pattern)]], 1).len() > 0
 
-fn or_let_covers(checker: Checker, pattern: Pattern) -> Checker / {abort.raise} =
+fn or_let_covers(checker: Checker, pattern: Pattern) -> Checker / {abort.raise, program.read} =
   if !has_or(pattern) { checker } else {
     let missing = uncovered(checker, [[coverage_pattern(checker, pattern)]], 1);
     if missing.len() == 0 { checker } else {
@@ -2926,7 +2939,7 @@ fn let_bound(
   pattern: Pattern,
   annotation: Option<TypeExpression>,
   value: Expression,
-) -> LetBinding / {abort.raise} = {
+) -> LetBinding / {abort.raise, program.read} = {
   let annotated: { checker: Checker, ty: Type, effects: Effects, value: Option<WalkedExpression> } = match annotation {
     Some(te) -> {
       let w: WithType = convert_type(checker, te);
@@ -2975,7 +2988,7 @@ fn infer_app(
   args: List<Expression>,
   labels: List<Identifier>,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} =
+) -> Inference / {abort.raise, program.read} =
   match function {
     NameExpression(_) ->
       infer_app_general(
@@ -3024,7 +3037,7 @@ fn member_function(
   checker: Checker,
   of: Bytes,
   name: Identifier,
-) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise} =
+) -> Option<{ qualified_name: QName, callee: Bytes }> / {abort.raise, program.read} =
   match ((
       find_method(checker.resolved, checker.module, of, name.name),
       locate_type(checker.resolved, checker.module, of),
@@ -3120,7 +3133,7 @@ fn member_target(
   args: List<Expression>,
   named: List<NamedArg>,
   labels: List<Identifier>,
-) -> MemberCall / {abort.raise} = {
+) -> MemberCall / {abort.raise, program.read} = {
   let ty = resolve(b.checker, b.ty);
   let none = |c: Checker, d: MemberTarget|
     {
@@ -3234,7 +3247,7 @@ fn infer_member_call(
   labels: List<Identifier>,
   hint: Option<Hint>,
   performed: Bool,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let returned = |o: Inference, noted: Checker| {
     let j: WithEffects = join(noted, span, b.effects, o.effects);
     let k: WithEffects = join(j.checker, span, j.effects, taken.effects);
@@ -3322,7 +3335,7 @@ fn infer_member_call(
   }
 }
 
-fn prelude_name_of(checker: Checker, function: Expression) -> Bytes / {abort.raise} =
+fn prelude_name_of(checker: Checker, function: Expression) -> Bytes / {abort.raise, program.read} =
   match function {
     NameExpression(v) -> if !is_bare(v.name) {
       match look_up_language_type(checker, v.name) {
@@ -3342,7 +3355,7 @@ fn joined_callbacks(
   checker: Checker,
   span: Span,
   types: List<Type>,
-) -> { checker: Checker, types: List<Type> } / {abort.raise} = {
+) -> { checker: Checker, types: List<Type> } / {abort.raise, program.read} = {
   let j: WithEffects = types.fold(
     { checker: checker, effects: no_effects },
     |accumulator: WithEffects, ty: Type|
@@ -3430,7 +3443,7 @@ fn fill_labels(
   span: Span,
   labels: List<Identifier>,
   app: Option<LabelApplication>,
-) -> Checker / {abort.raise} =
+) -> Checker / {abort.raise, program.read} =
   match app {
     None -> if labels.len() == 0 { checker } else { wrong_labels(checker, labels, None, 0, 0) },
     Some(a) -> if labels.len() > 0 && labels.len() != a.explicit_vars.len() {
@@ -3466,7 +3479,7 @@ fn wrong_labels(
   callee: Option<Bytes>,
   want: Int,
   scopes: Int,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let span = span_to(labels.get(0).span, labels.get(labels.len() - 1).span);
   let who = match callee {
     Some(n) -> Bytes::concat_all([b"`", simple_name_of(n), b"`"]),
@@ -3672,7 +3685,7 @@ pub fn expect_or_widen(
   expected: Type,
   found: Type,
   context: Bytes,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let u = unify(checker.substitution, checker.fresh, expected, found);
   match u.error {
     None -> with_unified(checker, u),
@@ -3694,7 +3707,7 @@ fn join_type_into(
   span: Span,
   found: Type,
   context: Bytes,
-) -> Joined / {abort.raise} = {
+) -> Joined / {abort.raise, program.read} = {
   let u = unify(accumulator.checker.substitution, accumulator.checker.fresh, accumulator.ty, found);
   match u.error {
     None ->
@@ -3737,7 +3750,7 @@ fn agree(
   first: Type,
   second: Type,
   context: Bytes,
-) -> { checker: Checker, ty: Type } / {abort.raise} = {
+) -> { checker: Checker, ty: Type } / {abort.raise, program.read} = {
   let j: Joined = join_type_into(
     { checker: checker, ty: first, variables: [] },
     span,
@@ -3805,7 +3818,7 @@ fn expect_argument(
   span: Span,
   expected: Type,
   found: Type,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let u = unify(checker.substitution, checker.fresh, expected, found);
   let c: Checker = with_unified(checker, u);
   match u.error { None -> c, Some(e) -> report_unify(c, e, span, b"argument type") }
@@ -3863,7 +3876,7 @@ fn infer_app_general(
   args: List<Expression>,
   labels: List<Identifier>,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} =
+) -> Inference / {abort.raise, program.read} =
   applied_call(span, function, infer(checker, function), None, args, labels, hint)
 
 pub type TrailingArgument =
@@ -3879,7 +3892,7 @@ fn applied_call(
   labels: List<Identifier>,
   hint: Option<Hint>,
   rest: List<TrailingArgument> = [],
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let args = List::concat(
     match on { Some(x) -> [x.written].concat(given), None -> given },
     rest.map(|t: TrailingArgument| match t { NamedValue(x) -> x.written, CopiedDefault(d) -> d }),
@@ -4154,7 +4167,7 @@ fn bind_private_constructor(
   args: List<Pattern>,
   closed: Diagnostic,
   out: List<Binder>,
-) -> PatternBindings / {abort.raise} = {
+) -> PatternBindings / {abort.raise, program.read} = {
   let bound = args.fold(
     { checker: if is_bare(name) { report(checker, closed) } else { checker }, out: out },
     |accumulator: { checker: Checker, out: List<Binder> }, arg: Pattern| {
@@ -4171,7 +4184,7 @@ fn bind_pattern(
   p: Pattern,
   scrutinee: Type,
   out: List<Binder>,
-) -> PatternBindings / {abort.raise} =
+) -> PatternBindings / {abort.raise, program.read} =
   match p {
     PatternWildcard(w) ->
       { checker: checker, out: out, pattern: Some(TypedWild({ span: w.span, ty: scrutinee })) },
@@ -4454,7 +4467,7 @@ fn same_binders(
   span: Span,
   want: List<Binder>,
   got: List<Binder>,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let wanted = want.map(|w: Binder| w.name.name);
   let found = got.map(|g: Binder| g.name.name);
   let missing = wanted.filter(|n: Bytes| !found.contains(n));
@@ -4520,7 +4533,7 @@ fn bind_range(
   lo: SourceLiteral,
   hi: SourceLiteral,
   scrutinee: Type,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let form = [
     b"a range is written `lo..=hi`, as in `0..=9` or `b'a'..=b'z'`, and includes both bounds",
   ];
@@ -4578,7 +4591,7 @@ fn infer_match(
   scrutinee: Expression,
   arms: List<MatchArm>,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let s: Inference = infer(checker, scrutinee);
   let result: WithType = new_type(s.checker);
   let walked = arms.fold(
@@ -4657,7 +4670,7 @@ pub fn resolve_operation(
   checker: Checker,
   eff: QName,
   operation_name: Identifier,
-) -> { checker: Checker, hit: Option<{ info: EffectInfo, operation: OperationInfo }> } / {abort.raise} =
+) -> { checker: Checker, hit: Option<{ info: EffectInfo, operation: OperationInfo }> } / {abort.raise, program.read} =
   if is_exit_effect(eff.name.name) { resolve_exit_raise(checker, eff) }
   else { declared_operation(checker, eff, operation_name) }
 
@@ -4708,7 +4721,7 @@ fn declared_operation(
   checker: Checker,
   eff: QName,
   operation_name: Identifier,
-) -> { checker: Checker, hit: Option<{ info: EffectInfo, operation: OperationInfo }> } / {abort.raise} = {
+) -> { checker: Checker, hit: Option<{ info: EffectInfo, operation: OperationInfo }> } / {abort.raise, program.read} = {
   let e: WithName = effect_name(checker, eff);
   match e.name {
     None -> { checker: e.checker, hit: None },
@@ -4768,7 +4781,7 @@ fn declared_operation(
   }
 }
 
-pub fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise} =
+pub fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise, program.read} =
   if is_prelude_effect(eff) || is_scoped_effect(eff) { Some(eff) } else {
     let scope = scope_of(checker);
     match scope.bound.effects.fold(None, |accumulator: Option<Bytes>, b: Binding|
@@ -4800,7 +4813,7 @@ pub fn written_as(checker: Checker, eff: Bytes) -> Option<Bytes> / {abort.raise}
     }
   }
 
-pub fn as_written(checker: Checker, eff: Bytes) -> Bytes / {abort.raise} =
+pub fn as_written(checker: Checker, eff: Bytes) -> Bytes / {abort.raise, program.read} =
   match written_as(checker, eff) {
     Some(w) -> w,
     None -> match effect_of(checker, eff) { Some(info) -> info.simple_name, None -> eff },
@@ -4812,7 +4825,7 @@ fn resource_for(
   op_info: OperationInfo,
   resource: Option<Identifier>,
   span: Span,
-) -> WithResource / {abort.raise} =
+) -> WithResource / {abort.raise, program.read} =
   match resource {
     Some(r) -> if op_info.resource_param {
       {
@@ -4882,7 +4895,7 @@ fn clause_resource_for(
   op_info: OperationInfo,
   clause: HandleClause,
   span: Span,
-) -> WithResource / {abort.raise} =
+) -> WithResource / {abort.raise, program.read} =
   if !clause.wildcard_label { resource_for(checker, info, op_info, clause.resource, span) }
   else if op_info.resource_param { { checker: checker, resource: Some(AnyResource) } } else {
     {
@@ -4948,7 +4961,7 @@ fn record_operation_instance(
   shape: OperationType,
   span: Span,
   op_info: OperationInfo,
-) -> OperationType / {abort.raise} =
+) -> OperationType / {abort.raise, program.read} =
   if operation_free_variables(op_info).len() == 0 { shape }
   else { { ..shape, checker: note_instance(shape.checker, span, operation_function_type(shape)) } }
 
@@ -5037,7 +5050,7 @@ fn marshalling_rejected(
   info: EffectInfo,
   op_info: OperationInfo,
   span: Span,
-) -> Checker / {abort.raise} =
+) -> Checker / {abort.raise, program.read} =
   if !is_shipped_effect(info) || is_shipped(module_name(checker, checker.module))
       || marshalling_variables(op_info).len() == 0 { checker } else {
     report_error_at(
@@ -5082,7 +5095,7 @@ fn infer_perform(
   operation_name: Identifier,
   resource: Option<Identifier>,
   args: List<Expression>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let wanted = if is_exit_effect(eff.name.name) { [] } else {
     match resolve_operation(checker, eff, operation_name).hit {
       Some(hit) -> hit.operation.params,
@@ -5232,7 +5245,7 @@ type HandleClauses = {
 fn spawn_counts(checker: Checker) -> List<Int> =
   checker.open_scopes.map(|region: OpenScope| region.spawns.len())
 
-fn handles_raise(checker: Checker, clause: HandleClause) -> Bool / {abort.raise} =
+fn handles_raise(checker: Checker, clause: HandleClause) -> Bool / {abort.raise, program.read} =
   match resolve_operation(checker, clause.effect_name, clause.operation).hit {
     Some(hit) -> is_raise(hit.operation.mode),
     None -> false,
@@ -5248,7 +5261,7 @@ type HandlerVariables = {
 fn infer_handler_variables(
   checker: Checker,
   handler_variables: List<HandlerStateVariable>,
-) -> HandlerVariables / {abort.raise} = {
+) -> HandlerVariables / {abort.raise, program.read} = {
   let pushed: Checker = { ..checker, env: env_push(checker.env) };
   let made = handler_variables.fold(
     { checker: pushed, effects: no_effects, variables: [], nodes: [] },
@@ -5336,7 +5349,7 @@ fn infer_handle(
   return_clause: Option<ReturnClause>,
   handler_variables: List<HandlerStateVariable>,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let made: HandlerVariables = infer_handler_variables(checker, handler_variables);
   let around: Assignable = checker.assignable;
   let mark = made.checker.performs.len();
@@ -5746,7 +5759,7 @@ fn infer_handle(
   }
 }
 
-fn named_raise(checker: Checker, name: RaiseName) -> WithOperation / {abort.raise} = {
+fn named_raise(checker: Checker, name: RaiseName) -> WithOperation / {abort.raise, program.read} = {
   let r: WithOperation = resolve_operation(checker, name.effect_name, name.operation);
   match r.hit {
     None -> r,
@@ -5776,7 +5789,11 @@ fn named_raise(checker: Checker, name: RaiseName) -> WithOperation / {abort.rais
   }
 }
 
-fn one_raise(checker: Checker, span: Span, effects: Effects) -> WithOperation / {abort.raise} = {
+fn one_raise(
+  checker: Checker,
+  span: Span,
+  effects: Effects,
+) -> WithOperation / {abort.raise, program.read} = {
   let raises = effects.listed.filter(try_handles);
   let found = |a: Effect|
     match effect_of(checker, a.effect) {
@@ -5863,7 +5880,7 @@ fn reject_passed_raise(
   span: Span,
   effects: Effects,
   entry: Effect,
-) -> Checker / {abort.raise} =
+) -> Checker / {abort.raise, program.read} =
   match effects.variable {
     Some(v) -> if effects_cover(effects.listed, entry)
         || !is_rigid_effects(checker.substitution, v) { checker } else {
@@ -5908,7 +5925,7 @@ fn infer_try_block(
   raise: Option<RaiseName>,
   body: Expression,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let mark = checker.performs.len();
   let result = match hint_type(checker, hint) {
     Some(h) -> match result_parts(h) {
@@ -5979,7 +5996,7 @@ fn try_block_node(
   raised: { effect: Bytes, operation: Bytes, params: List<Type> },
   carried: Type,
   result: Type,
-) -> Option<WalkedNode> =
+) -> Option<WalkedNode> / {program.read} =
   match ((body, constructor_of(checker, b"Ok"), constructor_of(checker, b"Err"))) {
     (Some(value), Some(ok), Some(err)) -> {
       let at = try_spans(span);
@@ -6095,7 +6112,7 @@ fn try_block_node(
     _ -> None,
   }
 
-fn perform_site_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise} = {
+fn perform_site_label(checker: Checker, site: PerformSite) -> Bytes / {abort.raise, program.read} = {
   let a = backticked_text(written_effect_text(checker, site.entry));
   match site.source {
     DirectPerform -> b"performs ".concat(a),
@@ -6114,7 +6131,7 @@ fn report_incomplete_handling(
   handled: List<Effect>,
   keys: List<OperationKey>,
   missing: List<Effect>,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let names = missing.map(|a: Effect| backticked_text(written_effect_text(checker, a)));
   let listed = if names.len() == 1 { names.get(0) } else {
     Bytes::concat_all([
@@ -6186,7 +6203,7 @@ fn report_incomplete_handling(
   report(checker, fixed)
 }
 
-fn clause_for(checker: Checker, entry: Effect) -> Bytes / {abort.raise} = {
+fn clause_for(checker: Checker, entry: Effect) -> Bytes / {abort.raise, program.read} = {
   let written = written_effect_text(checker, entry);
   let params = match effect_of(checker, entry.effect) {
     Some(info) -> match entry.operation {
@@ -6212,7 +6229,7 @@ fn note_universal_clause(
   checker: Checker,
   info: EffectInfo,
   op_info: OperationInfo,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, program.read} = {
   let n = checker.diagnostics.len();
   if n == 0 { checker } else {
     let last: Diagnostic = checker.diagnostics.get(n - 1);
@@ -6394,7 +6411,7 @@ fn infer_with_scope(
   binder: Identifier,
   body: Expression,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let a: Inference = infer(checker, acquire);
   let r: Inference = infer(a.checker, release);
   let eff: WithEffects = new_effects(r.checker);
@@ -6704,7 +6721,7 @@ fn infer_simulate(
   span: Span,
   body: Expression,
   hint: Option<Hint>,
-) -> Inference / {abort.raise} = {
+) -> Inference / {abort.raise, program.read} = {
   let mark = checker.performs.len();
   let crossed_at = checker.captured_locals.len();
   let carriers = task_carriers(checker);
@@ -6763,7 +6780,7 @@ pub fn contains_function(t: Type) -> Bool =
     VariableType(_) -> false,
   }
 
-pub fn written_effect_text(checker: Checker, entry: Effect) -> Bytes / {abort.raise} =
+pub fn written_effect_text(checker: Checker, entry: Effect) -> Bytes / {abort.raise, program.read} =
   if is_diverges(entry) { b"diverges" } else {
     Bytes::concat_all([
       as_written(checker, entry.effect),
@@ -6810,7 +6827,7 @@ pub fn ordered_variables(checker: Checker, t: Type) -> List<Int> / {abort.raise}
 fn note_map_keys(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
   note_parts(checker, span, ordered_parts(checker.ordered_parameters, ty, []))
 
-fn note_instance(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
+fn note_instance(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise, program.read} =
   note_type_constraints_in(
     note_map_key_sites(
       checker,
@@ -6829,7 +6846,11 @@ fn note_instance(checker: Checker, span: Span, ty: Type) -> Checker / {abort.rai
     ty,
   )
 
-pub fn note_type_constraints_in(checker: Checker, span: Span, ty: Type) -> Checker / {abort.raise} =
+pub fn note_type_constraints_in(
+  checker: Checker,
+  span: Span,
+  ty: Type,
+) -> Checker / {abort.raise, program.read} =
   if checker.stated.len() == 0 { checker } else {
     let within = |c: Checker, types: List<Type>|
       types.fold(c, |cc: Checker, t: Type| note_type_constraints_in(cc, span, t));
@@ -6848,8 +6869,8 @@ fn note_constraints(
   callee: Bytes,
   args: List<Type>,
   ty: Type,
-) -> Checker / {abort.raise} =
-  match checker.constraints.get(callee) {
+) -> Checker / {abort.raise, program.read} =
+  match constraints_of(checker, callee) {
     None -> checker,
     Some(cs) -> if cs.len() == 0 { checker } else {
       let callee_at = match definition_of(checker, callee) {

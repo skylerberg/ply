@@ -1,3 +1,7 @@
+import compiler.check.borrowing (mode_facts)
+import compiler.check.termination (summary_facts)
+import compiler.check.infer.checker (program)
+import compiler.check.infer.checker (with_no_other_definitions, constraints_of)
 import compiler.syntax.parsing (Span, span_between, node_id_base, dummy_span, moved_by)
 import std.bin
 import compiler.syntax.type_syntax (mode_text)
@@ -109,7 +113,7 @@ pub fn check_output_with(
   resolved: Resolution,
   modules: List<ParsedModule>,
   known: CheckCache,
-) -> { checked: CheckOutput, bodies: List<CheckedBody> } / {abort.raise} = {
+) -> { checked: CheckOutput, bodies: List<CheckedBody> } / {abort.raise, program.read} = {
   let out = check_program_with(resolved, modules, known);
   let failed = has_error(out.checker.diagnostics);
   {
@@ -281,7 +285,7 @@ fn restore_owners(checker: Checker) -> Checker =
       match unlowered_of(x.owner) { Some(o) -> { ..x, owner: o }, None -> x }),
   }
 
-fn emit_facts(all: Checker) -> EmitFacts / {abort.raise} = {
+fn emit_facts(all: Checker) -> EmitFacts / {abort.raise, program.read} = {
   let checker = restore_owners(all);
   let keyed = keyed_bodies(resolved_bodies(checker), checker.known.types);
   let bodies = grouped(keyed.bodies, |x: TypedBody<Bytes>| x.owner);
@@ -334,7 +338,7 @@ fn grouped<a>(xs: List<a>, owner: (a) -> Bytes) -> List<a> = {
   g.order.map(|o: Bytes| match g.by.get(o) { Some(ys) -> ys, None -> [] }).flatten()
 }
 
-fn resolved_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
+fn resolved_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise, program.read} = {
   let sorts = law_variable_numbers(checker);
   let released = checker.release_sites.fold(
     Map::new(),
@@ -473,8 +477,8 @@ fn witnesses_passed(
   checker: Checker,
   full: Bytes,
   args: List<Type>,
-) -> Option<List<NumericWitness>> / {abort.raise} = {
-  let cs = match checker.constraints.get(full) { Some(xs) -> xs, None -> [] };
+) -> Option<List<NumericWitness>> / {abort.raise, program.read} = {
+  let cs = match constraints_of(checker, full) { Some(xs) -> xs, None -> [] };
   range(0, args.len()).fold(Some([]), |accumulator: Option<List<NumericWitness>>, i: Int|
     match accumulator {
       None -> None,
@@ -626,7 +630,7 @@ pub type ElaborationResult = {
 pub fn elaborate(
   resolved: Resolution,
   modules: List<ParsedModule>,
-) -> Option<ElaborationResult> / {abort.raise} = {
+) -> Option<ElaborationResult> / {abort.raise, program.read} = {
   let out = check_program(resolved, modules);
   if has_error(out.checker.diagnostics) { None } else {
     Some({
@@ -655,7 +659,7 @@ pub fn bodies_with(
   resolved: Resolution,
   modules: List<ParsedModule>,
   known: CheckCache,
-) -> Option<List<TypedBody<Type>>> / {abort.raise} = {
+) -> Option<List<TypedBody<Type>>> / {abort.raise, program.read} = {
   let out = check_program_with(resolved, modules, known);
   if has_error(out.checker.diagnostics) { None } else { Some(resolved_bodies(out.checker)) }
 }
@@ -759,7 +763,14 @@ pub fn check_program_with(
   resolved: Resolution,
   modules: List<ParsedModule>,
   known: CheckCache,
-) -> CheckResult / {abort.raise} = {
+) -> CheckResult / {abort.raise} =
+  with_no_other_definitions(|| check_every_module(resolved, modules, known))
+
+fn check_every_module(
+  resolved: Resolution,
+  modules: List<ParsedModule>,
+  known: CheckCache,
+) -> CheckResult / {abort.raise, mode_facts.read, program.read, summary_facts.read} = {
   let c0 = new_checker(resolved, modules, known);
   let declared: Checker = resolved.order.fold(c0, |checker: Checker, i: Int| {
     let m = modules.get(i);
@@ -1078,7 +1089,8 @@ fn resolved_source_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.ra
   let key = |owner: Bytes, part: BodyPart| Bytes::concat_all([owner, b"#", part_key(part)]);
   let bases = checker.typed_bodies.fold(Map::new(), |m: Map<Bytes, Int>, b: WalkedTree|
     m.insert(key(b.owner, b.part), b.base));
-  resolved_bodies(checker).filter(|b: TypedBody<Type>| b.module == 0).map(|b: TypedBody<Type>| {
+  with_no_other_definitions(|| resolved_bodies(checker)).filter(|b: TypedBody<Type>|
+    b.module == 0).map(|b: TypedBody<Type>| {
     let base = match bases.get(key(b.owner, b.part)) { Some(x) -> x, None -> 0 };
     body_retyped(b, (), {
       ty: |t: Type, s: Unit| { ty: t, state: s },
@@ -1099,7 +1111,7 @@ fn nodes_where(
 fn covers_source(s: Span, at: Span) -> Bool =
   s.start == at.start && s.end == at.end && s.site > 0 && s.site < node_id_base
 
-fn written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+fn written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise, program.read} =
   nodes_where(checker, |s: Span| covers_source(s, at)).map(|e: TypedExpression<Type>| shown(e.ty))
 
 fn source_expression_at(checker: Checker, at: Span) -> Expression / {abort.raise} =
@@ -1179,7 +1191,10 @@ fn effects_of_node(e: TypedExpression<Type>) -> List<Bytes> = {
   }
 }
 
-fn effects_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abort.raise} =
+fn effects_where(
+  checker: Checker,
+  picked: (Span) -> Bool,
+) -> List<Bytes> / {abort.raise} =
   resolved_source_bodies(checker).flat_map(|b: TypedBody<Type>|
     typed_expression_nodes(b.body)).flat_map(|e: TypedExpression<Type>| {
     let own = if picked(e.span) { effects_of_node(e) } else { [] };
@@ -1201,13 +1216,13 @@ fn effects_where(checker: Checker, picked: (Span) -> Bool) -> List<Bytes> / {abo
     }
   })
 
-fn effects_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+fn effects_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise, program.read} =
   effects_where(checker, |s: Span| s == at)
 
-fn effects_written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
+fn effects_written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise, program.read} =
   effects_where(checker, |s: Span| covers_source(s, at))
 
-fn check_resolved_effects(source: Bytes) -> Checker / {abort.raise} = {
+fn check_resolved_effects(source: Bytes) -> Checker / {abort.raise, program.read} = {
   let checker = valid_module_checker(source);
   assert_eq(effects_where(checker, |s: Span| true).filter(|t: Bytes| t.index_of(b"?") != None), []);
   checker
@@ -1879,18 +1894,17 @@ test "a function's `numeric` constraints become extra arguments in type-paramete
 }
 
 fn passed_numeric_witnesses(checker: Checker) -> List<List<NumericWitness>> / {abort.raise} =
-  resolved_bodies(checker).filter(|b: TypedBody<Type>| b.module == 0).flat_map(
-    |b: TypedBody<Type>|
-      typed_expression_nodes(b.body).fold(
-        [],
-        |accumulator: List<List<NumericWitness>>, e: TypedExpression<Type>|
-          match e.node {
-            TypedRead(ReadDefinition(d)) -> if d.witnesses.len() == 0 { accumulator }
-            else { accumulator.push(d.witnesses) },
-            _ -> accumulator,
-          },
-      ),
-  )
+  with_no_other_definitions(|| resolved_bodies(checker)).filter(|b: TypedBody<Type>|
+    b.module == 0).flat_map(|b: TypedBody<Type>|
+    typed_expression_nodes(b.body).fold(
+      [],
+      |accumulator: List<List<NumericWitness>>, e: TypedExpression<Type>|
+        match e.node {
+          TypedRead(ReadDefinition(d)) -> if d.witnesses.len() == 0 { accumulator }
+          else { accumulator.push(d.witnesses) },
+          _ -> accumulator,
+        },
+    ))
 
 fn checked_context(source: Bytes) -> Checker / {abort.raise} = {
   let r = parse(source);
@@ -4005,7 +4019,7 @@ test "a function parameter's types and effects generalize" {
   assert_eq(defined(c, b"m.each").scheme, b"<a | e>((a) -> Unit / e, List<a>) -> Unit / e")
 }
 
-fn constraints_of(c: Checker, name: Bytes) -> List<Bytes> / {abort.raise} =
+fn constraint_texts(c: Checker, name: Bytes) -> List<Bytes> / {abort.raise} =
   info_of(c, name).constraints.map(|d: DefinitionConstraint|
     deriver_text(d.deriver).concat(ascii_of_int(d.param)))
 
@@ -4013,11 +4027,11 @@ test "a `derivable` constraint, written or inferred, is recorded on the type par
   let c = valid_module_checker(
     b"pub fn show<a>(x: a) -> Int where derivable(eq, a) = 1\npub fn keyed<k, v>(m: Map<k, v>) -> Int where derivable(ord, k) = m.len()\nfn used() -> Int = show(2) + keyed(Map::new())",
   );
-  assert_eq(constraints_of(c, b"m.show"), [b"eq0"]);
-  assert_eq(constraints_of(c, b"m.keyed"), [b"ord0"]);
-  assert_eq(constraints_of(c, b"m.used"), []);
+  assert_eq(constraint_texts(c, b"m.show"), [b"eq0"]);
+  assert_eq(constraint_texts(c, b"m.keyed"), [b"ord0"]);
+  assert_eq(constraint_texts(c, b"m.used"), []);
   assert_eq(
-    constraints_of(
+    constraint_texts(
       valid_module_checker(b"pub fn keyed<k, v>(m: Map<k, v>) -> Int = m.len()"),
       b"m.keyed",
     ),
@@ -4829,7 +4843,10 @@ fn with_db_effect(body: Bytes) -> Bytes =
     body,
   )
 
-fn counted(source: Bytes, name: Bytes) -> { scaling: Bool, repeats: List<Int> } / {abort.raise} =
+fn counted(
+  source: Bytes,
+  name: Bytes,
+) -> { scaling: Bool, repeats: List<Int> } / {abort.raise, program.read} =
   match definition_of(checked_context(source), b"m.".concat(name)) {
     Some(d) -> { scaling: d.scaling.len() > 0, repeats: d.repeats },
     None -> panic("the checked source has no definition with the name the test gives"),
@@ -4902,7 +4919,7 @@ test "a `bounded` effect in a signature is checked against the function body, an
   )
 }
 
-fn diverges(source: Bytes, name: Bytes) -> Bool / {abort.raise} =
+fn diverges(source: Bytes, name: Bytes) -> Bool / {abort.raise, program.read} =
   match definition_of(checked_context(source), b"m.".concat(name)) {
     Some(d) -> match d.ending { Diverges(_) -> true, _ -> false },
     None -> panic("the checked source has no definition with the name the test gives"),
@@ -5505,13 +5522,13 @@ test "a recursive group terminates when one argument shrinks in every call, even
   )
 }
 
-fn offset_of(context: Checker, s: Site) -> Int / {abort.raise} =
+fn offset_of(context: Checker, s: Site) -> Int / {abort.raise, program.read} =
   match definition_of(context, s.caller) {
     Some(d) -> d.at.span.start + s.span.start,
     None -> panic("the function containing the call has no definition"),
   }
 
-fn diverging_at(source: Bytes, name: Bytes) -> Option<Int> / {abort.raise} = {
+fn diverging_at(source: Bytes, name: Bytes) -> Option<Int> / {abort.raise, program.read} = {
   let context = checked_context(source);
   match definition_of(context, b"m.".concat(name)) {
     Some(d) -> match d.ending { Diverges(x) -> Some(offset_of(context, x.at)), _ -> None },
@@ -8300,7 +8317,7 @@ test "a function that borrows a record's field cannot be called after that field
 }
 
 fn resolved_of(source: Bytes) -> List<TypedBody<Type>> / {abort.raise} =
-  resolved_bodies(valid_module_checker(source))
+  with_no_other_definitions(|| resolved_bodies(valid_module_checker(source)))
 
 fn whole_body(source: Bytes, owner: Bytes) -> List<TypedExpression<Type>> / {abort.raise} =
   resolved_of(source).filter(|b: TypedBody<Type>| b.owner == owner && b.part == WholeBody).map(
@@ -8317,7 +8334,7 @@ test "every body the checker visits is resolved and recorded under its kind, suc
       b"law \"square\" forall (n: Int) where n > 0 { area(Square(n)) == n * n }\n",
     ]),
   );
-  let resolved = resolved_bodies(c);
+  let resolved = with_no_other_definitions(|| resolved_bodies(c));
   assert_eq(resolved.len(), c.typed_bodies.len());
   assert_eq(
     resolved.map(|b: TypedBody<Type>| part_key(b.part)).sort_by(|a: Bytes, b: Bytes|

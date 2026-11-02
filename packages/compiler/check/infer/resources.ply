@@ -1,3 +1,7 @@
+import compiler.check.borrowing (mode_facts)
+import compiler.check.termination (summary_facts)
+import compiler.check.infer.checker (program)
+import compiler.check.infer.checker (release_function_of, declared_resource)
 import compiler.check.types (Type, VariableType, NamedType, FunctionType, RecordType, NominalType,
                              Field, Effects, Effect, Scheme, is_label_or_effects, type_args,
                              instantiate, unify, resolve_effects, substitution_new, no_effects,
@@ -5,7 +9,7 @@ import compiler.check.types (Type, VariableType, NamedType, FunctionType, Record
 import compiler.check.infer.checker (Checker, ConstructorInfo, resolve, definition_of)
 import std.list
 
-pub fn resource_types(checker: Checker) -> List<Bytes> / {abort.raise} =
+pub fn resource_types(checker: Checker) -> List<Bytes> / {abort.raise, program.read} =
   iterate(
     checker.release_functions.fold([], |accumulator: List<Bytes>, name: Bytes, by: Bytes|
       accumulator.push(name)),
@@ -13,46 +17,60 @@ pub fn resource_types(checker: Checker) -> List<Bytes> / {abort.raise} =
     |known: List<Bytes>| {
       let more = checker.constructors.fold(known, |accumulator: List<Bytes>, x: ConstructorInfo|
         if accumulator.contains(x.type_name) { accumulator }
-        else if x.fields.any(|t: Type| names_resource(known, t)) { accumulator.push(x.type_name) }
-        else { accumulator });
+        else if x.fields.any(|t: Type| names_resource(checker, known, t)) {
+          accumulator.push(x.type_name)
+        } else { accumulator });
       if more.len() == known.len() { Stop(known) } else { Continue(more) }
     },
   )
 
-fn names_resource(known: List<Bytes>, ty: Type) -> Bool =
+fn names_resource(checker: Checker, known: List<Bytes>, ty: Type) -> Bool / {program.read} =
   match ty {
     VariableType(_) -> false,
-    NamedType(c) -> known.contains(c.name) || c.args.any(|a: Type| names_resource(known, a)),
+    NamedType(c) ->
+      known.contains(c.name) || declared_resource(checker, c.name)
+        || c.args.any(|a: Type| names_resource(checker, known, a)),
     FunctionType(f) -> f.once,
-    RecordType(fs) -> fs.any(|x: Field| names_resource(known, x.ty)),
+    RecordType(fs) -> fs.any(|x: Field| names_resource(checker, known, x.ty)),
     NominalType(n) ->
-      known.contains(n.name) || n.fields.any(|x: Field| names_resource(known, x.ty)),
+      known.contains(n.name) || declared_resource(checker, n.name)
+        || n.fields.any(|x: Field| names_resource(checker, known, x.ty)),
   }
 
 pub fn is_resource_type(
   checker: Checker,
   resource_variables: List<Int>,
   ty: Type,
-) -> Bool / {abort.raise} = contains_resource(checker, resource_variables, resolve(checker, ty))
+) -> Bool / {abort.raise, program.read} =
+  contains_resource(checker, resource_variables, resolve(checker, ty))
 
-fn contains_resource(checker: Checker, resource_variables: List<Int>, ty: Type) -> Bool =
+fn contains_resource(
+  checker: Checker,
+  resource_variables: List<Int>,
+  ty: Type,
+) -> Bool / {program.read} =
   match ty {
     VariableType(v) -> resource_variables.contains(v),
     NamedType(c) ->
       !is_label_or_effects(ty)
-        && (checker.resource_types.contains(c.name)
+        && (declared_resource(checker, c.name)
         || c.args.any(|a: Type| contains_resource(checker, resource_variables, a))),
     FunctionType(f) -> f.once,
     RecordType(fs) -> fs.any(|x: Field| contains_resource(checker, resource_variables, x.ty)),
     NominalType(n) ->
-      checker.resource_types.contains(n.name)
+      declared_resource(checker, n.name)
         || n.fields.any(|x: Field| contains_resource(checker, resource_variables, x.ty)),
   }
 
-pub fn release_effect_list(checker: Checker, ty: Type) -> List<Effect> / {abort.raise} =
+const longest_release_search: Int = 1 << 24
+
+pub fn release_effect_list(
+  checker: Checker,
+  ty: Type,
+) -> List<Effect> / {abort.raise, program.read} =
   iterate(
     { todo: [resolve(checker, ty)], seen: [], listed: [] },
-    checker.constructors.fold(256, |n: Int, x: ConstructorInfo| n + 4 * (x.fields.len() + 1)),
+    longest_release_search,
     |w: ReleaseSearch|
       match w.todo {
         [] -> Stop(w.listed),
@@ -66,9 +84,9 @@ fn release_search_step(
   checker: Checker,
   w: ReleaseSearch,
   ty: Type,
-) -> ReleaseSearch / {abort.raise} = {
+) -> ReleaseSearch / {abort.raise, program.read} = {
   let own = |name: Bytes|
-    match checker.release_functions.get(name) {
+    match release_function_of(checker, name) {
       None -> None,
       Some(by) -> match definition_of(checker, by) {
         None -> Some([]),
@@ -81,7 +99,7 @@ fn release_search_step(
     NamedType(c) -> match own(c.name) {
       Some(effects) -> stated(effects),
       None -> if is_label_or_effects(ty) || w.seen.contains(c.name)
-          || !checker.resource_types.contains(c.name) { reading(type_args(c.args)) } else {
+          || !declared_resource(checker, c.name) { reading(type_args(c.args)) } else {
         let fields = checker.constructors.filter(|x: ConstructorInfo| x.type_name == c.name).fold(
           [],
           |accumulator: List<Type>, x: ConstructorInfo| accumulator.concat(x.fields),
