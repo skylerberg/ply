@@ -17,14 +17,16 @@ import compiler.unit (definition_hash)
 import compiler.front.owner_checks
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
 import compiler.front.rows (Rows, Outline)
-import compiler.front (Published, published, ShippedWants, shipped_wants_bin)
+import compiler.front (Published, published, ShippedWants, shipped_wants_bin, locked_packages)
 import compiler.front.published (decode_rows, reserved_prefix_diagnostics)
 import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_module_tables,
-                             pulled_next, checked_program_over, analysis_identities, ToolchainTree)
+                             pulled_next, checked_program_over, analysis_identities, ToolchainTree,
+                             NoTree)
 import compiler.front.diagnostics (diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
                               embed_snapshot, request_of_key, snapshot_embed, with_embed_snapshot)
-import compiler.front.pkg (PackageSources, read_packages, validated_packages_bin, without_locations)
+import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, read_packages,
+                           validated_packages_bin, without_locations)
 import compiler.check.resolve.tables (placed_in)
 import compiler.check.resolve.tables (Source, Diagnostic, Edit, Label, backticked, error_at,
                                       fix_edits, offered_fixes)
@@ -664,28 +666,63 @@ pub type InMemory = {
   sources: List<Source>,
   shipped: List<Source>,
   files: List<FileAt>,
+  packages: PackageSources,
 }
 
 pub fn in_memory(
   sources: List<Source>,
   shipped: List<Source> = [],
   files: List<FileAt> = [],
-) -> InMemory = { store: fs::mem_empty(), sources: sources, shipped: shipped, files: files }
+  packages: PackageSources = { root: b"", manifest: None, supplied: [] },
+) -> InMemory =
+  { store: fs::mem_empty(), sources: sources, shipped: shipped, files: files, packages: packages }
+
+fn package_files(sources: List<Source>) -> List<PackageFile> =
+  sources.map(|s: Source| { module: s.name, text: s.source_text })
+
+fn inputs_in_memory(program: InMemory) -> LoadInputs / {abort.raise} =
+  load_inputs_of(
+    {
+      root: program.packages.root,
+      manifest: program.packages.manifest,
+      files: package_files(program.sources),
+    },
+    program.packages.supplied.map(|p: SuppliedPackage|
+      { root: p.root, manifest: p.manifest, files: package_files(p.modules) }),
+  )
+
+fn embedded_in_memory(
+  files: List<FileAt>,
+  module: Bytes,
+  want: EmbedRequest,
+) -> EmbedBytesResult / {abort.raise} =
+  if want.dir {
+    let prefix = want.path.concat(b"/");
+    match files.filter(|f: FileAt| f.module == module && f.path.starts_with(prefix)).sort_by_key(
+        |f: FileAt| f.path,
+      ) {
+      [] -> Err(b"no directory is there"),
+      found ->
+        Ok(found.map(|f: FileAt| { name: f.path.slice(prefix.len(), f.path.len()), bytes: f.bytes })),
+    }
+  } else {
+    match files.find(|f: FileAt| f.module == module && f.path == want.path) {
+      Some(f) -> Ok([{ name: b"", bytes: f.bytes }]),
+      None -> Err(b"no file is there"),
+    }
+  }
 
 pub fn session_over<a>(
   program: InMemory,
   work: (List<Bytes>) -> a / {SessionReads, abort.raise},
 ) -> { program: InMemory, value: a } / {abort.raise} = {
-  let w = inputs_alone(program.sources);
+  let w = inputs_in_memory(program);
   let qs = fresh_registry();
   let all = with_prelude_source(program.shipped);
   let text_of = |name: Bytes|
     match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.source_text), None -> None };
   let read = |package: Int, module: Bytes, want: EmbedRequest|
-    match program.files.find(|f: FileAt| f.module == module && f.path == want.path) {
-      Some(f) -> Ok([{ name: b"", bytes: f.bytes }]),
-      None -> Err(b"no file is there"),
-    };
+    embedded_in_memory(program.files, module, want);
   let done = over_decoding(
     program.store,
     prelude_frames,
@@ -1052,6 +1089,153 @@ test "changing an embedded file's bytes changes the hash of the definition that 
   assert(own_hash_of(moved, b"m.b") != own_hash_of(first, b"m.b"));
   let same = over(b"one", b"one");
   assert_eq(own_hash_of(same, b"m.a"), own_hash_of(same, b"m.b"))
+}
+
+fn manifest_text(name: Bytes, dependencies: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"",
+    name,
+    b"\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [",
+    dependencies,
+    b"], entry: None}",
+  ])
+
+const on_lib: Bytes =
+  b"{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../lib\")}"
+
+fn with_lib(dependencies: Bytes, lib: List<Source>) -> PackageSources =
+  {
+    root: b"/x/app",
+    manifest: Some(manifest_text(b"app", dependencies)),
+    supplied: [{ root: b"/x/lib", manifest: Some(manifest_text(b"lib", b"")), modules: lib }],
+  }
+
+const answer_lib: List<Source> =
+  [
+    { name: b"answer", source_text: b"pub fn answer() -> Int = 42\n" },
+    { name: b"extra", source_text: b"fn hidden() -> Int = 1\n" },
+  ]
+
+const answer_user: List<Source> =
+  [{ name: b"m", source_text: b"import lib.answer\nfn main() -> Int = answer::answer()\n" }]
+
+fn package_codes(packages: PackageSources) -> List<Bytes> / {abort.raise} =
+  packages_rejected(packages, [b"m"], 1, NoTree).map(|d: Diagnostic| d.code)
+
+test "a project's manifest is checked before the program, and a malformed manifest rejects it" {
+  assert_eq(package_codes(with_lib(on_lib, answer_lib)), []);
+  assert_eq(package_codes({ root: b"/x/app", manifest: None, supplied: [] }), []);
+  assert_eq(
+    package_codes({ root: b"/x/app", manifest: Some(b"fn package() -> Int = 1"), supplied: [] }),
+    [b"E0129"],
+  )
+}
+
+test "a declared dependency's modules resolve under its prefix" {
+  let outcome = checked_in_memory(
+    in_memory(answer_user, packages: with_lib(on_lib, answer_lib)),
+  ).outcome;
+  assert_eq(rejection_codes(outcome), []);
+  assert(accepted(outcome))
+}
+
+test "importing a module from an undeclared dependency is rejected, naming the package and the importing module" {
+  match checked_in_memory(in_memory(answer_user, packages: with_lib(b"", answer_lib))).outcome {
+    Analysed(_) -> panic("the undeclared dependency was imported"),
+    Rejected(ds) -> {
+      assert_eq(ds.map(|d: Diagnostic| d.code), [b"E0132"]);
+      assert(ds.get(0).message.contains(b"`lib`"));
+      assert(ds.get(0).message.contains(b"`app`"))
+    },
+  }
+}
+
+test "a dependency's imports resolve under the dependency's prefix, not at the top level of the program" {
+  let lib = [
+    { name: b"answer", source_text: b"import extra\npub fn answer() -> Int = extra::hidden()\n" },
+    { name: b"extra", source_text: b"pub fn hidden() -> Int = 1\n" },
+  ];
+  let outcome = checked_in_memory(in_memory(answer_user, packages: with_lib(on_lib, lib))).outcome;
+  assert_eq(rejection_codes(outcome), []);
+  assert(accepted(outcome))
+}
+
+test "a declared dependency with no manifest is reported as an error at its declaration" {
+  assert_eq(
+    package_codes({
+      ..with_lib(on_lib, answer_lib),
+      supplied: [{ root: b"/x/lib", manifest: None, modules: [] }],
+    }),
+    [b"E0135"],
+  )
+}
+
+fn embedded_outcome(source_text: Bytes, files: List<FileAt>) -> AnalysisOutcome / {abort.raise} =
+  analysed_over([{ name: b"m", source_text: source_text }], files: files)
+
+test "a directory embed returns a list of records, one per file, named by its path inside the directory" {
+  match embedded_outcome(
+      b"pub fn tree() -> List<{ name: String, bytes: Bytes }> = embed_dir(\"t\")\n",
+      [
+        { module: b"m", path: b"t/b/c", bytes: b"2" },
+        { module: b"m", path: b"t/a", bytes: b"1" },
+        { module: b"m", path: b"u/d", bytes: b"3" },
+      ],
+    ) {
+    Rejected(ds) -> panic("the directory embed was rejected: " ++ String::of_bytes_lossy(ds.get(0).message)),
+    Analysed(w) -> {
+      assert_eq(w.embeds.map(|e: ModuleEmbed| e.key), [b"dir:t"]);
+      assert_eq(w.embeds.map(|e: ModuleEmbed| e.read), [
+        Ok([embed_file(b"a", b"1"), embed_file(b"b/c", b"2")]),
+      ])
+    },
+  }
+}
+
+test "an embed's path must be a literal, and an embed whose file cannot be read is rejected" {
+  assert_eq(
+    rejection_codes(
+      embedded_outcome(b"fn p() -> String = \"d.txt\"\npub fn data() -> Bytes = embed(p())\n", []),
+    ),
+    [b"E0147"],
+  );
+  assert_eq(rejection_codes(embedded_outcome(b"pub fn data() -> Bytes = embed(\"d.txt\")\n", [])), [
+    b"E0146",
+  ])
+}
+
+test "a module that defines its own `embed` function calls that function instead of the built-in `embed`" {
+  match embedded_outcome(
+      b"fn embed(p: String) -> Bytes = b\"mine\"\npub fn data() -> Bytes = embed(\"d.txt\")\n",
+      [],
+    ) {
+    Rejected(_) -> panic("a module's own `embed` was taken for the built-in"),
+    Analysed(w) -> assert_eq(w.embeds, []),
+  }
+}
+
+fn locked_digests(read: Bytes) -> List<Bytes> / {abort.raise} = {
+  let packages = with_lib(on_lib, [
+    { name: b"answer", source_text: b"pub fn answer() -> Int = embed(\"n.txt\").len()\n" },
+  ]);
+  let embeds = [
+    {
+      root: b"/x/lib",
+      module: b"answer",
+      want: { path: b"n.txt", dir: false },
+      read: Ok([embed_file(b"", read)]),
+    },
+  ];
+  match locked_packages(answer_user, packages, embeds) {
+    Ok(pins) -> pins.map(|pin: LockedPackage| pin.digest),
+    Err(_) -> panic("the packages lock"),
+  }
+}
+
+test "a dependency's locked hash depends on the files its modules embed as well as on their text" {
+  assert(locked_digests(b"one").len() > 0);
+  assert(locked_digests(b"one") != locked_digests(b"two"));
+  assert_eq(locked_digests(b"one"), locked_digests(b"one"))
 }
 
 fn embed_from_files<[r]>(

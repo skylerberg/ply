@@ -16,8 +16,8 @@ import compiler.syntax.parsing (is_synthetic_site)
 import rename.lines (LocalLine, Moved, MemberLine, Renames, field_name, joined, renamed, shown)
 import rename.strings (line_at)
 import rename.programs (Entry, Library, Loaded, Read, DefinitionKey, Record, PlainRecord,
-                        NewRecordType, DeclaredRecord, plain_record, root_relative, key_of,
-                        module_path, package_of)
+                        NewRecordType, DeclaredRecord, ChangedNames, plain_record, root_relative,
+                        key_of, file_of_module, module_path, package_of)
 import compiler.emit.keys (name_in_module)
 
 type Applying = { at: Int, parts: List<Bytes> }
@@ -168,6 +168,33 @@ fn with_definitions(
     }))
 }
 
+pub fn changed_names(renames: Renames, r: Read) -> ChangedNames / {abort.raise} = {
+  let path = displayed(r.file.at);
+  let declared = namespaces.fold([], |found: List<Bytes>, namespace: Namespace|
+    declarations_in(r.declarations, namespace).fold(found, |names: List<Bytes>, d: Declaration|
+      if declared_name(renames, path, r.declarations, d.name) == d.name { names }
+      else { names.push_unique(d.name) }));
+  let effects = r.effects.fold(
+    declared,
+    |found: List<Bytes>, e: { name: Bytes, operations: List<Bytes> }|
+      if e.operations.any(|op: Bytes|
+          renamed(renames, op) != op
+            || renames.members.any(|m: MemberLine|
+              m.file == path && m.of == e.name && m.member == op)) { found.push_unique(e.name) }
+      else { found },
+  );
+  {
+    names: r.records.fold(effects, |found: List<Bytes>, d: DeclaredRecord|
+      if d.fields.any(|f: Bytes|
+          field_name(renames, f) != f
+            || renames.members.any(|m: MemberLine|
+              m.file == path && m.of == d.name && m.member == f)) { found.push_unique(d.name) }
+      else { found }),
+    module: renames.modules.len() > 0
+      || r.name.split(b".").any(|part: Bytes| renamed(renames, part) != part),
+  }
+}
+
 fn with_operations(
   renaming: Renaming,
   r: Read,
@@ -287,8 +314,8 @@ fn with_move(renaming: Renaming, r: Read, package: RootedPath) -> Renaming / {ab
   }
 }
 
-pub fn move_of(renaming: Renaming, l: Loaded, module: Int) -> Option<ModuleMove> =
-  match l.module_files.at(module) { Some(Some(file)) -> renaming.modules.get(file), _ -> None }
+pub fn move_of(renaming: Renaming, l: Loaded, module: Bytes) -> Option<ModuleMove> =
+  match file_of_module(l, module) { Some(file) -> renaming.modules.get(file), None -> None }
 
 pub fn moved_name(name: Bytes, move: Option<ModuleMove>) -> Bytes =
   match move {
@@ -356,7 +383,7 @@ pub fn renaming_of(
     },
     |accumulator: Renaming, l: Loaded|
       l.reads.fold(accumulator, |renaming: Renaming, r: Read| {
-        let declarations = l.declarations.get(r.index);
+        let declarations = r.declarations;
         let named = with_record_fields(
           with_operations(with_definitions(renaming, r, declarations), r, declarations),
           r,
@@ -378,11 +405,11 @@ pub fn qualified_after(
   qualified: Bytes,
 ) -> Bytes / {abort.raise} = {
   let module = module_of_name(qualified);
-  match l.indices.get(module) {
+  match file_of_module(l, module) {
     None -> qualified,
-    Some(i) ->
+    Some(_) ->
       qualify(
-        moved_name(module, move_of(renaming, l, i)),
+        moved_name(module, move_of(renaming, l, module)),
         key_of(l, qualified).and_then(|k: DefinitionKey|
           names_in_namespace(renaming.definitions, namespace).get(k)).unwrap_or(
           name_in_module(module, qualified),
@@ -400,14 +427,10 @@ pub type Edited = {
   failures: List<Failure>,
 }
 
-fn position_in(names: List<Bytes>, name: Bytes) -> Int =
-  names.fold({ at: 0, found: 0 - 1 }, |s: { at: Int, found: Int }, n: Bytes|
-    { at: s.at + 1, found: if n == name { s.at } else { s.found } }).found
-
-fn qualifier_new(renaming: Renaming, l: Loaded, r: Read, text: Bytes, m: Int) -> Bytes =
+fn qualifier_new(renaming: Renaming, l: Loaded, r: Read, text: Bytes, m: Bytes) -> Bytes =
   match move_of(renaming, l, m) {
     None -> text,
-    Some(move) -> if r.imports.any(|i: { declaration: ImportDeclaration, target: Int }|
+    Some(move) -> if r.imports.any(|i: { declaration: ImportDeclaration, target: Bytes }|
         match i.declaration.kind { ModuleAlias(a) -> a.name == text, _ -> false }) { text }
     else { move.new_parts.at(move.new_parts.len() - 1).unwrap_or(text) },
   }
@@ -431,7 +454,7 @@ pub fn shared_names(renaming: Renaming, loads: List<Loaded>) -> List<SharedName>
   loads.fold([], |accumulator: List<SharedName>, l: Loaded|
     l.reads.fold(accumulator, |found: List<SharedName>, r: Read| {
       let file = absolute(renaming.pwd, r.file.at);
-      let bound = l.scopes.get(r.index).bound;
+      let bound = r.scope.bound;
       let after = namespaces.map(|namespace: Namespace|
         {
           namespace: namespace,
@@ -442,7 +465,7 @@ pub fn shared_names(renaming: Renaming, loads: List<Loaded>) -> List<SharedName>
           ),
         });
       namespaces.fold(found, |f: List<SharedName>, namespace: Namespace|
-        declarations_in(l.declarations.get(r.index), namespace).fold(
+        declarations_in(r.declarations, namespace).fold(
           f,
           |into: List<SharedName>, d: Declaration| {
             let new = names_in_namespace(renaming.definitions, namespace).get({
@@ -451,7 +474,7 @@ pub fn shared_names(renaming: Renaming, loads: List<Loaded>) -> List<SharedName>
             }).unwrap_or(
               d.name,
             );
-            let declarations = l.declarations.get(r.index);
+            let declarations = r.declarations;
             if new == d.name { into } else {
               match after.find(|a: { namespace: Namespace, names: Set<Bytes> }|
                   a.namespace != namespace && a.names.contains(new)
@@ -492,7 +515,7 @@ fn reference_new(
       Some(ops) -> ops.get(o.name).unwrap_or(x.name),
       None -> x.name,
     },
-    ModuleQualifier(m) -> qualifier_new(renaming, l, r, x.name, position_in(l.names, m)),
+    ModuleQualifier(m) -> qualifier_new(renaming, l, r, x.name, m),
     Unbound -> x.name,
   }
 
@@ -600,7 +623,7 @@ fn noted_edit(
 fn import_edits(renaming: Renaming, l: Loaded, r: Read) -> List<Edit> / {abort.raise} =
   r.imports.fold(
     [],
-    |accumulator: List<Edit>, i: { declaration: ImportDeclaration, target: Int }|
+    |accumulator: List<Edit>, i: { declaration: ImportDeclaration, target: Bytes }|
       match move_of(renaming, l, i.target) {
         Some(move) -> {
           let offset = i.declaration.path.len() - move.before.len();
@@ -727,7 +750,7 @@ pub fn split_names(renaming: Renaming, loads: List<Loaded>) -> List<SplitName> /
   loads.fold([], |accumulator: List<SplitName>, l: Loaded|
     l.reads.fold(accumulator, |found: List<SplitName>, r: Read| {
       let file = absolute(renaming.pwd, r.file.at);
-      declarations_in(l.declarations.get(r.index), TypeSpace).fold(
+      declarations_in(r.declarations, TypeSpace).fold(
         found,
         |into: List<SplitName>, t: Declaration| {
           let new = names_in_namespace(renaming.definitions, TypeSpace).get({

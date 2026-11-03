@@ -237,84 +237,16 @@ fn reading_the_standard_library_modules_through_a_symbolic_link_to_their_directo
     let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     assert_eq!(trace, "shipped\tstd.list\tlist digest\n");
     recorder.read(Read::File, &real.join("shipped/std/words/list.txt"));
-    recorder.reached(VIEW, true);
     let embedding = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     assert_eq!(
         embedding,
-        "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd/words/list.txt\twords digest\n"
+        "shipped\tstd.list\tlist digest\nshipped\tstd/words/list.txt\twords digest\n"
     );
     recorder.read(Read::File, &real.join("shipped/stamps"));
     let stamped = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
     assert!(
         stamped.starts_with("program\tprogram digest\n"),
         "{stamped}"
-    );
-}
-
-const VIEW: &str =
-    "shipform\tstd.list\tlist digest\tform\nshipdef\tstd.list\tstd.list.take\thash\n";
-
-#[test]
-fn a_recorded_summary_of_standard_library_modules_replaces_the_separate_records_of_reading_those_modules()
- {
-    let recorder = Recorder::default();
-    recorder.shipped("std.list");
-    recorder.shipped("std.list");
-    recorder.reached(VIEW, true);
-    recorder.reached("shipform\tstd.handed\tt\tf\n", true);
-    let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    assert_eq!(
-        trace,
-        "shipdef\tstd.list\tstd.list.take\thash\nshipform\tstd.list\tlist digest\tform\nshipped\tstd.list\tlist digest\n"
-    );
-    recorder.reached(VIEW, true);
-    let viewed = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    assert!(!viewed.contains("shipped\t"));
-}
-
-#[test]
-fn a_summary_recorded_after_a_module_was_already_read_adds_its_definitions_to_the_earlier_summary()
-{
-    let recorder = Recorder::default();
-    recorder.shipped("std.list");
-    recorder.reached(VIEW, true);
-    recorder.reached(
-        "shipform\tstd.list\tlist digest\tform\nshipdef\tstd.list\tstd.list.drop\thash\n",
-        false,
-    );
-    let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    assert_eq!(
-        lines(&trace),
-        [
-            "shipdef\tstd.list\tstd.list.drop",
-            "shipdef\tstd.list\tstd.list.take",
-            "shipform\tstd.list\tlist digest",
-        ]
-    );
-}
-
-#[test]
-fn a_module_summary_is_valid_while_the_module_s_digest_is_unchanged_and_invalid_when_it_differs() {
-    assert!(stands(VIEW, &world(&[], "b")));
-    let moved_list = VIEW.replace("list digest", "another digest");
-    assert_eq!(
-        observe::moved(&moved_list, &world(&[], "b"), None),
-        Some("the shipped module `std.list`".to_string())
-    );
-}
-
-#[test]
-fn a_trace_includes_the_module_summaries_reported_by_a_child_ply_process() {
-    let recorder = Recorder::default();
-    let file = recorder.child_trace();
-    std::fs::write(&file, format!("{VIEW}end\n")).unwrap();
-    let trace = observe::finished(&recorder, &world(&[], "b"), false).unwrap();
-    assert_eq!(
-        trace,
-        VIEW.lines()
-            .rev()
-            .map(|l| format!("{l}\n"))
-            .collect::<String>()
     );
 }
 

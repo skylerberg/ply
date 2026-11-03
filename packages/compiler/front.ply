@@ -1,15 +1,14 @@
 import std.set (Set)
-import compiler.codes (internal_error_code)
 import compiler.check.resolve.tables (labelled_text)
 import compiler.check.resolve.tables (error_unplaced, InSource, Unplaced, NoFix)
 import compiler.syntax.parsing (Error, Warning)
-import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, generated_span, start)
+import compiler.syntax.parsing (Identifier, ParseDiagnostic, start)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, EffectSetItem, RequiresClause, ImportDeclaration,
-                              SelectedNames, dump_item, target_type, item_span, ModuleAlias,
+                              SelectedNames, target_type, item_span, ModuleAlias,
                               WholeModule, DeriveItem, InstanceItem, NumericItem)
 import compiler.syntax.type_syntax (WriteMode)
-import compiler.syntax.expressions (sees_homes, is_hidden_binder, prelude_module, Expression,
+import compiler.syntax.expressions (is_hidden_binder, prelude_module, Expression,
                                     PerformExpression, expression_span)
 import compiler.syntax.node_ids (numbered_module)
 import compiler.expand.rewrite.shared (expressions_matching)
@@ -18,29 +17,25 @@ import compiler.check.types (Effect, SingletonResource, Scheme, Type, FunctionTy
                              effect_list_text, scheme_text, named_type, int_type, bytes_type,
                              unit_type)
 import compiler.check.known (some_constructor)
-import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Label, Edit, fixes_moved,
-                                      qualify, place_module, in_module, error_at, backticked,
-                                      import_module_name, path_span, module_of_name)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, qualify, backticked,
+                                      module_of_name)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules)
-import compiler.check.resolve.scopes (unknown_shipped)
 import compiler.check.resolve.defaults (ResolvedProgram)
-import compiler.store.hash.graph (TestNode, LawNode, Node, NodeFn)
+import compiler.store.hash.graph (TestNode, LawNode)
 import compiler.store.hash.forms (build_index, by_name, reachable_functions, Subject, FunctionNamed,
                                   DeclarationNamed, ItemKeyed, own_hashes_of)
 import compiler.store.hash.template (emitted_code)
 import compiler.store.hash (hash_index, body_key)
 import compiler.store.hash.encoding (hex)
-import compiler.check.infer.checker (GroupModule, Own)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, LawInfo, BodyPlan, CheckEvery,
                                      Builtin, builtins)
 import compiler.emit.keys (LawPart, LawGuard, LawBody, root_name, root_text, test_owner, law_key,
                            printed, module_of)
 import compiler.check.infer (measured_definitions, bodies_read)
 import compiler.check.typed (TypedBody)
-import compiler.front.diagnostics (ParsedSource, parse_header_at, parse_all, parse_at, parse_from,
-                                   diagnostic_in_module, with_prelude_source)
-import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, ValidatedPackages,
-                           Closure, closure, closure_of_validated, pins_of)
+import compiler.front.diagnostics (ParsedSource, parse_all, parse_at, diagnostic_in_module,
+                                   with_prelude_source)
+import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, closure, pins_of)
 import compiler.prelude_source
 import std.bin
 import std.hash (blake3)
@@ -49,387 +44,32 @@ import compiler.expand.embed (ModuleEmbed, EmbedResult, EmbedFile, EmbedBytes, E
                               EmbedRequest, ItemEmbeds, embed_request_bin, embed_result_bin,
                               item_embeds_bin, embed_key, inline_embeds, embed_requests,
                               requests_by_item, requests_in, request_of_key, embed_file)
-import compiler.syntax.items (parse, import_declaration_bin, scheduler_modules_needed,
-                              homes_declaring, home_names_in, homes_for, called_names, is_std,
-                              is_shipped, HomeNames)
+import compiler.syntax.items (parse, import_declaration_bin, is_std, is_shipped)
 import compiler.syntax.lexer (is_identifier_continue)
-import compiler.front.rows (ModuleDerivations, KeyRow, EmitterRoot, EmitterConstructor,
+import compiler.front.rows (KeyRow, EmitterRoot, EmitterConstructor,
                             FunctionWidths, ListWidths, MapWidths, NoWidths, RecordWidths,
                             SumWidths, VariableWidths, FixedWidth, KnownDefinitionRow, KnownTestRow,
                             ModuleRow, DefinitionRow, TypeRow, TestRow, LawRow, OperationRow,
                             EffectRow, ConstructorRow, HashRow, ItemHashRow, DefinitionHashRow,
                             LawHashRow, TestHashRow, HashTableRow, BodyRow, Dump, constant_values)
 import compiler.front.facts (outlines_of, guard_bounds, Bounded, encode_tables, decode_tables,
-                             module_facts, functions_of, tests_of, assembled_program, cuts_of,
-                             Analysis, CallArgument, ConstructorArgument, ListArgument,
-                             OtherArgument, TextArgument, StatementSite, sites_in, statements_of,
-                             ShippedModuleSummary, ToolchainTree, group_part)
+                             module_facts, functions_of, tests_of, assembled_program, Analysis,
+                             CallArgument, ConstructorArgument, ListArgument, OtherArgument,
+                             TextArgument, StatementSite, sites_in, statements_of, group_part)
 import compiler.front.emitter_input (root_keys, checked_program_of, view_dump, Analysed,
                                      AnalysisOutcome, Rejected)
 import compiler.front.published (no_rows, encode_rows, decode_rows, rows_of, inferred_facts,
-                                 facts_read, StoredBody, stored_bodies, StubCuts, HashedProgram,
-                                 hashed_closure, resolved_closure, runtime_dump, entry_header,
+                                 facts_read, StoredBody, stored_bodies, runtime_dump, entry_header,
                                  dump_of, Claim, ClaimDefinition, ClaimLaw, ClaimSum, ClaimClause,
-                                 claims, claims_in, rechecked, untested, missing_imports)
-
-fn import_at(imports: List<ImportDeclaration>, name: Bytes) -> Span / {abort.raise} = {
-  let found = imports.fold(None, |accumulator: Option<Span>, declaration: ImportDeclaration|
-    match accumulator {
-      Some(_) -> accumulator,
-      None -> if import_module_name(declaration) == name { Some(path_span(declaration)) }
-      else { None },
-    });
-  match found { Some(s) -> s, None -> generated_span }
-}
-
-fn foreign_import(m: Int, span: Span, importer: Bytes, name: Bytes) -> Diagnostic =
-  error_at(
-    internal_error_code,
-    m,
-    span,
-    Bytes::concat_all([
-      b"the shipped module `",
-      importer,
-      b"` imports `",
-      name,
-      b"`, which this build does not ship",
-    ]),
-    b"a stdlib module may import only modules that ship with it",
-    [
-      b"this is an internal error in the compiler's own sources, not in this program",
-      b"please report it with the version of `ply` that produced it",
-    ],
-  )
-
-type ImportedModules = { wanted: Map<Bytes, Bytes>, diagnostics: List<Diagnostic> }
-
-type Wanted = { names: Set<Bytes>, diagnostics: List<Diagnostic> }
-
-type Importer = { name: Bytes, imports: List<ImportDeclaration> }
-
-fn importer(p: ParsedSource) -> Importer = { name: p.name, imports: p.module.module.imports }
-
-fn wanted(
-  users: Int,
-  listed: List<Bytes>,
-  parsed: List<Importer>,
-  required: List<Bytes>,
-) -> Wanted / {abort.raise} = {
-  let has = listed.fold(Set::empty(), |accumulator: Set<Bytes>, name: Bytes|
-    accumulator.insert(name));
-  let present = parsed.fold(Set::empty(), |accumulator: Set<Bytes>, p: Importer|
-    accumulator.insert(p.name));
-  let named: Wanted = {
-    names: required.fold(Set::empty(), |accumulator: Set<Bytes>, name: Bytes|
-      if has.contains(name) && !present.contains(name) { accumulator.insert(name) }
-      else { accumulator }),
-    diagnostics: [],
-  };
-  range(0, parsed.len()).fold(named, |accumulator: Wanted, i: Int| {
-    let p = parsed.get(i);
-    let imports = p.imports;
-    let ships = i >= users;
-    imports.fold(accumulator, |w: Wanted, declaration: ImportDeclaration| {
-      let name = import_module_name(declaration);
-      if is_shipped(name) && !present.contains(name) {
-        if has.contains(name) { { ..w, names: w.names.insert(name) } } else {
-          {
-            ..w,
-            diagnostics: w.diagnostics.push(if ships {
-              foreign_import(i, import_at(imports, name), p.name, name)
-            } else { unknown_shipped(i, import_at(imports, name), name, listed) }),
-          }
-        }
-      } else if ships && !is_shipped(name) {
-        {
-          ..w,
-          diagnostics: w.diagnostics.push(
-            foreign_import(i, import_at(imports, name), p.name, name),
-          ),
-        }
-      } else { w }
-    })
-  })
-}
-
-fn pull_round(
-  users: Int,
-  shipped: Map<Bytes, Bytes>,
-  listed: List<Bytes>,
-  parsed: List<ParsedSource>,
-  required: List<Bytes>,
-) -> ImportedModules / {abort.raise} = {
-  let w = wanted(users, listed, parsed.map(importer), required);
-  w.names.fold(
-    { wanted: Map::new(), diagnostics: w.diagnostics },
-    |r: ImportedModules, name: Bytes|
-      match shipped.get(name) {
-        Some(source) -> { ..r, wanted: r.wanted.insert(name, source) },
-        None -> { ..r, diagnostics: r.diagnostics.push(missing_shipped_source(name)) },
-      },
-  )
-}
-
-fn missing_shipped_source(name: Bytes) -> Diagnostic =
-  error_at(
-    internal_error_code,
-    0,
-    generated_span,
-    Bytes::concat_all([b"the shipped module `", name, b"` is pulled and was never read"]),
-    b"the load read its shipped modules before it knew what it pulls",
-    [b"this is Ply's fault, not the program's"],
-  )
+                                 claims, claims_in, rechecked)
 
 pub type ShippedData = { name: Bytes, bytes: Bytes }
 
 derive bin for ShippedData
 
-pub type ShippedInputs = {
-  sources: List<Source>,
-  unread: List<Bytes>,
-  data: List<ShippedData>,
-  required_modules: List<Bytes>,
-  dependencies: List<ModuleDependencies>,
-}
-
-pub type ModuleDependencies = { name: Bytes, pulls: Dependencies }
-
 pub type Dependencies = { imports: List<ImportDeclaration>, wants: List<ItemEmbeds> }
 
 derive bin for Dependencies
-
-pub fn dependencies_of(source: Source) -> Dependencies / {abort.raise} =
-  {
-    imports: parse_header_at(0, source).module.module.imports,
-    wants: if may_call_embed(source.source_text) {
-      requests_by_item(parse(source.source_text).node)
-    } else { [] },
-  }
-
-fn home_imports(homes: List<Bytes>) -> List<ImportDeclaration> =
-  homes.map(|h: Bytes|
-    {
-      path: h.split(b".").map(|part: Bytes| { name: part, span: generated_span }),
-      kind: WholeModule,
-      span: generated_span,
-    })
-
-pub fn shipped_inputs_of_pulled<| e>(
-  pulled: List<Bytes>,
-  listed: List<Bytes>,
-  read: (Bytes) -> Option<Bytes> / e,
-  read_data: (Bytes) -> Option<Bytes> / e,
-  wanted: (Source) -> ShippedWants / {abort.raise | e},
-  required: List<Bytes>,
-) -> ShippedInputs / {abort.raise | e} = {
-  let reading = |accumulator: List<Source>, n: Bytes|
-    if accumulator.fold(false, |b: Bool, s: Source| b || s.name == n) { accumulator } else {
-      match read(n) {
-        Some(source_text) -> accumulator.push({ name: n, source_text: source_text }),
-        None -> accumulator,
-      }
-    };
-  let pulled_read = pulled.fold([], reading);
-  let wants = pulled_read.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, ShippedWants>, source: Source|
-      accumulator.insert(source.name, wanted(source)),
-  );
-  let wants_of = |source: Source|
-    match wants.get(source.name) { Some(w) -> w, None -> wanted(source) };
-  let found = pulled_read.fold(pulled_read, |accumulator: List<Source>, source: Source|
-    wants_of(source).texts.fold(accumulator, reading));
-  let lookup_or_empty = found.fold(Set::empty(), |accumulator: Set<Bytes>, s: Source|
-    accumulator.insert(s.name));
-  {
-    sources: found,
-    unread: listed.filter(|n: Bytes| !lookup_or_empty.contains(n)),
-    data: found.fold([], |accumulator: List<ShippedData>, source: Source|
-      wants_of(source).data.fold(accumulator, |a: List<ShippedData>, name: Bytes|
-        if a.fold(false, |b: Bool, d: ShippedData| b || d.name == name) { a } else {
-          match read_data(name) { Some(bytes) -> a.push({ name: name, bytes: bytes }), None -> a }
-        })),
-    required_modules: required,
-    dependencies: [],
-  }
-}
-
-pub fn shipped_inputs_of<| e>(
-  user: List<Source>,
-  packages: PackageSources,
-  listed: List<Bytes>,
-  read: (Bytes) -> Option<Bytes> / e,
-  read_data: (Bytes) -> Option<Bytes> / e,
-  pulled: (Source) -> Dependencies / e,
-  required: List<Bytes> = [],
-) -> ShippedInputs / {abort.raise | e} = {
-  let package_closure = closure(packages, user.map(|s: Source| s.name));
-  let read_own = user.concat(
-    package_closure.modules.map(|m: { pkg: Int, source: Source }| m.source),
-  ).fold(
-    { own: [], declared: None },
-    |accumulator: { own: List<ModuleDependencies>, declared: Option<List<HomeNames>> }, source: Source| {
-      let p = with_home_imports(source, pulled(source), accumulator.declared, read);
-      { own: accumulator.own.push({ name: source.name, pulls: p.pulls }), declared: p.declared }
-    },
-  );
-  let own = read_own.own;
-  let needed = read_needed(
-    own.len(),
-    listed,
-    read,
-    read_data,
-    pulled,
-    {
-      importers: own.map(|m: ModuleDependencies| { name: m.name, imports: m.pulls.imports }),
-      found: [],
-      data: [],
-      tried: Set::empty(),
-      pulls: [],
-      declared: read_own.declared,
-    },
-    listed.len() + 1,
-    required,
-  );
-  let lookup_or_empty = needed.found.fold(Set::empty(), |accumulator: Set<Bytes>, s: Source|
-    accumulator.insert(s.name));
-  {
-    sources: needed.found,
-    unread: listed.filter(|name: Bytes| !lookup_or_empty.contains(name)),
-    data: needed.data,
-    required_modules: required,
-    dependencies: own.concat(needed.pulls),
-  }
-}
-
-type ReadProgress = {
-  importers: List<Importer>,
-  found: List<Source>,
-  data: List<ShippedData>,
-  tried: Set<Bytes>,
-  pulls: List<ModuleDependencies>,
-  declared: Option<List<HomeNames>>,
-}
-
-fn with_home_imports<| e>(
-  source: Source,
-  pulls: Dependencies,
-  declared: Option<List<HomeNames>>,
-  read: (Bytes) -> Option<Bytes> / e,
-) -> { pulls: Dependencies, declared: Option<List<HomeNames>> } / {abort.raise | e} =
-  if !sees_homes(source.name) { { pulls: pulls, declared: declared } } else {
-    let input = start(source.source_text).input;
-    let called = called_names(input);
-    let d = if called.is_empty() { declared } else {
-      Some(match declared {
-        Some(d) -> d,
-        None -> homes_declaring(|h: Bytes| home_names_in(read(h))),
-      })
-    };
-    let homes = match d { Some(x) -> homes_for(called, x), None -> [] };
-    {
-      pulls: {
-        ..pulls,
-        imports: pulls.imports.concat(
-          home_imports(homes.concat(scheduler_modules_needed(source.name, input))),
-        ),
-      },
-      declared: d,
-    }
-  }
-
-fn read_needed<| e>(
-  users: Int,
-  listed: List<Bytes>,
-  read: (Bytes) -> Option<Bytes> / e,
-  read_data: (Bytes) -> Option<Bytes> / e,
-  pulled: (Source) -> Dependencies / e,
-  x: ReadProgress,
-  rounds_left: Int,
-  required: List<Bytes>,
-) -> ReadProgress / {abort.raise | e} = {
-  let names = wanted(users, listed, x.importers, required).names.elements().filter(|name: Bytes|
-    !x.tried.contains(name));
-  if names.len() == 0 || rounds_left <= 0 { x } else {
-    read_needed(
-      users,
-      listed,
-      read,
-      read_data,
-      pulled,
-      names.fold(x, |accumulator: ReadProgress, name: Bytes| {
-        let tried = accumulator.tried.insert(name);
-        match read(name) {
-          None -> { ..accumulator, tried: tried },
-          Some(text) -> {
-            let source = { name: name, source_text: text };
-            let added = with_home_imports(source, pulled(source), accumulator.declared, read);
-            let pulls = added.pulls;
-            read_embedded_files(
-              listed,
-              read,
-              read_data,
-              {
-                ..accumulator,
-                importers: accumulator.importers.push({ name: name, imports: pulls.imports }),
-                found: accumulator.found.push(source),
-                tried: tried,
-                pulls: accumulator.pulls.push({ name: name, pulls: pulls }),
-                declared: added.declared,
-              },
-              name,
-              requests_in(pulls.wants),
-            )
-          },
-        }
-      }),
-      rounds_left - 1,
-      required,
-    )
-  }
-}
-
-fn read_embedded_files<| e>(
-  listed: List<Bytes>,
-  read: (Bytes) -> Option<Bytes> / e,
-  read_data: (Bytes) -> Option<Bytes> / e,
-  x: ReadProgress,
-  module: Bytes,
-  wants: List<EmbedRequest>,
-) -> ReadProgress / {abort.raise | e} =
-  wants.fold(x, |accumulator: ReadProgress, want: EmbedRequest|
-    if want.dir { accumulator } else {
-      match shipped_name(module, want.path) {
-        Some(name) -> if accumulator.tried.contains(name) || !listed.contains(name) { accumulator }
-        else {
-          let tried = accumulator.tried.insert(name);
-          match read(name) {
-            None -> { ..accumulator, tried: tried },
-            Some(text) ->
-              {
-                ..accumulator,
-                found: accumulator.found.push({ name: name, source_text: text }),
-                tried: tried,
-              },
-          }
-        },
-        None -> match shipped_data_name(module, want.path) {
-          None -> accumulator,
-          Some(name) -> if accumulator.tried.contains(name) { accumulator } else {
-            let tried = accumulator.tried.insert(name);
-            match read_data(name) {
-              None -> { ..accumulator, tried: tried },
-              Some(bytes) ->
-                {
-                  ..accumulator,
-                  data: accumulator.data.push({ name: name, bytes: bytes }),
-                  tried: tried,
-                },
-            }
-          },
-        },
-      }
-    })
 
 fn shipped_path_parts(module: Bytes, path: Bytes) -> Option<List<Bytes>> =
   if path.starts_with(b"/") { None } else {
@@ -492,10 +132,6 @@ pub type ShippedWants = { texts: List<Bytes>, data: List<Bytes> }
 
 derive bin for ShippedWants
 
-pub fn shipped_wants(module: Source) -> ShippedWants / {abort.raise} =
-  if !may_call_embed(module.source_text) { { texts: [], data: [] } }
-  else { shipped_wants_in(module.name, parse(module.source_text).node) }
-
 pub fn shipped_wants_of(module: Source, node: Module) -> ShippedWants / {abort.raise} =
   if !may_call_embed(module.source_text) { { texts: [], data: [] } }
   else { shipped_wants_in(module.name, node) }
@@ -535,19 +171,6 @@ pub fn shipped_data_embeds(
   )
 }
 
-type PullState = {
-  parsed: List<ParsedSource>,
-  pulled: List<Bytes>,
-  embeds: List<ModuleEmbed>,
-  diagnostics: List<Diagnostic>,
-  stubbable_bodies: List<StubCuts>,
-  unimported: Map<Bytes, List<Bytes>>,
-}
-
-fn required_with(required: List<Bytes>, unimported: Map<Bytes, List<Bytes>>) -> List<Bytes> =
-  unimported.fold(required, |accumulator: List<Bytes>, _: Bytes, read: List<Bytes>|
-    accumulator.concat(read))
-
 fn with_hidden_imports(p: ParsedSource, dependencies: Option<Dependencies>) -> ParsedSource =
   match dependencies {
     None -> p,
@@ -572,112 +195,6 @@ fn with_hidden_imports(p: ParsedSource, dependencies: Option<Dependencies>) -> P
         }
       }
     },
-  }
-
-fn pull_rounds(
-  users: Int,
-  shipped: Map<Bytes, Bytes>,
-  whole: Map<Bytes, Bytes>,
-  dependencies: Map<Bytes, Dependencies>,
-  data: Map<Bytes, EmbedFile>,
-  listed: List<Bytes>,
-  tested: Bool,
-  x: PullState,
-  rounds_left: Int,
-  required: List<Bytes>,
-  declared: List<HomeNames>,
-  given: List<ParsedSource>,
-  derived: List<ModuleDerivations>,
-) -> PullState / {abort.raise} = {
-  let early = x.parsed.fold([], |accumulator: List<Diagnostic>, parsed: ParsedSource|
-    accumulator.concat(parsed.diagnostics));
-  if early.len() > 0 { { ..x, diagnostics: early } } else {
-    let r = pull_round(users, shipped, listed, x.parsed, required);
-    if r.diagnostics.len() > 0 { { ..x, diagnostics: r.diagnostics } }
-    else if r.wanted.len() == 0 { x } else if rounds_left <= 0 {
-      panic(
-        "standard library modules were still being requested after the last allowed round of loading imports",
-      )
-    } else {
-      let read = missing_imports(
-        r.wanted.fold([], |accumulator: List<Source>, name: Bytes, text: Bytes|
-          accumulator.push({ name: name, source_text: text })),
-        declared,
-      );
-      let round = r.wanted.fold(x, |accumulator: PullState, name: Bytes, text: Bytes| {
-        let at = accumulator.parsed.len();
-        let o = shipped_embedded(
-          whole,
-          dependencies,
-          data,
-          at,
-          parsed_at(given, derived, at, { name: name, source_text: text }),
-        );
-        {
-          ..accumulator,
-          parsed: accumulator.parsed.push(if tested { o.parsed } else { untested(o.parsed) }),
-          stubbable_bodies: if tested { accumulator.stubbable_bodies } else {
-            accumulator.stubbable_bodies.push({
-              name: o.parsed.name,
-              cuts: cuts_of(o.parsed.module),
-            })
-          },
-          pulled: accumulator.pulled.push(name),
-          embeds: accumulator.embeds.concat(o.embeds),
-        }
-      });
-      pull_rounds(
-        users,
-        shipped,
-        whole,
-        dependencies,
-        data,
-        listed,
-        tested,
-        {
-          ..round,
-          unimported: read.fold(
-            round.unimported,
-            |accumulator: Map<Bytes, List<Bytes>>, name: Bytes, reads: List<Bytes>|
-              accumulator.insert(name, reads),
-          ),
-        },
-        rounds_left - 1,
-        required_with(required, read),
-        declared,
-        given,
-        derived,
-      )
-    }
-  }
-}
-
-fn parsed_at(
-  given: List<ParsedSource>,
-  derived: List<ModuleDerivations>,
-  index: Int,
-  source: Source,
-) -> ParsedSource / {abort.raise} =
-  match given.find(|g: ParsedSource| g.name == source.name && g.text == source.source_text) {
-    Some(g) -> { ..g, diagnostics: g.diagnostics.map(|d: Diagnostic| moved_to(d, index)) },
-    None ->
-      parse_from(
-        index,
-        source,
-        parse(source.source_text),
-        derivations: match derived.find(|m: ModuleDerivations| m.module == source.name) {
-          Some(m) -> m.derivations,
-          None -> [],
-        },
-      ),
-  }
-
-fn moved_to(d: Diagnostic, index: Int) -> Diagnostic =
-  {
-    ..d,
-    labels: d.labels.map(|l: Label|
-      if place_module(l.place) == Some(0) { { ..l, place: in_module(l.place, index) } } else { l }),
-    fixes: fixes_moved(d.fixes, |e: Edit| if e.module == 0 { { ..e, module: index } } else { e }),
   }
 
 type ShippedFile = | ShippedModuleText(Bytes) | ShippedDataFile(Bytes)
@@ -831,275 +348,6 @@ pub fn parse_shipped(
   range(0, modules.len()).map(|i: Int|
     shipped_embedded(whole, Map::new(), lookup_or_empty, i, parse_at(i, modules.get(i))).parsed)
 }
-
-pub type StagedLoad = { pulled: List<Bytes>, hashed: Result<HashedProgram, List<Diagnostic>> }
-
-pub fn viewed_text(viewed: List<ShippedModuleSummary>) -> Bytes = {
-  let line = |parts: List<Bytes>|
-    parts.fold(b"", |accumulator: Bytes, part: Bytes|
-      if accumulator.len() == 0 { part }
-      else { Bytes::concat_all([accumulator, b"\t", part]) }).concat(
-      b"\n",
-    );
-  Bytes::concat_all(
-    viewed.fold([], |accumulator: List<Bytes>, v: ShippedModuleSummary|
-      v.definitions.fold(
-        accumulator.push(line([b"shipform", v.module, v.text, v.form])),
-        |a: List<Bytes>, d: { name: Bytes, hash: Bytes }|
-          a.push(line([b"shipdef", v.module, d.name, d.hash])),
-      )),
-  )
-}
-
-type PulledLoad = {
-  pulled: PullState,
-  package_closure: Closure,
-  tree: ToolchainTree,
-  embeds_at: List<ModuleEmbed>,
-  items: Map<Bytes, List<ItemEmbeds>>,
-}
-
-fn pulled_load(
-  user: List<Source>,
-  shipped: List<Source>,
-  packages: PackageSources,
-  embeds: List<EmbedRecord>,
-  tested: Bool,
-  unread: List<Bytes>,
-  data: List<EmbedFile>,
-  required: List<Bytes>,
-  pulls: List<ModuleDependencies>,
-  given: List<ParsedSource>,
-  derived: List<ModuleDerivations>,
-  package_verdicts: Option<ValidatedPackages>,
-) -> PulledLoad / {abort.raise} = {
-  let package_closure = match package_verdicts {
-    Some(j) -> closure_of_validated(j, packages.supplied),
-    None -> closure(packages, user.map(|s: Source| s.name)),
-  };
-  let dependencies = pulls.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Dependencies>, m: ModuleDependencies|
-      accumulator.insert(m.name, m.pulls),
-  );
-  let lookup_or_empty = if unread.contains(prelude_module) { shipped }
-  else { with_prelude_source(shipped) };
-  let texts = lookup_or_empty.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
-    accumulator.insert(s.name, s.source_text));
-  let sources = user.concat(
-    package_closure.modules.map(|m: { pkg: Int, source: Source }| m.source),
-  );
-  let declared = homes_declaring(|h: Bytes| home_names_in(texts.get(h)));
-  let unimported = missing_imports(sources, declared);
-  let read = range(0, sources.len()).fold(
-    { parsed: [], cuts: [] },
-    |accumulator: { parsed: List<ParsedSource>, cuts: List<StubCuts> }, i: Int| {
-      let p = parsed_at(given, derived, i, sources.get(i));
-      if tested { { ..accumulator, parsed: accumulator.parsed.push(p) } } else {
-        {
-          parsed: accumulator.parsed.push(untested(p)),
-          cuts: accumulator.cuts.push({ name: p.name, cuts: cuts_of(p.module) }),
-        }
-      }
-    },
-  );
-  let parsed = read.parsed;
-  let items = range(0, sources.len()).fold(
-    pulls.fold(Map::new(), |accumulator: Map<Bytes, List<ItemEmbeds>>, m: ModuleDependencies|
-      if m.pulls.wants.len() == 0 { accumulator }
-      else { accumulator.insert(m.name, m.pulls.wants) }),
-    |accumulator: Map<Bytes, List<ItemEmbeds>>, i: Int| {
-      let s = sources.get(i);
-      if !tested || accumulator.contains(s.name) || !may_call_embed(s.source_text) { accumulator }
-      else { accumulator.insert(s.name, requests_by_item(parsed.get(i).module.module)) }
-    },
-  );
-  let mentions = user.map(|s: Source| may_call_embed(s.source_text)).concat(
-    package_closure.modules.map(|m: { pkg: Int, source: Source }|
-      may_call_embed(m.source.source_text)),
-  );
-  let declaration_sources = embedded_all(parsed, embed_slots(packages, user), mentions, embeds);
-  let assembled = declaration_sources.parsed;
-  let named = shipped.map(|s: Source| s.name).concat(unread);
-  let listed = named.concat(lookup_or_empty.drop(shipped.len()).map(|s: Source| s.name));
-  let tree = NoTree;
-  let x = pull_rounds(
-    assembled.len(),
-    texts,
-    texts,
-    dependencies,
-    data_by_name(data),
-    listed,
-    tested,
-    {
-      parsed: assembled,
-      pulled: [],
-      embeds: [],
-      stubbable_bodies: read.cuts,
-      diagnostics: [],
-      unimported: unimported,
-    },
-    texts.len(),
-    required_with(required, unimported),
-    declared,
-    given,
-    derived,
-  );
-  {
-    pulled: x,
-    package_closure: package_closure,
-    tree: tree,
-    embeds_at: declaration_sources.at,
-    items: items,
-  }
-}
-
-pub fn load_with_shipped(
-  user: List<Source>,
-  shipped: List<Source>,
-  packages: PackageSources = { root: b"", manifest: None, supplied: [] },
-  embeds: List<EmbedRecord> = [],
-  tested: Bool = true,
-  unread: List<Bytes> = [],
-  data: List<EmbedFile> = [],
-  required: List<Bytes> = [],
-  pulls: List<ModuleDependencies> = [],
-  given: List<ParsedSource> = [],
-  derived: List<ModuleDerivations> = [],
-  package_verdicts: Option<ValidatedPackages> = None,
-) -> StagedLoad / {abort.raise} = {
-  let load = pulled_load(
-    user,
-    shipped,
-    packages,
-    embeds,
-    tested,
-    unread,
-    data,
-    required,
-    pulls,
-    given,
-    derived,
-    package_verdicts,
-  );
-  let x = load.pulled;
-  let hashed = |parsed: List<ParsedSource>|
-    match hashed_closure(
-        parsed,
-        load.package_closure,
-        user.len(),
-        load.tree,
-        x.unimported,
-        load.embeds_at.concat(x.embeds),
-        x.stubbable_bodies,
-      ) {
-      Err(diagnostics) -> Err(diagnostics),
-      Ok(h) -> Ok({ ..h, embed_items: load.items }),
-    };
-  if x.diagnostics.len() > 0 { { pulled: x.pulled, hashed: Err(x.diagnostics) } }
-  else { { pulled: x.pulled, hashed: hashed(x.parsed) } }
-}
-
-fn first_shipped_slot(h: HashedProgram) -> Int =
-  h.resolved.modules.filter(|m: GroupModule| m.role == Own).len() + h.closure.modules.len()
-
-fn shipped_functions(h: HashedProgram) -> Set<Bytes> / {abort.raise} =
-  range(first_shipped_slot(h), h.resolved.modules.len()).fold(
-    Set::empty(),
-    |accumulator: Set<Bytes>, i: Int| {
-      let m = h.resolved.modules.get(i).parsed;
-      m.module.items.fold(accumulator, |a: Set<Bytes>, item: Item|
-        match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name)), _ -> a })
-    },
-  )
-
-fn shipped_views_of(
-  h: HashedProgram,
-  read: (Bytes) -> Bool,
-) -> List<ShippedModuleSummary> / {abort.raise} = {
-  let first = first_shipped_slot(h);
-  let candidates = shipped_functions(h);
-  let definitions = h.hashes.definitions.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
-      accumulator.insert(d.name, d.hash),
-  );
-  let declarations = h.hashes.declarations.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, d: { name: Bytes, hash: Bytes }|
-      accumulator.insert(d.name, d.hash),
-  );
-  let nodes = h.resolved.index.nodes.fold(
-    Map::new(),
-    |accumulator: Map<Int, List<Node>>, n: Node|
-      if n.module < first { accumulator } else {
-        accumulator.insert(
-          n.module,
-          List::push(match accumulator.get(n.module) { Some(ns) -> ns, None -> [] }, n),
-        )
-      },
-  );
-  range(first, h.resolved.modules.len()).map(|i: Int| {
-    let m = h.resolved.modules.get(i).parsed;
-    let own = match nodes.get(i) { Some(ns) -> ns, None -> [] };
-    let hash_of = |table: Map<Bytes, Bytes>, name: Bytes|
-      match table.get(name) { Some(hash) -> hash, None -> b"" };
-    let shape = own.fold([], |accumulator: List<Bytes>, n: Node|
-      match n.body {
-        NodeFn(_) -> if candidates.contains(n.name) { accumulator }
-        else { accumulator.push(b"derived ".concat(n.name)) },
-        _ ->
-          accumulator.push(
-            Bytes::concat_all([b"declared ", n.name, b" ", hash_of(declarations, n.name)]),
-          ),
-      }).concat(
-      m.module.imports.map(|d: ImportDeclaration| b"imports ".concat(import_module_name(d))),
-    ).concat(
-      m.module.items.fold([], |accumulator: List<Bytes>, item: Item|
-        match item {
-          EffectSetItem(_) -> accumulator.push(b"set ".concat(dump_item(item))),
-          _ -> accumulator,
-        }),
-    );
-    {
-      module: m.name,
-      text: hex(blake3(h.resolved.texts.get(i))),
-      form: hex(blake3(Bytes::join(shape, b"\n"))),
-      definitions: own.fold([], |accumulator: List<{ name: Bytes, hash: Bytes }>, n: Node|
-        match n.body {
-          NodeFn(_) -> if read(n.name) {
-            accumulator.push({ name: n.name, hash: hex(hash_of(definitions, n.name)) })
-          } else { accumulator },
-          _ -> accumulator,
-        }),
-    }
-  })
-}
-
-pub fn shipped_viewer(modules: List<Bytes>) -> Source =
-  {
-    name: b"viewer",
-    source_text: Bytes::concat_all(
-      modules.map(|m: Bytes| Bytes::concat_all([b"import ", m, b"\n"])),
-    ),
-  }
-
-pub fn shipped_views(
-  modules: List<Bytes>,
-  shipped: List<Source>,
-  unread: List<Bytes> = [],
-  data: List<ShippedData> = [],
-) -> Result<List<ShippedModuleSummary>, List<Diagnostic>> / {abort.raise} =
-  match load_with_shipped(
-      [shipped_viewer(modules)],
-      shipped,
-      tested: false,
-      unread: unread,
-      data: embed_files_of(data),
-    ).hashed {
-    Err(diagnostics) -> Err(diagnostics),
-    Ok(h) -> Ok(shipped_views_of(h, |name: Bytes| true)),
-  }
 
 fn is_module_level_item(item: Item) -> Bool =
   match item {
@@ -1283,32 +531,6 @@ fn embed_reads(embeds: List<EmbedRecord>) -> Map<Bytes, Map<Bytes, EmbedResult>>
     accumulator.insert(slot, was.insert(embed_key(embed.want), embed.read))
   })
 
-fn embedded_all(
-  parsed: List<ParsedSource>,
-  slots: List<Bytes>,
-  mentions: List<Bool>,
-  embeds: List<EmbedRecord>,
-) -> { parsed: List<ParsedSource>, at: List<ModuleEmbed> } / {abort.raise} = {
-  let tables = embed_reads(embeds);
-  range(0, parsed.len()).fold(
-    { parsed: [], at: [] },
-    |accumulator: { parsed: List<ParsedSource>, at: List<ModuleEmbed> }, i: Int| {
-      let p = parsed.get(i);
-      match ((slots.at(i), mentions.at(i))) {
-        (Some(slot), Some(true)) -> {
-          let table = match tables.get(slot) { Some(t) -> t, None -> Map::new() };
-          let inlined = embeds_inlined(p, i, table);
-          {
-            parsed: accumulator.parsed.push(inlined.parsed),
-            at: accumulator.at.concat(inlined.embeds),
-          }
-        },
-        _ -> { ..accumulator, parsed: accumulator.parsed.push(p) },
-      }
-    },
-  )
-}
-
 pub fn program() -> List<Source> =
   [
     {
@@ -1484,160 +706,6 @@ pub const shipped_modules: List<Source> =
 
 pub fn not_written(names: List<Bytes>) -> List<Bytes> =
   names.filter(|n: Bytes| !used_prelude_functions.contains(n))
-
-fn shipped_text(name: Bytes) -> Option<Bytes> =
-  shipped_modules.fold(None, |accumulator: Option<Bytes>, s: Source|
-    if s.name == name { Some(s.source_text) } else { accumulator })
-
-effect read_requests {
-  write module(name: Bytes) -> Unit
-  write data(name: Bytes) -> Unit
-}
-
-fn recording_reads<a | e>(
-  body: () -> a / {read_requests.module, read_requests.data | e},
-) -> { value: a, modules: List<Bytes>, data: List<Bytes> } / e =
-  handle {
-    body()
-  } with {
-    var modules: List<Bytes> = [],
-    var data: List<Bytes> = [],
-    read_requests.module(name) -> {
-      modules = modules.push(name);
-    },
-    read_requests.data(name) -> {
-      data = data.push(name);
-    },
-    return value -> { value: value, modules: modules, data: data },
-  }
-
-fn pulled_by(
-  user: List<Source>,
-  named: List<Bytes> = [],
-) -> { shipping: ShippedInputs, requested: List<Bytes> } / {abort.raise} = {
-  let ran = recording_reads(||
-    shipped_inputs_of(
-      user,
-      { root: b"", manifest: None, supplied: [] },
-      shipped_modules.map(|s: Source| s.name),
-      |name: Bytes| {
-        read_requests.module(name);
-        shipped_text(name)
-      },
-      |name: Bytes| None,
-      dependencies_of,
-      named,
-    ));
-  { shipping: ran.value, requested: ran.modules }
-}
-
-test "analysis reads only the bundled modules the program imports and the modules those import" {
-  let p = pulled_by([{ name: b"m", source_text: b"import std.a\npub fn f() -> Int = 1" }]);
-  assert_eq(p.requested, [b"std.a", b"std.c"]);
-  assert_eq(p.shipping.sources.map(|s: Source| s.name), [b"std.a", b"std.c"]);
-  assert_eq(p.shipping.unread, [b"std.b", b"std.d"])
-}
-
-test "analysis reads the compiler modules a compiler module imports from its package, and the module text it embeds" {
-  let texts = [
-    {
-      name: b"compiler.fmt",
-      source_text: b"import compiler.lexer\npub fn f() -> Bytes = embed(\"words/table.ply\")\n",
-    },
-    { name: b"compiler.lexer", source_text: b"pub fn l() -> Int = 1\n" },
-    { name: b"compiler.words.table", source_text: b"" },
-    { name: b"compiler.unit", source_text: b"pub fn u() -> Int = 2\n" },
-  ];
-  let s = shipped_inputs_of(
-    [{ name: b"app", source_text: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
-    { root: b"", manifest: None, supplied: [] },
-    texts.map(|t: Source| t.name),
-    |name: Bytes|
-      texts.fold(None, |accumulator: Option<Bytes>, t: Source|
-        if t.name == name { Some(t.source_text) } else { accumulator }),
-    |name: Bytes| None,
-    dependencies_of,
-  );
-  assert_eq(s.sources.map(|t: Source| t.name), [
-    b"compiler.fmt",
-    b"compiler.words.table",
-    b"compiler.lexer",
-  ]);
-  assert_eq(s.unread, [b"compiler.unit"]);
-  assert_eq(s.data, [])
-}
-
-test "analysis reads the library module text and the library data file that a compiler module embeds" {
-  let texts = [
-    {
-      name: b"compiler.fmt",
-      source_text: b"pub fn f() -> Bytes = embed(\"../std/words.ply\")\npub fn g() -> Bytes = embed(\"../std/oid/names.txt\")\n",
-    },
-    { name: b"std.words", source_text: b"" },
-  ];
-  let s = shipped_inputs_of(
-    [{ name: b"app", source_text: b"import compiler.fmt\nfn main() -> Unit = ()\n" }],
-    { root: b"", manifest: None, supplied: [] },
-    texts.map(|t: Source| t.name),
-    |name: Bytes|
-      texts.fold(None, |accumulator: Option<Bytes>, t: Source|
-        if t.name == name { Some(t.source_text) } else { accumulator }),
-    |name: Bytes| if name == b"std/oid/names.txt" { Some(b"2.5.4.3 cn\n") } else { None },
-    dependencies_of,
-  );
-  assert_eq(s.sources.map(|t: Source| t.name), [b"compiler.fmt", b"std.words"]);
-  assert_eq(s.data.map(|d: { name: Bytes, bytes: Bytes }| d.name), [b"std/oid/names.txt"])
-}
-
-fn data_pulled_by(
-  user: List<Source>,
-  named: List<Bytes> = [],
-) -> { shipping: ShippedInputs, modules: List<Bytes>, data: List<Bytes> } / {abort.raise} = {
-  let texts = [
-    {
-      name: b"std.words",
-      source_text: b"pub fn list() -> Bytes = embed(\"words/list.txt\")\npub fn again() -> Bytes = embed(\"./words/list.txt\")\n",
-    },
-    { name: b"std.idle", source_text: b"pub fn rest() -> Bytes = embed(\"idle/rest.txt\")\n" },
-  ];
-  let ran = recording_reads(||
-    shipped_inputs_of(
-      user,
-      { root: b"", manifest: None, supplied: [] },
-      texts.map(|t: Source| t.name),
-      |name: Bytes| {
-        read_requests.module(name);
-        texts.fold(None, |accumulator: Option<Bytes>, t: Source|
-          if t.name == name { Some(t.source_text) } else { accumulator })
-      },
-      |name: Bytes| {
-        read_requests.data(name);
-        if name == b"std/words/list.txt" { Some(b"one\ntwo\n") } else { None }
-      },
-      dependencies_of,
-      named,
-    ));
-  { shipping: ran.value, modules: ran.modules, data: ran.data }
-}
-
-test "analysis asked to include a bundled module reads the data file it embeds, even when no module imports it" {
-  let p = data_pulled_by([{ name: b"m", source_text: b"pub fn f() -> Int = 1" }], [b"std.words"]);
-  assert_eq(p.modules, [b"std.words"]);
-  assert_eq(p.data, [b"std/words/list.txt"]);
-  assert_eq(p.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\ntwo\n" }]);
-  assert_eq(p.shipping.unread, [b"std.idle"])
-}
-
-test "analysis reads each data file embedded by the bundled modules it loads exactly once, and no other data files" {
-  let p = data_pulled_by([{ name: b"m", source_text: b"import std.words\npub fn f() -> Int = 1" }]);
-  assert_eq(p.modules, [b"std.words"]);
-  assert_eq(p.data, [b"std/words/list.txt"]);
-  assert_eq(p.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\ntwo\n" }]);
-  assert_eq(p.shipping.unread, [b"std.idle"]);
-  let none = data_pulled_by([{ name: b"m", source_text: b"pub fn f() -> Int = 1" }]);
-  assert_eq(none.data, []);
-  assert_eq(none.shipping.data, [])
-}
 
 pub type Published = { dump: Dump, schemes: List<{ name: Bytes, scheme: Scheme }> }
 

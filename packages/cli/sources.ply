@@ -2,34 +2,25 @@ import compiler.check.resolve.tables (place_module)
 import compiler.check.resolve.tables (error_unplaced, error_in_file)
 import compiler.checkout (PartRole, StandardLibraryPart, prefix_of)
 import std.fs
-import std.fs (fs, MemFs, mem_empty, mem_list, mem_write, on_mem)
+import std.fs (fs)
 import std.bytes (u64_le)
 import std.hash (blake3)
 import compiler.store.hash.encoding (hex)
 import std.path (join, is_absolute, normalize, parent, strip_root)
 import compiler.front.rows (module_of)
-import compiler.front (EmbedRecord, ShippedInputs, ShippedData, ShippedWants, embeds_wanted,
-                       dependencies_of, shipped_data_wanted, shipped_inputs_of, shipped_wants,
-                       shipped_inputs_of_pulled)
-import compiler.unit (identity_of, read_cached_file, write_cached_file)
-import compiler.front.interface (blanked, imported)
-import compiler.syntax.items (parse, unneeded_spans, is_std)
-import std.bin
-import std.random (entropy)
-import std.time (time)
+import compiler.front (EmbedRecord, ShippedData, embeds_wanted, shipped_data_wanted)
+import compiler.syntax.items (is_std)
 import compiler.expand.embed (EmbedResult, EmbedBytesResult, EmbedRequest, EmbedSnapshot, embed_key,
                               snapshot_embed, with_digests)
 import compiler.check.resolve.tables (Source, Diagnostic, Label, error_at)
 import builder (builder)
-import compiler.cc (toolchain)
 import compiler.load (embedded_below, is_ply)
-import compiler.front.pkg (PackageSources, dependency_roots)
+import compiler.front.pkg (dependency_roots)
 import std.graph (Visit, traverse)
 import paths
 import paths (RootedPath, displayed, read_file)
 import walk (Failure, WalkResult, walk_for_load, nothing, walk_package)
 import std.list
-import compiler.syntax.parsing (Span, generated_span, span_between)
 
 pub type File = { path: String, module: String, text: Bytes, at: RootedPath }
 
@@ -524,113 +515,6 @@ pub fn shipped_path(name: Bytes) -> RootedPath =
 pub fn shipped_text(name: Bytes) -> Option<Bytes> / {fs.read_file[shipped]} =
   fs.read_file[shipped](shipped_path(name).path)
 
-pub fn shipping_for(
-  user: List<Source>,
-  packages: PackageSources,
-) -> ShippedInputs / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let listed = shipped_names();
-  shipped_inputs_of(
-    user,
-    packages,
-    listed,
-    |name: Bytes| match shipped_text(name) { Some(text) -> Some(imported(text)), None -> None },
-    |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
-    dependencies_of,
-  )
-}
-
-pub fn shipping_cached(
-  pulled: List<Bytes>,
-  wants: Map<Bytes, ShippedWants>,
-) -> ShippedInputs / {toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
-  let importing = imported_reader();
-  shipped_inputs_of_pulled(
-    pulled,
-    shipped_names(),
-    |name: Bytes|
-      match shipped_text(name) { Some(text) -> Some(read_imported(importing, text)), None -> None },
-    |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
-    |source: Source| match wants.get(source.name) { Some(w) -> w, None -> shipped_wants(source) },
-    [],
-  )
-}
-
-pub fn shipping_of(
-  pulled: List<Bytes>,
-) -> ShippedInputs / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
-  shipped_inputs_of_pulled(
-    pulled,
-    shipped_names(),
-    |name: Bytes| match shipped_text(name) { Some(text) -> Some(imported(text)), None -> None },
-    |name: Bytes| fs.read_file[shipped](String::of_bytes_lossy(name)),
-    shipped_wants,
-    [],
-  )
-
-type ImportedReader = { dir: String, importer: Bytes }
-
-fn imported_reader() -> ImportedReader / {toolchain.reuse_dir, fs.read_file[shipped], abort.raise} =
-  {
-    dir: strip_root(toolchain.reuse_dir()),
-    importer: match fs.read_file[shipped]("definitions") {
-      Some(definitions) ->
-        Bytes::concat_all([
-          b"ply.imported.1\x00",
-          hex(bin::shape_digest(blanked_spans_bin())),
-          b"\x00",
-          identity_of(definitions, [b"compiler.front.interface.imported"]),
-          b"\x00",
-        ]),
-      None -> b"",
-    },
-  }
-
-fn read_imported(
-  r: ImportedReader,
-  text: Bytes,
-) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  if r.importer.len() == 0 { imported(text) } else { cached_imported(r.dir, r.importer, text) }
-
-fn cached_imported(
-  dir: String,
-  importer: Bytes,
-  text: Bytes,
-) -> Bytes / {fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} = {
-  let key = hex(blake3(importer.concat(blake3(text))));
-  let cached_spans = match read_cached_file[abs](dir, key) {
-    Some(bytes) -> match bin::decode(bytes, blanked_spans_bin()) {
-      Ok(b) -> if !fits(b.bounds, text.len()) { None } else {
-        Some(
-          range(0, b.bounds.len() / 2).map(|i: Int|
-            span_between(b.bounds.at_or(2 * i, 0), b.bounds.at_or(2 * i + 1, 0))),
-        )
-      },
-      Err(_) -> None,
-    },
-    None -> None,
-  };
-  let spans = match cached_spans {
-    Some(spans) -> spans,
-    None -> {
-      let spans = unneeded_spans(text);
-      let bounds = spans.fold([], |accumulator: List<Int>, s: Span|
-        accumulator.push(s.start).push(s.end));
-      write_cached_file[abs](dir, key, bin::encode({ bounds: bounds }, blanked_spans_bin()));
-      spans
-    },
-  };
-  blanked(text, spans)
-}
-
-type BlankedSpans = { bounds: List<Int> }
-
-derive bin for BlankedSpans
-
-fn fits(bounds: List<Int>, size: Int) -> Bool =
-  bounds.len() % 2 == 0
-    && bounds.fold({ ok: true, at: 0 }, |s: { ok: Bool, at: Int }, b: Int|
-      { ok: s.ok && s.at <= b && b <= size, at: b }).ok
-
 pub fn shipped_data(
   modules: List<Source>,
 ) -> List<ShippedData> / {fs.read_file[shipped], abort.raise} =
@@ -646,9 +530,6 @@ pub fn shipped_data(
           }
         },
     ))
-
-pub fn all_shipped_names(s: ShippedInputs) -> List<Bytes> =
-  s.sources.map(|source: Source| source.name).concat(s.unread)
 
 pub fn shipped_modules() -> List<Source> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} =
   match fs::listed_names(fs.list_dir[shipped](".")) {
@@ -788,144 +669,7 @@ test "`with_manifest` reads `ply.pkg` from the directory of the given path's bas
   }
 }
 
-test "a load reads only the shipped modules the program imports, directly or indirectly, and the data files they embed" {
-  let got = handle {
-    shipping_for([{ name: b"main", source_text: b"import std.json\nfn main() -> Unit = ()\n" }], {
-      root: b"",
-      manifest: None,
-      supplied: [],
-    })
-  } with {
-    var files: List<String> = [],
-    fs.list_dir[shipped](p) ->
-      Some(files_listed(["std.json.ply", "std.bytes.ply", "std.list.ply", "compiler.fmt.ply"])),
-    fs.read_file[shipped](p) -> {
-      files = files.push(p);
-      if p == "std.json.ply" { Some(b"import std.bytes\npub fn j() -> Int = bytes::b()\n") }
-      else if p == "std.bytes.ply" { Some(b"pub fn b() -> Int = 2\n") }
-      else { Some(b"pub fn x() -> Int = 3\n") }
-    },
-    return shipping -> { shipping: shipping, files: files },
-  };
-  assert_eq(got.shipping.sources.map(|source: Source| source.name), [b"std.json", b"std.bytes"]);
-  assert_eq(got.shipping.unread, [b"std.list", b"compiler.fmt"]);
-  assert_eq(got.files, ["std.json.ply", "std.bytes.ply"])
-}
-
-const sample_module_source: Bytes =
-  b"//! Counting.\n\nimport std.laws (agrees)\n\n/// One more.\npub fn more(x: Int) -> Int = bump(x)\n\nfn bump(x: Int) -> Int = x + 1\n\n/// Only the tests ask.\nfn twice(x: Int) -> Int = x * 2\n\ntest \"more adds one\" {\n  assert_eq(more(twice(1)), 3)\n}\n\nlaw \"more is bump\" = agrees(more, bump)\n"
-
-const counted_load: { read: List<Bytes>, text: Bytes, files: List<String> } =
-  handle {
-    shipping_for([{ name: b"main", source_text: b"import std.count\nfn main() -> Unit = ()\n" }], {
-      root: b"",
-      manifest: None,
-      supplied: [],
-    })
-  } with {
-    var files: List<String> = [],
-    fs.list_dir[shipped](p) -> Some(files_listed(["std.count.ply", "std.laws.ply"])),
-    fs.read_file[shipped](p) -> {
-      files = files.push(p);
-      if p == "std.count.ply" { Some(sample_module_source) }
-      else { Some(b"pub fn agrees<a>(f: (Int) -> a, g: (Int) -> a) -> Bool = true\n") }
-    },
-    return shipping ->
-      {
-        read: shipping.sources.map(|source: Source| source.name),
-        text: shipping.sources.fold(b"", |accumulator: Bytes, source: Source|
-          if source.name == b"std.count" { source.source_text } else { accumulator }),
-        files: files,
-      },
-  }
-
-fn cached_count(store: MemFs) -> { text: Bytes, toolchain: MemFs } / {abort.raise} = {
-  let over = on_mem[cwd](mem_empty(), ||
-    on_mem[abs](store, ||
-      handle {
-        shipping_cached([b"std.count"], Map::new())
-      } with {
-        toolchain.reuse_dir() -> "/reused",
-        fs.list_dir[shipped](p) -> Some(files_listed(["std.count.ply"])),
-        fs.read_file[shipped](p) -> if p == "std.count.ply" { Some(sample_module_source) }
-        else if p == "definitions" {
-          Some(b"compiler.front.pulls_of aa\ncompiler.front.interface.imported bb\n")
-        } else { None },
-        entropy.next() -> 7,
-        time.now_ms() -> 0,
-      })).value;
-  {
-    text: over.value.sources.fold(b"", |accumulator: Bytes, source: Source|
-      if source.name == b"std.count" { source.source_text } else { accumulator }),
-    toolchain: over.tree,
-  }
-}
-
-test "the cached source of a shipped module is reused by every project, and a cache entry with invalid contents is ignored" {
-  let viewed = imported(sample_module_source);
-  let cold = cached_count(mem_empty());
-  assert_eq(cold.text, viewed);
-  let cached_names = match fs::listed_names(mem_list(cold.toolchain, "reused")) {
-    Some(names) -> names,
-    None -> [],
-  };
-  assert_eq(cached_names.len(), 1);
-  let entry = "reused/" ++ cached_names.at_or(0, "");
-  let planted = mem_write(
-    cold.toolchain,
-    entry,
-    bin::encode({ bounds: [] }, blanked_spans_bin()),
-  ).fs;
-  assert_eq(cached_count(planted).text, sample_module_source);
-  let spoiled = mem_write(
-    cold.toolchain,
-    entry,
-    bin::encode({ bounds: [5, 2] }, blanked_spans_bin()),
-  ).fs;
-  assert_eq(cached_count(spoiled).text, viewed)
-}
-
-test "loading a project does not read a shipped module's tests or laws, or code that only the tests and laws use" {
-  let load = counted_load;
-  assert_eq(load.read, [b"std.count"]);
-  assert_eq(load.files, ["std.count.ply"]);
-  assert_eq(load.text.len(), sample_module_source.len());
-  let says = |word: Bytes| load.text.index_of(word) != None;
-  assert(says(b"/// One more.\npub fn more(x: Int) -> Int = bump(x)"));
-  assert(says(b"fn bump(x: Int) -> Int = x + 1"));
-  assert(!says(b"std.laws") && !says(b"twice") && !says(b"test") && !says(b"law"));
-  let parsed = parse(load.text);
-  assert_eq(parsed.parser.diagnostics.len(), 0);
-  assert_eq(parsed.node.items.len(), 2)
-}
-
 const embedding_words: Bytes = b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n"
-
-test "a load reads the data file embedded by an imported shipped module and names it by its path under `std`" {
-  let got = handle {
-    shipping_for([{ name: b"main", source_text: b"import std.words\nfn main() -> Unit = ()\n" }], {
-      root: b"",
-      manifest: None,
-      supplied: [],
-    })
-  } with {
-    var files: List<String> = [],
-    fs.list_dir[shipped](p) ->
-      Some(
-        [{ name: "std", kind: fs::Dir }].concat(files_listed(["std.idle.ply", "std.words.ply"])),
-      ),
-    fs.read_file[shipped](p) -> {
-      files = files.push(p);
-      if p == "std.words.ply" { Some(embedding_words) }
-      else if p == "std/words/list.txt" { Some(b"one\n") }
-      else { None }
-    },
-    return shipping -> { shipping: shipping, files: files },
-  };
-  assert_eq(got.shipping.data, [{ name: b"std/words/list.txt", bytes: b"one\n" }]);
-  assert_eq(got.shipping.unread, [b"std.idle"]);
-  assert_eq(got.files, ["std.words.ply", "std/words/list.txt"])
-}
 
 test "the digest of the shipped modules covers the data files they embed" {
   let sources = [{ name: b"std.words", source_text: embedding_words }];
