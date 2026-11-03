@@ -1099,14 +1099,15 @@ effect unsettled {
 
 type Known = { run: Run, snapshot: Snapshot, added: Bool }
 
-fn bounded_by(run: Run, waiting: List<Step>) -> Run / {memo_store.read} = {
-  let confirm_above = run.confirm_above;
-  {
-    ..run,
-    confirm_above: waiting.fold(confirm_above, |bound: Option<Int>, s: Step|
-      lowered_bound(bound, s.key)),
+fn depth_bound(waiting: List<Step>) -> Option<Int> / {memo_store.read} =
+  waiting.fold(None, |bound: Option<Int>, s: Step| lowered_bound(bound, s.key))
+
+fn bounded_by(run: Run, bound: Option<Int>) -> Run =
+  match ((run.confirm_above, bound)) {
+    (Some(above), Some(depth)) -> { ..run, confirm_above: Some(min(above, depth)) },
+    (None, Some(depth)) -> { ..run, confirm_above: Some(depth) },
+    (_, None) -> run,
   }
-}
 
 fn with_wanted(k: Known, wanted: Wanted) -> Known / {memo_store.read, abort.raise} =
   match wanted {
@@ -1164,11 +1165,11 @@ fn grown(
   run: Run,
   snapshot: Snapshot,
   wanted: List<Wanted>,
-  waiting: List<Step>,
+  bound: Option<Int>,
 ) -> Known / {memo_store.read, abort.raise} = {
   let confirm_above = run.confirm_above;
   let k = wanted.fold(
-    { run: bounded_by(run, waiting), snapshot: snapshot, added: false },
+    { run: bounded_by(run, bound), snapshot: snapshot, added: false },
     with_wanted,
   );
   { ..k, run: { ..k.run, confirm_above: confirm_above } }
@@ -1239,7 +1240,7 @@ fn computed_together<| e>(
       confirmed,
       empty_snapshot,
       waiting.flat_map(|s: Step| predicted(s.key)),
-      waiting,
+      depth_bound(waiting),
     );
     iterate(
       { run: first.run, snapshot: first.snapshot, waiting: waiting },
@@ -1267,6 +1268,7 @@ fn next_round<| e>(
   serially: (Run, Step) -> Run / {memo_store.read, memo_store.write, abort.raise | e},
 ) -> Round / {memo_store.read, memo_store.write, abort.raise | e} = {
   let seen = still_held(r.run, r.snapshot);
+  let bound = depth_bound(r.waiting);
   let attempts = attempted_apart(queries, seen, r.waiting);
   let waiting_keys = r.waiting.fold(Map::new(), |m: Map<Bytes, Bool>, s: Step|
     m.insert(s.key, true));
@@ -1308,7 +1310,7 @@ fn next_round<| e>(
             }
           },
           Needed(wanted) -> {
-            let k = grown(run, snapshot, [wanted], r.waiting);
+            let k = grown(run, snapshot, [wanted], bound);
             let sibling = match wanted {
               WantedFact(name, input, _) -> waiting_keys.contains(fact_key(name, input)),
               WantedWorld(_, _) -> false,
@@ -1335,7 +1337,7 @@ fn next_round<| e>(
       }
     },
   );
-  let after = grown(passed.run, passed.snapshot, passed.siblings, passed.again);
+  let after = grown(passed.run, passed.snapshot, passed.siblings, depth_bound(passed.again));
   if passed.progressed || after.added {
     { run: after.run, snapshot: after.snapshot, waiting: passed.again }
   } else {
