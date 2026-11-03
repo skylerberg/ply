@@ -8,7 +8,9 @@ import compiler.check.resolve.tables (module_names)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
 import compiler.check.infer.checker (program)
-import compiler.check.infer.checker (CheckReads, with_no_other_definitions, constraints_of)
+import compiler.check.infer.checker (CheckReads, with_no_other_definitions, constraints_of,
+                                     EffectsSource, WrittenEffects, InferredEffects,
+                                     WidenedByError)
 import compiler.syntax.parsing (Span, span_between, node_id_base, generated_span, moved_by)
 import std.bin
 import compiler.syntax.type_syntax (mode_text)
@@ -21,9 +23,10 @@ import compiler.expand.rewrite.shared (expressions_matching)
 import std.list (positions, zip)
 import compiler.check.types (Effect, Effects, ResourceVariable, SingletonResource, AnyResource,
                              NamedResource, Type, VariableType, NamedType, FunctionType,
-                             canonical_beside, RecordType, record_fields, Field, effects_sorted,
-                             resolve_effect, no_effects, open_effects, single_effect,
-                             without_raises, int_type, bool_type, bytes_type, list_type, iter_type,
+                             canonical_beside, canonical_in, RecordType, record_fields, Field,
+                             effects_sorted, resolve_effect, no_effects, open_effects,
+                             single_effect, without_raises, int_type, bool_type, bytes_type,
+                             list_type, iter_type,
                              function_type, shallow_resolve, written_label, label_of,
                              effect_list_text, scheme_text, type_text, NominalType, TypeTable,
                              insert_type, subtable, tables_joined, type_table_bin, variables_in,
@@ -168,22 +171,31 @@ fn canonical_definition(d: DefinitionInfo) -> DefinitionInfo / {abort.raise} = {
   let c = canonical_beside(
     d.scheme,
     [],
-    [d.effects, d.performed, d.scaling, d.promised_bounded, d.undeclared].concat(
-      d.spec.map(|s: SpecInfo| s.effects),
-    ),
+    [
+      d.effects,
+      d.performed,
+      d.scaling,
+      d.promised_bounded,
+      error_widening(d.effects_source),
+    ].concat(d.spec.map(|s: SpecInfo| s.effects)),
   );
   {
     ..d,
     scheme: c.scheme,
-    effects: c.effect_lists.get(0),
-    performed: c.effect_lists.get(1),
-    scaling: c.effect_lists.get(2),
-    promised_bounded: c.effect_lists.get(3),
-    undeclared: c.effect_lists.get(4),
-    spec: range(0, d.spec.len()).map(|i: Int|
-      { ..d.spec.get(i), effects: c.effect_lists.get(5 + i) }),
+    effects: canonical_in(c, d.effects),
+    performed: canonical_in(c, d.performed),
+    scaling: canonical_in(c, d.scaling),
+    promised_bounded: canonical_in(c, d.promised_bounded),
+    effects_source: match d.effects_source {
+      WidenedByError(effects) -> WidenedByError(canonical_in(c, effects)),
+      other -> other,
+    },
+    spec: d.spec.map(|s: SpecInfo| { ..s, effects: canonical_in(c, s.effects) }),
   }
 }
+
+fn error_widening(source: EffectsSource) -> List<Effect> =
+  match source { WidenedByError(effects) -> effects, WrittenEffects -> [], InferredEffects -> [] }
 
 pub fn is_pure_definition(definition_info: DefinitionInfo) -> Bool =
   definition_info.effects.len() == 0 && definition_info.constraints.len() == 0
@@ -331,7 +343,7 @@ fn in_body_order(sites: List<MemberSite>, bodies: List<TypedBody<Bytes>>) -> Lis
       None -> [x],
     }));
   let listed = bodies.fold(
-    { out: [], named: Map::new() },
+    { out: [], named: Set::empty() },
     |accumulator: { out: List<MemberSite>, named: Set<Bytes> }, b: TypedBody<Bytes>|
       match by.get(b.owner) {
         Some(ys) -> if accumulator.named.contains(b.owner) { accumulator }
@@ -1091,7 +1103,9 @@ fn scheme_of(source: Bytes, name: Bytes) -> Bytes / {abort.raise} =
 
 fn labelled_diagnostics(source: Bytes) -> List<List<Bytes>> / {abort.raise} =
   dedup_diagnostics(checked_m(source).checker.diagnostics).map(|diagnostic: Diagnostic|
-    [diagnostic.code].concat(diagnostic.labels.map(|label: Label| labelled_text(source, label))))
+    [diagnostic.code].concat(
+      diagnostic.labels.flat_map(|label: Label| labelled_text(source, label).to_list()),
+    ))
 
 fn resolved_source_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
   let key = |owner: Bytes, part: BodyPart| Bytes::concat_all([owner, b"#", part_key(part)]);
@@ -1529,15 +1543,21 @@ test "an unknown name's error suggests an in-scope name when the unknown name is
     source_diagnostics(source).map(|diagnostic: Diagnostic|
       {
         code: diagnostic.code,
-        at: diagnostic.labels.fold(b"", |at: Bytes, label: Label|
+        at: diagnostic.labels.fold(None, |at: Option<Bytes>, label: Label|
           if label.primary { labelled_text(source, label) } else { at }),
         offered: diagnostic.notes_text.any(|note: Bytes| note.index_of(b"count") != None),
       })
   };
-  assert_eq(with_note_effect(b"cuont(2)"), [{ code: b"E0101", at: b"cuont", offered: true }]);
-  assert_eq(with_note_effect(b"counts(2)"), [{ code: b"E0101", at: b"counts", offered: true }]);
-  assert_eq(with_note_effect(b"breadth(2)"), [{ code: b"E0101", at: b"breadth", offered: false }]);
-  assert_eq(with_note_effect(b"cnt(2)"), [{ code: b"E0101", at: b"cnt", offered: false }])
+  assert_eq(with_note_effect(b"cuont(2)"), [{ code: b"E0101", at: Some(b"cuont"), offered: true }]);
+  assert_eq(
+    with_note_effect(b"counts(2)"),
+    [{ code: b"E0101", at: Some(b"counts"), offered: true }],
+  );
+  assert_eq(
+    with_note_effect(b"breadth(2)"),
+    [{ code: b"E0101", at: Some(b"breadth"), offered: false }],
+  );
+  assert_eq(with_note_effect(b"cnt(2)"), [{ code: b"E0101", at: Some(b"cnt"), offered: false }])
 }
 
 test "`[*]` on an operation that takes no resource is rejected" {
@@ -2443,9 +2463,9 @@ test "a law's `forall` rejects a sum type with an effect parameter, and an alias
 test "a `Map` whose key type is an alias with no ordering is rejected at every signature that uses the alias" {
   let source = b"type Keyed = Map<(Int) -> Int, Int>\nfn first(m: Keyed) -> Int = m.len()\nfn second(m: Keyed) -> Int = m.len()";
   let primary = |diagnostic: Diagnostic|
-    diagnostic.labels.fold(b"", |accumulator: Bytes, label: Label|
+    diagnostic.labels.fold(None, |accumulator: Option<Bytes>, label: Label|
       if label.primary { labelled_text(source, label) } else { accumulator });
-  assert_eq(source_diagnostics(source).map(primary), [b"Keyed", b"Keyed"])
+  assert_eq(source_diagnostics(source).map(primary), [Some(b"Keyed"), Some(b"Keyed")])
 }
 
 fn fixes_of(diagnostics: List<Diagnostic>) -> List<Fix> =
@@ -4102,12 +4122,10 @@ test "comparing two functions and using a Float as a `Map` key are rejected afte
 
 fn rejections(source: Bytes) -> List<List<Bytes>> / {abort.raise} =
   source_diagnostics(source).map(|diagnostic: Diagnostic|
-    [
-      diagnostic.code,
-      diagnostic.message,
-      diagnostic.labels.fold(b"", |accumulator: Bytes, label: Label|
-        if label.primary { labelled_text(source, label) } else { accumulator }),
-    ])
+    [diagnostic.code, diagnostic.message].concat(
+      diagnostic.labels.fold(None, |accumulator: Option<Bytes>, label: Label|
+        if label.primary { labelled_text(source, label) } else { accumulator }).to_list(),
+    ))
 
 fn label_rejections(source: Bytes) -> List<Bytes> / {abort.raise} =
   match resolved_all([
@@ -4442,20 +4460,38 @@ test "a body that performs an effect its signature lacks makes every caller that
       source_text: b"import base (inner, log)\nfn middle(n: Int) -> Int / {} = inner(n) + 1\nfn outer(n: Int) -> Int = middle(n) * 2\nfn quiet(n: Int) -> Int / {} = handle { middle(n) } with { log.emit(x) -> () }\n",
     },
   ]);
-  assert_eq(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), [
-    b"E0302",
-    b"E0302",
-    b"E0302",
-  ]);
+  assert(diagnostics.all(|diagnostic: Diagnostic| diagnostic.code == b"E0302"));
   assert_eq(effects_added_to(diagnostics).sort(), [b"inner", b"middle", b"outer"])
 }
 
-test "a missing effect reaches every caller in its recursive group in the same run" {
-  let diagnostics = source_diagnostics(
-    b"effect log { write emit(n: Int) -> Unit }\nfn ping(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [x, ..rest] -> { log.emit(x); pong(rest) } }\nfn pong(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [_, ..rest] -> ping(rest) }\nfn quiet(xs: List<Int>) -> Int / {} = handle { pong(xs) } with { log.emit(x) -> () }\n",
+test "a missing effect reaches every caller in its recursive group in the same run, whichever member performs it" {
+  let widened = |source: Bytes| {
+    let diagnostics = source_diagnostics(
+      b"effect log { write emit(n: Int) -> Unit }\n".concat(source).concat(
+        b"fn quiet(xs: List<Int>) -> Int / {} = handle { ping(xs) } with { log.emit(x) -> () }\n",
+      ),
+    );
+    assert(diagnostics.all(|diagnostic: Diagnostic| diagnostic.code == b"E0302"));
+    effects_added_to(diagnostics).sort()
+  };
+  assert_eq(
+    widened(
+      b"fn ping(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [x, ..rest] -> { log.emit(x); pong(rest) } }\nfn pong(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [_, ..rest] -> ping(rest) }\n",
+    ),
+    [b"ping", b"pong"],
   );
-  assert_eq(diagnostics.map(|diagnostic: Diagnostic| diagnostic.code), [b"E0302", b"E0302"]);
-  assert_eq(effects_added_to(diagnostics).sort(), [b"ping", b"pong"])
+  assert_eq(
+    widened(
+      b"fn ping(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [_, ..rest] -> pong(rest) }\nfn pong(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [x, ..rest] -> { log.emit(x); ping(rest) } }\n",
+    ),
+    [b"ping", b"pong"],
+  );
+  assert_eq(
+    widened(
+      b"fn ping(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [_, ..rest] -> pong(rest) }\nfn pong(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [_, ..rest] -> pang(rest) }\nfn pang(xs: List<Int>) -> Int / {} = match xs { [] -> 0, [x, ..rest] -> { log.emit(x); ping(rest) } }\n",
+    ),
+    [b"pang", b"ping", b"pong"],
+  )
 }
 
 test "a record update takes its shape from the base's inferred type, not from where it was written" {
@@ -7502,8 +7538,8 @@ fn with_effects(row_and_body: Bytes) -> Bytes =
   ])
 
 fn unperformed_in(src: Bytes) -> List<Bytes> / {abort.raise} =
-  valid_module_checker(src).unperformed.flat_map(|d: Diagnostic| d.labels).map(|l: Label|
-    labelled_text(src, l))
+  valid_module_checker(src).unperformed.flat_map(|d: Diagnostic| d.labels).flat_map(|l: Label|
+    labelled_text(src, l).to_list())
 
 fn narrowed(src: Bytes) -> Bytes / {abort.raise} =
   match fixes_of(valid_module_checker(src).unperformed) {
@@ -7556,7 +7592,7 @@ fn unperformed_beside_a_module(src: Bytes) -> List<Bytes> / {abort.raise} =
     Err(rejected) -> panic(String::of_bytes_lossy(rejected)),
     Ok(x) ->
       check_program(x.resolution, x.modules).checker.unperformed.flat_map(|d: Diagnostic|
-        d.labels).map(|l: Label| labelled_text(src, l)),
+        d.labels).flat_map(|l: Label| labelled_text(src, l).to_list()),
   }
 
 test "a set from another module is treated the same way" {

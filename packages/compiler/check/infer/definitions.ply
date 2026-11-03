@@ -35,33 +35,20 @@ import compiler.syntax.expressions (Expression, NameExpression, BlockExpression,
                                     expression_span, is_order_comparison, TaggedLiteralExpression,
                                     tagged_parser, tagged_filler, call_operator, prelude_module,
                                     case_index_binder, case_identity)
-import compiler.check.types (type_bin, backticked_text, effects_insert, effects_union,
-                             NamedResource, SingletonResource, ResourceVariable, AnyResource,
-                             Effect, Effects, Type, VariableType, NamedType, FunctionType,
-                             RecordType, Field, Scheme, FreeVariables, effects_cover,
-                             effects_sorted, no_effects, open_effects, is_pure_but_raise, run_needs,
-                             is_diverges, effect_covers, effects_with_label_variables,
-                             positional_effects, int_type, bool_type, bytes_type, unit_type,
-                             monomorphic, field_get, ints_union, ints_difference, substitution_new,
-                             mark_rigid_type, is_rigid_effects, free_variables, unify,
-                             unify_effects, env_push, env_pop, env_bind, env_bind_global,
-                             env_remove_global, env_lookup, generalize, effects_outside_definition,
-                             resolve_effect, effect_text, resource_text, type_text, effects_text,
-                             Printer, printer_new, printer_naming, print_type, NominalType,
-                             record_fields, apply_arguments, string_type, secret_type)
 import compiler.check.types (type_bin, backticked_text, effects_insert, NamedResource,
                              SingletonResource, ResourceVariable, AnyResource, Effect, Effects,
                              Type, VariableType, NamedType, FunctionType, RecordType, Field, Scheme,
                              FreeVariables, effects_cover, effects_sorted, no_effects, open_effects,
                              is_pure_but_raise, run_needs, is_diverges, effect_covers, relabelled,
-                             int_type, bool_type, bytes_type, unit_type, function_type, monomorphic,
+                             int_type, bool_type, bytes_type, unit_type, monomorphic,
                              field_get, ints_union, ints_difference, substitution_new,
                              mark_rigid_type, is_rigid_effects, free_variables, unify,
                              unify_effects, env_push, env_pop, env_bind, env_bind_global,
                              env_remove_global, env_lookup, generalize, effects_outside_definition,
                              resolve_effect, effect_text, resource_text, type_text, effects_text,
                              Printer, printer_new, printer_naming, print_type, NominalType,
-                             record_fields, apply_arguments, string_type, secret_type)
+                             record_fields, apply_arguments, string_type, secret_type,
+                             effects_union)
 import compiler.check.known (is_int, is_bool, is_char, is_float, is_string, is_bytes, is_unit,
                              secret_item, task_result, chan_item, task_type, is_integer_name,
                              float_name, char_name, decimal_name, bool_name, string_name,
@@ -102,7 +89,8 @@ import compiler.check.infer.checker (HoleSite, DeclaredAlias, DeclaredExtern, De
                                      RaiseNote, DirectPerform, PerformViaFunctionValue,
                                      PerformViaArguments, PerformViaCall, PerformSite,
                                      PendingIteration, RepeatedEffectVariable, RepeatedEffects,
-                                     OwnCall, MemberSite, TagUse, NumericOperation,
+                                     OwnCall, MemberSite, TagUse, EffectsSource, WrittenEffects,
+                                     InferredEffects, WidenedByError, NumericOperation,
                                      GroupInstantiation, Signature, RigidParam, MapKeySite,
                                      ConstraintSite, SpecEnv, GroupDefinition, CachedDefinition,
                                      listing_type, CheckEvery, ReuseBodies, CheckOnly, ReusedBody,
@@ -595,17 +583,21 @@ pub fn check_bodies(
       results,
     );
     {
-      checker: if o.left != BodyChecked { o.checker } else {
-        {
-          ..o.checker,
-          bodies: o.checker.bodies.push(
-            checked_body_of(names.get(i), signed.members.get(i).labels, o.body),
-          ),
-        }
+      walk: {
+        checker: if o.left != BodyChecked { o.checker } else {
+          {
+            ..o.checker,
+            bodies: o.checker.bodies.push(
+              checked_body_of(names.get(i), signed.members.get(i).labels, o.body),
+            ),
+          }
+        },
+        bodies: accumulator.bodies.insert(i, o.body),
+        signed: if o.left == FromSignature { accumulator.signed.insert(i, true) }
+        else { accumulator.signed },
       },
-      bodies: accumulator.bodies.insert(i, o.body),
-      signed: if o.left == FromSignature { accumulator.signed.insert(i, true) }
-      else { accumulator.signed },
+      undeclared: o.undeclared,
+      callees: o.body.refs.concat(o.body.calls.concat(o.body.stated).map(|c: OwnCall| c.callee)),
     }
   };
   let walked = check_order_components(functions).fold(
@@ -658,44 +650,60 @@ pub fn check_bodies(
 
 type Walk = { checker: Checker, bodies: Map<Int, ClosedBody>, signed: Map<Int, Bool> }
 
-type ComponentPass = { walk: Walk, assumed: List<List<Effect>> }
+type MemberChecked = { walk: Walk, undeclared: List<Effect>, callees: List<Bytes> }
+
+type CheckedBodies = { walk: Walk, members: List<{ undeclared: List<Effect>, callees: List<Int> }> }
+
+fn checked_bodies(
+  start: Walk,
+  component: List<Int>,
+  signed: ModuleSignatures,
+  check_member: (Walk, Int) -> MemberChecked / {abort.raise, program.read, mode_facts.read, module_names.read},
+) -> CheckedBodies / {abort.raise, program.read, mode_facts.read, module_names.read} =
+  component.fold({ walk: start, members: [] }, |pass: CheckedBodies, i: Int| {
+    let m = check_member(pass.walk, i);
+    {
+      walk: m.walk,
+      members: pass.members.push({
+        undeclared: m.undeclared,
+        callees: range(0, component.len()).filter(|k: Int|
+          m.callees.contains(signed.names.get(component.get(k)))),
+      }),
+    }
+  })
 
 fn checked_component(
   start: Walk,
   component: List<Int>,
   signed: ModuleSignatures,
-  check_member: (Walk, Int) -> Walk / {abort.raise, program.read, mode_facts.read, module_names.read},
+  check_member: (Walk, Int) -> MemberChecked / {abort.raise, program.read, mode_facts.read, module_names.read},
 ) -> Walk / {abort.raise, program.read, mode_facts.read, module_names.read} = {
-  let first = component.fold(start, check_member);
-  if component.len() < 2 { first } else {
-    let undeclared = |walk: Walk|
-      component.map(|i: Int|
-        match definition_of(walk.checker, signed.names.get(i)) {
-          Some(d) -> d.undeclared,
-          None -> [],
-        });
-    let kinds = undeclared(first).fold([], |all: List<Effect>, xs: List<Effect>|
-      effects_union(all, xs)).len(
-    );
-    iterate(
-      { walk: first, assumed: component.map(|_: Int| []) },
-      component.len() * kinds + 2,
-      |pass: ComponentPass| {
-        let found = undeclared(pass.walk);
-        if range(0, component.len()).all(|k: Int|
-            uncovered(pass.assumed.get(k), found.get(k)).len() == 0) { Stop(pass.walk) } else {
-          let assumed = range(0, component.len()).map(|k: Int|
-            effects_union(pass.assumed.get(k), found.get(k)));
-          let bound = range(0, component.len()).fold(start.checker, |c: Checker, k: Int|
-            with_assumed_effects(c, signed, component.get(k), assumed.get(k)));
-          Continue({
-            walk: component.fold({ ..start, checker: bound }, check_member),
-            assumed: assumed,
-          })
-        }
-      },
-    )
+  let first = checked_bodies(start, component, signed, check_member);
+  if component.len() < 2
+      || first.members.all(|m: { undeclared: List<Effect>, callees: List<Int> }|
+        m.undeclared.len() == 0) { first.walk } else {
+    let reached = effects_reached_in_group(start.checker, signed, component, first.members);
+    let bound = range(0, component.len()).fold(start.checker, |c: Checker, k: Int|
+      with_assumed_effects(c, signed, component.get(k), reached.get(k)));
+    checked_bodies({ ..start, checker: bound }, component, signed, check_member).walk
   }
+}
+
+fn effects_reached_in_group(
+  checker: Checker,
+  signed: ModuleSignatures,
+  component: List<Int>,
+  members: List<{ undeclared: List<Effect>, callees: List<Int> }>,
+) -> List<List<Effect>> / {abort.raise} = {
+  let published = component.map(|i: Int|
+    resolve_effects_in(checker, signed.sigs.get(i).published_effects).listed);
+  range(0, component.len()).fold(
+    members.map(|m: { undeclared: List<Effect>, callees: List<Int> }| m.undeclared),
+    |reached: List<List<Effect>>, _: Int|
+      range(0, component.len()).map(|k: Int|
+        members.get(k).callees.fold(reached.get(k), |found: List<Effect>, j: Int|
+          effects_union(found, uncovered(published.get(k), reached.get(j))))),
+  )
 }
 
 fn with_assumed_effects(
@@ -706,11 +714,13 @@ fn with_assumed_effects(
 ) -> Checker / {abort.raise} =
   if effects.len() == 0 { checker } else {
     let sig = signed.sigs.get(i);
-    let published = resolve_effects_in(checker, sig.published_effects);
-    let widened = with_function_effects(sig.fn_type, {
-      ..published,
-      listed: effects_union(published.listed, effects),
-    });
+    let widened = with_function_effects(
+      sig.fn_type,
+      widened_effects(
+        resolve_effects_in(checker, sig.published_effects),
+        { listed: effects, variable: None },
+      ),
+    );
     {
       ..checker,
       env: env_bind_global(
@@ -1096,7 +1106,7 @@ fn bind_signature(
       scheme: scheme,
       effects: resolve_effects_in(bound, s.sig.published_effects).listed,
       performed: [],
-      undeclared: [],
+      effects_source: effects_source_of(definition, []),
       scaling: [],
       repeats: [],
       promised_bounded: s.sig.promised_bounded.map(|a: Effect|
@@ -1126,11 +1136,11 @@ fn check_function(
   member: GroupDefinition,
   stated: Map<Bytes, InstanceFunctions>,
   results: (Bytes) -> Option<Type> / {abort.raise},
-) -> { checker: Checker, body: ClosedBody, left: BodySource } / {abort.raise, program.read, mode_facts.read, module_names.read} =
+) -> FunctionChecked / {abort.raise, program.read, mode_facts.read, module_names.read} =
   match reused_body(checker, name) {
     Some(reused) -> {
       let o = reused_function(checker, parsed, definition, name, sig, member, reused);
-      { checker: o.checker, body: o.body, left: Taken }
+      { checker: o.checker, body: o.body, left: Taken, undeclared: o.undeclared }
     },
     None -> if !checks_body(checker, name) && cached_rows(checker, name) == None {
       let recorded: Checker = {
@@ -1150,9 +1160,19 @@ fn check_function(
         checker: p.checker,
         body: body_of_signature(p.checker, sig, p.effects, p.written),
         left: FromSignature,
+        undeclared: p.undeclared,
       }
     } else { checked_or_cached(checker, parsed, definition, name, sig, member, stated, results) },
   }
+
+type FunctionChecked = {
+  checker: Checker,
+  body: ClosedBody,
+  left: BodySource,
+  undeclared: List<Effect>,
+}
+
+type BodyStep = { checker: Checker, body: ClosedBody, undeclared: List<Effect> }
 
 fn reused_function(
   checker: Checker,
@@ -1162,7 +1182,7 @@ fn reused_function(
   sig: Signature,
   member: GroupDefinition,
   reused: ReusedBody,
-) -> { checker: Checker, body: ClosedBody } / {abort.raise, program.read, module_names.read} =
+) -> BodyStep / {abort.raise, program.read, module_names.read} =
   match ((
       relabelled(reused.body.listed, reused.body.labels, member.labels),
       relabelled(
@@ -1199,6 +1219,7 @@ fn reused_function(
           fills: reused.body.instantiations,
           names: reused.body.names,
         },
+        undeclared: p.undeclared,
       }
     },
     _ -> panic("the checked function body refers to a label that its definition does not declare"),
@@ -1213,7 +1234,7 @@ fn checked_or_cached(
   member: GroupDefinition,
   stated: Map<Bytes, InstanceFunctions>,
   results: (Bytes) -> Option<Type> / {abort.raise},
-) -> { checker: Checker, body: ClosedBody, left: BodySource } / {abort.raise, program.read, mode_facts.read, module_names.read} = {
+) -> FunctionChecked / {abort.raise, program.read, mode_facts.read, module_names.read} = {
   let cached_definition = cached_rows(checker, name);
   let taken: Option<{ checker: Checker, effects: Effects, count: Count }> = match cached_definition {
     None -> None,
@@ -1249,7 +1270,7 @@ fn checked_or_cached(
       _ -> None,
     },
   };
-  let stepped: { checker: Checker, body: ClosedBody } = match taken {
+  let stepped: BodyStep = match taken {
     Some(x) -> {
       let recorded: Checker = {
         ..x.checker,
@@ -1267,6 +1288,7 @@ fn checked_or_cached(
           recorded: cached_definition,
           count: Some(x.count),
         },
+        undeclared: p.undeclared,
       }
     },
     None -> {
@@ -1384,6 +1406,7 @@ fn checked_or_cached(
             }),
           names: named_callees(c, definition),
         },
+        undeclared: p.undeclared,
       }
     },
   };
@@ -1391,6 +1414,7 @@ fn checked_or_cached(
     checker: record_spec_env(stepped.checker, definition, name, sig),
     body: stepped.body,
     left: match taken { None -> BodyChecked, Some(_) -> Taken },
+    undeclared: stepped.undeclared,
   }
 }
 
@@ -1703,7 +1727,7 @@ fn record_function(
   name: Bytes,
   sig: Signature,
   effects: Effects,
-) -> { checker: Checker, effects: Effects, written: { scaling: List<Effect>, repeats: List<Int> } } / {abort.raise} = {
+) -> FunctionRecorded / {abort.raise} = {
   let c: Checker = { ..checker, env: env_remove_global(checker.env, name) };
   let body_effects = resolve_effects_in(c, effects);
   let undeclared = undeclared_effects(c, definition, sig, body_effects);
@@ -1733,7 +1757,7 @@ fn record_function(
         scheme: scheme,
         effects: effects.listed,
         performed: body_effects.listed,
-        undeclared: undeclared.listed,
+        effects_source: effects_source_of(definition, undeclared.listed),
         scaling: [],
         repeats: [],
         promised_bounded: bounded,
@@ -1749,8 +1773,22 @@ fn record_function(
     ),
     effects: body_effects,
     written: written_counts(fn_type, effects.listed, bounded, sig.variable_bounded),
+    undeclared: undeclared.listed,
   }
 }
+
+type FunctionRecorded = {
+  checker: Checker,
+  effects: Effects,
+  written: { scaling: List<Effect>, repeats: List<Int> },
+  undeclared: List<Effect>,
+}
+
+fn effects_source_of(definition: FnDefinition, undeclared: List<Effect>) -> EffectsSource =
+  match definition.effects {
+    None -> InferredEffects,
+    Some(_) -> if undeclared.len() == 0 { WrittenEffects } else { WidenedByError(undeclared) },
+  }
 
 fn body_of_signature(
   checker: Checker,
