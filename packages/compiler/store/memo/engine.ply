@@ -734,8 +734,16 @@ fn restored<| e>(
     Some(f) -> {
       let held = reads_still_hold(queries, run, memo_store.details(f.details).reads, left);
       if !held.same { { run: held.run, at: None } } else {
-        memo_store.settle(key);
-        { run: held.run, at: Some({ parts: f.parts, depth: f.depth, sealed: false }) }
+        match memo_store.fact(key) {
+          None -> { run: held.run, at: None },
+          Some(confirmed) -> {
+            memo_store.settle(key);
+            {
+              run: held.run,
+              at: Some({ parts: confirmed.parts, depth: confirmed.depth, sealed: false }),
+            }
+          },
+        }
       }
     },
   }
@@ -780,14 +788,8 @@ fn recorded<| e>(
   let details = encoded_details({ query: q.name, code: q.hash, input: input, reads: s.reads });
   edges_updated(key, reads_in(details_before(stored)), s.reads);
   match stored { Some(f) -> marked_readers(key, changed_tags(f.parts, digests)), None -> () };
-  let unchanged = match stored {
-    Some(f) -> f.parts == digests && f.details == details.digest,
-    None -> false,
-  };
-  if unchanged {
-    output.fold((), |_: Unit, _: Bytes, bytes: Bytes|
-      memo_store.keep_output(digest_of(Some(bytes)), bytes, q.persistent))
-  } else {
+  let at = { parts: digests, depth: depth, sealed: false };
+  let put = ||
     memo_store.put(
       key,
       { parts: digests, details: details.digest, depth: depth },
@@ -795,10 +797,51 @@ fn recorded<| e>(
       details.encoded,
       outputs_by_digest(output),
       q.persistent,
-    )
-  };
-  { parts: digests, depth: depth, sealed: false }
+    );
+  match stored {
+    None -> {
+      put();
+      readers_deepened(key, depth);
+      at
+    },
+    Some(f) -> if f.parts == digests && f.details == details.digest {
+      output.fold((), |_: Unit, _: Bytes, bytes: Bytes|
+        memo_store.keep_output(digest_of(Some(bytes)), bytes, q.persistent));
+      { ..at, depth: f.depth }
+    } else {
+      put();
+      if depth > f.depth { readers_deepened(key, depth) };
+      at
+    },
+  }
 }
+
+type Deepened = { key: Bytes, depth: Int }
+
+fn readers_deepened(
+  key: Bytes,
+  depth: Int,
+) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
+  iterate([{ key: key, depth: depth }], unlimited_steps, deepened_round)
+
+fn deepened_round(
+  grown: List<Deepened>,
+) -> Iter<List<Deepened>, Unit> / {memo_store.read, memo_store.write, abort.raise} =
+  match grown { [] -> Stop(()), _ -> Continue(grown.flat_map(deepened_readers_of)) }
+
+fn deepened_readers_of(
+  fact: Deepened,
+) -> List<Deepened> / {memo_store.read, memo_store.write, abort.raise} =
+  memo_store.dependents(fact.key).fold([], |deepened: List<Deepened>, edge: Bytes| {
+    let reader = reader_of(edge).dependent;
+    match memo_store.fact(reader) {
+      Some(r) -> if r.depth > fact.depth { deepened } else {
+        memo_store.deepen(reader, fact.depth + 1);
+        deepened.push({ key: reader, depth: fact.depth + 1 })
+      },
+      None -> deepened,
+    }
+  })
 
 fn execute<| e>(
   queries: Queries<| e>,
