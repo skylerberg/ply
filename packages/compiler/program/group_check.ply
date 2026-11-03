@@ -110,8 +110,8 @@ pub fn checked_group(
   inputs: GroupInputs,
   body_plan: BodyPlan,
 ) -> GroupCheck / {CheckReads, abort.raise} =
-  match resolved_group(inputs) {
-    Err(ds) -> unresolved(ds),
+  match group_to_check(inputs) {
+    Err(unchecked) -> unchecked,
     Ok(group) -> type_check(group, body_plan, []),
   }
 
@@ -120,15 +120,29 @@ pub fn rejected_group(
   diagnostics: List<Diagnostic>,
   declared: StoredDeclarations,
 ) -> GroupCheck / {other_modules.read, abort.raise} =
-  match resolved_group(inputs) {
-    Err(ds) -> unresolved(ds),
+  match group_to_check(inputs) {
+    Err(unchecked) -> unchecked,
     Ok(group) ->
       {
-        resolved: resolved_facts(group),
+        resolved: Some(resolved_facts(group)),
         declared: declared,
         checked: None,
         diagnostics: diagnostics,
       },
+  }
+
+type GroupReading =
+  | TextRejected(List<Diagnostic>)
+  | ReadingRejected(List<Diagnostic>)
+  | NamesResolved(ResolvedGroup)
+
+fn group_to_check(
+  inputs: GroupInputs,
+) -> Result<ResolvedGroup, GroupCheck> / {other_modules.read, abort.raise} =
+  match group_reading(inputs) {
+    TextRejected(_) -> Err(unresolved([])),
+    ReadingRejected(ds) -> Err(unresolved(ds)),
+    NamesResolved(group) -> Ok(group),
   }
 
 fn values_bound_elsewhere(elsewhere: List<NameElsewhere>, module: Bytes) -> List<Bytes> =
@@ -138,37 +152,49 @@ fn values_bound_elsewhere(elsewhere: List<NameElsewhere>, module: Bytes) -> List
 
 pub fn resolved_group(
   inputs: GroupInputs,
-) -> Result<ResolvedGroup, List<Diagnostic>> / {other_modules.read, abort.raise} = {
-  let read = inputs.loaded.fold([], |found: List<LoadedRead>, l: LoadedSource| {
-    let at = found.len();
-    found.push({
-      read: with_embeds(
-        parsed_group(l.source, at),
-        at,
-        values_bound_elsewhere(inputs.elsewhere, l.source.source.name),
-        l.embed_read,
-      ),
-      loaded: l,
-    })
-  });
-  let problems = read.flat_map(|r: LoadedRead| r.read.parsed.diagnostics);
-  if problems.len() > 0 { Err(problems) } else {
-    match resolve_group(
-        read.map(|r: LoadedRead| { module: r.read.parsed.module, tables: r.loaded.tables }),
-        inputs.elsewhere.map(|n: NameElsewhere| n.module),
-      ) {
-      ResolveFailed(ds) -> Err(ds),
-      ResolveSucceeded(x) -> {
-        let built = build_index(x.modules, x.resolution);
-        if built.diagnostics.len() > 0 { Err(built.diagnostics) } else {
-          let scopes = x.resolution.scopes.take(read.len());
-          let index = index_beside(
-            built.index,
-            inputs.elsewhere.map(|n: NameElsewhere| with_scopes(n, scopes)),
-          );
-          Ok(grouped(read, x, index, inputs))
-        }
-      },
+) -> Result<ResolvedGroup, List<Diagnostic>> / {other_modules.read, abort.raise} =
+  match group_reading(inputs) {
+    TextRejected(ds) -> Err(ds),
+    ReadingRejected(ds) -> Err(ds),
+    NamesResolved(group) -> Ok(group),
+  }
+
+fn group_reading(inputs: GroupInputs) -> GroupReading / {other_modules.read, abort.raise} = {
+  let parsed = inputs.loaded.fold([], |found: List<ParsedSource>, l: LoadedSource|
+    found.push(parsed_group(l.source, found.len())));
+  let text_problems = parsed.flat_map(|p: ParsedSource| p.diagnostics);
+  if text_problems.len() > 0 { TextRejected(text_problems) } else {
+    let read = range(0, parsed.len()).map(|at: Int| {
+      let l = inputs.loaded.get(at);
+      {
+        read: with_embeds(
+          parsed.get(at),
+          at,
+          values_bound_elsewhere(inputs.elsewhere, l.source.source.name),
+          l.embed_read,
+        ),
+        loaded: l,
+      }
+    });
+    let problems = read.flat_map(|r: LoadedRead| r.read.parsed.diagnostics);
+    if problems.len() > 0 { ReadingRejected(problems) } else {
+      match resolve_group(
+          read.map(|r: LoadedRead| { module: r.read.parsed.module, tables: r.loaded.tables }),
+          inputs.elsewhere.map(|n: NameElsewhere| n.module),
+        ) {
+        ResolveFailed(ds) -> ReadingRejected(ds),
+        ResolveSucceeded(x) -> {
+          let built = build_index(x.modules, x.resolution);
+          if built.diagnostics.len() > 0 { ReadingRejected(built.diagnostics) } else {
+            let scopes = x.resolution.scopes.take(read.len());
+            let index = index_beside(
+              built.index,
+              inputs.elsewhere.map(|n: NameElsewhere| with_scopes(n, scopes)),
+            );
+            NamesResolved(grouped(read, x, index, inputs))
+          }
+        },
+      }
     }
   }
 }
