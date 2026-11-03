@@ -1,5 +1,5 @@
 import std.set (Set)
-import std.graph (Visit, traverse)
+import std.graph (Visit, traverse, keyed, condensation)
 import compiler.check.infer.checker (with_no_other_definitions, CheckReads, StoredDeclarations,
                                      no_stored_declarations, BodyFacts, decode_facts, no_body_facts,
                                      RecordedFacts, BodyRecord, RecordedHere, CheckedElsewhere)
@@ -59,7 +59,7 @@ import compiler.expand.embed (ModuleEmbed)
 import compiler.syntax.items (parse, homes_declaring, home_names_in)
 import compiler.front.rows (KeyRow, EmitterRoot, KnownDefinitionRow, KnownTestRow, KnownLawRow,
                             Rows, known_definition_row_bin, rows_bin, DefinitionRow, TestRow,
-                            DefinitionHashRow, HashTableRow, Dump, normalized_diagnostic)
+                            DefinitionHashRow, HashRow, HashTableRow, Dump, normalized_diagnostic)
 import compiler.front.facts (Analysis, GroupAnalysis, hashed_analysis, home_of, ToolchainTree,
                              NoTree)
 import compiler.front.emitter_input (test_root_at, checked_program_of, view_dump, Analysed,
@@ -531,23 +531,72 @@ fn reachable_names(hashes: List<HashTableRow>, entry: Bytes) -> Set<Bytes> / {ab
   )
 }
 
+pub type HashedName = { name: Bytes, own: List<Bytes>, dependencies: List<Bytes> }
+
+derive bin for HashedName
+
+type ReachedComponent = { members: List<HashedName>, reached: List<Bytes> }
+
+derive bin for ReachedComponent
+
+const reach_domain: Bytes = b"ply.reach\x00"
+
+pub fn reach_identities(rows: List<HashedName>) -> Map<Bytes, Bytes> / {abort.raise} = {
+  let by_name = rows.fold(Map::new(), |found: Map<Bytes, HashedName>, row: HashedName|
+    found.insert(row.name, row));
+  let names = keyed(by_name.keys(), |name: Bytes|
+    match by_name.get(name) { Some(row) -> row.dependencies, None -> [] });
+  let condensed = condensation(names.graph);
+  let row_at = |n: Int|
+    match by_name.get(names.keys.get(n)) {
+      Some(row) -> row,
+      None -> panic("a name in the graph of hashed names has no row"),
+    };
+  let identities = range(0, condensed.members.len()).fold([], |found: List<Bytes>, c: Int|
+    found.push(
+      blake3(
+        reach_domain.concat(
+          bin::encode(
+            {
+              members: condensed.members.get(c).sort().map(row_at),
+              reached: condensed.graph.out.get(c).map(|lower: Int| found.get(lower)).sort(),
+            },
+            reached_component_bin(),
+          ),
+        ),
+      ),
+    ));
+  range(0, names.keys.len()).fold(Map::new(), |found: Map<Bytes, Bytes>, n: Int|
+    found.insert(names.keys.get(n), identities.get(condensed.component.get(n))))
+}
+
+fn hashed_name(row: HashRow) -> HashedName =
+  {
+    name: row.name,
+    own: [
+      match row.definition { Some(h) -> b"d".concat(h), None -> b"-" },
+      match row.declaration { Some(h) -> b"t".concat(h), None -> b"-" },
+    ].concat(
+      row.specs,
+    ),
+    dependencies: row.dependencies,
+  }
+
 fn reachable_definitions(hashes: List<HashTableRow>, entry: Bytes) -> Bytes / {abort.raise} = {
   let reachable = reachable_names(hashes, entry);
-  let reachable_hashes = hashes.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, frame: HashTableRow|
-      match frame {
-        DefinitionHashRow(row) -> match row.definition {
-          Some(h) -> if reachable.contains(row.name) { accumulator.insert(row.name, h) }
-          else { accumulator },
-          None -> accumulator,
-        },
-        _ -> accumulator,
-      },
-  );
+  let rows = hashes.fold([], |found: List<HashRow>, frame: HashTableRow|
+    match frame {
+      DefinitionHashRow(row) -> if reachable.contains(row.name) { found.push(row) } else { found },
+      _ -> found,
+    });
+  let identities = reach_identities(rows.map(hashed_name));
   Bytes::concat_all(
-    reachable_hashes.fold([], |lines: List<Bytes>, name: Bytes, h: Bytes|
-      lines.push(Bytes::concat_all([name, b" ", h, b"\n"]))),
+    rows.fold(Map::new(), |defined: Map<Bytes, Bytes>, row: HashRow|
+      match ((row.definition, identities.get(row.name))) {
+        (Some(_), Some(identity)) -> defined.insert(row.name, Bytes::of_string(identity.hex_of())),
+        _ -> defined,
+      }).fold([], |lines: List<Bytes>, name: Bytes, identity: Bytes|
+      lines.push(Bytes::concat_all([name, b" ", identity, b"\n"]))),
   )
 }
 
@@ -1147,6 +1196,24 @@ pub fn untested(p: ParsedSource) -> ParsedSource =
       },
     },
   }
+
+test "a name's reach identity changes with the hashes of what it reaches, through cycles, and with nothing else" {
+  let identities = |b_own: Bytes|
+    reach_identities([
+      { name: b"a", own: [b"1"], dependencies: [b"b"] },
+      { name: b"b", own: [b_own], dependencies: [b"a"] },
+      { name: b"c", own: [b"3"], dependencies: [b"a", b"missing"] },
+      { name: b"d", own: [b"4"], dependencies: [] },
+    ]);
+  let first = identities(b"2");
+  let changed = identities(b"5");
+  assert_eq(identities(b"2"), first);
+  assert(
+    [b"a", b"b", b"c"].all(|name: Bytes| changed.get(name) != first.get(name)),
+    Some("a change to `b` left something that reaches it alone"),
+  );
+  assert_eq(changed.get(b"d"), first.get(b"d"))
+}
 
 test "a published builtin lists its type signature and its parameter names" {
   let rows = builtin_rows.filter(|r: BuiltinRow| r.name == b"Array::get");

@@ -5,6 +5,7 @@ import compiler.cc (Profile, Toolchain, compilers, memory, toolchain)
 import compiler.checkout (ShippedFile, digests_of, module_names, part_containing, shipped_files)
 import compiler.emit.abi (runtime_of)
 import compiler.front.interface (length_prefixed)
+import compiler.front.published (HashedName, reach_identities)
 import compiler.front.pkg (check_workspace)
 import compiler.native
 import compiler.native (PackFile)
@@ -18,7 +19,6 @@ import std.hash (blake3)
 import std.json
 import std.json (Array, Json, Object, Str)
 import std.list
-import std.set (Set)
 import std.path (join, parent, strip_root)
 import std.pkg (ToolchainParts)
 import std.process (process)
@@ -97,26 +97,44 @@ fn entered(
   }
 }
 
-type ListedDefinition = { name: String, hash: String, closure: List<String> }
-
-fn listed_definition(row: Json) -> Option<ListedDefinition> =
-  match row {
-    Object(members) -> match ((members.get("name"), members.get("hash"), members.get("closure"))) {
-      (Some(Str(name)), Some(Str(hash)), Some(Array(reached))) ->
-        Some({
-          name: name,
-          hash: hash,
-          closure: reached.fold([], |names: List<String>, n: Json|
-            match n { Str(text) -> names.push(text), _ -> names }),
-        }),
-      _ -> None,
-    },
-    _ -> None,
+fn listed_names(value: Option<Json>) -> List<Bytes> =
+  match value {
+    Some(Array(items)) ->
+      items.fold([], |names: List<Bytes>, item: Json|
+        match item { Str(text) -> names.push(Bytes::of_string(text)), _ -> names }),
+    _ -> [],
   }
 
-fn hashed_without_closure(row: Json) -> Bool =
+fn with_listed_rows(
+  rows: List<Json>,
+  marker: Bytes,
+  into: Map<Bytes, HashedName>,
+) -> Map<Bytes, HashedName> =
+  rows.fold(into, |found: Map<Bytes, HashedName>, row: Json|
+    match row {
+      Object(members) -> match ((members.get("name"), members.get("hash"))) {
+        (Some(Str(text)), Some(Str(hash))) -> {
+          let name = Bytes::of_string(text);
+          let own = marker.concat(Bytes::of_string(hash));
+          let dependencies = listed_names(members.get("dependencies"));
+          found.insert(name, match found.get(name) {
+            Some(held) ->
+              {
+                ..held,
+                own: held.own.push(own),
+                dependencies: held.dependencies.concat(dependencies),
+              },
+            None -> { name: name, own: [own], dependencies: dependencies },
+          })
+        },
+        _ -> found,
+      },
+      _ -> found,
+    })
+
+fn hashed_without_dependencies(row: Json) -> Bool =
   match row {
-    Object(members) -> match ((members.get("hash"), members.get("closure"))) {
+    Object(members) -> match ((members.get("hash"), members.get("dependencies"))) {
       (Some(Str(_)), Some(Array(_))) -> false,
       (Some(Str(_)), _) -> true,
       _ -> false,
@@ -124,55 +142,37 @@ fn hashed_without_closure(row: Json) -> Bool =
     _ -> false,
   }
 
-fn listed_hashes(rows: List<Json>, into: Map<String, String>) -> Map<String, String> =
-  rows.fold(into, |found: Map<String, String>, row: Json|
-    match row {
-      Object(members) -> match ((members.get("name"), members.get("hash"))) {
-        (Some(Str(name)), Some(Str(hash))) -> found.insert(name, hash),
-        _ -> found,
-      },
-      _ -> found,
-    })
-
-fn closure_identity(d: ListedDefinition, hashes: Map<String, String>) -> String / {abort.raise} =
-  blake3(
-    Bytes::concat_all(
-      Set::of_list(d.closure.push(d.name)).elements().map(|name: String|
-        Bytes::of_string(match hashes.get(name) {
-          Some(hash) -> name ++ " " ++ hash ++ "\n",
-          None -> name ++ "\n",
-        })),
-    ),
-  ).hex_of(
-  )
-
 fn definitions_of(listing: Bytes) -> Result<Bytes, String> / {abort.raise} =
   match json::parse(listing) {
     Ok(Object(members)) -> match members.get("definitions") {
-      Some(Array(rows)) -> {
+      Some(Array(rows)) -> if rows.any(hashed_without_dependencies) {
+        Err(
+          "the listing of definitions holds no dependencies: list them with `ply hash --json --dependencies`",
+        )
+      } else {
         let declared = match members.get("declarations") {
-          Some(Array(declarations)) -> listed_hashes(declarations, Map::new()),
+          Some(Array(declarations)) -> with_listed_rows(declarations, b"t", Map::new()),
           _ -> Map::new(),
         };
-        let hashes = listed_hashes(rows, declared);
-        let listed = rows.fold([], |found: List<ListedDefinition>, row: Json|
-          match listed_definition(row) { Some(d) -> found.push(d), None -> found });
-        if rows.any(hashed_without_closure) {
-          Err(
-            "the listing of definitions holds no closures: list them with `ply hash --json --dependencies`",
-          )
-        } else {
-          Ok(
-            Bytes::concat_all(
-              listed.fold(Map::new(), |by_name: Map<String, String>, d: ListedDefinition|
-                by_name.insert(d.name, closure_identity(d, hashes))).fold(
-                [],
-                |lines: List<Bytes>, name: String, identity: String|
-                  lines.push(Bytes::of_string(name ++ " " ++ identity ++ "\n")),
-              ),
-            ),
-          )
-        }
+        let defined = with_listed_rows(rows, b"d", Map::new());
+        let identities = reach_identities(
+          with_listed_rows(rows, b"d", declared).fold(
+            [],
+            |all: List<HashedName>, _: Bytes, row: HashedName| all.push(row),
+          ),
+        );
+        Ok(
+          Bytes::concat_all(
+            defined.fold([], |lines: List<Bytes>, name: Bytes, _: HashedName|
+              match identities.get(name) {
+                Some(identity) ->
+                  lines.push(
+                    Bytes::concat_all([name, b" ", Bytes::of_string(identity.hex_of()), b"\n"]),
+                  ),
+                None -> lines,
+              }),
+          ),
+        )
       },
       _ -> Err("the listing of definitions holds none"),
     },
@@ -408,7 +408,7 @@ fn shipped_results(
               keys.shipped,
               keys.linking,
               Bytes::of_string(String::of_bytes_lossy(results_run.out).trim()),
-              identity_of(target.definitions, shipped_results_roots),
+              identity_of(front, shipped_results_roots),
             ),
           )
         };
@@ -685,9 +685,9 @@ test "a unit is entered by the runtime's tool, which is handed its arguments in 
 }
 
 test "each listed definition is named by a digest of everything it reaches, in name order" {
-  let row = |name: String, hash: String, closure: List<String>|
-    "{\"name\":\"" ++ name ++ "\",\"hash\":\"" ++ hash ++ "\",\"closure\":["
-      ++ String::join(closure.map(|c: String| "\"" ++ c ++ "\""), ",")
+  let row = |name: String, hash: String, dependencies: List<String>|
+    "{\"name\":\"" ++ name ++ "\",\"hash\":\"" ++ hash ++ "\",\"dependencies\":["
+      ++ String::join(dependencies.map(|c: String| "\"" ++ c ++ "\""), ",")
       ++ "]}";
   let read = |b_hash: String, t_hash: String| {
     let listing = "{\"definitions\":[" ++ row("m.b", b_hash, []) ++ ","
@@ -714,7 +714,7 @@ test "each listed definition is named by a digest of everything it reaches, in n
   assert(
     definitions_of(b"{\"definitions\":[{\"name\":\"m.a\",\"hash\":\"01\"}],\"tests\":[]}")
       == Err(
-        "the listing of definitions holds no closures: list them with `ply hash --json --dependencies`",
+        "the listing of definitions holds no dependencies: list them with `ply hash --json --dependencies`",
       ),
     None,
   );
