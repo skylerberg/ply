@@ -1,104 +1,75 @@
 import std.list
-import compiler.check.infer.checker (EffectInfo, Location, TestInfo, prelude_effects)
-import compiler.check.resolve.tables (Source)
+import compiler.check.infer.checker (EffectInfo, Location, TestInfo)
+import compiler.check.resolve.tables (Diagnostic, Source)
 import compiler.emit.keys (RootKey, TestCases, root_name, root_text, test_key, test_roots)
 import compiler.front.checking (LoadInputs)
-import compiler.front.checking.groups (HashSummary, TestHash)
 import compiler.front.checking.view
-import compiler.front.checking.view (Modules, NamedRollup)
+import compiler.front.checking.program_facts (ListedTest, TestIdentity, TestList, names_of,
+                                              names_reached, test_list)
 import module_queries (LaterChecks)
-import compiler.front.facts (ProgramListing, test_label_spans)
-import compiler.front.rows (DeclaredEffect, Outline)
-import compiler.store.hash.forms (ModuleHashes)
-import compiler.syntax.parsing (Span, dummy_span)
+import compiler.front.facts (ProgramListing, test_labels)
+import compiler.front.rows (Outline)
+import compiler.store.hash.forms (ModuleHashes, of_key)
+import compiler.syntax.parsing (dummy_span)
 import diagnostic (SourceText)
 import program (ProgramStore, Session, in_program_store)
+
+pub type TestRecord = { info: TestInfo, label: Location, identity: Option<TestIdentity> }
 
 pub type TestListing = {
   root: Int,
   names: List<Bytes>,
-  tests: List<TestInfo>,
-  labels: List<Location>,
-  hashes: Map<Bytes, Bytes>,
-  listings: Map<Bytes, Bytes>,
+  tests: List<TestRecord>,
   effects: Map<Bytes, Bool>,
   records: List<Bytes>,
 }
 
-pub type TestReading = { listing: TestListing, later: LaterChecks, whole: Option<ProgramListing> }
+pub type TestReading = { listing: TestListing, later: LaterChecks, schema: Option<Diagnostic> }
 
-pub fn test_at(listing: TestListing, i: Int) -> Option<TestInfo> = listing.tests.at(i)
+pub fn selected_listing(list: TestList, identities: Map<Bytes, TestIdentity>) -> TestListing =
+  {
+    root: list.root,
+    names: list.names,
+    tests: list.tests.map(|t: ListedTest|
+      { info: t.info, label: t.label, identity: identities.get(t.info.key) }),
+    effects: list.effects,
+    records: list.records,
+  }
 
-pub fn test_hash_at(listing: TestListing, i: Int) -> Option<Bytes> =
-  match test_at(listing, i) { Some(t) -> listing.hashes.get(t.key), None -> None }
+pub fn test_at(listing: TestListing, i: Int) -> Option<TestRecord> = listing.tests.at(i)
 
-pub fn listing_hash_at(listing: TestListing, i: Int) -> Option<Bytes> =
-  match test_at(listing, i) { Some(t) -> listing.listings.get(t.key), None -> None }
+pub fn run_hash(t: TestRecord) -> Option<Bytes> = t.identity.map(|x: TestIdentity| x.run)
 
 pub fn hash_at(listing: TestListing, i: Int) -> Option<String> / {abort.raise} =
-  match test_hash_at(listing, i) { Some(h) -> Some(h.hex_of()), None -> None }
+  match test_at(listing, i) {
+    Some(t) -> match run_hash(t) { Some(h) -> Some(h.hex_of()), None -> None },
+    None -> None,
+  }
 
 pub fn test_root_at(listing: TestListing, i: Int) -> Option<RootKey> / {abort.raise} =
-  match test_at(listing, i) { Some(t) -> Some(test_key(t.module, t.name)), None -> None }
+  match test_at(listing, i) { Some(t) -> Some(test_key(t.info.module, t.info.name)), None -> None }
+
+pub fn infos_of(listing: TestListing) -> List<TestInfo> =
+  listing.tests.map(|t: TestRecord| t.info)
 
 pub fn roots_of_tests(listing: TestListing) -> List<RootKey> / {abort.raise} =
-  listing.tests.fold([], |found: List<RootKey>, t: TestInfo|
-    found.concat(test_roots(t.module, t.name, t.cases)))
-
-fn effects_by_name(rollups: List<NamedRollup>) -> Map<Bytes, Bool> =
-  rollups.fold(
-    prelude_effects.fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
-      found.insert(e.name, e.nondet)),
-    |found: Map<Bytes, Bool>, r: NamedRollup|
-      r.rollup.declared.fold(found, |m: Map<Bytes, Bool>, d: DeclaredEffect|
-        m.insert(d.name, d.nondet)),
-  )
-
-pub fn listing_over(
-  modules: Modules,
-  rollups: List<NamedRollup>,
-  summaries: List<HashSummary>,
-) -> TestListing / {abort.raise} = {
-  let placed = range(0, modules.own.len()).fold(
-    { tests: [], labels: [] },
-    |found: { tests: List<TestInfo>, labels: List<Location> }, i: Int| {
-      let r = rollups.get(i).rollup;
-      {
-        tests: r.tests.fold(found.tests, |tests: List<TestInfo>, t: TestInfo|
-          tests.push({ ..t, index: tests.len(), at: { ..t.at, module: i } })),
-        labels: found.labels.concat(r.labels.map(|s: Span| { module: i, span: s })),
-      }
-    },
-  );
-  {
-    root: modules.root,
-    names: rollups.map(|r: NamedRollup| r.module),
-    tests: placed.tests,
-    labels: placed.labels,
-    hashes: summaries.fold(Map::new(), |found: Map<Bytes, Bytes>, s: HashSummary|
-      s.tests.fold(found, |m: Map<Bytes, Bytes>, t: TestHash| m.insert(t.key, t.hash))),
-    listings: summaries.fold(Map::new(), |found: Map<Bytes, Bytes>, s: HashSummary|
-      s.tests.fold(found, |m: Map<Bytes, Bytes>, t: TestHash|
-        if t.listing.len() == 0 { m } else { m.insert(t.key, t.listing) })),
-    effects: effects_by_name(rollups),
-    records: summaries.map(|s: HashSummary| s.record),
-  }
-}
+  listing.tests.fold([], |found: List<RootKey>, t: TestRecord|
+    found.concat(test_roots(t.info.module, t.info.name, t.info.cases)))
 
 pub fn listing_of_program(w: ProgramListing) -> TestListing / {abort.raise} =
-  {
-    root: w.root,
-    names: w.outlines.map(|o: Outline| o.name),
-    tests: w.checked.tests,
-    labels: test_label_spans(w.outlines),
-    hashes: w.hashes.tests,
-    listings: w.hashes.listing_hashes,
-    effects: prelude_effects.concat(w.checked.effects).fold(
-      Map::new(),
-      |found: Map<Bytes, Bool>, e: EffectInfo| found.insert(e.name, e.nondet),
+  selected_listing(
+    test_list(
+      w.root,
+      w.outlines.map(|o: Outline| o.name),
+      w.checked.tests,
+      test_labels(w.outlines),
+      w.checked.effects.fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
+        found.insert(e.name, e.nondet)),
+      w.modules.map(|m: ModuleHashes| m.record),
     ),
-    records: w.modules.map(|m: ModuleHashes| m.record),
-  }
+    w.hashes.tests.fold(Map::new(), |found: Map<Bytes, TestIdentity>, key: Bytes, run: Bytes|
+      found.insert(key, { run: run, listing: of_key(w.hashes.listing_hashes, key) })),
+  )
 
 pub fn sources_named(names: List<Bytes>, places: List<SourceText>) -> List<Source> / {abort.raise} =
   range(0, names.len()).map(|i: Int|
@@ -116,27 +87,21 @@ pub fn view_of_imports(
   t: Session<TestReading>,
   places: List<SourceText>,
   start: List<Bytes>,
-) -> TestsView / {ProgramStore, abort.raise} =
-  match t.value.whole {
-    Some(w) -> { whole: w, places: places, included: range(0, t.value.listing.names.len()) },
-    None -> {
-      let rollups = t.value.later.reading.rollups;
-      let reached = view::imports_reached(rollups, start.push(b"std.prelude"));
-      let included = range(0, rollups.len()).filter(|i: Int|
-        reached.contains(rollups.get(i).module));
-      let name = |i: Int| rollups.get(i).module;
-      let subset = {
-        root: included.filter(|i: Int| i < t.modules.root).len(),
-        own: included.filter(|i: Int| i < t.modules.own.len()).map(name),
-        pulled: included.filter(|i: Int| i >= t.modules.own.len()).map(name),
-      };
-      {
-        whole: in_program_store(t.place, |_: LoadInputs| view::listed(subset)).value,
-        places: included.map(|i: Int| places.get(i)),
-        included: included,
-      }
-    },
+) -> TestsView / {ProgramStore, abort.raise} = {
+  let names = names_of(t.modules);
+  let reached = names_reached(names, t.value.later.reading.sites.imports, start.push(b"std.prelude"));
+  let included = range(0, names.len()).filter(|i: Int| reached.contains(names.get(i)));
+  let subset = {
+    root: included.filter(|i: Int| i < t.modules.root).len(),
+    own: included.filter(|i: Int| i < t.modules.own.len()).map(|i: Int| names.get(i)),
+    pulled: included.filter(|i: Int| i >= t.modules.own.len()).map(|i: Int| names.get(i)),
+  };
+  {
+    whole: in_program_store(t.place, |_: LoadInputs| view::listed(subset)).value,
+    places: included.map(|i: Int| places.get(i)),
+    included: included,
   }
+}
 
 test "only a test over cases has a root that lists its cases" {
   let plain = {
@@ -149,17 +114,19 @@ test "only a test over cases has a root that lists its cases" {
     effects: [],
     at: { module: 0, span: dummy_span },
   };
-  let over_cases = { ..plain, name: b"over" };
-  let listing = {
-    root: 1,
-    names: [b"m"],
-    tests: [plain, { ..over_cases, cases: true }],
-    labels: [],
-    hashes: Map::new(),
-    listings: Map::new(),
-    effects: Map::new(),
-    records: [],
-  };
+  let over_cases = { ..plain, name: b"over", key: b"m.over", cases: true };
+  let listing = selected_listing(
+    test_list(
+      1,
+      [b"m"],
+      [plain, over_cases],
+      [plain, over_cases].fold(Map::new(), |found: Map<Bytes, Location>, t: TestInfo|
+        found.insert(t.key, t.at)),
+      Map::new(),
+      [],
+    ),
+    Map::new(),
+  );
   let run = test_key(b"m", b"over");
   assert_eq(
     roots_of_tests(listing).map(|k: RootKey| root_text(root_name(k))),
