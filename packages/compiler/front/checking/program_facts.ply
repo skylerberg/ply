@@ -10,8 +10,9 @@ import compiler.expand.embed (ModuleEmbed, module_embed_bin)
 import compiler.front.emitter_input (ConstSite, LawPlace, MainPlace, ModuleMain, RootPlace,
                                      const_site_bin, law_place_bin, main_place_bin, root_place_bin)
 import compiler.front.exports (named_node)
-import compiler.front.facts (Argument, StatementSite, TaggedSite, callees_of, statement_site_bin,
-                             tagged_site_bin)
+import compiler.front.facts (Argument, TextArgument, CallArgument, RowArgument, TaggedArgument,
+                             ListArgument, ConstructorArgument, OtherArgument, StatementSite,
+                             TaggedSite, statement_site_bin, tagged_site_bin)
 import compiler.front.rows (DeclaredEffect, DeclaredOperation, declared_effect_bin)
 import compiler.front.checking.world (CheckDefinition, ModuleKey, Modules, modules_bin, shipped_for)
 import compiler.front.checking.groups (code_part, declared_effects_part, imports_part, sites_part,
@@ -96,28 +97,24 @@ pub type CalleeIdentity = | RunIdentity(Bytes) | NoRunIdentity
 
 derive bin for CalleeIdentity
 
+pub type Callee = { name: Bytes, identity: CalleeIdentity }
+
+derive bin for Callee
+
+pub type IdentifiedSite<a> = { site: a, identity: CalleeIdentity }
+
+derive bin for IdentifiedSite
+
 pub type ProgramSites = {
-  tagged: List<TaggedSite>,
-  statements: List<StatementSite>,
-  constants: List<ConstSite>,
-  callee_identities: Map<Bytes, CalleeIdentity>,
+  tagged: List<IdentifiedSite<TaggedSite>>,
+  statements: List<StatementSite<Callee>>,
+  constants: List<IdentifiedSite<ConstSite>>,
 }
 
 derive bin for ProgramSites
 
-pub fn run_identity(
-  identities: Map<Bytes, CalleeIdentity>,
-  callee: Bytes,
-) -> Option<Bytes> / {abort.raise} =
-  match identities.get(callee) {
-    Some(RunIdentity(identity)) -> Some(identity),
-    Some(NoRunIdentity) -> None,
-    None ->
-      panic(
-        "`" ++ String::of_bytes_lossy(callee)
-          ++ "` is not a callee of the program's sites, so it has no listed identity",
-      ),
-  }
+pub fn run_identity(identity: CalleeIdentity) -> Option<Bytes> =
+  match identity { RunIdentity(hash) -> Some(hash), NoRunIdentity -> None }
 
 pub fn program_sites_query() -> QueryOf<Modules, ProgramSites> =
   { name: b"program sites", input: modules_bin(), output: program_sites_bin() }
@@ -156,14 +153,95 @@ pub fn names_reached(
   ).fold(Set::empty(), |found: Set<Bytes>, i: Int| found.insert(names.get(i)))
 }
 
-fn identities_of_callees(
-  modules: Modules,
-  callees: List<Bytes>,
-) -> Map<Bytes, CalleeIdentity> / {memo.read, abort.raise} = {
-  let known = Set::of_list(names_of(modules));
-  callees.fold(Map::new(), |found: Map<Bytes, CalleeIdentity>, name: Bytes|
-    if found.contains(name) { found } else { found.insert(name, callee_identity(known, name)) })
-}
+type Identifying<a> = { identities: Map<Bytes, CalleeIdentity>, value: a }
+
+fn identified_callee(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  name: Bytes,
+) -> Identifying<Callee> / {memo.read, abort.raise} =
+  match identities.get(name) {
+    Some(identity) -> { identities: identities, value: { name: name, identity: identity } },
+    None -> {
+      let identity = callee_identity(program_modules, name);
+      { identities: identities.insert(name, identity), value: { name: name, identity: identity } }
+    },
+  }
+
+fn identified_sites<a>(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  sites: List<a>,
+  called: (a) -> Bytes,
+) -> Identifying<List<IdentifiedSite<a>>> / {memo.read, abort.raise} =
+  sites.fold({ identities: identities, value: [] }, |found: Identifying<List<IdentifiedSite<a>>>,
+                                                     site: a| {
+    let callee = identified_callee(program_modules, found.identities, called(site));
+    {
+      identities: callee.identities,
+      value: found.value.push({ site: site, identity: callee.value.identity }),
+    }
+  })
+
+fn identified_arguments(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  arguments: List<Argument<Bytes>>,
+) -> Identifying<List<Argument<Callee>>> / {memo.read, abort.raise} =
+  arguments.fold({ identities: identities, value: [] }, |found: Identifying<List<Argument<Callee>>>,
+                                                         a: Argument<Bytes>| {
+    let one = identified_argument(program_modules, found.identities, a);
+    { identities: one.identities, value: found.value.push(one.value) }
+  })
+
+fn identified_argument(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  a: Argument<Bytes>,
+) -> Identifying<Argument<Callee>> / {memo.read, abort.raise} =
+  match a {
+    TextArgument(text) -> { identities: identities, value: TextArgument(text) },
+    CallArgument(c) -> {
+      let callee = identified_callee(program_modules, identities, c.callee);
+      let args = identified_arguments(program_modules, callee.identities, c.args);
+      { identities: args.identities, value: CallArgument({ callee: callee.value, args: args.value }) }
+    },
+    RowArgument(fields) -> { identities: identities, value: RowArgument(fields) },
+    TaggedArgument(t) -> {
+      let callee = identified_callee(program_modules, identities, t.callee);
+      let holes = identified_arguments(program_modules, callee.identities, t.holes);
+      {
+        identities: holes.identities,
+        value: TaggedArgument({ callee: callee.value, parts: t.parts, holes: holes.value }),
+      }
+    },
+    ListArgument(items) -> {
+      let listed = identified_arguments(program_modules, identities, items);
+      { identities: listed.identities, value: ListArgument(listed.value) }
+    },
+    ConstructorArgument(c) -> { identities: identities, value: ConstructorArgument(c) },
+    OtherArgument -> { identities: identities, value: OtherArgument },
+  }
+
+fn identified_statements(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  sites: List<StatementSite<Bytes>>,
+) -> Identifying<List<StatementSite<Callee>>> / {memo.read, abort.raise} =
+  sites.fold({ identities: identities, value: [] }, |found: Identifying<List<StatementSite<Callee>>>,
+                                                     site: StatementSite<Bytes>| {
+    let args = identified_arguments(program_modules, found.identities, site.args);
+    {
+      identities: args.identities,
+      value: found.value.push({
+        module: site.module,
+        span: site.span,
+        callee: site.callee,
+        label: site.label,
+        args: args.value,
+      }),
+    }
+  })
 
 fn callee_identity(known: Set<Bytes>, name: Bytes) -> CalleeIdentity / {memo.read, abort.raise} = {
   let module = named_node(name).module;
@@ -184,21 +262,23 @@ pub fn program_sites_result(modules: Modules) -> Written / {memo.read, abort.rai
   let read = root.map(|i: Int| fetch_part(sites_part(), keys.get(i)));
   let tagged = root.fold([], |found: List<TaggedSite>, i: Int|
     found.concat(read.get(i).tagged.map(|t: TaggedSite| { ..t, module: i })));
-  let statements = root.fold([], |found: List<StatementSite>, i: Int|
-    found.concat(read.get(i).statements.map(|x: StatementSite| { ..x, module: i })));
+  let statements = root.fold([], |found: List<StatementSite<Bytes>>, i: Int|
+    found.concat(read.get(i).statements.map(|x: StatementSite<Bytes>| { ..x, module: i })));
   let constants = root.fold([], |found: List<ConstSite>, i: Int|
     found.concat(read.get(i).constants.map(|c: ConstSite| { ..c, module: i })));
+  let program_modules = Set::of_list(names_of(modules));
+  let identified_tagged = identified_sites(program_modules, Map::new(), tagged, |t: TaggedSite|
+    t.callee);
+  let identified_constants = identified_sites(
+    program_modules,
+    identified_tagged.identities,
+    constants,
+    |c: ConstSite| c.name,
+  );
   written(program_sites_query(), {
-    tagged: tagged,
-    statements: statements,
-    constants: constants,
-    callee_identities: identities_of_callees(
-      modules,
-      tagged.map(|t: TaggedSite| t.callee).concat(constants.map(|c: ConstSite| c.name)).concat(
-        statements.fold([], |found: List<Bytes>, x: StatementSite|
-          x.args.fold(found, |names: List<Bytes>, a: Argument| names.concat(callees_of(a)))),
-      ),
-    ),
+    tagged: identified_tagged.value,
+    statements: identified_statements(program_modules, identified_constants.identities, statements).value,
+    constants: identified_constants.value,
   })
 }
 

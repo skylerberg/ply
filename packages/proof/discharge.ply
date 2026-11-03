@@ -41,52 +41,44 @@ pub fn discharged<a | e>(
   sim: plan::Plan,
   ask: (RuntimeRequest) -> RuntimeReply / e,
   report_outcome: (a, Outcome) -> Unit / e,
-) -> List<Outcome> / {abort.raise | e} = {
-  let works = claims.map(|c: ClaimToDischarge<a>| plan_claim(c, world));
-  range(0, works.len()).fold((), |_: Unit, i: Int|
-    match ((works.at(i), claims.at(i))) {
-      (Some(Finished(o)), Some(a)) -> report_outcome(a.reported_as, o),
-      _ -> (),
+) -> Unit / {abort.raise | e} = {
+  let needing = claims.fold([], |found: List<PlannedClaim<a>>, c: ClaimToDischarge<a>|
+    match plan_claim(c, world) {
+      Finished(o) -> {
+        report_outcome(c.reported_as, o);
+        found
+      },
+      NeedsPoints(p) -> found.push({ claim: c, plan: p }),
     });
-  let batches = range(0, works.len()).fold([], |accumulator: List<Batch>, i: Int|
-    match ((works.at(i), claims.at(i))) {
-      (Some(NeedsPoints(p)), Some(a)) ->
-        accumulator.push({
-          claim_index: a.claim,
-          points: p.points,
-          mode: match p.kind {
-            LawPoints -> GuardFilter,
-            WitnessPoints(_) -> WitnessSearch,
-            _ -> WholeClaim,
-          },
-        }),
-      _ -> accumulator,
+  let batches = needing.map(|n: PlannedClaim<a>|
+    {
+      claim_index: n.claim.claim,
+      points: n.plan.points,
+      mode: match n.plan.kind {
+        LawPoints -> GuardFilter,
+        WitnessPoints(_) -> WitnessSearch,
+        _ -> WholeClaim,
+      },
     });
   let results = if batches.len() == 0 { [] }
   else { match ask(JudgePoints(batches)) { Judgements(js) -> js, _ -> [] } };
-  range(0, works.len()).fold(
-    { outcomes: [], next: 0 },
-    |accumulator: { outcomes: List<Outcome>, next: Int }, i: Int|
-      match ((works.at(i), claims.at(i))) {
-        (Some(Finished(o)), _) -> { ..accumulator, outcomes: accumulator.outcomes.push(o) },
-        (Some(NeedsPoints(p)), Some(a)) -> {
-          let js = match results.at(accumulator.next) { Some(x) -> x, None -> [] };
-          let outcome = match p.kind {
-            LawPoints -> match admitted_points(a.obligation, p, js) {
-              Err(o) -> o,
-              Ok(points) -> search_interleavings(a, p, points, sim, ask),
-            },
-            WitnessPoints(c) -> witness_outcome(a.obligation, p, js, c),
-            EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
-            CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
-          };
-          report_outcome(a.reported_as, outcome);
-          { outcomes: accumulator.outcomes.push(outcome), next: accumulator.next + 1 }
-        },
-        _ -> accumulator,
+  range(0, needing.len()).fold((), |_: Unit, i: Int| {
+    let a = needing.get(i).claim;
+    let p = needing.get(i).plan;
+    let js = match results.at(i) { Some(x) -> x, None -> [] };
+    report_outcome(a.reported_as, match p.kind {
+      LawPoints -> match admitted_points(a.obligation, p, js) {
+        Err(o) -> o,
+        Ok(points) -> search_interleavings(a, p, points, sim, ask),
       },
-  ).outcomes
+      WitnessPoints(c) -> witness_outcome(a.obligation, p, js, c),
+      EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
+      CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
+    })
+  })
 }
+
+type PlannedClaim<a> = { claim: ClaimToDischarge<a>, plan: PointPlan }
 
 type PointPurpose =
   | EveryPoint(Option<Certificate>)
@@ -538,23 +530,46 @@ fn no_runtime() -> (RuntimeRequest) -> RuntimeReply / {abort.raise} =
   |ask: RuntimeRequest|
     panic("a claim that already has a result must not send a request to the runtime")
 
+effect reports {
+  write reported(claim: Int, outcome: Outcome) -> Unit
+}
+
+fn reported_outcomes<| e>(
+  claims: List<ClaimToDischarge<Int>>,
+  sim: plan::Plan,
+  ask: (RuntimeRequest) -> RuntimeReply / e,
+) -> Map<Int, Outcome> / {abort.raise | e} =
+  handle {
+    discharged(
+      claims,
+      empty_prover_input,
+      sim,
+      |q: RuntimeRequest| ask(q),
+      |claim: Int, outcome: Outcome| reports.reported(claim, outcome),
+    )
+  } with {
+    var outcomes: Map<Int, Outcome> = Map::new(),
+    reports.reported(claim, outcome) -> {
+      outcomes = outcomes.insert(claim, outcome);
+    },
+    return _discharged -> outcomes,
+  }
+
 fn run_one<| e>(
   obligation: Obligation,
   resolved: StaticResult,
   sim: plan::Plan,
   ask: (RuntimeRequest) -> RuntimeReply / e,
 ) -> Outcome / {abort.raise | e} =
-  match discharged(
+  match reported_outcomes(
       [{ claim: 0, obligation: obligation, resolved: resolved, reported_as: 0 }],
-      empty_prover_input,
       sim,
       ask,
-      |_claim: Int, _outcome: Outcome| (),
-    ).at(
+    ).get(
       0,
     ) {
     Some(x) -> x,
-    None -> panic("checking one claim must return exactly one outcome"),
+    None -> panic("checking one claim must report its outcome"),
   }
 
 fn int_of(vs: List<Value>) -> Int / {abort.raise} =
@@ -759,7 +774,7 @@ test "one runtime request checks the inputs of all claims that need it, each cla
       },
       RunInterleaving(_, _, _, _) -> panic("nothing to search"),
     };
-  let outcomes = discharged(
+  let outcomes = reported_outcomes(
     [
       { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided, reported_as: 4 },
       {
@@ -776,12 +791,19 @@ test "one runtime request checks the inputs of all claims that need it, each cla
         reported_as: 9,
       },
     ],
-    empty_prover_input,
     plan::default_plan,
     ask,
-    |_claim: Int, _outcome: Outcome| (),
   );
-  assert_eq(outcomes.map(is_proved), [false, true, true, true])
+  assert_eq(
+    [4, 5, 7, 9].map(|claim: Int|
+      match outcomes.get(claim) { Some(o) -> Some(is_proved(o)), None -> None }),
+    [
+      Some(false),
+      Some(true),
+      Some(true),
+      Some(true),
+    ],
+  )
 }
 
 effect events {
