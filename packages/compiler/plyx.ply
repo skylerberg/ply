@@ -1,6 +1,5 @@
 import std.bytes (u32_le, u64_le, ascii_of_int)
 import std.hash (blake3)
-import compiler.store.segments (read_u32)
 import std.list
 
 const magic: Bytes = b"PLYPROG1"
@@ -68,8 +67,6 @@ pub type Container = {
 }
 
 pub type DecodeError = { stale: Bool, note: Bytes, message: Bytes }
-
-pub type Range = { at: Int, len: Int }
 
 fn fixed_width(b: Bytes, n: Int) -> Bytes / {abort.raise} =
   if b.len() == n { b }
@@ -152,6 +149,12 @@ fn truncated(offset: Int, wanted: Int, n: Int) -> DecodeError =
     ]),
   )
 
+fn word_at(b: Bytes, at: Int) -> Int / {abort.raise} =
+  match b.u32_at(at) {
+    Some(n) -> n,
+    None -> panic("an artifact's header field was read past the length checked for it"),
+  }
+
 fn hash32(b: Bytes, i: Int) -> Bytes = match b.slice_at(i, 32) { Some(x) -> x, None -> b"" }
 
 fn descriptor_at(
@@ -160,8 +163,8 @@ fn descriptor_at(
   k: Int,
   table: Int,
   n: Int,
-) -> Result<SectionLocation, DecodeError> = {
-  let count = read_u32(b, d + 4);
+) -> Result<SectionLocation, DecodeError> / {abort.raise} = {
+  let count = word_at(b, d + 4);
   let beyond = malformed(
     Bytes::concat_all([
       b"section ",
@@ -203,7 +206,7 @@ fn section_table(
   iterate({ i: 0, out: [] }, count + 1, |s: { i: Int, out: List<SectionLocation> }|
     if s.i >= count { Stop(Ok(s.out)) } else {
       let d = header_len + descriptor_len * s.i;
-      let k = read_u32(b, d);
+      let k = word_at(b, d);
       if s.out.filter(|placed: SectionLocation| placed.kind == k).len() > 0 {
         Stop(Err(malformed(Bytes::concat_all([b"section ", ascii_of_int(k), b" appears twice"]))))
       } else {
@@ -238,7 +241,7 @@ fn decode_as(
       message: b"this file is not a Ply ".concat(what),
     })
   } else {
-    let written = read_u32(b, offset_format);
+    let written = word_at(b, offset_format);
     if written != format_version {
       Err({
         stale: true,
@@ -251,7 +254,7 @@ fn decode_as(
         ]),
       })
     } else {
-      let count = read_u32(b, offset_sections);
+      let count = word_at(b, offset_sections);
       let table = header_len + descriptor_len * count;
       if table > n { Err(truncated(header_len, table - header_len, n)) } else {
         match section_table(b, count, table, n) {
@@ -259,7 +262,7 @@ fn decode_as(
           Ok(sections) ->
             Ok({
               format: written,
-              flags: read_u32(b, offset_flags),
+              flags: word_at(b, offset_flags),
               frontend: hash32(b, offset_frontend),
               runtime: hash32(b, offset_runtime_hash),
               entry: hash32(b, offset_entry),
@@ -272,34 +275,20 @@ fn decode_as(
   }
 }
 
-pub fn digest_covered_ranges(n: Int) -> Option<List<Range>> =
-  if n < offset_sections { None }
-  else { Some([{ at: offset_entry, len: 32 }, { at: offset_sections, len: n - offset_sections }]) }
-
 pub fn digest_of(digest_domain: Bytes, container: Bytes) -> Option<Bytes> / {abort.raise} =
-  match digest_covered_ranges(container.len()) {
-    None -> None,
-    Some(ranges) ->
-      Some(
-        blake3(
-          Bytes::concat_all(
-            [digest_domain].concat(
-              ranges.map(|range: Range| container.slice(range.at, range.at + range.len)),
-            ),
-          ),
-        ),
+  if container.len() < offset_sections { None } else {
+    Some(
+      blake3(
+        Bytes::concat_all([
+          digest_domain,
+          container.slice(offset_entry, offset_entry + 32),
+          container.slice(offset_sections, container.len()),
+        ]),
       ),
+    )
   }
 
 pub fn digest_text(d: Bytes) -> String / {abort.raise} = "b3:" ++ d.hex_of()
-
-pub type DigestPlan = { domain: Bytes, at: Int, ranges: List<Range> }
-
-pub fn digest_plan(n: Int) -> Option<DigestPlan> =
-  match digest_covered_ranges(n) {
-    None -> None,
-    Some(rs) -> Some({ domain: domain, at: offset_digest, ranges: rs }),
-  }
 
 pub fn archive_digest(b: Bytes) -> String / {abort.raise} =
   match digest_of(library_domain, b) { Some(d) -> digest_text(d), None -> "" }
@@ -351,16 +340,11 @@ test "a section's payload comes back where it was put" {
 
 test "the digest covers the entry point and the sections, and never its own field" {
   let bytes = encode(sample, [{ name: b"bodies", count: 1, payload: b"AA" }]);
-  match digest_covered_ranges(bytes.len()) {
-    None -> panic("an artifact this module wrote is long enough to carry a digest"),
-    Some(rs) -> {
-      assert_eq(rs.len(), 2);
-      assert_eq(rs.get(0), { at: offset_entry, len: 32 });
-      assert_eq(rs.get(1), { at: offset_sections, len: bytes.len() - offset_sections });
-      assert(offset_digest >= offset_entry + 32);
-      assert(offset_digest + 32 <= offset_sections)
-    },
-  }
+  let changed = |at: Int|
+    Bytes::concat_all([bytes.slice(0, at), b"\xff", bytes.slice(at + 1, bytes.len())]);
+  assert(digest_of(domain, changed(offset_entry)) != digest_of(domain, bytes));
+  assert(digest_of(domain, changed(bytes.len() - 1)) != digest_of(domain, bytes));
+  assert_eq(digest_of(domain, changed(offset_digest)), digest_of(domain, bytes))
 }
 
 test "an artifact's digest depends only on the domain string and the bytes in the digested ranges, not on the bytes stored in the digest field" {
@@ -399,25 +383,10 @@ test "a library reads back under its own magic, and a program is not a library" 
   }
 }
 
-test "an artifact too short to contain a header has no byte ranges to digest" {
-  assert_eq(digest_covered_ranges(0), None);
-  assert_eq(digest_covered_ranges(offset_sections - 1), None);
-  assert_eq(
-    digest_covered_ranges(offset_sections),
-    Some([{ at: offset_entry, len: 32 }, { at: offset_sections, len: 0 }]),
-  )
-}
-
-test "a digest plan names its domain, the field it is written into and the ranges it covers" {
-  assert_eq(digest_plan(offset_sections - 1), None);
-  assert_eq(
-    digest_plan(offset_sections + 10),
-    Some({
-      domain: b"ply.program.2",
-      at: offset_digest,
-      ranges: [{ at: offset_entry, len: 32 }, { at: offset_sections, len: 10 }],
-    }),
-  )
+test "an artifact too short to contain a header has no digest" {
+  assert_eq(digest_of(domain, b""), None);
+  assert_eq(digest_of(domain, b"\x00".repeat(offset_sections - 1)), None);
+  assert(digest_of(domain, b"\x00".repeat(offset_sections)) != None)
 }
 
 test "a file that does not start with the magic bytes is rejected, and the error names the expected magic" {

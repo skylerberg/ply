@@ -6,10 +6,11 @@ import sources (ProjectFiles)
 import std.fs
 import std.fs (fs)
 import compiler.cc (toolchain)
-import compiler.store.memo
-import compiler.store.memo (memo, Run, QueryStats, reachable_keys, missing_count, reading,
-                            in_session, query_stats)
-import compiler.store.memo_files
+import compiler.store.memo (memo)
+import compiler.store.memo.engine (Run, QueryStats, reachable_keys, missing_count, reading,
+                                   in_session, query_stats)
+import compiler.store.memo.store (QueriesId, queries_id)
+import compiler.store.database
 import compiler.store.packs
 import compiler.unit (shipped, pack_frame)
 import compiler.front.checking (CheckedModule, PackageFile, LoadInputs, LoadResults, query_load,
@@ -24,7 +25,7 @@ import compiler.front.checking.view
 import compiler.front.checking.view (LaterReading)
 import compiler.front.checking.world (Modules)
 import compiler.front.checking.promises (MeasureEntry, measures_query, module_costs_query)
-import compiler.store.handles (fetched)
+import compiler.store.handles (fetch)
 import measures (proof_queries)
 import compiler.emit.costs (Report)
 import compiler.load (Derives, derivation_response)
@@ -111,7 +112,7 @@ pub type Opened<a> = {
 
 type SessionRead<a> = { value: a, tallies: List<QueryStats>, missing_results: Int }
 
-fn opened_from<a>(w: LoadInputs, done: memo_files::StoreOutcome<SessionRead<a>>) -> Opened<a> =
+fn opened_from<a>(w: LoadInputs, done: database::StoreOutcome<SessionRead<a>>) -> Opened<a> =
   {
     inputs: w,
     value: done.value.value,
@@ -146,7 +147,7 @@ pub fn stored_session<a, [r]>(
   let w = query_inputs(project);
   opened_from(
     w,
-    memo_files::with_memo_store[r](
+    database::with_database[r](
       dir,
       pack_frame,
       shipped_files(),
@@ -172,10 +173,10 @@ pub fn promise_facts(
 ) -> PromiseFacts / {memo.read, abort.raise} = {
   let keys = modules.map(|m: Bytes| { module: m, shipped: false, tested: false });
   {
-    costs: (if costs { keys } else { [] }).map(|k: ModuleKey| fetched(module_costs_query(), k)),
+    costs: (if costs { keys } else { [] }).map(|k: ModuleKey| fetch(module_costs_query(), k)),
     measures: (if measures { keys } else { [] }).fold(
       [],
-      |found: List<MeasureEntry>, k: ModuleKey| found.concat(fetched(measures_query(), k)),
+      |found: List<MeasureEntry>, k: ModuleKey| found.concat(fetch(measures_query(), k)),
     ),
   }
 }
@@ -199,7 +200,7 @@ pub fn temporary_session<a>(
   let qs = running_queries();
   let w = query_inputs(project);
   opened_from(w, {
-    value: memo_files::with_store_in_memory(
+    value: database::with_store_in_memory(
       fs::mem_empty(),
       pack_frame,
       shipped_files(),
@@ -216,14 +217,16 @@ pub fn temporary_session<a>(
   })
 }
 
+pub type ShippedResults = { queries: QueriesId, keys: List<Bytes>, rejected: List<CheckedModule> }
+
 pub fn shipped_results<[r]>(
   store_dir: String,
   shipped: List<Bytes>,
-) -> { keys: List<Bytes>, rejected: List<CheckedModule> } / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], Derives, abort.raise} = {
+) -> ShippedResults / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], Derives, abort.raise} = {
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   let wanted = Set::of_list(shipped_queries);
-  memo_files::with_memo_store[r](
+  database::with_database[r](
     store_dir,
     packs::no_pack,
     b"",
@@ -245,7 +248,11 @@ pub fn shipped_results<[r]>(
           let all = reading(qs, run, || check_shipped_modules(shipped));
           {
             run: all.run,
-            value: { keys: reachable_keys(qs, wanted, all.run), rejected: all.value },
+            value: {
+              queries: queries_id(qs),
+              keys: reachable_keys(qs, wanted, all.run),
+              rejected: all.value,
+            },
           }
         })),
   ).value
@@ -253,9 +260,9 @@ pub fn shipped_results<[r]>(
 
 pub fn write_shipped_pack<[r]>(
   store_dir: String,
-  keys: List<Bytes>,
+  results: ShippedResults,
 ) -> { written: packs::PackFiles, records: Int } / {fs.read[r], fs.read_file[shipped], abort.raise} =
-  memo_files::write_pack[r](store_dir, keys, memo::queries_id(running_queries()), shipped_files())
+  database::write_pack[r](store_dir, results.keys, results.queries, shipped_files())
 
 fn shipped_files() -> Bytes / {fs.read_file[shipped]} =
   match fs.read_file[shipped]("digests") { Some(b) -> b, None -> b"" }
@@ -265,7 +272,7 @@ fn query_shipped<a>(
 ) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} = {
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  memo_files::with_store_in_memory(
+  database::with_store_in_memory(
     fs::mem_empty(),
     pack_frame,
     shipped_files(),

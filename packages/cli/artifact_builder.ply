@@ -22,9 +22,8 @@ import compiler.store.hash.printer (Printed, Unprintable, PrintedDefinition, Def
 import compiler.store.hash (body_key)
 import compiler.store.hash.encoding (hex)
 import compiler.load (SourceFile)
-import compiler.store.plyx (Header, SectionLocation, Section, decode, digest_of, digest_text,
+import compiler.plyx (Header, SectionLocation, Section, decode, digest_of, digest_text,
                             domain)
-import compiler.store.segments (read_u32)
 import compiler.check.infer.checker (DefinitionInfo)
 import compiler.check.types (Effect, effect_list_text)
 import compiler.check.resolve.tables (Diagnostic, Unplaced, error_unplaced, qualify)
@@ -574,8 +573,9 @@ fn read_bodies(
         Err(_) -> accumulator,
         Ok(s) -> if s.at + 36 > end { Err(overrun_error(path, "definition", s.at)) } else {
           let hash = match b.slice_at(s.at, 32) { Some(h) -> h, None -> b"" };
-          let n = read_u32(b, s.at + 32);
-          if s.at + 36 + n > end { Err(overrun_error(path, "definition", s.at)) } else {
+          match b.u32_at(s.at + 32) {
+          None -> Err(overrun_error(path, "definition", s.at)),
+          Some(n) -> if s.at + 36 + n > end { Err(overrun_error(path, "definition", s.at)) } else {
             let body = match b.slice_at(s.at + 36, n) { Some(x) -> x, None -> b"" };
             if body_key(body) != Some(hash) {
               Err(
@@ -592,6 +592,7 @@ fn read_bodies(
             } else if s.by_hash.contains(hash) {
               Err(invalid_artifact(path, "the artifact carries `" ++ short(hash) ++ "` twice", []))
             } else { Ok({ at: s.at + 36 + n, by_hash: s.by_hash.insert(hash, body) }) }
+          },
           }
         },
       },
@@ -637,7 +638,10 @@ fn read_names(
           Err(_) -> accumulator,
           Ok(done) -> {
             let at = p.at + i * 40;
-            match text.slice_at(read_u32(b, at), read_u32(b, at + 4)) {
+            match match ((b.u32_at(at), b.u32_at(at + 4))) {
+                (Some(start), Some(length)) -> text.slice_at(start, length),
+                _ -> None,
+              } {
               None -> Err(invalid_artifact(path, "a name lies outside the string section", [])),
               Some(hex_bytes) -> match utf8(hex_bytes) {
                 None -> Err(invalid_artifact(path, "a name is not valid UTF-8", [])),
@@ -673,39 +677,49 @@ fn read_closure(
         |accumulator: Result<FilesCursor, Diagnostic>, _i: Int|
           match accumulator {
             Err(_) -> accumulator,
-            Ok(s) -> {
-              let path_len = read_u32(b, s.at);
-              let text_at = s.at + 8 + path_len;
-              let text_len = read_u32(b, s.at + 4 + path_len);
-              if s.at + 8 > end || text_at > end || text_at + text_len > end {
-                Err(overrun_error(path, "closure", s.at))
-              } else {
-                match utf8(match b.slice_at(s.at + 4, path_len) { Some(x) -> x, None -> b"" }) {
-                  None ->
-                    Err(
-                      invalid_artifact(
-                        path,
-                        "a module path in the artifact's source modules is not valid UTF-8",
-                        [],
-                      ),
-                    ),
-                  Some(file) -> {
-                    let text = match b.slice_at(text_at, text_len) { Some(x) -> x, None -> b"" };
-                    match utf8(text) {
+            Ok(s) -> match b.u32_at(s.at) {
+              None -> Err(overrun_error(path, "closure", s.at)),
+              Some(path_len) -> {
+                let text_at = s.at + 8 + path_len;
+                match b.u32_at(s.at + 4 + path_len) {
+                  None -> Err(overrun_error(path, "closure", s.at)),
+                  Some(text_len) -> if s.at + 8 > end || text_at > end || text_at + text_len > end {
+                    Err(overrun_error(path, "closure", s.at))
+                  } else {
+                    match utf8(match b.slice_at(s.at + 4, path_len) { Some(x) -> x, None -> b"" }) {
                       None ->
                         Err(
                           invalid_artifact(
                             path,
-                            "a module in the artifact's source modules is not valid UTF-8",
+                            "a module path in the artifact's source modules is not valid UTF-8",
                             [],
                           ),
                         ),
-                      Some(_) ->
-                        Ok({ at: text_at + text_len, out: s.out.push({ path: file, text: text }) }),
+                      Some(file) -> {
+                        let text = match b.slice_at(text_at, text_len) {
+                          Some(x) -> x,
+                          None -> b"",
+                        };
+                        match utf8(text) {
+                          None ->
+                            Err(
+                              invalid_artifact(
+                                path,
+                                "a module in the artifact's source modules is not valid UTF-8",
+                                [],
+                              ),
+                            ),
+                          Some(_) ->
+                            Ok({
+                              at: text_at + text_len,
+                              out: s.out.push({ path: file, text: text }),
+                            }),
+                        }
+                      },
                     }
                   },
                 }
-              }
+              },
             },
           },
       );
@@ -958,8 +972,8 @@ test "`named_sections` stores each distinct name's text once, and every record w
     [names, strings] -> {
       assert_eq(strings.payload, b"m.Tm.f");
       assert_eq(names.count, 3);
-      assert_eq(read_u32(names.payload, 40), 0);
-      assert_eq(read_u32(names.payload, 80), 3)
+      assert_eq(names.payload.u32_at(40), Some(0));
+      assert_eq(names.payload.u32_at(80), Some(3))
     },
     _ -> panic("two sections"),
   }

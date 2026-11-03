@@ -8,7 +8,7 @@ import std.list
 import std.show (show)
 import compiler.store.segments
 import compiler.store.segments (CommitResult, Committed, LockHeld, Manifest, Segment, SegmentWriter,
-                                StoreChanged, WriteFailed)
+                                StoreChanged, WriteFailed, RowFound, RowAbsent, RowUnreadable)
 import compiler.store.fact_tree
 import compiler.store.fact_tree (TreeEntry, TreeNode, TreeRoot, tree_node_bin)
 
@@ -24,7 +24,7 @@ pub effect recent_reads {
   write lookups_in(name: Bytes) -> Int
 }
 
-pub type Tree = | Facts | Dependents | Inputs | Codes | Records | Cursors
+pub type Tree = | Facts | Dependents | Inputs | Codes | Records | Cursors | PackUsed
 
 pub type LogEntry = { offset: Int, changes: List<Bytes> }
 
@@ -45,7 +45,7 @@ pub type Database = {
   log_floor: Int,
 }
 
-const schema: Bytes = b"ply fact database 11".blake3()
+const schema: Bytes = b"ply fact database 12".blake3()
 
 type Table = | NodesTable | ChangesTable | SnapshotsTable | ResultsTable
 
@@ -61,13 +61,24 @@ type PayloadPlace = { at: Int, size: Int }
 fn place_row(_: Bytes, place: PayloadPlace) -> Option<Bytes> =
   Some(u64_le(place.at).concat(u32_le(place.size)))
 
-fn row_place(row: Bytes, at: Int) -> PayloadPlace / {abort.raise} =
-  { at: segments::read_u64(row, at), size: segments::read_u32(row, at + 8) }
+fn row_place(row: Bytes, at: Int) -> PayloadPlace / {fact_damage.damaged, abort.raise} =
+  match ((row.u64_at(at), row.u32_at(at + 8))) {
+    (Some(offset), Some(size)) -> { at: offset, size: size },
+    _ -> fact_damage.damaged("a table row is shorter than its table's width"),
+  }
 
 const current_snapshot: Bytes = b"current snapshot".blake3()
 
 fn tree_number(tree: Tree) -> Int =
-  match tree { Facts -> 1, Dependents -> 3, Inputs -> 4, Codes -> 5, Records -> 6, Cursors -> 7 }
+  match tree {
+    Facts -> 1,
+    Dependents -> 3,
+    Inputs -> 4,
+    Codes -> 5,
+    Records -> 6,
+    Cursors -> 7,
+    PackUsed -> 8,
+  }
 
 fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
@@ -105,7 +116,13 @@ fn row_in_segment<[r]>(
     Some(rows) -> segments::row_of(rows, row_width(table), key),
     None -> if recent_reads.lookups_in(name) >= whole_table_after {
       segments::row_of(loaded_rows[r](db, seg, table), row_width(table), key)
-    } else { segments::row_on_disk[r](db.dir, seg, table_number(table), key) },
+    } else {
+      match segments::row_on_disk[r](db.dir, seg, table_number(table), key) {
+        RowFound(row) -> Some(row),
+        RowAbsent -> None,
+        RowUnreadable -> fact_damage.damaged("a segment that the manifest lists does not read"),
+      }
+    },
   }
 }
 
@@ -224,7 +241,8 @@ fn with_stored_state<[r]>(
   match file {
     segments::Garbled -> fact_damage.damaged(unreadable_manifest),
     _ -> match table_value[r](blank, SnapshotsTable, current_snapshot) {
-      None -> blank,
+      None -> if blank.manifest.segments.len() == 0 { blank }
+      else { fact_damage.damaged("the manifest lists segments that hold no snapshot") },
       Some(bytes) -> {
         let state = decoded(bytes, stored_state_bin());
         {
@@ -600,11 +618,8 @@ fn located_rows<[r]>(
     let keys = key_width(table);
     segments::rows_folded(rows.len() / width, found, |into: Map<Bytes, Located>, i: Int| {
       let row = rows.slice(i * width, (i + 1) * width);
-      into.insert(row.slice(0, keys), {
-        token: seg.token,
-        offset: segments::read_u64(row, keys),
-        size: segments::read_u32(row, keys + 8),
-      })
+      let place = row_place(row, keys);
+      into.insert(row.slice(0, keys), { token: seg.token, offset: place.at, size: place.size })
     })
   })
 

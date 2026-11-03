@@ -4,7 +4,8 @@ import std.hash (blake3)
 import std.bytes
 import std.list
 import compiler.store.memo
-import compiler.store.memo (memo, Run, reading, in_session)
+import compiler.store.memo (memo)
+import compiler.store.memo.engine (Run, reading, in_session)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
@@ -49,8 +50,9 @@ import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, Ch
                                 outcome_summary, reject_embed, nothing_derived, over_decoding,
                                 queried_over, prelude_frames, prelude_files,
                                 lookup_input_alone, inputs_alone, queried_results, outcome_of, Step,
-                                product_queries, check_sources, layered, module_of, stopped_over,
-                                listed_module)
+                                product_queries, check_sources, layered, module_of,
+                                checked_with_write_limit, listed_module)
+import compiler.store.database (AllWrites, FailAfter, same_database_in_memory)
 
 type Reference = { whole: OutcomeSummary, own_hashes: OwnHashes, results: List<CheckedModule> }
 
@@ -71,9 +73,11 @@ fn sources_key(sources: List<Source>) -> Bytes =
 type EditSession = { store: fs::MemFs, references: Map<Bytes, Reference>, off: List<Bytes> }
 
 pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
-  steps.fold(
-    { store: fs::mem_empty(), references: Map::new(), off: [] },
-    |s: EditSession, step: Step| {
+  steps.fold(edit_session_over(fs::mem_empty()), with_step).off
+
+fn edit_session_over(store: fs::MemFs) -> EditSession = { store: store, references: Map::new(), off: [] }
+
+fn with_step(s: EditSession, step: Step) -> EditSession / {abort.raise} = {
       let warm = queried_over(s.store, step.sources);
       let now = outcome_summary(warm.outcome);
       let key = sources_key(step.sources);
@@ -100,8 +104,7 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
           )
         },
       }
-    },
-  ).off
+}
 
 fn hash_differences(warm: OwnHashes, fresh: OwnHashes) -> Bytes = {
   let by = |f: OwnHashes|
@@ -649,11 +652,11 @@ test "a check stopped at any write to the store leaves a store that the next che
   let before = record_reads(b"a: Int, b: Int", b"f.a + f.b", b"{ a: 1, b: 2 }");
   let after = record_reads(b"a: Int", b"f.a", b"{ a: 1 }");
   let cold = queried_over(fs::mem_empty(), before).store;
-  let fresh = queried_over(fs::mem_empty(), after);
-  [0, 1, 2, 4, 8, 16, 32, 64].fold((), |_: Unit, writes: Int| {
-    let next = queried_over(stopped_over(cold, after, writes), after);
-    assert_eq(outcome_summary(next.outcome), outcome_summary(fresh.outcome));
-    assert_eq(next.fixing, fresh.fixing)
+  let complete = checked_with_write_limit(cold, after, AllWrites);
+  iterate(0, 1099511627776, |writes: Int| {
+    let left = checked_with_write_limit(cold, after, FailAfter(writes));
+    assert_eq(with_step(edit_session_over(left), step(b"after a stopped check", after)).off, []);
+    if same_database_in_memory(left, complete) { Stop(()) } else { Continue(writes + 1) }
   })
 }
 

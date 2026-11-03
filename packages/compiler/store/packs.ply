@@ -2,6 +2,8 @@ import std.bin
 import std.bytes (u32_le, u64_le)
 import std.hash (blake3)
 import compiler.store.segments
+import compiler.store.memo (Query, main_only, plain_queries)
+import compiler.store.memo.store (QueriesId, queries_id, queries_id_bin)
 
 pub const store_file: String = "store"
 
@@ -11,11 +13,11 @@ pub type Range = { offset: Int, len: Int }
 
 derive bin for Range
 
-pub type Index = { queries: Bytes, id: Bytes, files: Bytes, records: Range, results: Range }
+pub type Index = { queries: QueriesId, id: Bytes, files: Bytes, records: Range, results: Range }
 
 derive bin for Index
 
-const index_magic: Bytes = b"PLYPACK\x05"
+const index_magic: Bytes = b"PLYPACK\x06"
 
 pub fn index_bytes(i: Index) -> Bytes / {abort.raise} =
   index_magic.concat(bin::encode(i, index_bin()))
@@ -31,14 +33,17 @@ fn row_of(key: Bytes, at: Range) -> Bytes =
 
 pub fn frame_range(table: Bytes, key: Bytes) -> Option<Range> / {abort.raise} =
   match segments::row_of(table, row_width, key) {
-    Some(row) -> Some({ offset: segments::read_u64(row, 32), len: segments::read_u32(row, 40) }),
+    Some(row) -> match ((row.u64_at(32), row.u32_at(40))) {
+      (Some(offset), Some(len)) -> Some({ offset: offset, len: len }),
+      _ -> None,
+    },
     None -> None,
   }
 
 pub fn output_key(digest: Bytes) -> Option<Bytes> =
   if digest.len() == 33 { Some(digest.slice(1, 33)) } else { None }
 
-pub fn is_trusted(i: Index, queries: Bytes, shipped_files: Bytes) -> Bool =
+pub fn is_trusted(i: Index, queries: QueriesId, shipped_files: Bytes) -> Bool =
   shipped_files.len() > 0 && i.queries == queries && i.files == shipped_files
 
 pub type PackWriter = { frames: List<Bytes>, end: Int }
@@ -58,7 +63,7 @@ pub fn finish(
   records: Map<Bytes, Range>,
   results: Map<Bytes, Range>,
   record_outputs: Map<Bytes, Bytes>,
-  queries: Bytes,
+  queries: QueriesId,
   files: Bytes,
 ) -> PackFiles / {abort.raise} = {
   let rows = |m: Map<Bytes, Range>|
@@ -153,6 +158,20 @@ pub fn frame_in(
 
 pub fn no_pack(_: String, _: Int, _: Int) -> Option<Bytes> = None
 
+fn queries_of(names: List<Bytes>) -> QueriesId =
+  queries_id(
+    plain_queries(
+      names.fold(Map::new(), |named: Map<Bytes, Query<| {}>>, name: Bytes|
+        named.insert(name, {
+          name: name,
+          hash: name,
+          body: main_only,
+          persistent: true,
+          product: None,
+        })),
+    ),
+  )
+
 fn test_pack(
   records: List<{ key: Bytes, bytes: Bytes }>,
   results: List<{ key: Bytes, bytes: Bytes }>,
@@ -174,14 +193,14 @@ fn test_pack(
     a.placed,
     records.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, it: { key: Bytes, bytes: Bytes }|
       accumulator.insert(it.key, blake3(it.bytes))),
-    b"queries",
+    queries_of([b"queries"]),
     files,
   )
 }
 
 test "a pack's index decodes to the value that was encoded" {
   let i = {
-    queries: b"s",
+    queries: queries_of([b"s"]),
     id: b"id",
     files: b"a.ply 00\n",
     records: { offset: 7, len: 44 },
@@ -221,8 +240,8 @@ test "a pack's records are reused only when the queries and the files match thos
     Some(x) -> x,
     None -> panic("the index reads"),
   };
-  assert(is_trusted(i, b"queries", b"files one"));
-  assert(!is_trusted(i, b"other queries", b"files one"));
-  assert(!is_trusted(i, b"queries", b"files two"));
-  assert(!is_trusted(i, b"queries", b""))
+  assert(is_trusted(i, queries_of([b"queries"]), b"files one"));
+  assert(!is_trusted(i, queries_of([b"other queries"]), b"files one"));
+  assert(!is_trusted(i, queries_of([b"queries"]), b"files two"));
+  assert(!is_trusted(i, queries_of([b"queries"]), b""))
 }
