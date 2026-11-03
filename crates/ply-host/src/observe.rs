@@ -328,18 +328,6 @@ fn rooted(path: &Path, roots: &[(String, PathBuf)]) -> (String, String) {
     }
 }
 
-fn located(root: &str, rest: &str, roots: &[(String, PathBuf)]) -> Option<PathBuf> {
-    if root.is_empty() {
-        return Some(PathBuf::from(rest));
-    }
-    let (_, dir) = roots.iter().find(|(name, _)| name == root)?;
-    Some(if rest.is_empty() {
-        dir.clone()
-    } else {
-        dir.join(rest)
-    })
-}
-
 fn returned(how: Read, path: &Path, own: &[PathBuf]) -> String {
     let mut hasher = blake3::Hasher::new();
     hasher.update(how.word().as_bytes());
@@ -420,7 +408,6 @@ fn hash_tree(hasher: &mut blake3::Hasher, root: &Path, below: &Path, own: &[Path
 pub struct World<'a> {
     pub roots: &'a [(String, PathBuf)],
     pub binding: String,
-    pub config: &'a BTreeMap<String, String>,
     pub binary: Binary<'a>,
 }
 
@@ -495,61 +482,4 @@ fn paths_written_under(how: Read, path: &Path, writes: &BTreeSet<PathBuf>) -> Ve
         Read::File | Read::Kind => BTreeSet::new(),
     };
     own.into_iter().collect()
-}
-
-pub fn moved(trace: &str, world: &World<'_>, into: Option<&Recorder>) -> Option<String> {
-    let noted = |note: &dyn Fn(&Recorder)| {
-        if let Some(recorder) = into {
-            note(recorder);
-        }
-    };
-    trace.lines().find_map(|line| {
-        let fields: Vec<&str> = line.split('\t').collect();
-        let stands = match fields.as_slice() {
-            ["shipped", name, digest] => {
-                noted(&|r| r.shipped(name));
-                (world.binary.shipped)(name).unwrap_or_else(|| "none".to_string()) == *digest
-            }
-            ["program", digest] => {
-                noted(&|r| r.ran_program());
-                world.binary.program == *digest
-            }
-            ["binding", digest] => world.binding == *digest,
-            ["config", key, digest] => {
-                let now = world.config.get(*key).map(String::as_str);
-                noted(&|r| r.configured(key, now));
-                configured_digest(now) == *digest
-            }
-            [how, root, rest, own, digest] => match Read::from_name(how) {
-                Some(how) => match located(root, rest, world.roots) {
-                    Some(path) => {
-                        let own: Vec<PathBuf> = own
-                            .split(OWN)
-                            .filter(|o| !o.is_empty())
-                            .map(PathBuf::from)
-                            .collect();
-                        noted(&|r| r.read(how, &path));
-                        returned(how, &path, &own) == *digest
-                    }
-                    None => false,
-                },
-                None => false,
-            },
-            _ => false,
-        };
-        (!stands).then(|| said(&fields))
-    })
-}
-
-fn said(fields: &[&str]) -> String {
-    match fields {
-        ["shipped", "", _] => "the list of shipped modules".to_string(),
-        ["shipped", name, _] => format!("the shipped module `{name}`"),
-        ["program", _] => "the `ply` program".to_string(),
-        ["binding", _] => "the binding".to_string(),
-        ["config", key, _] => format!("the configuration key `{key}`"),
-        [how, "", rest, ..] => format!("the {how} `{rest}`"),
-        [how, root, rest, ..] => format!("the {how} `{rest}` under `{root}`"),
-        _ => format!("an unreadable trace line `{}`", fields.join(" ")),
-    }
 }

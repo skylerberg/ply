@@ -67,8 +67,6 @@ pub trait Binder: Send + Sync {
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>>;
 
     fn hosting(&self, grants: &Grants, w: &mut Writer);
-
-    fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String>;
 }
 
 pub trait Bound: Send + Sync {
@@ -497,10 +495,6 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
             rt_unit_hosting as unsafe extern "C" fn(_, _, _) -> _,
         ),
         runtime_native(
-            "unit_moved",
-            rt_unit_moved as unsafe extern "C" fn(_, _, _, _, _) -> _,
-        ),
-        runtime_native(
             "unit_enter",
             rt_unit_enter as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
@@ -634,33 +628,6 @@ unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenByt
     };
     let mut w = Writer::new();
     binder.hosting(&grants, &mut w);
-    c.given(w.finish())
-}
-
-unsafe extern "C" fn rt_unit_moved(
-    ctx: *mut Ctx,
-    gp: Addr,
-    gn: I64,
-    tp: Addr,
-    tn: I64,
-) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { borrowed(gp, gn) }, read_grants) else {
-        return TakenBytes(0);
-    };
-    if !allowed(c, "machine.moved") {
-        return TakenBytes(0);
-    }
-    let Some(binder) = INSTALLED_BINDER.get() else {
-        return TakenBytes(c.fail(err_no_binder()));
-    };
-    let trace = String::from_utf8_lossy(unsafe { borrowed(tp, tn) }).into_owned();
-    let caller = ply_host::observe::of(&*c.host_runtime());
-    let moved = binder.moved(&grants, &trace, caller.as_deref());
-    let mut w = Writer::new();
-    w.option(moved.as_deref(), |w, m| {
-        w.str(m);
-    });
     c.given(w.finish())
 }
 

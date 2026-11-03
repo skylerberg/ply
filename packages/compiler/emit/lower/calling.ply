@@ -15,7 +15,6 @@ import compiler.syntax.parsing (Span, generated_span, prelude_binder)
 import compiler.syntax.expressions (prelude_module)
 import compiler.check.resolve.tables (qualify)
 import std.bytes (ascii_of_int)
-import std.list (zip)
 import compiler.emit.representations (Definition, Imported, EmitParam, BoundLambda, has_variables,
                                       word_type, substituted, substituted_fully, type_variables,
                                       resumption, resume_result_type, resume_function_type,
@@ -59,8 +58,8 @@ import compiler.emit.lower.base (Context, Lowering, LoweredValue, Target, ToCons
                                  exit_function, with_lambda, initial_lowering, typed_slot_read,
                                  type_of, represented_as, note_slot_read, read_note, capture_note,
                                  note_frame_entry, retyped, with_need, no_captured_evidence,
-                                 EvidenceValues, listed_evidence_values, evidence_values_of,
-                                 substitute_evidence_variables, exit_block)
+                                 EvidenceValues, CapturedEvidence, HandlerInstance,
+                                 listed_evidence_values, evidence_values_of, exit_block)
 import compiler.emit.lower.data (constructed, record_literal)
 import compiler.emit.lower.containers (builtin, item_read_into, length_read,
                                        empty_list_with_capacity, intrinsic_call, list_pushed)
@@ -1973,15 +1972,15 @@ pub fn lambda_body_start(
       words: no_closure_evidence,
     }),
   ).st;
-  let caps = zip(frame.captures, s.captured).fold(
+  let caps = s.captured.fold(
     enter_function(reserved, shape_params(s), Map::new()),
-    |accumulator: Lowering, p: { first: Capture, second: Variable }|
+    |accumulator: Lowering, p: { item: Capture, variable: Variable }|
       {
         ..accumulator,
-        env: accumulator.env.insert(p.first.destination, VariableOperand(p.second)),
-        closures: match st.env.get(p.first.source) {
+        env: accumulator.env.insert(p.item.destination, VariableOperand(p.variable)),
+        closures: match st.env.get(p.item.source) {
           Some(VariableOperand(outer)) -> match st.closures.get(outer.id) {
-            Some(n) -> accumulator.closures.insert(p.second.id, n),
+            Some(n) -> accumulator.closures.insert(p.variable.id, n),
             None -> accumulator.closures,
           },
           _ -> accumulator.closures,
@@ -1994,7 +1993,7 @@ pub fn lambda_body_start(
       match s.parameters.at(j) { Some(p) -> m.insert(j, VariableOperand(p)), None -> m }),
   };
   let read = read_evidence_words(given, s.evidence_parameters, frame.words, at);
-  let inside = substitute_evidence_variables(frame.captured_evidence, s.held_evidence);
+  let inside = s.inside;
   {
     context: {
       ..context,
@@ -2009,8 +2008,8 @@ pub fn lambda_body_start(
       words: inside.words.concat(read.words),
       label_values: label_values_at(
         context,
-        frame_labels(context, frame),
-        s.labels.map(VariableOperand),
+        s.labels.map(|l: { item: Int, variable: Variable }|
+          { place: l.item, value: VariableOperand(l.variable) }),
       ),
       instance: inside.instance,
       retained_arguments: inside.retained_values,
@@ -2073,11 +2072,8 @@ pub fn closure(
     statics: [],
   };
   let unraised = exit_function(outer, returned.st);
-  let exit_inlined = frame_labels(context, frame);
-  let raising = match substitute_evidence_variables(
-      frame.captured_evidence,
-      s.held_evidence,
-    ).words.find(|w: EvidenceWord| w.evidence.effect == b"abort" && !w.inherited) {
+  let raising = match s.inside.words.find(|w: EvidenceWord|
+      w.evidence.effect == b"abort" && !w.inherited) {
     Some(w) -> match w.word {
       VariableOperand(v) -> pending_abort_raise(context, unraised, v),
       _ -> { st: unraised, pending: None },
@@ -2101,11 +2097,10 @@ pub fn closure(
           count: frame.words.len(),
           resource_captures: frame.words.fold([], |accumulator: List<Int>, o: EffectsEvidence|
             match o.evidence.resource {
-              ResourceVariable(p) -> match zip(exit_inlined, s.labels).find(
-                  |l: { first: Int, second: Variable }| l.first == p,
-                ) {
+              ResourceVariable(p) -> match s.labels.find(|l: { item: Int, variable: Variable }|
+                  l.item == p) {
                 Some(l) -> match range(0, laid.len()).find(|k: Int|
-                    match laid.at(k) { Some(v) -> v.id == l.second.id, None -> false }) {
+                    match laid.at(k) { Some(v) -> v.id == l.variable.id, None -> false }) {
                   Some(k) -> accumulator.push(k),
                   None -> accumulator,
                 },
@@ -2117,12 +2112,12 @@ pub fn closure(
       }),
     ),
   };
-  let caps = zip(frame.captures, s.captured).fold(
+  let caps = s.captured.fold(
     { st: note_captures(context, placed, frame.captures, at), args: [] },
-    |accumulator: { st: Lowering, args: List<Arg> }, p: { first: Capture, second: Variable }|
-      match accumulator.st.env.get(p.first.source) {
+    |accumulator: { st: Lowering, args: List<Arg> }, p: { item: Capture, variable: Variable }|
+      match accumulator.st.env.get(p.item.source) {
         Some(a) -> {
-          let h = represented_as({ st: accumulator.st, arg: a }, p.second.representation, at);
+          let h = represented_as({ st: accumulator.st, arg: a }, p.variable.representation, at);
           { st: h.st, args: accumulator.args.push(h.arg) }
         },
         None -> unreachable(b"a captured variable has no bound value"),
@@ -2136,7 +2131,7 @@ pub fn closure(
       made: ClosureAllocation({ nth: nth, captures: laid.len(), params: s.parameters.len() }),
       args: captures_in_order(
         caps.args,
-        exit_inlined.map(|p: Int| label_value(context, p)),
+        s.labels.map(|l: { item: Int, variable: Variable }| label_value(context, l.item)),
         evidence_values_of(frame.captured_evidence),
       ),
       reuse: None,
@@ -2348,9 +2343,10 @@ fn called_known_lambdas(c: Code) -> List<KnownLambda> = {
 type Reference = { st: Lowering, callee: Callee, args: List<Type>, given: List<Type> }
 
 type ClosureLayout = {
-  captured: List<Variable>,
-  labels: List<Variable>,
+  captured: List<{ item: Capture, variable: Variable }>,
+  labels: List<{ item: Int, variable: Variable }>,
   held_evidence: EvidenceValues<Variable>,
+  inside: CapturedEvidence,
   parameters: List<Variable>,
   evidence_parameters: List<Variable>,
   result: Representation,
@@ -2365,7 +2361,11 @@ fn captures_in_order<a>(
 ) -> List<a> = note_captures.concat(labels).concat(listed_evidence_values(evidence_values))
 
 fn shape_captures(s: ClosureLayout) -> List<Variable> =
-  captures_in_order(s.captured, s.labels, s.held_evidence)
+  captures_in_order(
+    s.captured.map(|c: { item: Capture, variable: Variable }| c.variable),
+    s.labels.map(|l: { item: Int, variable: Variable }| l.variable),
+    s.held_evidence,
+  )
 
 fn shape_params(s: ClosureLayout) -> List<Variable> =
   shape_captures(s).concat(s.parameters).concat(s.evidence_parameters)
@@ -2380,22 +2380,42 @@ fn shape_convention(s: ClosureLayout) -> Convention = {
   }
 }
 
+fn numbered_each<a | e>(
+  first: Int,
+  items: List<a>,
+  spec_of: (a, Int) -> { ty: Type, representation: Representation } / e,
+) -> { vars: List<{ item: a, variable: Variable }>, next: Int } / e =
+  {
+    vars: items.fold([], |accumulator: List<{ item: a, variable: Variable }>, x: a| {
+      let spec = spec_of(x, accumulator.len());
+      accumulator.push({
+        item: x,
+        variable: {
+          id: first + accumulator.len(),
+          ty: spec.ty,
+          representation: spec.representation,
+        },
+      })
+    }),
+    next: first + items.len(),
+  }
+
 fn numbered(
   first: Int,
   specs: List<{ ty: Type, representation: Representation }>,
-) -> { vars: List<Variable>, next: Int } =
+) -> { vars: List<Variable>, next: Int } = {
+  let laid = numbered_each(
+    first,
+    specs,
+    |s: { ty: Type, representation: Representation }, _: Int| s,
+  );
   {
-    vars: specs.fold(
-      [],
-      |accumulator: List<Variable>, s: { ty: Type, representation: Representation }|
-        accumulator.push({
-          id: first + accumulator.len(),
-          ty: s.ty,
-          representation: s.representation,
-        }),
+    vars: laid.vars.map(
+      |v: { item: { ty: Type, representation: Representation }, variable: Variable }| v.variable,
     ),
-    next: first + specs.len(),
+    next: laid.next,
   }
+}
 
 fn continuation_type(t: Type, resumes: Option<Effects>) -> Type =
   match ((t, resumes)) { (FunctionType(f), Some(r)) -> FunctionType({ ..f, effects: r }), _ -> t }
@@ -2409,35 +2429,32 @@ fn closure_layout(
   let f = frame.ty;
   let continued = |j: Int| frame.resumes != None && j == frame.params - 1;
   let capture_representations = capture_representations(context, frame.body, frame.captures);
-  let note_captures = numbered(
-    0,
-    range(0, frame.captures.len()).map(|i: Int|
-      {
-        ty: match frame.captures.at(i) {
-          Some(c) -> match env.get(c.source) { Some(a) -> type_of(a), None -> unknown_type },
-          None -> unknown_type,
-        },
-        representation: match capture_representations.at(i) { Some(r) -> r, None -> AsWord },
-      }),
-  );
-  let labels = numbered(
-    note_captures.next,
-    frame_labels(context, frame).map(|_: Int| { ty: int_type, representation: AsInt }),
-  );
+  let note_captures = numbered_each(0, frame.captures, |c: Capture, i: Int|
+    {
+      ty: match env.get(c.source) { Some(a) -> type_of(a), None -> unknown_type },
+      representation: match capture_representations.at(i) { Some(r) -> r, None -> AsWord },
+    });
+  let labels = numbered_each(note_captures.next, frame_labels(context, frame), |_: Int, _: Int|
+    { ty: int_type, representation: AsInt });
   let uncounted = { ty: evidence_type, representation: AsImmediate };
-  let words_held = numbered(
+  let words_held = numbered_each(
     labels.next,
-    frame.captured_evidence.words.map(|_: EvidenceWord| uncounted),
+    frame.captured_evidence.words,
+    |_: EvidenceWord, _: Int| uncounted,
   );
-  let instance = numbered(words_held.next, match frame.captured_evidence.instance {
-    Some(_) -> [uncounted],
-    None -> [],
-  });
-  let retained_evidence = numbered(
+  let instance = numbered_each(
+    words_held.next,
+    match frame.captured_evidence.instance { Some(i) -> [i], None -> [] },
+    |_: HandlerInstance, _: Int| uncounted,
+  );
+  let retained_evidence = numbered_each(
     instance.next,
-    frame.captured_evidence.retained_values.map(|_: Arg|
-      { ty: instance_block_type, representation: AsWord }),
+    frame.captured_evidence.retained_values,
+    |_: Arg, _: Int| { ty: instance_block_type, representation: AsWord },
   );
+  let held_word = |w: { item: EvidenceWord, variable: Variable }| w.variable;
+  let held_instance = |h: { item: HandlerInstance, variable: Variable }| h.variable;
+  let held_value = |r: { item: Arg, variable: Variable }| r.variable;
   let own = numbered(
     retained_evidence.next,
     f.params.fold([], |accumulator: List<{ ty: Type, representation: Representation }>, t: Type|
@@ -2456,9 +2473,19 @@ fn closure_layout(
     captured: note_captures.vars,
     labels: labels.vars,
     held_evidence: {
-      words: words_held.vars,
-      instance: instance.vars.at(0),
-      retained_values: retained_evidence.vars,
+      words: words_held.vars.map(held_word),
+      instance: match instance.vars.at(0) { Some(h) -> Some(held_instance(h)), None -> None },
+      retained_values: retained_evidence.vars.map(held_value),
+    },
+    inside: {
+      words: words_held.vars.map(|w: { item: EvidenceWord, variable: Variable }|
+        { ..w.item, word: VariableOperand(w.variable) }),
+      instance: match instance.vars.at(0) {
+        Some(h) -> Some({ ..h.item, word: VariableOperand(h.variable) }),
+        None -> None,
+      },
+      retained_values: retained_evidence.vars.map(|r: { item: Arg, variable: Variable }|
+        VariableOperand(r.variable)),
     },
     parameters: own.vars,
     evidence_parameters: words.vars,

@@ -16,7 +16,6 @@ import compiler.check.types (Type, VariableType, NamedType, FunctionType, Record
                              fields_sorted)
 import compiler.emit.typing (unknown_type)
 import std.list
-import std.list (zip)
 import compiler.syntax.patterns (LiteralChar)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (BoolKind, BoxedKind, IntKind, width_named)
@@ -36,7 +35,7 @@ import compiler.emit.writing (unspanned_code, prelude_call, placed, int_code, bo
                               applied, builtin_call, native_call, compare_call, constructor_made,
                               prelude_made, prelude_pattern, value_made, if_code, match_code,
                               block_code, some_or, sequence, value_type, Bound, bound_from,
-                              bound_pattern, bound_read)
+                              bound_each, bound_pattern, bound_read)
 
 fn is_key_value(t: Type) -> Bool =
   match t { RecordType(fs) -> fs.map(|f: Field| f.name) == [b"key", b"value"], _ -> false }
@@ -610,9 +609,10 @@ pub fn equality_code(ty: Type, cs: List<SumConstructor>) -> Code = {
   let sum = match ty { NamedType(c) -> c.name, _ -> b"" };
   let arms = cs.map(|c: SumConstructor| {
     let xs = bound_from(2, b"x", c.fields);
-    let ys = bound_from(2 + xs.len(), b"y", c.fields);
-    let same = zip(xs, ys).fold(None, |both: Option<Code>, p: { first: Bound, second: Bound }| {
-      let eq = binary_of(b"eq", bound_read(p.first), bound_read(p.second));
+    let paired = bound_each(2 + xs.len(), b"y", xs, |x: Bound| x.ty);
+    let ys = paired.map(|p: { bound: Bound, item: Bound }| p.bound);
+    let same = paired.fold(None, |both: Option<Code>, p: { bound: Bound, item: Bound }| {
+      let eq = binary_of(b"eq", bound_read(p.item), bound_read(p.bound));
       Some(match both { None -> eq, Some(b) -> binary_of(b"and", b, eq) })
     });
     let inner = match_code(
@@ -681,16 +681,15 @@ pub fn ordering_code(ty: Type, cs: List<SumConstructor>) -> Code = {
     { arms: [], slot: 4 },
     |accumulator: { arms: List<CodeArm>, slot: Int }, c: SumConstructor| {
       let xs = bound_from(accumulator.slot, b"x", c.fields);
-      let ys = bound_from(accumulator.slot + xs.len(), b"y", c.fields);
-      let orders = bound_from(
+      let paired = bound_each(accumulator.slot + xs.len(), b"y", xs, |x: Bound| x.ty);
+      let ys = paired.map(|p: { bound: Bound, item: Bound }| p.bound);
+      let fields = bound_each(
         accumulator.slot + 2 * xs.len(),
         b"o",
-        c.fields.map(|_: Type| ordering_type),
-      );
-      let fields = zip(zip(xs, ys), orders).map(
-        |p: { first: { first: Bound, second: Bound }, second: Bound }|
-          { x: p.first.first, y: p.first.second, order: p.second },
-      );
+        paired,
+        |_: { bound: Bound, item: Bound }| ordering_type,
+      ).map(|o: { bound: Bound, item: { bound: Bound, item: Bound } }|
+        { x: o.item.item, y: o.item.bound, order: o.bound });
       let compared = |f: Ordered| compare_call(bound_read(f.x), bound_read(f.y));
       let lex = fields.fold_right(None, |f: Ordered, later: Option<Code>|
         Some(match later {
@@ -1186,12 +1185,13 @@ fn dynamic_code(
           let arms = cs.fold(
             { arms: [], slot: 1 },
             |accumulator: { arms: List<CodeArm>, slot: Int }, sum_constructor: SumConstructor| {
-              let args = constructor_fields_at(sum_constructor, c.args);
-              let xs = bound_from(
+              let args = bound_each(
                 accumulator.slot,
                 b"x",
-                args.map(|t: Type| dynamic_side(t, !keeping)),
+                constructor_fields_at(sum_constructor, c.args),
+                |t: Type| dynamic_side(t, !keeping),
               );
+              let xs = args.map(|x: { bound: Bound, item: Type }| x.bound);
               {
                 arms: accumulator.arms.push({
                   pattern: CodeConstructorPattern({
@@ -1205,8 +1205,8 @@ fn dynamic_code(
                     c.name,
                     sum_constructor.name,
                     sum_constructor.index,
-                    zip(xs, args).map(|p: { first: Bound, second: Type }|
-                      wrap_handles(bound_read(p.first), p.second, keeping)),
+                    args.map(|x: { bound: Bound, item: Type }|
+                      wrap_handles(bound_read(x.bound), x.item, keeping)),
                     into,
                   ),
                 }),
@@ -1593,8 +1593,13 @@ fn lowering_code(module: Bytes, ty: Type) -> { code: Code, here: List<Definition
           let arms = cs.fold(
             { arms: [], slot: 1 },
             |accumulator: { arms: List<CodeArm>, slot: Int }, constructor: SumConstructor| {
-              let args = constructor_fields_at(constructor, c.args);
-              let xs = bound_from(accumulator.slot, b"x", args.map(without_marks));
+              let args = bound_each(
+                accumulator.slot,
+                b"x",
+                constructor_fields_at(constructor, c.args),
+                without_marks,
+              );
+              let xs = args.map(|x: { bound: Bound, item: Type }| x.bound);
               {
                 arms: accumulator.arms.push({
                   pattern: CodeConstructorPattern({
@@ -1608,8 +1613,8 @@ fn lowering_code(module: Bytes, ty: Type) -> { code: Code, here: List<Definition
                     [
                       out(b"?out_ctor", [bytes_code(constructor.name), int_code(args.len())]),
                     ].concat(
-                      zip(xs, args).map(|p: { first: Bound, second: Type }|
-                        builtin_call(b"?lower", [p.second], [bound_read(p.first)], unit_type)),
+                      args.map(|x: { bound: Bound, item: Type }|
+                        builtin_call(b"?lower", [x.item], [bound_read(x.bound)], unit_type)),
                     ),
                   ),
                 }),

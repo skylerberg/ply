@@ -135,11 +135,9 @@ fn a_file_read_through_the_real_file_handler_is_recorded_in_the_run_trace_with_i
     assert!(ctx.take_failure().is_none());
     let borrowed = [("app".to_string(), dir.path().canonicalize().unwrap())];
     let shipped = |_: &str| None;
-    let config = std::collections::BTreeMap::new();
     let world = World {
         roots: &borrowed,
         binding: "b".to_string(),
-        config: &config,
         binary: Binary {
             shipped: &shipped,
             program: "p".to_string(),
@@ -171,11 +169,9 @@ fn reading_the_program_binary_through_the_real_handler_is_recorded_in_the_run_tr
     }
     assert!(ctx.take_failure().is_none());
     let shipped = |name: &str| (name == "std.list").then(|| "listed".to_string());
-    let config = std::collections::BTreeMap::new();
     let world = World {
         roots: &[],
         binding: "b".to_string(),
-        config: &config,
         binary: Binary {
             shipped: &shipped,
             program: "entered".to_string(),

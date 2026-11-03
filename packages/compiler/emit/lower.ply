@@ -1,4 +1,3 @@
-import std.list (zip)
 import compiler.emit.code (Code, read_name, CodeLiteral, CodeVariable, NDefinition, NConstructor,
                            NBuiltin, CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeLabel, CodeLambda, CodeSimulate,
@@ -289,6 +288,14 @@ type SlotRead = { slot: Int, at: Span, arg: Arg }
 
 type Operands = { state: Lowering, args: List<Arg>, read: List<SlotRead> }
 
+type Operand = { state: Lowering, arg: Arg, read: Option<SlotRead> }
+
+type FieldOperands = {
+  state: Lowering,
+  fields: List<{ name: Bytes, arg: Arg }>,
+  read: List<SlotRead>,
+}
+
 fn slot_read(
   context: Context,
   state: Lowering,
@@ -343,25 +350,47 @@ fn list_view_slot(state: Lowering, c: Code) -> Option<{ slot: Int, arg: Arg }> =
     _ -> None,
   }
 
+fn operand_lowered(
+  context: Context,
+  state: Lowering,
+  x: Code,
+  views: Bool,
+) -> Operand / {EmitReads} =
+  match slot_read(context, state, x, views) {
+    Some(r) -> { state: r.st, arg: r.read.arg, read: Some(r.read) },
+    None -> {
+      let o = lowered(context, state, x, false);
+      { state: o.st, arg: o.arg, read: None }
+    },
+  }
+
+fn read_kept(read: List<SlotRead>, operand: Operand) -> List<SlotRead> =
+  match operand.read { Some(r) -> read.push(r), None -> read }
+
 fn operands_lowered(
   context: Context,
   state: Lowering,
   codes: List<Code>,
   views: Bool,
 ) -> Operands / {EmitReads} =
-  codes.fold({ state: state, args: [], read: [] }, |accumulator: Operands, x: Code|
-    match slot_read(context, accumulator.state, x, views) {
-      Some(r) ->
-        {
-          state: r.st,
-          args: accumulator.args.push(r.read.arg),
-          read: accumulator.read.push(r.read),
-        },
-      None -> {
-        let o = lowered(context, accumulator.state, x, false);
-        { ..accumulator, state: o.st, args: accumulator.args.push(o.arg) }
-      },
-    })
+  codes.fold({ state: state, args: [], read: [] }, |accumulator: Operands, x: Code| {
+    let o = operand_lowered(context, accumulator.state, x, views);
+    { state: o.state, args: accumulator.args.push(o.arg), read: read_kept(accumulator.read, o) }
+  })
+
+fn fields_lowered(
+  context: Context,
+  state: Lowering,
+  fields: List<CodeField>,
+) -> FieldOperands / {EmitReads} =
+  fields.fold({ state: state, fields: [], read: [] }, |accumulator: FieldOperands, f: CodeField| {
+    let o = operand_lowered(context, accumulator.state, f.value, false);
+    {
+      state: o.state,
+      fields: accumulator.fields.push({ name: f.name, arg: o.arg }),
+      read: read_kept(accumulator.read, o),
+    }
+  })
 
 fn reads_noted(context: Context, state: Lowering, read: List<SlotRead>) -> Lowering =
   read.fold(state, |s: Lowering, r: SlotRead| note_slot_read(context, s, read_note, r.slot, r.at))
@@ -649,15 +678,8 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       list_literal(context, items.st, items.args, c.ty, c.span)
     },
     CodeRecord(r) -> {
-      let fs = operands_lowered(context, state, r.fields.map(|f: CodeField| f.value), false);
-      record_literal(
-        context,
-        reads_noted(context, fs.state, fs.read),
-        zip(r.fields, fs.args).map(|x: { first: CodeField, second: Arg }|
-          { name: x.first.name, arg: x.second }),
-        c.ty,
-        c.span,
-      )
+      let fs = fields_lowered(context, state, r.fields);
+      record_literal(context, reads_noted(context, fs.state, fs.read), fs.fields, c.ty, c.span)
     },
     CodeFieldRead(f) -> if !reads_column(context, f.base, f.field) {
       field(context, field_base_lowered(context, state, f.base, f.field), f.field, c.span)
@@ -691,19 +713,17 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
         _ -> unreachable(b"a record update has no base record"),
       };
       let held = holds_base(started.plan);
-      let sets = operands_lowered(
+      let sets = fields_lowered(
         context,
         if held { started.st } else { reads_noted(context, started.st, base.read) },
-        u.sets.map(|f: CodeField| f.value),
-        false,
+        u.sets,
       );
       update_finished(
         context,
         reads_noted(context, sets.state, if held { base.read.concat(sets.read) }
         else { sets.read }),
         started.plan,
-        zip(u.sets, sets.args).map(|x: { first: CodeField, second: Arg }|
-          { name: x.first.name, arg: x.second }),
+        sets.fields,
         c.ty,
         c.span,
       )

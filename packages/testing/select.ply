@@ -33,8 +33,6 @@ pub fn key_of(row: Row, s: Search) -> Bytes / {abort.raise} =
 
 pub fn keyed_per_root(row: Row, s: Search) -> Bool = row.seeded && per_root(s)
 
-pub type StoredResult = | Passing | Failing
-
 pub type Case = {
   index: Int,
   label: String,
@@ -44,14 +42,14 @@ pub type Case = {
   cache_key: Bytes,
   seeded: Bool,
   nondet: Bool,
-  cached: Option<StoredResult>,
+  stored_pass: Bool,
   pending_seeds: Option<List<Int>>,
 }
 
 pub fn case_of(
   row: Row,
   cache_key: Bytes,
-  cached: Option<StoredResult>,
+  stored_pass: Bool,
   pending_seeds: Option<List<Int>>,
 ) -> Case =
   {
@@ -63,11 +61,11 @@ pub fn case_of(
     cache_key: cache_key,
     seeded: row.seeded,
     nondet: row.nondet,
-    cached: cached,
+    stored_pass: stored_pass,
     pending_seeds: pending_seeds,
   }
 
-pub type Reason = | New | PreviousFailure | Cached | SameCode | Nondet
+pub type Reason = | New | Cached | SameCode | Nondet
 
 pub type Pass = { key: Bytes, trace: Bytes }
 
@@ -78,27 +76,16 @@ pub fn passed_before(r: Reason) -> Bool = match r { Cached -> true, SameCode -> 
 pub fn runs(d: Decision) -> Bool = !passed_before(d.reason)
 
 pub fn reason_of(c: Case) -> Reason =
-  if c.nondet { Nondet } else {
-    match c.cached {
-      None -> match c.pending_seeds {
-        Some(roots) -> if roots.len() == 0 { Cached } else { New },
-        None -> New,
-      },
-      Some(Passing) -> Cached,
-      Some(Failing) -> PreviousFailure,
-    }
-  }
+  if c.nondet { Nondet }
+  else if c.stored_pass || c.pending_seeds == Some([]) { Cached }
+  else { New }
 
 pub fn decide(cases: List<Case>) -> List<Decision> =
   cases.map(|c: Case| { case: c, reason: reason_of(c) })
 
-pub fn pending_roots(
-  roots: List<Int>,
-  cached_results: List<Option<StoredResult>>,
-) -> List<Int> / {abort.raise} =
-  range(0, roots.len()).filter(|i: Int| {
-    match cached_results.at(i) { Some(Some(Passing)) -> false, _ -> true }
-  }).map(|i: Int| roots.get(i))
+pub fn pending_roots(roots: List<Int>, stored_passes: List<Bool>) -> List<Int> / {abort.raise} =
+  range(0, roots.len()).filter(|i: Int| stored_passes.at(i) != Some(true)).map(|i: Int|
+    roots.get(i))
 
 pub fn seed_keys(
   test_hash: Bytes,
@@ -204,17 +191,11 @@ pub fn reused(decisions: List<Decision>) -> List<{ index: Int, outcome: String }
     else { accumulator })
 
 pub fn reason_word(r: Reason) -> String =
-  match r {
-    New -> "new",
-    PreviousFailure -> "previous failure",
-    Cached -> "cached",
-    SameCode -> "same code",
-    Nondet -> "nondet",
-  }
+  match r { New -> "new", Cached -> "cached", SameCode -> "same code", Nondet -> "nondet" }
 
 const a_hash: Bytes = b"\x07".repeat(32)
 
-fn a_case(index: Int, cached: Option<StoredResult>) -> Case =
+fn a_case(index: Int, stored_pass: Bool) -> Case =
   {
     index: index,
     label: "doubles",
@@ -224,7 +205,7 @@ fn a_case(index: Int, cached: Option<StoredResult>) -> Case =
     cache_key: a_hash,
     seeded: false,
     nondet: false,
-    cached: cached,
+    stored_pass: stored_pass,
     pending_seeds: None,
   }
 
@@ -239,7 +220,7 @@ const a_row: Row =
     nondet: false,
   }
 
-fn reason(index: Int, cached: Option<StoredResult>) -> Reason = reason_of(a_case(index, cached))
+fn reason(index: Int, stored_pass: Bool) -> Reason = reason_of(a_case(index, stored_pass))
 
 fn random(roots: Int) -> Search =
   {
@@ -255,19 +236,18 @@ const dpor: Search =
   { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [], profile: cc::development() }
 
 test "only a stored passing result makes a test skip running" {
-  assert_eq(reason(0, Some(Passing)), Cached);
-  assert_eq(reason(0, None), New);
-  assert_eq(reason(0, Some(Failing)), PreviousFailure)
+  assert_eq(reason(0, true), Cached);
+  assert_eq(reason(0, false), New)
 }
 
 const code_hash: Bytes = b"\x77".repeat(32)
 
-test "a new test reuses a stored pass for the same code, and runs again after a stored failure" {
+test "a new test reuses a stored pass for the same code, and a test with a stored pass of its own does not run" {
   let decisions = decide([
-    a_case(0, None),
-    a_case(1, Some(Failing)),
-    a_case(2, None),
-    { ..a_case(3, None), nondet: true },
+    a_case(0, false),
+    a_case(1, true),
+    a_case(2, false),
+    { ..a_case(3, false), nondet: true },
   ]);
   let codes = range(0, 4).fold(Map::new(), |m: Map<Int, Bytes>, i: Int| m.insert(i, code_hash));
   let keys = code_keys(decisions, codes, dpor);
@@ -278,47 +258,40 @@ test "a new test reuses a stored pass for the same code, and runs again after a 
     2,
   ]);
   let returned = by_code(decisions, Map::new().insert(0, b"read"), dpor);
-  assert_eq(returned.decisions.map(|d: Decision| d.reason), [
-    SameCode,
-    PreviousFailure,
-    New,
-    Nondet,
-  ]);
+  assert_eq(returned.decisions.map(|d: Decision| d.reason), [SameCode, Cached, New, Nondet]);
   assert_eq(returned.written_passes, [
     { key: result_key(a_hash, false, digest_of(dpor), dpor.profile), trace: b"read" },
   ]);
-  assert_eq(to_run(returned.decisions), [1, 2, 3]);
-  assert_eq(reused(returned.decisions), [{ index: 0, outcome: "passed" }])
+  assert_eq(to_run(returned.decisions), [2, 3]);
+  assert_eq(reused(returned.decisions), [
+    { index: 0, outcome: "passed" },
+    { index: 1, outcome: "passed" },
+  ])
 }
 
 test "a test run with random seeds gets a different cache key when its code or its `random` or `dpor` setting changes" {
-  let seeded = decide([{ ..a_case(0, None), seeded: true }]);
+  let seeded = decide([{ ..a_case(0, false), seeded: true }]);
   let codes = Map::new().insert(0, code_hash);
   assert(code_keys(seeded, codes, dpor) != code_keys(seeded, codes, random(4)), None);
-  assert(code_keys(seeded, codes, dpor) != code_keys(decide([a_case(0, None)]), codes, dpor), None)
+  assert(code_keys(seeded, codes, dpor) != code_keys(decide([a_case(0, false)]), codes, dpor), None)
 }
 
 test "a `test/nondet` test runs every time, because its effects can write" {
-  assert_eq(reason_of({ ..a_case(0, Some(Passing)), nondet: true }), Nondet);
-  let d = decide([{ ..a_case(0, Some(Passing)), nondet: true }, a_case(1, Some(Passing))]);
+  assert_eq(reason_of({ ..a_case(0, true), nondet: true }), Nondet);
+  let d = decide([{ ..a_case(0, true), nondet: true }, a_case(1, true)]);
   assert_eq(to_run(d), [0])
 }
 
 test "only a cached test is left out, and the run's list is in index order" {
-  let cases = [a_case(0, Some(Passing)), a_case(1, None), a_case(2, Some(Failing))];
+  let cases = [a_case(0, true), a_case(1, false), a_case(2, false)];
   let decisions = decide(cases);
-  assert_eq(decisions.map(|d: Decision| reason_word(d.reason)), [
-    "cached",
-    "new",
-    "previous failure",
-  ]);
+  assert_eq(decisions.map(|d: Decision| reason_word(d.reason)), ["cached", "new", "new"]);
   assert_eq(to_run(decisions), [1, 2]);
   assert_eq(reused(decisions), [{ index: 0, outcome: "passed" }])
 }
 
 test "`reason_word` returns the word the report prints for each reason a test runs or is skipped" {
   assert_eq(reason_word(New), "new");
-  assert_eq(reason_word(PreviousFailure), "previous failure");
   assert_eq(reason_word(Cached), "cached");
   assert_eq(reason_word(SameCode), "same code");
   assert_eq(reason_word(Nondet), "nondet")
@@ -346,7 +319,7 @@ test "`key_of` gives a randomly seeded test a key that depends on the search set
 }
 
 test "a randomly seeded test is cached when every seed already passed, and otherwise reruns only the seeds without a pass" {
-  let seeded = { ..a_case(0, None), seeded: true, pending_seeds: Some([]) };
+  let seeded = { ..a_case(0, false), seeded: true, pending_seeds: Some([]) };
   assert_eq(reason_of(seeded), Cached);
   let decisions = decide([seeded]);
   assert_eq(to_run(decisions), []);
@@ -357,31 +330,20 @@ test "a randomly seeded test is cached when every seed already passed, and other
   assert_eq(narrowed_searches(some, [0, 1, 2, 3]), [{ index: 0, roots: [2, 3] }]);
   let all = decide([{ ..seeded, pending_seeds: Some([0, 1, 2, 3]) }]);
   assert_eq(narrowed_searches(all, [0, 1, 2, 3]), []);
-  assert_eq(reason_of({ ..seeded, cached: Some(Failing) }), PreviousFailure);
-  assert_eq(reason_of({ ..seeded, cached: Some(Passing), pending_seeds: Some([1]) }), Cached)
+  assert_eq(reason_of({ ..seeded, stored_pass: true, pending_seeds: Some([1]) }), Cached)
 }
 
-test "a failing randomly seeded test with every seed already passed still runs again, using all seeds" {
-  let failing = decide([{ ..a_case(0, Some(Failing)), seeded: true, pending_seeds: Some([]) }]);
-  assert_eq(to_run(failing), [0]);
-  assert_eq(narrowed_searches(failing, [0, 1, 2, 3]), []);
-  assert_eq(roots_to_search(failing.get(0).case, [0, 1, 2, 3]), [0, 1, 2, 3])
-}
-
-test "`pending_roots` returns the seeds whose own cache key has no stored pass, including seeds with a stored failure" {
-  assert_eq(pending_roots([0, 1, 2, 3], [Some(Passing), None, Some(Failing), Some(Passing)]), [
-    1,
-    2,
-  ]);
+test "`pending_roots` returns the seeds whose own cache key has no stored pass" {
+  assert_eq(pending_roots([0, 1, 2, 3], [true, false, false, true]), [1, 2]);
   assert_eq(pending_roots([4, 5], []), [4, 5]);
   assert_eq(seed_keys(a_hash, [0, 1, 2], [], dpor.profile).len(), 3)
 }
 
 test "a passing test is stored under its code hash, and a rerun of some seeds also stores a key for each seed it ran" {
-  let hermetic = decide([a_case(0, None)]);
+  let hermetic = decide([a_case(0, false)]);
   assert_eq(pass_keys_by_test(hermetic, dpor), [{ index: 0, keys: [key_of(a_row, dpor)] }]);
-  assert_eq(pass_keys_by_test(decide([a_case(0, Some(Passing))]), dpor), []);
-  let seeded = { ..a_case(0, None), seeded: true, pending_seeds: Some([2, 3]) };
+  assert_eq(pass_keys_by_test(decide([a_case(0, true)]), dpor), []);
+  let seeded = { ..a_case(0, false), seeded: true, pending_seeds: Some([2, 3]) };
   let four = random(4);
   let keys = pass_keys_by_test(
     decide([{ ..seeded, cache_key: key_of({ ..a_row, seeded: true }, four) }]),

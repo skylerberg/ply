@@ -75,6 +75,7 @@ import compiler.check.infer.derivability (ContainsFunction, ContainsHandle, Unco
                                           ContainsSecret)
 import std.bytes
 import std.bytes (ascii_of_int)
+import std.list
 import std.list (zip)
 import std.option
 import compiler.prelude_source
@@ -95,7 +96,7 @@ import compiler.check.infer.checker (HoleSite, DeclaredAlias, DeclaredExtern, De
                                      GroupInstantiation, Signature, RigidParam, MapKeySite,
                                      ConstraintSite, SpecEnv, GroupDefinition, listing_type,
                                      CheckEvery, ReuseBodies, CheckOnly, ReusedBody, Checker,
-                                     Inference, WithType, WithTypes, WithSignature, BoundSignatures,
+                                     Inference, WithType, WithSignature, BoundSignatures,
                                      InferredBody, ClosedBody, TagRejection, GrowingArgument,
                                      NamedCallee, CheckedBody, ModuleFunctions, DeferredSites,
                                      InstanceFunctions, InstanceCalls, Count, Generalization,
@@ -1414,8 +1415,10 @@ fn ownership_errors(
       },
   );
   let resource = |t: Type| is_resource_type(checker, keep_variables, t);
-  let params = zip(definition.params, sig.params).map(|p: { first: Param, second: Type }|
-    { name: p.first.name.name, span: p.first.name.span, ty: p.second, keep: p.first.keep });
+  let params = params_with_types(definition.params, sig.params).map(
+    |p: { first: Param, second: Type }|
+      { name: p.first.name.name, span: p.first.name.span, ty: p.second, keep: p.first.keep },
+  );
   let j = check_body_ownership(
     check_keep_params(checker, definition, sig, resource),
     { resource: resource, owner: name },
@@ -3983,26 +3986,25 @@ fn check_law(
     current_definition: law_owner(parsed.name, definition.name),
     binders: item_binders(outer.resolved, outer.module, LawItem(definition)),
   };
-  let types: WithTypes = definition.binders.fold(
-    { checker: checker, types: [] },
-    |accumulator: { checker: Checker, types: List<Type> }, b: Binder| {
+  let types = definition.binders.fold(
+    { checker: checker, typed: [] },
+    |accumulator: { checker: Checker, typed: List<{ binder: Binder, ty: Type }> }, b: Binder| {
       let o: WithType = if definition.of != None { new_type(accumulator.checker) }
       else { law_binder(accumulator.checker, b) };
-      { checker: o.checker, types: accumulator.types.push(o.ty) }
+      { checker: o.checker, typed: accumulator.typed.push({ binder: b, ty: o.ty }) }
     },
   );
+  let typed = types.typed;
   let c1: Checker = { ..types.checker, auto_type_params: false };
   let sorts = c1.type_params.fold([], |accumulator: List<Int>, k: Bytes, ty: Type|
     match ty { VariableType(v) -> accumulator.push(v), _ -> accumulator });
   let rigid: Checker = sorts.fold(c1, |c: Checker, v: Int|
     { ..c, substitution: mark_rigid_type(c.substitution, v) });
   let pushed: Checker = { ..rigid, env: env_push(rigid.env) };
-  let bound: Checker = range(0, definition.binders.len()).fold(pushed, |c: Checker, i: Int|
-    { ..c, env: env_bind(c.env, definition.binders.get(i).name, monomorphic(types.types.get(i))) });
-  let binders_typed = zip(definition.binders, types.types).map(
-    |b: { first: Binder, second: Type }|
-      { name: b.first.name.name, ty: b.second, span: b.first.name.span },
-  );
+  let bound: Checker = typed.fold(pushed, |c: Checker, t: { binder: Binder, ty: Type }|
+    { ..c, env: env_bind(c.env, t.binder.name, monomorphic(t.ty)) });
+  let binders_typed = typed.map(|t: { binder: Binder, ty: Type }|
+    { name: t.binder.name.name, ty: t.ty, span: t.binder.name.span });
   let guarded: Checker = match definition.guard {
     Some(g) -> {
       let walked: Inference = infer_whole({ ..bound, performs: [] }, g);
@@ -4075,7 +4077,7 @@ fn check_law(
     None -> closed,
     Some(u) -> if closed.diagnostics.len() != outer.diagnostics.len() { closed } else {
       range(0, definition.binders.len()).fold(closed, |c: Checker, i: Int|
-        instantiable(c, u, shown(i), resolve(c, types.types.get(i))))
+        instantiable(c, u, shown(i), resolve(c, typed.get(i).ty)))
     },
   };
   let identified: IdentityVariables = match definition.of {
@@ -4091,7 +4093,7 @@ fn check_law(
   let binders = range(0, definition.binders.len()).map(|i: Int|
     {
       name: shown(i),
-      ty: resolve(identified.checker, types.types.get(i)),
+      ty: resolve(identified.checker, typed.get(i).ty),
       span: definition.binders.get(i).span,
     });
   let last: Checker = identified.checker;
@@ -4824,8 +4826,20 @@ fn spec_scope(
     })
 }
 
-fn params_typed_as(params: List<Param>, types: List<Type>) -> List<TypedParam<Type>> =
-  zip(params, types).map(|p: { first: Param, second: Type }|
+fn params_with_types(
+  params: List<Param>,
+  types: List<Type>,
+) -> List<{ first: Param, second: Type }> / {abort.raise} =
+  match params.zip_strict(types) {
+    Some(pairs) -> pairs,
+    None -> panic("a signature has a different number of parameters than its definition"),
+  }
+
+fn params_typed_as(
+  params: List<Param>,
+  types: List<Type>,
+) -> List<TypedParam<Type>> / {abort.raise} =
+  params_with_types(params, types).map(|p: { first: Param, second: Type }|
     { name: p.first.name.name, ty: p.second, span: p.first.name.span })
 
 fn check_measure(
