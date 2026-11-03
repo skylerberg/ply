@@ -16,7 +16,7 @@ import compiler.store.memo.store (Dependency, ExternalInput, FactDetails, Querie
                                   lowest_waiting, memo_store, nothing_left_waiting, nothing_waiting,
                                   parts_digest, queries_id, session_input, session_inputs,
                                   stored_fact_bin, stored_input_bin, trusted_pack_id, with_mark,
-                                  with_session_inputs, without_mark)
+                                  with_mark_moved, with_session_inputs, without_mark)
 import compiler.store.memo.engine (in_session_of)
 import compiler.store.packs
 import compiler.store.segments
@@ -281,6 +281,7 @@ fn over_database<a, [r] | e>(
         else { { ..o, transient: o.transient.insert(digest, output) } });
       st = {
         ..stored,
+        waiting: with_mark_moved(stored.waiting, key, fact.depth),
         db: fact_store::with_value(
           fact_store::with_result[r](stored.db, fact.details, encoded_details),
           Facts,
@@ -288,6 +289,23 @@ fn over_database<a, [r] | e>(
           bin::encode(fact, stored_fact_bin()),
         ),
       };
+    },
+    memo_store.deepen(key, depth) -> match fact_store::value_of[r](st.db, Facts, key) {
+      None -> (),
+      Some(b) -> {
+        let fact = undecoded(b, stored_fact_bin());
+        let deeper = max(fact.depth, depth);
+        st = {
+          ..st,
+          waiting: with_mark_moved(st.waiting, key, deeper),
+          db: fact_store::with_value(
+            st.db,
+            Facts,
+            key,
+            bin::encode({ ..fact, depth: deeper }, stored_fact_bin()),
+          ),
+        };
+      },
     },
     memo_store.keep_output(digest, output, lasting) -> {
       st = if lasting { stored_output[r](st, digest, output) }
@@ -1356,6 +1374,82 @@ test "a fact that reads a stored fact which read it before gets that fact comput
   let after = fetched_in(q, reversed, b"a", b"x");
   assert_eq(after.output, b"b");
   same_facts(after, fetched_in(q, from_nothing(reversed), b"a", b"x"))
+}
+
+fn queries_named(queries: List<Query<| {}>>) -> Map<Bytes, Query<| {}>> =
+  queries.fold(Map::new(), |found: Map<Bytes, Query<| {}>>, q: Query<| {}>| found.insert(q.name, q))
+
+fn reading_query(name: Bytes, read: Bytes) -> Query<| {}> =
+  query(name, name, |input: Bytes| fetched_main(read, input))
+
+fn chain_of_three() -> List<Query<| {}>> =
+  [
+    query(b"one", b"one", |_: Bytes| b"a"),
+    reading_query(b"two", b"one"),
+    reading_query(b"three", b"two"),
+  ]
+
+fn reported(named: Map<Bytes, Query<| {}>>, w: TestWorld, name: Bytes) -> Bytes =
+  handle { fetched_in(named, w, name, b"x").output } with { abort.raise(m) -> Bytes::of_string(m) }
+
+fn deepening(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
+  let mode = read_file(b"a");
+  if mode == b"loop" { fetched_main(b"f", input) }
+  else if mode == b"deep" { fetched_main(b"three", input) }
+  else { b"a" }
+}
+
+test "a fact recorded again deeper with the same result makes its readers deeper, so a dependency an edit reverses through them is the cycle a build from nothing reports" {
+  let q = queries_named(
+    chain_of_three().concat([
+      query(b"a", b"a1", deepening),
+      reading_query(b"r", b"a"),
+      reading_query(b"f", b"r"),
+    ]),
+  );
+  let first = fetched_in(q, world_of([{ at: b"a", text: b"plain" }]), b"f", b"x");
+  assert_eq(first.output, b"a");
+  let deep = agreed(q, edited(first.world, b"a", b"deep"), b"f", b"x");
+  assert_eq(deep.output, b"a");
+  let looped = edited(deep.world, b"a", b"loop");
+  let cycle = reported(q, looped, b"f");
+  assert(cycle.index_of(b"in a cycle") != None);
+  assert_eq(cycle, reported(q, from_nothing(looped), b"f"))
+}
+
+fn first_product(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  if read_file(b"p") == b"loop" { fetched_main(b"w", input) } else { b"a" }
+
+fn rebuilt_product(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  fetched_main(if read_file(b"p") == b"loop" { b"w" } else { b"three" }, input)
+
+fn product_reading(
+  code: Bytes,
+  body: keep (Bytes) -> Bytes / {memo.read, abort.raise},
+) -> Map<Bytes, Query<| {}>> =
+  queries_named(
+    chain_of_three().concat([
+      { ..query(b"p", code, body), product: Some({ kind: b"p", after: [] }) },
+      reading_query(b"r", b"p"),
+      reading_query(b"w", b"r"),
+    ]),
+  )
+
+test "a product deleted for new code and computed again deeper makes its readers deeper, so a dependency an edit reverses through them is the cycle a build from nothing reports" {
+  let first = fetched_in(
+    product_reading(b"p1", first_product),
+    world_of([{ at: b"p", text: b"plain" }]),
+    b"w",
+    b"x",
+  );
+  assert_eq(first.output, b"a");
+  let q = product_reading(b"p2", rebuilt_product);
+  let rebuilt = agreed(q, first.world, b"p", b"x");
+  assert_eq(rebuilt.output, b"a");
+  let looped = edited(rebuilt.world, b"p", b"loop");
+  let cycle = reported(q, looped, b"p");
+  assert(cycle.index_of(b"in a cycle") != None);
+  assert_eq(cycle, reported(q, from_nothing(looped), b"p"))
 }
 
 fn entering_ring(input: Bytes) -> Bytes / {memo.read, abort.raise} = fetched_main(b"b", input)
