@@ -2352,8 +2352,9 @@ $ ply run app.plyx
 ```
 
 `ply build` writes a `.plyx` file that contains everything the program needs to run from an entry
-point (default `main`). The `.plyx` contains:  - the definitions the entry point uses, identified by
-hash and stored as source without tests, laws (properties the program states about its definitions)
+point (default `main`). The `.plyx` contains:  - the definitions the entry point uses, each
+identified by a hash of its text and of what it uses that leaves out every name, so a rename changes
+no hash, and stored as source without tests, laws (properties the program states about its definitions)
 or comments; - the compiled code of those definitions.  Running a `.plyx` checks nothing. The
 `.plyx` has a BLAKE3 digest of that content. An edit to a definition the program does not use is not
 part of the content, so the digest stays the same. A `.plyx` also contains the standard library

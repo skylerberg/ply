@@ -16,7 +16,7 @@ import project_store (InWorkingDirectory, AtAbsolutePath, Databases, databases)
 import compiler.store.database (database_in, open_database)
 import compiler.store.fact_store (Opening, recent_reads)
 import paths
-import paths (PathLabel, WorkingDirectory, Absolute)
+import paths (WorkingDirectory, Absolute)
 import store.tables
 import store.fake (run_in_memory)
 import testing.conclude (StoreUpdate, PassRecord)
@@ -26,7 +26,7 @@ import claims (proof_store, AcceptResult, ClaimsEntry)
 import std.env (env)
 import proof.obligation (ClaimSnapshot)
 import tester (result_cache, LastPass, ListingRequest, CasesListed, ListedCase, StartedTest,
-               listed_case_bin)
+               TestJournal, listed_case_bin)
 import sources
 import std.path (strip_root)
 import semantics (semantics)
@@ -248,9 +248,7 @@ derive bin for JournalMark
 derive bin for JournalRows
 derive bin for JournalEntry
 
-type Journal = { label: PathLabel, path: String, base: tables::Cache }
-
-fn journal_of(k: OpenStore) -> Journal =
+fn journal_of(k: OpenStore) -> TestJournal =
   { label: k.place.label, path: k.place.dir ++ "/test-journal", base: k.cache }
 
 fn header_of(stamps: tables::Stamps) -> JournalHeader =
@@ -290,12 +288,12 @@ fn recovery_of(entries: List<JournalEntry>, stamps: tables::Stamps) -> Recovery 
     _ -> { rows: [], interrupted: [] },
   }
 
-fn read_journal<[r]>(j: Journal) -> List<JournalEntry> / {fs.read[r], abort.raise} =
+fn read_journal<[r]>(j: TestJournal) -> List<JournalEntry> / {fs.read[r], abort.raise} =
   match fs.read_file[r](j.path) { Some(bytes) -> journal_entries(bytes), None -> [] }
 
 fn begun_journal<[r]>(
   k: OpenStore,
-  j: Journal,
+  j: TestJournal,
 ) -> { store: OpenStore, interrupted: List<StartedTest> } / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
   let found = recovery_of(read_journal[r](j), k.cache.stamps);
   let cache = if found.rows.len() == 0 { k.cache }
@@ -306,7 +304,7 @@ fn begun_journal<[r]>(
 }
 
 fn appended(
-  journal: Journal,
+  journal: TestJournal,
   entry: JournalEntry,
 ) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} = {
   let _ = match journal.label {
@@ -316,7 +314,7 @@ fn appended(
   ()
 }
 
-fn ended_journal(journal: Journal) -> Unit / {fs.write[cwd], fs.write[abs]} = {
+fn ended_journal(journal: TestJournal) -> Unit / {fs.write[cwd], fs.write[abs]} = {
   let _ = match journal.label {
     WorkingDirectory -> fs.remove[cwd](journal.path),
     Absolute -> fs.remove[abs](journal.path),
@@ -324,38 +322,47 @@ fn ended_journal(journal: Journal) -> Unit / {fs.write[cwd], fs.write[abs]} = {
   ()
 }
 
-fn finished_rows(journal: Journal, update: StoreUpdate) -> List<JournalRow> / {abort.raise} =
+fn finished_rows(journal: TestJournal, update: StoreUpdate) -> List<JournalRow> / {abort.raise} =
   tables::rows_written(journal.base, |c: tables::Cache| put_update(c, update, []))
 
 pub fn with_result_cache<a | e>(
   opened_store: OpenStore,
-  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.journal, result_cache.started, result_cache.finished | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} = {
   let begun = match opened_store.place.label {
     WorkingDirectory -> begun_journal[cwd](opened_store, journal_of(opened_store)),
     Absolute -> begun_journal[abs](opened_store, journal_of(opened_store)),
   };
   let journal = journal_of(begun.store);
-  let result = journaled(begun.store, begun.interrupted, journal, go);
+  let result = appending_journal(|| journaled(begun.store, begun.interrupted, journal, go));
   ended_journal(journal);
   result
 }
 
+fn appending_journal<a | e>(
+  go: () -> a / {result_cache.started, result_cache.finished | e},
+) -> a / {fs.write[cwd], fs.write[abs], abort.raise | e} =
+  handle {
+    go()
+  } with {
+    result_cache.started(at, running) ->
+      appended(at, Started({ key: running.key, hash: running.hash })),
+    result_cache.finished(at, key, update) ->
+      appended(at, Finished({ key: key, rows: finished_rows(at, update) })),
+  }
+
 fn journaled<a | e>(
   opened_store: OpenStore,
   interrupted: List<StartedTest>,
-  journal: Journal,
-  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} =
+  journal: TestJournal,
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.journal, result_cache.started, result_cache.finished | e},
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, result_cache.started, result_cache.finished | e} =
   handle {
     go()
   } with {
     var store_state = opened_store,
     result_cache.interrupted() -> interrupted,
-    result_cache.started(running) ->
-      appended(journal, Started({ key: running.key, hash: running.hash })),
-    result_cache.finished(key, update) ->
-      appended(journal, Finished({ key: key, rows: finished_rows(journal, update) })),
+    result_cache.journal() -> journal,
     result_cache.open_warnings() -> {
       let warnings = cache_warnings(store_state.cache);
       store_state = without_warnings(store_state);
@@ -591,6 +598,7 @@ fn defined(name: Bytes, uses: List<NodeRef>) -> DefinitionHash =
     clause_uses: [],
     contract_uses: [],
     transparent: false,
+    shapes: { body: blake3(name), text: no_form, clauses: [], contract: blake3(name) },
   }
 
 const a_module: ModuleHashes = {
@@ -600,6 +608,7 @@ const a_module: ModuleHashes = {
       {
         key: b"m.t",
         hash: hashed("t"),
+        shape: hashed("t"),
         body: no_form,
         uses: [{ name: b"m.f", kind: HeldValue }],
         listing: None,

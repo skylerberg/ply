@@ -2328,6 +2328,13 @@ pub fn sum_shapes(constructors: List<ConstructorInfo>) -> Shapes =
 pub fn compares_through_key(deriver: Deriver) -> Bool =
   deriver == EqDeriver || deriver == OrderingDeriver || deriver == HashDeriver
 
+pub type ShapeView = | PlainShapes | ComparedShapes | ShownShapes
+
+pub fn view_of(deriver: Deriver) -> ShapeView =
+  if compares_through_key(deriver) { ComparedShapes }
+  else if deriver == ShowDeriver { ShownShapes }
+  else { PlainShapes }
+
 fn instances_by_type(
   instances: List<InstanceInfo>,
   kind: InstanceKind,
@@ -2356,16 +2363,18 @@ pub fn instance_shapes(instances: List<InstanceInfo>, adts: Shapes, deriver: Der
   }
 
 fn shape_named(
-  deriver: Deriver,
+  view: ShapeView,
   adts: Shapes,
   name: Bytes,
 ) -> Option<AlgebraicShape> / {elsewhere.read} =
   match find_adt(adts, name) {
     Some(a) -> Some(a),
     None -> match elsewhere.look_up_type(name) {
-      Some(f) -> if compares_through_key(deriver) { f.compared }
-      else if deriver == ShowDeriver { f.shown }
-      else { f.shape },
+      Some(f) -> match view {
+        ComparedShapes -> f.compared,
+        ShownShapes -> f.shown,
+        PlainShapes -> f.shape,
+      },
       None -> None,
     },
   }
@@ -2378,10 +2387,20 @@ pub fn derivable(
   adts: Shapes,
   assumed: List<Int>,
 ) -> Option<Blocker> / {abort.raise, elsewhere.read} =
-  derivable_within(deriver, ty, adts, assumed, [], most_types_on_a_path)
+  derivable_seen(deriver, view_of(deriver), ty, adts, assumed)
+
+pub fn derivable_seen(
+  deriver: Deriver,
+  view: ShapeView,
+  ty: Type,
+  adts: Shapes,
+  assumed: List<Int>,
+) -> Option<Blocker> / {abort.raise, elsewhere.read} =
+  derivable_within(deriver, view, ty, adts, assumed, [], most_types_on_a_path)
 
 fn first_blocked(
   deriver: Deriver,
+  view: ShapeView,
   types: List<Type>,
   adts: Shapes,
   assumed: List<Int>,
@@ -2391,11 +2410,12 @@ fn first_blocked(
   types.fold(None, |accumulator: Option<Blocker>, ty: Type|
     match accumulator {
       Some(_) -> accumulator,
-      None -> derivable_within(deriver, ty, adts, assumed, visiting, room),
+      None -> derivable_within(deriver, view, ty, adts, assumed, visiting, room),
     })
 
 fn derivable_within(
   deriver: Deriver,
+  view: ShapeView,
   ty: Type,
   adts: Shapes,
   assumed: List<Int>,
@@ -2407,20 +2427,21 @@ fn derivable_within(
     else { Some({ ty: ty, reason: Unconstrained(v) }) },
     FunctionType(_) -> Some({ ty: ty, reason: ContainsFunction }),
     RecordType(fs) ->
-      first_blocked(deriver, fs.map(|f: Field| f.ty), adts, assumed, visiting, room),
+      first_blocked(deriver, view, fs.map(|f: Field| f.ty), adts, assumed, visiting, room),
     NominalType(n) ->
-      first_blocked(deriver, n.fields.map(|f: Field| f.ty), adts, assumed, visiting, room),
+      first_blocked(deriver, view, n.fields.map(|f: Field| f.ty), adts, assumed, visiting, room),
     NamedType(c) -> match constructor_shape(deriver, c.name) {
       Leaf -> None,
       Rejected(reason) -> Some({ ty: ty, reason: reason }),
-      Structural -> first_blocked(deriver, c.args, adts, assumed, visiting, room),
+      Structural -> first_blocked(deriver, view, c.args, adts, assumed, visiting, room),
       Nominal -> if visiting.contains(c.name) { None } else {
-        match shape_named(deriver, adts, c.name) {
+        match shape_named(view, adts, c.name) {
           None -> None,
           Some(adt) -> if adt.native { Some({ ty: ty, reason: ContainsNative }) }
           else if room <= 0 { panic("the search visited a type more than once on one path") } else {
             first_blocked(
               deriver,
+              view,
               adt.fields.map(|f: Type| apply_arguments(f, adt.params, adt.effect_params, c.args)),
               adts,
               assumed,
@@ -2460,7 +2481,7 @@ fn native_fields(t: Type, adts: Shapes) -> { value: Bool, next: List<Type> } / {
     RecordType(fs) -> { value: false, next: fs.map(|f: Field| f.ty) },
     NominalType(n) -> { value: false, next: n.fields.map(|f: Field| f.ty) },
     NamedType(c) -> match constructor_shape(EqDeriver, c.name) {
-      Nominal -> match shape_named(EqDeriver, adts, c.name) {
+      Nominal -> match shape_named(ComparedShapes, adts, c.name) {
         Some(adt) ->
           {
             value: adt.native,
