@@ -1,7 +1,7 @@
 import compiler.front.checking (FileAt, analysed_over)
 import compiler.front.checking.unit_programs (value_fixture, compiled_program)
 import compiler.check.infer.checker (decode_facts, RecordedFacts, BodyRecord, RecordedHere,
-                                     CheckedElsewhere)
+                                     CheckedElsewhere, ConstructorInfo, builtin_constructors)
 import compiler.emit.print.lists (item_function)
 import compiler.emit.print.probe (probed_fn, probed_helper)
 import compiler.check.resolve.tables (Source, qualify)
@@ -33,11 +33,11 @@ import compiler.emit.keys (printed, RootKey, Named, Generated, Clause, ClauseKin
                            Lift, Lower, RootName, specialisation_key, root_name, root_text,
                            module_of, test_key)
 import compiler.emit.output (DefinitionSymbol, ExpectedPrototype, CallAt, GenericAt, SharedFunction,
-                             callee_name, Prototype, word_prototype, GenericCall, Scalar,
-                             no_generics, Tables, no_tables, EmittedRoot, RootOutput,
-                             PublishedSignature, Output)
+                             callee_name, Prototype, word_prototype, GenericCall, no_generics,
+                             Tables, no_tables, EmittedRoot, RootOutput, PublishedSignature, Output)
 import compiler.emit.statics (BytesDatum, EmbeddedDatum, statics_of)
-import compiler.emit.representations (SumConstructor, constructor_sums, at_args, has_variables)
+import compiler.emit.representations (SumConstructor, constructor_sums, at_args, has_variables,
+                                      sum_constructor)
 import compiler.front.facts (Analysis)
 import compiler.emit.emit_harness (program_of, lowered_root)
 import compiler.emit.lower.module_context (Root)
@@ -655,7 +655,7 @@ test "when a lambda is passed to a function that calls it, the specialised funct
 test "a specialisation that stores its lambda argument in a closure passes that same lambda on to the function the closure calls" {
   let source = Bytes::concat_all([
     b"fn each(f: (Int) -> Int, x: Int) -> Int = f(x)\n",
-    b"fn later(f: keep (Int) -> Int) -> List<() -> Int> = [|| each(f, 1)]\n",
+    b"fn later(f: keep (Int) -> Int) -> List<() -> Int> = if f(0) > 0 { [|| each(f, 1)] } else { [] }\n",
     b"fn scaled(k: Int) -> List<() -> Int> = later(|x: Int| x * k)\n",
   ]);
   let borrowed = [{ param: 0, owner: Named(b"m.scaled"), nth: 0 }];
@@ -1570,14 +1570,17 @@ test "a generic sum's constructor fields get their concrete types by substitutin
   let d = dump_of(analysed_over(zip_sources([b"m"], [b"type P<a, b> = | L(a) | R(b, a) | N\n"])));
   let int = int_type;
   let text = string_type;
-  let at = |name: Bytes|
-    match constructor_sums(d.constructors).get(name) {
-      Some(cs) ->
-        cs.map(|c: SumConstructor| c.fields.map(|f: Type| at_args(f, c.params, [int, text]))),
-      None -> [],
-    };
-  assert_eq(at(b"Result"), [[int], [text]]);
-  assert_eq(at(b"m.P"), [[int], [text, int], []])
+  let substituted = |cs: List<SumConstructor>|
+    cs.map(|c: SumConstructor| c.fields.map(|f: Type| at_args(f, c.params, [int, text])));
+  let builtin = builtin_constructors().filter(|c: ConstructorInfo|
+    c.type_name == b"Result").sort_by(|a: ConstructorInfo, b: ConstructorInfo|
+    a.index <= b.index).map(|c: ConstructorInfo|
+    sum_constructor(c.name, c.index, c.scheme, c.fields));
+  assert_eq(substituted(builtin), [[int], [text]]);
+  assert_eq(
+    match constructor_sums(d.constructors).get(b"m.P") { Some(cs) -> substituted(cs), None -> [] },
+    [[int], [text, int], []],
+  )
 }
 
 test "`reflect` converts a scalar to a `std.value` constructor such as `VInt`, and converts a sum or record with a generated function" {
@@ -2682,7 +2685,7 @@ test "a byte returned by `byte_of_int` is a preallocated single-byte value, so a
 }
 
 test "the generated lower and lift functions for a type, which the runtime calls through the type's function table, check the stack depth" {
-  let pair = NamedType({ name: b"P", args: [] });
+  let pair = RecordType([{ name: b"a", ty: bytes_type }, { name: b"n", ty: int_type }]);
   let worded = [keys::OnWordForm(Lower), keys::OnWordForm(Lift)].fold(
     [],
     |accumulator: List<RootKey>, operation: TypeOperation|
@@ -3464,7 +3467,7 @@ test "a generic definition used at a type that is not a single machine word is e
       effect_evidence: [],
     },
   ]);
-  assert(body(b"m.twice").tables.generics.needs.contains({ var: 0, reads: Scalar }), None);
+  assert(!emits(results, Named(b"m.twice")), None);
   assert_eq(body(b"m.id").tables.generics.needs, []);
   assert(body(b"m.id").text.len() > 0, None);
   assert(has(b"m.twice@Float", b"double "));
@@ -3530,10 +3533,16 @@ test "a contract's clauses read the parameters, and an `ensures` the result, at 
     clause(b"m.kept", Requires, 0),
     clause(b"m.kept", Ensures, 0),
   ];
-  let wanted = keyed.map(root_name);
   let results = outputs_at([b"m"], [source], keyed);
-  assert_eq(results.fold([], |accumulator: List<Bytes>, r: RootOutput| { accumulator }), []);
-  assert_eq(wanted.filter(|w: RootName| !results.any(|r: RootOutput| r.name == w)), [])
+  let emitted = |name: Bytes| results.any(|r: RootOutput| output_name(r) == name);
+  assert_eq(
+    [b"m.adjusted#requires#0", b"m.adjusted#ensures#0", b"m.adjusted#ensures#1"].filter(
+      |n: Bytes| !emitted(n),
+    ),
+    [],
+  );
+  assert_eq([b"m.kept#requires#0", b"m.kept#ensures#0"].filter(emitted), []);
+  assert_eq([b"m.kept@Int#requires#0", b"m.kept@Int#ensures#0"].filter(|n: Bytes| !emitted(n)), [])
 }
 
 test "a call inside a mutually recursive group names its callee in the caller's type variables, although each function numbers its type variables separately" {
@@ -4228,16 +4237,22 @@ test "a specialisation borrows and returns values the same way its generic defin
     b"fn err_or<a>(r: Result<a, String>, d: String) -> String = match r { Err(e) -> e, Ok(_) -> d }\n",
     b"fn either(r: Result<Int, String>) -> String = err_or(r, \"none\")\n",
   ]);
-  let keyed = [b"m.name_of", b"m.err_or", b"m.use_it", b"m.either"].map(Named).concat([
+  let generic = [b"m.name_of", b"m.err_or"].map(Named);
+  let keyed = [b"m.use_it", b"m.either"].map(Named).concat([
     specialised_at(b"m.name_of", [b"Int"]),
     specialised_at(b"m.err_or", [b"Int"]),
   ]);
-  let results = outputs_at([b"m"], [source], keyed);
+  let results = outputs_at([b"m"], [source], generic.concat(keyed));
   assert_eq(keyed.filter(|k: RootKey| !emits(results, k)), []);
+  assert_eq(generic.filter(|k: RootKey| emits(results, k)), []);
   let borrowed = |name: Bytes|
     results.fold([], |accumulator: List<PublishedSignature>, a: RootOutput|
-      if output_name(a) != name { accumulator }
-      else { accumulator.concat(a.result.tables.handings) });
+      if !output_name(a).starts_with(name.concat(b"@")) { accumulator } else {
+        accumulator.concat(
+          a.result.tables.assumed.filter(|p: PublishedSignature|
+            p.definition == root_name(Named(name))),
+        )
+      });
   assert_eq(borrowed(b"m.name_of"), [published_signature(b"m.name_of", [true])]);
   assert_eq(borrowed(b"m.err_or"), [
     {
