@@ -35,17 +35,19 @@ import compiler.front.checking.world (ModuleKey, InterfaceKey, QueryEffects, Ses
                                       interface_key_bin, module_key_bin, own_modules_kind,
                                       package_location_of, shipped_for, CheckDefinition,
                                       cost_products, measure_products)
-import compiler.front.checking.groups (GroupKey, GroupSource, OwnerFacts, OwnerKey, OwnersResult,
+import compiler.front.checking.groups (UnitKey, GroupSource, OwnerFacts, OwnerKey, OwnersResult,
                                        from_groups, with_performed_effects, known_of_types,
-                                       declared_of, group_key_bin, layout_of, placed_facts,
-                                       group_keys, no_bodies, owner_facts, owner_hash_query,
-                                       owner_key_bin, owners_result_of, with_group_read, GroupRead,
-                                       module_owners, unit_key_of, group_key_of, group_of,
-                                       group_hashes_of, GroupDeclarations, stored_declarations_of,
-                                       context_once)
+                                       declared_of, unit_key_bin, check_group_key_bin, layout_of,
+                                       placed_facts, group_keys, no_bodies, owner_facts,
+                                       owner_hash_query, owner_key_bin, owners_result_of,
+                                       with_group_read, GroupRead, module_owners, unit_key_of,
+                                       group_key_of, group_of, group_hashes_of, GroupDeclarations,
+                                       stored_declarations_of, context_once, GroupOutput,
+                                       CurrentGroup, ObsoleteGroup, group_output_bin,
+                                       current_output, is_current_unit, module_key_of)
 
-pub fn cost_walk_query() -> QueryOf<GroupKey, GroupWalk> =
-  { name: b"cost walk", input: group_key_bin(), output: group_walk_bin() }
+pub fn cost_walk_query() -> QueryOf<UnitKey, GroupOutput<GroupWalk>> =
+  { name: b"cost walk", input: unit_key_bin(), output: group_output_bin(group_walk_bin()) }
 
 pub fn cost_return_query() -> QueryOf<InterfaceKey, ReturnOwnership> =
   { name: b"cost return", input: interface_key_bin(), output: return_ownership_bin() }
@@ -78,13 +80,17 @@ fn root_modules() -> List<Bytes> / {memo.read, abort.raise} =
     in_root,
   )
 
-fn module_of_unit(u: GroupKey) -> ModuleKey =
+type LoadedOwners = { named: ModuleKey, owners: List<Bytes> }
+
+fn module_of_unit(u: UnitKey) -> ModuleKey =
   { module: u.module, shipped: u.shipped, tested: u.tested }
+
+fn loaded_unit(u: UnitKey) -> LoadedOwners = { named: module_of_unit(u), owners: u.owners }
 
 fn root_module(module: Bytes) -> ModuleKey = { module: module, shipped: false, tested: false }
 
-fn owner_at(u: GroupKey, owner: Bytes) -> OwnerKey =
-  { module: u.module, shipped: u.shipped, tested: u.tested, owner: owner }
+fn owner_at(named: ModuleKey, owner: Bytes) -> OwnerKey =
+  { module: named.module, shipped: named.shipped, tested: named.tested, owner: owner }
 
 fn functions_of(read: OwnersResult, wanted: (OutlineItem) -> Bool) -> Set<Bytes> =
   read.shape.outline.items.fold(Set::empty(), |found: Set<Bytes>, item: OutlineItem|
@@ -106,22 +112,22 @@ fn measured_function(item: OutlineItem) -> Bool =
 
 fn is_test_or_law(owner: Bytes) -> Bool = owner.starts_with(b"test ") || owner.starts_with(b"law ")
 
-fn walked_units(named: ModuleKey, read: OwnersResult) -> List<GroupKey> / {memo.read, abort.raise} = {
+fn walked_units(named: ModuleKey, read: OwnersResult) -> List<UnitKey> / {memo.read, abort.raise} = {
   let bodied = functions_of(read, any_function);
-  group_keys(named).filter(|u: GroupKey|
+  group_keys(named).filter(|u: UnitKey|
     u.owners.any(|o: Bytes| bodied.contains(o) || is_test_or_law(o)))
 }
 
-fn unit_members(u: GroupKey) -> List<OwnerFacts> / {memo.read, abort.raise} =
-  u.owners.map(|o: Bytes| owner_facts(module_of_unit(u), o))
+fn unit_members(u: LoadedOwners) -> List<OwnerFacts> / {memo.read, abort.raise} =
+  u.owners.map(|o: Bytes| owner_facts(u.named, o))
 
 fn imports_for_unit(
-  u: GroupKey,
+  u: LoadedOwners,
   members: List<OwnerFacts>,
 ) -> List<Imported> / {SessionReads, abort.raise} = {
-  let context = context_once(module_of_unit(u));
+  let context = context_once(u.named);
   group_imports(
-    u.module,
+    u.named.module,
     members.map(|f: OwnerFacts| f.text),
     members.fold([], |accumulator: List<Mention>, f: OwnerFacts| accumulator.concat(f.mentions)),
     context.imports,
@@ -148,11 +154,15 @@ fn returned_by(name: Bytes) -> ReturnOwnership / {memo.read, abort.raise} = {
   fetch(cost_return_query(), { module: m.module, shipped: false, full_text: false, name: m.name })
 }
 
-pub fn cost_walk_result(u: GroupKey) -> Written / {QueryEffects, abort.raise} = {
-  let read = stored_analysis([u]);
+pub fn cost_walk_result(u: UnitKey) -> Written / {QueryEffects, abort.raise} =
+  written(cost_walk_query(), if !is_current_unit(u) { ObsoleteGroup }
+  else { CurrentGroup(walked_unit(u)) })
+
+fn walked_unit(u: UnitKey) -> GroupWalk / {QueryEffects, abort.raise} = {
+  let read = stored_analysis([loaded_unit(u)]);
   let source = read.loaded.get(0);
   let unwalked = |reason: Bytes| { unfinished: [reason], bodies: [], declared: [] };
-  written(cost_walk_query(), match read.outcome {
+  match read.outcome {
     Rejected(diagnostics) ->
       unwalked(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"; ")),
     Analysed(w) -> handle {
@@ -169,10 +179,11 @@ pub fn cost_walk_result(u: GroupKey) -> Written / {QueryEffects, abort.raise} = 
     } with {
       lowering.fail(reason) -> unwalked(reason),
     },
-  })
+  }
 }
 
-fn walk_of(u: GroupKey) -> GroupWalk / {memo.read, abort.raise} = fetch(cost_walk_query(), u)
+fn walk_of(u: UnitKey) -> GroupWalk / {memo.read, abort.raise} =
+  current_output(cost_walk_query(), u)
 
 pub fn cost_return_result(key: InterfaceKey) -> Written / {memo.read, abort.raise} = {
   let definition = qualify(key.module, key.name);
@@ -232,7 +243,7 @@ pub fn module_costs_result(named: ModuleKey) -> Written / {memo.read, abort.rais
   written(
     module_costs_query(),
     module_costs(
-      walked_units(named, read).map(|u: GroupKey|
+      walked_units(named, read).map(|u: UnitKey|
         { items: item_layout(u.owners.map(text_of)), walk: walk_of(u) }),
       fetch(module_parameters_query(), named),
     ),
@@ -271,23 +282,24 @@ fn bodies_reached(start: List<OwnerKey>) -> Map<Bytes, OwnerKey> / {memo.read, a
   }).fold(Map::new(), |found: Map<Bytes, OwnerKey>, v: Visit<OwnerKey, Bool>|
     if v.value { found.insert(body_key(v.key), v.key) } else { found })
 
-fn groups_reached(u: GroupKey) -> List<GroupKey> / {memo.read, abort.raise} = {
-  let by_module = bodies_reached(u.owners.map(|o: Bytes| owner_at(u, o))).values().fold(
-    Map::new(),
-    |found: Map<Bytes, GroupKey>, o: OwnerKey|
-      found.insert(o.module, match found.get(o.module) {
-        Some(g) -> { ..g, owners: g.owners.push(o.owner) },
-        None -> { module: o.module, shipped: o.shipped, tested: o.tested, owners: [o.owner] },
-      }),
-  );
-  [match by_module.get(u.module) { Some(g) -> g, None -> u }].concat(
-    by_module.values().filter(|g: GroupKey| g.module != u.module),
+fn with_loaded_owner(found: Map<Bytes, LoadedOwners>, o: OwnerKey) -> Map<Bytes, LoadedOwners> =
+  found.insert(o.module, match found.get(o.module) {
+    Some(g) -> { ..g, owners: g.owners.push(o.owner) },
+    None -> { named: module_key_of(o), owners: [o.owner] },
+  })
+
+fn groups_reached(u: UnitKey) -> List<LoadedOwners> / {memo.read, abort.raise} = {
+  let named = module_of_unit(u);
+  let reached = bodies_reached(u.owners.map(|o: Bytes| owner_at(named, o)));
+  let by_module = reached.values().fold(Map::new(), with_loaded_owner);
+  [match by_module.get(u.module) { Some(g) -> g, None -> loaded_unit(u) }].concat(
+    by_module.values().filter(|g: LoadedOwners| g.named.module != u.module),
   )
 }
 
-fn source_of_unit(u: GroupKey) -> GroupSource / {SessionReads, abort.raise} = {
+fn source_of_unit(u: LoadedOwners) -> GroupSource / {SessionReads, abort.raise} = {
   let members = unit_members(u);
-  { named: module_of_unit(u), members: members, imported: imports_for_unit(u, members) }
+  { named: u.named, members: members, imported: imports_for_unit(u, members) }
 }
 
 fn with_stored_tables(
@@ -360,21 +372,19 @@ type StoredTables = {
 fn with_stored_owner(
   found: StoredTables,
   module: Int,
-  u: GroupKey,
+  u: LoadedOwners,
   loaded: OwnerSource,
   owner: Bytes,
 ) -> StoredTables / {SessionReads, abort.raise} = {
-  let at = owner_at(u, owner);
+  let at = owner_at(u.named, owner);
   let checked_in = group_key_of(at);
   let unit = unit_key_of(at);
   let result = group_of(checked_in);
-  let stored = item_layout(
-    checked_in.owners.map(|o: Bytes| owner_facts(module_of_unit(u), o).text),
-  );
+  let stored = item_layout(checked_in.owners.map(|o: Bytes| owner_facts(u.named, o).text));
   let placed = laid_out(loaded.items, loaded.offset);
-  let seen = bin::encode(checked_in, group_key_bin());
+  let seen = bin::encode(checked_in, check_group_key_bin());
   let first = !found.seen.contains(seen);
-  let hashed = bin::encode(unit, group_key_bin());
+  let hashed = bin::encode(unit, unit_key_bin());
   {
     parts: found.parts.insert(
       module,
@@ -397,7 +407,7 @@ fn with_stored_owner(
 }
 
 fn stored_tables(
-  groups: List<GroupKey>,
+  groups: List<LoadedOwners>,
   loaded: List<OwnerSource>,
 ) -> StoredTables / {SessionReads, abort.raise} =
   range(0, groups.len()).fold(
@@ -414,7 +424,7 @@ fn stored_tables(
         with_stored_owner(f, i, groups.get(i), loaded.get(i), o)),
   )
 
-fn stored_analysis(groups: List<GroupKey>) -> GroupsAnalysed / {SessionReads, abort.raise} =
+fn stored_analysis(groups: List<LoadedOwners>) -> GroupsAnalysed / {SessionReads, abort.raise} =
   with_group_read(groups.map(source_of_unit), from_groups, no_bodies, [], |group: GroupRead| {
     let loaded = group.inputs.loaded.map(|l: LoadedSource| l.source);
     {
@@ -454,11 +464,10 @@ pub type ClaimsOutcome = | ClaimsRejected(List<Diagnostic>) | ClaimsAnalysed(Ana
 
 pub type ClaimsProgram = { outcome: ClaimsOutcome, placed: List<PlacedModule> }
 
-fn placed_module(g: GroupKey, offset: Int) -> PlacedModule / {memo.read, abort.raise} = {
-  let named = module_of_unit(g);
-  let facts = placed_facts(named, layout_of(named));
+fn placed_module(g: LoadedOwners, offset: Int) -> PlacedModule / {memo.read, abort.raise} = {
+  let facts = placed_facts(g.named, layout_of(g.named));
   {
-    module: g.module,
+    module: g.named.module,
     offset: offset,
     items: item_layout(
       g.owners.map(|o: Bytes|
@@ -470,22 +479,17 @@ fn placed_module(g: GroupKey, offset: Int) -> PlacedModule / {memo.read, abort.r
   }
 }
 
-type OpenedGroups = { groups: List<GroupKey>, others: List<GroupKey> }
+type OpenedGroups = { groups: List<LoadedOwners>, others: List<LoadedOwners> }
 
 fn opened_groups(open: List<ModuleKey>) -> OpenedGroups / {SessionReads, abort.raise} = {
-  let whole = open.map(|m: ModuleKey|
-    { module: m.module, shipped: m.shipped, tested: m.tested, owners: module_owners(m) });
+  let whole = open.map(|m: ModuleKey| { named: m, owners: module_owners(m) });
   let opened = open.fold(Set::empty(), |found: Set<Bytes>, m: ModuleKey| found.insert(m.module));
-  let others = bodies_reached(
-    whole.flat_map(|u: GroupKey| u.owners.map(|o: Bytes| owner_at(u, o))),
-  ).values(
-  ).filter(|o: OwnerKey| !opened.contains(o.module)).fold(
+  let reached = bodies_reached(
+    whole.flat_map(|u: LoadedOwners| u.owners.map(|o: Bytes| owner_at(u.named, o))),
+  );
+  let others = reached.values().filter(|o: OwnerKey| !opened.contains(o.module)).fold(
     Map::new(),
-    |found: Map<Bytes, GroupKey>, o: OwnerKey|
-      found.insert(o.module, match found.get(o.module) {
-        Some(g) -> { ..g, owners: g.owners.push(o.owner) },
-        None -> { module: o.module, shipped: o.shipped, tested: o.tested, owners: [o.owner] },
-      }),
+    with_loaded_owner,
   ).values(
   );
   { groups: whole.concat(others), others: others }
@@ -506,11 +510,7 @@ pub fn claims_analysed(open: List<ModuleKey>) -> ClaimsProgram / {SessionReads, 
           w,
           joined_identities(
             open.map(|m: ModuleKey| module_identities(m, |_: Identified| true)).concat(
-              opened.others.map(|g: GroupKey|
-                module_identities(
-                  { module: g.module, shipped: g.shipped, tested: g.tested },
-                  is_law,
-                )),
+              opened.others.map(|g: LoadedOwners| module_identities(g.named, is_law)),
             ),
           ),
         ),
@@ -523,18 +523,19 @@ pub fn claims_analysed(open: List<ModuleKey>) -> ClaimsProgram / {SessionReads, 
 fn is_law(subject: Identified) -> Bool =
   match subject { LawRun(_) -> true, LawProof(_) -> true, _ -> false }
 
-pub fn measure_program(u: GroupKey) -> MeasureProgram / {QueryEffects, abort.raise} = {
+pub fn measure_program(u: UnitKey) -> MeasureProgram / {QueryEffects, abort.raise} = {
   let groups = groups_reached(u);
   let analysed = stored_analysis(groups);
   {
     outcome: analysed.outcome,
     measured: measured_in(u, owners_result_of(module_of_unit(u))),
     offset: analysed.offset,
-    owned: groups.map(|g: GroupKey| g.module).filter(|m: Bytes| m == u.module || in_root(m)),
+    owned: groups.map(|g: LoadedOwners| g.named.module).filter(|m: Bytes|
+      m == u.module || in_root(m)),
   }
 }
 
-fn measured_in(u: GroupKey, read: OwnersResult) -> List<Bytes> =
+fn measured_in(u: UnitKey, read: OwnersResult) -> List<Bytes> =
   read.shape.outline.items.fold([], |found: List<Bytes>, item: OutlineItem|
     match item {
       OutlinedFunction(f) -> if !f.measured { found } else {
@@ -545,7 +546,7 @@ fn measured_in(u: GroupKey, read: OwnersResult) -> List<Bytes> =
       _ -> found,
     })
 
-pub type MeasureEntry = { unit: GroupKey, items: List<ItemAt> }
+pub type MeasureEntry = { unit: UnitKey, items: List<ItemAt> }
 
 derive bin for MeasureEntry
 
@@ -554,8 +555,8 @@ pub fn measures_result(named: ModuleKey) -> Written / {memo.read, abort.raise} =
   let measured = functions_of(read, measured_function);
   written(measures_query(), if measured.is_empty() { [] } else {
     let facts = placed_facts(named, layout_of(named));
-    group_keys(named).filter(|u: GroupKey| u.owners.any(|o: Bytes| measured.contains(o))).map(
-      |u: GroupKey|
+    group_keys(named).filter(|u: UnitKey| u.owners.any(|o: Bytes| measured.contains(o))).map(
+      |u: UnitKey|
         {
           unit: u,
           items: item_layout(
