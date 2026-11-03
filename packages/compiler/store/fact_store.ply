@@ -24,7 +24,7 @@ pub effect recent_reads {
   write lookups_in(name: Bytes) -> Int
 }
 
-pub type Tree = | Facts | Dependents | Inputs | Codes | Records
+pub type Tree = | Facts | Dependents | Inputs | Codes | Records | Cursors
 
 pub type LogEntry = { offset: Int, changes: List<Bytes> }
 
@@ -43,10 +43,9 @@ pub type Database = {
   writing: SegmentWriter,
   written_results: Map<Bytes, PayloadPlace>,
   log_floor: Int,
-  garbled: Bool,
 }
 
-const schema: Bytes = b"ply fact database 10".blake3()
+const schema: Bytes = b"ply fact database 11".blake3()
 
 type Table = | NodesTable | ChangesTable | SnapshotsTable | ResultsTable
 
@@ -68,7 +67,7 @@ fn row_place(row: Bytes, at: Int) -> PayloadPlace / {abort.raise} =
 const current_snapshot: Bytes = b"current snapshot".blake3()
 
 fn tree_number(tree: Tree) -> Int =
-  match tree { Facts -> 1, Dependents -> 3, Inputs -> 4, Codes -> 5, Records -> 6 }
+  match tree { Facts -> 1, Dependents -> 3, Inputs -> 4, Codes -> 5, Records -> 6, Cursors -> 7 }
 
 fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
@@ -205,64 +204,68 @@ fn fresh_database(dir: String, manifest: Manifest) -> Database =
     writing: segments::new_writer,
     written_results: Map::new(),
     log_floor: 0,
-    garbled: false,
   }
 
-pub fn emptied(db: Database) -> Database =
-  {
-    ..fresh_database(db.dir, db.manifest),
-    starts_over: true,
-    run: db.run,
-    token: db.token,
-    writing: db.writing,
-  }
+pub opaque type Opening = | Opening({ blank: Database, file: segments::ManifestFile })
+
+pub const unreadable_manifest: String = "its manifest does not read"
+
+pub fn emptied(opening: Opening) -> Database =
+  match opening { Opening(o) -> { ..o.blank, starts_over: true } }
 
 type StoredState = { roots: List<fact_tree::TreeChild>, log_end: Int }
 
 derive bin for StoredState
 
 fn with_stored_state<[r]>(
-  opened: Database,
-) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
-  handle {
-    match table_value[r](opened, SnapshotsTable, current_snapshot) {
-      None -> opened,
+  blank: Database,
+  file: segments::ManifestFile,
+) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match file {
+    segments::Garbled -> fact_damage.damaged(unreadable_manifest),
+    _ -> match table_value[r](blank, SnapshotsTable, current_snapshot) {
+      None -> blank,
       Some(bytes) -> {
         let state = decoded(bytes, stored_state_bin());
         {
-          ..opened,
+          ..blank,
           snapshot: state.roots.fold(Map::new(), |roots: Snapshot, child: fact_tree::TreeChild|
             roots.insert(child.slot, child.root)),
           log_end: state.log_end,
         }
       },
-    }
-  } with {
-    fact_damage.damaged(_) -> emptied(opened),
+    },
   }
+
+pub fn loaded<[r]>(
+  opening: Opening,
+) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match opening { Opening(o) -> with_stored_state[r](o.blank, o.file) }
 
 pub fn read_only<[r]>(
   dir: String,
-) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
-  with_stored_state[r](opened_database(dir, segments::manifest_file[r](dir, schema)))
+) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let file = segments::manifest_file[r](dir, schema);
+  with_stored_state[r](fresh_database(dir, segments::listed(file)), file)
+}
 
-fn opened_database(dir: String, file: segments::ManifestFile) -> Database =
-  { ..fresh_database(dir, segments::listed(file)), garbled: file == segments::Garbled }
-
-pub fn open<[r]>(
-  dir: String,
-) -> Database / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
-  let opened = opened_database(dir, segments::manifest_file[r](dir, schema));
+pub fn open<[r]>(dir: String) -> Opening / {fs.read[r], fs.write[r], abort.raise} = {
+  let file = segments::manifest_file[r](dir, schema);
+  let manifest = segments::listed(file);
   let run = segments::start_run[r](dir);
-  with_stored_state[r]({
-    ..opened,
-    run: run,
-    token: segments::segment_token(run, opened.manifest.generation, 0),
-    writing: if run == None { segments::failed_writer } else { segments::new_writer },
+  Opening({
+    blank: {
+      ..fresh_database(dir, manifest),
+      run: run,
+      token: segments::segment_token(run, manifest.generation, 0),
+      writing: if run == None { segments::failed_writer } else { segments::new_writer },
+    },
+    file: file,
   })
 }
 
-pub fn close<[r]>(db: Database) -> Unit / {fs.write[r]} = segments::end_run[r](db.run)
+pub fn close<[r]>(opening: Opening) -> Unit / {fs.write[r]} =
+  match opening { Opening(o) -> segments::end_run[r](o.blank.run) }
 
 fn pending_in(db: Database, tree: Int) -> Map<Bytes, Option<Bytes>> =
   match db.pending.get(tree) { Some(entries) -> entries, None -> Map::new() }
@@ -681,7 +684,7 @@ fn table_copied<[r]>(
       let put = segments::append_frames(sofar.writing, chunk_bytes[r](db, chunk));
       {
         writing: segments::flush_when_full[r](db.dir, schema, token, put.writing),
-        rows: chunk.rows.fold(sofar.rows, |rows: Map<Bytes, Bytes>, row: RowToCopy|
+        rows: chunk.rows.fold(sofar.rows, |rows: Map<Bytes, PayloadPlace>, row: RowToCopy|
           rows.insert(row.key, { at: put.at + row.at.offset - chunk.start, size: row.at.size })),
       }
     },
@@ -762,7 +765,7 @@ fn tree_nodes<[r]>(
   roots: List<TreeRoot>,
 ) -> Set<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   iterate(
-    { found: Map::new(), work: roots, next: 0 },
+    { found: Set::empty(), work: roots, next: 0 },
     1099511627776,
     |walk: { found: Set<Bytes>, work: List<TreeRoot>, next: Int }|
       match walk.work.at(walk.next) {
@@ -827,9 +830,9 @@ fn in_store<a, [r] | e>(
   go: (Database) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e},
 ) -> a / {fs.read[r], fs.write[r], abort.raise | e} =
   with_recent_reads(|| {
-    let db = open[r]("facts");
-    let value = undamaged(|| go(db));
-    close[r](db);
+    let opening = open[r]("facts");
+    let value = undamaged(|| go(loaded[r](opening)));
+    close[r](opening);
     value
   })
 
@@ -840,7 +843,7 @@ pub fn undamaged<a | e>(go: () -> a / {fact_damage.damaged | e}) -> a / {abort.r
     fact_damage.damaged(reason) -> panic("the fact database is damaged: " ++ reason),
   }
 
-fn no_results(db: Database) -> Set<Bytes> = Map::new()
+fn no_results(_: Database) -> Set<Bytes> = Set::empty()
 
 fn committed<[r]>(
   db: Database,
@@ -939,7 +942,8 @@ test "a tree node that fails its checksum raises `damaged`, and starting over re
   let bytes = match fs::mem_read(tree, segment) { Some(b) -> b, None -> b"" };
   let damaged = fs::on_mem[abs](tree, ||
     with_recent_reads(|| {
-      let db = open[abs]("facts");
+      let opening = open[abs]("facts");
+      let db = undamaged(|| loaded[abs](opening));
       fs.write_file[abs](
         segment,
         Bytes::concat_all([bytes.slice(0, 60), b"\x00".repeat(bytes.len() - 60)]),
@@ -948,7 +952,7 @@ test "a tree node that fails its checksum raises `damaged`, and starting over re
         value_of[abs](db, Facts, key_of("first")) == None
       } with {
         fact_damage.damaged(_) -> {
-          committed_over[abs](emptied(db));
+          committed_over[abs](emptied(opening));
           true
         },
       }
@@ -989,7 +993,7 @@ test "a commit that replaces a result drops the old one when its merge reaches t
     fs::on_mem[abs](tree, ||
       in_store[abs](|db: Database|
         match commit[abs](with_result[abs](db, digest, value), |_: Database|
-            Map::new().insert(digest)) {
+            Set::empty().insert(digest)) {
           Committed(_) -> (),
           other -> panic("the commit failed: " ++ show(other)),
         })).tree;

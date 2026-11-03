@@ -1,6 +1,10 @@
 import std.set (Set)
 import compiler.codes (never_used_code)
-import compiler.store.hash.forms (framed_body, framed_head, SingleBody, MemberBody)
+import compiler.store.hash.forms (framed_body, body_head, CallsResolved, CallsPending, Identities,
+                                  Identified, TestRun, TestListing, LawRun, LawProof, DefinitionRun,
+                                  DefinitionProof, DefinitionContract, InsidePackage,
+                                  OutsidePackage, hash_identities, identity_in,
+                                  node_ref_bin)
 import compiler.syntax.parsing (Warning)
 import compiler.store.hash.graph (NodeElsewhere)
 import compiler.syntax.parsing (Span, span_bin, generated_span)
@@ -45,20 +49,25 @@ pub fn body_key(body: Bytes) -> Option<Bytes> / {abort.raise} =
   match envelope(body) { Some(e) -> Some(own_hash(body.slice(e.at, body.len()))), None -> None }
 
 pub fn checked_body(body: Bytes, resolved_calls: Map<CallSite, Choice>) -> Bytes / {abort.raise} =
-  if body.len() == 0 || body.at(0) != 2 { body } else {
-    let n = match body.u32_at(1) { Some(x) -> x, None -> panic("a malformed body") };
-    let picks = match bin::decode(body.slice(5, 5 + n), pending_resolutions_bin()) {
-      Ok(p) -> p,
-      Err(_) -> panic("a malformed body"),
-    };
-    Bytes::concat_all([
-      byte_of_int(0),
-      encoded_resolutions(
-        picks.map(|p: CallResolution|
-          match p { Known(c) -> c, Pending(site) -> choice_at(resolved_calls, site) }),
-      ),
-      body.slice(5 + n, body.len()),
-    ])
+  match framed_body(body) {
+    None -> body,
+    Some(framed) -> match framed.calls {
+      CallsResolved -> body,
+      CallsPending -> {
+        let picks = match bin::decode(body.slice(framed.picks, framed.at), pending_resolutions_bin()) {
+          Ok(p) -> p,
+          Err(_) -> panic("a malformed body"),
+        };
+        Bytes::concat_all([
+          body_head(CallsResolved),
+          encoded_resolutions(
+            picks.map(|p: CallResolution|
+              match p { Known(c) -> c, Pending(site) -> choice_at(resolved_calls, site) }),
+          ),
+          body.slice(framed.at, body.len()),
+        ])
+      },
+    },
   }
 
 pub fn checked_hashes(
@@ -93,12 +102,11 @@ pub const no_hashes: HashOutput =
     refs: no_refs,
     bodies: [],
     test_bodies: Map::new(),
-    contracts: [],
     test_refs: Map::new(),
     test_runs: Map::new(),
     law_refs: Map::new(),
     listing_hashes: Map::new(),
-    identities: [],
+    own: no_own_hashes,
   }
 
 pub const no_refs: Refs =
@@ -189,21 +197,21 @@ fn is_public(node: Node) -> Bool =
 
 pub fn public_contracts(
   index: Index,
-  h: HashOutput,
+  identities: Identities,
   mine: (Bytes) -> Bool,
-) -> List<Contract> / {abort.raise} = {
-  let contracts = by_name(h.contracts);
-  let declared = by_name(h.declarations);
+) -> List<Contract> / {abort.raise} =
   index.nodes.fold([], |accumulator: List<Contract>, node: Node| {
-    let kind = node_kind(node);
-    let hash = Map::get(if kind == HeldValue { contracts } else { declared }, node.name);
-    match hash {
-      Some(c) -> if !is_public(node) || !mine(index.modules.get(node.module).name) { accumulator }
-      else { accumulator.push({ reference: { name: node.name, kind: kind }, hash: c }) },
-      None -> accumulator,
+    let reference = { name: node.name, kind: node_kind(node) };
+    match node.body {
+      NodeElsewhere(_) -> accumulator,
+      _ -> if !is_public(node) || !mine(index.modules.get(node.module).name) { accumulator } else {
+        match identity_in(identities, DefinitionContract(reference)) {
+          Some(contract) -> accumulator.push({ reference: reference, hash: contract }),
+          None -> panic("a public definition of the program has no contract identity"),
+        }
+      },
     }
   })
-}
 
 pub fn unused_diagnostics(index: Index) -> List<Diagnostic> / {abort.raise} =
   unused_over(
@@ -497,7 +505,7 @@ fn dump_hashes(out: HashOutput) -> Bytes / {abort.raise} =
           b"C;",
           d.name,
           b";",
-          names_text(closure_of(out, [d.name]).keys()),
+          names_text(closure_of(out, [d.name]).elements()),
           b";",
         ])),
     ),
@@ -790,10 +798,10 @@ test "a function's closure is every function it references directly or indirectl
       },
     ]),
   );
-  assert_eq(closure_of(h, [b"m.mid"]).keys(), [b"m.leaf", b"m.mid"]);
-  assert_eq(closure_of(h, [b"m.it"]).keys(), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
-  assert_eq(closure_of(h, [b"m.mid", b"m.other"]).keys(), [b"m.leaf", b"m.mid", b"m.other"]);
-  assert_eq(closure_of(h, [b"m.nothing"]), Map::new())
+  assert_eq(closure_of(h, [b"m.mid"]).elements(), [b"m.leaf", b"m.mid"]);
+  assert_eq(closure_of(h, [b"m.it"]).elements(), [b"m.it", b"m.leaf", b"m.mid", b"m.top"]);
+  assert_eq(closure_of(h, [b"m.mid", b"m.other"]).elements(), [b"m.leaf", b"m.mid", b"m.other"]);
+  assert_eq(closure_of(h, [b"m.nothing"]), Set::empty())
 }
 
 test "the functions a definition depends on include those named in its `requires` and `ensures` clauses and everything they call" {
@@ -804,14 +812,14 @@ test "the functions a definition depends on include those named in its `requires
     },
   ]);
   let h = hash_index(index);
-  assert_eq(closure_of(h, [b"m.f"]).keys(), [b"m.f"]);
-  assert_eq(reachable_functions(h, [FunctionNamed(b"m.f")]).keys(), [
+  assert_eq(closure_of(h, [b"m.f"]).elements(), [b"m.f"]);
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.f")]).elements(), [
     b"m.f",
     b"m.floor",
     b"m.model",
     b"m.under",
   ]);
-  assert_eq(reachable_functions(h, [FunctionNamed(b"m.other")]).keys(), [b"m.other"])
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.other")]).elements(), [b"m.other"])
 }
 
 test "a parameterized test depends on the functions its case table and case label call, but not on functions only its body calls" {
@@ -827,10 +835,10 @@ test "a parameterized test depends on the functions its case table and case labe
     { name: b"std.show", source_text: b"pub fn display(x: Int) -> Int = x\n" },
   ]);
   let h = hash_index(index);
-  let listed = reachable_by_tests(h, [b"m.case {name_of(n)}"]).keys();
+  let listed = reachable_by_tests(h, [b"m.case {name_of(n)}"]).elements();
   assert(listed.contains(b"m.table") && listed.contains(b"m.build"), Some("the table is listed"));
   assert(!listed.contains(b"m.heavy") && !listed.contains(b"m.deeper"), Some("no case runs"));
-  let run = reachable_functions(h, [ItemKeyed(b"m.case {name_of(n)}")]).keys();
+  let run = reachable_functions(h, [ItemKeyed(b"m.case {name_of(n)}")]).elements();
   assert(run.contains(b"m.heavy") && run.contains(b"m.table"), None)
 }
 
@@ -851,7 +859,7 @@ test "a module with a test that uses `simulate` depends on the scheduler's funct
   assert_eq(scheduled_present(reachable_by_tests(h, [b"m.x"])), scheduled);
   assert(reachable_functions(h, [ItemKeyed(b"m.x")]).contains(b"m.three"), None);
   assert_eq(
-    reachable_functions(hash_index(index_sources([program])), [ItemKeyed(b"m.x")]).keys(),
+    reachable_functions(hash_index(index_sources([program])), [ItemKeyed(b"m.x")]).elements(),
     [b"m.three"],
   )
 }
@@ -864,16 +872,16 @@ test "a function reference depends only on the function itself, not on a type or
     },
   ]);
   let h = hash_index(index);
-  assert_eq(reachable_functions(h, [FunctionNamed(b"m.user")]).keys(), [b"m.user"]);
-  assert_eq(reachable_functions(h, [FunctionNamed(b"m.boxed")]).keys(), [b"m.boxed"]);
-  assert_eq(reachable_functions(h, [FunctionNamed(b"m.caller")]).keys(), [
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.user")]).elements(), [b"m.user"]);
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.boxed")]).elements(), [b"m.boxed"]);
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.caller")]).elements(), [
     b"m.caller",
     b"m.helper",
     b"m.log",
   ]);
-  assert_eq(reachable_functions(h, [FunctionNamed(b"m.log")]).keys(), [b"m.helper", b"m.log"]);
-  assert_eq(reachable_functions(h, [DeclarationNamed(b"m.log")]).keys(), []);
-  assert_eq(reachable_functions(h, [DeclarationNamed(b"m.Box")]).keys(), [])
+  assert_eq(reachable_functions(h, [FunctionNamed(b"m.log")]).elements(), [b"m.helper", b"m.log"]);
+  assert_eq(reachable_functions(h, [DeclarationNamed(b"m.log")]).elements(), []);
+  assert_eq(reachable_functions(h, [DeclarationNamed(b"m.Box")]).elements(), [])
 }
 
 fn hash_parameterized_test(
@@ -950,7 +958,7 @@ const three_of_a_name: HashOutput =
 test "following a reference to a function finds only functions and the effect it names, not an effect or test that happens to share the name" {
   let h = three_of_a_name;
   let names = |r: ReachableNames|
-    { functions: r.functions.keys(), declarations: r.declarations.keys() };
+    { functions: r.functions.elements(), declarations: r.declarations.elements() };
   assert_eq(names(reach(h, [FunctionNamed(b"m.user")])), {
     functions: [b"m.user"],
     declarations: [b"m.log"],
@@ -1004,8 +1012,8 @@ test "`find_referrers` returns different definitions for a function and for an e
 
 test "a reference given only by name follows every definition with that name: functions, effects and tests" {
   let h = three_of_a_name;
-  assert_eq(closure_of(h, [b"m.user"]).keys(), [b"m.log", b"m.user"]);
-  assert_eq(closure_of(h, [b"m.log"]).keys(), [b"m.caller", b"m.helper", b"m.log"])
+  assert_eq(closure_of(h, [b"m.user"]).elements(), [b"m.log", b"m.user"]);
+  assert_eq(closure_of(h, [b"m.log"]).elements(), [b"m.caller", b"m.helper", b"m.log"])
 }
 
 fn printed_modules(
@@ -1731,7 +1739,7 @@ test "a body that compares, digests or shows a value references the functions th
   assert_eq(references_in(hashes, FunctionNamed(b"n.own")), [
     { name: b"n.digest", kind: HeldValue },
   ]);
-  assert_eq(reachable_functions(hashes, [FunctionNamed(b"m.same")]).keys(), [
+  assert_eq(reachable_functions(hashes, [FunctionNamed(b"m.same")]).elements(), [
     b"m.same",
     b"std.prelude.List::at",
     b"std.prelude.List::push",
@@ -1937,8 +1945,100 @@ test "reading each module's saved hash record finds the same functions, with the
     alone(recorded_reachable_hashes(g, plain, false)).concat(alone(case)).fold(
       Set::empty(),
       |m: Set<Bytes>, h: Bytes| m.insert(h),
-    ).keys(
+    ).elements(
     ),
   );
   assert(record_digest(records.get(2)) != record_digest(records.get(3)), None)
+}
+
+fn package_named(name: Bytes) -> Bytes = if name.starts_with(b"lib.") { b"lib" } else { b"app" }
+
+fn subject_name(subject: Identified) -> Bytes =
+  match subject {
+    TestRun(key) -> key,
+    TestListing(key) -> key,
+    LawRun(key) -> key,
+    LawProof(key) -> key,
+    DefinitionRun(name) -> name,
+    DefinitionProof(name) -> name,
+    DefinitionContract(reference) -> reference.name,
+  }
+
+fn identity_from(sources: List<Source>, subject: Identified) -> Bytes / {abort.raise} = {
+  let identities = hash_identities(
+    hash_index(index_sources(sources)),
+    |s: Identified, reference: NodeRef|
+      if package_named(subject_name(s)) == package_named(reference.name) { InsidePackage }
+      else { OutsidePackage },
+  );
+  match identity_in(identities, subject) {
+    Some(identity) -> identity,
+    None -> panic("the subject has no identity"),
+  }
+}
+
+fn promised(helper: Bytes, two: Bytes, other: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub fn two(x: Int) -> Int\n  ensures result > helper(x)\n= ",
+        two,
+        b"\nfn helper(x: Int) -> Int = ",
+        helper,
+        b"\npub fn other() -> Int = ",
+        other,
+        b"\n",
+      ]),
+    },
+  ]
+
+test "a public function's contract changes when a helper that its clause calls changes its body, and stays when its own body or an unrelated function changes" {
+  let contract = |sources: List<Source>|
+    identity_from(sources, DefinitionContract({ name: b"m.two", kind: HeldValue }));
+  let base = contract(promised(b"x", b"x + 1", b"3"));
+  assert(contract(promised(b"x - 1", b"x + 1", b"3")) != base);
+  assert_eq(contract(promised(b"x", b"x + 2", b"3")), base);
+  assert_eq(contract(promised(b"x", b"x + 1", b"4")), base)
+}
+
+fn tested(f: Bytes, g: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"fn f() -> Int = ",
+        f,
+        b"\nfn g() -> Int = ",
+        g,
+        b"\ntest \"t\" { assert_eq(f(), 1) }\n",
+      ]),
+    },
+  ]
+
+test "a test's identity changes when a definition it reaches changes, and stays when a definition it does not reach changes" {
+  let run = |sources: List<Source>| identity_from(sources, TestRun(b"m.t"));
+  let base = run(tested(b"1", b"2"));
+  assert(run(tested(b"0 + 1", b"2")) != base);
+  assert_eq(run(tested(b"1", b"3")), base)
+}
+
+fn across(helper: Bytes) -> List<Source> =
+  [
+    { name: b"lib", source_text: helper },
+    {
+      name: b"m",
+      source_text: b"import lib\npub fn f(x: Int) -> Int\n  ensures result >= 0\n= lib::helper(x)\n",
+    },
+  ]
+
+test "a definition's proof identity reads another package's callee by its contract, while its run identity reads the callee's body" {
+  let proof = |helper: Bytes| identity_from(across(helper), DefinitionProof(b"m.f"));
+  let run = |helper: Bytes| identity_from(across(helper), DefinitionRun(b"m.f"));
+  let plain = b"pub fn helper(x: Int) -> Int = x * x\n";
+  let edited = b"pub fn helper(x: Int) -> Int = x * x + 0\n";
+  let promising = b"pub fn helper(x: Int) -> Int\n  ensures result >= 0\n= x * x\n";
+  assert_eq(proof(edited), proof(plain));
+  assert(proof(promising) != proof(plain));
+  assert(run(edited) != run(plain))
 }

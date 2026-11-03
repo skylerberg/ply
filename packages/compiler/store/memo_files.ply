@@ -1,11 +1,12 @@
+import std.set (Set)
 import std.bin
 import std.fs
 import std.fs (fs)
 import std.list
 import std.hash (blake3)
 import compiler.store.fact_store
-import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, fact_damage,
-                                  recent_reads, with_recent_reads)
+import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, Cursors,
+                                  fact_damage, recent_reads, with_recent_reads)
 import compiler.store.memo
 import compiler.store.memo (Dependency, ExternalInput, FactDetails, PackBuild, Parts, Product,
                             Query, Run, SealedInput, Step, StoredFact, StoredInput, Waiting,
@@ -26,7 +27,6 @@ type StoreRun = {
   outputs_size: Int,
   details: Map<Bytes, FactDetails>,
   transient: Map<Bytes, Bytes>,
-  dependent_counts: Map<Bytes, Int>,
   pack: packs::PackReader,
   trusted: Bool,
   pack_differs: Bool,
@@ -40,8 +40,6 @@ const max_cached_size: Int = 268435456
 
 const pack_id_name: Bytes = b"\x00pack"
 
-fn cursor_name(kind: Bytes) -> Bytes = b"\x00products read the log up to ".concat(kind)
-
 fn int_bytes(n: Int) -> Bytes / {abort.raise} = bin::encode(n, bin::int_bin())
 
 fn code_key(name: Bytes) -> Bytes = name.blake3()
@@ -54,9 +52,6 @@ fn undecoded<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {fact_damage.damag
     Ok(value) -> value,
     Err(_) -> fact_damage.damaged("a stored fact does not decode"),
   }
-
-fn moved_count(counts: Map<Bytes, Int>, key: Bytes, by: Int) -> Map<Bytes, Int> =
-  match counts.get(key) { Some(n) -> counts.insert(key, n + by), None -> counts }
 
 fn remembered_output(o: StoreRun, digest: Bytes, output: Bytes) -> StoreRun =
   if o.outputs.contains(digest) || o.outputs_size + output.len() > max_cached_size { o } else {
@@ -74,18 +69,14 @@ fn stored_output<[r]>(
   }
 
 fn results_of_facts(
-  found: Map<Bytes, Bool>,
+  found: Set<Bytes>,
   values: List<Bytes>,
-) -> Map<Bytes, Bool> / {abort.raise} =
-  values.fold(found, |live: Map<Bytes, Bool>, b: Bytes|
-    match bin::decode(b, stored_fact_bin()) {
-      Ok(f) ->
-        f.parts.fold(
-          live.insert(f.details, true),
-          |l: Map<Bytes, Bool>, _: Bytes, digest: Bytes| l.insert(result_key(digest), true),
-        ),
-      Err(_) -> live,
-    })
+) -> Set<Bytes> / {fact_damage.damaged, abort.raise} =
+  values.fold(found, |live: Set<Bytes>, b: Bytes| {
+    let f = undecoded(b, stored_fact_bin());
+    f.parts.fold(live.insert(f.details), |l: Set<Bytes>, _: Bytes, digest: Bytes|
+      l.insert(result_key(digest)))
+  })
 
 fn inputs_of<[r]>(
   db: Database,
@@ -95,11 +86,11 @@ fn inputs_of<[r]>(
 
 fn live_results<[r]>(
   db: Database,
-) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+) -> Set<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   inputs_of[r](db).fold(
-    results_of_facts(Map::new(), fact_store::entries_under[r](db, Facts, b"").values()),
-    |live: Map<Bytes, Bool>, input: StoredInput|
-      match fixed_digest(input) { Some(d) -> live.insert(result_key(d), true), None -> live },
+    results_of_facts(Set::empty(), fact_store::entries_under[r](db, Facts, b"").values()),
+    |live: Set<Bytes>, input: StoredInput|
+      match fixed_digest(input) { Some(d) -> live.insert(result_key(d)), None -> live },
   )
 
 fn fixed_input<[r]>(
@@ -115,17 +106,18 @@ fn cursor_of<[r]>(
   db: Database,
   kind: Bytes,
 ) -> Option<Int> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match fact_store::value_of[r](db, Codes, code_key(cursor_name(kind))) {
+  match fact_store::value_of[r](db, Cursors, kind) {
     Some(b) -> Some(undecoded(b, bin::int_bin())),
     None -> None,
   }
 
 fn lowest_cursor<[r]>(
   db: Database,
-  kinds: List<Bytes>,
 ) -> Int / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  kinds.fold(fact_store::log_end(db), |lowest: Int, kind: Bytes|
-    match cursor_of[r](db, kind) { Some(at) -> min(lowest, at), None -> lowest })
+  fact_store::entries_under[r](db, Cursors, b"").values().fold(
+    fact_store::log_end(db),
+    |lowest: Int, b: Bytes| min(lowest, undecoded(b, bin::int_bin())),
+  )
 
 fn over_database<a, [r] | e>(
   database: Database,
@@ -152,7 +144,6 @@ fn over_database<a, [r] | e>(
       outputs_size: 0,
       details: Map::new(),
       transient: Map::new(),
-      dependent_counts: Map::new(),
       pack: packs::open_reader(read),
       trusted: false,
       pack_differs: false,
@@ -166,13 +157,13 @@ fn over_database<a, [r] | e>(
       None -> None,
     },
     memo_store.details(digest) -> match st.details.get(digest) {
-      Some(d) -> Some(d),
+      Some(d) -> d,
       None -> match fact_store::result_of[r](st.db, digest) {
-        None -> None,
+        None -> fact_damage.damaged("a stored fact names details that are not stored"),
         Some(b) -> {
           let d = undecoded(b, fact_details_bin());
           st = { ..st, details: st.details.insert(digest, d) };
-          Some(d)
+          d
         },
       },
     },
@@ -212,14 +203,7 @@ fn over_database<a, [r] | e>(
     },
     memo_store.sealed_changed() -> st.pack_differs,
     memo_store.dependents(key) -> fact_store::members[r](st.db, Dependents, key),
-    memo_store.has_dependents(key) -> {
-      let count = match st.dependent_counts.get(key) {
-        Some(n) -> n,
-        None -> fact_store::members[r](st.db, Dependents, key).len(),
-      };
-      st = { ..st, dependent_counts: st.dependent_counts.insert(key, count) };
-      count > 0
-    },
+    memo_store.has_dependents(key) -> fact_store::members[r](st.db, Dependents, key) != [],
     memo_store.inputs() -> inputs_of[r](st.db),
     memo_store.facts_of(prefix) -> fact_store::entries_under[r](st.db, Facts, prefix).keys(),
     memo_store.code(name) -> fact_store::value_of[r](st.db, Codes, code_key(name)),
@@ -254,18 +238,10 @@ fn over_database<a, [r] | e>(
       };
     },
     memo_store.add_dependent(key, dependent) -> {
-      st = {
-        ..st,
-        dependent_counts: moved_count(st.dependent_counts, key, 1),
-        db: fact_store::add_member(st.db, Dependents, key, dependent),
-      };
+      st = { ..st, db: fact_store::add_member(st.db, Dependents, key, dependent) };
     },
     memo_store.remove_dependent(key, dependent) -> {
-      st = {
-        ..st,
-        dependent_counts: moved_count(st.dependent_counts, key, -1),
-        db: fact_store::remove_member(st.db, Dependents, key, dependent),
-      };
+      st = { ..st, db: fact_store::remove_member(st.db, Dependents, key, dependent) };
     },
     memo_store.put_input(input) -> {
       let id = input_id(input);
@@ -358,16 +334,13 @@ fn over_database<a, [r] | e>(
       let read_kinds = st.kinds_read.fold(logged, |db: Database, kind: Bytes, changes_seen: Int|
         fact_store::with_value(
           db,
-          Codes,
-          code_key(cursor_name(kind)),
+          Cursors,
+          kind,
           int_bytes(if changes_seen == st.changes.len() { fact_store::log_end(logged) }
           else { before }),
         ));
       fact_store::commit[r](
-        fact_store::with_log_floor(
-          read_kinds,
-          lowest_cursor[r](read_kinds, st.waiting.products.values().unique()),
-        ),
+        fact_store::with_log_floor(read_kinds, lowest_cursor[r](read_kinds)),
         |current: Database| live_results[r](current),
       );
       value
@@ -376,8 +349,6 @@ fn over_database<a, [r] | e>(
 }
 
 pub type StoreOutcome<a> = { value: a, damage: Option<String> }
-
-pub const unreadable_manifest: String = "its manifest does not read"
 
 pub fn with_memo_store<a, [r] | e>(
   dir: String,
@@ -388,24 +359,24 @@ pub fn with_memo_store<a, [r] | e>(
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
   with_recent_reads(|| {
-    let db = fact_store::open[r](dir);
+    let opening = fact_store::open[r](dir);
     let run = with_session_inputs(|| {
       let first = handle {
-        Ok(over_database[r](db, read, world, look, noted, work))
+        Ok(over_database[r](fact_store::loaded[r](opening), read, world, look, noted, work))
       } with {
         fact_damage.damaged(reason) -> Err(reason),
       };
       match first {
-        Ok(v) -> { value: v, damage: if db.garbled { Some(unreadable_manifest) } else { None } },
+        Ok(v) -> { value: v, damage: None },
         Err(reason) ->
           {
             value: fact_store::undamaged(||
-              over_database[r](fact_store::emptied(db), read, world, look, noted, work)),
+              over_database[r](fact_store::emptied(opening), read, world, look, noted, work)),
             damage: Some(reason),
           },
       }
     });
-    fact_store::close[r](db);
+    fact_store::close[r](opening);
     run
   })
 
@@ -414,9 +385,7 @@ pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
 pub fn records<[r]>(dir: String) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], abort.raise} =
   with_recent_reads(||
     handle {
-      let db = fact_store::read_only[r](dir);
-      if db.garbled { Err(unreadable_manifest) }
-      else { Ok(fact_store::entries_under[r](db, Records, b"")) }
+      Ok(fact_store::entries_under[r](fact_store::read_only[r](dir), Records, b""))
     } with {
       fact_damage.damaged(reason) -> Err(reason),
     })
@@ -426,17 +395,15 @@ pub fn records_written<[r]>(
   puts: Map<Bytes, Bytes>,
   deleted: Map<Bytes, Bool>,
 ) -> Result<Unit, String> / {fs.read[r], fs.write[r], abort.raise} =
-  with_recent_reads(||
-    handle {
-      let db = fact_store::open[r](dir);
+  with_recent_reads(|| {
+    let opening = fact_store::open[r](dir);
+    let outcome = handle {
       let written = puts.fold(
-        deleted.fold(db, |d: Database, key: Bytes, _: Bool|
+        deleted.fold(fact_store::loaded[r](opening), |d: Database, key: Bytes, _: Bool|
           fact_store::without_value(d, Records, key)),
         |d: Database, key: Bytes, value: Bytes| fact_store::with_value(d, Records, key, value),
       );
-      let outcome = fact_store::commit[r](written, |current: Database| live_results[r](current));
-      fact_store::close[r](db);
-      match outcome {
+      match fact_store::commit[r](written, |current: Database| live_results[r](current)) {
         Committed(_) -> Ok(()),
         LockHeld -> Err("another `ply` was writing the store"),
         StoreChanged -> Err("another `ply` changed the store at the same time"),
@@ -444,7 +411,10 @@ pub fn records_written<[r]>(
       }
     } with {
       fact_damage.damaged(reason) -> Err("the store is damaged (" ++ reason ++ ")"),
-    })
+    };
+    fact_store::close[r](opening);
+    outcome
+  })
 
 pub fn copy_database<[r]>(from: String, to: String) -> Unit / {fs.read[r], fs.write[r]} = {
   fs.create_dir[r](to);
@@ -554,18 +524,16 @@ fn fact_records<[r]>(dir: String) -> Map<Bytes, FactRecord> / {fs.read[r], abort
         Map::new(),
         |found: Map<Bytes, FactRecord>, key: Bytes, b: Bytes| {
           let fact = undecoded(b, stored_fact_bin());
-          match fact_store::result_of[r](db, fact.details) {
-            None -> found,
-            Some(encoded) -> {
-              let details = undecoded(encoded, fact_details_bin());
-              found.insert(key, {
-                query: details.query,
-                input: details.input,
-                reads: details.reads,
-                parts: fact.parts,
-              })
-            },
-          }
+          let details = match fact_store::result_of[r](db, fact.details) {
+            Some(encoded) -> undecoded(encoded, fact_details_bin()),
+            None -> fact_damage.damaged("a stored fact names details that are not stored"),
+          };
+          found.insert(key, {
+            query: details.query,
+            input: details.input,
+            reads: details.reads,
+            parts: fact.parts,
+          })
         },
       )
     }))
@@ -1315,6 +1283,6 @@ test "a fact fetched together whose body needs a fact not yet computed still com
   assert_eq(labels.output, b"long 4,long 5");
   same_facts(labels, fetched_in(batched(one_by_one), w, b"labels", b"a,b"));
   let downs = fetched_in(batched(together), w, b"downs", b"cba,a,ba");
-  assert_eq(downs.output, b"fourbc,four(),fourb");
+  assert_eq(downs.output, b"fourbc,four,fourb");
   same_facts(downs, fetched_in(batched(one_by_one), w, b"downs", b"cba,a,ba"))
 }
