@@ -1,4 +1,5 @@
 import std.set (Set)
+import std.graph (Visit, traverse)
 import compiler.syntax.parsing (Error)
 import compiler.check.resolve.defaults (names_in_defaults)
 import compiler.check.resolve (ImportPackages, ModuleHeader, empty_header, import_problems,
@@ -1482,58 +1483,35 @@ pub fn unit_key_of(o: OwnerKey) -> GroupKey / {memo.read, abort.raise} =
     owners: fetch_keyed_part(unit_part(), module_key_of(o), o.owner).unwrap_or([]),
   }
 
-type KnownWalk = { work: List<Bytes>, seen: Map<Bytes, Bool>, known: KnownConstructors }
+fn types_named_in(f: TypeFacts) -> List<Bytes> =
+  f.constructors.flat_map(|c: ConstructorInfo| c.fields.flat_map(type_names)).concat(
+    match f.alias { Some(a) -> type_names(a.t), None -> [] },
+  ).concat(match f.record { Some(r) -> type_names(r.ty), None -> [] })
 
-fn with_type(
-  w: KnownWalk,
-  rest: List<Bytes>,
-  name: Bytes,
-  f: TypeFacts,
-) -> KnownWalk / {CheckReads} =
+fn with_type(known: KnownConstructors, name: Bytes, f: TypeFacts) -> KnownConstructors / {CheckReads} =
   {
-    ..w,
-    work: rest.concat(
-      f.constructors.flat_map(|c: ConstructorInfo| c.fields.flat_map(type_names)),
-    ).concat(match f.alias { Some(a) -> type_names(a.t), None -> [] }).concat(match f.record {
-      Some(r) -> type_names(r.ty),
-      None -> [],
-    }),
-    known: {
-      constructors: w.known.constructors.concat(f.constructors),
-      instances: w.known.instances.concat(f.instances),
-      numeric: match f.numeric { Some(x) -> w.known.numeric.push(x), None -> w.known.numeric },
-      opaque: if f.declaration.opaque == None { w.known.opaque }
-      else { w.known.opaque.insert(name, f) },
-      released: match f.release_function {
-        Some(by) -> match elsewhere.look_up_definition(by) {
-          Some(d) -> w.known.released.push({ name: by, scheme: d.scheme }),
-          None -> w.known.released,
-        },
-        None -> w.known.released,
+    constructors: known.constructors.concat(f.constructors),
+    instances: known.instances.concat(f.instances),
+    numeric: match f.numeric { Some(x) -> known.numeric.push(x), None -> known.numeric },
+    opaque: if f.declaration.opaque == None { known.opaque } else { known.opaque.insert(name, f) },
+    released: match f.release_function {
+      Some(by) -> match elsewhere.look_up_definition(by) {
+        Some(d) -> known.released.push({ name: by, scheme: d.scheme }),
+        None -> known.released,
       },
+      None -> known.released,
     },
   }
 
+const no_known: KnownConstructors =
+  { constructors: [], instances: [], numeric: [], released: [], opaque: Map::new() }
+
 pub fn known_of_types(names: List<Bytes>) -> KnownConstructors / {CheckReads, abort.raise} =
-  iterate(
-    {
-      work: names,
-      seen: Map::new(),
-      known: { constructors: [], instances: [], numeric: [], released: [], opaque: Map::new() },
-    },
-    1000000,
-    |w: KnownWalk|
-      match w.work {
-        [] -> Stop(w.known),
-        [name, ..rest] -> if w.seen.contains(name) { Continue({ ..w, work: rest }) } else {
-          let seen = { ..w, seen: w.seen.insert(name, true) };
-          match elsewhere.look_up_type(name) {
-            Some(f) -> Continue(with_type(seen, rest, name, f)),
-            None -> Continue({ ..seen, work: rest }),
-          }
-        },
-      },
-  )
+  traverse(names, |name: Bytes| {
+    let facts = elsewhere.look_up_type(name);
+    { value: facts, next: match facts { Some(f) -> types_named_in(f), None -> [] } }
+  }).fold(no_known, |known: KnownConstructors, v: Visit<Bytes, Option<TypeFacts>>|
+    match v.value { Some(f) -> with_type(known, v.key, f), None -> known })
 
 pub fn stored_rows(g: GroupKey) -> Rows / {memo.read, abort.raise} =
   if g.owners.len() == 0 { no_rows } else {

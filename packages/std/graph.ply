@@ -2,18 +2,21 @@
 //!
 //! A `Graph` numbers its nodes from zero and stores each one's successors, so a caller with
 //! adjacency lists already has one: `{ out: lists }`. `of` calls a successor function for each
-//! node, `of_edges` reads pairs, and `keyed` and `explore` number nodes of any ordered type. A
-//! successor that is not one of the graph's nodes is not an edge, and every traversal skips it.
+//! node, `of_edges` reads pairs, and `keyed` numbers nodes of any ordered type. A successor that
+//! is not one of the graph's nodes is not an edge, and every traversal skips it. `traverse` walks a
+//! graph that is found as it is walked, from a function that returns each node's successors.
 //!
 //! A result depends only on the graph as written. A traversal tries nodes in ascending order and a
 //! node's successors in the order the graph lists them. Where several nodes could come next in an
 //! order, the least comes first.
 //!
 //! No traversal recurses: each is a loop over a stack it manages itself, so a chain deeper than the
-//! call stack is traversed like a short one. Each loop is limited to a number of steps based on the
-//! graph's node and edge counts and panics if it exceeds that limit, so every loop ends.
+//! call stack is traversed like a short one. Each loop over a `Graph` is limited to a number of
+//! steps based on the graph's node and edge counts and panics if it exceeds that limit, so every
+//! loop ends. `traverse` reaches each node once, so it ends whenever finitely many are reachable.
 
 import std.laws (agrees)
+import std.set (Set)
 import std.list
 import std.gen
 
@@ -704,60 +707,57 @@ pub fn keyed<k | e>(nodes: List<k>, next: (k) -> List<k> / e) -> Keyed<k> / e
 
 type Numbering<k> = { index: Map<k, Int>, at: Int }
 
-/// Returns the graph of everything `roots` reach, where `next(node)` returns a node's successors.
+/// A node that `traverse` reached, with the value `expand` returned for it.
+pub type Visit<k, v> = { key: k, value: v }
+
+/// Returns each node reachable from `from` once, nearest first, with the value `expand` returned
+/// for it.
 ///
-/// `next` is called once for each node, nearest to the roots first. Returns `None` if the roots
-/// reach more than `limit` nodes, and the search stops calling `next` at that point.
-pub fn explore<k | e>(
-  roots: List<k>,
-  next: (k) -> List<k> / e,
-  limit: Int,
-) -> Option<Keyed<k>> / {abort.raise | e}
+/// `expand(node)` returns the node's value and its successors, and `traverse` calls it once for
+/// each node it reaches. The nodes of `from` come first, in their order. After them come the
+/// successors of each node in the order `expand` listed them, skipping any node already reached.
+/// The walk ends whenever finitely many nodes are reachable. Use it for a graph that is found as
+/// it is walked, such as names whose successors are read from storage.
+pub fn traverse<k, v | e>(
+  from: List<k>,
+  expand: (k) -> { value: v, next: List<k> } / e,
+) -> List<Visit<k, v>> / {abort.raise | e}
   where derivable(ord, k)
-= {
-  let start = roots.fold({ met: Map::new(), queue: [], successors: Map::new() }, add_if_new);
-  let walked = explore_from(next, limit, start, 0, limit + 1);
-  if walked.met.len() > limit { None } else {
-    Some(
-      keyed(walked.queue, |key: k| match walked.successors.get(key) { Some(to) -> to, None -> [] }),
-    )
-  }
-}
+= traversed(expand, from.fold({ met: Set::empty(), queue: [] }, reached), 0, [], unlimited_steps)
 
-type Exploration<k> = { met: Map<k, Unit>, queue: List<k>, successors: Map<k, List<k>> }
+const unlimited_steps: Int = 4611686018427387903
 
-fn add_if_new<k>(s: Exploration<k>, key: k) -> Exploration<k>
+type Frontier<k> = { met: Set<k>, queue: List<k> }
+
+fn reached<k>(s: Frontier<k>, key: k) -> Frontier<k>
   where derivable(ord, k)
 =
   if s.met.contains(key) { s } else {
-    let { met, queue, successors: successors } = s;
-    { met: met.insert(key, ()), queue: queue.push(key), successors: successors }
+    let { met, queue } = s;
+    { met: met.insert(key), queue: queue.push(key) }
   }
 
-fn explore_from<k | e>(
-  next: (k) -> List<k> / e,
-  limit: Int,
-  s: Exploration<k>,
+fn traversed<k, v | e>(
+  expand: (k) -> { value: v, next: List<k> } / e,
+  s: Frontier<k>,
   head: Int,
+  visits: List<Visit<k, v>>,
   room: Int,
-) -> Exploration<k> / {abort.raise | e}
+) -> List<Visit<k, v>> / {abort.raise | e}
   where derivable(ord, k)
 =
-  if s.met.len() > limit { s } else {
-    match s.queue.at(head) {
-      None -> s,
-      Some(key) -> if room <= 0 { out_of_budget() } else {
-        let to = next(key);
-        let { met, queue, successors: successors } = s;
-        explore_from(
-          next,
-          limit,
-          to.fold({ met: met, queue: queue, successors: successors.insert(key, to) }, add_if_new),
-          head + 1,
-          room - 1,
-        )
-      },
-    }
+  match s.queue.at(head) {
+    None -> visits,
+    Some(key) -> if room <= 0 { out_of_budget() } else {
+      let expanded = expand(key);
+      traversed(
+        expand,
+        expanded.next.fold(s, reached),
+        head + 1,
+        visits.push({ key: key, value: expanded.value }),
+        room - 1,
+      )
+    },
   }
 
 /// The number of the node `key`, or `None` if the graph has no such node.
@@ -779,11 +779,6 @@ pub fn named<k>(g: Keyed<k>, nodes: List<Int>) -> List<k> =
     match g.keys.at(v) { Some(key) -> accumulator.push(key), None -> accumulator })
 
 const rings: Graph = { out: [[1], [2], [0, 3], [4], [3], [0]] }
-
-effect asks {
-  write one() -> Unit
-  read total() -> Int
-}
 
 test "a graph is its nodes' successors, however it was built" {
   let g = of_edges(3, [
@@ -912,31 +907,21 @@ test "nodes of any ordered type are numbered in their order, and a result maps b
   assert_eq(named(g, [2, 7, 0]), ["std", "app"])
 }
 
-test "`explore` expands each reachable node once, and returns None when the node count exceeds its limit" {
-  let expansion_count = handle {
-    let halves = |n: Int| {
-      asks.one();
-      if n <= 1 { [] } else { [n / 2, n - n / 2] }
-    };
-    match explore([12, 12], halves, 8) {
-      None -> assert(false),
-      Some(g) -> {
-        assert_eq(g.keys, [1, 2, 3, 6, 12]);
-        assert_eq(g.graph, { out: [[], [0, 0], [0, 1], [2, 2], [3, 3]] })
-      },
-    };
-    asks.total()
-  } with {
-    var n = 0,
-    asks.one() -> {
-      n = n + 1;
-    },
-    asks.total() -> n,
-  };
-  assert_eq(expansion_count, 5);
-  let doubles = |n: Int| [n * 2, n * 2 + 1];
-  assert(match explore([1], doubles, 100) { None -> true, Some(_) -> false });
-  assert(match explore([1], |_: Int| [], 0) { None -> true, Some(_) -> false })
+test "`traverse` visits each reachable node once, nearest first, with the value `expand` returned for it" {
+  let divided = |n: Int| { value: n * 10, next: if n == 0 { [] } else { [n / 2, n / 3] } };
+  let visits = traverse([12, 12], divided);
+  assert_eq(visits.map(|v: Visit<Int, Int>| v.key), [12, 6, 4, 3, 2, 1, 0]);
+  assert_eq(
+    visits.map(|v: Visit<Int, Int>| v.value),
+    visits.map(|v: Visit<Int, Int>| v.key * 10),
+  )
+}
+
+test "`traverse` ends on a cycle, after visiting each node of it once" {
+  assert_eq(
+    traverse([0], |n: Int| { value: (), next: [(n + 1) % 3] }).map(|v: Visit<Int, Unit>| v.key),
+    [0, 1, 2],
+  )
 }
 
 fn chain(n: Int) -> Graph = { out: range(0, n).map(|v: Int| if v + 1 < n { [v + 1] } else { [] }) }
