@@ -1,7 +1,7 @@
-import compiler.front.checking (analysed_over)
+import compiler.front.checking (in_memory)
+import compiler.front.checking.view (Listed, ListingRejected, listed_over)
 import std.set (Set)
-import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
-import compiler.front.facts (OneModule, ProgramListing, listing_of)
+import compiler.front.facts (OneModule, ProgramListing)
 import compiler.front.rows (Outline, OutlinedType, OutlineItem)
 import compiler.store.hash.forms (OwnHashes, DefinitionHash, TestHash, ItemKeyed, reach)
 import compiler.store.hash.graph (HeldValue)
@@ -269,10 +269,10 @@ const call_chain_source: String =
   "fn leaf(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
 
 fn tree_of_source(source: String) -> Tree / {abort.raise} = {
-  let sources = [{ name: b"", source_text: Bytes::of_string(source) }];
-  match analysed_over(sources) {
-    Analysed(w) -> tree_of(sources, listing_of(checked_program_of(w))),
-    Rejected(_) -> panic("the test fixture failed to check"),
+  let sources = [{ name: b"m", source_text: Bytes::of_string(source) }];
+  match listed_over(in_memory(sources)) {
+    Listed(listing) -> tree_of(sources, listing),
+    ListingRejected(_) -> panic("the test fixture failed to check"),
   }
 }
 
@@ -352,29 +352,34 @@ const leaf_edited: String =
   "fn leaf(n: Int) -> Int = n + 2\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
 
 test "editing a function marks it as edited, and the functions that call it keep their hashes" {
-  assert_eq(kinds(call_chain_source, leaf_edited, "chain"), ["leaf edited"]);
+  assert_eq(kinds(call_chain_source, leaf_edited, "m.chain"), ["m.leaf edited"]);
   assert_eq(
-    over(tree_of_source(call_chain_source), tree_of_source(leaf_edited), "chain", every).delta.own,
+    over(
+      tree_of_source(call_chain_source),
+      tree_of_source(leaf_edited),
+      "m.chain",
+      every,
+    ).delta.own,
     None,
   )
 }
 
-test "a renamed definition is no change" {
+test "renaming a definition is no change to it, and edits the definitions that call it by name" {
   let renamed = "fn first(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = first(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n";
-  assert_eq(kinds(call_chain_source, renamed, "chain"), [])
+  assert_eq(kinds(call_chain_source, renamed, "m.chain"), ["m.mid edited"])
 }
 
 test "an edit to the test body is the test's own change" {
   let edited = call_chain_source.replace("top(1), 4", "top(2), 4");
-  let o = over(tree_of_source(call_chain_source), tree_of_source(edited), "chain", every);
-  assert_eq(match o.delta.own { Some(c) -> c.name, None -> "none" }, "chain");
+  let o = over(tree_of_source(call_chain_source), tree_of_source(edited), "m.chain", every);
+  assert_eq(match o.delta.own { Some(c) -> c.name, None -> "none" }, "m.chain");
   assert_eq(o.delta.changes, [])
 }
 
-test "editing one member of a recursive pair names only that member as edited" {
+test "editing one member of a recursive pair reports only that member" {
   let parity = "fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\ntest \"parity holds\" { assert(even(4)) }\n";
   let edited = parity.replace("else { even(n - 1) }", "else { even(n - 1) && true }");
-  assert_eq(kinds(parity, edited, "parity holds"), ["even rehashed", "odd edited"])
+  assert_eq(kinds(parity, edited, "m.parity holds"), ["m.odd edited"])
 }
 
 test "an added definition is added, and the one that calls it edited" {
@@ -382,7 +387,7 @@ test "an added definition is added, and the one that calls it edited" {
     "fn mid(n: Int) -> Int = leaf(n) + 1",
     "fn bump(n: Int) -> Int = n\nfn mid(n: Int) -> Int = bump(leaf(n)) + 1",
   );
-  assert_eq(kinds(call_chain_source, added, "chain"), ["bump added", "mid edited"])
+  assert_eq(kinds(call_chain_source, added, "m.chain"), ["m.bump added", "m.mid edited"])
 }
 
 fn zero_padded(i: Int) -> String = if i < 10 { "00" ++ i.to_string() } else { "0" ++ i.to_string() }
@@ -398,15 +403,15 @@ fn deep(depth: Int, leaf: String) -> String =
     ++ ") }\n"
 
 test "in a chain of 64 functions, editing the last one reports only that function as changed" {
-  assert_eq(kinds(deep(64, "n + 1"), deep(64, "n + 2"), "deep"), ["f000 edited"])
+  assert_eq(kinds(deep(64, "n + 1"), deep(64, "n + 2"), "m.deep"), ["m.f000 edited"])
 }
 
 const handled_source: String =
   "effect db {\n  read get[users](key: Int) -> Int\n}\nfn lookup(k: Int) -> Int / {db.get[users]} = db.get[users](k)\nfn twice(k: Int) -> Int / {db.get[users]} = lookup(k) + lookup(k)\nfn seeded(k: Int) -> Int = handle { twice(k) } with { db.get[users](n) -> n * 10 }\ntest \"handled\" { assert_eq(seeded(2), 40) }\n"
 
 test "editing an effect handler reports only the definition containing the handler, not the functions that run under it" {
-  assert_eq(kinds(handled_source, handled_source.replace("n * 10", "n * 11"), "handled"), [
-    "seeded edited",
+  assert_eq(kinds(handled_source, handled_source.replace("n * 10", "n * 11"), "m.handled"), [
+    "m.seeded edited",
   ])
 }
 
@@ -415,32 +420,27 @@ test "editing an effect declaration reports the declaration as edited, and the f
     "}\nfn lookup",
     "  read peek[users](key: Int) -> Int\n}\nfn lookup",
   );
-  let o = over(tree_of_source(handled_source), tree_of_source(after), "handled", every);
+  let o = over(tree_of_source(handled_source), tree_of_source(after), "m.handled", every);
   assert_eq(
     o.delta.changes.map(|c: Change|
       { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
-    [{ name: "db", declaration: true, kind: Edited }],
+    [{ name: "m.db", declaration: true, kind: Edited }],
   )
 }
 
-test "a rename beside an edit shows the old name removed and the new one added" {
+test "a definition renamed beside an edit to its callee is still a rename" {
   let after = "fn leaf(n: Int) -> Int = n + 2\nfn middle(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = middle(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n";
-  assert_eq(kinds(call_chain_source, after, "chain"), [
-    "leaf edited",
-    "mid removed",
-    "middle added",
-    "top edited",
-  ])
+  assert_eq(kinds(call_chain_source, after, "m.chain"), ["m.leaf edited", "m.top edited"])
 }
 
 test "when a function and a type share a name, reordering the type's variants reports only the type as edited" {
   let collide = "type Amount = Cents(Int) | Dollars(Int)\nfn Amount(n: Int) -> Int = n + 1\nfn use_it(a: Amount) -> Int = match a { Cents(c) -> c, Dollars(d) -> d * 100 }\ntest \"t\" { assert_eq(use_it(Cents(5)), 5) }\n";
   let swapped = collide.replace("Cents(Int) | Dollars(Int)", "Dollars(Int) | Cents(Int)");
-  let o = over(tree_of_source(collide), tree_of_source(swapped), "t", every);
+  let o = over(tree_of_source(collide), tree_of_source(swapped), "m.t", every);
   assert_eq(
     o.delta.changes.map(|c: Change|
       { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
-    [{ name: "Amount", declaration: true, kind: Edited }],
+    [{ name: "m.Amount", declaration: true, kind: Edited }],
   )
 }
 
@@ -451,13 +451,13 @@ test "an edited definition's diff shows the full old and new lines of the defini
   let diffs = over(
     tree_of_source(call_chain_source),
     tree_of_source(leaf_edited),
-    "chain",
+    "m.chain",
     every,
   ).diffs;
-  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["leaf"]);
+  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["m.leaf"]);
   assert_eq(diffs.map(|d: ChangeDiff| d.diff), [
     Some(
-      "--- leaf\n+++ leaf\n@@ -1 +1 @@\n-fn leaf(n: Int) -> Int = n + 1\n+fn leaf(n: Int) -> Int = n + 2\n",
+      "--- m.leaf\n+++ m.leaf\n@@ -1 +1 @@\n-fn leaf(n: Int) -> Int = n + 1\n+fn leaf(n: Int) -> Int = n + 2\n",
     ),
   ]);
   assert(diffs.all(|d: ChangeDiff| d.at != None))
@@ -466,8 +466,8 @@ test "an edited definition's diff shows the full old and new lines of the defini
 test "an edited test shows its own diff, and an added or a removed definition shows one side" {
   let before = "fn spare() -> Int = 1\nfn leaf(n: Int) -> Int = n + spare()\ntest \"chain\" { assert_eq(leaf(1), 2) }\n";
   let after = "fn bump(n: Int) -> Int = n\nfn leaf(n: Int) -> Int = bump(n) + 1\ntest \"chain\" { assert_eq(leaf(1), 3) }\n";
-  let diffs = over(tree_of_source(before), tree_of_source(after), "chain", every).diffs;
-  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["chain", "bump", "leaf", "spare"]);
+  let diffs = over(tree_of_source(before), tree_of_source(after), "m.chain", every).diffs;
+  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["m.chain", "m.bump", "m.leaf", "m.spare"]);
   assert_eq(
     diffs.map(|d: ChangeDiff|
       d.diff.unwrap_or("").contains("+test \"chain\" { assert_eq(leaf(1), 3) }")),
@@ -482,10 +482,10 @@ test "when the store has no earlier source text for a definition, it is reported
   let diffs = over(
     tree_of_source(call_chain_source),
     tree_of_source(leaf_edited),
-    "chain",
+    "m.chain",
     |_h: Bytes| false,
   ).diffs;
-  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["leaf", "mid", "top"]);
+  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["m.leaf"]);
   assert(diffs.all(|d: ChangeDiff| d.diff == None && d.at != None))
 }
 
@@ -494,7 +494,8 @@ test "a recorded text is the whole lines of a definition, a type, an effect and 
   let t = tree_of_source(source);
   let hashes = t.whole.hashes;
   let wanted = hashes.definitions.concat(hashes.declarations).filter(
-    |x: { name: Bytes, hash: Bytes }| x.name == b"size" || x.name == b"Shape" || x.name == b"db",
+    |x: { name: Bytes, hash: Bytes }|
+      x.name == b"m.size" || x.name == b"m.Shape" || x.name == b"m.db",
   ).map(|x: { name: Bytes, hash: Bytes }| x.hash).concat(
     hashes.tests.values(),
   );
