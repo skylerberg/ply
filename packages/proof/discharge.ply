@@ -18,7 +18,12 @@ import sim.search (Exact, Cause, RunFailed, InvalidRecording, Diverged, explore_
 import std.list
 import compiler.check.resolve.tables (InSource, Place)
 
-pub type ClaimToDischarge = { claim: Int, obligation: Obligation, resolved: StaticResult }
+pub type ClaimToDischarge<a> = {
+  claim: Int,
+  obligation: Obligation,
+  resolved: StaticResult,
+  reported_as: a,
+}
 
 pub type Batch = { claim_index: Int, points: List<List<Value>>, mode: JudgeMode }
 
@@ -30,17 +35,17 @@ pub type RuntimeReply = | Judgements(List<List<Judgement>>) | Interleaved(LawRun
 
 pub type LawRun = { interleaving: Interleaving<Judgement>, observed: Bool }
 
-pub fn discharged<| e>(
-  claims: List<ClaimToDischarge>,
+pub fn discharged<a | e>(
+  claims: List<ClaimToDischarge<a>>,
   world: ProverInput,
   sim: plan::Plan,
   ask: (RuntimeRequest) -> RuntimeReply / e,
-  report_outcome: (Int, Outcome) -> Unit / e,
+  report_outcome: (a, Outcome) -> Unit / e,
 ) -> List<Outcome> / {abort.raise | e} = {
-  let works = claims.map(|a: ClaimToDischarge| plan_claim(a, world));
+  let works = claims.map(|c: ClaimToDischarge<a>| plan_claim(c, world));
   range(0, works.len()).fold((), |_: Unit, i: Int|
     match ((works.at(i), claims.at(i))) {
-      (Some(Finished(o)), Some(a)) -> report_outcome(a.claim, o),
+      (Some(Finished(o)), Some(a)) -> report_outcome(a.reported_as, o),
       _ -> (),
     });
   let batches = range(0, works.len()).fold([], |accumulator: List<Batch>, i: Int|
@@ -75,7 +80,7 @@ pub fn discharged<| e>(
             EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
             CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
           };
-          report_outcome(a.claim, outcome);
+          report_outcome(a.reported_as, outcome);
           { outcomes: accumulator.outcomes.push(outcome), next: accumulator.next + 1 }
         },
         _ -> accumulator,
@@ -100,7 +105,7 @@ type ClaimWork = | Finished(Outcome) | NeedsPoints(PointPlan)
 fn certificate_of(s: StaticProof, ran: Bool) -> Certificate =
   { rules: s.rules, steps: s.steps, guard_satisfiable: true, sorts: s.sorts, ran: ran }
 
-fn guard_place(obligation: Obligation) -> Place =
+pub fn guard_place(obligation: Obligation) -> Place =
   match obligation.guards.at(0) { Some(g) -> g, None -> obligation.at }
 
 fn open_reason(s: FailedAttempt) -> Reason =
@@ -119,7 +124,7 @@ fn every_point(domain: Domain) -> Option<List<List<Value>>> / {abort.raise} =
       Some(points) -> match point_at(domain, i) { Some(vs) -> Some(points.push(vs)), None -> None },
     })
 
-fn plan_claim(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort.raise} = {
+fn plan_claim<a>(claim: ClaimToDischarge<a>, world: ProverInput) -> ClaimWork / {abort.raise} = {
   let o = claim.obligation;
   match o.strategy {
     Interleave(points) -> match points {
@@ -137,12 +142,12 @@ fn plan_claim(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort
     Bounded -> match claim.resolved {
       Certified(s) -> Finished(Proved(certificate_of(s, false))),
       Unwitnessed(s) -> Finished(Proved(certificate_of(s, false))),
-      GuardRefuted -> Finished(Vacuous({ guard: guard_place(o) })),
+      GuardRefuted -> Finished(Vacuous),
       Undecided(stopped) -> Finished(Unproved(open_reason(stopped))),
     },
     Static(after) -> match claim.resolved {
       Certified(s) -> Finished(Proved(certificate_of(s, false))),
-      GuardRefuted -> Finished(Vacuous({ guard: guard_place(o) })),
+      GuardRefuted -> Finished(Vacuous),
       _ -> match after {
         Unhandled(row) -> Finished(Unproved(UnhandledEffect(Some(row)))),
         Run(Every(domain, name)) -> match every_point(domain) {
@@ -163,7 +168,7 @@ fn plan_claim(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort
   }
 }
 
-fn plan_search(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort.raise} = {
+fn plan_search<a>(claim: ClaimToDischarge<a>, world: ProverInput) -> ClaimWork / {abort.raise} = {
   let o = claim.obligation;
   let points = if o.binders.fold(false, |any: Bool, b: Binder| any || !b.constructible) { [] }
   else { candidates(o.binders.map(|b: Binder| b.ty), world.declarations, o.literals) };
@@ -174,7 +179,7 @@ fn plan_search(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abor
     Undecided(stopped) -> if points.len() == 0 { Finished(Unproved(open_reason(stopped))) }
     else { NeedsPoints({ kind: CounterexampleSearch(stopped), points: points, domain: None }) },
     Certified(s) -> Finished(Proved(certificate_of(s, false))),
-    GuardRefuted -> Finished(Vacuous({ guard: guard_place(o) })),
+    GuardRefuted -> Finished(Vacuous),
   }
 }
 
@@ -243,7 +248,7 @@ fn enumeration_outcome(
   let w = first_decisive(obligation, p, js);
   match w.stop {
     Some(o) -> o,
-    None -> if w.held == 0 { Vacuous({ guard: guard_place(obligation) }) } else {
+    None -> if w.held == 0 { Vacuous } else {
       match witness {
         Some(c) -> Proved(c),
         None -> {
@@ -326,8 +331,8 @@ type Totals = {
 
 type SimulationCount = { entered: Int, observed: Bool }
 
-fn search_interleavings<| e>(
-  claim: ClaimToDischarge,
+fn search_interleavings<a | e>(
+  claim: ClaimToDischarge<a>,
   p: PointPlan,
   points: List<List<Value>>,
   plan_search: plan::Plan,
@@ -461,7 +466,7 @@ fn law_outcome(
   sim: plan::Plan,
   t: Totals,
 ) -> Outcome =
-  if admitted_points == 0 { Vacuous({ guard: guard_place(obligation) }) }
+  if admitted_points == 0 { Vacuous }
   else if !proves(sim, t) { Unproved(Unsearched(t.evaluations)) } else {
     let d = match p.domain { Some(x) -> x, None -> { name: "", points: 0 } };
     Proved({
@@ -540,7 +545,7 @@ fn run_one<| e>(
   ask: (RuntimeRequest) -> RuntimeReply / e,
 ) -> Outcome / {abort.raise | e} =
   match discharged(
-      [{ claim: 0, obligation: obligation, resolved: resolved }],
+      [{ claim: 0, obligation: obligation, resolved: resolved, reported_as: 0 }],
       empty_prover_input,
       sim,
       ask,
@@ -573,10 +578,7 @@ test "a claim proved by the static prover is accepted without calling the runtim
     run_one(o, Certified(ground_static_proof), plan::default_plan, no_runtime()),
     Proved(certificate(false)),
   );
-  assert_eq(
-    run_one(o, GuardRefuted, plan::default_plan, no_runtime()),
-    Vacuous({ guard: InSource({ module: 0, start: 3, end: 4 }) }),
-  )
+  assert_eq(run_one(o, GuardRefuted, plan::default_plan, no_runtime()), Vacuous)
 }
 
 test "a claim the prover cannot close is reported open, even when every tested point passes" {
@@ -697,10 +699,7 @@ test "checking a domain stops at the first point where the claim fails, and is v
     _ -> panic("not refuted"),
   };
   let rejecting = runtime_from_rule(|mode: JudgeMode, p: List<Value>| PointRejected);
-  assert_eq(
-    run_one(bool_claim, undecided, plan::default_plan, rejecting),
-    Vacuous({ guard: InSource({ module: 0, start: 3, end: 4 }) }),
-  );
+  assert_eq(run_one(bool_claim, undecided, plan::default_plan, rejecting), Vacuous);
   let raising = runtime_from_rule(|mode: JudgeMode, p: List<Value>|
     PointRaised({ message: "no", values: [] }));
   assert(match run_one(bool_claim, undecided, plan::default_plan, raising) {
@@ -762,17 +761,24 @@ test "one runtime request checks the inputs of all claims that need it, each cla
     };
   let outcomes = discharged(
     [
-      { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided },
+      {
+        claim: 4,
+        obligation: open_claim([int_binder("x")]),
+        resolved: undecided,
+        reported_as: 4,
+      },
       {
         claim: 5,
         obligation: open_claim([int_binder("x")]),
         resolved: Certified(ground_static_proof),
+        reported_as: 5,
       },
-      { claim: 7, obligation: bool_claim, resolved: undecided },
+      { claim: 7, obligation: bool_claim, resolved: undecided, reported_as: 7 },
       {
         claim: 9,
         obligation: open_claim([int_binder("x")]),
         resolved: Unwitnessed(ground_static_proof),
+        reported_as: 9,
       },
     ],
     empty_prover_input,
@@ -791,11 +797,17 @@ test "each claim is reported once when decided, and claims resolved statically a
   let order = handle {
     discharged(
       [
-        { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided },
+        {
+          claim: 4,
+          obligation: open_claim([int_binder("x")]),
+          resolved: undecided,
+          reported_as: 4,
+        },
         {
           claim: 5,
           obligation: open_claim([int_binder("x")]),
           resolved: Certified(ground_static_proof),
+          reported_as: 5,
         },
       ],
       empty_prover_input,
@@ -1019,8 +1031,5 @@ test "a law whose guard rejects every point of its domain is vacuous" {
       },
       RunInterleaving(_, _, _, _) -> panic("nothing kept, so nothing to search"),
     };
-  assert_eq(
-    run_one(bool_law, undecided, dpor_plan(64), rejecting),
-    Vacuous({ guard: InSource({ module: 0, start: 3, end: 4 }) }),
-  )
+  assert_eq(run_one(bool_law, undecided, dpor_plan(64), rejecting), Vacuous)
 }

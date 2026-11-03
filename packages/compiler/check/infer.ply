@@ -8,6 +8,7 @@ import compiler.check.resolve.tables (other_modules)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (termination_facts)
 import compiler.check.infer.checker (elsewhere)
+import compiler.check.infer.checker (GroupModule, own_module)
 import compiler.check.infer.checker (CheckReads, with_no_other_definitions, constraints_of,
                                      EffectsSource, WrittenEffects, InferredEffects, WidenedByError)
 import compiler.syntax.parsing (Span, span_between, node_id_base, generated_span, moved_by)
@@ -93,7 +94,8 @@ type CheckResult = { checker: Checker, ok: Bool }
 pub fn check_program(
   resolved: Resolution,
   modules: List<ParsedModule>,
-) -> CheckResult / {abort.raise} = check_program_with(resolved, modules, empty_cache(modules.len()))
+) -> CheckResult / {abort.raise} =
+  check_program_with(resolved, modules.map(own_module), empty_cache)
 
 pub fn check_diagnostics(
   resolved: Resolution,
@@ -121,7 +123,7 @@ pub type CheckOutput = {
 
 pub fn check_output_with(
   resolved: Resolution,
-  modules: List<ParsedModule>,
+  modules: List<GroupModule>,
   known: CheckCache,
 ) -> { checked: CheckOutput, bodies: List<CheckedBody>, declared: StoredDeclarations } / {abort.raise, CheckReads} = {
   let out = check_every_module(resolved, modules, known);
@@ -633,7 +635,7 @@ pub fn measured_definitions(definitions: List<DefinitionInfo>) -> Set<Bytes> =
 
 pub fn bodies_with(
   resolved: Resolution,
-  modules: List<ParsedModule>,
+  modules: List<GroupModule>,
   known: CheckCache,
 ) -> Option<List<TypedBody<Type>>> / {abort.raise, elsewhere.read} = {
   let out = check_program_with(resolved, modules, known);
@@ -737,19 +739,20 @@ fn param_named(params: Map<Bytes, Int>, v: Int) -> Option<Bytes> =
 
 pub fn check_program_with(
   resolved: Resolution,
-  modules: List<ParsedModule>,
+  modules: List<GroupModule>,
   known: CheckCache,
 ) -> CheckResult / {abort.raise} =
   with_no_other_definitions(|| check_every_module(resolved, modules, known))
 
 fn check_every_module(
   resolved: Resolution,
-  modules: List<ParsedModule>,
+  modules: List<GroupModule>,
   known: CheckCache,
 ) -> CheckResult / {abort.raise, mode_facts.read, elsewhere.read, termination_facts.read, other_modules.read} = {
   let c0 = new_checker(resolved, modules, known);
+  let parsed = |i: Int| modules.get(i).parsed;
   let declared: Checker = resolved.order.fold(c0, |checker: Checker, i: Int| {
-    let m = modules.get(i);
+    let m = parsed(i);
     let c1: Checker = { ..checker, module: i };
     let typed: Checker = collect_nominals(collect_effects(collect_types(c1, m), m), m);
     collect_instances(
@@ -759,11 +762,11 @@ fn check_every_module(
   });
   let declared: Checker = { ..declared, resource_types: resource_types(declared) };
   let ordered = resolved.order.fold(with_orders(declared), |checker: Checker, i: Int|
-    with_declared_aliases({ ..checker, module: i }, modules.get(i)));
+    with_declared_aliases({ ..checker, module: i }, parsed(i)));
   let signed = resolved.order.fold(
     { checker: ordered, by: Map::new() },
     |accumulator: { checker: Checker, by: Map<Int, ModuleSignatures> }, i: Int| {
-      let o = bind_signatures({ ..accumulator.checker, module: i }, modules.get(i));
+      let o = bind_signatures({ ..accumulator.checker, module: i }, parsed(i));
       { checker: o.checker, by: accumulator.by.insert(i, o.signed) }
     },
   );
@@ -772,12 +775,12 @@ fn check_every_module(
       Some(s) -> s.names.len() > 0 && s.names.all(|n: Bytes| known.definitions.contains(n)),
       None -> false,
     };
-  let rank = |i: Int| if read(i) { 0 } else if sees_homes(modules.get(i).name) { 2 } else { 1 };
+  let rank = |i: Int| if read(i) { 0 } else if sees_homes(parsed(i).name) { 2 } else { 1 };
   let checked: Checker = [0, 1, 2].fold([], |accumulator: List<Int>, r: Int|
     accumulator.concat(resolved.order.filter(|i: Int| rank(i) == r))).fold(
     signed.checker,
     |checker: Checker, i: Int| {
-      let m = modules.get(i);
+      let m = parsed(i);
       match signed.by.get(i) {
         Some(s) -> check_specs(check_bodies({ ..checker, module: i }, m, s), m),
         None -> panic("a module of the program has no checked signatures"),
@@ -786,8 +789,8 @@ fn check_every_module(
   );
   let tested: Checker = range(0, modules.len()).fold(checked, |checker: Checker, i: Int|
     check_laws(
-      check_schemas(check_tests({ ..checker, module: i }, modules.get(i)), modules.get(i)),
-      modules.get(i),
+      check_schemas(check_tests({ ..checker, module: i }, parsed(i)), parsed(i)),
+      parsed(i),
     ));
   let resolved: Checker = check_columns(
     check_bit_operations(check_numerics(check_concats(check_updates(check_instances(tested))))),
@@ -1042,7 +1045,7 @@ fn written_at(checker: Checker, at: Span) -> List<Bytes> / {abort.raise} =
   nodes_where(checker, |s: Span| covers_source(s, at)).map(|e: TypedExpression<Type>| shown(e.ty))
 
 fn source_expression_at(checker: Checker, at: Span) -> Expression / {abort.raise} =
-  match expressions_matching(checker.modules.get(0).module, |e: Expression|
+  match expressions_matching(checker.modules.get(0).parsed.module, |e: Expression|
       expression_span(e).start == at.start && expression_span(e).end == at.end) {
     [e, ..] -> e,
     [] -> panic("no node is written there"),
