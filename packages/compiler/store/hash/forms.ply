@@ -307,6 +307,8 @@ const identity_domain: Bytes = b"ply.identity.2"
 
 const node_domain: Bytes = b"ply.node.1"
 
+const rejected_domain: Bytes = b"ply.rejected.1"
+
 pub fn own_hash(payload: Bytes) -> Bytes = blake3(own_domain.concat(payload))
 
 pub fn spec_hash(owner: Bytes, kind: Int, index: Int, payload: Bytes) -> Bytes / {abort.raise} =
@@ -386,6 +388,8 @@ pub type ReadIdentities = { body: Bytes, contract: Bytes, proof: Bytes }
 derive bin for ReadIdentities
 
 pub type DefinitionIdentities = { reference: NodeRef, identities: ReadIdentities }
+
+pub type DefinitionElsewhere = | HashedElsewhere(ReadIdentities) | RejectedElsewhere
 
 pub type WorldIdentities = {
   definitions: List<DefinitionIdentities>,
@@ -470,6 +474,9 @@ fn identity_read(found: ReadIdentities, reading: Reading) -> Bytes =
     ReadsProof -> found.proof,
   }
 
+fn rejected_identity(reference: NodeRef) -> Bytes / {abort.raise} =
+  digest_of(rejected_domain, [definition_key(reference.name, reference.kind)], [])
+
 fn local_nodes(targets: List<Resolved>) -> List<Int> =
   targets.flat_map(|t: Resolved| match t { LocalNode(n) -> [n], KnownIdentity(_) -> [] })
 
@@ -488,7 +495,7 @@ fn world_of(definitions: List<DefinitionHash>) -> World =
 
 pub fn world_identities<| e>(
   own: OwnHashes,
-  beyond: (NodeRef) -> List<ReadIdentities> / {abort.raise | e},
+  beyond: (NodeRef) -> DefinitionElsewhere / {abort.raise | e},
   boundary: (Origin, NodeRef) -> Boundary / {abort.raise | e},
 ) -> WorldIdentities / {abort.raise | e} = {
   let world = world_of(own.definitions);
@@ -498,17 +505,18 @@ pub fn world_identities<| e>(
       OutsidePackage -> next.outside,
     };
     match world.at.get(definition_key(next.reference.name, next.reference.kind)) {
-      Some(i) -> [LocalNode(node_at(i, reading))],
-      None ->
-        beyond(next.reference).map(|found: ReadIdentities|
-          KnownIdentity(identity_read(found, reading))),
+      Some(i) -> LocalNode(node_at(i, reading)),
+      None -> match beyond(next.reference) {
+        HashedElsewhere(found) -> KnownIdentity(identity_read(found, reading)),
+        RejectedElsewhere -> KnownIdentity(rejected_identity(next.reference)),
+      },
     }
   };
   let nodes = world.definitions.flat_map(|d: DefinitionHash|
     readings.map(|reading: Reading| { definition: d, reading: reading }));
   let targets = nodes.map(|node: ReadNode| {
     let origin = FromDefinition({ name: node.definition.name, kind: node.definition.kind });
-    nexts_of(node.definition, node.reading).flat_map(|next: Next| resolved(origin, next))
+    nexts_of(node.definition, node.reading).map(|next: Next| resolved(origin, next))
   });
   let condensed = condensation({ out: targets.map(local_nodes) });
   let component_identities = range(0, condensed.members.len()).fold(
@@ -548,10 +556,8 @@ pub fn world_identities<| e>(
         identity: digest_of(
           identity_domain,
           [begun.own],
-          first_reads(policy_of(begun.subject), begun.uses).flat_map(|next: Next|
-            resolved(origin, next)).map(
-            identity_of_target,
-          ),
+          first_reads(policy_of(begun.subject), begun.uses).map(|next: Next|
+            identity_of_target(resolved(origin, next))),
         ),
       }
     }),
@@ -590,7 +596,17 @@ pub fn hash_identities(
   hashes: HashOutput,
   boundary: (Origin, NodeRef) -> Boundary / {abort.raise},
 ) -> Identities / {abort.raise} =
-  identities_of(world_identities(hashes.own, |_: NodeRef| [], boundary).subjects)
+  identities_of(
+    world_identities(
+      hashes.own,
+      |reference: NodeRef|
+        panic(
+          "internal error: the program's hashes read `" ++ String::of_bytes_lossy(reference.name)
+            ++ "`, which they do not hash",
+        ),
+      boundary,
+    ).subjects,
+  )
 
 pub type TestIdentities = | PlainTestRun(Bytes) | TestRunOverCases({ run: Bytes, listing: Bytes })
 
