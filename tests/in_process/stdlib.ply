@@ -1,5 +1,5 @@
 import harness (scratch, in_memory, one_module_tree, tree, on_disk, warm_matches_cold, Hermetic,
-                Shipped, std_tree, std_data, on_disk_shipping, on_disk_shipping_only, over_tree,
+                Shipped, std_data, on_disk_shipping, on_disk_shipping_only, over_tree,
                 with_prelude_shipped)
 import spawning.harness (WorkingDirectory, PlyProcess, spawned_warm_agrees, Source, write_project,
                          write_program, write, all_output, stdout, json_of, at, path, nth, items,
@@ -23,14 +23,14 @@ fn named(list: Json, name: String) -> Option<Json> =
 
 fn has_named(list: Json, name: String) -> Bool = named(list, name) != None
 
-fn hash_of(report: Json, name: String) -> String / {abort.raise} =
+fn definition_named(report: Json, name: String) -> Json / {abort.raise} =
   match named(at(report, "definitions"), name) {
-    Some(d) -> str(at(d, "hash")),
+    Some(d) -> d,
     None -> panic("`" ++ name ++ "` is not in the program: " ++ json_text(report)),
   }
 
-fn hashed(t: MemFs) -> Json / {Hermetic, Shipped, abort.raise, diverges} =
-  json_of(in_memory(t, ["hash", "--json"]))
+fn hash_of(report: Json, name: String) -> String / {abort.raise} =
+  str(at(definition_named(report, name), "hash"))
 
 fn tests_hashed(report: Json) -> List<String> =
   items(at(report, "tests")).map(|t: Json| str(at(t, "hash")))
@@ -205,28 +205,30 @@ fn mention_count(
   sources.map(|s: Source| s.text).concat(more).fold(0, |n: Int, text: String|
     words.fold(n, |k: Int, word: String| k + text.split(word).len() - 1))
 
-test "definitions in a standard library module have the same hashes as the same definitions in a project module" {
+fn shipped_text(path: String) -> String / {abort.raise} =
+  match two_shipped.filter(|s: Source| s.path == path) {
+    [s, ..] -> s.text,
+    [] -> panic("`two_shipped` ships `" ++ path ++ "`"),
+  }
+
+test "definitions in a standard library module, and one that embeds its data file, have the same hashes as the same definitions copied into a project" {
   scratch(|| {
-    let shipped_text = match two_shipped.filter(|s: Source| s.path == "std.kept.ply") {
-      [s, ..] -> s.text,
-      [] -> panic("`two_shipped` ships `std.kept`"),
-    };
-    let caller = |module: String|
-      "import " ++ module ++ " (one)\n\npub fn two() -> Int = one() + one()\n";
+    let caller = |kept: String, idle: String|
+      "import " ++ kept ++ " (one)\nimport " ++ idle
+        ++ " (words)\n\npub fn two() -> Int = one() + words().len()\n";
     let hashes = |files: List<Source>| {
       write_project(files);
       json_of(on_disk_shipping_only(["hash", "--json"], two_shipped))
     };
-    let shipped = hashes([{ path: "app.ply", text: caller("std.kept") }]);
+    let shipped = hashes([{ path: "app.ply", text: caller("std.kept", "std.idle") }]);
     let copied = hashes([
-      { path: "mine.ply", text: shipped_text },
-      { path: "app.ply", text: caller("mine") },
+      { path: "kept.ply", text: shipped_text("std.kept.ply") },
+      { path: "idle.ply", text: shipped_text("std.idle.ply") },
+      { path: "idle/words.txt", text: shipped_text("std/idle/words.txt") },
+      { path: "app.ply", text: caller("kept", "idle") },
     ]);
-    assert(
-      hash_of(shipped, "std.kept.one") == hash_of(copied, "mine.one"),
-      Some("a shipped definition must hash like a project one"),
-    );
-    assert_eq(hash_of(shipped, "app.two"), hash_of(copied, "app.two"))
+    assert_eq(hash_of(shipped, "std.kept.one"), hash_of(copied, "kept.one"));
+    assert_eq(hash_of(shipped, "std.idle.words"), hash_of(copied, "idle.words"))
   })
 }
 
@@ -299,7 +301,7 @@ test "`ply check` loads only the standard library definitions a program calls, a
   })
 }
 
-test "renaming a project definition that calls a standard library definition does not change any hash" {
+test "renaming a project definition that calls a standard library definition keeps its hash and the standard library's, and changes the hash of the test that names it" {
   let hashed_with = |text: String|
     over_tree(one_module_tree(text), ||
       json_of(on_disk_shipping_only(["hash", "--json"], two_shipped))).value;
@@ -310,7 +312,7 @@ test "renaming a project definition that calls a standard library definition doe
     Some("renaming a definition changed its hash"),
   );
   assert_eq(hash_of(before, "std.kept.one"), hash_of(after, "std.kept.one"));
-  assert(tests_hashed(before) == tests_hashed(after), Some("a test re-runs"))
+  assert(tests_hashed(before) != tests_hashed(after), Some("the test names the renamed definition"))
 }
 
 const two_shipped: List<Source> =
@@ -772,40 +774,38 @@ test/nondet "`ply check` gives the same result with a cache from an earlier run 
   assert(has_named(at(warm, "definitions"), "std.oid.registry"), Some(json_text(warm)))
 }
 
-test "editing a standard library data file changes the hash of exactly the definitions that depend on it" {
+fn closure_listed(entry: Json) -> List<String> = items(at(entry, "closure")).map(str)
+
+test "editing a standard library data file changes the hash of only the definition that embeds it, and each definition and test that calls it has it in its closure" {
   let renamed = {
     path: oid_names.path,
     text: oid_names.text.replace("2.5.4.3 commonName", "2.5.4.3 cn"),
   };
   assert(renamed.text != oid_names.text, Some("the edit landed"));
   let hashes = |shipped: List<Source>|
-    over_tree(app(naming), || json_of(on_disk_shipping(["hash", "--json"], shipped))).value;
+    over_tree(app(naming), ||
+      json_of(on_disk_shipping(["hash", "--json", "--dependencies"], shipped))).value;
   let before = hashes([]);
   let after = hashes([renamed]);
-  ["std.oid.registry", "std.oid.name", "app.named", "app.main"].fold((), |u: Unit, name: String|
-    assert(hash_of(before, name) != hash_of(after, name), Some(name)));
-  ["std.oid.common_name", "std.oid.arcs", "app.plain"].fold((), |u: Unit, name: String|
+  assert(hash_of(before, "std.oid.registry") != hash_of(after, "std.oid.registry"), None);
+  [
+    "std.oid.name",
+    "std.oid.common_name",
+    "std.oid.arcs",
+    "app.named",
+    "app.main",
+    "app.plain",
+  ].fold((), |u: Unit, name: String|
     assert(hash_of(before, name) == hash_of(after, name), Some(name)));
-  assert(tests_hashed(before) != tests_hashed(after), Some("the test that reads a name reruns"));
-  assert_eq(hashes([oid_names]), before)
-}
-
-test "copying a shipped module and its data file into a project produces identical hashes" {
-  let source = match std_tree.filter(|f: { name: String, bytes: Bytes }| f.name == "oid.ply") {
-    [f, ..] -> String::of_bytes(f.bytes),
-    [] -> panic("the standard library's tree holds no `oid.ply`"),
-  };
-  let shipped = hashed(app(naming));
-  let copied = hashed(
-    tree([
-      { path: "mine.ply", text: source },
-      { path: "oid/names.txt", text: oid_names.text },
-      { path: "app.ply", text: naming.replace("import std.oid", "import mine as oid") },
-    ]),
+  let depends = |entry: Json| closure_listed(entry).contains("std.oid.registry");
+  ["std.oid.name", "app.named", "app.main"].fold((), |u: Unit, name: String|
+    assert(depends(definition_named(before, name)), Some(name)));
+  assert(!depends(definition_named(before, "app.plain")), Some(json_text(before)));
+  assert(
+    items(at(before, "tests")).all(depends),
+    Some("the test that reads a name reruns: " ++ json_text(before)),
   );
-  ["registry", "name", "common_name"].fold((), |u: Unit, name: String|
-    assert_eq(hash_of(shipped, "std.oid." ++ name), hash_of(copied, "mine." ++ name)));
-  assert_eq(hash_of(shipped, "app.named"), hash_of(copied, "app.named"))
+  assert_eq(hashes([oid_names]), before)
 }
 
 test "a program that uses nothing from a standard library module's data file has no definition whose hash changes when the file is edited" {

@@ -46,7 +46,9 @@ import compiler.front.checking.groups (UnitKey, GroupSource, OwnerFacts, OwnerKe
                                        stored_declarations_of, context_once, GroupOutput,
                                        CurrentGroup, ObsoleteGroup, group_output_bin,
                                        current_output, is_current_unit, module_key_of,
-                                       TextPositions, GroupPositions, FilePositions)
+                                       TextPositions, GroupPositions, FilePositions, owner_key_at,
+                                       states_measure)
+import compiler.front.checking.program_facts (own_key)
 
 pub fn cost_walk_query() -> QueryOf<UnitKey, GroupOutput<GroupWalk>> =
   { name: b"cost walk", input: unit_key_bin(), output: group_output_bin(group_walk_bin()) }
@@ -89,11 +91,6 @@ fn module_of_unit(u: UnitKey) -> ModuleKey =
 
 fn loaded_unit(u: UnitKey) -> LoadedOwners = { named: module_of_unit(u), owners: u.owners }
 
-fn root_module(module: Bytes) -> ModuleKey = { module: module, shipped: false, tested: false }
-
-fn owner_at(named: ModuleKey, owner: Bytes) -> OwnerKey =
-  { module: named.module, shipped: named.shipped, tested: named.tested, owner: owner }
-
 fn functions_of(read: OwnersResult, wanted: (OutlineItem) -> Bool) -> Set<Bytes> =
   read.shape.outline.items.fold(Set::empty(), |found: Set<Bytes>, item: OutlineItem|
     match item {
@@ -108,9 +105,6 @@ fn functions_of(read: OwnersResult, wanted: (OutlineItem) -> Bool) -> Set<Bytes>
     })
 
 fn any_function(_: OutlineItem) -> Bool = true
-
-fn measured_function(item: OutlineItem) -> Bool =
-  match item { OutlinedFunction(f) -> f.measured, _ -> false }
 
 fn is_test_or_law(owner: Bytes) -> Bool = owner.starts_with(b"test ") || owner.starts_with(b"law ")
 
@@ -213,7 +207,7 @@ pub fn cost_demands_result(named: ModuleKey) -> Written / {memo.read, abort.rais
 pub fn cost_parameters_result(_: Unit) -> Written / {memo.read, abort.raise} =
   written(
     cost_parameters_query(),
-    parameters_of(root_modules().map(|m: Bytes| fetch(cost_demands_query(), root_module(m)))),
+    parameters_of(root_modules().map(|m: Bytes| fetch(cost_demands_query(), own_key(m)))),
   )
 
 pub fn module_parameters_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
@@ -257,20 +251,25 @@ fn owners_of_function(name: Bytes) -> List<OwnerKey> / {memo.read, abort.raise} 
 fn hashed_nodes(o: OwnerKey) -> List<DefinitionHash> / {memo.read, abort.raise} =
   fetch(owner_hash_query(), o).definitions
 
-fn states_clauses(o: OwnerKey) -> Bool / {memo.read, abort.raise} =
-  hashed_nodes(o).any(|n: DefinitionHash| n.clauses.len() > 0)
+fn states_contract(o: OwnerKey) -> Bool / {memo.read, abort.raise} =
+  hashed_nodes(o).any(|n: DefinitionHash| n.clauses.len() > 0 || n.transparent)
 
-type References = { body: List<NodeRef>, clauses: List<NodeRef> }
+type References = { body: List<NodeRef>, clauses: List<NodeRef>, contract: List<NodeRef> }
 
 fn references_of(o: OwnerKey) -> References / {memo.read, abort.raise} =
   if is_test_or_law(o.owner) {
     let own = group_hashes_of(unit_key_of(o));
-    { body: own.tests.flat_map(test_uses), clauses: own.laws.flat_map(|l: LawHash| l.uses) }
+    {
+      body: own.tests.flat_map(test_uses),
+      clauses: own.laws.flat_map(|l: LawHash| l.uses),
+      contract: [],
+    }
   } else {
     let nodes = hashed_nodes(o);
     {
       body: nodes.flat_map(|n: DefinitionHash| n.uses),
       clauses: nodes.flat_map(|n: DefinitionHash| n.clause_uses),
+      contract: nodes.flat_map(|n: DefinitionHash| n.contract_uses),
     }
   }
 
@@ -301,8 +300,15 @@ fn outside_expanded(
 ) -> { value: Bool, next: List<Wanted> } / {memo.read, abort.raise} =
   match need {
     NeedsBody -> { value: true, next: wanted_as(NeedsBody, functions_used_by(o)) },
-    NeedsContract -> if !states_clauses(o) { { value: false, next: [] } }
-    else { { value: true, next: wanted_as(NeedsBody, functions_named(references_of(o).clauses)) } },
+    NeedsContract -> if !states_contract(o) { { value: false, next: [] } } else {
+      let references = references_of(o);
+      {
+        value: true,
+        next: wanted_as(NeedsBody, functions_named(references.clauses)).concat(
+          wanted_as(NeedsContract, functions_named(references.contract)),
+        ),
+      }
+    },
   }
 
 fn bodies_reached(start: List<OwnerKey>) -> Map<NameInModule, OwnerKey> / {memo.read, abort.raise} =
@@ -321,7 +327,7 @@ fn with_loaded_owner(found: Map<Bytes, LoadedOwners>, o: OwnerKey) -> Map<Bytes,
 
 fn groups_reached(u: UnitKey) -> List<LoadedOwners> / {memo.read, abort.raise} = {
   let named = module_of_unit(u);
-  let reached = bodies_reached(u.owners.map(|o: Bytes| owner_at(named, o)));
+  let reached = bodies_reached(u.owners.map(|o: Bytes| owner_key_at(named, o)));
   let by_module = reached.values().fold(Map::new(), with_loaded_owner);
   let beside = match by_module.get(u.module) {
     Some(g) -> g.owners.filter(|o: Bytes| !u.owners.contains(o)),
@@ -425,7 +431,7 @@ fn with_stored_owner(
   loaded: OwnerSource,
   owner: Bytes,
 ) -> StoredTables / {SessionReads, abort.raise} = {
-  let at = owner_at(u.named, owner);
+  let at = owner_key_at(u.named, owner);
   let checked_in = group_key_of(at);
   let unit = unit_key_of(at);
   let result = group_of(checked_in);
@@ -529,7 +535,7 @@ fn opened_groups(open: List<ModuleKey>) -> OpenedGroups / {SessionReads, abort.r
   let whole = open.map(|m: ModuleKey| { named: m, owners: module_owners(m) });
   let opened = open.fold(Set::empty(), |found: Set<Bytes>, m: ModuleKey| found.insert(m.module));
   let reached = bodies_reached(
-    whole.flat_map(|u: LoadedOwners| u.owners.map(|o: Bytes| owner_at(u.named, o))),
+    whole.flat_map(|u: LoadedOwners| u.owners.map(|o: Bytes| owner_key_at(u.named, o))),
   );
   let others = reached.values().filter(|o: OwnerKey| !opened.contains(o.module)).fold(
     Map::new(),
@@ -593,7 +599,7 @@ derive bin for MeasureEntry
 
 pub fn measures_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let read = owners_result_of(named);
-  let measured = functions_of(read, measured_function);
+  let measured = functions_of(read, states_measure);
   written(measures_query(), if measured.is_empty() { [] } else {
     let facts = placed_facts(named, layout_of(named));
     group_keys(named).filter(|u: UnitKey| u.owners.any(|o: Bytes| measured.contains(o))).map(
