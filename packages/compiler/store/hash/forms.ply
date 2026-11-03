@@ -1,5 +1,7 @@
 import std.set (Set)
 import compiler.store.hash.graph (NodeElsewhere, is_declared_kind)
+import compiler.store.hash.graph (NodeElsewhere, HeldKind, HeldType, HeldEffect, HeldValue,
+                                  is_declared_kind)
 import compiler.syntax.parsing (Span, Identifier, QName, is_bare, bare, starts_upper,
                                 prelude_binder)
 import std.bin
@@ -48,16 +50,14 @@ import compiler.store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, Node, 
                                   DefinitionEntry, IndexEntry, LawEntry, TestEntry, Target,
                                   ConstructorTarget, FnTarget, Index, qualifier, simple_of,
                                   IndexBuilder, Declarations, declare, no_declarations,
-                                  instances_in, is_effect, value_target, constructor_target,
-                                  type_target, effect_target, is_cyclic)
+                                  instances_in, value_target, constructor_target, type_target,
+                                  effect_target)
 import compiler.store.hash.encoding (Choice, CallSite, Known, CallResolution, Pending,
                                      call_resolution_bin, spec_tag)
 import compiler.store.hash.stored (Template, TestOf, template_bin)
 import compiler.store.hash.template (node_template, test_template, law_template, spec_template,
                                      expression_template, renumbered, emitted_code)
-import compiler.store.hash.fill (Substitution, blank, FilledForm, fill, references,
-                                 expression_references)
-import std.list (positions)
+import compiler.store.hash.fill (FilledForm, fill, references, expression_references)
 
 pub fn build_index(
   modules: List<ParsedModule>,
@@ -260,7 +260,6 @@ pub fn build_index(
     order: built.order,
     items: built.items,
     scopes: scopes,
-    effect_sketches: Map::new(),
     written: prelude.fold(Map::new(), |accumulator: Map<Bytes, Int>, m: Int|
       emitted_code.calls.concat(emitted_code.insert_calls).fold(
         accumulator,
@@ -268,21 +267,8 @@ pub fn build_index(
           match built.items.get(m).functions.get(n) { Some(v) -> a.insert(n, v), None -> a },
       )),
   };
-  { index: { ..index, effect_sketches: sketch_effects(index) }, diagnostics: built.diagnostics }
+  { index: index, diagnostics: built.diagnostics }
 }
-
-fn sketch_effects(index: Index) -> Map<Int, Bytes> / {abort.raise} =
-  range(0, index.nodes.len()).fold(Map::new(), |accumulator: Map<Int, Bytes>, v: Int| {
-    let node = index.nodes.get(v);
-    match node.body {
-      NodeEffect(_) ->
-        accumulator.insert(
-          v,
-          fill(node_template(index, node.module, node.name, None, node.body), blank).bytes,
-        ),
-      _ -> accumulator,
-    }
-  })
 
 fn bytes_lt(a: Bytes, b: Bytes) -> Bool = match compare_values(a, b) { Less -> true, _ -> false }
 
@@ -312,115 +298,192 @@ pub fn listed_refs(index: Index, t: TestNode) -> List<Int> / {abort.raise} =
       ),
   }
 
-const spec_domain: Bytes = b"ply.spec.1"
+const own_domain: Bytes = b"ply.own.2"
 
-const spec_text_domain: Bytes = b"ply.spec.text.1"
+const clause_domain: Bytes = b"ply.clause.2"
 
-const own_domain: Bytes = b"ply.own.1"
+const contract_domain: Bytes = b"ply.contract.3"
 
-fn spec_text_hash(kind: Int, index: Int, normalized: Bytes) -> Bytes / {abort.raise} =
-  blake3(Bytes::concat_all([spec_text_domain, byte_of_int(kind), u32_le(index), normalized]))
+const identity_domain: Bytes = b"ply.identity.1"
 
-fn own_hash(normalized: Bytes) -> Bytes = blake3(own_domain.concat(normalized))
+pub fn own_hash(payload: Bytes) -> Bytes = blake3(own_domain.concat(payload))
 
-pub fn spec_hash(owner: Bytes, kind: Int, index: Int, normalized: Bytes) -> Bytes / {abort.raise} =
-  blake3(Bytes::concat_all([spec_domain, owner, byte_of_int(kind), u32_le(index), normalized]))
+pub fn spec_hash(owner: Bytes, kind: Int, index: Int, payload: Bytes) -> Bytes / {abort.raise} =
+  blake3(Bytes::concat_all([clause_domain, owner, byte_of_int(kind), u32_le(index), payload]))
 
-pub fn member_hash(component: Bytes, class: Int) -> Bytes = blake3(component.concat(u32_le(class)))
-
-pub fn encoded_resolutions(picks: List<List<Choice>>) -> Bytes = {
-  let inner = Bytes::concat_all(
-    picks.map(|p: List<Choice>|
-      u32_le(p.len()).concat(
-        Bytes::concat_all(
-          p.map(|c: Choice|
-            u32_le(c.targets.len()).concat(Bytes::concat_all(c.targets.map(u32_le)))),
-        ),
-      )),
+pub fn encoded_resolutions(picks: List<Choice>) -> Bytes = {
+  let inner = u32_le(picks.len()).concat(
+    Bytes::concat_all(
+      picks.map(|c: Choice| u32_le(c.targets.len()).concat(Bytes::concat_all(c.targets.map(u32_le)))),
+    ),
   );
   u32_le(inner.len()).concat(inner)
 }
 
-pub fn pending_resolutions_bin() -> bin::BinCodec<List<List<CallResolution>>> =
-  bin::list_bin(bin::list_bin(call_resolution_bin()))
+pub fn pending_resolutions_bin() -> bin::BinCodec<List<CallResolution>> =
+  bin::list_bin(call_resolution_bin())
 
-pub type BodyFrame = | SingleBody | MemberBody(Int)
-
-pub type FramedBody = { frame: BodyFrame, pending: Bool, picks: Int, at: Int }
-
-fn frame_head(frame: BodyFrame, pending: Bool) -> Bytes = {
-  let base = if pending { 2 } else { 0 };
-  match frame {
-    SingleBody -> byte_of_int(base),
-    MemberBody(class) -> byte_of_int(base + 1).concat(u32_le(class)),
-  }
-}
-
-pub fn framed_head(body: FramedBody, pending: Bool) -> Bytes = frame_head(body.frame, pending)
-
-pub fn framed_body(body: Bytes) -> Option<FramedBody> = {
-  let framed = |frame: BodyFrame, pending: Bool, from: Int|
-    match body.u32_at(from) {
-      Some(n) -> if from + 4 + n > body.len() { None }
-      else { Some({ frame: frame, pending: pending, picks: from + 4, at: from + 4 + n }) },
-      None -> None,
-    };
-  let member = |pending: Bool|
-    match body.u32_at(1) { Some(class) -> framed(MemberBody(class), pending, 5), None -> None };
-  let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
-  if kind == 0 { framed(SingleBody, false, 1) }
-  else if kind == 1 { member(false) }
-  else if kind == 2 { framed(SingleBody, true, 1) }
-  else if kind == 3 { member(true) }
-  else { None }
-}
-
-fn stored_body(
-  class: Option<Int>,
-  picks: List<List<CallResolution>>,
-  payload: Bytes,
-) -> Bytes / {abort.raise} = {
-  let frame = match class { None -> SingleBody, Some(c) -> MemberBody(c) };
-  let head = |pending: Bool| frame_head(frame, pending);
-  let found = Option::traverse(picks, |member: List<CallResolution>|
-    Option::traverse(member, |p: CallResolution|
-      match p { Known(c) -> Some(c), Pending(_) -> None }));
-  match found {
-    Some(choices) -> Bytes::concat_all([head(false), encoded_resolutions(choices), payload]),
+pub fn single_body(f: FilledForm) -> Bytes / {abort.raise} =
+  match Option::traverse(f.chosen, |p: CallResolution|
+      match p { Known(c) -> Some(c), Pending(_) -> None }) {
+    Some(choices) -> Bytes::concat_all([byte_of_int(0), encoded_resolutions(choices), f.bytes]),
     None -> {
-      let open = bin::encode(picks, pending_resolutions_bin());
-      Bytes::concat_all([head(true), u32_le(open.len()), open, payload])
+      let open = bin::encode(f.chosen, pending_resolutions_bin());
+      Bytes::concat_all([byte_of_int(2), u32_le(open.len()), open, f.bytes])
     },
   }
+
+pub type Identified = | TestRun(Bytes) | TestListing(Bytes) | LawRun(Bytes) | DefinitionRun(Bytes)
+
+pub type SubjectIdentity = { subject: Identified, identity: Bytes }
+
+derive bin for Identified
+
+derive bin for SubjectIdentity
+
+pub type Reached = { reference: NodeRef, hash: Bytes }
+
+pub fn identity_digest(own: Bytes, reached: List<Reached>) -> Bytes / {abort.raise} = {
+  let keyed = reached.map(|r: Reached|
+    definition_key(r.reference.name, r.reference.kind).concat(b"\x00").concat(r.hash)).sort().unique();
+  blake3(
+    Bytes::concat_all([identity_domain, own, u32_le(keyed.len())].concat(
+      keyed.map(|k: Bytes| u32_le(k.len()).concat(k)),
+    )),
+  )
+}
+
+pub type Held<at> = { at: at, hash: Bytes, clauses: List<Bytes>, uses: List<NodeRef> }
+
+type Unvisited<at> = { from: at, reference: NodeRef }
+
+type Walk<at> = { seen: Map<Bytes, Bool>, reached: List<Reached>, work: List<Unvisited<at>> }
+
+pub fn held_definition<at>(at: at, d: DefinitionHash) -> Held<at> =
+  { at: at, hash: d.hash, clauses: d.clauses, uses: d.uses.concat(d.clause_uses) }
+
+pub fn identity_over<at | e>(
+  own: Bytes,
+  from: at,
+  uses: List<NodeRef>,
+  held: (at, NodeRef) -> List<Held<at>> / {abort.raise | e},
+) -> Bytes / {abort.raise | e} = {
+  let visit = |w: Walk<at>, item: Unvisited<at>| {
+    let key = definition_key(item.reference.name, item.reference.kind);
+    if w.seen.contains(key) { w } else {
+      held(item.from, item.reference).fold(
+        { ..w, seen: w.seen.insert(key, true) },
+        |a: Walk<at>, h: Held<at>|
+          {
+            ..a,
+            reached: a.reached.push({ reference: item.reference, hash: h.hash }).concat(
+              h.clauses.map(|c: Bytes| { reference: item.reference, hash: c }),
+            ),
+            work: a.work.concat(h.uses.map(|r: NodeRef| { from: h.at, reference: r })),
+          },
+      )
+    }
+  };
+  identity_digest(
+    own,
+    iterate(
+      { seen: Map::new(), reached: [], work: uses.map(|r: NodeRef| { from: from, reference: r }) },
+      1000000,
+      |w: Walk<at>|
+        match w.work {
+          [] -> Stop(w.reached),
+          [item, ..rest] -> Continue(visit({ ..w, work: rest }, item)),
+        },
+    ),
+  )
+}
+
+pub fn with_identities(hashes: HashOutput) -> HashOutput / {abort.raise} =
+  { ..hashes, identities: hash_identities(hashes, every_subject(hashes)) }
+
+pub fn every_subject(hashes: HashOutput) -> List<Identified> =
+  hashes.definitions.map(|d: { name: Bytes, hash: Bytes }| DefinitionRun(d.name)).concat(
+    hashes.tests.keys().map(TestRun),
+  ).concat(
+    hashes.listing_hashes.keys().map(TestListing),
+  ).concat(
+    hashes.laws.keys().map(LawRun),
+  )
+
+pub fn hash_identities(hashes: HashOutput, subjects: List<Identified>) -> List<SubjectIdentity> / {abort.raise} = {
+  let r = hashes.refs;
+  let hashed = by_name(hashes.definitions);
+  let declared = by_name(hashes.declarations);
+  let specs = hashes.specs.fold(
+    Map::new(),
+    |m: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }| m.insert(s.name, s.hashes),
+  );
+  let at = range(0, r.names.len()).fold(Map::new(), |m: Map<Bytes, Int>, v: Int|
+    m.insert(definition_key(r.names.get(v), r.kinds.get(v)), v));
+  let refs = |vs: List<Int>| vs.map(|v: Int| { name: r.names.get(v), kind: r.kinds.get(v) });
+  let held = |_: Unit, reference: NodeRef|
+    match at.get(definition_key(reference.name, reference.kind)) {
+      None -> [],
+      Some(v) -> match Map::get(if reference.kind == HeldValue { hashed } else { declared }, reference.name) {
+        None -> [],
+        Some(hash) ->
+          [
+            {
+              at: (),
+              hash: hash,
+              clauses: specs.get(reference.name).unwrap_or([]),
+              uses: refs(r.edges.get(v).concat(r.clauses.at(v).unwrap_or([]))),
+            },
+          ],
+      },
+    };
+  let start = |s: Identified|
+    match s {
+      TestRun(k) -> match (hashes.tests.get(k), hashes.test_runs.get(k)) {
+        (Some(h), Some(vs)) -> Some({ own: h, uses: refs(vs) }),
+        _ -> None,
+      },
+      TestListing(k) -> match (hashes.listing_hashes.get(k), r.listings.get(k)) {
+        (Some(h), Some(vs)) -> Some({ own: h, uses: refs(vs) }),
+        _ -> None,
+      },
+      LawRun(k) -> match (hashes.laws.get(k), hashes.law_refs.get(k)) {
+        (Some(h), Some(vs)) -> Some({ own: h, uses: refs(vs) }),
+        _ -> None,
+      },
+      DefinitionRun(name) -> match hashed.get(name) {
+        Some(h) -> Some({ own: h, uses: [{ name: name, kind: HeldValue }] }),
+        None -> None,
+      },
+    };
+  subjects.fold([], |found: List<SubjectIdentity>, s: Identified|
+    match start(s) {
+      Some(begun) -> found.push({ subject: s, identity: identity_over(begun.own, (), begun.uses, held) }),
+      None -> found,
+    })
 }
 
 pub type HashOutput = {
   definitions: List<{ name: Bytes, hash: Bytes }>,
-  own: List<{ name: Bytes, hash: Bytes }>,
   declarations: List<{ name: Bytes, hash: Bytes }>,
   tests: Map<Bytes, Bytes>,
   laws: Map<Bytes, Bytes>,
   specs: List<{ name: Bytes, hashes: List<Bytes> }>,
-  spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
-  law_texts: Map<Bytes, Bytes>,
   dependencies: List<{ name: Bytes, names: List<Bytes> }>,
   refs: Refs,
   bodies: List<{ name: Bytes, body: Bytes }>,
   test_bodies: Map<Bytes, Bytes>,
-  test_texts: Map<Bytes, Bytes>,
   contracts: List<{ name: Bytes, hash: Bytes }>,
-  checks: List<{ name: Bytes, hash: Bytes }>,
-  spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
   test_refs: Map<Bytes, List<Int>>,
   test_runs: Map<Bytes, List<Int>>,
   law_refs: Map<Bytes, List<Int>>,
-  component_members: List<List<Int>>,
-  listing_hashes: Map<Bytes, Option<Bytes>>,
+  listing_hashes: Map<Bytes, Bytes>,
+  identities: List<SubjectIdentity>,
 }
 
 pub type Refs = {
   names: List<Bytes>,
-  is_declaration: List<Bool>,
+  kinds: List<HeldKind>,
   edges: List<List<Int>>,
   functions: Map<Bytes, Int>,
   declared: Map<Bytes, List<Int>>,
@@ -430,41 +493,16 @@ pub type Refs = {
   listings: Map<Bytes, List<Int>>,
 }
 
+pub fn identity_in(hashes: HashOutput, subject: Identified) -> Option<Bytes> =
+  hashes.identities.fold(None, |found: Option<Bytes>, s: SubjectIdentity|
+    if s.subject == subject { Some(s.identity) } else { found })
+
 type Recording = { out: HashOutput, dependencies_at: Map<Bytes, Int> }
 
 pub fn of_key<a>(m: Map<Bytes, a>, key: Bytes) -> a / {abort.raise} =
   match m.get(key) { Some(x) -> x, None -> panic("a key the table does not contain") }
 
-pub fn single_body(f: FilledForm) -> Bytes / {abort.raise} = stored_body(None, [f.chosen], f.bytes)
-
-pub fn member_body(refined: Refinement, class: Int) -> Bytes / {abort.raise} =
-  stored_body(Some(class), refined.picks, refined.packed)
-
-type Sccs = { component_of: List<Int>, orders: List<List<Int>> }
-
-fn effect_order(
-  shapes: HashInput,
-  refs: List<Int>,
-  scc: Sccs,
-  own: Option<Int>,
-  out: List<Int>,
-) -> List<Int> / {abort.raise} =
-  refs.fold(out, |accumulator: List<Int>, r: Int| {
-    let with_effect = if shapes.nodes.get(r).effect { accumulator.push_unique(r) }
-    else { accumulator };
-    let ci = if r < scc.component_of.len() { scc.component_of.get(r) } else { 0 - 1 };
-    if (match own { Some(o) -> o == ci, None -> false }) || ci < 0 || ci >= scc.orders.len() {
-      with_effect
-    } else { scc.orders.get(ci).fold(with_effect, |a: List<Int>, node: Int| a.push_unique(node)) }
-  })
-
-pub type HashNode = {
-  name: Bytes,
-  declaration: Bool,
-  effect: Bool,
-  package: Int,
-  form: Option<NodeForm>,
-}
+pub type NodeRef = { name: Bytes, kind: HeldKind }
 
 pub type NodeForm = {
   form: Template,
@@ -475,22 +513,28 @@ pub type NodeForm = {
 
 pub type ClauseForm = { kind: Int, form: Template }
 
-pub type ItemForm = { form: Template, case_refs: List<Int>, listing: Option<Template> }
+pub type FormedNode = { node: Int, form: NodeForm }
 
-pub type HashItem = { key: Bytes, form: Option<ItemForm> }
+pub type ItemForm = { form: Template, listing: Option<Template> }
+
+pub type HashItem = { key: Bytes, form: ItemForm }
 
 pub type HashInput = {
-  nodes: List<HashNode>,
-  order: List<Int>,
+  names: List<NodeRef>,
+  definitions: List<FormedNode>,
   tests: List<HashItem>,
   laws: List<HashItem>,
 }
+
+derive bin for HeldKind
+
+derive bin for NodeRef
 
 derive bin for ClauseForm
 
 derive bin for NodeForm
 
-derive bin for HashNode
+derive bin for FormedNode
 
 derive bin for ItemForm
 
@@ -498,211 +542,132 @@ derive bin for HashItem
 
 derive bin for HashInput
 
-fn has_no_form(shape: HashNode) -> Bool = match shape.form { None -> true, Some(_) -> false }
+pub type DefinitionHash = {
+  name: Bytes,
+  kind: HeldKind,
+  hash: Bytes,
+  body: Bytes,
+  contract: Bytes,
+  clauses: List<Bytes>,
+  uses: List<NodeRef>,
+  clause_uses: List<NodeRef>,
+}
 
-type HashContext = { shapes: HashInput, names: List<Bytes>, graph: Graph }
+pub type ListingHash = { hash: Bytes, uses: List<NodeRef> }
 
-fn form_of(over: HashContext, v: Int) -> Template / {abort.raise} =
-  match over.shapes.nodes.get(v).form {
-    Some(f) -> f.form,
-    None -> panic("a node being hashed again has no template to compute its hash from"),
+pub type TestHash = {
+  key: Bytes,
+  hash: Bytes,
+  body: Bytes,
+  uses: List<NodeRef>,
+  listing: Option<ListingHash>,
+}
+
+pub type LawHash = { key: Bytes, hash: Bytes, uses: List<NodeRef> }
+
+pub type OwnHashes = { definitions: List<DefinitionHash>, tests: List<TestHash>, laws: List<LawHash> }
+
+pub const no_own_hashes: OwnHashes = { definitions: [], tests: [], laws: [] }
+
+derive bin for DefinitionHash
+
+derive bin for ListingHash
+
+derive bin for TestHash
+
+derive bin for LawHash
+
+derive bin for OwnHashes
+
+pub fn joined_own_hashes(parts: List<OwnHashes>) -> OwnHashes =
+  parts.fold(no_own_hashes, |accumulator: OwnHashes, part: OwnHashes|
+    {
+      definitions: accumulator.definitions.concat(part.definitions),
+      tests: accumulator.tests.concat(part.tests),
+      laws: accumulator.laws.concat(part.laws),
+    })
+
+pub fn test_uses(item: TestHash) -> List<NodeRef> =
+  match item.listing {
+    Some(l) ->
+      l.uses.fold(item.uses, |accumulator: List<NodeRef>, r: NodeRef|
+        if accumulator.contains(r) { accumulator } else { accumulator.push(r) }),
+    None -> item.uses,
   }
 
-fn filled_under(
-  over: HashContext,
-  form: Template,
-  hashes: Map<Int, Bytes>,
-  effects: Map<Int, Int>,
-  by_name: Bool,
-) -> FilledForm / {abort.raise} =
-  fill(form, {
-    hashes: hashes,
-    component: Map::new(),
-    effects: effects,
-    by_name: by_name,
-    names: over.names,
-  })
+fn unique_ints(xs: List<Int>) -> List<Int> =
+  xs.fold([], |accumulator: List<Int>, x: Int|
+    if accumulator.contains(x) { accumulator } else { accumulator.push(x) })
 
-fn slots_of(over: HashContext, form: Template) -> Map<Int, Int> / {abort.raise} =
-  slots_under(over, references(form))
-
-fn slots_under(over: HashContext, referenced: List<Int>) -> Map<Int, Int> / {abort.raise} =
-  positions(effect_order(over.shapes, referenced, over.graph.scc, None, []))
-
-fn filled_item(
-  over: HashContext,
-  form: Template,
-  hashes: Map<Int, Bytes>,
-  by_name: Bool,
-) -> FilledForm / {abort.raise} = filled_under(over, form, hashes, slots_of(over, form), by_name)
-
-fn sketch_lt(a: Bytes, ia: Int, b: Bytes, ib: Int) -> Bool = bytes_lt(a, b) || (a == b && ia < ib)
-
-type Refinement = {
-  members: List<{ node: Int, hash: Bytes }>,
-  packed: Bytes,
-  picks: List<List<CallResolution>>,
-  classes: Map<Int, Int>,
-}
-
-fn hash_component(
-  over: HashContext,
-  component: List<Int>,
-  hashes: Map<Int, Bytes>,
-  effects: Map<Int, Int>,
-) -> Refinement / {abort.raise} = {
-  let encode = |classes: Map<Int, Int>, v: Int|
-    fill(form_of(over, v), {
-      hashes: hashes,
-      component: classes,
-      effects: effects,
-      by_name: false,
-      names: over.names,
-    });
-  let relabel = |finished: List<FilledForm>| {
-    let encodings = finished.map(|f: FilledForm| f.bytes);
-    let distinct = dedup_sorted(sort_bytes(encodings));
-    range(0, component.len()).fold(Map::new(), |accumulator: Map<Int, Int>, i: Int|
-      accumulator.insert(component.get(i), position_bytes(distinct, encodings.get(i))))
-  };
-  let grouping = |classes: Map<Int, Int>|
-    sort_groups(
-      component.fold(Map::new(), |accumulator: Map<Int, List<Int>>, v: Int| {
-        let c = match classes.get(v) { Some(x) -> x, None -> 0 };
-        accumulator.insert(c, List::push(match accumulator.get(c) { Some(g) -> g, None -> [] }, v))
-      }),
-    );
-  let start = component.fold(Map::new(), |accumulator: Map<Int, Int>, v: Int|
-    accumulator.insert(v, 0));
-  let resolved = iterate(
-    { classes: start, encodings: component.map(|v: Int| encode(start, v)) },
-    component.len() + 2,
-    |s: { classes: Map<Int, Int>, encodings: List<FilledForm> }| {
-      let next = relabel(s.encodings);
-      let same = grouping(next) == grouping(s.classes);
-      let re = { classes: next, encodings: component.map(|v: Int| encode(next, v)) };
-      if same { Stop(re) } else { Continue(re) }
-    },
-  );
-  let width = component.fold(0, |accumulator: Int, v: Int|
-      max(accumulator, match resolved.classes.get(v) { Some(c) -> c, None -> 0 }))
-    + 1;
-  let by_class = range(0, component.len()).fold(
-    range(0, width).map(|i: Int| { bytes: b"", chosen: [] }),
-    |accumulator: List<FilledForm>, i: Int|
-      accumulator.set(
-        match resolved.classes.get(component.get(i)) { Some(c) -> c, None -> 0 },
-        resolved.encodings.get(i),
-      ),
-  );
-  let packed = u32_le(by_class.len()).concat(
-    Bytes::concat_all(by_class.map(|m: FilledForm| u32_le(m.bytes.len()).concat(m.bytes))),
-  );
-  let component_hash = blake3(packed);
-  {
-    members: component.map(|v: Int|
-      {
-        node: v,
-        hash: member_hash(component_hash, match resolved.classes.get(v) {
-          Some(c) -> c,
-          None -> 0,
-        }),
-      }),
-    packed: packed,
-    picks: by_class.map(|m: FilledForm| m.chosen),
-    classes: resolved.classes,
-  }
-}
-
-fn dedup_sorted(xs: List<Bytes>) -> List<Bytes> / {abort.raise} =
-  xs.fold([], |accumulator: List<Bytes>, x: Bytes|
-    if accumulator.len() > 0 && accumulator.get(accumulator.len() - 1) == x { accumulator }
-    else { accumulator.push(x) })
-
-fn position_bytes(xs: List<Bytes>, v: Bytes) -> Int / {abort.raise} =
-  range(0, xs.len()).fold(0, |accumulator: Int, i: Int|
-    if xs.get(i) == v { i } else { accumulator })
-
-fn sort_groups(groups: Map<Int, List<Int>>) -> List<List<Int>> / {abort.raise} = {
-  let out = groups.fold([], |accumulator: List<List<Int>>, k: Int, g: List<Int>|
-    accumulator.push(sort_ints(g)));
-  out.fold([], |accumulator: List<List<Int>>, g: List<Int>| {
-    let n = accumulator.len();
-    let i = range(0, n).fold(n, |p: Int, j: Int|
-      if p < n { p } else if ints_lt(g, accumulator.get(j)) { j } else { p });
-    accumulator.take(i).push(g).concat(range(i, n).map(|j: Int| accumulator.get(j)))
-  })
-}
-
-fn sort_ints(xs: List<Int>) -> List<Int> / {abort.raise} =
-  xs.fold([], |accumulator: List<Int>, x: Int| {
-    let n = accumulator.len();
-    let i = range(0, n).fold(n, |p: Int, j: Int|
-      if p < n { p } else if x < accumulator.get(j) { j } else { p });
-    accumulator.take(i).push(x).concat(range(i, n).map(|j: Int| accumulator.get(j)))
-  })
-
-fn ints_lt(a: List<Int>, b: List<Int>) -> Bool =
-  match compare_values(a, b) { Less -> true, _ -> false }
-
-type SpecHashes = {
-  own: List<{ name: Bytes, hash: Bytes }>,
-  specs: List<{ name: Bytes, hashes: List<Bytes> }>,
-  spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
-  spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
-}
-
-type HashTables = {
-  hashes: Map<Int, Bytes>,
-  bodies: Map<Int, Bytes>,
-  tests: List<Bytes>,
-  test_bodies: List<Bytes>,
-  test_texts: List<Bytes>,
-  test_refs: List<List<Int>>,
-  test_runs: List<List<Int>>,
-  laws: List<Bytes>,
-  law_refs: List<List<Int>>,
-  law_texts: List<Bytes>,
-  own: List<{ name: Bytes, hash: Bytes }>,
-  specs: List<{ name: Bytes, hashes: List<Bytes> }>,
-  spec_texts: List<{ name: Bytes, hashes: List<Bytes> }>,
-  contracts: Map<Int, Bytes>,
-  checks: Map<Int, Bytes>,
-  spec_checks: List<{ name: Bytes, hashes: List<Bytes> }>,
-  enumerations: List<List<Int>>,
-  clauses: List<List<Int>>,
-  test_listings: List<List<Int>>,
-  test_listing_hashes: List<Option<Bytes>>,
-}
-
-type TestHashes = {
-  hashes: List<Bytes>,
-  bodies: List<Bytes>,
-  texts: List<Bytes>,
-  refs: List<List<Int>>,
-  runs: List<List<Int>>,
-  listings: List<List<Int>>,
-  listing_hashes: List<Option<Bytes>>,
-}
-
-type ComponentKeys = { hashes: Map<Int, Bytes>, bodies: Map<Int, Bytes>, computed: Map<Int, Bytes> }
-
-type Graph = { edges: List<List<Int>>, components: List<List<Int>>, scc: Sccs }
-
-pub type FirstPass = { sketch: Bytes, references: List<Int> }
-
-fn first_pass_of(shapes: HashInput, fixed: Map<Int, List<Int>>) -> List<FirstPass> / {abort.raise} =
-  range(0, shapes.nodes.len()).map(|v: Int| {
-    let edges = fixed.get(v);
-    match shapes.nodes.get(v).form {
-      None -> { sketch: b"", references: match edges { Some(es) -> es, None -> [] } },
-      Some(f) ->
+pub fn own_hashes(forms: HashInput) -> OwnHashes / {abort.raise} = {
+  let names = forms.names.map(|r: NodeRef| r.name);
+  let named = |vs: List<Int>| vs.map(|v: Int| forms.names.get(v));
+  let test = |x: HashItem| {
+    let own = fill(x.form.form, names);
+    {
+      key: x.key,
+      hash: own_hash(own.bytes),
+      body: single_body(own),
+      uses: named(references(x.form.form)),
+      listing: x.form.listing.map(|l: Template|
         {
-          sketch: fill(f.form, blank).bytes,
-          references: match edges { Some(es) -> es, None -> references(f.form) },
-        },
+          hash: own_hash(fill(l, names).bytes),
+          uses: named(references(l)),
+        }),
     }
-  })
+  };
+  {
+    definitions: forms.definitions.map(|d: FormedNode| {
+      let own = fill(d.form.form, names);
+      let hash = own_hash(own.bytes);
+      let reference = forms.names.get(d.node);
+      {
+        name: reference.name,
+        kind: reference.kind,
+        hash: hash,
+        body: single_body(own),
+        contract: contract_of(d.form, reference.kind, names, hash, own.bytes),
+        clauses: range(0, d.form.clauses.len()).map(|i: Int| {
+          let clause = d.form.clauses.get(i);
+          spec_hash(hash, clause.kind, i, fill(clause.form, names).bytes)
+        }),
+        uses: named(references(d.form.form)),
+        clause_uses: named(
+          unique_ints(
+            d.form.clauses.fold([], |accumulator: List<Int>, c: ClauseForm|
+              accumulator.concat(references(c.form))),
+          ),
+        ),
+      }
+    }),
+    tests: forms.tests.map(test),
+    laws: forms.laws.map(|x: HashItem|
+      {
+        key: x.key,
+        hash: own_hash(fill(x.form.form, names).bytes),
+        uses: named(references(x.form.form)),
+      }),
+  }
+}
+
+fn contract_of(
+  form: NodeForm,
+  kind: HeldKind,
+  names: List<Bytes>,
+  hash: Bytes,
+  payload: Bytes,
+) -> Bytes / {abort.raise} =
+  if kind != HeldValue { hash } else {
+    let filled = |t: Template| fill(t, names).bytes;
+    blake3(
+      Bytes::concat_all([
+        contract_domain,
+        match form.signature { Some(s) -> filled(s), None -> b"" },
+        Bytes::concat_all(form.clauses.map(|c: ClauseForm| filled(c.form))),
+        if form.transparent { b"transparent".concat(payload) } else { b"" },
+      ]),
+    )
+  }
 
 fn node_form(
   index: Index,
@@ -745,7 +710,6 @@ fn test_form(
       chose,
       t.definition,
     ),
-    case_refs: listed_refs(index, t),
     listing: match t.definition.cases {
       Some(c) ->
         Some(
@@ -760,227 +724,22 @@ fn test_form(
   }
 
 fn law_form(index: Index, l: LawNode) -> ItemForm / {abort.raise} =
-  { form: law_template(index, l.module, l.definition), case_refs: [], listing: None }
+  { form: law_template(index, l.module, l.definition), listing: None }
 
-type Shaped = { shapes: HashInput, first: List<FirstPass> }
-
-pub fn hash_input(
-  index: Index,
-  packages: List<Int>,
-  fixed: Map<Int, List<Int>>,
-  fixing: CachedHashes,
-) -> Shaped / {abort.raise} = {
-  let held_tests = fixing.tests.fold(Set::empty(), |accumulator: Set<Bytes>, t: CachedTest|
-    accumulator.insert(t.key));
-  let held_laws = fixing.laws.fold(Set::empty(), |accumulator: Set<Bytes>, l: CachedLaw|
-    accumulator.insert(l.key));
-  let shape = |v: Int, formed: Bool| {
+pub fn node_references(index: Index) -> List<List<Int>> / {abort.raise} =
+  range(0, index.nodes.len()).map(|v: Int| {
     let node = index.nodes.get(v);
-    {
-      name: node.name,
-      declaration: is_declaration(node),
-      effect: is_effect(index, v),
-      package: match packages.at(node.module) { Some(p) -> p, None -> 0 },
-      form: if formed { Some(node_form(index, v, None)) } else { None },
+    match node.body {
+      NodeElsewhere(_) -> [],
+      _ -> references(node_template(index, node.module, node.name, None, node.body)),
     }
-  };
-  let plain = {
-    nodes: range(0, index.nodes.len()).map(|v: Int| shape(v, !fixed.contains(v))),
-    order: index.order.fold([], |accumulator: List<Int>, e: IndexEntry|
-      match e { DefinitionEntry(v) -> accumulator.push(v), _ -> accumulator }),
-    tests: index.tests.map(|t: TestNode|
-      {
-        key: t.key,
-        form: if held_tests.contains(t.key) { None } else { Some(test_form(index, t, None)) },
-      }),
-    laws: index.laws.map(|l: LawNode|
-      {
-        key: l.key,
-        form: if held_laws.contains(l.key) { None } else { Some(law_form(index, l)) },
-      }),
-  };
-  let first = first_pass_of(plain, fixed);
-  let cyclic = if fixed.len() == 0 { Map::new() } else {
-    graph::components({ out: first.map(|f: FirstPass| f.references) }).fold(Set::empty(),
-      |accumulator: Set<Int>, c: List<Int>|
-        if c.len() < 2 || c.fold(true, |all: Bool, v: Int| all && fixed.contains(v)) { accumulator }
-        else {
-          c.fold(accumulator, |a: Set<Int>, v: Int|
-            if fixed.contains(v) { a.insert(v) } else { a })
-        },
-    )
-  };
-  if cyclic.len() == 0 { { shapes: plain, first: first } } else {
-    let shapes = {
-      ..plain,
-      nodes: range(0, index.nodes.len()).map(|v: Int|
-        if cyclic.contains(v) { shape(v, true) } else { plain.nodes.get(v) }),
-    };
-    { shapes: shapes, first: first_pass_of(shapes, fixed) }
-  }
-}
-
-pub fn hash_context(index: Index) -> HashContext / {abort.raise} = {
-  let shaped = hash_input(index, [], Map::new(), no_cached_hashes);
-  {
-    shapes: shaped.shapes,
-    names: shaped.shapes.nodes.map(|s: HashNode| s.name),
-    graph: graph_with(shaped.shapes, shaped.first, Map::new()),
-  }
-}
-
-fn graph_with(
-  shapes: HashInput,
-  first: List<FirstPass>,
-  carried: Map<Int, List<Int>>,
-) -> Graph / {abort.raise} = {
-  let n = shapes.nodes.len();
-  let edges = first.map(|f: FirstPass| f.references);
-  let sketches = first.map(|f: FirstPass| f.sketch);
-  let components = graph::components({ out: edges }).map(|c: List<Int>| c.reverse());
-  let component_of = range(0, components.len()).fold(
-    range(0, n).map(|i: Int| 0 - 1),
-    |accumulator: List<Int>, ci: Int|
-      components.get(ci).fold(accumulator, |a: List<Int>, v: Int| a.set(v, ci)),
-  );
-  let orders = range(0, components.len()).fold([], |accumulator: List<List<Int>>, ci: Int| {
-    let members = components.get(ci).fold([], |ms: List<Int>, v: Int| {
-      let k = ms.len();
-      let i = range(0, k).fold(k, |p: Int, j: Int|
-        if p < k { p }
-        else if sketch_lt(sketches.get(v), v, sketches.get(ms.get(j)), ms.get(j)) { j }
-        else { p });
-      ms.take(i).push(v).concat(range(i, k).map(|j: Int| ms.get(j)))
-    });
-    let scc = { component_of: component_of, orders: accumulator };
-    let carried_order = match members {
-      [first_member, ..] -> if members.fold(true, |all: Bool, v: Int| all && carried.contains(v)) {
-        carried.get(first_member)
-      } else { None },
-      [] -> None,
-    };
-    accumulator.push(match carried_order {
-      Some(order) -> order,
-      None ->
-        members.fold([], |o: List<Int>, v: Int|
-          effect_order(shapes, edges.get(v), scc, Some(ci), o)),
-    })
-  });
-  { edges: edges, components: components, scc: { component_of: component_of, orders: orders } }
-}
-
-fn key_components(
-  over: HashContext,
-  pinned: Map<Int, Bytes>,
-  cached: Map<Int, CachedNode>,
-) -> ComponentKeys / {abort.raise} =
-  range(0, over.graph.components.len()).fold(
-    { hashes: Map::new(), bodies: Map::new(), computed: Map::new() },
-    |accumulator: ComponentKeys, ci: Int| {
-      let component = over.graph.components.get(ci);
-      if component.fold(true, |all: Bool, v: Int|
-          all && (cached.contains(v) || has_no_form(over.shapes.nodes.get(v)))) {
-        component.fold(accumulator, |a: ComponentKeys, v: Int|
-          match cached.get(v) {
-            None -> a,
-            Some(f) ->
-              {
-                hashes: a.hashes.insert(v, f.hash),
-                bodies: a.bodies.insert(v, f.body),
-                computed: a.computed.insert(v, f.hash),
-              },
-          })
-      } else { key_component(over, pinned, accumulator, ci, component) }
-    },
-  )
-
-fn key_component(
-  over: HashContext,
-  pinned: Map<Int, Bytes>,
-  accumulator: ComponentKeys,
-  ci: Int,
-  component: List<Int>,
-) -> ComponentKeys / {abort.raise} = {
-  let effects = positions(over.graph.scc.orders.get(ci));
-  let own: ComponentKeys = if is_cyclic(component, over.graph.edges) {
-    let refined: Refinement = hash_component(over, component, accumulator.hashes, effects);
-    refined.members.fold(accumulator, |a: ComponentKeys, m: { node: Int, hash: Bytes }| {
-      let class = match refined.classes.get(m.node) { Some(c) -> c, None -> 0 };
-      {
-        ..a,
-        computed: a.computed.insert(m.node, m.hash),
-        bodies: a.bodies.insert(m.node, member_body(refined, class)),
-      }
-    })
-  } else {
-    let v = component.get(0);
-    let encoding = filled_under(over, form_of(over, v), accumulator.hashes, effects, false);
-    {
-      ..accumulator,
-      computed: accumulator.computed.insert(v, blake3(encoding.bytes)),
-      bodies: accumulator.bodies.insert(v, single_body(encoding)),
-    }
-  };
-  {
-    ..own,
-    hashes: component.fold(own.hashes, |h: Map<Int, Bytes>, v: Int|
-      match pinned.get(v) {
-        Some(x) -> h.insert(v, x),
-        None -> match own.computed.get(v) { Some(x) -> h.insert(v, x), None -> h },
-      }),
-  }
-}
-
-pub type NodeRef = { name: Bytes, declaration: Bool }
-
-pub type CachedNode = {
-  name: Bytes,
-  declaration: Bool,
-  hash: Bytes,
-  own: Option<Bytes>,
-  specs: List<Bytes>,
-  spec_texts: List<Bytes>,
-  spec_checks: List<Bytes>,
-  contract: Bytes,
-  check: Bytes,
-  body: Bytes,
-  edges: List<NodeRef>,
-  effects: List<NodeRef>,
-  clauses: List<NodeRef>,
-}
-
-pub type CachedTest = {
-  key: Bytes,
-  hash: Bytes,
-  body: Bytes,
-  text: Bytes,
-  refs: List<NodeRef>,
-  runs: List<NodeRef>,
-  listing: List<NodeRef>,
-  listing_hash: Option<Bytes>,
-}
-
-pub type CachedLaw = { key: Bytes, hash: Bytes, text: Bytes, refs: List<NodeRef> }
-
-pub type CachedHashes = { nodes: List<CachedNode>, tests: List<CachedTest>, laws: List<CachedLaw> }
-
-pub const no_cached_hashes: CachedHashes = { nodes: [], tests: [], laws: [] }
-
-derive bin for NodeRef
-
-derive bin for CachedNode
-
-derive bin for CachedTest
-
-derive bin for CachedLaw
-
-derive bin for CachedHashes
+  })
 
 pub type ModuleRecord = { nodes: List<RecordedNode>, tests: List<RecordedTest> }
 
-pub type RecordedNode = { name: Bytes, declaration: Bool, hash: Bytes, edges: List<NodeRef> }
+pub type RecordedNode = { reference: NodeRef, hash: Bytes, edges: List<NodeRef> }
 
-pub type RecordedTest = { key: Bytes, hash: Bytes, refs: List<NodeRef>, runs: List<NodeRef> }
+pub type RecordedTest = { key: Bytes, hash: Bytes, uses: List<NodeRef>, listing: List<NodeRef> }
 
 derive bin for RecordedNode
 
@@ -988,28 +747,34 @@ derive bin for RecordedTest
 
 derive bin for ModuleRecord
 
-pub fn module_record(fixing: CachedHashes) -> Bytes / {abort.raise} =
+pub fn module_record(own: OwnHashes) -> Bytes / {abort.raise} =
   bin::encode(
     {
-      nodes: fixing.nodes.map(|f: CachedNode|
-        { name: f.name, declaration: f.declaration, hash: f.hash, edges: f.edges }),
-      tests: fixing.tests.map(|t: CachedTest|
-        { key: t.key, hash: t.hash, refs: t.refs, runs: t.runs }),
+      nodes: own.definitions.map(|d: DefinitionHash|
+        {
+          reference: { name: d.name, kind: d.kind },
+          hash: d.hash,
+          edges: d.uses.concat(d.clause_uses),
+        }),
+      tests: own.tests.map(|t: TestHash|
+        {
+          key: t.key,
+          hash: t.hash,
+          uses: t.uses,
+          listing: match t.listing { Some(l) -> l.uses, None -> [] },
+        }),
     },
     module_record_bin(),
   )
 
-pub type ModuleHashes = { record: Bytes, cached: CachedHashes }
+pub type ModuleHashes = { record: Bytes, own: OwnHashes }
 
-pub fn joined_cached_hashes(modules: List<ModuleHashes>) -> CachedHashes =
-  modules.fold(no_cached_hashes, |accumulator: CachedHashes, m: ModuleHashes|
-    {
-      nodes: accumulator.nodes.concat(m.cached.nodes),
-      tests: accumulator.tests.concat(m.cached.tests),
-      laws: accumulator.laws.concat(m.cached.laws),
-    })
+derive bin for ModuleHashes
 
-const record_domain: Bytes = b"ply.record.1"
+pub fn joined_module_hashes(modules: List<ModuleHashes>) -> OwnHashes =
+  joined_own_hashes(modules.map(|m: ModuleHashes| m.own))
+
+const record_domain: Bytes = b"ply.record.2"
 
 pub fn record_digest(record: Bytes) -> Bytes = blake3(record_domain.concat(record))
 
@@ -1022,8 +787,10 @@ pub type RecordedGraph = {
 
 pub fn recorded_graph(records: List<ModuleRecord>) -> RecordedGraph / {abort.raise} = {
   let nodes = records.flat_map(|r: ModuleRecord| r.nodes);
-  let at = range(0, nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int|
-    accumulator.insert(definition_key(nodes.get(v).name, nodes.get(v).declaration), v));
+  let at = range(0, nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
+    let reference = nodes.get(v).reference;
+    accumulator.insert(definition_key(reference.name, reference.kind), v)
+  });
   {
     nodes: nodes,
     edges: nodes.map(|n: RecordedNode| places_of(at, n.edges)),
@@ -1035,7 +802,7 @@ pub fn recorded_graph(records: List<ModuleRecord>) -> RecordedGraph / {abort.rai
 
 fn places_of(at: Map<Bytes, Int>, refs: List<NodeRef>) -> List<Int> =
   refs.fold([], |accumulator: List<Int>, r: NodeRef|
-    match at.get(definition_key(r.name, r.declaration)) {
+    match at.get(definition_key(r.name, r.kind)) {
       Some(v) -> accumulator.push(v),
       None -> accumulator,
     })
@@ -1045,7 +812,7 @@ pub type ReachableHashes = { functions: Map<Bytes, Bytes>, declarations: Map<Byt
 fn starts_of(g: RecordedGraph, key: Bytes, case: Bool) -> Option<List<Int>> =
   match g.tests.get(key) {
     None -> None,
-    Some(t) -> Some(places_of(g.at, if case { t.runs } else { t.refs })),
+    Some(t) -> Some(places_of(g.at, if case { t.uses } else { t.uses.concat(t.listing) })),
   }
 
 pub fn recorded_reachable_hashes(
@@ -1061,9 +828,14 @@ pub fn recorded_reachable_hashes(
           { functions: Map::new(), declarations: Map::new() },
           |accumulator: ReachableHashes, v: Int| {
             let n = g.nodes.get(v);
-            if n.declaration {
-              { ..accumulator, declarations: accumulator.declarations.insert(n.name, n.hash) }
-            } else { { ..accumulator, functions: accumulator.functions.insert(n.name, n.hash) } }
+            if is_declared_kind(n.reference.kind) {
+              {
+                ..accumulator,
+                declarations: accumulator.declarations.insert(n.reference.name, n.hash),
+              }
+            } else {
+              { ..accumulator, functions: accumulator.functions.insert(n.reference.name, n.hash) }
+            }
           },
         ),
       ),
@@ -1076,355 +848,6 @@ pub fn recorded_hashes(
   let starts = tests.fold([], |accumulator: List<Int>, t: { key: Bytes, case: Bool }|
     match starts_of(g, t.key, t.case) { Some(vs) -> accumulator.concat(vs), None -> accumulator });
   walk(g.edges, starts).map(|v: Int| g.nodes.get(v).hash)
-}
-
-fn hash_node_keys(shapes: HashInput) -> Map<Bytes, Int> / {abort.raise} =
-  range(0, shapes.nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
-    let s = shapes.nodes.get(v);
-    accumulator.insert(definition_key(s.name, s.declaration), v)
-  })
-
-pub fn hash_all(
-  shapes: HashInput,
-  first: List<FirstPass>,
-  cached: Map<Int, CachedNode>,
-  fixing: CachedHashes,
-) -> { graph: Graph, hashed: HashTables } / {abort.raise} = {
-  let keys = hash_node_keys(shapes);
-  let held_tests = fixing.tests.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CachedTest>, t: CachedTest| accumulator.insert(t.key, t),
-  );
-  let held_laws = fixing.laws.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CachedLaw>, l: CachedLaw| accumulator.insert(l.key, l),
-  );
-  let present = |refs: List<NodeRef>|
-    refs.fold([], |es: List<Int>, r: NodeRef|
-      match keys.get(definition_key(r.name, r.declaration)) { Some(w) -> es.push(w), None -> es });
-  let g = graph_with(
-    shapes,
-    first,
-    cached.fold(Map::new(), |accumulator: Map<Int, List<Int>>, v: Int, f: CachedNode|
-      accumulator.insert(v, present(f.effects))),
-  );
-  let over = { shapes: shapes, names: shapes.nodes.map(|s: HashNode| s.name), graph: g };
-  let pinned = cached.fold(Map::new(), |accumulator: Map<Int, Bytes>, v: Int, f: CachedNode|
-    accumulator.insert(v, f.hash));
-  let keyed = key_components(over, pinned, cached);
-  let hashes = keyed.hashes;
-  let contracts = contracts_of(over, cached, hashes);
-  let checks = check_key_components(over, contracts, cached, hashes);
-  let tests = shapes.tests.fold(
-    { hashes: [], bodies: [], texts: [], refs: [], runs: [], listings: [], listing_hashes: [] },
-    |accumulator: TestHashes, t: HashItem|
-      match t.form {
-        None -> match held_tests.get(t.key) {
-          Some(x) ->
-            {
-              hashes: accumulator.hashes.push(x.hash),
-              bodies: accumulator.bodies.push(x.body),
-              texts: accumulator.texts.push(x.text),
-              refs: accumulator.refs.push(present(x.refs)),
-              runs: accumulator.runs.push(present(x.runs)),
-              listings: accumulator.listings.push(present(x.listing)),
-              listing_hashes: accumulator.listing_hashes.push(x.listing_hash),
-            },
-          None -> panic("a test has no template to hash and no cached hash"),
-        },
-        Some(form) -> {
-          let referenced = references(form.form);
-          let effects = slots_under(over, referenced);
-          let f: FilledForm = filled_under(over, form.form, hashes, effects, false);
-          let text: FilledForm = filled_under(over, form.form, hashes, effects, true);
-          {
-            hashes: accumulator.hashes.push(blake3(f.bytes)),
-            bodies: accumulator.bodies.push(single_body(f)),
-            texts: accumulator.texts.push(own_hash(text.bytes)),
-            refs: accumulator.refs.push(
-              form.case_refs.fold(referenced, |rs: List<Int>, r: Int| rs.push_unique(r)),
-            ),
-            runs: accumulator.runs.push(referenced),
-            listings: accumulator.listings.push(match form.listing {
-              Some(l) -> references(l),
-              None -> [],
-            }),
-            listing_hashes: accumulator.listing_hashes.push(match form.listing {
-              Some(l) ->
-                Some(
-                  blake3(
-                    filled_under(over, l, hashes, slots_under(over, references(l)), false).bytes,
-                  ),
-                ),
-              None -> None,
-            }),
-          }
-        },
-      },
-  );
-  let laws = shapes.laws.fold(
-    { hashes: [], refs: [], texts: [] },
-    |accumulator: { hashes: List<Bytes>, refs: List<List<Int>>, texts: List<Bytes> }, l: HashItem|
-      match l.form {
-        None -> match held_laws.get(l.key) {
-          Some(x) ->
-            {
-              hashes: accumulator.hashes.push(x.hash),
-              refs: accumulator.refs.push(present(x.refs)),
-              texts: accumulator.texts.push(x.text),
-            },
-          None -> panic("a law has no template to hash and no cached hash"),
-        },
-        Some(form) -> {
-          let referenced = references(form.form);
-          let effects = slots_under(over, referenced);
-          let f: FilledForm = filled_under(over, form.form, hashes, effects, false);
-          let text: FilledForm = filled_under(over, form.form, hashes, effects, true);
-          {
-            hashes: accumulator.hashes.push(blake3(f.bytes)),
-            refs: accumulator.refs.push(referenced),
-            texts: accumulator.texts.push(spec_text_hash(0, 0, text.bytes)),
-          }
-        },
-      },
-  );
-  let stated = shapes.order.fold(
-    { own: [], specs: [], spec_texts: [], spec_checks: [] },
-    |accumulator: SpecHashes, v: Int|
-      match cached.get(v) {
-        Some(f) -> cached_spec_hashes(accumulator, shapes.nodes.get(v).name, f),
-        None ->
-          computed_spec_hashes(
-            over,
-            hashes,
-            reference_keys(over, contracts, hashes, checks, v),
-            checks,
-            accumulator,
-            v,
-            first.get(v).references,
-          ),
-      },
-  );
-  {
-    graph: g,
-    hashed: {
-      hashes: hashes,
-      bodies: keyed.bodies,
-      tests: tests.hashes,
-      test_bodies: tests.bodies,
-      test_texts: tests.texts,
-      test_refs: tests.refs,
-      test_runs: tests.runs,
-      laws: laws.hashes,
-      law_refs: laws.refs,
-      law_texts: laws.texts,
-      own: stated.own,
-      specs: stated.specs,
-      spec_texts: stated.spec_texts,
-      contracts: contracts,
-      checks: checks,
-      spec_checks: stated.spec_checks,
-      enumerations: range(0, shapes.nodes.len()).map(|v: Int| {
-        let ci = g.scc.component_of.get(v);
-        if ci < 0 { [] } else { g.scc.orders.get(ci) }
-      }),
-      clauses: range(0, shapes.nodes.len()).map(|v: Int|
-        match shapes.nodes.get(v).form {
-          Some(form) ->
-            form.clauses.fold([], |accumulator: List<Int>, c: ClauseForm|
-              accumulator.concat(references(c.form))),
-          None -> match cached.get(v) { Some(f) -> present(f.clauses), None -> [] },
-        }),
-      test_listings: tests.listings,
-      test_listing_hashes: tests.listing_hashes,
-    },
-  }
-}
-
-const contract_domain: Bytes = b"ply.contract.2"
-
-fn form_bytes(over: HashContext, form: Template, view: Map<Int, Bytes>) -> Bytes / {abort.raise} =
-  filled_item(over, form, view, false).bytes
-
-fn contract_of(
-  over: HashContext,
-  stored: Bytes,
-  hash: Bytes,
-  view: Map<Int, Bytes>,
-  bodies: Bytes,
-  v: Int,
-) -> Bytes / {abort.raise} =
-  if stored.len() > 0 { stored } else {
-    match over.shapes.nodes.get(v).form {
-      None -> hash,
-      Some(form) -> {
-        let signature = match form.signature { Some(s) -> form_bytes(over, s, view), None -> b"" };
-        let clauses = form.clauses.map(|clause: ClauseForm| form_bytes(over, clause.form, view));
-        let body = if form.transparent { b"transparent".concat(bodies) } else { b"" };
-        blake3(Bytes::concat_all([contract_domain, signature, Bytes::concat_all(clauses), body]))
-      },
-    }
-  }
-
-fn transparent_bodies(
-  over: HashContext,
-  members: List<Int>,
-  view: Map<Int, Bytes>,
-) -> Bytes / {abort.raise} = {
-  let forms = members.fold(Map::new(), |found: Map<Bytes, Bytes>, v: Int|
-    match over.shapes.nodes.get(v).form {
-      Some(form) -> if form.transparent {
-        found.insert(over.names.get(v), form_bytes(over, form.form, view))
-      } else { found },
-      None -> found,
-    });
-  Bytes::concat_all(forms.values())
-}
-
-type ContractWalk = { view: Map<Int, Bytes>, contracts: Map<Int, Bytes> }
-
-pub fn contracts_of(
-  over: HashContext,
-  cached: Map<Int, CachedNode>,
-  hashes: Map<Int, Bytes>,
-) -> Map<Int, Bytes> / {abort.raise} =
-  over.graph.components.fold(
-    { view: hashes, contracts: Map::new() },
-    |walk: ContractWalk, component: List<Int>| {
-      let functions = component.filter(|v: Int| !over.shapes.nodes.get(v).declaration);
-      let inside = functions.fold(walk.view, |view: Map<Int, Bytes>, v: Int|
-        view.insert(v, over.names.get(v)));
-      let bodies = transparent_bodies(over, functions, inside);
-      let hash_of = |v: Int| match hashes.get(v) { Some(h) -> h, None -> b"" };
-      let with_declarations = component.filter(|v: Int| over.shapes.nodes.get(v).declaration).fold(
-        walk,
-        |done: ContractWalk, v: Int| { ..done, contracts: done.contracts.insert(v, hash_of(v)) },
-      );
-      functions.fold(with_declarations, |done: ContractWalk, v: Int| {
-        let stored = match cached.get(v) { Some(f) -> f.contract, None -> b"" };
-        let contract = contract_of(over, stored, hash_of(v), inside, bodies, v);
-        { view: done.view.insert(v, contract), contracts: done.contracts.insert(v, contract) }
-      })
-    },
-  ).contracts
-
-fn reference_keys(
-  over: HashContext,
-  contracts: Map<Int, Bytes>,
-  hashes: Map<Int, Bytes>,
-  checks: Map<Int, Bytes>,
-  v: Int,
-) -> Map<Int, Bytes> / {abort.raise} = {
-  let own = over.shapes.nodes.get(v).package;
-  over.graph.edges.get(v).fold(Map::new(), |view: Map<Int, Bytes>, r: Int| {
-    let key = if over.shapes.nodes.get(r).package != own { contracts.get(r) }
-    else { match checks.get(r) { Some(x) -> Some(x), None -> hashes.get(r) } };
-    match key { Some(k) -> view.insert(r, k), None -> view }
-  })
-}
-
-fn check_key_components(
-  over: HashContext,
-  contracts: Map<Int, Bytes>,
-  cached: Map<Int, CachedNode>,
-  hashes: Map<Int, Bytes>,
-) -> Map<Int, Bytes> / {abort.raise} =
-  range(0, over.graph.components.len()).fold(Map::new(), |checks: Map<Int, Bytes>, ci: Int| {
-    let component = over.graph.components.get(ci);
-    if component.fold(true, |all: Bool, v: Int|
-        all && (cached.contains(v) || has_no_form(over.shapes.nodes.get(v)))) {
-      component.fold(checks, |keys: Map<Int, Bytes>, v: Int|
-        match cached.get(v) { Some(f) -> keys.insert(v, f.check), None -> keys })
-    } else {
-      let view = component.fold(Map::new(), |gathered: Map<Int, Bytes>, v: Int|
-        reference_keys(over, contracts, hashes, checks, v).fold(
-          gathered,
-          |m: Map<Int, Bytes>, r: Int, k: Bytes|
-            if over.graph.scc.component_of.get(r) == ci { m } else { m.insert(r, k) },
-        ));
-      if view.fold(true, |all: Bool, r: Int, k: Bytes| all && hashes.get(r) == Some(k)) {
-        component.fold(checks, |keys: Map<Int, Bytes>, v: Int|
-          match hashes.get(v) { Some(h) -> keys.insert(v, h), None -> keys })
-      } else {
-        let effects = positions(over.graph.scc.orders.get(ci));
-        if is_cyclic(component, over.graph.edges) {
-          hash_component(over, component, view, effects).members.fold(
-            checks,
-            |keys: Map<Int, Bytes>, m: { node: Int, hash: Bytes }| keys.insert(m.node, m.hash),
-          )
-        } else {
-          let v = component.get(0);
-          checks.insert(v, blake3(filled_under(over, form_of(over, v), view, effects, false).bytes))
-        }
-      }
-    }
-  })
-
-fn cached_spec_hashes(accumulator: SpecHashes, name: Bytes, fixed: CachedNode) -> SpecHashes = {
-  let owned: SpecHashes = match fixed.own {
-    Some(o) -> { ..accumulator, own: accumulator.own.push({ name: name, hash: o }) },
-    None -> accumulator,
-  };
-  if fixed.specs.len() == 0 { owned } else {
-    {
-      ..owned,
-      specs: owned.specs.push({ name: name, hashes: fixed.specs }),
-      spec_texts: owned.spec_texts.push({ name: name, hashes: fixed.spec_texts }),
-      spec_checks: owned.spec_checks.push({ name: name, hashes: fixed.spec_checks }),
-    }
-  }
-}
-
-fn computed_spec_hashes(
-  over: HashContext,
-  hashes: Map<Int, Bytes>,
-  view: Map<Int, Bytes>,
-  checks: Map<Int, Bytes>,
-  accumulator: SpecHashes,
-  v: Int,
-  refs: List<Int>,
-) -> SpecHashes / {abort.raise} = {
-  let shape = over.shapes.nodes.get(v);
-  match shape.form {
-    None -> accumulator,
-    Some(form) -> if shape.declaration { accumulator } else {
-      let own: FilledForm = filled_under(
-        over,
-        form.form,
-        hashes,
-        positions(effect_order(over.shapes, refs, over.graph.scc, None, [])),
-        true,
-      );
-      let owned: SpecHashes = {
-        ..accumulator,
-        own: accumulator.own.push({ name: shape.name, hash: own_hash(own.bytes) }),
-      };
-      if form.clauses.len() == 0 { owned } else {
-        match hashes.get(v) {
-          None -> owned,
-          Some(owner) -> {
-            let effects = form.clauses.map(|c: ClauseForm| slots_of(over, c.form));
-            let encoded = |i: Int, table: Map<Int, Bytes>, by_name: Bool|
-              filled_under(over, form.clauses.get(i).form, table, effects.get(i), by_name).bytes;
-            let kinds = range(0, form.clauses.len());
-            let clauses = kinds.map(|i: Int|
-              spec_hash(owner, form.clauses.get(i).kind, i, encoded(i, hashes, false)));
-            let texts = kinds.map(|i: Int|
-              spec_text_hash(form.clauses.get(i).kind, i, encoded(i, hashes, true)));
-            let cut_owner = match checks.get(v) { Some(k) -> k, None -> owner };
-            let cuts = kinds.map(|i: Int|
-              spec_hash(cut_owner, form.clauses.get(i).kind, i, encoded(i, view, false)));
-            {
-              ..owned,
-              specs: owned.specs.push({ name: shape.name, hashes: clauses }),
-              spec_texts: owned.spec_texts.push({ name: shape.name, hashes: texts }),
-              spec_checks: owned.spec_checks.push({ name: shape.name, hashes: cuts }),
-            }
-          },
-        }
-      }
-    },
-  }
 }
 
 fn form_nodes(form: Template, seen: NodeOrder) -> NodeOrder / {abort.raise} =
@@ -1445,17 +868,37 @@ fn renumber(form: Template, ids: Map<Int, Int>) -> Template / {abort.raise} =
       None -> panic("a template refers to a definition that has no new index"),
     })
 
-fn optional_renumber(
-  form: Option<Template>,
-  ids: Map<Int, Int>,
-) -> Option<Template> / {abort.raise} =
-  match form { Some(f) -> Some(renumber(f, ids)), None -> None }
+fn renumbered_node(f: NodeForm, ids: Map<Int, Int>) -> NodeForm / {abort.raise} =
+  {
+    form: renumber(f.form, ids),
+    signature: f.signature.map(|s: Template| renumber(s, ids)),
+    clauses: f.clauses.map(|c: ClauseForm| { ..c, form: renumber(c.form, ids) }),
+    transparent: f.transparent,
+  }
 
-pub fn module_forms(index: Index, packages: List<Int>, module: Int) -> HashInput / {abort.raise} =
-  filtered_forms(index, packages, module, {
+fn renumbered_item(x: ItemForm, ids: Map<Int, Int>) -> ItemForm / {abort.raise} =
+  { form: renumber(x.form, ids), listing: x.listing.map(|l: Template| renumber(l, ids)) }
+
+pub fn module_forms(index: Index, module: Int) -> HashInput / {abort.raise} =
+  filtered_forms(index, module, {
     node: |_: Bytes| true,
     test: |_: Bytes| true,
     law: |_: Bytes| true,
+  })
+
+pub fn index_forms(index: Index) -> HashInput / {abort.raise} =
+  selection_forms(index, {
+    own: index.order.fold([], |accumulator: List<Int>, e: IndexEntry|
+      match e {
+        DefinitionEntry(v) -> match index.nodes.get(v).body {
+          NodeElsewhere(_) -> accumulator,
+          _ -> accumulator.push(v),
+        },
+        _ -> accumulator,
+      }),
+    tests: index.tests,
+    laws: index.laws,
+    called: None,
   })
 
 pub type ItemFilter = {
@@ -1466,12 +909,11 @@ pub type ItemFilter = {
 
 pub fn filtered_forms(
   index: Index,
-  packages: List<Int>,
   module: Int,
   filter: ItemFilter,
 ) -> HashInput / {abort.raise} = {
   let c = module_selection(index, module);
-  selection_forms(index, packages, {
+  selection_forms(index, {
     own: c.own.filter(|v: Int| (filter.node)(index.nodes.get(v).name)),
     tests: c.tests.filter(|t: TestNode| (filter.test)(t.key)),
     laws: c.laws.filter(|l: LawNode| (filter.law)(l.key)),
@@ -1499,22 +941,13 @@ pub fn module_selection(index: Index, module: Int) -> ModuleSelection / {abort.r
     called: None,
   }
 
-pub fn selection_forms(
-  index: Index,
-  packages: List<Int>,
-  chosen: ModuleSelection,
-) -> HashInput / {abort.raise} = {
+pub fn selection_forms(index: Index, chosen: ModuleSelection) -> HashInput / {abort.raise} = {
   let own = chosen.own;
   let forms = own.map(|v: Int| node_form(index, v, chosen.called));
-  let tests = chosen.tests;
-  let laws = chosen.laws;
-  let test_forms = tests.map(|t: TestNode| test_form(index, t, chosen.called));
-  let law_forms = laws.map(|l: LawNode| law_form(index, l));
+  let test_forms = chosen.tests.map(|t: TestNode| test_form(index, t, chosen.called));
+  let law_forms = chosen.laws.map(|l: LawNode| law_form(index, l));
   let item_nodes = |accumulator: NodeOrder, x: ItemForm|
-    x.case_refs.fold(
-      optional_form_nodes(x.listing, form_nodes(x.form, accumulator)),
-      |a: NodeOrder, v: Int| add_node(a, v),
-    );
+    optional_form_nodes(x.listing, form_nodes(x.form, accumulator));
   let table = law_forms.fold(
     test_forms.fold(
       forms.fold(
@@ -1530,378 +963,78 @@ pub fn selection_forms(
     item_nodes,
   );
   let ids = table.at;
-  let item = |x: ItemForm|
-    {
-      form: renumber(x.form, ids),
-      case_refs: x.case_refs.map(|v: Int| match ids.get(v) { Some(k) -> k, None -> v }),
-      listing: x.listing.map(|l: Template| renumber(l, ids)),
-    };
   {
-    nodes: range(0, table.order.len()).map(|k: Int| {
-      let v = table.order.get(k);
+    names: table.order.map(|v: Int| {
       let node = index.nodes.get(v);
-      {
-        name: node.name,
-        declaration: is_declaration(node),
-        effect: is_effect(index, v),
-        package: match packages.at(node.module) { Some(p) -> p, None -> 0 },
-        form: if k < own.len() {
-          let f = forms.get(k);
-          Some({
-            form: renumber(f.form, ids),
-            signature: optional_renumber(f.signature, ids),
-            clauses: f.clauses.map(|c: ClauseForm| { ..c, form: renumber(c.form, ids) }),
-            transparent: f.transparent,
-          })
-        } else { None },
-      }
+      { name: node.name, kind: node_kind(node) }
     }),
-    order: range(0, own.len()),
-    tests: range(0, tests.len()).map(|i: Int|
-      { key: tests.get(i).key, form: Some(item(test_forms.get(i))) }),
-    laws: range(0, laws.len()).map(|i: Int|
-      { key: laws.get(i).key, form: Some(item(law_forms.get(i))) }),
+    definitions: range(0, own.len()).map(|k: Int|
+      { node: k, form: renumbered_node(forms.get(k), ids) }),
+    tests: range(0, chosen.tests.len()).map(|i: Int|
+      { key: chosen.tests.get(i).key, form: renumbered_item(test_forms.get(i), ids) }),
+    laws: range(0, chosen.laws.len()).map(|i: Int|
+      { key: chosen.laws.get(i).key, form: renumbered_item(law_forms.get(i), ids) }),
   }
 }
-
-type JoinedNode = { part: Int, at: Int, shape: HashNode }
 
 pub fn joined_forms(parts: List<HashInput>) -> HashInput / {abort.raise} = {
-  let visit = |formed: Bool|
-    |accumulator: { at: Map<Bytes, Int>, nodes: List<JoinedNode> }, k: Int|
-      range(0, parts.get(k).nodes.len()).fold(
+  let all = parts.fold(
+    { at: Map::new(), names: [] },
+    |accumulator: { at: Map<Bytes, Int>, names: List<NodeRef> }, part: HashInput|
+      part.names.fold(
         accumulator,
-        |a: { at: Map<Bytes, Int>, nodes: List<JoinedNode> }, v: Int| {
-          let shape = parts.get(k).nodes.get(v);
-          let key = definition_key(shape.name, shape.declaration);
-          if has_no_form(shape) == formed || a.at.contains(key) { a } else {
-            {
-              at: a.at.insert(key, a.nodes.len()),
-              nodes: a.nodes.push({ part: if formed { k } else { 0 - 1 }, at: v, shape: shape }),
-            }
-          }
-        },
-      );
-  let formed = range(0, parts.len()).fold({ at: Map::new(), nodes: [] }, visit(true));
-  let all = range(0, parts.len()).fold(formed, visit(false));
-  let ids = parts.map(|part: HashInput|
-    range(0, part.nodes.len()).fold(Map::new(), |accumulator: Map<Int, Int>, v: Int| {
-      let shape = part.nodes.get(v);
-      match all.at.get(definition_key(shape.name, shape.declaration)) {
-        Some(k) -> accumulator.insert(v, k),
-        None ->
-          panic("a definition from one package is missing from the combined list of definitions"),
-      }
-    }));
-  let item = |k: Int|
-    |x: HashItem|
-      {
-        ..x,
-        form: match x.form {
-          None -> None,
-          Some(f) ->
-            Some({
-              form: renumber(f.form, ids.get(k)),
-              case_refs: f.case_refs.map(|v: Int|
-                match ids.get(k).get(v) { Some(w) -> w, None -> v }),
-              listing: f.listing.map(|l: Template| renumber(l, ids.get(k))),
-            }),
-        },
-      };
-  {
-    nodes: all.nodes.map(|j: JoinedNode|
-      match j.shape.form {
-        None -> j.shape,
-        Some(f) ->
-          {
-            ..j.shape,
-            form: Some({
-              form: renumber(f.form, ids.get(j.part)),
-              signature: optional_renumber(f.signature, ids.get(j.part)),
-              clauses: f.clauses.map(|c: ClauseForm|
-                { ..c, form: renumber(c.form, ids.get(j.part)) }),
-              transparent: f.transparent,
-            }),
-          },
-      }),
-    order: range(0, formed.nodes.len()),
-    tests: range(0, parts.len()).fold([], |accumulator: List<HashItem>, k: Int|
-      accumulator.concat(parts.get(k).tests.map(item(k)))),
-    laws: range(0, parts.len()).fold([], |accumulator: List<HashItem>, k: Int|
-      accumulator.concat(parts.get(k).laws.map(item(k)))),
-  }
-}
-
-pub fn hash_forms(forms: HashInput, fixed: List<CachedNode>) -> CachedHashes / {abort.raise} = {
-  let named = hash_node_keys(forms);
-  let fixed_by_node = fixed.fold(Map::new(), |accumulator: Map<Int, CachedNode>, f: CachedNode|
-    match named.get(definition_key(f.name, f.declaration)) {
-      Some(v) -> if has_no_form(forms.nodes.get(v)) { accumulator.insert(v, f) }
-      else { accumulator },
-      None -> accumulator,
-    });
-  let extra = fixed_by_node.fold(
-    { keys: named, nodes: [] },
-    |accumulator: { keys: Map<Bytes, Int>, nodes: List<HashNode> }, _: Int, f: CachedNode|
-      f.effects.fold(
-        accumulator,
-        |a: { keys: Map<Bytes, Int>, nodes: List<HashNode> }, r: NodeRef| {
-          let key = definition_key(r.name, r.declaration);
-          if a.keys.contains(key) { a } else {
-            {
-              keys: a.keys.insert(key, forms.nodes.len() + a.nodes.len()),
-              nodes: a.nodes.push({
-                name: r.name,
-                declaration: r.declaration,
-                effect: true,
-                package: 0 - 1,
-                form: None,
-              }),
-            }
-          }
+        |a: { at: Map<Bytes, Int>, names: List<NodeRef> }, r: NodeRef| {
+          let key = definition_key(r.name, r.kind);
+          if a.at.contains(key) { a }
+          else { { at: a.at.insert(key, a.names.len()), names: a.names.push(r) } }
         },
       ),
   );
-  let shapes = { ..forms, nodes: forms.nodes.concat(extra.nodes) };
-  let keys = extra.keys;
-  let unfixed = range(0, forms.nodes.len()).filter(|v: Int|
-    has_no_form(forms.nodes.get(v)) && !fixed_by_node.contains(v));
-  if unfixed.len() > 0 {
-    panic(
-      "no template or cached hash for "
-        ++ String::of_bytes_lossy(forms.nodes.get(unfixed.get(0)).name),
-    )
-  };
-  let present = |refs: List<NodeRef>|
-    refs.fold([], |es: List<Int>, r: NodeRef|
-      match keys.get(definition_key(r.name, r.declaration)) { Some(w) -> es.push(w), None -> es });
-  let out = hash_all(
-    shapes,
-    first_pass_of(
-      shapes,
-      fixed_by_node.fold(Map::new(), |accumulator: Map<Int, List<Int>>, v: Int, f: CachedNode|
-        accumulator.insert(v, present(f.edges))),
-    ),
-    fixed_by_node,
-    no_cached_hashes,
-  );
-  let h = out.hashed;
-  let refs = |rs: List<Int>|
-    rs.map(|r: Int|
-      { name: shapes.nodes.get(r).name, declaration: shapes.nodes.get(r).declaration });
-  let by_name = |xs: List<{ name: Bytes, hashes: List<Bytes> }>|
-    xs.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
-        accumulator.insert(x.name, x.hashes),
-    );
-  let own = h.own.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-      accumulator.insert(x.name, x.hash),
-  );
-  let specs = by_name(h.specs);
-  let texts = by_name(h.spec_texts);
-  let checks = by_name(h.spec_checks);
-  let listed = |m: Map<Bytes, List<Bytes>>, name: Bytes|
-    match m.get(name) { Some(xs) -> xs, None -> [] };
-  {
-    nodes: forms.order.map(|v: Int| {
-      let s = shapes.nodes.get(v);
-      let hash = match h.hashes.get(v) { Some(x) -> x, None -> b"" };
-      {
-        name: s.name,
-        declaration: s.declaration,
-        hash: hash,
-        own: if s.declaration { None } else { own.get(s.name) },
-        specs: if s.declaration { [] } else { listed(specs, s.name) },
-        spec_texts: if s.declaration { [] } else { listed(texts, s.name) },
-        spec_checks: if s.declaration { [] } else { listed(checks, s.name) },
-        contract: if s.declaration { b"" }
-        else { match h.contracts.get(v) { Some(c) -> c, None -> hash } },
-        check: if s.declaration { hash }
-        else { match h.checks.get(v) { Some(c) -> c, None -> hash } },
-        body: match h.bodies.get(v) { Some(b) -> b, None -> b"" },
-        edges: refs(out.graph.edges.get(v)),
-        effects: refs(h.enumerations.get(v)),
-        clauses: refs(h.clauses.get(v)),
+  let ids = parts.map(|part: HashInput|
+    range(0, part.names.len()).fold(Map::new(), |accumulator: Map<Int, Int>, v: Int| {
+      let r = part.names.get(v);
+      match all.at.get(definition_key(r.name, r.kind)) {
+        Some(k) -> accumulator.insert(v, k),
+        None -> panic("a definition of one part is missing from the joined list of names"),
       }
-    }),
-    tests: range(0, forms.tests.len()).map(|i: Int|
-      {
-        key: forms.tests.get(i).key,
-        hash: h.tests.get(i),
-        body: h.test_bodies.get(i),
-        text: h.test_texts.get(i),
-        refs: refs(h.test_refs.get(i)),
-        runs: refs(h.test_runs.get(i)),
-        listing: refs(h.test_listings.get(i)),
-        listing_hash: h.test_listing_hashes.get(i),
-      }),
-    laws: range(0, forms.laws.len()).map(|i: Int|
-      {
-        key: forms.laws.get(i).key,
-        hash: h.laws.get(i),
-        text: h.law_texts.get(i),
-        refs: refs(h.law_refs.get(i)),
-      }),
+    }));
+  let joined = |pick: (HashInput) -> List<HashItem>|
+    range(0, parts.len()).fold([], |accumulator: List<HashItem>, k: Int|
+      accumulator.concat(
+        pick(parts.get(k)).map(|x: HashItem|
+          { key: x.key, form: renumbered_item(x.form, ids.get(k)) }),
+      ));
+  {
+    names: all.names,
+    definitions: range(0, parts.len()).fold([], |accumulator: List<FormedNode>, k: Int|
+      accumulator.concat(
+        parts.get(k).definitions.map(|d: FormedNode|
+          {
+            node: match ids.get(k).get(d.node) {
+              Some(w) -> w,
+              None -> panic("a defined node is missing from its part's names"),
+            },
+            form: renumbered_node(d.form, ids.get(k)),
+          }),
+      )),
+    tests: joined(|p: HashInput| p.tests),
+    laws: joined(|p: HashInput| p.laws),
   }
 }
 
-pub fn cached_nodes(
-  index: Index,
-  hashes: HashOutput,
-  keep: Set<Bytes>,
-) -> List<CachedNode> / {abort.raise} = {
-  let node_refs = |refs: List<Int>|
-    refs.map(|r: Int|
-      { name: index.nodes.get(r).name, declaration: is_declaration(index.nodes.get(r)) });
-  let edges_of = |v: Int, node: Node|
-    match hashes.refs.edges.at(v) {
-      Some(refs) -> node_refs(refs),
-      None -> node_refs(references(node_template(index, node.module, node.name, None, node.body))),
-    };
-  let own = hashes.own.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-      accumulator.insert(x.name, x.hash),
-  );
-  let specs = hashes.specs.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
-      accumulator.insert(x.name, x.hashes),
-  );
-  let texts = hashes.spec_texts.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
-      accumulator.insert(x.name, x.hashes),
-  );
-  let checks = hashes.spec_checks.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
-      accumulator.insert(x.name, x.hashes),
-  );
-  let named = |xs: List<{ name: Bytes, hash: Bytes }>|
-    xs.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
-      accumulator.insert(x.name, x.hash));
-  let contracts = named(hashes.contracts);
-  let check_keys = named(hashes.checks);
-  let listed = |m: Map<Bytes, List<Bytes>>, name: Bytes|
-    match m.get(name) { Some(xs) -> xs, None -> [] };
-  let walked = index.order.fold(
-    { body: 0, definition: 0, declaration: 0, out: [] },
-    |accumulator: { body: Int, definition: Int, declaration: Int, out: List<CachedNode> }, e: IndexEntry|
-      match e {
-        DefinitionEntry(v) -> {
-          let node = index.nodes.get(v);
-          let declaration = is_declaration(node);
-          let body = hashes.bodies.get(accumulator.body);
-          if body.name != node.name {
-            panic("hashes and the index disagree on the order of nodes")
-          };
-          let next = {
-            ..accumulator,
-            body: accumulator.body + 1,
-            definition: if declaration { accumulator.definition }
-            else { accumulator.definition + 1 },
-            declaration: if declaration { accumulator.declaration + 1 }
-            else { accumulator.declaration },
-          };
-          if !keep.contains(index.modules.get(node.module).name) { next } else {
-            {
-              ..next,
-              out: next.out.push({
-                name: node.name,
-                declaration: declaration,
-                hash: if declaration { hashes.declarations.get(accumulator.declaration).hash }
-                else { hashes.definitions.get(accumulator.definition).hash },
-                own: if declaration { None } else { own.get(node.name) },
-                specs: if declaration { [] } else { listed(specs, node.name) },
-                spec_texts: if declaration { [] } else { listed(texts, node.name) },
-                spec_checks: if declaration { [] } else { listed(checks, node.name) },
-                contract: if declaration { b"" }
-                else { match contracts.get(node.name) { Some(c) -> c, None -> b"" } },
-                check: if declaration { hashes.declarations.get(accumulator.declaration).hash }
-                else { match check_keys.get(node.name) { Some(c) -> c, None -> b"" } },
-                body: body.body,
-                edges: edges_of(v, node),
-                effects: node_refs(match hashes.component_members.at(v) {
-                  Some(es) -> es,
-                  None -> [],
-                }),
-                clauses: node_refs(match hashes.refs.clauses.at(v) { Some(cs) -> cs, None -> [] }),
-              }),
-            }
-          }
-        },
-        _ -> accumulator,
-      },
-  );
-  walked.out
-}
-
-pub fn cached_hashes_of(
-  index: Index,
-  hashes: HashOutput,
-  keep: Set<Bytes>,
-) -> CachedHashes / {abort.raise} = {
-  let refs = |rs: List<Int>|
-    rs.map(|r: Int|
-      { name: index.nodes.get(r).name, declaration: is_declaration(index.nodes.get(r)) });
-  let in_selection = |module: Int| keep.contains(index.modules.get(module).name);
-  {
-    nodes: cached_nodes(index, hashes, keep),
-    tests: range(0, index.tests.len()).fold([], |accumulator: List<CachedTest>, i: Int| {
-      let t = index.tests.get(i);
-      if !in_selection(t.module) { accumulator } else {
-        accumulator.push({
-          key: t.key,
-          hash: of_key(hashes.tests, t.key),
-          body: of_key(hashes.test_bodies, t.key),
-          text: of_key(hashes.test_texts, t.key),
-          refs: refs(of_key(hashes.test_refs, t.key)),
-          runs: refs(of_key(hashes.test_runs, t.key)),
-          listing: refs(match hashes.refs.listings.get(t.key) { Some(xs) -> xs, None -> [] }),
-          listing_hash: of_key(hashes.listing_hashes, t.key),
-        })
-      }
-    }),
-    laws: range(0, index.laws.len()).fold([], |accumulator: List<CachedLaw>, i: Int| {
-      let l = index.laws.get(i);
-      if !in_selection(l.module) { accumulator } else {
-        accumulator.push({
-          key: l.key,
-          hash: of_key(hashes.laws, l.key),
-          text: of_key(hashes.law_texts, l.key),
-          refs: refs(of_key(hashes.law_refs, l.key)),
-        })
-      }
-    }),
-  }
-}
-
-pub fn is_declaration(node: Node) -> Bool =
-  match node.body { NodeFn(_) -> false, NodeElsewhere(e) -> is_declared_kind(e.kind), _ -> true }
-
-pub fn node_held_elsewhere(name: Bytes, declaration: Bool) -> CachedNode =
-  {
-    name: name,
-    declaration: declaration,
-    hash: b"",
-    own: None,
-    specs: [],
-    spec_texts: [],
-    spec_checks: [],
-    contract: b"",
-    check: b"",
-    body: b"",
-    edges: [],
-    effects: [],
-    clauses: [],
+pub fn node_kind(node: Node) -> HeldKind =
+  match node.body {
+    NodeFn(_) -> HeldValue,
+    NodeType(_) -> HeldType,
+    NodeEffect(_) -> HeldEffect,
+    NodeElsewhere(e) -> e.kind,
   }
 
-pub fn definition_key(name: Bytes, declaration: Bool) -> Bytes =
-  Bytes::concat(if declaration { b"decl " } else { b"def " }, name)
+pub fn definition_key(name: Bytes, kind: HeldKind) -> Bytes =
+  Bytes::concat(
+    match kind { HeldValue -> b"def ", HeldType -> b"type ", HeldEffect -> b"effect " },
+    name,
+  )
 
 fn append_at(m: Map<Bytes, List<Int>>, key: Bytes, vs: List<Int>) -> Map<Bytes, List<Int>> =
   m.insert(key, List::concat(match m.get(key) { Some(xs) -> xs, None -> [] }, vs))
@@ -1915,217 +1048,191 @@ pub type HashLayout = {
 
 pub fn hash_layout(index: Index) -> HashLayout =
   {
-    nodes: index.nodes.map(|node: Node| { name: node.name, declaration: is_declaration(node) }),
+    nodes: index.nodes.map(|node: Node| { name: node.name, kind: node_kind(node) }),
     order: index.order,
     tests: index.tests.map(|t: TestNode| { key: t.key, cases: t.definition.cases != None }),
     laws: index.laws.map(|l: LawNode| l.key),
   }
 
-fn by_key<a>(keys: List<Bytes>, xs: List<a>) -> Map<Bytes, a> / {abort.raise} =
-  range(0, keys.len()).fold(Map::new(), |accumulator: Map<Bytes, a>, i: Int|
-    accumulator.insert(keys.get(i), xs.get(i)))
-
-pub fn assemble(
-  sk: HashLayout,
-  edges: List<List<Int>>,
-  h: HashTables,
-) -> HashOutput / {abort.raise} = {
-  let functions = range(0, sk.nodes.len()).fold(
+pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise} = {
+  let keys = range(0, sk.nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
+    let node = sk.nodes.get(v);
+    accumulator.insert(definition_key(node.name, node.kind), v)
+  });
+  let ids = |refs: List<NodeRef>|
+    refs.fold([], |es: List<Int>, r: NodeRef|
+      match keys.get(definition_key(r.name, r.kind)) { Some(w) -> es.push(w), None -> es });
+  let by_node = own.definitions.fold(
     Map::new(),
-    |accumulator: Map<Bytes, Int>, v: Int| {
-      let node = sk.nodes.get(v);
-      if node.declaration { accumulator } else { accumulator.insert(node.name, v) }
-    },
+    |accumulator: Map<Int, DefinitionHash>, d: DefinitionHash|
+      match keys.get(definition_key(d.name, d.kind)) {
+        Some(v) -> accumulator.insert(v, d),
+        None -> accumulator,
+      },
   );
-  let declared = range(0, sk.nodes.len()).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Int>>, v: Int| {
-      let node = sk.nodes.get(v);
-      if node.declaration { append_at(accumulator, node.name, [v]) } else { accumulator }
-    },
-  );
-  let tested = range(0, sk.tests.len()).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Int>>, i: Int|
-      append_at(accumulator, sk.tests.get(i).key, h.test_refs.get(i)),
-  );
-  let items = range(0, sk.laws.len()).fold(tested, |accumulator: Map<Bytes, List<Int>>, i: Int|
-    append_at(accumulator, sk.laws.get(i), h.law_refs.get(i)));
+  let tests = own.tests.fold(Map::new(), |accumulator: Map<Bytes, TestHash>, t: TestHash|
+    accumulator.insert(t.key, t));
+  let laws = own.laws.fold(Map::new(), |accumulator: Map<Bytes, LawHash>, l: LawHash|
+    accumulator.insert(l.key, l));
+  let tested = sk.tests.fold([], |accumulator: List<TestHash>, t: { key: Bytes, cases: Bool }|
+    match tests.get(t.key) { Some(x) -> accumulator.push(x), None -> accumulator });
+  let lawful = sk.laws.fold([], |accumulator: List<LawHash>, key: Bytes|
+    match laws.get(key) { Some(x) -> accumulator.push(x), None -> accumulator });
+  let test_keys = tested.map(|t: TestHash| t.key);
+  let law_keys = lawful.map(|l: LawHash| l.key);
+  let edges = range(0, sk.nodes.len()).map(|v: Int|
+    match by_node.get(v) { Some(d) -> ids(d.uses), None -> [] });
   let names_at = |refs: List<Int>| refs.map(|r: Int| sk.nodes.get(r).name);
-  let tests = sk.tests.map(|t: { key: Bytes, cases: Bool }| t.key);
-  let empty: HashOutput = {
+  let test_refs = tested.map(|t: TestHash| ids(test_uses(t)));
+  let law_refs = lawful.map(|l: LawHash| ids(l.uses));
+  let start: HashOutput = {
     definitions: [],
-    own: h.own,
     declarations: [],
-    tests: by_key(tests, h.tests),
-    laws: by_key(sk.laws, h.laws),
-    specs: h.specs,
-    spec_texts: h.spec_texts,
-    law_texts: by_key(sk.laws, h.law_texts),
+    tests: by_key(test_keys, tested.map(|t: TestHash| t.hash)),
+    laws: by_key(law_keys, lawful.map(|l: LawHash| l.hash)),
+    specs: [],
     dependencies: [],
     refs: {
       names: sk.nodes.map(|node: NodeRef| node.name),
-      is_declaration: sk.nodes.map(|node: NodeRef| node.declaration),
+      kinds: sk.nodes.map(|node: NodeRef| node.kind),
       edges: edges,
-      functions: functions,
-      declared: declared,
-      items: items,
-      cases: range(0, sk.tests.len()).fold(
+      functions: range(0, sk.nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
+        let node = sk.nodes.get(v);
+        if node.kind == HeldValue { accumulator.insert(node.name, v) } else { accumulator }
+      }),
+      declared: range(0, sk.nodes.len()).fold(
         Map::new(),
-        |accumulator: Map<Bytes, List<Int>>, i: Int| {
-          let t = sk.tests.get(i);
-          if !t.cases { accumulator } else { append_at(accumulator, t.key, h.test_runs.get(i)) }
+        |accumulator: Map<Bytes, List<Int>>, v: Int| {
+          let node = sk.nodes.get(v);
+          if is_declared_kind(node.kind) { append_at(accumulator, node.name, [v]) }
+          else { accumulator }
         },
       ),
-      clauses: h.clauses,
-      listings: range(0, sk.tests.len()).fold(
-        Map::new(),
-        |accumulator: Map<Bytes, List<Int>>, i: Int| {
-          let t = sk.tests.get(i);
-          if !t.cases { accumulator } else { append_at(accumulator, t.key, h.test_listings.get(i)) }
-        },
+      items: range(0, lawful.len()).fold(
+        range(0, tested.len()).fold(Map::new(), |accumulator: Map<Bytes, List<Int>>, i: Int|
+          append_at(accumulator, test_keys.get(i), test_refs.get(i))),
+        |accumulator: Map<Bytes, List<Int>>, i: Int|
+          append_at(accumulator, law_keys.get(i), law_refs.get(i)),
       ),
+      cases: tested.fold(Map::new(), |accumulator: Map<Bytes, List<Int>>, t: TestHash|
+        match t.listing { Some(_) -> append_at(accumulator, t.key, ids(t.uses)), None -> accumulator }),
+      clauses: range(0, sk.nodes.len()).map(|v: Int|
+        match by_node.get(v) { Some(d) -> ids(d.clause_uses), None -> [] }),
+      listings: tested.fold(Map::new(), |accumulator: Map<Bytes, List<Int>>, t: TestHash|
+        match t.listing { Some(l) -> append_at(accumulator, t.key, ids(l.uses)), None -> accumulator }),
     },
     bodies: [],
-    test_bodies: by_key(tests, h.test_bodies),
-    test_texts: by_key(tests, h.test_texts),
+    test_bodies: by_key(test_keys, tested.map(|t: TestHash| t.body)),
     contracts: [],
-    checks: [],
-    spec_checks: h.spec_checks,
-    test_refs: by_key(tests, h.test_refs),
-    test_runs: by_key(tests, h.test_runs),
-    law_refs: by_key(sk.laws, h.law_refs),
-    component_members: h.enumerations,
-    listing_hashes: by_key(tests, h.test_listing_hashes),
+    test_refs: by_key(test_keys, test_refs),
+    test_runs: by_key(test_keys, tested.map(|t: TestHash| ids(t.uses))),
+    law_refs: by_key(law_keys, law_refs),
+    listing_hashes: tested.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, t: TestHash|
+      match t.listing { Some(l) -> accumulator.insert(t.key, l.hash), None -> accumulator }),
+    identities: [],
   };
   sk.order.fold(
-    { out: empty, dependencies_at: Map::new() },
+    { out: start, dependencies_at: Map::new() },
     |accumulator: Recording, e: IndexEntry|
       match e {
-        DefinitionEntry(v) -> {
-          let node = sk.nodes.get(v);
-          let bodied: HashOutput = match h.bodies.get(v) {
-            None -> accumulator.out,
-            Some(body) ->
-              {
-                ..accumulator.out,
-                bodies: accumulator.out.bodies.push({ name: node.name, body: body }),
-              },
-          };
-          let keyed: HashOutput = match h.hashes.get(v) {
-            None -> bodied,
-            Some(hash) -> if node.declaration {
-              { ..bodied, declarations: bodied.declarations.push({ name: node.name, hash: hash }) }
-            } else {
-              {
-                ..bodied,
-                definitions: bodied.definitions.push({ name: node.name, hash: hash }),
-                contracts: bodied.contracts.push({
-                  name: node.name,
-                  hash: match h.contracts.get(v) { Some(c) -> c, None -> hash },
-                }),
-                checks: bodied.checks.push({
-                  name: node.name,
-                  hash: match h.checks.get(v) { Some(c) -> c, None -> hash },
-                }),
-              }
-            },
-          };
-          record({ ..accumulator, out: keyed }, node.name, names_at(edges.get(v)))
+        DefinitionEntry(v) -> match by_node.get(v) {
+          None -> accumulator,
+          Some(d) -> {
+            let o = accumulator.out;
+            let named = { name: d.name, hash: d.hash };
+            let placed: HashOutput = {
+              ..o,
+              bodies: o.bodies.push({ name: d.name, body: d.body }),
+              definitions: if d.kind == HeldValue { o.definitions.push(named) } else { o.definitions },
+              declarations: if d.kind == HeldValue { o.declarations } else { o.declarations.push(named) },
+              contracts: if d.kind == HeldValue {
+                o.contracts.push({ name: d.name, hash: d.contract })
+              } else { o.contracts },
+              specs: if d.clauses.len() == 0 { o.specs }
+              else { o.specs.push({ name: d.name, hashes: d.clauses }) },
+            };
+            record({ ..accumulator, out: placed }, d.name, names_at(edges.get(v)))
+          },
         },
-        TestEntry(i) -> record(accumulator, sk.tests.get(i).key, names_at(h.test_refs.get(i))),
-        LawEntry(i) -> record(accumulator, sk.laws.get(i), names_at(h.law_refs.get(i))),
+        TestEntry(i) -> match tests.get(sk.tests.get(i).key) {
+          Some(t) -> record(accumulator, t.key, names_at(ids(test_uses(t)))),
+          None -> accumulator,
+        },
+        LawEntry(i) -> match laws.get(sk.laws.get(i)) {
+          Some(l) -> record(accumulator, l.key, names_at(ids(l.uses))),
+          None -> accumulator,
+        },
       },
   ).out
 }
 
-pub fn hashes_from_cache(sk: HashLayout, fixing: CachedHashes) -> HashOutput / {abort.raise} = {
-  let keys = range(0, sk.nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
-    let node = sk.nodes.get(v);
-    accumulator.insert(definition_key(node.name, node.declaration), v)
-  });
-  let ids = |refs: List<NodeRef>|
-    refs.fold([], |es: List<Int>, r: NodeRef|
-      match keys.get(definition_key(r.name, r.declaration)) { Some(w) -> es.push(w), None -> es });
-  let cached_by_node = fixing.nodes.fold(
+fn by_key<a>(keys: List<Bytes>, xs: List<a>) -> Map<Bytes, a> / {abort.raise} =
+  range(0, keys.len()).fold(Map::new(), |accumulator: Map<Bytes, a>, i: Int|
+    accumulator.insert(keys.get(i), xs.get(i)))
+
+pub fn own_hashes_of(index: Index, hashes: HashOutput, keep: Map<Bytes, Bool>) -> OwnHashes / {abort.raise} = {
+  let r = hashes.refs;
+  let refs = |vs: List<Int>| vs.map(|v: Int| { name: r.names.get(v), kind: r.kinds.get(v) });
+  let bodies = hashes.bodies.fold(Map::new(), |m: Map<Bytes, Bytes>, b: { name: Bytes, body: Bytes }|
+    m.insert(b.name, b.body));
+  let hashed = by_name(hashes.definitions);
+  let declared = by_name(hashes.declarations);
+  let contracts = by_name(hashes.contracts);
+  let specs = hashes.specs.fold(
     Map::new(),
-    |accumulator: Map<Int, CachedNode>, f: CachedNode|
-      match keys.get(definition_key(f.name, f.declaration)) {
-        Some(v) -> accumulator.insert(v, f),
-        None -> accumulator,
-      },
+    |m: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }| m.insert(s.name, s.hashes),
   );
-  let tests = fixing.tests.fold(Map::new(), |accumulator: Map<Bytes, CachedTest>, t: CachedTest|
-    accumulator.insert(t.key, t));
-  let laws = fixing.laws.fold(Map::new(), |accumulator: Map<Bytes, CachedLaw>, l: CachedLaw|
-    accumulator.insert(l.key, l));
-  let test_of = |key: Bytes|
-    match tests.get(key) {
-      Some(t) -> t,
-      None -> panic("no cached test has the key " ++ String::of_bytes_lossy(key)),
-    };
-  let law_of = |key: Bytes|
-    match laws.get(key) {
-      Some(l) -> l,
-      None -> panic("no cached law has the key " ++ String::of_bytes_lossy(key)),
-    };
-  let field = |pick: (CachedNode) -> Bytes|
-    cached_by_node.fold(Map::new(), |accumulator: Map<Int, Bytes>, v: Int, f: CachedNode|
-      accumulator.insert(v, pick(f)));
-  let stated = sk.order.fold(
-    { own: [], specs: [], spec_texts: [], spec_checks: [] },
-    |accumulator: SpecHashes, e: IndexEntry|
+  let at = range(0, r.names.len()).fold(Map::new(), |m: Map<Bytes, Int>, v: Int|
+    m.insert(definition_key(r.names.get(v), r.kinds.get(v)), v));
+  let kept = |module: Int| keep.contains(index.modules.get(module).name);
+  {
+    definitions: index.order.fold([], |accumulator: List<DefinitionHash>, e: IndexEntry|
       match e {
-        DefinitionEntry(v) -> match cached_by_node.get(v) {
-          Some(f) -> if f.declaration { accumulator }
-          else { cached_spec_hashes(accumulator, f.name, f) },
-          None -> accumulator,
+        DefinitionEntry(v) -> {
+          let node = index.nodes.get(v);
+          let kind = node_kind(node);
+          let hash = Map::get(if kind == HeldValue { hashed } else { declared }, node.name);
+          match (kept(node.module), hash, at.get(definition_key(node.name, kind))) {
+            (true, Some(h), Some(w)) ->
+              accumulator.push({
+                name: node.name,
+                kind: kind,
+                hash: h,
+                body: bodies.get(node.name).unwrap_or(b""),
+                contract: contracts.get(node.name).unwrap_or(h),
+                clauses: specs.get(node.name).unwrap_or([]),
+                uses: refs(r.edges.get(w)),
+                clause_uses: refs(r.clauses.at(w).unwrap_or([])),
+              }),
+            _ -> accumulator,
+          }
         },
         _ -> accumulator,
-      },
-  );
-  let tested = sk.tests.map(|t: { key: Bytes, cases: Bool }| test_of(t.key));
-  let lawful = sk.laws.map(law_of);
-  assemble(
-    sk,
-    range(0, sk.nodes.len()).map(|v: Int|
-      match cached_by_node.get(v) { Some(f) -> ids(f.edges), None -> [] }),
-    {
-      hashes: field(|f: CachedNode| f.hash),
-      bodies: field(|f: CachedNode| f.body),
-      tests: tested.map(|t: CachedTest| t.hash),
-      test_bodies: tested.map(|t: CachedTest| t.body),
-      test_texts: tested.map(|t: CachedTest| t.text),
-      test_refs: tested.map(|t: CachedTest| ids(t.refs)),
-      test_runs: tested.map(|t: CachedTest| ids(t.runs)),
-      laws: lawful.map(|l: CachedLaw| l.hash),
-      law_refs: lawful.map(|l: CachedLaw| ids(l.refs)),
-      law_texts: lawful.map(|l: CachedLaw| l.text),
-      own: stated.own,
-      specs: stated.specs,
-      spec_texts: stated.spec_texts,
-      contracts: cached_by_node.fold(
-        Map::new(),
-        |accumulator: Map<Int, Bytes>, v: Int, f: CachedNode|
-          if f.declaration || f.contract.len() == 0 { accumulator }
-          else { accumulator.insert(v, f.contract) },
-      ),
-      checks: cached_by_node.fold(
-        Map::new(),
-        |accumulator: Map<Int, Bytes>, v: Int, f: CachedNode|
-          if f.declaration || f.check.len() == 0 { accumulator }
-          else { accumulator.insert(v, f.check) },
-      ),
-      spec_checks: stated.spec_checks,
-      enumerations: range(0, sk.nodes.len()).map(|v: Int|
-        match cached_by_node.get(v) { Some(f) -> ids(f.effects), None -> [] }),
-      clauses: range(0, sk.nodes.len()).map(|v: Int|
-        match cached_by_node.get(v) { Some(f) -> ids(f.clauses), None -> [] }),
-      test_listings: tested.map(|t: CachedTest| ids(t.listing)),
-      test_listing_hashes: tested.map(|t: CachedTest| t.listing_hash),
-    },
-  )
+      }),
+    tests: index.tests.fold([], |accumulator: List<TestHash>, t: TestNode|
+      if !kept(t.module) { accumulator } else {
+        accumulator.push({
+          key: t.key,
+          hash: of_key(hashes.tests, t.key),
+          body: of_key(hashes.test_bodies, t.key),
+          uses: refs(of_key(hashes.test_runs, t.key)),
+          listing: match hashes.listing_hashes.get(t.key) {
+            Some(h) -> Some({ hash: h, uses: refs(r.listings.get(t.key).unwrap_or([])) }),
+            None -> None,
+          },
+        })
+      }),
+    laws: index.laws.fold([], |accumulator: List<LawHash>, l: LawNode|
+      if !kept(l.module) { accumulator } else {
+        accumulator.push({
+          key: l.key,
+          hash: of_key(hashes.laws, l.key),
+          uses: refs(of_key(hashes.law_refs, l.key)),
+        })
+      }),
+  }
 }
+
 
 fn record(a: Recording, name: Bytes, dependencies: List<Bytes>) -> Recording / {abort.raise} = {
   let out: HashOutput = a.out;
@@ -2194,9 +1301,9 @@ fn reachable_names(r: Refs, nodes: List<Int>) -> ReachableNames / {abort.raise} 
   nodes.fold(
     { functions: Map::new(), declarations: Map::new() },
     |accumulator: ReachableNames, v: Int|
-      if r.is_declaration.get(v) {
-        { ..accumulator, declarations: accumulator.declarations.insert(r.names.get(v)) }
-      } else { { ..accumulator, functions: accumulator.functions.insert(r.names.get(v)) } },
+      if is_declared_kind(r.kinds.get(v)) {
+        { ..accumulator, declarations: accumulator.declarations.insert(r.names.get(v), true) }
+      } else { { ..accumulator, functions: accumulator.functions.insert(r.names.get(v), true) } },
   )
 
 pub fn reach(hashes: HashOutput, roots: List<Subject>) -> ReachableNames / {abort.raise} =
@@ -2229,7 +1336,7 @@ pub fn reachable_functions(
 fn unit_reach(r: Refs, starts: List<Int>) -> Set<Bytes> / {abort.raise} = {
   let scheduled = scheduler_module.concat(b".");
   let written = range(0, r.names.len()).filter(|v: Int|
-    !r.is_declaration.get(v) && r.names.get(v).starts_with(scheduled));
+    r.kinds.get(v) == HeldValue && r.names.get(v).starts_with(scheduled));
   reachable_names(r, walked(with_clauses(r), starts.concat(written)).all).functions
 }
 
@@ -2271,7 +1378,7 @@ pub fn references_in(hashes: HashOutput, which: Subject) -> List<NodeRef> / {abo
       nodes_of(r, which).fold([], |accumulator: List<Int>, v: Int|
         accumulator.concat(r.edges.get(v))),
   };
-  direct.map(|v: Int| { name: r.names.get(v), declaration: r.is_declaration.get(v) })
+  direct.map(|v: Int| { name: r.names.get(v), kind: r.kinds.get(v) })
 }
 
 fn back_edges(r: Refs) -> List<List<Int>> / {abort.raise} = {
@@ -2309,14 +1416,14 @@ pub fn find_referrers(
   }
 }
 
-pub type ClosureEntry = { name: Bytes, declaration: Bool, hash: Bytes, refs: List<Int> }
+pub type ClosureEntry = { reference: NodeRef, hash: Bytes, refs: List<Int> }
 
 pub fn build_closure(hashes: HashOutput, roots: List<Bytes>) -> List<ClosureEntry> / {abort.raise} = {
   let r = hashes.refs;
   let definitions = by_name(hashes.definitions);
   let declarations = by_name(hashes.declarations);
   let hash_of = |v: Int|
-    Map::get(if r.is_declaration.get(v) { declarations } else { definitions }, r.names.get(v));
+    Map::get(if r.kinds.get(v) == HeldValue { definitions } else { declarations }, r.names.get(v));
   let closure_nodes = walked(
     r.edges,
     start_nodes(r, roots.map(|name: Bytes| FunctionNamed(name))),
@@ -2327,8 +1434,7 @@ pub fn build_closure(hashes: HashOutput, roots: List<Bytes>) -> List<ClosureEntr
   );
   closure_nodes.map(|v: Int|
     {
-      name: r.names.get(v),
-      declaration: r.is_declaration.get(v),
+      reference: { name: r.names.get(v), kind: r.kinds.get(v) },
       hash: match hash_of(v) { Some(h) -> h, None -> b"" },
       refs: r.edges.get(v).fold([], |accumulator: List<Int>, w: Int|
         match place.get(w) { Some(i) -> accumulator.push(i), None -> accumulator }),

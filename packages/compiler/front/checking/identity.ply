@@ -1,0 +1,122 @@
+import std.bin
+import std.list
+import compiler.store.memo (memo)
+import compiler.store.handles (QueryOf, Written, written, fetched, query_definition)
+import compiler.store.hash.forms (Identified, TestRun, TestListing, LawRun, DefinitionRun,
+                                  identified_bin, NodeRef, Held, OwnHashes, DefinitionHash, TestHash,
+                                  LawHash, ListingHash, SubjectIdentity, identity_over,
+                                  held_definition)
+import compiler.store.hash.graph (HeldValue)
+import compiler.front.exports (named_node)
+import compiler.front.checking.world (ModuleKey, Modules, CheckDefinition, shipped_for)
+import compiler.front.checking.groups (OwnerKey, declared_of, hashes_query, owner_hash_query)
+
+pub type SubjectKey = { module: Bytes, shipped: Bool, tested: Bool, subject: Identified }
+
+derive bin for SubjectKey
+
+pub fn identity_query() -> QueryOf<SubjectKey, Option<Bytes>> =
+  { name: b"identity", input: subject_key_bin(), output: bin::option_bin(bin::bytes_bin()) }
+
+pub fn identity_of(key: SubjectKey) -> Option<Bytes> / {memo.read, abort.raise} =
+  fetched(identity_query(), key)
+
+pub type TestIdentity = { run: Bytes, listing: Option<Bytes> }
+
+pub fn test_identities(
+  modules: Modules,
+  keys: List<Bytes>,
+) -> Map<Bytes, TestIdentity> / {memo.read, abort.raise} = {
+  let wanted = keys.fold(Map::new(), |found: Map<Bytes, Bool>, k: Bytes| found.insert(k, true));
+  modules.own.fold(Map::new(), |found: Map<Bytes, TestIdentity>, m: Bytes| {
+    let module = { module: m, shipped: false, tested: false };
+    let subject = |s: Identified|
+      identity_of({ module: m, shipped: false, tested: false, subject: s });
+    fetched(hashes_query(), module).own.tests.fold(found, |f: Map<Bytes, TestIdentity>, t: TestHash|
+      if !wanted.contains(t.key) { f } else {
+        match subject(TestRun(t.key)) {
+          None -> f,
+          Some(run) ->
+            f.insert(t.key, {
+              run: run,
+              listing: match t.listing {
+                Some(_) -> subject(TestListing(t.key)),
+                None -> None,
+              },
+            }),
+        }
+      })
+  })
+}
+
+pub fn subject_identities(
+  module: ModuleKey,
+  own: OwnHashes,
+) -> List<SubjectIdentity> / {memo.read, abort.raise} = {
+  let identified = |s: Identified|
+    match identity_of({ module: module.module, shipped: module.shipped, tested: module.tested, subject: s }) {
+      Some(identity) -> [{ subject: s, identity: identity }],
+      None -> [],
+    };
+  own.definitions.filter(|d: DefinitionHash| d.kind == HeldValue).flat_map(|d: DefinitionHash|
+    identified(DefinitionRun(d.name))).concat(
+    own.laws.flat_map(|l: LawHash| identified(LawRun(l.key))),
+  )
+}
+
+type Start = { own: Bytes, uses: List<NodeRef> }
+
+fn simple_in(module: Bytes, name: Bytes) -> Bytes / {abort.raise} =
+  name.slice(module.len() + 1, name.len())
+
+fn owner_in(module: ModuleKey, owner: Bytes) -> OwnerKey =
+  { module: module.module, shipped: module.shipped, tested: module.tested, owner: owner }
+
+fn held_by(from: ModuleKey, reference: NodeRef) -> List<Held<ModuleKey>> / {memo.read, abort.raise} = {
+  let m = named_node(reference.name);
+  let at = if m.module == from.module { from } else {
+    { module: m.module, shipped: shipped_for(from.shipped, m.module), tested: false }
+  };
+  declared_of(at.module, at.shipped, at.tested, m.name).flat_map(|o: Bytes|
+    fetched(owner_hash_query(), owner_in(at, o)).definitions.filter(|d: DefinitionHash|
+      d.name == reference.name && d.kind == reference.kind).map(|d: DefinitionHash|
+      held_definition(at, d)))
+}
+
+fn subject_start(key: SubjectKey, from: ModuleKey) -> Option<Start> / {memo.read, abort.raise} = {
+  let owned = |owner: Bytes| fetched(owner_hash_query(), owner_in(from, owner));
+  let test_of = |k: Bytes|
+    owned(b"test ".concat(simple_in(key.module, k))).tests.find(|t: TestHash| t.key == k);
+  match key.subject {
+    TestRun(k) -> test_of(k).map(|t: TestHash| { own: t.hash, uses: t.uses }),
+    TestListing(k) -> match test_of(k) {
+      Some(t) -> t.listing.map(|l: ListingHash| { own: l.hash, uses: l.uses }),
+      None -> None,
+    },
+    LawRun(k) ->
+      owned(b"law ".concat(simple_in(key.module, k))).laws.find(|l: LawHash| l.key == k).map(
+        |l: LawHash| { own: l.hash, uses: l.uses },
+      ),
+    DefinitionRun(name) -> {
+      let reference = { name: name, kind: HeldValue };
+      held_by(from, reference).at(0).map(|h: Held<ModuleKey>| { own: h.hash, uses: [reference] })
+    },
+  }
+}
+
+pub fn identity_result(key: SubjectKey) -> Written / {memo.read, abort.raise} = {
+  let from = { module: key.module, shipped: key.shipped, tested: key.tested };
+  written(identity_query(), match subject_start(key, from) {
+    None -> None,
+    Some(start) -> Some(identity_over(start.own, from, start.uses, held_by)),
+  })
+}
+
+pub fn identity_queries() -> List<CheckDefinition> =
+  [
+    query_definition(
+      identity_query(),
+      b"compiler.front.checking.identity.identity_result",
+      identity_result,
+    ),
+  ]

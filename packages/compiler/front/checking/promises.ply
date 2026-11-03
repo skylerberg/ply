@@ -13,7 +13,7 @@ import compiler.front.published (group_analysis)
 import compiler.front.owner_checks (MemberResult, rejected_in, tables_in)
 import compiler.front.rows (OutlineItem, OutlinedFunction)
 import compiler.front.exports (item_at_bin, Imported, ItemAt, Mention, OwnerSource, OwnerText,
-                               group_imports, hash_entry_bin, item_layout, laid_out, mention_key,
+                               group_imports, item_layout, laid_out, mention_key,
                                named_node)
 import compiler.emit.costs (cost_input_of, GroupWalk, ParamSharing, ReturnOwnership, FreshReturn,
                             WalkedBody, demands_of, group_walk_bin, module_costs,
@@ -23,8 +23,11 @@ import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, item_span)
 import compiler.check.resolve.tables (Diagnostic, ParsedModule, placed_in, qualify)
 import compiler.check.infer (item_owner)
 import compiler.store.hash (unreached)
-import compiler.store.hash.forms (CachedHashes, CachedLaw, CachedNode, CachedTest, NodeRef,
-                                  hash_layout, hashes_from_cache, no_cached_hashes)
+import compiler.store.hash.forms (OwnHashes, DefinitionHash, TestHash, LawHash, NodeRef,
+                                  hash_layout, hash_output, no_own_hashes, joined_own_hashes,
+                                  test_uses)
+import compiler.store.hash.graph (HeldValue)
+import compiler.front.checking.identity (subject_identities)
 import compiler.front.checking.units (with_code_reads)
 import compiler.program.group_check (LoadedSource, resolved_group)
 import compiler.front.checking.world (ModuleKey, InterfaceKey, QueryEffects, SessionReads, decoded,
@@ -36,7 +39,7 @@ import compiler.front.checking.groups (GroupKey, GroupSource, OwnerFacts, OwnerK
                                        group_keys, no_bodies, owner_facts, owner_hash_query,
                                        owner_key_bin, owners_result_of, with_group_read, GroupRead,
                                        unit_key_of, group_key_of, group_of, group_hashes_of, Entire,
-                                       stored_declarations_of, context_once)
+                                       stored_declarations_of, context_once, hashes_query)
 
 pub fn cost_walk_query() -> QueryOf<GroupKey, GroupWalk> =
   { name: b"cost walk", input: group_key_bin(), output: group_walk_bin() }
@@ -239,28 +242,21 @@ fn owners_of_function(name: Bytes) -> List<OwnerKey> / {memo.read, abort.raise} 
     { module: m.module, shipped: shipped, tested: false, owner: o })
 }
 
-fn hashed_nodes(o: OwnerKey) -> List<CachedNode> / {memo.read, abort.raise} =
-  match fetched(owner_hash_query(), o) { Some(e) -> e.cached_nodes, None -> [] }
-
-pub fn hash_of_definition(name: Bytes) -> Option<Bytes> / {memo.read, abort.raise} =
-  owners_of_function(name).fold(None, |found: Option<Bytes>, o: OwnerKey|
-    hashed_nodes(o).fold(found, |h: Option<Bytes>, n: CachedNode|
-      if n.name == name && !n.declaration { Some(n.hash) } else { h }))
+fn hashed_nodes(o: OwnerKey) -> List<DefinitionHash> / {memo.read, abort.raise} =
+  fetched(owner_hash_query(), o).definitions
 
 fn states_clauses(o: OwnerKey) -> Bool / {memo.read, abort.raise} =
-  hashed_nodes(o).any(|n: CachedNode| n.specs.len() > 0)
+  hashed_nodes(o).any(|n: DefinitionHash| n.clauses.len() > 0)
 
 fn references_of(o: OwnerKey) -> List<NodeRef> / {memo.read, abort.raise} =
   if is_test_or_law(o.owner) {
-    let fixing = group_hashes_of(unit_key_of(o)).fixing;
-    fixing.tests.flat_map(|t: CachedTest| t.refs.concat(t.runs)).concat(
-      fixing.laws.flat_map(|l: CachedLaw| l.refs),
-    )
-  } else { hashed_nodes(o).flat_map(|n: CachedNode| n.edges.concat(n.clauses)) }
+    let own = group_hashes_of(unit_key_of(o));
+    own.tests.flat_map(test_uses).concat(own.laws.flat_map(|l: LawHash| l.uses))
+  } else { hashed_nodes(o).flat_map(|n: DefinitionHash| n.uses.concat(n.clause_uses)) }
 
 fn functions_used_by(o: OwnerKey) -> List<OwnerKey> / {memo.read, abort.raise} =
   references_of(o).fold([], |accumulator: List<OwnerKey>, r: NodeRef|
-    if r.declaration { accumulator } else { accumulator.concat(owners_of_function(r.name)) })
+    if r.kind != HeldValue { accumulator } else { accumulator.concat(owners_of_function(r.name)) })
 
 fn body_key(o: OwnerKey) -> Bytes = mention_key({ module: o.module, name: o.owner })
 
@@ -362,7 +358,7 @@ type StoredTables = {
   parts: Map<Int, List<PlacedTables>>,
   rejected: List<Diagnostic>,
   declared: StoredDeclarations,
-  fixing: CachedHashes,
+  own: OwnHashes,
   seen: Set<Bytes>,
 }
 
@@ -382,7 +378,7 @@ fn with_stored_owner(
   let placed = laid_out(loaded.items, loaded.offset);
   let seen = bin::encode(checked_in, group_key_bin());
   let first = !found.seen.contains(seen);
-  let fixing = if first { group_hashes_of(checked_in).fixing } else { no_cached_hashes };
+  let own = if first { group_hashes_of(checked_in) } else { no_own_hashes };
   {
     parts: found.parts.insert(
       module,
@@ -397,11 +393,7 @@ fn with_stored_owner(
       )
     },
     declared: declarations_joined(found.declared, stored_declarations_of(at, Entire)),
-    fixing: {
-      nodes: found.fixing.nodes.concat(fixing.nodes),
-      tests: found.fixing.tests.concat(fixing.tests),
-      laws: found.fixing.laws.concat(fixing.laws),
-    },
+    own: joined_own_hashes([found.own, own]),
     seen: found.seen.insert(seen),
   }
 }
@@ -415,7 +407,7 @@ fn stored_tables(
       parts: Map::new(),
       rejected: [],
       declared: no_stored_declarations,
-      fixing: no_cached_hashes,
+      own: no_own_hashes,
       seen: Set::empty(),
     },
     |found: StoredTables, i: Int|
@@ -444,7 +436,7 @@ fn stored_analysis(groups: List<GroupKey>) -> GroupsAnalysed / {SessionReads, ab
                     read.declared,
                     unreached(resolved.uses),
                   ),
-                  hashes_from_cache(hash_layout(resolved.index), read.fixing),
+                  hash_output(hash_layout(resolved.index), read.own),
                 ),
                 with_performed_effects(group.mentioned),
               ),
@@ -496,7 +488,18 @@ pub fn claims_analysed(open: List<ModuleKey>) -> ClaimsProgram / {SessionReads, 
   let groups = whole.concat(reached.values());
   let analysed = stored_analysis(groups);
   {
-    outcome: analysed.outcome,
+    outcome: match analysed.outcome {
+      Analysed(w) ->
+        Analysed({
+          ..w,
+          hashes: {
+            ..w.hashes,
+            identities: open.flat_map(|m: ModuleKey|
+              subject_identities(m, fetched(hashes_query(), m).own)),
+          },
+        }),
+      rejected -> rejected,
+    },
     placed: range(0, groups.len()).map(|i: Int|
       placed_module(groups.get(i), analysed.loaded.get(i).offset)),
   }

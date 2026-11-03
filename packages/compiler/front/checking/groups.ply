@@ -19,7 +19,7 @@ import compiler.program.reads (NameDeclarations, StoredReads, name_declarations_
                                first_stored)
 import compiler.check.infer.checker (stored_declarations_bin)
 import compiler.store.hash.graph (HeldConstructor, HeldEffect, HeldName, HeldType, HeldValue,
-                                  NameElsewhere)
+                                  NameElsewhere, simple_of)
 import compiler.syntax.expressions (implicitly_imported_by)
 import compiler.syntax.items (ModuleAlias, is_compiler)
 import std.bin
@@ -32,10 +32,10 @@ import compiler.store.handles (QueryOf, PartOf, KeyedPartOf, Written, written, w
                                part_fetched_once, keyed_part_fetched_once, main_part_of,
                                query_definition)
 import compiler.store.hash (UseLink, any_unreached, link_of, use_link_bin)
-import compiler.front.exports (OwnerInterface, HashEntry, ModuleOrigin, InRoot, ShippedModule,
+import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, ShippedModule,
                                CheckInputs, Mention, OwnerText, OwnerSource, ItemAt, Imported,
-                               imported_bin, group_imports, exports_of, hashes_by_owner, named_node,
-                               imported_mentions_in, owner_interface_bin, hash_entry_bin,
+                               imported_bin, group_imports, exports_of, named_node,
+                               imported_mentions_in, owner_interface_bin,
                                module_origin_bin, mention_bin, owner_text_bin, module_scope,
                                owner_texts, owner_mentions, owner_groups, group_source_from,
                                value_owners, mention_key, unplaced_imports, item_layout, called_of,
@@ -74,9 +74,9 @@ import compiler.syntax.parsing (Identifier, generated_span)
 import compiler.check.infer.definitions (checked_functions, check_order)
 import compiler.check.infer.checker (BodyPlan, Checked, CheckOnly, ExternFunction, UncheckedBuiltin)
 import compiler.check.types (Effect, FunctionType)
-import compiler.store.hash.forms (CachedNode, CachedTest, CachedLaw, CachedHashes, NodeRef,
-                                  HashInput, HashNode, hash_forms, cached_hashes_bin,
-                                  hash_input_bin, definition_key, joined_forms, module_record,
+import compiler.store.hash.forms (NodeRef, HashInput, OwnHashes, DefinitionHash, TestHash,
+                                  LawHash, own_hashes, own_hashes_bin, no_own_hashes,
+                                  joined_own_hashes, hash_input_bin, joined_forms, module_record,
                                   record_digest)
 import compiler.front.pages (Page, module_pages, pages_bin)
 import compiler.front.checking.world (build_packages, shipped_module_exists, ModuleKey,
@@ -112,8 +112,6 @@ pub type OwnersResult = {
   problems: List<Diagnostic>,
 }
 
-pub type GroupHashes = { entries: Map<Bytes, HashEntry>, fixing: CachedHashes }
-
 pub type DeclaredOwners = { owners: List<Bytes>, values: List<Bytes> }
 
 pub type OwnerPlace = { owner: Bytes, starts: List<Int> }
@@ -129,8 +127,6 @@ derive bin for GroupKey
 derive bin for OwnerFacts
 
 derive bin for OwnersResult
-
-derive bin for GroupHashes
 
 derive bin for DeclaredOwners
 
@@ -224,11 +220,11 @@ pub fn signatures_query() -> QueryOf<GroupKey, owner_checks::SignatureCheck> =
 pub fn typed_query() -> QueryOf<OwnerKey, owner_checks::InferenceResult> =
   { name: b"typed", input: owner_key_bin(), output: owner_checks::inference_result_bin() }
 
-pub fn group_hash_query() -> QueryOf<GroupKey, GroupHashes> =
-  { name: b"group hash", input: group_key_bin(), output: group_hashes_bin() }
+pub fn group_hash_query() -> QueryOf<GroupKey, OwnHashes> =
+  { name: b"group hash", input: group_key_bin(), output: own_hashes_bin() }
 
-pub fn owner_hash_query() -> QueryOf<OwnerKey, Option<HashEntry>> =
-  { name: b"owner hash", input: owner_key_bin(), output: bin::option_bin(hash_entry_bin()) }
+pub fn owner_hash_query() -> QueryOf<OwnerKey, OwnHashes> =
+  { name: b"owner hash", input: owner_key_bin(), output: own_hashes_bin() }
 
 pub fn module_key_of(o: OwnerKey) -> ModuleKey =
   { module: o.module, shipped: o.shipped, tested: o.tested }
@@ -1912,70 +1908,19 @@ pub fn header_result(key: ModuleKey) -> Written / {QueryEffects, abort.raise} =
 fn module_header(named: ModuleKey) -> ModuleHeader / {memo.read, abort.raise} =
   fetched(header_query(), named)
 
-const no_group_hashes: GroupHashes =
-  { entries: Map::new(), fixing: { nodes: [], tests: [], laws: [] } }
-
 pub fn group_hash_result(key: GroupKey) -> Written / {memo.read, abort.raise} =
-  written(group_hash_query(), if !current_unit(key) { no_group_hashes } else {
-    let h = group_hash_inputs(key);
-    let fixed_definitions = h.fixed.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, Bool>, f: CachedNode|
-        accumulator.insert(definition_key(f.name, f.declaration), true),
-    );
-    if h.forms.nodes.fold(false, |b: Bool, x: HashNode|
-        b
-          || (match x.form {
-            None -> !fixed_definitions.contains(definition_key(x.name, x.declaration)),
-            Some(_) -> false,
-          })) { no_group_hashes } else {
-      let fixing = hash_forms(h.forms, h.fixed);
-      { entries: hashes_by_owner(key.module, fixing.nodes, h.functions).entries, fixing: fixing }
-    }
-  })
+  written(group_hash_query(), if !current_unit(key) { no_own_hashes }
+  else { own_hashes(group_hash_inputs(key)) })
 
-pub fn group_hash_inputs(
-  key: GroupKey,
-) -> { forms: HashInput, fixed: List<CachedNode>, functions: Map<Bytes, Bytes> } / {memo.read, abort.raise} = {
-  let parts = (if key.owners.len() < 2 { [key.owners] } else { cycles_of(key) }).map(
-    |g: List<Bytes>| group_forms_of({ ..key, owners: g }),
-  );
-  let g = {
-    forms: match parts {
-      [one] -> one.forms,
-      _ -> joined_forms(parts.map(|p: GroupForms| p.forms)),
-    },
-    functions: parts.fold(Map::new(), |found: Map<Bytes, Bytes>, p: GroupForms|
-      p.functions.fold(found, |m: Map<Bytes, Bytes>, n: Bytes, o: Bytes| m.insert(n, o))),
-  };
-  let forms = g.forms;
-  let fixed = forms.nodes.fold([], |accumulator: List<CachedNode>, s: HashNode|
-    match s.form {
-      Some(_) -> accumulator,
-      None -> {
-        let m = named_node(s.name);
-        let shipped = if m.module == key.module { key.shipped }
-        else { shipped_for(key.shipped, m.module) };
-        let tested = if m.module == key.module { key.tested } else { false };
-        declared_of(m.module, shipped, tested, m.name).fold(
-          accumulator,
-          |a: List<CachedNode>, o: Bytes|
-            if m.module == key.module && key.owners.contains(o) { a } else {
-              match fetched(owner_hash_query(), {
-                  module: m.module,
-                  shipped: shipped,
-                  tested: tested,
-                  owner: o,
-                }) {
-                Some(e) -> a.concat(e.cached_nodes),
-                None -> a,
-              }
-            },
-        )
-      },
-    });
-  { forms: forms, fixed: fixed, functions: g.functions }
-}
+fn unit_forms(key: GroupKey) -> List<GroupForms> / {memo.read, abort.raise} =
+  (if key.owners.len() < 2 { [key.owners] } else { cycles_of(key) }).map(|g: List<Bytes>|
+    group_forms_of({ ..key, owners: g }))
+
+pub fn group_hash_inputs(key: GroupKey) -> HashInput / {memo.read, abort.raise} =
+  match unit_forms(key) {
+    [one] -> one.forms,
+    parts -> joined_forms(parts.map(|p: GroupForms| p.forms)),
+  }
 
 pub type GroupForms = { forms: HashInput, functions: Map<Bytes, Bytes> }
 
@@ -1991,46 +1936,42 @@ fn formed(reads: List<OwnerText>, forms: HashInput) -> GroupForms =
       r.names.fold(accumulator, |m: Map<Bytes, Bytes>, n: Bytes| m.insert(n, r.owner))),
   }
 
-pub fn group_hashes_of(g: GroupKey) -> GroupHashes / {memo.read, abort.raise} =
+pub fn group_hashes_of(g: GroupKey) -> OwnHashes / {memo.read, abort.raise} =
   fetched(group_hash_query(), g)
 
-pub fn owner_hash_result(key: OwnerKey) -> Written / {memo.read, abort.raise} =
-  written(owner_hash_query(), group_hashes_of(unit_key_of(key)).entries.get(key.owner))
+fn owned_by(module: Bytes, owner: Bytes, functions: Map<Bytes, Bytes>, all: OwnHashes) -> OwnHashes / {abort.raise} = {
+  let item = |kind: Bytes, key: Bytes|
+    owner.starts_with(kind) && key == qualify(module, owner.slice(kind.len(), owner.len()));
+  {
+    definitions: all.definitions.filter(|d: DefinitionHash| {
+      let simple = simple_of(d.name, module);
+      if d.kind == HeldValue { functions.get(simple) == Some(owner) } else { simple == owner }
+    }),
+    tests: all.tests.filter(|t: TestHash| item(b"test ", t.key)),
+    laws: all.laws.filter(|l: LawHash| item(b"law ", l.key)),
+  }
+}
+
+pub fn owner_hash_result(key: OwnerKey) -> Written / {memo.read, abort.raise} = {
+  let unit = unit_key_of(key);
+  written(
+    owner_hash_query(),
+    owned_by(
+      key.module,
+      key.owner,
+      unit_forms(unit).fold(Map::new(), |found: Map<Bytes, Bytes>, p: GroupForms|
+        p.functions.fold(found, |m: Map<Bytes, Bytes>, n: Bytes, o: Bytes| m.insert(n, o))),
+      group_hashes_of(unit),
+    ),
+  )
+}
 
 pub fn hashes_query() -> QueryOf<ModuleKey, HashResult> =
   { name: b"hashes", input: module_key_bin(), output: hash_result_bin() }
 
 pub fn hashes_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
-  let hashed = group_keys(named, owners_result_of(named)).map(group_hashes_of);
-  let fixing = {
-    nodes: hashed.fold([], |accumulator: List<CachedNode>, h: GroupHashes|
-      accumulator.concat(h.fixing.nodes)),
-    tests: hashed.fold([], |accumulator: List<CachedTest>, h: GroupHashes|
-      accumulator.concat(h.fixing.tests)),
-    laws: hashed.fold([], |accumulator: List<CachedLaw>, h: GroupHashes|
-      accumulator.concat(h.fixing.laws)),
-  };
-  written(hashes_query(), { fixing: fixing, record: record_digest(module_record(fixing)) })
-}
-
-pub type TestHash = { key: Bytes, hash: Bytes, listing: Option<Bytes> }
-
-pub type HashSummary = { record: Bytes, tests: List<TestHash> }
-
-derive bin for TestHash
-
-derive bin for HashSummary
-
-pub fn hash_summary_query() -> QueryOf<ModuleKey, HashSummary> =
-  { name: b"hash summary", input: module_key_bin(), output: hash_summary_bin() }
-
-pub fn hash_summary_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
-  let hashed = fetched(hashes_query(), named);
-  written(hash_summary_query(), {
-    record: hashed.record,
-    tests: hashed.fixing.tests.map(|t: CachedTest|
-      { key: t.key, hash: t.hash, listing: t.listing_hash }),
-  })
+  let own = joined_own_hashes(group_keys(named, owners_result_of(named)).map(group_hashes_of));
+  written(hashes_query(), { own: own, record: record_digest(module_record(own)) })
 }
 
 pub fn documented_query() -> QueryOf<ModuleKey, Pages> =
@@ -2047,10 +1988,10 @@ fn laws_referencing(lawful: ModuleKey) -> Map<Bytes, List<Bytes>> / {memo.read, 
         tested: lawful.tested,
         owners: group_containing(read, o),
       });
-      hashed.fixing.laws.fold(accumulator, |by: Map<Bytes, List<Bytes>>, l: CachedLaw|
-        l.refs.fold(by, |a: Map<Bytes, List<Bytes>>, r: NodeRef| {
+      hashed.laws.fold(accumulator, |by: Map<Bytes, List<Bytes>>, l: LawHash|
+        l.uses.fold(by, |a: Map<Bytes, List<Bytes>>, r: NodeRef| {
           let recorded_laws = match a.get(r.name) { Some(laws) -> laws, None -> [] };
-          if r.declaration || recorded_laws.contains(law) { a }
+          if r.kind != HeldValue || recorded_laws.contains(law) { a }
           else { a.insert(r.name, recorded_laws.push(law)) }
         }))
     })
@@ -2064,10 +2005,10 @@ pub fn documented_result(key: ModuleKey) -> Written / {QueryEffects, abort.raise
       let hashed = fetched(hashes_query(), key);
       module_pages(m.parsed, m.source.source_text, {
         definitions: decode_tables(listing.tables).definitions,
-        hashes: hashed.fixing.nodes.fold(
+        hashes: hashed.own.definitions.fold(
           Map::new(),
-          |accumulator: Map<Bytes, Bytes>, f: CachedNode|
-            if f.declaration { accumulator } else { accumulator.insert(f.name, f.hash) },
+          |accumulator: Map<Bytes, Bytes>, f: DefinitionHash|
+            if f.kind == HeldValue { accumulator.insert(f.name, f.hash) } else { accumulator },
         ),
         laws_by_definition: if m.raw.items.fold(false, |b: Bool, item: Item|
             b || (match item { LawItem(_) -> true, _ -> false })) {
@@ -2407,11 +2348,6 @@ pub fn queries() -> List<CheckDefinition> =
       hashes_query(),
       b"compiler.front.checking.groups.hashes_result",
       hashes_result,
-    ),
-    query_definition(
-      hash_summary_query(),
-      b"compiler.front.checking.groups.hash_summary_result",
-      hash_summary_result,
     ),
     query_definition(
       documented_query(),

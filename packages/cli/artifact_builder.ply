@@ -12,10 +12,11 @@ import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected, RootPlace, checked_program_of)
 import compiler.front.facts (ProgramListing, listing_of)
 import compiler.front.published (analyse)
-import compiler.front.rows (DeclaredEffect, ModuleSpan, Outline, OutlineItem, OutlinedEffect,
-                            OutlinedFunction, OutlinedType)
-import compiler.store.hash.forms (ClosureEntry, HashOutput, by_name, build_closure, walk)
-import compiler.store.hash.printer (Printed, Unprintable, print_bodies)
+import compiler.front.rows (DeclaredEffect, ModuleSpan)
+import compiler.store.hash.forms (ClosureEntry, HashOutput, by_name, build_closure, walk,
+                                  definition_key)
+import compiler.store.hash.graph (HeldKind, HeldType, HeldValue)
+import compiler.store.hash.printer (Printed, Unprintable, PrintedDefinition, print_bodies)
 import compiler.store.hash (body_key)
 import compiler.store.hash.encoding (hex)
 import compiler.load (SourceFile)
@@ -197,8 +198,8 @@ fn bodies_of(h: HashOutput, pairs: List<NamedHash>) -> Map<Bytes, Bytes> / {abor
 
 fn pairs_of(closure_entries: List<ClosureEntry>) -> List<NamedHash> =
   closure_entries.fold(Map::new(), |accumulator: Map<Bytes, NamedHash>, x: ClosureEntry|
-    accumulator.insert(Bytes::concat_all([x.name, b"\x00", x.hash]), {
-      name: x.name,
+    accumulator.insert(Bytes::concat_all([x.reference.name, b"\x00", x.hash]), {
+      name: x.reference.name,
       hash: x.hash,
     })).values(
   )
@@ -233,27 +234,6 @@ fn unhashed(name: Bytes) -> Diagnostic =
     [],
   )
 
-type Exports = { functions: Set<Bytes>, declarations: Set<Bytes> }
-
-fn visibility_of(outlines: List<Outline>) -> Exports =
-  outlines.fold({ functions: Map::new(), declarations: Map::new() }, |found: Exports, o: Outline|
-    o.items.fold(found, |e: Exports, item: OutlineItem|
-      match item {
-        OutlinedFunction(f) ->
-          { ..e, functions: e.functions.insert(qualify(o.name, f.name), f.public) },
-        OutlinedType(t) ->
-          { ..e, declarations: e.declarations.insert(qualify(o.name, t.name), t.public) },
-        OutlinedEffect(d) ->
-          { ..e, declarations: e.declarations.insert(qualify(o.name, d.name), d.public) },
-        _ -> e,
-      }))
-
-fn exported(e: Exports, x: ClosureEntry) -> Bool =
-  match Map::get(if x.declaration { e.declarations } else { e.functions }, x.name) {
-    Some(public) -> public,
-    None -> true,
-  }
-
 fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
   let parts = String::of_bytes(name).split(".");
   Bytes::of_string(String::join(parts.take(parts.len() - 1), "."))
@@ -263,7 +243,6 @@ fn path_of(module: Bytes) -> String / {abort.raise} =
   String::join(String::of_bytes(module).split("."), "/") ++ ".ply"
 
 fn printed_files(
-  outlines: List<Outline>,
   closure_entries: List<ClosureEntry>,
   bodies: Map<Bytes, Bytes>,
 ) -> Result<List<SourceFile>, Diagnostic> / {shipped.names, abort.raise} = {
@@ -272,37 +251,19 @@ fn printed_files(
   );
   let shipped_modules = closure_entries.fold(Set::empty(),
     |accumulator: Set<Bytes>, x: ClosureEntry| {
-      let m = module_of(x.name);
+      let m = module_of(x.reference.name);
       if shipped_names.contains(m) { accumulator.insert(m) } else { accumulator }
     },
   ).keys(
   );
-  let exports = visibility_of(outlines);
   match print_bodies(
-      pairs_of(closure_entries).fold([], |found: List<Bytes>, pair: NamedHash|
-        match bodies.get(pair.hash) { Some(b) -> found.push(b), None -> found }),
-      closure_entries.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, { name: Bytes, hash: Bytes, public: Bool }>, x: ClosureEntry|
-          accumulator.insert(Bytes::concat_all([x.name, b"\x00", x.hash]), {
-            name: x.name,
-            hash: x.hash,
-            public: exported(exports, x),
-          }),
-      ).values(
-      ),
+      pairs_of(closure_entries).fold([], |found: List<PrintedDefinition>, pair: NamedHash|
+        match bodies.get(pair.hash) {
+          Some(b) -> found.push({ name: pair.name, body: b }),
+          None -> found,
+        }),
       [],
       shipped_modules,
-      closure_entries.map(|x: ClosureEntry|
-        {
-          name: x.name,
-          hash: x.hash,
-          names: x.refs.fold([], |accumulator: List<Bytes>, i: Int|
-            match closure_entries.at(i) {
-              Some(to) -> accumulator.push(to.name),
-              None -> accumulator,
-            }),
-        }),
     ) {
     Unprintable(r) ->
       Err(
@@ -327,7 +288,7 @@ fn names_of_pairs(pairs: List<NamedHash>) -> List<Bytes> =
 
 fn closures_of(closure_entries: List<ClosureEntry>) -> List<Dependencies> / {abort.raise} = {
   let edges = closure_entries.map(|x: ClosureEntry| x.refs);
-  let name_at = |i: Int| match closure_entries.at(i) { Some(x) -> x.name, None -> b"" };
+  let name_at = |i: Int| match closure_entries.at(i) { Some(x) -> x.reference.name, None -> b"" };
   range(0, closure_entries.len()).fold(
     Map::new(),
     |accumulator: Map<Bytes, Dependencies>, i: Int|
@@ -335,9 +296,9 @@ fn closures_of(closure_entries: List<ClosureEntry>) -> List<Dependencies> / {abo
         None -> accumulator,
         Some(x) ->
           accumulator.insert(
-            Bytes::concat_all([x.name, b"\x00", if x.declaration { b"0" } else { b"1" }]),
+            definition_key(x.reference.name, x.reference.kind),
             {
-              name: String::of_bytes(x.name),
+              name: String::of_bytes(x.reference.name),
               dependencies: walk(edges, [i]).fold(Set::empty(),
                 |seen: Set<Bytes>, j: Int| seen.insert(name_at(j)),
               ).keys(
@@ -421,7 +382,7 @@ pub fn build_artifact(
               no_body(names_of_pairs(pairs.filter(|pair: NamedHash| !bodies.contains(pair.hash)))),
             ]),
           ),
-        [] -> match printed_files(listing.outlines, closure, bodies) {
+        [] -> match printed_files(closure, bodies) {
           Err(d) -> Err(rejection([d])),
           Ok(files) -> match closure_unit(listing, program, closure) {
             Err(diagnostics) -> Err(rejection(diagnostics)),
@@ -470,7 +431,7 @@ pub fn build_artifact(
 }
 
 fn reached_names(closure: List<ClosureEntry>) -> Set<Bytes> =
-  closure.fold(Set::empty(), |found: Set<Bytes>, x: ClosureEntry| found.insert(x.name))
+  closure.fold(Set::empty(), |found: Set<Bytes>, x: ClosureEntry| found.insert(x.reference.name))
 
 fn closure_unit(
   listing: ProgramListing,
@@ -483,7 +444,7 @@ fn closure_unit(
       if reached.contains(d.name) { found.insert(d.name) } else { found },
   );
   let modules = closure.fold(Set::empty(), |found: Set<Bytes>, x: ClosureEntry|
-    found.insert(module_of(x.name)));
+    found.insert(module_of(x.reference.name)));
   units::whole_text(
     { ..program, modules: modules.keys().len() },
     names.keys().map(|n: Bytes| keys::Named(n)),
@@ -904,14 +865,14 @@ pub fn previous(
     },
   }
 
-fn closure_entry(name: Bytes, declaration: Bool, hash: Bytes, refs: List<Int>) -> ClosureEntry =
-  { name: name, declaration: declaration, hash: hash, refs: refs }
+fn closure_entry(name: Bytes, kind: HeldKind, hash: Bytes, refs: List<Int>) -> ClosureEntry =
+  { reference: { name: name, kind: kind }, hash: hash, refs: refs }
 
 test "`pairs_of` returns a name and hash pair for both a function and a declaration of one name, sorted by name and then by hash" {
   let closure_entries = [
-    closure_entry(b"m.f", false, b"\x05", [1, 2]),
-    closure_entry(b"m.T", false, b"\x09", []),
-    closure_entry(b"m.T", true, b"\x02", []),
+    closure_entry(b"m.f", HeldValue, b"\x05", [1, 2]),
+    closure_entry(b"m.T", HeldValue, b"\x09", []),
+    closure_entry(b"m.T", HeldType, b"\x02", []),
   ];
   assert_eq(pairs_of(closure_entries), [
     { name: b"m.T", hash: b"\x02" },
@@ -976,7 +937,7 @@ fn listing_over(source: Bytes) -> ProgramListing / {abort.raise} =
 fn printed_from(listing: ProgramListing) -> List<SourceFile> / {abort.raise} = {
   let closure = build_closure(listing.hashes, [b"m.main"]);
   let printed = handle {
-    printed_files(listing.outlines, closure, bodies_of(listing.hashes, pairs_of(closure)))
+    printed_files(closure, bodies_of(listing.hashes, pairs_of(closure)))
   } with {
     shipped.names() -> ["std.prelude"],
   };

@@ -29,6 +29,10 @@ import compiler.check.resolve.tables (placed_in)
 import compiler.check.resolve.tables (Source, Diagnostic, Edit, Fix, Label, backticked, error_at)
 import compiler.syntax.parsing (Span, ParseDiagnostic, generated_span)
 import compiler.store.hash.forms (CachedNode, CachedHashes, ModuleHashes, joined_cached_hashes)
+import compiler.store.hash.forms (DefinitionHash, OwnHashes, ModuleHashes, joined_module_hashes,
+                                  own_hashes_bin, definition_key)
+import compiler.store.hash.graph (HeldValue)
+import compiler.front.checking.identity (identity_queries, identity_query)
 import compiler.front.pages (Pages, pages_bin)
 import compiler.store.hash.encoding (hex)
 import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, ModuleResult,
@@ -45,9 +49,9 @@ import compiler.front.checking.promises (promise_queries, cost_walk_query, cost_
                                          cost_demands_query, cost_parameters_query,
                                          module_parameters_query, module_costs_query, measure_name,
                                          measures_query)
-import compiler.front.checking.groups (module_rollup_query, hash_summary_query, group_key_bin,
+import compiler.front.checking.groups (module_rollup_query, group_key_bin,
                                        module_rejected, listed_result, owners_result_bin,
-                                       group_hashes_bin, owners_query, calls_query, cycles_query,
+                                       owners_query, calls_query, cycles_query,
                                        group_imports_query, visible_modules_query,
                                        wanted_files_query, group_query, signatures_query,
                                        typed_query, group_hash_query, header_text_query,
@@ -187,6 +191,8 @@ pub fn evaluator_of(stamps: Bytes) -> Bytes / {abort.raise} =
 pub fn every_query() -> List<CheckDefinition> =
   queries().concat(promise_queries()).concat(code_queries()).concat(interface_queries()).concat(
     program_queries(),
+  ).concat(
+    identity_queries(),
   )
 
 pub const placeholder_definitions: Bytes =
@@ -338,7 +344,6 @@ pub const shipped_queries: List<Bytes> =
     header_query().name,
     header_text_query().name,
     hashes_query().name,
-    hash_summary_query().name,
     wanted_files_query().name,
     documented_query().name,
     declaring_query().name,
@@ -375,7 +380,7 @@ pub const product_queries: List<Bytes> =
     group_hash_query().name,
     owner_hash_query().name,
     hashes_query().name,
-    hash_summary_query().name,
+    identity_query().name,
     documented_query().name,
     declaring_query().name,
   ].concat(
@@ -493,7 +498,7 @@ pub fn hashed_all(
 
 pub fn module_hashes(named: ModuleKey) -> ModuleHashes / {memo.read, abort.raise} = {
   let h = fetched(hashes_query(), named);
-  { record: h.record, cached: h.fixing }
+  { record: h.record, own: h.own }
 }
 
 pub fn cycles_among(own: List<Bytes>) -> List<CheckedModule> / {memo.read, abort.raise} = {
@@ -583,10 +588,10 @@ pub fn cycles_among(own: List<Bytes>) -> List<CheckedModule> / {memo.read, abort
 
 pub fn entry_hash(module: Bytes, name: Bytes) -> Option<Bytes> / {memo.read, abort.raise} =
   if module.len() == 0 { None } else {
-    module_hashes({ module: module, shipped: false, tested: false }).cached.nodes.fold(
+    module_hashes({ module: module, shipped: false, tested: false }).own.definitions.fold(
       None,
-      |accumulator: Option<Bytes>, f: CachedNode|
-        if !f.declaration && f.name == name { Some(f.hash) } else { accumulator },
+      |accumulator: Option<Bytes>, f: DefinitionHash|
+        if f.kind == HeldValue && f.name == name { Some(f.hash) } else { accumulator },
     )
   }
 
@@ -637,14 +642,14 @@ pub fn over_decoding<a | e>(
 pub fn queried_over(
   store: fs::MemFs,
   sources: List<Source>,
-) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} =
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} =
   queried_under(fresh_registry(), store, sources)
 
 pub fn queried_results(
   qs: CheckQueries,
   store: fs::MemFs,
   sources: List<Source>,
-) -> { store: fs::MemFs, run: Run, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
+) -> { store: fs::MemFs, run: Run, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
   let w = inputs_alone(sources);
   let done = over_decoding(
     store,
@@ -653,19 +658,19 @@ pub fn queried_results(
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     || query_alone(qs, w),
   );
-  { store: done.store, run: done.value.run, fixing: done.value.fixing, results: done.value.results }
+  { store: done.store, run: done.value.run, own_hashes: done.value.own_hashes, results: done.value.results }
 }
 
 pub fn queried_under(
   qs: CheckQueries,
   store: fs::MemFs,
   sources: List<Source>,
-) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
   let done = queried_results(qs, store, sources);
   {
     store: done.store,
     run: done.run,
-    fixing: done.fixing,
+    own_hashes: done.own_hashes,
     results: done.results,
     outcome: outcome_of(sources, done.results),
   }
@@ -730,11 +735,11 @@ pub fn lookup_input_shipping(
 
 fn hashed_load(
   own: List<Bytes>,
-) -> { results: List<CheckedModule>, fixing: CachedHashes } / {memo.read, abort.raise} = {
+) -> { results: List<CheckedModule>, own_hashes: OwnHashes } / {memo.read, abort.raise} = {
   let all = query_load(own, [], false, module_of);
   {
     results: all.results,
-    fixing: joined_cached_hashes(
+    own_hashes: joined_module_hashes(
       hashed_all(
         own.filter(|m: Bytes|
           !all.results.any(|a: CheckedModule| a.module == m && a.result.rejected.len() > 0)),
@@ -748,12 +753,12 @@ fn hashed_load(
 fn query_alone(
   qs: CheckQueries,
   w: LoadInputs,
-) -> { run: Run, results: List<CheckedModule>, fixing: CachedHashes } / {RunEffects, abort.raise} =
+) -> { run: Run, results: List<CheckedModule>, own_hashes: OwnHashes } / {RunEffects, abort.raise} =
   in_session(qs, |run: Run| {
     let done = reading(qs, run, || hashed_load(w.own));
     {
       run: done.run,
-      value: { run: done.run, results: done.value.results, fixing: done.value.fixing },
+      value: { run: done.run, results: done.value.results, own_hashes: done.value.own_hashes },
     }
   })
 
@@ -789,7 +794,7 @@ fn queried_in(
   sources: List<Source>,
   company: StoreSharing,
   nth: Int,
-) -> { tree: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes } / {abort.raise} = {
+) -> { tree: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes } / {abort.raise} = {
   let w = inputs_alone(sources);
   let fresh = fresh_registry();
   let qs = if company != Turns { fresh } else {
@@ -838,7 +843,7 @@ fn queried_in(
   {
     tree: done.tree,
     run: done.value.run,
-    fixing: done.value.fixing,
+    own_hashes: done.value.own_hashes,
     outcome: outcome_of(sources, done.value.results),
   }
 }
@@ -873,7 +878,7 @@ pub fn files_differing(steps: List<Step>, company: StoreSharing) -> List<Bytes> 
       let recorded = queried_in(s.tree, step.sources, company, i);
       let fresh = queried_over(fs::mem_empty(), step.sources);
       let agrees = outcome_summary(recorded.outcome) == outcome_summary(fresh.outcome)
-        && recorded.fixing == fresh.fixing;
+        && recorded.own_hashes == fresh.own_hashes;
       { tree: recorded.tree, off: if agrees { s.off } else { s.off.push(step.what) } }
     },
   ).off
@@ -919,7 +924,7 @@ test "a module's definition list decodes to the same value that was stored" {
 }
 
 test "a group's hashes decode to the same value that was stored" {
-  assert(results_round_trip(stored_results(group_hash_query().name), group_hashes_bin()))
+  assert(results_round_trip(stored_results(group_hash_query().name), own_hashes_bin()))
 }
 
 test "a module's imports read back as they were recorded" {
@@ -933,7 +938,7 @@ test "a module's hashes read back as they were recorded" {
 fn embedding_queried(
   source_text: Bytes,
   files: Map<Bytes, Bytes>,
-) -> { store: fs::MemFs, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
+) -> { store: fs::MemFs, results: List<CheckedModule>, own_hashes: OwnHashes } / {abort.raise} = {
   let w = inputs_alone([{ name: b"m", source_text: source_text }]);
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
@@ -948,11 +953,11 @@ fn embedding_queried(
     |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
     || query_alone(fresh_registry(), w),
   );
-  { store: done.store, results: done.value.results, fixing: done.value.fixing }
+  { store: done.store, results: done.value.results, own_hashes: done.value.own_hashes }
 }
 
-fn fixed_hash(fixing: CachedHashes, name: Bytes) -> Option<Bytes> =
-  fixing.nodes.fold(None, |accumulator: Option<Bytes>, f: CachedNode|
+fn own_hash_of(own_hashes: OwnHashes, name: Bytes) -> Option<Bytes> =
+  own_hashes.definitions.fold(None, |accumulator: Option<Bytes>, f: DefinitionHash|
     if f.name == name { Some(f.hash) } else { accumulator })
 
 const two_embeds: Bytes =
@@ -966,7 +971,7 @@ test "a module's stored results refer to an embedded file by its digest and neve
   let source_text = b"pub fn data() -> Bytes = embed(\"big.bin\")\npub fn size() -> Int = data().len()\ntest \"sized\" { assert(size() > 0) }\n";
   let done = embedding_queried(source_text, Map::new().insert(b"big.bin", big));
   assert_eq(rejected_first(done.results), []);
-  assert(fixed_hash(done.fixing, b"m.data") != None);
+  assert(own_hash_of(done.own_hashes, b"m.data") != None);
   assert_eq(
     done.results.map(|a: CheckedModule| a.result.shape.embeds.map(|e: ModuleEmbed| e.read)),
     [[Ok([embed_file(b"", big)])]],
@@ -983,14 +988,14 @@ test "a module's stored results refer to an embedded file by its digest and neve
 
 test "changing an embedded file's bytes changes the hash of the definition that embeds it and of no other definition" {
   let over = |a: Bytes, b: Bytes|
-    embedding_queried(two_embeds, Map::new().insert(b"a.bin", a).insert(b"b.bin", b)).fixing;
+    embedding_queried(two_embeds, Map::new().insert(b"a.bin", a).insert(b"b.bin", b)).own_hashes;
   let first = over(b"one", b"two");
   let moved = over(b"one", b"three");
-  assert(fixed_hash(first, b"m.a") != None);
-  assert_eq(fixed_hash(moved, b"m.a"), fixed_hash(first, b"m.a"));
-  assert(fixed_hash(moved, b"m.b") != fixed_hash(first, b"m.b"));
+  assert(own_hash_of(first, b"m.a") != None);
+  assert_eq(own_hash_of(moved, b"m.a"), own_hash_of(first, b"m.a"));
+  assert(own_hash_of(moved, b"m.b") != own_hash_of(first, b"m.b"));
   let same = over(b"one", b"one");
-  assert_eq(fixed_hash(same, b"m.a"), fixed_hash(same, b"m.b"))
+  assert_eq(own_hash_of(same, b"m.a"), own_hash_of(same, b"m.b"))
 }
 
 fn embed_from_files<[r]>(
@@ -1017,7 +1022,7 @@ fn session_over_embeds<[r]>(
     |_: Bytes| (),
     ||
       with_decode_cache(||
-        if checks { fixed_hash(query_alone(qs, w).fixing, b"m.a") }
+        if checks { own_hash_of(query_alone(qs, w).own_hashes, b"m.a") }
         else { in_session(qs, |run: Run| { run: run, value: None }) }),
   ).value
 }
@@ -1043,7 +1048,7 @@ type CheckedSources = {
   store: fs::MemFs,
   run: Run,
   results: List<CheckedModule>,
-  cached_hashes: CachedHashes,
+  own_hashes: OwnHashes,
   warnings: List<Diagnostic>,
   fetched: List<Bytes>,
 }
@@ -1097,7 +1102,7 @@ pub fn check_under(
             let all = query_load(w.own, [], false, module_of);
             {
               results: all.results,
-              fixing: joined_cached_hashes(hashed_all(w.own, all.pulled, false)),
+              own_hashes: joined_module_hashes(hashed_all(w.own, all.pulled, false)),
             }
           });
           {
@@ -1105,7 +1110,7 @@ pub fn check_under(
             value: {
               run: done.run,
               results: done.value.results,
-              fixing: done.value.fixing,
+              own_hashes: done.value.own_hashes,
               warnings: root_warnings(done.value.results, sources.len()),
             },
           }
@@ -1116,7 +1121,7 @@ pub fn check_under(
       store: done.store,
       run: done.value.run,
       results: done.value.results,
-      fixing: done.value.fixing,
+      own_hashes: done.value.own_hashes,
       warnings: done.value.warnings,
     }
   } with {
@@ -1129,7 +1134,7 @@ pub fn check_under(
         store: d.store,
         run: d.run,
         results: d.results,
-        cached_hashes: d.fixing,
+        own_hashes: d.own_hashes,
         warnings: d.warnings,
         fetched: fetched,
       },
@@ -1670,5 +1675,5 @@ test "a module's stored interface and contracts equal those of a whole check" {
 
 fn contract_lines(contracts: List<Contract>) -> List<Bytes> =
   contracts.map(|c: Contract|
-    Bytes::concat_all([c.name, if c.declaration { b" type " } else { b" " }, c.hash])).sort(
+    Bytes::concat_all([definition_key(c.reference.name, c.reference.kind), b" ", c.hash])).sort(
   )
