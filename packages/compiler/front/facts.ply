@@ -17,8 +17,7 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, HandlerStateVariable, RecordLiteralField,
                                     expression_span, TaggedLiteralExpression, TaggedLiteral, Hole,
-                                    TaggedPart, tagged_parts, tagged_part_bin, prelude_module,
-                                    prelude_hosts)
+                                    TaggedPart, tagged_parts, tagged_part_bin, prelude_module)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralString, LiteralBytes)
 import compiler.check.types (unit_type, TypeTable, InternedType, interned_type_bin, intern_types,
                              types_of)
@@ -158,27 +157,6 @@ pub fn outlines_of(w: GroupAnalysis) -> List<Outline> / {abort.raise} =
       effect_sets_of(w.r, w.checked.effects, i, parsed),
       match w.stub_cuts.get(parsed.name) { Some(c) -> c, None -> cuts_of(parsed) },
       w.modules,
-    )
-  })
-
-pub fn effect_hosts(outlines: List<Outline>) -> Map<Bytes, Bytes> =
-  outlines.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, o: Outline| {
-    let declared = o.items.fold(accumulator, |a: Map<Bytes, Bytes>, item: OutlineItem|
-      match item {
-        OutlinedEffect(e) -> match e.host {
-          Some(by) -> a.insert(qualify(o.name, e.name), qualify(o.name, by)),
-          None -> a,
-        },
-        _ -> a,
-      });
-    prelude_hosts.fold(
-      declared,
-      |a: Map<Bytes, Bytes>, h: { effect: Bytes, module: Bytes, by: Bytes }|
-        if h.module == o.name
-            && o.items.any(|item: OutlineItem|
-              match item { OutlinedFunction(f) -> f.name == h.by, _ -> false }) {
-          a.insert(h.effect, qualify(o.name, h.by))
-        } else { a },
     )
   })
 
@@ -732,14 +710,12 @@ fn cut_tables(t: ModuleTables, o: Outline, reachable: Set<Bytes>) -> ModuleTable
   }
 }
 
-fn test_and_law_owners(outlines: List<Outline>) -> Set<Bytes> / {abort.raise} =
-  outlines.fold(Set::empty(), |accumulator: Set<Bytes>, o: Outline|
-    o.items.fold(accumulator, |m: Set<Bytes>, item: OutlineItem|
-      match item {
-        OutlinedTest(t) -> m.insert(test_owner(o.name, t.name)),
-        OutlinedLaw(l) -> m.insert(law_owner(o.name, l.name)),
-        _ -> m,
-      }))
+fn test_and_law_owners(placed: List<ModuleTables>) -> Set<Bytes> / {abort.raise} =
+  placed.fold(Set::empty(), |accumulator: Set<Bytes>, t: ModuleTables| {
+    let tested = t.tests.fold(accumulator, |m: Set<Bytes>, x: TestInfo|
+      m.insert(test_owner(x.module, x.name)));
+    t.laws.fold(tested, |m: Set<Bytes>, x: LawInfo| m.insert(law_owner(x.module, x.name)))
+  })
 
 fn in_check_order<a>(
   checked: List<ModuleTables>,
@@ -774,8 +750,8 @@ fn untested_shape(s: ModuleShape) -> ModuleShape = {
   }
 }
 
-fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} = {
-  let apart = test_and_law_owners([o]);
+fn untested_tables(t: ModuleTables) -> ModuleTables / {abort.raise} = {
+  let apart = test_and_law_owners([t]);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ..t,
@@ -1004,8 +980,7 @@ fn checked_tables(
     { out: [], tests: 0, laws: 0 },
     |accumulator: { out: List<ModuleTables>, tests: Int, laws: Int }, k: Int| {
       let r = reads.reads.get(k);
-      let plain = if r.untested { untested_tables(tables.get(k), r.outline) }
-      else { tables.get(k) };
+      let plain = if r.untested { untested_tables(tables.get(k)) } else { tables.get(k) };
       let t = if r.trimmed { cut_tables(plain, r.outline, reads.reachable) } else { plain };
       {
         out: accumulator.out.push(moved_tables(t, 0, k, accumulator.tests, accumulator.laws)),
@@ -1019,44 +994,32 @@ fn checked_tables(
 
 pub type PlacedTables = { module: Int, tables: ModuleTables }
 
-pub fn checked_of_parts(parts: List<PlacedTables>) -> CheckOutput = {
-  let placed = parts.fold(
+pub fn checked_of_parts(
+  order: List<Int>,
+  parts: Map<Int, List<PlacedTables>>,
+) -> CheckOutput / {abort.raise} = {
+  let placed = range(0, order.len()).fold(
     { out: [], tests: 0, laws: 0 },
-    |accumulator: { out: List<ModuleTables>, tests: Int, laws: Int }, p: PlacedTables|
-      {
-        out: accumulator.out.push(
-          moved_tables(p.tables, 0, p.module, accumulator.tests, accumulator.laws),
-        ),
-        tests: accumulator.tests + p.tables.tests.len(),
-        laws: accumulator.laws + p.tables.laws.len(),
-      },
+    |accumulator: { out: List<PlacedTables>, tests: Int, laws: Int }, module: Int|
+      parts.get(module).unwrap_or([]).fold(
+        accumulator,
+        |a: { out: List<PlacedTables>, tests: Int, laws: Int }, p: PlacedTables|
+          {
+            out: a.out.push({
+              module: p.module,
+              tables: moved_tables(p.tables, 0, p.module, a.tests, a.laws),
+            }),
+            tests: a.tests + p.tables.tests.len(),
+            laws: a.laws + p.tables.laws.len(),
+          },
+      ),
   ).out;
-  {
-    ok: true,
-    diagnostics: [],
-    warnings: [],
-    definitions: gathered_tables(placed, |t: ModuleTables| t.definitions),
-    tests: gathered_tables(placed, |t: ModuleTables| t.tests),
-    laws: gathered_tables(placed, |t: ModuleTables| t.laws),
-    effects: gathered_tables(placed, |t: ModuleTables| t.effects),
-    constructors: gathered_tables(placed, |t: ModuleTables| t.constructors),
-    seeded: [],
-    facts: {
-      pure: gathered_tables(placed, |t: ModuleTables| t.facts.pure),
-      orders: gathered_tables(placed, |t: ModuleTables| t.facts.orders),
-      members: gathered_tables(placed, |t: ModuleTables| t.facts.members),
-      types: placed.fold(Map::new(), |accumulator: TypeTable, t: ModuleTables|
-        types_joined(accumulator, t.facts.types)),
-      bodies: gathered_tables(placed, |t: ModuleTables| t.facts.bodies),
-    },
-    cached: gathered_tables(placed, |t: ModuleTables| t.cached),
-    instances: gathered_tables(placed, |t: ModuleTables| t.instances),
-    numeric_types: gathered_tables(placed, |t: ModuleTables| t.numeric),
-  }
+  tables_merged(
+    order.flat_map(|module: Int|
+      placed.filter(|p: PlacedTables| p.module == module).map(|p: PlacedTables| p.tables)),
+    placed.map(|p: PlacedTables| p.tables),
+  )
 }
-
-fn gathered_tables<a>(tables: List<ModuleTables>, pick: (ModuleTables) -> List<a>) -> List<a> =
-  tables.fold([], |accumulator: List<a>, t: ModuleTables| accumulator.concat(pick(t)))
 
 pub fn assembled_program(
   facts: List<ModuleFacts>,
@@ -1189,9 +1152,23 @@ fn merged_tables(
 ) -> CheckOutput / {abort.raise} = {
   let at_name = range(0, outlines.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, k: Int|
     accumulator.insert(outlines.get(k).name, k));
-  let checked_order = order.fold([], |accumulator: List<ModuleTables>, n: Bytes|
-    match at_name.get(n) { Some(k) -> accumulator.push(placed.get(k)), None -> accumulator });
-  let apart = test_and_law_owners(outlines);
+  let merged = tables_merged(
+    order.fold([], |accumulator: List<ModuleTables>, n: Bytes|
+      match at_name.get(n) { Some(k) -> accumulator.push(placed.get(k)), None -> accumulator }),
+    placed,
+  );
+  {
+    ..merged,
+    effects: prelude.effects.concat(merged.effects),
+    constructors: prelude.constructors.concat(merged.constructors),
+  }
+}
+
+fn tables_merged(
+  checked_order: List<ModuleTables>,
+  placed: List<ModuleTables>,
+) -> CheckOutput / {abort.raise} = {
+  let apart = test_and_law_owners(placed);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ok: true,
@@ -1202,14 +1179,10 @@ fn merged_tables(
     tests: placed.fold([], |accumulator: List<TestInfo>, t: ModuleTables|
       accumulator.concat(t.tests)),
     laws: placed.fold([], |accumulator: List<LawInfo>, t: ModuleTables| accumulator.concat(t.laws)),
-    effects: checked_order.fold(
-      prelude.effects,
-      |accumulator: List<EffectInfo>, t: ModuleTables| accumulator.concat(t.effects),
-    ),
-    constructors: checked_order.fold(
-      prelude.constructors,
-      |accumulator: List<ConstructorInfo>, t: ModuleTables| accumulator.concat(t.constructors),
-    ),
+    effects: checked_order.fold([], |accumulator: List<EffectInfo>, t: ModuleTables|
+      accumulator.concat(t.effects)),
+    constructors: checked_order.fold([], |accumulator: List<ConstructorInfo>, t: ModuleTables|
+      accumulator.concat(t.constructors)),
     seeded: [],
     facts: {
       pure: checked_order.fold([], |accumulator: List<Bytes>, t: ModuleTables|
