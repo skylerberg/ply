@@ -1,4 +1,3 @@
-import std.set (Set)
 import compiler.codes (unknown_name_code, unsupported_operation_code)
 import compiler.check.resolve.tables (source_span)
 import compiler.check.resolve.tables (other_modules)
@@ -21,8 +20,8 @@ import compiler.check.types (backticked_text, Resource, ResourceVariable, AnyRes
                              Effects, Type, VariableType, NamedType, FunctionType, RecordType,
                              Field, FreeVariables, effects_cover, no_effects, is_pure,
                              effects_conflict, named_type, int_type, string_type, bool_type,
-                             fresh_new, substitution_new, occurs_type, free_variables, env_new,
-                             label_of, effect_text, type_text, effects_text, apply_arguments,
+                             fresh_new, substitution_new, free_variables, env_new, label_of,
+                             effect_text, type_text, effects_text, apply_arguments,
                              is_label_or_effects, NominalType, arg_effects, arg_label, unit_type)
 import compiler.check.known (name_of, scoped_name, task_name, builtin_channel_name)
 import compiler.check.resolve.tables (ParsedModule, Resolution, Diagnostic, Label, qualify,
@@ -45,7 +44,7 @@ import compiler.check.infer.checker (DeclaredAlias, DeclaredExtern, DeclaredReco
                                      report_error_at_and, report_error_with_labels,
                                      deriver_description, resolve, resolve_effects_in, seed_effect,
                                      definition_of, channel_operations, install_prelude, mode_eq,
-                                     Blocker, AlgebraicShape, Shapes, find_adt, derivable)
+                                     Blocker, Shapes, find_adt, derivable, contains_native)
 import compiler.check.infer.names (simple_name_of)
 import compiler.check.infer.declarations (is_scheduler_handle, task_operation,
                                           effects_include_brand)
@@ -1217,55 +1216,8 @@ fn contains_function(t: Type) -> Bool =
 fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> =
   xs.fold([x], |accumulator: List<Bytes>, y: Bytes| accumulator.push(y))
 
-type NativeReach = { native_types: Set<Bytes>, uses: Map<Bytes, List<Int>> }
-
-fn native_reach(shapes: Shapes) -> NativeReach / {abort.raise} = {
-  let uses = shapes.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, List<Int>>, name: Bytes, shape: AlgebraicShape|
-      accumulator.insert(
-        name,
-        range(0, shape.params.len()).filter(|i: Int|
-          shape.fields.any(|f: Type| occurs_type(shape.params.get(i), f))),
-      ),
-  );
-  let natives = shapes.fold(
-    Set::empty(),
-    |accumulator: Set<Bytes>, name: Bytes, shape: AlgebraicShape|
-      if shape.native { accumulator.insert(name) } else { accumulator },
-  );
-  let native_types = iterate(natives, shapes.len() + 1, |found: Set<Bytes>| {
-    let next = shapes.fold(found, |accumulator: Set<Bytes>, name: Bytes, shape: AlgebraicShape|
-      if accumulator.contains(name) { accumulator }
-      else if shape.fields.any(|f: Type|
-          contains_native_type({ native_types: accumulator, uses: uses }, f)) {
-        accumulator.insert(name)
-      } else { accumulator });
-    if next.size() == found.size() { Stop(next) } else { Continue(next) }
-  });
-  { native_types: native_types, uses: uses }
-}
-
-fn contains_native_type(reach: NativeReach, ty: Type) -> Bool / {abort.raise} =
-  match ty {
-    NamedType(c) ->
-      reach.native_types.contains(c.name)
-        || (match reach.uses.get(c.name) {
-          Some(at) ->
-            at.any(|i: Int|
-              match c.args.at(i) { Some(a) -> contains_native_type(reach, a), None -> false }),
-          None -> c.args.any(|a: Type| contains_native_type(reach, a)),
-        }),
-    RecordType(fs) -> fs.any(|f: Field| contains_native_type(reach, f.ty)),
-    NominalType(n) -> n.fields.any(|f: Field| contains_native_type(reach, f.ty)),
-    FunctionType(_) -> false,
-    VariableType(_) -> false,
-  }
-
-pub fn check_comparisons(checker: Checker) -> Checker / {abort.raise} = {
-  let reach = native_reach(
-    instance_shapes(checker.instances, algebraic_shapes(checker), EqDeriver),
-  );
+pub fn check_comparisons(checker: Checker) -> Checker / {abort.raise, elsewhere.read} = {
+  let compared = instance_shapes(checker.instances, algebraic_shapes(checker), EqDeriver);
   checker.comparisons.fold(
     { ..checker, comparisons: [] },
     |c: Checker, site: { module: Int, span: Span, ty: Type }| {
@@ -1296,7 +1248,7 @@ pub fn check_comparisons(checker: Checker) -> Checker / {abort.raise} = {
             ],
           ),
         )
-      } else if contains_native_type(reach, resolved) {
+      } else if contains_native(resolved, compared) {
         report(
           c,
           error_at(
