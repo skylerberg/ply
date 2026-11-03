@@ -76,9 +76,9 @@ pub type Label = { place: Place, primary: Bool, text: Bytes }
 
 pub type Edit = { module: Int, start: Int, end: Int, text: Bytes }
 
-pub type AddedEffects = { function: Bytes, effects: List<Bytes>, calls: List<Bytes> }
+pub type Fix = { title: Bytes, first: Edit, rest: List<Edit> }
 
-pub type Fix = { title: Bytes, edits: List<Edit>, adds: Option<AddedEffects> }
+pub type Fixes = | NoFix | Apply(Fix) | ChooseOne(Fix, Fix, List<Fix>)
 
 pub type Diagnostic = {
   code: Bytes,
@@ -87,14 +87,14 @@ pub type Diagnostic = {
   message: Bytes,
   notes_text: List<Bytes>,
   severity: Severity,
-  fixes: List<Fix>,
+  fixes: Fixes,
 }
 
 pub fn placed_in(d: Diagnostic, module: Int) -> Diagnostic =
   {
     ..d,
     labels: d.labels.map(|l: Label| { ..l, place: in_module(l.place, module) }),
-    fixes: d.fixes.map(|f: Fix| { ..f, edits: f.edits.map(|e: Edit| { ..e, module: module }) }),
+    fixes: fixes_moved(d.fixes, |e: Edit| { ..e, module: module }),
   }
 
 derive bin for Source
@@ -105,9 +105,9 @@ derive bin for Label
 
 derive bin for Edit
 
-derive bin for AddedEffects
-
 derive bin for Fix
+
+derive bin for Fixes
 
 derive bin for Diagnostic
 
@@ -568,19 +568,56 @@ pub fn error_with_labels(
     message: message,
     notes_text: notes,
     severity: Error,
-    fixes: [],
+    fixes: NoFix,
   }
 
-pub fn with_fix(diagnostic: Diagnostic, title: Bytes, edits: List<Edit>) -> Diagnostic =
-  { ..diagnostic, fixes: diagnostic.fixes.push({ title: title, edits: edits, adds: None }) }
+pub fn fix_of(title: Bytes, edits: List<Edit>) -> Option<Fix> =
+  match edits { [] -> None, [first, ..rest] -> Some({ title: title, first: first, rest: rest }) }
 
-pub fn with_added_effects(
-  diagnostic: Diagnostic,
-  title: Bytes,
-  edits: List<Edit>,
-  adds: AddedEffects,
-) -> Diagnostic =
-  { ..diagnostic, fixes: diagnostic.fixes.push({ title: title, edits: edits, adds: Some(adds) }) }
+pub fn with_fix(diagnostic: Diagnostic, title: Bytes, edits: List<Edit>) -> Diagnostic =
+  match fix_of(title, edits) { Some(fix) -> { ..diagnostic, fixes: Apply(fix) }, None -> diagnostic }
+
+pub fn alternatives(fixes: List<Fix>) -> Fixes =
+  match fixes {
+    [] -> NoFix,
+    [only] -> Apply(only),
+    [first, second, ..rest] -> ChooseOne(first, second, rest),
+  }
+
+pub fn with_alternatives(diagnostic: Diagnostic, fixes: List<Fix>) -> Diagnostic =
+  { ..diagnostic, fixes: alternatives(fixes) }
+
+pub fn fix_edits(fix: Fix) -> List<Edit> = [fix.first].concat(fix.rest)
+
+pub fn offered_fixes(fixes: Fixes) -> List<Fix> =
+  match fixes {
+    NoFix -> [],
+    Apply(fix) -> [fix],
+    ChooseOne(first, second, rest) -> [first, second].concat(rest),
+  }
+
+fn fix_moved(fix: Fix, moved: (Edit) -> Edit) -> Fix =
+  { ..fix, first: moved(fix.first), rest: fix.rest.map(moved) }
+
+pub fn fixes_moved(fixes: Fixes, moved: (Edit) -> Edit) -> Fixes =
+  match fixes {
+    NoFix -> NoFix,
+    Apply(fix) -> Apply(fix_moved(fix, moved)),
+    ChooseOne(first, second, rest) ->
+      ChooseOne(
+        fix_moved(first, moved),
+        fix_moved(second, moved),
+        rest.map(|fix: Fix| fix_moved(fix, moved)),
+      ),
+  }
+
+pub fn fixes_kept(fixes: Fixes, kept: (Edit) -> Bool) -> Fixes =
+  match fixes {
+    NoFix -> NoFix,
+    Apply(fix) -> if fix_edits(fix).all(kept) { fixes } else { NoFix },
+    ChooseOne(_, _, _) ->
+      alternatives(offered_fixes(fixes).filter(|fix: Fix| fix_edits(fix).all(kept))),
+  }
 
 pub fn insertion(m: Int, at: Int, text: Bytes) -> Edit =
   { module: m, start: at, end: at, text: text }
@@ -770,5 +807,8 @@ test "a diagnostic placed in a module moves its labels and the edits of its fixe
   );
   let placed = placed_in(d, 3);
   assert_eq(placed.labels.map(|l: Label| l.place), [InSource({ module: 3, start: 4, end: 9 })]);
-  assert_eq(placed.fixes.flat_map(|f: Fix| f.edits.map(|e: Edit| e.module)), [3])
+  assert_eq(
+    offered_fixes(placed.fixes).flat_map(|f: Fix| fix_edits(f).map(|e: Edit| e.module)),
+    [3],
+  )
 }

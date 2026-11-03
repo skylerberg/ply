@@ -25,7 +25,7 @@ import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, 
                               InstanceItem, NumericItem, FnDefinition, TypeDefinition, AliasBody,
                               SumBody, NominalBody, ExternBody, VariantDefinition, EffectDefinition,
                               OperationDefinition, TestDefinition, Constraint, ReturnsFresh,
-                              ReturnsParam, Public, HostInstance)
+                              ReturnsParam, Visibility, Private, HostInstance)
 import compiler.syntax.fmt (module_text)
 import compiler.syntax.literal_printer (float_text, decimal_text)
 import compiler.check.resolve.tables (default_binder, module_of_name)
@@ -93,7 +93,9 @@ pub type PrintError = { message: Bytes, notes: List<Bytes> }
 
 pub type PrintResult = | Printed(List<{ module: Bytes, text: Bytes }>) | Unprintable(PrintError)
 
-pub type PrintedDefinition = { name: Bytes, body: Bytes }
+pub type DefinitionRole = | WrittenWith(Visibility) | FromShippedModule
+
+pub type PrintedDefinition = { name: Bytes, body: Bytes, role: DefinitionRole }
 
 type Layout = {
   printed: Map<Bytes, Bool>,
@@ -1198,6 +1200,7 @@ fn items_of(
   naming: NameState,
   form: Stored,
   name: Bytes,
+  visibility: Visibility,
 ) -> NamedNode<List<Item>> / {abort.raise} = {
   let span = generated_span;
   match form {
@@ -1242,7 +1245,7 @@ fn items_of(
         naming: body.naming,
         node: [
           FunctionItem({
-            visibility: Public,
+            visibility: visibility,
             name: identifier(name),
             generics: generics_of(function.generics),
             params: parameters.node,
@@ -1331,7 +1334,7 @@ fn items_of(
         },
       );
       let declaration = TypeItem({
-        visibility: Public,
+        visibility: visibility,
         opaque: if declared.opaque { Some({ span: span, result: [], take: [] }) } else { None },
         name: identifier(name),
         generics: generics_of(declared.generics),
@@ -1377,7 +1380,7 @@ fn items_of(
         },
       );
       let declaration = EffectItem({
-        visibility: Public,
+        visibility: visibility,
         name: identifier(name),
         is_nondet: declared.nondet,
         operations: operations.node,
@@ -1508,6 +1511,7 @@ fn printed_into(
   output: Bytes,
   name: Bytes,
   body: Bytes,
+  visibility: Visibility,
 ) -> Printing / {abort.raise} = {
   let read = read_body(body, name);
   let had = match done.modules.get(output) {
@@ -1519,6 +1523,7 @@ fn printed_into(
     fresh_naming(had.imports, done.missing, read.picks),
     read.form,
     default_binder(name),
+    visibility,
   );
   {
     modules: done.modules.insert(output, {
@@ -1534,7 +1539,6 @@ pub fn stored_form(body: Bytes) -> Stored / {abort.raise} = read_body(body, b"a 
 pub fn print_bodies(
   definitions: List<PrintedDefinition>,
   tests: List<Bytes>,
-  shipped: List<Bytes>,
 ) -> PrintResult / {abort.raise} =
   match definitions.find(|d: PrintedDefinition| module_of_name(d.name).len() == 0) {
     Some(d) ->
@@ -1543,8 +1547,12 @@ pub fn print_bodies(
         notes: [],
       }),
     None -> {
-      let shipped_modules = shipped.fold(Map::new(), |m: Map<Bytes, Bool>, s: Bytes|
-        m.insert(s, true));
+      let shipped_modules = definitions.fold(
+        Map::new(),
+        |m: Map<Bytes, Bool>, d: PrintedDefinition| match d.role {
+          FromShippedModule -> m.insert(module_of_name(d.name), true),
+          WrittenWith(_) -> m,
+        });
       let layout = {
         printed: definitions.fold(Map::new(), |m: Map<Bytes, Bool>, d: PrintedDefinition|
           m.insert(d.name, true)),
@@ -1562,14 +1570,25 @@ pub fn print_bodies(
       };
       let printed = definitions.fold(
         { modules: Map::new(), missing: Map::new() },
-        |done: Printing, d: PrintedDefinition| {
-          let module = module_of_name(d.name);
-          if shipped_modules.contains(module) { done }
-          else { printed_into(layout, done, module, module, d.name, d.body) }
-        },
+        |done: Printing, d: PrintedDefinition|
+          match d.role {
+            FromShippedModule -> done,
+            WrittenWith(visibility) -> {
+              let module = module_of_name(d.name);
+              printed_into(layout, done, module, module, d.name, d.body, visibility)
+            },
+          },
       );
       let all = range(0, tests.len()).fold(printed, |done: Printing, i: Int|
-        printed_into(layout, done, b"", b"ply_tests", b"t".concat(ascii_of_int(i)), tests.get(i)));
+        printed_into(
+          layout,
+          done,
+          b"",
+          b"ply_tests",
+          b"t".concat(ascii_of_int(i)),
+          tests.get(i),
+          Private,
+        ));
       let missing = all.missing.keys();
       if missing.len() > 0 {
         Unprintable({

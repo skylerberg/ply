@@ -31,7 +31,8 @@ import compiler.check.types (Effect, Effects, ResourceVariable, SingletonResourc
                              variables_in, unit_type, type_at)
 import compiler.check.termination (Terminates, TerminatesByDecreases, Diverges, Site)
 import compiler.check.resolve.tables (ParsedModule, Source, Resolution, Diagnostic, Label, Edit,
-                                      Fix, with_fix, insertion, qualify, error_at)
+                                      Fix, with_fix, insertion, qualify, error_at, fix_edits,
+                                      offered_fixes)
 import compiler.check.resolve (resolve_modules, ResolveSucceeded, ResolveFailed, dump_diagnostics,
                                has_error)
 import compiler.check.resolve.defaults (ResolvedProgram)
@@ -2468,12 +2469,13 @@ test "a `Map` whose key type is an alias with no ordering is rejected at every s
 
 fn fixes_of(diagnostics: List<Diagnostic>) -> List<Fix> =
   diagnostics.fold([], |accumulator: List<Fix>, diagnostic: Diagnostic|
-    accumulator.concat(diagnostic.fixes))
+    accumulator.concat(offered_fixes(diagnostic.fixes)))
 
 fn fixed_by(source: Bytes, fix: Fix) -> Bytes / {abort.raise} = {
-  let n = fix.edits.len();
+  let edits = fix_edits(fix);
+  let n = edits.len();
   range(0, n).fold(source, |s: Bytes, i: Int| {
-    let e = fix.edits.get(n - 1 - i);
+    let e = edits.get(n - 1 - i);
     Bytes::concat_all([s.slice(0, e.start), e.text, s.slice(e.end, s.len())])
   })
 }
@@ -2961,8 +2963,7 @@ test "a callee written with a mode effect may perform any of its operations, so 
     ],
   ]);
   assert_eq(fixes_of(diagnostics).map(|fix: Fix| fix.title), [
-    b"add a clause for `net.recv[c]`",
-    b"add a clause for `net.close[c]`",
+    b"add clauses for `net.recv[c]`, `net.close[c]`",
   ]);
   assert_eq(
     check_codes(
@@ -3024,17 +3025,15 @@ test "the missing clause is named as the module would write it" {
     b"this `handle` has no clause for `net.close[c]` and `net.send[c]`, which its body performs",
   ]);
   let fixes = fixes_of(diagnostics);
-  assert_eq(fixes.map(|fix: Fix| fix.title), [
-    b"add a clause for `net.close[c]`",
-    b"add a clause for `net.send[c]`",
-  ]);
-  assert_eq(fixes.map(|fix: Fix| fix.edits.map(|edit: Edit| edit.text)), [
-    [b", net.close[c]() -> panic(\"net.close[c] is not handled here\")"],
-    [b", net.send[c](a0) -> panic(\"net.send[c] is not handled here\")"],
+  assert_eq(fixes.map(|fix: Fix| fix.title), [b"add clauses for `net.close[c]`, `net.send[c]`"]);
+  assert_eq(fixes.map(|fix: Fix| fix_edits(fix).map(|edit: Edit| edit.text)), [
+    [
+      b", net.close[c]() -> panic(\"net.close[c] is not handled here\"), net.send[c](a0) -> panic(\"net.send[c] is not handled here\")",
+    ],
   ]);
   assert_eq(
-    fixes.map(|fix: Fix| fix.edits.map(|edit: Edit| source.slice(edit.start - 1, edit.end))),
-    [[b"\""], [b"\""]],
+    fixes.map(|fix: Fix| fix_edits(fix).map(|edit: Edit| source.slice(edit.start - 1, edit.end))),
+    [[b"\""]],
   )
 }
 
@@ -3072,9 +3071,9 @@ test "an operation the written effects do not name is rejected by name, with the
   );
   let fixes = fixes_of(diagnostics);
   assert_eq(fixes.map(|fix: Fix| fix.title), [b"add `net.recv[c]` to the effects"]);
-  assert_eq(fixes.map(|fix: Fix| fix.edits.map(|edit: Edit| edit.text)), [[b", net.recv[c]"]]);
+  assert_eq(fixes.map(|fix: Fix| fix_edits(fix).map(|edit: Edit| edit.text)), [[b", net.recv[c]"]]);
   assert_eq(
-    fixes.map(|fix: Fix| fix.edits.map(|edit: Edit| source.slice(edit.start, edit.end + 1))),
+    fixes.map(|fix: Fix| fix_edits(fix).map(|edit: Edit| source.slice(edit.start, edit.end + 1))),
     [[b"}"]],
   )
 }
@@ -4444,12 +4443,20 @@ test "a suggested fix lists only effects the module can name in its source, so n
   assert_eq(fixes_of(ds), [])
 }
 
-fn effects_added_to(diagnostics: List<Diagnostic>) -> List<Bytes> =
-  fixes_of(diagnostics).fold([], |found: List<Bytes>, f: Fix|
-    match f.adds { Some(a) -> found.push(a.function), None -> found })
+fn functions_fixed(
+  sources: List<Source>,
+  diagnostics: List<Diagnostic>,
+) -> List<Bytes> / {abort.raise} =
+  fixes_of(diagnostics).map(|fix: Fix| {
+    let before = sources.get(fix.first.module).source_text.slice(0, fix.first.start);
+    let lines = before.split(b"\n");
+    let line = lines.get(lines.len() - 1);
+    let start = match line.index_of(b"fn ") { Some(keyword) -> keyword + 3, None -> 0 };
+    match line.index_of(b"(") { Some(end) -> line.slice(start, end), None -> line }
+  }).sort()
 
 test "a body that performs an effect its signature lacks makes every caller that does not handle it report the effect with a fix, in one run" {
-  let diagnostics = errors_across([
+  let sources = [
     {
       name: b"base",
       source_text: b"pub effect log { write emit(n: Int) -> Unit }\npub fn inner(n: Int) -> Int / {} = { log.emit(n); n }\n",
@@ -4458,20 +4465,20 @@ test "a body that performs an effect its signature lacks makes every caller that
       name: b"app",
       source_text: b"import base (inner, log)\nfn middle(n: Int) -> Int / {} = inner(n) + 1\nfn outer(n: Int) -> Int = middle(n) * 2\nfn quiet(n: Int) -> Int / {} = handle { middle(n) } with { log.emit(x) -> () }\n",
     },
-  ]);
+  ];
+  let diagnostics = errors_across(sources);
   assert(diagnostics.all(|diagnostic: Diagnostic| diagnostic.code == b"E0302"));
-  assert_eq(effects_added_to(diagnostics).sort(), [b"inner", b"middle", b"outer"])
+  assert_eq(functions_fixed(sources, diagnostics), [b"inner", b"middle", b"outer"])
 }
 
 test "a missing effect reaches every caller in its recursive group in the same run, whichever member performs it" {
-  let widened = |source: Bytes| {
-    let diagnostics = source_diagnostics(
-      b"effect log { write emit(n: Int) -> Unit }\n".concat(source).concat(
-        b"fn quiet(xs: List<Int>) -> Int / {} = handle { ping(xs) } with { log.emit(x) -> () }\n",
-      ),
+  let widened = |group: Bytes| {
+    let source = b"effect log { write emit(n: Int) -> Unit }\n".concat(group).concat(
+      b"fn quiet(xs: List<Int>) -> Int / {} = handle { ping(xs) } with { log.emit(x) -> () }\n",
     );
+    let diagnostics = source_diagnostics(source);
     assert(diagnostics.all(|diagnostic: Diagnostic| diagnostic.code == b"E0302"));
-    effects_added_to(diagnostics).sort()
+    functions_fixed([{ name: b"m", source_text: source }], diagnostics)
   };
   assert_eq(
     widened(
@@ -5012,7 +5019,7 @@ test "a function that may not return must declare `diverges`, its callers must d
   assert_eq(root.map(|diagnostic: Diagnostic| diagnostic.message), [
     b"`spin` may not return, and its effects do not say so",
   ]);
-  assert_eq(root.map(|diagnostic: Diagnostic| diagnostic.fixes.len()), [0]);
+  assert_eq(root.map(|diagnostic: Diagnostic| offered_fixes(diagnostic.fixes).len()), [0]);
   assert_eq(check_codes(b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\n"), []);
   let caller = source_diagnostics(
     b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\nfn wait(n: Int) -> Int = spin(n)\n",
@@ -5023,7 +5030,7 @@ test "a function that may not return must declare `diverges`, its callers must d
       b"a call that may not return makes `wait` one too: write `/ {diverges}` after the return type, or call only what ends",
     ],
   ]);
-  assert_eq(caller.map(|diagnostic: Diagnostic| diagnostic.fixes.len()), [1]);
+  assert_eq(caller.map(|diagnostic: Diagnostic| offered_fixes(diagnostic.fixes).len()), [1]);
   assert_eq(
     check_codes(
       b"fn spin(n: Int) -> Int / {diverges} = spin(n + 1)\nfn wait(n: Int) -> Int / {diverges} = spin(n)\n",

@@ -11,11 +11,14 @@ import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected, RootPlace, checked_program_of)
 import compiler.front.facts (ProgramListing, listing_of)
 import compiler.front.published (analyse)
-import compiler.front.rows (DeclaredEffect)
-import compiler.store.hash.forms (ClosureEntry, HashOutput, by_name, build_closure, walk,
+import compiler.front.rows (DeclaredEffect, Outline, OutlineItem, OutlinedFunction, OutlinedTest,
+                            OutlinedLaw, OutlinedType, OutlinedEffect)
+import compiler.syntax.items (Visibility, Public, Private)
+import compiler.store.hash.forms (ClosureEntry, HashOutput, NodeRef, by_name, build_closure, walk,
                                   definition_key)
 import compiler.store.hash.graph (HeldEffect, HeldKind, HeldType, HeldValue)
-import compiler.store.hash.printer (Printed, Unprintable, PrintedDefinition, print_bodies)
+import compiler.store.hash.printer (Printed, Unprintable, PrintedDefinition, DefinitionRole,
+                                    WrittenWith, FromShippedModule, print_bodies)
 import compiler.store.hash (body_key)
 import compiler.store.hash.encoding (hex)
 import compiler.load (SourceFile)
@@ -225,42 +228,109 @@ fn module_of(name: Bytes) -> Bytes / {abort.raise} = {
 fn path_of(module: Bytes) -> String / {abort.raise} =
   String::join(String::of_bytes(module).split("."), "/") ++ ".ply"
 
+type Visibilities = {
+  values: Map<Bytes, Visibility>,
+  types: Map<Bytes, Visibility>,
+  effects: Map<Bytes, Visibility>,
+}
+
+fn visibility_of(public: Bool) -> Visibility = if public { Public } else { Private }
+
+fn visibilities_of(outlines: List<Outline>) -> Visibilities =
+  outlines.fold(
+    { values: Map::new(), types: Map::new(), effects: Map::new() },
+    |found: Visibilities, o: Outline|
+      o.items.fold(found, |v: Visibilities, item: OutlineItem|
+        match item {
+          OutlinedFunction(f) ->
+            { ..v, values: v.values.insert(qualify(o.name, f.name), visibility_of(f.public)) },
+          OutlinedType(t) ->
+            { ..v, types: v.types.insert(qualify(o.name, t.name), visibility_of(t.public)) },
+          OutlinedEffect(e) ->
+            { ..v, effects: v.effects.insert(qualify(o.name, e.name), visibility_of(e.public)) },
+          OutlinedTest(_) -> v,
+          OutlinedLaw(_) -> v,
+        }),
+  )
+
+fn visibility_in(visibilities: Visibilities, reference: NodeRef) -> Option<Visibility> =
+  match reference.kind {
+    HeldValue -> visibilities.values.get(reference.name),
+    HeldType -> visibilities.types.get(reference.name),
+    HeldEffect -> visibilities.effects.get(reference.name),
+  }
+
+fn role_of(
+  shipped_names: Set<Bytes>,
+  visibilities: Visibilities,
+  reference: NodeRef,
+) -> Option<DefinitionRole> / {abort.raise} =
+  if shipped_names.contains(module_of(reference.name)) { Some(FromShippedModule) } else {
+    match visibility_in(visibilities, reference) {
+      Some(visibility) -> Some(WrittenWith(visibility)),
+      None -> None,
+    }
+  }
+
+type PrintedEntries = { definitions: List<PrintedDefinition>, unknown: List<Bytes> }
+
 fn printed_files(
+  outlines: List<Outline>,
   closure_entries: List<ClosureEntry>,
   bodies: Map<Bytes, Bytes>,
 ) -> Result<List<SourceFile>, Diagnostic> / {shipped.names, abort.raise} = {
   let shipped_names = shipped.names().fold(Set::empty(), |accumulator: Set<Bytes>, n: String|
     accumulator.insert(Bytes::of_string(n)));
-  let shipped_modules = closure_entries.fold(
-    Set::empty(),
-    |accumulator: Set<Bytes>, x: ClosureEntry| {
-      let m = module_of(x.reference.name);
-      if shipped_names.contains(m) { accumulator.insert(m) } else { accumulator }
-    },
-  ).elements(
+  let visibilities = visibilities_of(outlines);
+  let entries = closure_entries.fold(
+    Map::new(),
+    |found: Map<Bytes, ClosureEntry>, x: ClosureEntry|
+      found.insert(Bytes::concat_all([x.reference.name, b"\x00", x.hash]), x),
+  ).values(
   );
-  match print_bodies(
-      pairs_of(closure_entries).fold([], |found: List<PrintedDefinition>, pair: NamedHash|
-        match bodies.get(pair.hash) {
-          Some(b) -> found.push({ name: pair.name, body: b }),
-          None -> found,
-        }),
-      [],
-      shipped_modules,
-    ) {
-    Unprintable(r) ->
-      Err(
-        internal_error(
-          "the stored definitions could not be printed back to source: "
-            ++ String::of_bytes_lossy(r.message),
-          r.notes,
+  let printed = entries.fold(
+    { definitions: [], unknown: [] },
+    |found: PrintedEntries, x: ClosureEntry|
+      match bodies.get(x.hash) {
+        None -> found,
+        Some(body) -> match role_of(shipped_names, visibilities, x.reference) {
+          Some(role) ->
+            {
+              ..found,
+              definitions: found.definitions.push({
+                name: x.reference.name,
+                body: body,
+                role: role,
+              }),
+            },
+          None -> { ..found, unknown: found.unknown.push(x.reference.name) },
+        },
+      },
+  );
+  if printed.unknown.len() > 0 {
+    Err(
+      internal_error(
+        "no module outline gives the visibility of "
+          ++ String::of_bytes_lossy(joined_names(printed.unknown)),
+        [],
+      ),
+    )
+  } else {
+    match print_bodies(printed.definitions, []) {
+      Unprintable(r) ->
+        Err(
+          internal_error(
+            "the stored definitions could not be printed back to source: "
+              ++ String::of_bytes_lossy(r.message),
+            r.notes,
+          ),
         ),
-      ),
-    Printed(modules) ->
-      Ok(
-        modules.map(|m: { module: Bytes, text: Bytes }|
-          { path: path_of(m.module), name: String::of_bytes(m.module), text: m.text }),
-      ),
+      Printed(modules) ->
+        Ok(
+          modules.map(|m: { module: Bytes, text: Bytes }|
+            { path: path_of(m.module), name: String::of_bytes(m.module), text: m.text }),
+        ),
+    }
   }
 }
 
@@ -363,7 +433,7 @@ pub fn build_artifact(
               no_body(names_of_pairs(pairs.filter(|pair: NamedHash| !bodies.contains(pair.hash)))),
             ]),
           ),
-        [] -> match printed_files(closure, bodies) {
+        [] -> match printed_files(listing.outlines, closure, bodies) {
           Err(d) -> Err(rejection([d])),
           Ok(files) -> match closure_unit(listing, program, closure) {
             Err(diagnostics) -> Err(rejection(diagnostics)),
@@ -909,7 +979,7 @@ fn listing_over(source: Bytes) -> ProgramListing / {abort.raise} =
 fn printed_from(listing: ProgramListing) -> List<SourceFile> / {abort.raise} = {
   let closure = build_closure(listing.hashes, [b"m.main"]);
   let printed = handle {
-    printed_files(closure, bodies_of(listing.hashes, pairs_of(closure)))
+    printed_files(listing.outlines, closure, bodies_of(listing.hashes, pairs_of(closure)))
   } with {
     shipped.names() -> ["std.prelude"],
   };
@@ -970,6 +1040,20 @@ test "the printed source defines each definition exactly as the program does" {
         && declarations.get(pair.name) != Some(pair.hash)).map(|pair: NamedHash| pair.name),
     [],
   )
+}
+
+test "the printed source writes each definition with the visibility its module gives it" {
+  let printed = printed_from(
+    listing_over(
+      b"type Hidden = | Hidden(Int)\n\npub type Shown = | Shown(Int)\n\nfn helper(h: Hidden) -> Int = match h { Hidden(n) -> n }\n\npub fn main() -> Int = helper(Hidden(1)) + match Shown(2) { Shown(n) -> n }\n",
+    ),
+  );
+  let text = Bytes::concat_all(printed.map(|f: SourceFile| f.text));
+  let shown = Some(String::of_bytes_lossy(text));
+  assert(text.index_of(b"\nfn helper(") != None, shown);
+  assert(text.index_of(b"\ntype Hidden") != None, shown);
+  assert(text.index_of(b"\npub fn main(") != None, shown);
+  assert(text.index_of(b"\npub type Shown") != None, shown)
 }
 
 test "a body edit leaves every other line of the printed program alone" {
