@@ -62,6 +62,10 @@ pub type Entries = { roots: List<RootKey>, tested: Bool }
 
 pub type PartMembers = { module: Bytes, label: Bytes, units: List<CodeUnit> }
 
+pub type PartName =
+  | ChunkPart({ module: ModuleKey, label: Bytes })
+  | CopiesPart({ module: Bytes, label: Bytes, roots: List<RootAt> })
+
 pub type RootLink = { key: RootKey, unit: Int, calls: List<Int> }
 
 pub type UnitFailure = { unit: Int, reason: Bytes }
@@ -93,6 +97,8 @@ derive bin for CodeUnit
 derive bin for Entries
 
 derive bin for PartMembers
+
+derive bin for PartName
 
 derive bin for RootLink
 
@@ -155,8 +161,8 @@ pub fn unit_calls_query() -> QueryOf<CodeUnit, List<CodeUnit>> =
 pub fn reachable_query() -> QueryOf<Entries, Reached> =
   { name: b"reachable", input: entries_bin(), output: reached_bin() }
 
-pub fn part_query() -> QueryOf<PartMembers, MadePart> =
-  { name: b"part", input: part_members_bin(), output: made_part_bin() }
+pub fn part_query() -> QueryOf<PartName, MadePart> =
+  { name: b"part", input: part_name_bin(), output: made_part_bin() }
 
 pub fn constant_values_query() -> QueryOf<CheckGroupKey, GroupOutput<Unit>> =
   {
@@ -225,7 +231,7 @@ fn roots_of_item(
 fn is_test_root(k: RootKey) -> Bool =
   match k { Test(_) -> true, TestCases(_) -> true, Law(_) -> true, _ -> false }
 
-type RootedGroup = { group: CheckGroupKey, roots: List<RootKey> }
+type RootedGroup = { group: CheckGroupKey, first: Bytes, roots: List<RootKey> }
 
 type GroupRoots = { group: CheckGroupKey, roots: List<RootKey>, chunk: Bytes }
 
@@ -237,20 +243,18 @@ const fewest_groups_in_a_chunk: Int = 32
 
 const most_groups_in_a_chunk: Int = 256
 
-fn first_owner(g: RootedGroup) -> Bytes = g.group.owners.at_or(0, b"")
-
 fn chunked(module: Bytes, groups: List<RootedGroup>) -> List<GroupRoots> =
   match groups {
     [] -> [],
     [opening, ..rest] ->
       rest.fold(
         {
-          out: [{ group: opening.group, roots: opening.roots, chunk: first_owner(opening) }],
-          label: first_owner(opening),
+          out: [{ group: opening.group, roots: opening.roots, chunk: opening.first }],
+          label: opening.first,
           groups: 1,
         },
         |accumulator: Chunking, g: RootedGroup| {
-          let first = first_owner(g);
+          let first = g.first;
           let picked = root_id(qualify(module, first)) & (1 << chunk_rule_bits) - 1 == 0;
           let opens = (accumulator.groups >= fewest_groups_in_a_chunk && picked)
             || accumulator.groups >= most_groups_in_a_chunk;
@@ -267,8 +271,14 @@ fn chunked(module: Bytes, groups: List<RootedGroup>) -> List<GroupRoots> =
 fn owner_places(owners: List<Bytes>) -> Map<Bytes, Int> =
   owners.fold(Map::new(), |at: Map<Bytes, Int>, o: Bytes| at.insert(o, at.len()))
 
-fn placed_first(places: Map<Bytes, Int>, g: RootedGroup) -> Int =
-  match places.get(first_owner(g)) { Some(i) -> i, None -> 0 }
+fn placed_first(places: Map<Bytes, Int>, g: RootedGroup) -> Int / {abort.raise} =
+  match places.get(g.first) {
+    Some(i) -> i,
+    None -> panic("a group's first owner is missing from its module's owners"),
+  }
+
+fn first_owner_of(g: CheckGroupKey) -> Bytes / {abort.raise} =
+  match g.owners { [o, ..] -> o, [] -> panic("a check group has no owners") }
 
 pub fn list_module_units(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let read = owners_result_of(named);
@@ -286,7 +296,8 @@ pub fn list_module_units(named: ModuleKey) -> Written / {memo.read, abort.raise}
     |accumulator: List<RootedGroup>, g: CheckGroupKey| {
       let roots = g.owners.fold([], |rs: List<RootKey>, o: Bytes|
         rs.concat(match by_owner.get(o) { Some(ks) -> ks, None -> [] }));
-      if roots.len() == 0 { accumulator } else { accumulator.push({ group: g, roots: roots }) }
+      if roots.len() == 0 { accumulator }
+      else { accumulator.push({ group: g, first: first_owner_of(g), roots: roots }) }
     },
   ).sort_by(|a: RootedGroup, b: RootedGroup| placed_first(places, a) <= placed_first(places, b));
   let tests = |g: RootedGroup| g.roots.any(is_test_root);
@@ -979,11 +990,28 @@ fn foreign_head(
   }
 }
 
-fn part_tested(part: PartMembers) -> Bool = part.units.any(unit_tested)
+fn part_name_of(part: PartMembers) -> PartName / {abort.raise} =
+  match part.units {
+    [OfGroup(g), ..] -> ChunkPart({ module: module_key_of(g), label: part.label }),
+    _ -> CopiesPart({ module: part.module, label: part.label, roots: part.units.map(copied_root) }),
+  }
 
-pub fn build_part(part: PartMembers) -> Written / {memo.read, abort.raise} = {
-  let tested = part_tested(part);
-  let codes = codes_of_part(part);
+fn copied_root(unit: CodeUnit) -> RootAt / {abort.raise} =
+  match unit { OfRoot(r) -> r, _ -> panic("a part of copies holds only specialised roots") }
+
+fn units_named(name: PartName) -> List<CodeUnit> / {memo.read, abort.raise} =
+  match name {
+    ChunkPart(chunk) -> match fetch_keyed_part(chunk_groups_part(), chunk.module, chunk.label) {
+      Some(groups) -> groups.map(OfGroup),
+      None -> panic("a reached chunk is missing from the units of its module"),
+    },
+    CopiesPart(copies) -> copies.roots.map(OfRoot),
+  }
+
+pub fn build_part(name: PartName) -> Written / {memo.read, abort.raise} = {
+  let units = units_named(name);
+  let tested = units.any(unit_tested);
+  let codes = fetch_all(code_query(), units);
   let own = codes.fold(Set::empty(), |m: Set<RootName>, c: UnitCode|
     c.results.fold(m, |into: Set<RootName>, r: RootOutput|
       r.result.tables.members.map(root_name).fold(
@@ -995,7 +1023,7 @@ pub fn build_part(part: PartMembers) -> Written / {memo.read, abort.raise} = {
       r.result.tables.calls.fold(f, |x: Map<RootName, Prototype>, k: RootKey|
         if own.contains(root_name(k)) || x.contains(root_name(k)) { x }
         else { foreign_head(x, k, tested) })));
-  let digests = part.units.map(|u: CodeUnit| fetch_digest(code_query(), u));
+  let digests = units.map(|u: CodeUnit| fetch_digest(code_query(), u));
   written(part_query(), {
     identity: blake3(
       Bytes::concat_all(digests).concat(
@@ -1091,7 +1119,7 @@ pub fn program_code(entries: Entries) -> ProgramCode / {memo.read, abort.raise} 
     { module: p.module, label: p.label, units: p.members.map(|i: Int| reached.units.get(i)) });
   {
     units: reached.units,
-    parts: list::zip(parts, fetch_all(part_query(), parts)).map(
+    parts: list::zip(parts, fetch_all(part_query(), parts.map(part_name_of))).map(
       |p: { first: PartMembers, second: MadePart }| { part: p.first, made: p.second },
     ),
     links: reached.links,
