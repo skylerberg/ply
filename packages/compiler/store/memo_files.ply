@@ -6,12 +6,13 @@ import compiler.store.fact_store
 import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, fact_damage,
                                   recent_reads, with_recent_reads)
 import compiler.store.memo
-import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, deferred_kind, digest_of,
-                            fact_details_bin, first_waiting, in_session, inline_output, location_id,
-                            lowest_waiting, memo, memo_store, nothing_left_waiting, nothing_waiting,
-                            pack_digest_of, pack_inline_of, pack_record_bytes, pack_row_key, query,
-                            sealed_lookup, session_input, session_inputs, stored_fact_bin,
-                            stored_input_bin, with_mark, with_session_inputs, without_mark)
+import compiler.store.memo (ExternalInput, FactDetails, StoredFact, StoredInput, fixed_digest,
+                            input_id, Waiting, deferred_kind, digest_of, fact_details_bin,
+                            first_waiting, in_session, inline_output, location_id, lowest_waiting,
+                            memo, memo_store, nothing_left_waiting, nothing_waiting, pack_digest_of,
+                            pack_inline_of, pack_record_bytes, pack_row_key, query, sealed_lookup,
+                            session_input, session_inputs, stored_fact_bin, stored_input_bin,
+                            with_mark, with_session_inputs, without_mark)
 import compiler.store.packs
 import compiler.store.segments
 import compiler.store.segments (Committed, LockHeld, StoreChanged, WriteFailed)
@@ -44,9 +45,6 @@ fn code_key(name: Bytes) -> Bytes = name.blake3()
 
 fn result_key(digest: Bytes) -> Bytes =
   match packs::output_key(digest) { Some(k) -> k, None -> digest }
-
-fn input_id(input: StoredInput) -> Bytes / {abort.raise} =
-  if input.kind == b"sealed" { input.at } else { location_id(input.kind, input.at) }
 
 fn undecoded<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {fact_damage.damaged, abort.raise} =
   match bin::decode(bytes, codec) {
@@ -88,20 +86,19 @@ fn live_results<[r]>(
   fact_store::entries_under[r](db, Inputs, b"").values().fold(
     results_of_facts(Map::new(), fact_store::entries_under[r](db, Facts, b"").values()),
     |live: Map<Bytes, Bool>, b: Bytes| {
-      let i = undecoded(b, stored_input_bin());
-      if i.fixed { live.insert(result_key(i.digest), true) } else { live }
+      match fixed_digest(undecoded(b, stored_input_bin())) {
+        Some(d) -> live.insert(result_key(d), true),
+        None -> live,
+      }
     },
   )
 
 fn fixed_input<[r]>(
   db: Database,
   id: Bytes,
-) -> Option<StoredInput> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   match fact_store::value_of[r](db, Inputs, id) {
-    Some(b) -> {
-      let i = undecoded(b, stored_input_bin());
-      if i.fixed { Some(i) } else { None }
-    },
+    Some(b) -> { fixed_digest(undecoded(b, stored_input_bin())) },
     None -> None,
   }
 
@@ -132,7 +129,7 @@ fn over_database<a, [r] | e>(
     let id = location_id(kind, at);
     session_input(id, ||
       match fixed_input[r](db, id) {
-        Some(i) -> fact_store::result_of[r](db, result_key(i.digest)),
+        Some(d) -> fact_store::result_of[r](db, result_key(d)),
         None -> look(kind, at),
       })
   };
@@ -285,7 +282,10 @@ fn over_database<a, [r] | e>(
               stored.db,
               Inputs,
               id,
-              bin::encode({ kind: kind, at: at, digest: d, fixed: true }, stored_input_bin()),
+              bin::encode(
+                ExternalInput({ kind: kind, at: at, digest: d, fixed: true }),
+                stored_input_bin(),
+              ),
             ),
           };
         },
