@@ -20,7 +20,8 @@ import compiler.front (Published, published, ShippedWants, shipped_wants_bin)
 import compiler.front.published (no_rows, decode_rows, analyse, analyse_with,
                                  reserved_prefix_diagnostics)
 import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_module_tables,
-                             pulled_next, checked_program_over, analysis_identities)
+                             pulled_next, checked_program_over, analysis_identities,
+                             ToolchainTree)
 import compiler.front.diagnostics (parse_all, diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
                               embed_snapshot, request_of_key, snapshot_embed, with_embed_snapshot)
@@ -36,27 +37,28 @@ import compiler.front.pages (Pages, pages_bin)
 import compiler.store.hash.encoding (hex)
 import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, ModuleResult,
                                       package_location_bin, module_key_bin, embedding_bin,
-                                      module_result_bin, layout_kind, module_kind, text_kind,
+                                      layout_kind, module_kind, text_kind,
                                       shipped_kind, shipped_exists_kind, data_kind,
                                       embedded_file_kind, derived_kind, deriver_kind,
                                       shipped_names_kind, own_modules_kind, QueryEffects,
                                       RunEffects, SessionReads, CheckQuery, CheckQueries,
                                       check_queries, with_decode_cache, decoded, prefix_in,
                                       imports_query, ImportOf, imports_of_bin, absent,
-                                      hash_result_bin, shipped_names_listed, CheckDefinition)
+                                      shipped_names_listed, CheckDefinition)
 import compiler.front.checking.promises (promise_queries, cost_walk_query, cost_return_query,
                                          cost_demands_query, cost_parameters_query,
                                          module_parameters_query, module_costs_query, measure_name,
                                          measures_query)
-import compiler.front.checking.groups (module_rollup_query, group_key_bin, module_rejected,
+import compiler.front.checking.groups (module_contents_query, group_key_bin, module_rejected,
                                        listed_result, owners_result_bin, owners_query, calls_query,
                                        cycles_query, group_imports_query, visible_modules_query,
                                        wanted_files_query, group_query, signatures_query,
                                        typed_query, group_hash_query, header_text_query,
                                        header_query, owner_imports_query, signature_imports_query,
-                                       hashes_query, documented_query, declaring_query, queries,
-                                       tables_of_result, module_summary_query, owner_hash_query,
-                                       name_declaration_query, module_listing_query, module_query)
+                                       module_record_query, documented_query, declaring_query,
+                                       queries, tables_of_result, module_summary_query,
+                                       owner_hash_query, module_listing_query, module_listing_bin,
+                                       checked_module, module_own_hashes)
 
 import compiler.front.checking.units (code_queries, code_product_queries)
 import compiler.front.checking.interfaces (interface_queries, published_module)
@@ -266,7 +268,7 @@ pub fn listed_module(named: ModuleKey) -> CheckedModule / {memo.read, abort.rais
   else { { module: named.module, result: listed_result(named) } }
 
 pub fn module_of(named: ModuleKey) -> CheckedModule / {memo.read, abort.raise} =
-  { module: named.module, result: fetched(module_query(), named) }
+  { module: named.module, result: checked_module(named) }
 
 pub fn query_load(
   own: List<Bytes>,
@@ -330,25 +332,23 @@ pub const shipped_queries: List<Bytes> =
     owners_query().name,
     module_summary_query().name,
     module_listing_query().name,
-    module_rollup_query().name,
+    module_contents_query().name,
     signatures_query().name,
     typed_query().name,
     calls_query().name,
     cycles_query().name,
     group_query().name,
     group_hash_query().name,
-    module_query().name,
     header_query().name,
     header_text_query().name,
-    hashes_query().name,
+    module_record_query().name,
     wanted_files_query().name,
     documented_query().name,
     declaring_query().name,
-    name_declaration_query().name,
   ]
 
 const listing_queries: List<Bytes> =
-  [module_query().name, module_listing_query().name, module_rollup_query().name]
+  [module_listing_query().name, module_contents_query().name]
 
 fn product_of(name: Bytes) -> Option<Product> =
   if [documented_query().name, declaring_query().name].contains(name) {
@@ -376,7 +376,7 @@ pub const product_queries: List<Bytes> =
   [
     group_hash_query().name,
     owner_hash_query().name,
-    hashes_query().name,
+    module_record_query().name,
     identity_query().name,
     documented_query().name,
     declaring_query().name,
@@ -400,7 +400,7 @@ pub fn check_shipped_modules(
   let rejected = dependency_levels(
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   ).levels.fold([], |accumulator: List<CheckedModule>, level: List<ModuleKey>| {
-    all_fetched(hashes_query(), level);
+    all_fetched(module_record_query(), level);
     all_fetched(wanted_files_query(), level);
     all_fetched(module_listing_query(), level);
     level.fold(accumulator, |found: List<CheckedModule>, named: ModuleKey|
@@ -470,9 +470,9 @@ pub fn packages_rejected(
   packages: PackageSources,
   root_modules: List<Bytes>,
   modules: Int,
-  listed: List<Bytes>,
+  tree: ToolchainTree,
 ) -> List<Diagnostic> / {abort.raise} =
-  reserved_prefix_diagnostics(root_modules, listed).map(
+  reserved_prefix_diagnostics(root_modules, tree).map(
     |sd: { slot: Int, diagnostic: ParseDiagnostic }|
       diagnostic_in_module(0 - sd.slot - 1, sd.diagnostic),
   ).concat(
@@ -493,10 +493,8 @@ pub fn hashed_all(
     module_hashes,
   )
 
-pub fn module_hashes(named: ModuleKey) -> ModuleHashes / {memo.read, abort.raise} = {
-  let h = fetched(hashes_query(), named);
-  { record: h.record, own: h.own }
-}
+pub fn module_hashes(named: ModuleKey) -> ModuleHashes / {memo.read, abort.raise} =
+  { record: fetched(module_record_query(), named), own: module_own_hashes(named) }
 
 pub fn cycles_among(own: List<Bytes>) -> List<CheckedModule> / {memo.read, abort.raise} = {
   let edges = own.fold(Map::new(), |accumulator: Map<Bytes, List<ImportOf>>, m: Bytes|
@@ -639,8 +637,16 @@ pub fn over_decoding<a | e>(
 pub fn queried_over(
   store: fs::MemFs,
   sources: List<Source>,
-) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} =
-  queried_under(fresh_registry(), store, sources)
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
+  let done = queried_results(fresh_registry(), store, sources);
+  {
+    store: done.store,
+    run: done.run,
+    own_hashes: done.own_hashes,
+    results: done.results,
+    outcome: outcome_of(sources, done.results),
+  }
+}
 
 pub fn queried_results(
   qs: CheckQueries,
@@ -660,21 +666,6 @@ pub fn queried_results(
     run: done.value.run,
     own_hashes: done.value.own_hashes,
     results: done.value.results,
-  }
-}
-
-pub fn queried_under(
-  qs: CheckQueries,
-  store: fs::MemFs,
-  sources: List<Source>,
-) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
-  let done = queried_results(qs, store, sources);
-  {
-    store: done.store,
-    run: done.run,
-    own_hashes: done.own_hashes,
-    results: done.results,
-    outcome: outcome_of(sources, done.results),
   }
 }
 
@@ -917,8 +908,8 @@ fn results_round_trip<a>(results: List<Bytes>, codec: bin::BinCodec<a>) -> Bool 
       ok && bin::encode(value, codec) == b && bin::round_trips(value, codec)
     })
 
-test "a module's result reads back as it was recorded" {
-  assert(results_round_trip(stored_results(module_query().name), module_result_bin()))
+test "a module's listing reads back as it was recorded" {
+  assert(results_round_trip(stored_results(module_listing_query().name), module_listing_bin()))
 }
 
 test "a module's definition list decodes to the same value that was stored" {
@@ -933,8 +924,8 @@ test "a module's imports read back as they were recorded" {
   assert(results_round_trip(stored_results(imports_query().name), imports_of_bin()))
 }
 
-test "a module's hashes read back as they were recorded" {
-  assert(results_round_trip(stored_results(hashes_query().name), hash_result_bin()))
+test "a module's record of its hashes reads back as it was recorded" {
+  assert(results_round_trip(stored_results(module_record_query().name), bin::bytes_bin()))
 }
 
 fn embedding_queried(
