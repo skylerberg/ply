@@ -27,13 +27,14 @@ type StoredEntry = | Present(Bytes) | Removed
 
 derive bin for StoredEntry
 
+type Basis = | Extending(Manifest) | Replacing(Manifest)
+
 pub type Database = {
   dir: String,
-  manifest: Manifest,
+  basis: Basis,
   pending: Map<Tree, Map<Bytes, StoredEntry>>,
   unwritten_log: Map<Int, Bytes>,
   log_end: Int,
-  starts_over: Bool,
   run: Option<String>,
   token: Bytes,
   writing: SegmentWriter,
@@ -86,9 +87,6 @@ const log_end_key: Bytes = b"log end"
 
 fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
-fn table_name(seg: Segment, entry: segments::TableEntry) -> Bytes / {abort.raise} =
-  Bytes::concat_all([seg.token, byte_of_int(entry.table), entry.sum])
-
 fn loaded_rows<[r]>(
   db: Database,
   seg: Segment,
@@ -96,23 +94,25 @@ fn loaded_rows<[r]>(
 ) -> SortedTable / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   match segments::table_entry(seg, table_number(table)) {
     None -> segments::empty_table,
-    Some(entry) -> {
-      let name = table_name(seg, entry);
-      match recent_reads.table(name) {
-        Some(rows) -> rows,
-        None -> match segments::table_rows[r](db.dir, seg.token, entry) {
-          Some(rows) -> {
-            recent_reads.keep_table(name, rows);
-            rows
-          },
-          None -> fact_damage.damaged("a table does not match its checksum"),
+    Some(entry) -> match recent_reads.table(entry.name) {
+      Some(rows) -> rows,
+      None -> match segments::table_rows[r](db.dir, seg.token, entry) {
+        Some(rows) -> {
+          recent_reads.keep_table(entry.name, rows);
+          rows
         },
-      }
+        None -> fact_damage.damaged("a table does not match its checksum"),
+      },
     },
   }
 
+fn manifest_of(basis: Basis) -> Manifest = match basis { Extending(m) -> m, Replacing(m) -> m }
+
 fn readable_segments(db: Database) -> List<Segment> =
-  if db.starts_over { [] } else { db.manifest.segments }
+  match db.basis { Extending(m) -> m.segments, Replacing(_) -> [] }
+
+fn segments_kept(basis: Basis, now: Manifest) -> Int =
+  match basis { Extending(_) -> now.segments.len(), Replacing(_) -> 0 }
 
 type StoredRow = { token: Bytes, value: Bytes }
 
@@ -170,11 +170,10 @@ pub fn with_recent_reads<a | e>(
 fn fresh_database(dir: String, manifest: Manifest) -> Database =
   {
     dir: dir,
-    manifest: manifest,
+    basis: Extending(manifest),
     pending: Map::new(),
     unwritten_log: Map::new(),
     log_end: 0,
-    starts_over: false,
     run: None,
     token: b"",
     writing: segments::new_writer,
@@ -207,7 +206,7 @@ pub const unreadable_manifest: String = "its manifest does not read"
 
 pub fn emptied<[r]>(opening: Opening) -> Database / {fs.read[r], abort.raise} = {
   let now = current[r](opening);
-  { ..now.blank, starts_over: true }
+  { ..now.blank, basis: Replacing(manifest_of(now.blank.basis)) }
 }
 
 fn with_stored_state<[r]>(
@@ -217,7 +216,7 @@ fn with_stored_state<[r]>(
   match file {
     segments::Garbled -> fact_damage.damaged(unreadable_manifest),
     _ -> match stored_row[r](blank, LogEndTable, log_end_key) {
-      None -> if blank.manifest.segments.len() == 0 { blank }
+      None -> if readable_segments(blank).len() == 0 { blank }
       else { fact_damage.damaged("the manifest lists segments that hold no log end") },
       Some(found) -> { ..blank, log_end: decoded(found.value, bin::int_bin()) },
     },
@@ -549,41 +548,44 @@ pub fn commit<[r]>(
   live_results: (Database) -> Set<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
 ) -> CommitResult / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
   let changed = changed_entries[r](db);
-  if changed.len() == 0 && db.unwritten_log.len() == 0 && !db.starts_over
-      && db.written_results.len() == 0 { Committed(db.manifest) } else {
-    match finished_segment[r](db, changed) {
-      None -> WriteFailed,
-      Some(seg) -> {
-        let now = segments::manifest[r](db.dir, schema);
-        let installed = if tokens(now.segments) == tokens(db.manifest.segments) {
-          segments::replace_merged[r](
-            db.dir,
-            schema,
-            now,
-            if db.starts_over { 0 } else { now.segments.len() },
-            seg,
-            true,
-          )
-        } else { StoreChanged };
-        match installed {
-          Committed(m) -> {
-            merge_tail[r](
-              {
-                ..fresh_database(db.dir, m),
-                log_end: db.log_end,
-                log_floor: db.log_floor,
-                run: db.run,
-              },
-              live_results,
-            );
-            installed
-          },
-          _ -> removed_after_refusal[r](db, installed),
-        }
-      },
-    }
+  let nothing_written = changed.len() == 0 && db.unwritten_log.len() == 0
+    && db.written_results.len() == 0;
+  match db.basis {
+    Extending(m) -> if nothing_written { Committed(m) }
+    else { written_over[r](db, changed, live_results) },
+    Replacing(_) -> written_over[r](db, changed, live_results),
   }
 }
+
+fn written_over<[r]>(
+  db: Database,
+  changed: Map<Tree, Map<Bytes, Bytes>>,
+  live_results: (Database) -> Set<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
+) -> CommitResult / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match finished_segment[r](db, changed) {
+    None -> WriteFailed,
+    Some(seg) -> {
+      let now = segments::manifest[r](db.dir, schema);
+      let installed = if tokens(now.segments) == tokens(manifest_of(db.basis).segments) {
+        segments::replace_merged[r](db.dir, schema, now, segments_kept(db.basis, now), seg, true)
+      } else { StoreChanged };
+      match installed {
+        Committed(m) -> {
+          merge_tail[r](
+            {
+              ..fresh_database(db.dir, m),
+              log_end: db.log_end,
+              log_floor: db.log_floor,
+              run: db.run,
+            },
+            live_results,
+          );
+          installed
+        },
+        _ -> removed_after_refusal[r](db, installed),
+      }
+    },
+  }
 
 type Located = { token: Bytes, offset: Int, size: Int }
 
@@ -790,7 +792,7 @@ fn merge_tail<[r]>(
   db: Database,
   live_results: (Database) -> Set<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
 ) -> Unit / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
-  let m = db.manifest;
+  let m = manifest_of(db.basis);
   let from = segments::merge_start(m);
   if from < m.segments.len() - 1 {
     rewritten_segments[r](
@@ -807,8 +809,10 @@ fn merge_tail<[r]>(
 
 fn store_bytes(m: Manifest) -> Int = m.segments.fold(0, |n: Int, seg: Segment| n + seg.size)
 
-pub fn store_size(db: Database) -> { segments: Int, bytes: Int } =
-  { segments: db.manifest.segments.len(), bytes: store_bytes(db.manifest) }
+pub fn store_size(db: Database) -> { segments: Int, bytes: Int } = {
+  let m = manifest_of(db.basis);
+  { segments: m.segments.len(), bytes: store_bytes(m) }
+}
 
 fn key_of(text: String) -> Bytes = Bytes::of_string(text).blake3()
 
