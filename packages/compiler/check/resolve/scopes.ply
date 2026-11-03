@@ -5,7 +5,7 @@ import compiler.syntax.items (is_explicit_import, Module, Item, is_shipped, is_s
                               SelectedNames, member_name, Opaque)
 import compiler.syntax.expressions (implicitly_imported_by)
 import std.list
-import compiler.check.resolve.tables (no_declarations, module_elsewhere, module_names, declared_in,
+import compiler.check.resolve.tables (no_declarations, module_elsewhere, other_modules, declared_in,
                                       bound_in, module_binding_in, binding_of, ParsedModule,
                                       Namespace, TypeSpace, ValueSpace, Declaration, Declarations,
                                       Binding, Bindings, Scope, Diagnostic, Edge, ModuleEntry,
@@ -59,7 +59,7 @@ pub fn module_scope(
   own: ParsedModule,
   bound: Bindings,
   w: ImportContext,
-) -> ScopeBuilder / {abort.raise, module_names.read} =
+) -> ScopeBuilder / {abort.raise, other_modules.read} =
   own.module.imports.fold(
     {
       scope: { module: own.name, modules: [], selected_modules: [], bound: bound, failed: [] },
@@ -78,7 +78,7 @@ fn bind_found(
   builder: ScopeBuilder,
   declaration: ImportDeclaration,
   target: Bytes,
-) -> ScopeBuilder / {abort.raise, module_names.read} = {
+) -> ScopeBuilder / {abort.raise, other_modules.read} = {
   let b2: ScopeBuilder = {
     ..builder,
     edges: builder.edges.push({ target: target, span: path_span(declaration) }),
@@ -106,7 +106,7 @@ fn bind_found(
           if namespaces.any(|namespace: Namespace|
                 bound_in(accumulator.scope, namespace, n) != None)
               || !namespaces.any(|namespace: Namespace|
-                module_names.name_declared(target, namespace, n) != None) { accumulator }
+                other_modules.look_up_declaration(target, namespace, n) != None) { accumulator }
           else { bind_name(w, accumulator, target, { name: n, span: path_span(declaration) }) },
       ),
     _ -> bind_module(w, b2, declaration, target),
@@ -115,7 +115,7 @@ fn bind_found(
 
 type ImportTarget = | Found(Bytes) | Missing | Undeclared({ importer: Int, owning_package: Int })
 
-fn import_target(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, module_names.read} =
+fn import_target(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, other_modules.read} =
   if name.len() == 0 { Missing } else {
     let p = w.package;
     if 0 < p && p < w.shipped_package_count && p < w.packages.len() && name.index_of(b".") == None {
@@ -123,7 +123,7 @@ fn import_target(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, 
     } else {
       match sibling(w, name) {
         Found(t) -> Found(t),
-        _ -> match module_names.module_package(name) {
+        _ -> match other_modules.look_up_package(name) {
           Some(q) -> allowed_target(w, name, q),
           None -> Missing,
         },
@@ -131,13 +131,13 @@ fn import_target(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, 
     }
   }
 
-fn sibling(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, module_names.read} = {
+fn sibling(w: ImportContext, name: Bytes) -> ImportTarget / {abort.raise, other_modules.read} = {
   let p = w.package;
   if p == 0 || p >= w.shipped_package_count || p >= w.packages.len() { Missing } else {
     let prefix = w.packages.get(p).prefix;
     if name.starts_with(prefix.concat(b".")) { Missing } else {
       let full = Bytes::concat_all([prefix, b".", name]);
-      match module_names.module_package(full) { Some(_) -> Found(full), None -> Missing }
+      match other_modules.look_up_package(full) { Some(_) -> Found(full), None -> Missing }
     }
   }
 }
@@ -180,7 +180,7 @@ fn bind_import(
   w: ImportContext,
   builder: ScopeBuilder,
   declaration: ImportDeclaration,
-) -> ScopeBuilder / {abort.raise, module_names.read} =
+) -> ScopeBuilder / {abort.raise, other_modules.read} =
   match import_target(w, import_module_name(declaration)) {
     Found(target) -> if internal_import(builder.scope.module, target) {
       failed_import(
@@ -238,12 +238,12 @@ fn bind_import(
           w.at,
           path_span(declaration),
           import_module_name(declaration),
-          module_names.shipped_modules(),
+          other_modules.list_shipped_modules(),
         ),
       )
     } else {
       let name = import_module_name(declaration);
-      let near = module_names.every_module().filter(|known: Bytes|
+      let near = other_modules.list_modules().filter(|known: Bytes|
         known.len() > 0 && known.ends_with(default_binder(name)));
       let note = if near.len() == 0 {
         b"a module is a file: `store/orders.ply` is `store.orders`, relative to the project root"
@@ -326,11 +326,11 @@ fn bind_name(
   builder: ScopeBuilder,
   target: Bytes,
   name: Identifier,
-) -> ScopeBuilder / {abort.raise, module_names.read} = {
+) -> ScopeBuilder / {abort.raise, other_modules.read} = {
   let found = namespaces.filter(|namespace: Namespace|
-    module_names.name_declared(target, namespace, name.name) != None);
+    other_modules.look_up_declaration(target, namespace, name.name) != None);
   if found.len() == 0 {
-    let exported = match module_names.declarations_stored(target) {
+    let exported = match other_modules.look_up_declarations(target) {
       Some(d) -> exported_names(d),
       None -> [],
     };
@@ -351,19 +351,19 @@ fn bind_name(
     )
   } else {
     let public = found.filter(|namespace: Namespace|
-      match module_names.name_declared(target, namespace, name.name) {
+      match other_modules.look_up_declaration(target, namespace, name.name) {
         Some(x) -> x.public,
         None -> false,
       });
     if public.len() == 0 {
-      let private = match module_names.name_declared(target, found.get(0), name.name) {
+      let private = match other_modules.look_up_declaration(target, found.get(0), name.name) {
         Some(x) -> x,
         None -> panic("just found"),
       };
       failed_name(
         builder,
         name,
-        match match module_names.name_declared(target, ValueSpace, name.name) {
+        match match other_modules.look_up_declaration(target, ValueSpace, name.name) {
             Some(d) -> opaque_constructor_error(w.at, name.span, place_of(w, target), target, d),
             None -> None,
           } {
@@ -489,12 +489,12 @@ fn bind_one(
   target: Bytes,
   name: Identifier,
   namespace: Namespace,
-) -> ScopeBuilder / {abort.raise, module_names.read} = {
-  let declared = match module_names.name_declared(target, namespace, name.name) {
+) -> ScopeBuilder / {abort.raise, other_modules.read} = {
+  let declared = match other_modules.look_up_declaration(target, namespace, name.name) {
     Some(x) -> x,
     None -> panic("a public declaration always has a binding"),
   };
-  match module_names.name_declared(builder.scope.module, namespace, name.name) {
+  match other_modules.look_up_declaration(builder.scope.module, namespace, name.name) {
     Some(local_definition) ->
       reported(
         builder,
@@ -700,7 +700,7 @@ pub fn find(
   module: Int,
   namespace: Namespace,
   qualified_name: QName,
-) -> Option<Binding> / {abort.raise, module_names.read} = {
+) -> Option<Binding> / {abort.raise, other_modules.read} = {
   let scope = resolved.scopes.get(module);
   let name = qualified_name.name.name;
   match qualified_name.module {
@@ -730,7 +730,7 @@ fn find_in_module(
   home: Bytes,
   namespace: Namespace,
   name: Bytes,
-) -> Option<Binding> / {module_names.read} =
+) -> Option<Binding> / {other_modules.read} =
   match declared_in(resolved, home, namespace, name) {
     None -> None,
     Some(d) -> if !d.public && home != scope.module { None } else { Some(binding_of(d, home)) },
@@ -741,7 +741,7 @@ pub fn find_method(
   module: Int,
   of: Bytes,
   name: Bytes,
-) -> Option<Binding> / {abort.raise, module_names.read} =
+) -> Option<Binding> / {abort.raise, other_modules.read} =
   match locate_type(resolved, module, of) {
     None -> None,
     Some(t) ->
@@ -758,7 +758,7 @@ pub fn locate_type(
   resolved: Resolution,
   module: Int,
   of: Bytes,
-) -> Option<{ owner: Bytes, simple: Bytes }> / {abort.raise, module_names.read} = {
+) -> Option<{ owner: Bytes, simple: Bytes }> / {abort.raise, other_modules.read} = {
   let split = |qualified: Bytes|
     range(0, qualified.len()).fold(None, |last: Option<Int>, i: Int|
       if qualified.at(i) == 46 { Some(i) } else { last });
@@ -775,7 +775,7 @@ pub fn locate_type(
       None -> None,
       Some(i) -> {
         let home = of.slice(0, i);
-        if resolved.positions.contains(home) || module_names.every_module().contains(home) {
+        if resolved.positions.contains(home) || other_modules.list_modules().contains(home) {
           Some({ owner: home, simple: of.slice(i + 1, of.len()) })
         } else { None }
       },

@@ -7,7 +7,7 @@ import compiler.check.guards (contract_bin)
 import compiler.check.borrowing (parameter_modes_bin)
 import compiler.syntax.type_syntax (type_expression_bin)
 import compiler.syntax.items (opaque_bin)
-import compiler.check.resolve.tables (module_names, module_elsewhere, module_of_name,
+import compiler.check.resolve.tables (other_modules, module_elsewhere, module_of_name,
                                       with_no_other_modules)
 import compiler.syntax.parsing (Span, Identifier, QName, generated_span, span_bin, is_bare,
                                 is_generated, mapped_span)
@@ -25,7 +25,8 @@ import compiler.syntax.items (EffectSetDefinition, EffectSetItem, Item, Function
                               IntegerDeriver, ConstantDeriver, is_predicate, deriver_tag, SpecKind,
                               RequiresClause, EnsuresClause, CostClause, SpaceClause, SpecClause,
                               DeriveOrigin, parse, ExternBody, InstanceKind, is_pub, Opaque,
-                              spec_kind_bin, deriver_bin, instance_kind_bin)
+                              spec_kind_bin, deriver_bin, instance_kind_bin, Visibility, Public,
+                              visibility_bin)
 import compiler.syntax.expressions (Expression, BinaryExpression, Param, expression_span,
                                     TaggedLiteral, prelude_module)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, LiteralWide, LiteralBool,
@@ -45,7 +46,7 @@ import compiler.check.types (Resource, SingletonResource, ResourceVariable, Effe
 import compiler.check.known (BuiltinSum, builtin_types, builtin_sums, char_type, instant_type,
                              duration_type, task_type, chan_type, scoped_name, scoped_type,
                              map_parts)
-import compiler.check.termination (summary_facts, Callee, Termination, Terminates, Diverges, Site,
+import compiler.check.termination (termination_facts, Callee, Termination, Terminates, Diverges, Site,
                                    Summary, summary_bin, termination_bin, callee_bin)
 import compiler.check.resolve.tables (Parameters, qualify, ParsedModule, Resolution, Scope,
                                       Diagnostic, diagnostic_bin, Label, error_with_labels,
@@ -100,6 +101,7 @@ pub type EffectInfo = {
   name: Bytes,
   module: Bytes,
   simple_name: Bytes,
+  visibility: Visibility,
   nondet: Bool,
   operations: List<OperationInfo>,
   at: Location,
@@ -794,30 +796,30 @@ derive bin for DefinitionFacts
 
 derive bin for StoredDeclarations
 
-pub effect set CheckReads = {program.read, module_names.read, mode_facts.read, summary_facts.read}
+pub effect set CheckReads = {elsewhere.read, other_modules.read, mode_facts.read, termination_facts.read}
 
-pub effect program {
-  read type_named(name: Bytes) -> Option<TypeFacts>
-  read effect_named(name: Bytes) -> Option<EffectInfo>
-  read constructor_named(name: Bytes) -> Option<ConstructorInfo>
-  read definition_named(name: Bytes) -> Option<DefinitionFacts>
-  read host_named(name: Bytes) -> Option<Bytes>
+pub effect elsewhere {
+  read look_up_type(name: Bytes) -> Option<TypeFacts>
+  read look_up_effect(name: Bytes) -> Option<EffectInfo>
+  read look_up_constructor(name: Bytes) -> Option<ConstructorInfo>
+  read look_up_definition(name: Bytes) -> Option<DefinitionFacts>
+  read look_up_host(name: Bytes) -> Option<Bytes>
 }
 
 pub fn with_no_other_definitions<a | e>(
-  body: () -> a / {module_names.read, program.read, mode_facts.read, summary_facts.read | e},
+  body: () -> a / {other_modules.read, elsewhere.read, mode_facts.read, termination_facts.read | e},
 ) -> a / e =
   handle {
     with_no_other_modules(body)
   } with {
-    program.type_named(name) -> None,
-    program.effect_named(name) -> None,
-    program.constructor_named(name) -> None,
-    program.definition_named(name) -> None,
-    program.host_named(name) -> None,
-    mode_facts.modes_named(name) -> None,
-    summary_facts.summary_stored(name) -> None,
-    summary_facts.ending_stored(name) -> None,
+    elsewhere.look_up_type(name) -> None,
+    elsewhere.look_up_effect(name) -> None,
+    elsewhere.look_up_constructor(name) -> None,
+    elsewhere.look_up_definition(name) -> None,
+    elsewhere.look_up_host(name) -> None,
+    mode_facts.look_up_modes(name) -> None,
+    termination_facts.look_up_summary(name) -> None,
+    termination_facts.look_up_ending(name) -> None,
   }
 
 pub type Checker = {
@@ -1239,7 +1241,7 @@ pub fn with_unified(checker: Checker, unified: UnifyResult) -> Checker =
   { ..checker, substitution: unified.substitution, fresh: unified.fresh }
 
 const prelude_effect_names: List<Bytes> =
-  [b"task", b"clock", b"random", b"sim", b"abort", b"diverges"]
+  [b"task", b"clock", b"random", b"sim", b"abort", b"diverges", scoped_effect]
 
 pub fn is_prelude_effect(name: Bytes) -> Bool = prelude_effect_names.contains(name)
 
@@ -1306,10 +1308,10 @@ pub fn add_constructor(checker: Checker, info: ConstructorInfo) -> Checker =
     constructor_index: checker.constructor_index.insert(info.name, checker.constructors.len()),
   }
 
-pub fn constructor_of(checker: Checker, name: Bytes) -> Option<ConstructorInfo> / {program.read} =
+pub fn constructor_of(checker: Checker, name: Bytes) -> Option<ConstructorInfo> / {elsewhere.read} =
   match checker.constructor_index.get(name) {
     Some(i) -> checker.constructors.at(i),
-    None -> program.constructor_named(name),
+    None -> elsewhere.look_up_constructor(name),
   }
 
 pub fn add_effect(checker: Checker, info: EffectInfo) -> Checker =
@@ -1322,71 +1324,71 @@ pub fn add_effect(checker: Checker, info: EffectInfo) -> Checker =
 pub fn effect_of(
   checker: Checker,
   name: Bytes,
-) -> Option<EffectInfo> / {program.read, abort.raise} =
+) -> Option<EffectInfo> / {elsewhere.read, abort.raise} =
   match checker.effect_index.get(name) {
     Some(i) -> Some(checker.effects.get(i)),
-    None -> program.effect_named(name),
+    None -> elsewhere.look_up_effect(name),
   }
 
 pub fn function_of_this_module(
   checker: Checker,
   name: Bytes,
-) -> Bool / {abort.raise, program.read} =
+) -> Bool / {abort.raise, elsewhere.read} =
   checker.own_functions.contains(name)
     || (module_of_name(name) == scope_of(checker).module && constructor_of(checker, name) == None)
 
-pub fn global_scheme(checker: Checker, name: Bytes) -> Option<Scheme> / {program.read} =
+pub fn global_scheme(checker: Checker, name: Bytes) -> Option<Scheme> / {elsewhere.read} =
   match env_lookup(checker.env, name) {
     Some(scheme) -> Some(scheme),
     None -> match checker.definition_index.get(name) {
       Some(i) -> match checker.definitions.at(i) { Some(d) -> Some(d.scheme), None -> None },
-      None -> match program.definition_named(name) {
+      None -> match elsewhere.look_up_definition(name) {
         Some(f) -> Some(f.scheme),
-        None -> match program.constructor_named(name) { Some(c) -> Some(c.scheme), None -> None },
+        None -> match elsewhere.look_up_constructor(name) { Some(c) -> Some(c.scheme), None -> None },
       },
     },
   }
 
-pub fn definition_of(checker: Checker, name: Bytes) -> Option<DefinitionInfo> / {program.read} =
+pub fn definition_of(checker: Checker, name: Bytes) -> Option<DefinitionInfo> / {elsewhere.read} =
   match checker.definition_index.get(name) {
     Some(i) -> checker.definitions.at(i),
-    None -> match program.definition_named(name) {
+    None -> match elsewhere.look_up_definition(name) {
       Some(f) -> match f.implementation { Checked(d, _) -> Some(d), _ -> None },
       None -> None,
     },
   }
 
-fn type_facts<a>(name: Bytes, field: (TypeFacts) -> Option<a>) -> Option<a> / {program.read} =
-  match program.type_named(name) { Some(f) -> field(f), None -> None }
+fn type_facts<a>(name: Bytes, field: (TypeFacts) -> Option<a>) -> Option<a> / {elsewhere.read} =
+  match elsewhere.look_up_type(name) { Some(f) -> field(f), None -> None }
 
 fn definition_facts<a>(
   name: Bytes,
   field: (DefinitionFacts) -> Option<a>,
-) -> Option<a> / {program.read} =
-  match program.definition_named(name) { Some(f) -> field(f), None -> None }
+) -> Option<a> / {elsewhere.read} =
+  match elsewhere.look_up_definition(name) { Some(f) -> field(f), None -> None }
 
-pub fn type_declared(checker: Checker, name: Bytes) -> Option<TypeDeclaration> / {program.read} =
+pub fn type_declared(checker: Checker, name: Bytes) -> Option<TypeDeclaration> / {elsewhere.read} =
   match checker.types.get(name) {
     Some(t) -> Some(t),
     None -> type_facts(name, |f: TypeFacts| Some(f.declaration)),
   }
 
-pub fn is_type_declared(checker: Checker, name: Bytes) -> Bool / {program.read} =
+pub fn is_type_declared(checker: Checker, name: Bytes) -> Bool / {elsewhere.read} =
   type_declared(checker, name) != None
 
 pub fn record_declared(
   checker: Checker,
   name: Bytes,
-) -> Option<RecordDeclaration> / {program.read} =
+) -> Option<RecordDeclaration> / {elsewhere.read} =
   match checker.nominals.get(name) {
     Some(r) -> Some(r),
     None -> type_facts(name, |f: TypeFacts| f.record),
   }
 
-pub fn is_record_declared(checker: Checker, name: Bytes) -> Bool / {program.read} =
+pub fn is_record_declared(checker: Checker, name: Bytes) -> Bool / {elsewhere.read} =
   record_declared(checker, name) != None
 
-pub fn alias_declared(checker: Checker, name: Bytes) -> Option<AliasFacts> / {program.read} =
+pub fn alias_declared(checker: Checker, name: Bytes) -> Option<AliasFacts> / {elsewhere.read} =
   match checker.aliases.get(name) {
     Some(a) -> Some(a),
     None -> type_facts(name, |f: TypeFacts| f.alias),
@@ -1395,39 +1397,39 @@ pub fn alias_declared(checker: Checker, name: Bytes) -> Option<AliasFacts> / {pr
 pub fn stated_of(
   checker: Checker,
   name: Bytes,
-) -> Option<List<DefinitionConstraint>> / {program.read} =
+) -> Option<List<DefinitionConstraint>> / {elsewhere.read} =
   match checker.stated.get(name) {
     Some(s) -> Some(s),
     None -> type_facts(name, |f: TypeFacts| f.stated),
   }
 
-pub fn ordered_parameters_of(checker: Checker, name: Bytes) -> Option<List<Int>> / {program.read} =
+pub fn ordered_parameters_of(checker: Checker, name: Bytes) -> Option<List<Int>> / {elsewhere.read} =
   ordered_in(checker.ordered_parameters, name)
 
-pub fn ordered_in(table: Map<Bytes, List<Int>>, name: Bytes) -> Option<List<Int>> / {program.read} =
+pub fn ordered_in(table: Map<Bytes, List<Int>>, name: Bytes) -> Option<List<Int>> / {elsewhere.read} =
   match table.get(name) {
     Some(p) -> Some(p),
     None -> type_facts(name, |f: TypeFacts| f.ordered_parameters),
   }
 
-pub fn release_function_of(checker: Checker, name: Bytes) -> Option<Bytes> / {program.read} =
+pub fn release_function_of(checker: Checker, name: Bytes) -> Option<Bytes> / {elsewhere.read} =
   match checker.release_functions.get(name) {
     Some(by) -> Some(by),
     None -> type_facts(name, |f: TypeFacts| f.release_function),
   }
 
-pub fn has_release_function(checker: Checker, name: Bytes) -> Bool / {program.read} =
+pub fn has_release_function(checker: Checker, name: Bytes) -> Bool / {elsewhere.read} =
   release_function_of(checker, name) != None
 
-pub fn declared_resource(checker: Checker, name: Bytes) -> Bool / {program.read} =
+pub fn declared_resource(checker: Checker, name: Bytes) -> Bool / {elsewhere.read} =
   checker.resource_types.contains(name)
     || type_facts(name, |f: TypeFacts| if f.resource { Some(true) } else { None }) != None
 
-pub fn is_keyed(checker: Checker, name: Bytes) -> Bool / {program.read} =
+pub fn is_keyed(checker: Checker, name: Bytes) -> Bool / {elsewhere.read} =
   checker.keyed_names.contains(name)
     || type_facts(name, |f: TypeFacts| if f.keyed { Some(true) } else { None }) != None
 
-pub fn numeric_stated(checker: Checker, type_name: Bytes) -> Option<NumericInfo> / {program.read} =
+pub fn numeric_stated(checker: Checker, type_name: Bytes) -> Option<NumericInfo> / {elsewhere.read} =
   match checker.numeric_types.find(|x: NumericInfo| x.type_name == type_name) {
     Some(x) -> Some(x),
     None -> type_facts(type_name, |f: TypeFacts| f.numeric),
@@ -1437,7 +1439,7 @@ pub fn instance_stated(
   checker: Checker,
   type_name: Bytes,
   kind: InstanceKind,
-) -> Option<InstanceInfo> / {program.read} =
+) -> Option<InstanceInfo> / {elsewhere.read} =
   match checker.instances.find(|x: InstanceInfo| x.type_name == type_name && x.kind == kind) {
     Some(x) -> Some(x),
     None ->
@@ -1447,28 +1449,28 @@ pub fn instance_stated(
 pub fn constructors_of_type(
   checker: Checker,
   name: Bytes,
-) -> List<ConstructorInfo> / {program.read} = {
+) -> List<ConstructorInfo> / {elsewhere.read} = {
   let local = checker.constructors.filter(|c: ConstructorInfo| c.type_name == name);
   if local.len() > 0 { local }
-  else { match program.type_named(name) { Some(f) -> f.constructors, None -> [] } }
+  else { match elsewhere.look_up_type(name) { Some(f) -> f.constructors, None -> [] } }
 }
 
-pub fn contract_named(checker: Checker, name: Bytes) -> Option<Contract> / {program.read} =
+pub fn contract_named(checker: Checker, name: Bytes) -> Option<Contract> / {elsewhere.read} =
   match checker.contracts.get(name) {
     Some(k) -> Some(k),
     None -> definition_facts(name, |f: DefinitionFacts| f.contract),
   }
 
-pub fn has_contract(checker: Checker, name: Bytes) -> Bool / {program.read} =
+pub fn has_contract(checker: Checker, name: Bytes) -> Bool / {elsewhere.read} =
   contract_named(checker, name) != None
 
 pub fn modes_of(checker: Checker, name: Bytes) -> Option<ParameterModes> / {mode_facts.read} =
   match checker.parameter_modes.get(name) {
     Some(m) -> Some(m),
-    None -> mode_facts.modes_named(name),
+    None -> mode_facts.look_up_modes(name),
   }
 
-pub fn parameters_of(checker: Checker, name: Bytes) -> Option<List<Int>> / {program.read} =
+pub fn parameters_of(checker: Checker, name: Bytes) -> Option<List<Int>> / {elsewhere.read} =
   match checker.function_parameters.get(name) {
     Some(p) -> Some(p),
     None -> definition_facts(name, |f: DefinitionFacts| f.parameters),
@@ -1477,22 +1479,22 @@ pub fn parameters_of(checker: Checker, name: Bytes) -> Option<List<Int>> / {prog
 pub fn constraints_of(
   checker: Checker,
   name: Bytes,
-) -> Option<List<DefinitionConstraint>> / {program.read} =
+) -> Option<List<DefinitionConstraint>> / {elsewhere.read} =
   match checker.constraints.get(name) {
     Some(c) -> Some(c),
     None -> definition_facts(name, |f: DefinitionFacts| f.constraints),
   }
 
-pub fn ending_named(checker: Checker, name: Bytes) -> Termination / {summary_facts.read} =
+pub fn ending_named(checker: Checker, name: Bytes) -> Termination / {termination_facts.read} =
   match checker.definition_index.get(name) {
     Some(i) -> match checker.definitions.at(i) { Some(d) -> d.ending, None -> Terminates },
-    None -> match summary_facts.ending_stored(name) { Some(e) -> e, None -> Terminates },
+    None -> match termination_facts.look_up_ending(name) { Some(e) -> e, None -> Terminates },
   }
 
-pub fn summary_named(checker: Checker, name: Bytes) -> Option<Summary> / {summary_facts.read} =
+pub fn summary_named(checker: Checker, name: Bytes) -> Option<Summary> / {termination_facts.read} =
   match checker.summaries.get(name) {
     Some(k) -> Some(k),
-    None -> summary_facts.summary_stored(name),
+    None -> termination_facts.look_up_summary(name),
   }
 
 pub fn set_definition(checker: Checker, info: DefinitionInfo) -> Checker / {abort.raise} =
@@ -1548,6 +1550,7 @@ pub const prelude_effects: List<EffectInfo> = {
       name: b"task",
       module: b"",
       simple_name: b"task",
+      visibility: Public,
       nondet: true,
       at: none,
       operations: [
@@ -1575,6 +1578,7 @@ pub const prelude_effects: List<EffectInfo> = {
       name: b"clock",
       module: b"",
       simple_name: b"clock",
+      visibility: Public,
       nondet: true,
       at: none,
       operations: [
@@ -1586,6 +1590,7 @@ pub const prelude_effects: List<EffectInfo> = {
       name: b"random",
       module: b"",
       simple_name: b"random",
+      visibility: Public,
       nondet: true,
       at: none,
       operations: [
@@ -1597,6 +1602,7 @@ pub const prelude_effects: List<EffectInfo> = {
       name: b"sim",
       module: b"",
       simple_name: b"sim",
+      visibility: Public,
       nondet: false,
       at: none,
       operations: [prelude_operation(b"seed", ReadMode, [], [], [], int_type, no_effects)],
@@ -1605,6 +1611,7 @@ pub const prelude_effects: List<EffectInfo> = {
       name: b"abort",
       module: b"",
       simple_name: b"abort",
+      visibility: Public,
       nondet: false,
       at: none,
       operations: [prelude_operation(b"raise", RaiseMode, [0], [], [string_type], ta, no_effects)],
@@ -1613,6 +1620,16 @@ pub const prelude_effects: List<EffectInfo> = {
       name: b"diverges",
       module: b"",
       simple_name: b"diverges",
+      visibility: Public,
+      nondet: false,
+      at: none,
+      operations: [],
+    },
+    {
+      name: scoped_effect,
+      module: b"",
+      simple_name: scoped_effect,
+      visibility: Public,
       nondet: false,
       at: none,
       operations: [],
@@ -2259,10 +2276,10 @@ fn shape_named(
   deriver: Deriver,
   adts: Shapes,
   name: Bytes,
-) -> Option<AlgebraicShape> / {program.read} =
+) -> Option<AlgebraicShape> / {elsewhere.read} =
   match find_adt(adts, name) {
     Some(a) -> Some(a),
-    None -> match program.type_named(name) {
+    None -> match elsewhere.look_up_type(name) {
       Some(f) -> if compares_through_key(deriver) { f.compared }
       else if deriver == ShowDeriver { f.shown }
       else { f.shape },
@@ -2277,7 +2294,7 @@ pub fn derivable(
   ty: Type,
   adts: Shapes,
   assumed: List<Int>,
-) -> Option<Blocker> / {abort.raise, program.read} =
+) -> Option<Blocker> / {abort.raise, elsewhere.read} =
   derivable_within(deriver, ty, adts, assumed, [], most_types_on_a_path)
 
 fn first_blocked(
@@ -2287,7 +2304,7 @@ fn first_blocked(
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
-) -> Option<Blocker> / {abort.raise, program.read} =
+) -> Option<Blocker> / {abort.raise, elsewhere.read} =
   types.fold(None, |accumulator: Option<Blocker>, ty: Type|
     match accumulator {
       Some(_) -> accumulator,
@@ -2301,7 +2318,7 @@ fn derivable_within(
   assumed: List<Int>,
   visiting: List<Bytes>,
   room: Int,
-) -> Option<Blocker> / {abort.raise, program.read} =
+) -> Option<Blocker> / {abort.raise, elsewhere.read} =
   match ty {
     VariableType(v) -> if assumed.contains(v) { None }
     else { Some({ ty: ty, reason: Unconstrained(v) }) },
@@ -2333,7 +2350,7 @@ fn derivable_within(
     },
   }
 
-pub fn order_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise, program.read} =
+pub fn order_needs(ty: Type, shapes: Shapes) -> List<Int> / {abort.raise, elsewhere.read} =
   iterate([], variables_of_type(ty).len() + 2, |found: List<Int>|
     match derivable(OrderingDeriver, ty, shapes, found) {
       Some(b) -> match b.reason {
