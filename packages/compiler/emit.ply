@@ -1,3 +1,4 @@
+import std.set (Set)
 import compiler.syntax.parsing (Identifier, ParseDiagnostic)
 import compiler.emit.code (Code)
 import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, TypeItem, parse,
@@ -15,7 +16,7 @@ import compiler.check.infer (BodyFacts, item_owner, facts_by_owner)
 import compiler.check.infer.definitions (Extern, MachineCall, parsed_natives, machine_calls)
 import compiler.check.types (Type, NamedType, VariableType, FunctionType, Scheme, Effect, int_type,
                              bool_type, bytes_type, unit_type, function_type, monomorphic,
-                             no_effects, read_effects)
+                             no_effects, relabelled)
 import compiler.emit.lower.module_context (HostHandler, ModuleContext, resolved_imports,
                                            recorded_annotations, param_type, scheduler_imported,
                                            root_body, resolved_at, root_params, body_code,
@@ -83,10 +84,10 @@ fn parse_diagnostics_text(diagnostics: List<ParseDiagnostic>) -> Bytes =
     b"; ",
   )
 
-fn wanted_names(wanted: List<RootKey>) -> Map<RootName, Bool> =
-  wanted.fold(Map::new(), |m: Map<RootName, Bool>, k: RootKey| m.insert(root_name(k), true))
+fn wanted_names(wanted: List<RootKey>) -> Set<RootName> =
+  wanted.fold(Set::empty(), |m: Set<RootName>, k: RootKey| m.insert(root_name(k)))
 
-fn wants_root(wanted: Map<RootName, Bool>, k: RootKey) -> Bool = wanted.contains(root_name(k))
+fn wants_root(wanted: Set<RootName>, k: RootKey) -> Bool = wanted.contains(root_name(k))
 
 fn written_wanted(
   wanted: List<RootKey>,
@@ -182,7 +183,7 @@ pub type Scope = {
   places: Map<Bytes, Int>,
   module_scopes: List<ModuleScope>,
   owned: Map<Bytes, BodyFacts>,
-  reading: Map<Bytes, Bool>,
+  reading: Set<Bytes>,
   release_build: Bool,
   test_effects: Map<Bytes, List<Effect>>,
 }
@@ -221,8 +222,8 @@ pub fn scope_over(
   w: InferredFacts,
 ) -> Scope / {abort.raise} = {
   let reading = owners_to_read(rows, roots);
-  let every = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
-    accumulator.insert(m.name, true));
+  let every = modules.fold(Set::empty(), |accumulator: Set<Bytes>, m: ParsedModule|
+    accumulator.insert(m.name));
   let facts = match facts_read(rows, w, Some({ roots: reading, modules: every }), modules) {
     Ok(f) -> f,
     Err(reason) -> unread(reason),
@@ -254,7 +255,7 @@ pub fn scope_over(
     reading: reading,
     release_build: release,
     test_effects: rows.tests.fold(Map::new(), |m: Map<Bytes, List<Effect>>, r: KnownTestRow|
-      match read_effects(r.effects) { Some(xs) -> m.insert(r.key, xs), None -> m }),
+      match relabelled(r.effects, [], []) { Some(xs) -> m.insert(r.key, xs), None -> m }),
   }
 }
 
@@ -284,8 +285,8 @@ pub fn lowered_in(
   lent: Option<Map<RootName, Option<BoundLambda>>> = None,
 ) -> LoweredProgram / {EmitReads} = {
   let wanted = wanted_names(roots);
-  let touched = roots.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: RootKey|
-    match definition_root(k) { Some(d) -> accumulator.insert(d, true), None -> accumulator });
+  let touched = roots.fold(Set::empty(), |accumulator: Set<Bytes>, k: RootKey|
+    match definition_root(k) { Some(d) -> accumulator.insert(d), None -> accumulator });
   let lowered = modules_lowered(roots);
   let specialised = specialisations_wanted(roots);
   let borrowed_by = specialised.fold(
@@ -321,8 +322,8 @@ pub fn lowered_in(
 
 type FormInputs = {
   scope: Scope,
-  wanted: Map<RootName, Bool>,
-  touched: Map<Bytes, Bool>,
+  wanted: Set<RootName>,
+  touched: Set<Bytes>,
   specialised: Map<Bytes, List<RootKey>>,
   written: List<{ key: RootKey, operation: TypeOperation, ty: Type, module: Bytes }>,
   borrowed_by: Map<RootName, Option<BoundLambda>>,
@@ -462,14 +463,14 @@ pub fn owner_lambdas(s: Scope, owner: RootKey) -> Option<BoundLambda> / {EmitRea
   }
 }
 
-fn owners_to_read(rows: Rows, roots: List<RootKey>) -> Map<Bytes, Bool> =
+fn owners_to_read(rows: Rows, roots: List<RootKey>) -> Set<Bytes> =
   roots.fold(
-    rows.definitions.fold(Map::new(), |accumulator: Map<Bytes, Bool>, row: KnownDefinitionRow|
-      if row.facts.len() == 0 { accumulator } else { accumulator.insert(row.name, true) }),
-    |accumulator: Map<Bytes, Bool>, k: RootKey|
+    rows.definitions.fold(Set::empty(), |accumulator: Set<Bytes>, row: KnownDefinitionRow|
+      if row.facts.len() == 0 { accumulator } else { accumulator.insert(row.name) }),
+    |accumulator: Set<Bytes>, k: RootKey|
       inlined_lambdas(k).fold(
-        accumulator.insert(site_owner_text(k), true).insert(site_owner_text(parent_root(k)), true),
-        |r: Map<Bytes, Bool>, f: InlinedLambda| r.insert(site_owner_text(f.owner), true),
+        accumulator.insert(site_owner_text(k)).insert(site_owner_text(parent_root(k))),
+        |r: Set<Bytes>, f: InlinedLambda| r.insert(site_owner_text(f.owner)),
       ),
   )
 
@@ -724,10 +725,10 @@ type ItemFormInputs = {
 
 fn distinct_forms(forms: List<Function>) -> List<Function> =
   forms.fold(
-    { seen: Map::new(), out: [] },
-    |accumulator: { seen: Map<RootName, Bool>, out: List<Function> }, r: Function|
+    { seen: Set::empty(), out: [] },
+    |accumulator: { seen: Set<RootName>, out: List<Function> }, r: Function|
       if accumulator.seen.contains(root_name(r.key)) { accumulator } else {
-        { seen: accumulator.seen.insert(root_name(r.key), true), out: accumulator.out.push(r) }
+        { seen: accumulator.seen.insert(root_name(r.key)), out: accumulator.out.push(r) }
       },
   ).out
 
@@ -1023,7 +1024,7 @@ fn int_arguments(type_variables: List<Int>) -> List<Type> =
 
 fn with_entry(
   s: ModuleContext,
-  wanted: Map<RootName, Bool>,
+  wanted: Set<RootName>,
   root: RootKey,
   scheme: Option<Scheme>,
   out: List<Function>,
@@ -1097,7 +1098,7 @@ fn instantiated_callee(root: RootKey, type_variable_count: Int) -> RootKey =
 
 fn with_claim_entry(
   s: ModuleContext,
-  wanted: Map<RootName, Bool>,
+  wanted: Set<RootName>,
   root: RootKey,
   params: List<EmitParam>,
   type_variables: List<Int>,
@@ -1121,7 +1122,7 @@ fn clause_roots(
   accumulator: RootForms,
   definition: FnDefinition,
   s: ModuleContext,
-  wanted: Map<RootName, Bool>,
+  wanted: Set<RootName>,
   recorded: SiteAnnotations,
 ) -> RootForms / {EmitReads} = {
   let full = qualify(s.module, definition.name.name);

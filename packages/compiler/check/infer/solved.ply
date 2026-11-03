@@ -1,3 +1,6 @@
+import std.set (Set)
+import compiler.codes (unknown_name_code, unsupported_operation_code)
+import compiler.check.resolve.tables (source_span)
 import compiler.check.resolve.tables (module_names)
 import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
@@ -5,7 +8,7 @@ import compiler.check.infer.checker (program)
 import compiler.check.infer.checker (algebraic_shapes, instance_shapes)
 import compiler.check.infer.checker (type_declared, stated_of, ordered_parameters_of,
                                      constructors_of_type)
-import compiler.syntax.parsing (Span, Identifier)
+import compiler.syntax.parsing (Span, Identifier, is_generated)
 import compiler.syntax.type_syntax (mode_text)
 import compiler.syntax.items (Item, Deriver, EqDeriver, OrderingDeriver, HashDeriver, DeriveOrigin,
                               InstanceItem, InstanceDefinition, KeyInstance, ShowInstance,
@@ -227,7 +230,7 @@ fn check_release(
             None ->
               report_error_at(
                 checker,
-                b"E0101",
+                unknown_name_code,
                 definition.function.span,
                 Bytes::concat_all([
                   b"`",
@@ -459,7 +462,7 @@ fn check_declared_instance(
               None ->
                 report_error_at(
                   checker,
-                  b"E0101",
+                  unknown_name_code,
                   definition.function.span,
                   Bytes::concat_all([
                     b"`",
@@ -932,7 +935,7 @@ fn check_numeric_signature(
     None ->
       report_error_at(
         checker,
-        b"E0101",
+        unknown_name_code,
         x.by.span,
         Bytes::concat_all([b"`", x.by.name, b"` is not a function this module declares"]),
         b"a `numeric` must name functions declared in the same module as its type",
@@ -1118,7 +1121,7 @@ pub fn check_instances(checker: Checker) -> Checker / {abort.raise, program.read
                     report(
                       cc,
                       error_at(
-                        b"E0206",
+                        unsupported_operation_code,
                         x.at.module,
                         x.at.span,
                         Bytes::concat_all([
@@ -1161,21 +1164,21 @@ pub fn blame_deriver_errors(checker: Checker) -> Checker / {abort.raise} = {
           Some(_) -> accumulator,
           None -> if l.primary { Some(l) } else { None },
         }) {
-      Some(p) -> {
-        let at = { module: p.module, start: p.start, end: p.end };
-        if spans.contains(at) { Some(at) } else { None }
+      Some(p) -> match source_span(p) {
+        Some(at) -> if spans.contains(at) { Some(at) } else { None },
+        None -> None,
       },
       None -> None,
     };
   let unseen = checker.diagnostics.fold([], |accumulator: List<LabelLocation>, d: Diagnostic|
-    if d.code != b"E0206" { accumulator }
+    if d.code != unsupported_operation_code { accumulator }
     else { match derived_at(d) { Some(at) -> accumulator.push(at), None -> accumulator } });
   {
     ..checker,
     diagnostics: checker.diagnostics.fold([], |accumulator: List<Diagnostic>, d: Diagnostic|
       match derived_at(d) {
         None -> accumulator.push(d),
-        Some(at) -> if d.code == b"E0206" { accumulator.push(d) }
+        Some(at) -> if d.code == unsupported_operation_code { accumulator.push(d) }
         else if unseen.contains(at) { accumulator }
         else { accumulator.push(blamed_on_deriver(d)) },
       }),
@@ -1210,7 +1213,7 @@ fn contains_function(t: Type) -> Bool =
 fn push_front_bytes(x: Bytes, xs: List<Bytes>) -> List<Bytes> =
   xs.fold([x], |accumulator: List<Bytes>, y: Bytes| accumulator.push(y))
 
-type NativeReach = { native_types: Map<Bytes, Bool>, uses: Map<Bytes, List<Int>> }
+type NativeReach = { native_types: Set<Bytes>, uses: Map<Bytes, List<Int>> }
 
 fn native_reach(shapes: Shapes) -> NativeReach / {abort.raise} = {
   let uses = shapes.fold(
@@ -1222,19 +1225,18 @@ fn native_reach(shapes: Shapes) -> NativeReach / {abort.raise} = {
           shape.fields.any(|f: Type| occurs_type(shape.params.get(i), f))),
       ),
   );
-  let natives = shapes.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
-      if shape.native { accumulator.insert(name, true) } else { accumulator },
+  let natives = shapes.fold(Set::empty(),
+    |accumulator: Set<Bytes>, name: Bytes, shape: AlgebraicShape|
+      if shape.native { accumulator.insert(name) } else { accumulator },
   );
-  let native_types = iterate(natives, shapes.len() + 1, |found: Map<Bytes, Bool>| {
+  let native_types = iterate(natives, shapes.len() + 1, |found: Set<Bytes>| {
     let next = shapes.fold(
       found,
-      |accumulator: Map<Bytes, Bool>, name: Bytes, shape: AlgebraicShape|
+      |accumulator: Set<Bytes>, name: Bytes, shape: AlgebraicShape|
         if accumulator.contains(name) { accumulator }
         else if shape.fields.any(|f: Type|
             contains_native_type({ native_types: accumulator, uses: uses }, f)) {
-          accumulator.insert(name, true)
+          accumulator.insert(name)
         } else { accumulator },
     );
     if next.len() == found.len() { Stop(next) } else { Continue(next) }
@@ -1309,10 +1311,8 @@ pub fn check_comparisons(checker: Checker) -> Checker / {abort.raise} = {
   )
 }
 
-fn is_dummy(span: Span) -> Bool = span.start == 0 && span.end == 0
-
 fn encloses(outer: Span, inner: Span) -> Bool =
-  !is_dummy(outer) && !is_dummy(inner) && outer.start <= inner.start && inner.end <= outer.end
+  !is_generated(outer) && !is_generated(inner) && outer.start <= inner.start && inner.end <= outer.end
 
 pub fn check_parallels(checker: Checker) -> Checker / {abort.raise} =
   checker.parallels.fold({ ..checker, parallels: [] }, |c: Checker, site: ParallelSite| {
@@ -1875,7 +1875,7 @@ pub const prelude_tables: { effects: List<EffectInfo>, constructors: List<Constr
       positions: Map::new(),
     },
     [],
-    empty_cache,
+    empty_cache(0),
   );
   { effects: c.effects, constructors: c.constructors }
 }

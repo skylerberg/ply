@@ -1,6 +1,7 @@
+import std.set (Set)
 import compiler.check.infer.checker (with_no_other_definitions, CheckReads, StoredDeclarations,
                                      no_stored_declarations)
-import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, dummy_span, moved_by,
+import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, generated_span, moved_by,
                                 parse_diagnostic, parse_label, start)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, TestItem, LawItem, SumBody,
                               SpecKind, FnDefinition, LawDefinition, SchemaInstance)
@@ -16,7 +17,8 @@ import compiler.check.types (Scheme, Type, Effects, Field, Effect, Resource, Fun
                              InternedType, interned_type_bin, intern_types, types_of,
                              canonical_beside, resource_bin)
 import compiler.syntax.type_syntax (Mode, mode_bin)
-import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Resolution, qualify,
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Resolution, qualify, Label,
+                                      place_module,
                                       module_of_name, default_binder)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed)
 import compiler.check.resolve.scopes (find)
@@ -44,7 +46,7 @@ import compiler.emit.keys (test_owner, test_key, law_owner)
 import compiler.check.termination (Terminates, TerminatesByDecreases)
 import compiler.check.borrowing (ParameterMode)
 import compiler.check.callbacks (prelude_callback_use)
-import compiler.front.diagnostics (ParsedSource, parse_all, parse_at, outside_every_module,
+import compiler.front.diagnostics (ParsedSource, parse_all, parse_at,
                                    diagnostic_in_module, with_prelude_source)
 import compiler.front.pkg (PackageSources, Closure, closure, closure_of_validated, pins_of,
                            first_segment)
@@ -110,9 +112,9 @@ pub fn rows_of(analysis: Analysis) -> Rows / {abort.raise} =
 pub fn inferred_facts(analysis: Analysis) -> InferredFacts =
   inferred_facts_of(analysis.modules.map(|parsed: ParsedModule| parsed.name), analysis.checked)
 
-pub type LoweringTargets = { roots: Map<Bytes, Bool>, modules: Map<Bytes, Bool> }
+pub type LoweringTargets = { roots: Set<Bytes>, modules: Set<Bytes> }
 
-pub fn lowers(lowered: Option<Map<Bytes, Bool>>, module: Bytes) -> Bool =
+pub fn lowers(lowered: Option<Set<Bytes>>, module: Bytes) -> Bool =
   match lowered { None -> true, Some(m) -> m.contains(module) }
 
 type GatheredFacts = { facts: BodyFacts, missing: Option<Bytes> }
@@ -217,7 +219,7 @@ pub fn facts_read(
   }
 }
 
-pub fn wants(wanted: Option<Map<Bytes, Bool>>, name: Bytes) -> Bool =
+pub fn wants(wanted: Option<Set<Bytes>>, name: Bytes) -> Bool =
   match wanted { None -> true, Some(m) -> m.contains(name) }
 
 pub type Identity = | ByHashes(List<Bytes>) | ByName(Bytes)
@@ -440,8 +442,8 @@ fn unimported_in(
   r: Resolution,
   read: Map<Bytes, List<Bytes>>,
 ) -> List<List<Bytes>> / {abort.raise} = {
-  let module_names = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
-    accumulator.insert(m.name, true));
+  let module_names = modules.fold(Set::empty(), |accumulator: Set<Bytes>, m: ParsedModule|
+    accumulator.insert(m.name));
   range(0, modules.len()).map(|i: Int|
     unimported_of(
       match read.get(modules.get(i).name) { Some(xs) -> xs, None -> [] },
@@ -488,7 +490,7 @@ fn std_squats(
               Bytes::concat_all([b"`", n, b"` would shadow the built-in package `", seg, b"`"]),
               [
                 parse_label(
-                  dummy_span,
+                  generated_span,
                   true,
                   b"this file claims a module under the toolchain's own prefix",
                 ),
@@ -567,10 +569,8 @@ pub fn hashed_closure(
       Ok({
         hashes: hashed.hashes,
         unused: hashed.unused.filter(|diagnostic: Diagnostic|
-          diagnostic.labels.any(
-            |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
-              l.primary && l.module < root_count,
-          )),
+          diagnostic.labels.any(|l: Label| l.primary
+            && match place_module(l.place) { Some(m) -> m < root_count, None -> false })),
         resolved: {
           modules: x.modules,
           resolution: x.resolution,
@@ -625,14 +625,14 @@ pub fn resolved_closure(
         tables.compiler,
         tables.other_shipped_package,
       ) {
-      ResolveFailed(ds) -> Err(ds.map(outside_every_module)),
+      ResolveFailed(ds) -> Err(ds),
       ResolveSucceeded(resolved) -> {
         let x = match checked {
           Some(_) -> { ..resolved, resolution: make_all_visible(resolved.resolution) },
           None -> resolved,
         };
         let built = build_index(x.modules, x.resolution);
-        if built.diagnostics.len() > 0 { Err(built.diagnostics.map(outside_every_module)) }
+        if built.diagnostics.len() > 0 { Err(built.diagnostics) }
         else { Ok({ program: x, tables: tables, index: built.index }) }
       },
     }
@@ -676,7 +676,7 @@ pub fn type_check(
     declared: out.declared,
     checked: if !checked.ok || group.problems.len() > 0 { None }
     else { Some(group_analysis(group, checked, out.bodies, out.declared, unused)) },
-    diagnostics: group.problems.concat(checked.diagnostics.map(outside_every_module)),
+    diagnostics: group.problems.concat(checked.diagnostics),
   }
 }
 
@@ -690,9 +690,9 @@ fn sited_hashes(
     hashes,
     checked.facts.members.concat(cached_sites.sites),
     cached_sites.unread,
-    checked.tests.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: TestInfo|
+    checked.tests.fold(Set::empty(), |accumulator: Set<Bytes>, t: TestInfo|
       if cached_sites.unread.contains(test_owner(t.module, t.name)) {
-        accumulator.insert(t.key, true)
+        accumulator.insert(t.key)
       } else { accumulator }),
   )
 }
@@ -710,7 +710,7 @@ pub fn group_analysis(
     unimported: group.modules.map(|_: ParsedModule| []),
     checked: checked,
     index: group.index,
-    warnings: unused.map(outside_every_module).concat(checked.warnings),
+    warnings: unused.concat(checked.warnings),
     uses: group.uses,
     manifest: None,
     packages: [],
@@ -726,18 +726,18 @@ pub fn group_analysis(
 fn cached_member_sites(
   modules: List<ParsedModule>,
   checked: CheckOutput,
-) -> { sites: List<MemberSite>, unread: Map<Bytes, Bool> } / {abort.raise} = {
+) -> { sites: List<MemberSite>, unread: Set<Bytes> } / {abort.raise} = {
   let cached_facts = checked.cached.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, k: CachedFacts| accumulator.insert(k.name, k.facts),
   );
   let read = range(0, modules.len()).fold(
     { sites: [], placed: Map::new() },
-    |accumulator: { sites: List<MemberSite>, placed: Map<Bytes, Bool> }, i: Int| {
+    |accumulator: { sites: List<MemberSite>, placed: Set<Bytes> }, i: Int| {
       let m = modules.get(i);
       m.module.items.fold(
         accumulator,
-        |a: { sites: List<MemberSite>, placed: Map<Bytes, Bool> }, item: Item| {
+        |a: { sites: List<MemberSite>, placed: Set<Bytes> }, item: Item| {
           let at = match item {
             FunctionItem(d) -> Some({ owner: qualify(m.name, d.name.name) }),
             TestItem(d) -> Some({ owner: test_owner(m.name, d.name) }),
@@ -750,7 +750,7 @@ fn cached_member_sites(
               Some(recorded) -> match decode_facts(recorded, i, x.owner) {
                 None -> a,
                 Some(f) ->
-                  { sites: a.sites.concat(f.members), placed: a.placed.insert(x.owner, true) },
+                  { sites: a.sites.concat(f.members), placed: a.placed.insert(x.owner) },
               },
             },
           }
@@ -764,8 +764,8 @@ fn cached_member_sites(
       checked.tests.fold([], |accumulator: List<Bytes>, t: TestInfo|
         if checked.cached_tests.contains(t.key) { accumulator.push(test_owner(t.module, t.name)) }
         else { accumulator }),
-    ).fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
-      if read.placed.contains(n) { accumulator } else { accumulator.insert(n, true) }),
+    ).fold(Set::empty(), |accumulator: Set<Bytes>, n: Bytes|
+      if read.placed.contains(n) { accumulator } else { accumulator.insert(n) }),
   }
 }
 
@@ -849,9 +849,9 @@ pub fn runtime_dump(d: Dump) -> Dump =
     inferred_facts: b"",
   }
 
-type ReachSearch = { seen: Map<Bytes, Bool>, frontier: List<Bytes> }
+type ReachSearch = { seen: Set<Bytes>, frontier: List<Bytes> }
 
-fn reachable_names(hashes: List<HashTableRow>, entry: Bytes) -> Map<Bytes, Bool> / {abort.raise} = {
+fn reachable_names(hashes: List<HashTableRow>, entry: Bytes) -> Set<Bytes> / {abort.raise} = {
   let dependencies = hashes.fold(
     Map::new(),
     |accumulator: Map<Bytes, List<Bytes>>, frame: HashTableRow|
@@ -861,7 +861,7 @@ fn reachable_names(hashes: List<HashTableRow>, entry: Bytes) -> Map<Bytes, Bool>
       },
   );
   iterate(
-    { seen: Map::new().insert(entry, true), frontier: [entry] },
+    { seen: Set::empty().insert(entry), frontier: [entry] },
     hashes.len() + 2,
     |w: ReachSearch|
       if w.frontier.len() == 0 { Stop(w.seen) } else {
@@ -875,7 +875,7 @@ fn reachable_names(hashes: List<HashTableRow>, entry: Bytes) -> Map<Bytes, Bool>
                 |met: ReachSearch, dependency: Bytes|
                   if met.seen.contains(dependency) { met } else {
                     {
-                      seen: met.seen.insert(dependency, true),
+                      seen: met.seen.insert(dependency),
                       frontier: met.frontier.push(dependency),
                     }
                   },
@@ -1026,17 +1026,17 @@ fn resolved_at(
       ),
   }
 
-pub const prover_modelled: Map<Bytes, Bool> =
-  builtins.fold(Map::new(), |m: Map<Bytes, Bool>, b: Builtin|
-    match prelude_callback_use(b.name) { Some(_) -> m, None -> m.insert(b.name, true) })
+pub const prover_modelled: Set<Bytes> =
+  builtins.fold(Set::empty(), |m: Set<Bytes>, b: Builtin|
+    match prelude_callback_use(b.name) { Some(_) -> m, None -> m.insert(b.name) })
 
-pub fn prover_builtin(modelled: Map<Bytes, Bool>, full: Bytes) -> Option<Bytes> =
+pub fn prover_builtin(modelled: Set<Bytes>, full: Bytes) -> Option<Bytes> =
   match prelude_own(full) {
     Some(name) -> if modelled.contains(name) { Some(name) } else { None },
     None -> None,
   }
 
-fn prelude_builtins(modelled: Map<Bytes, Bool>, b: TypedBody<Type>) -> TypedBody<Type> =
+fn prelude_builtins(modelled: Set<Bytes>, b: TypedBody<Type>) -> TypedBody<Type> =
   {
     ..b,
     body: typed_expression_nodes_mapped(b.body, |e: TypedExpression<Type>|
@@ -1358,9 +1358,9 @@ fn claims_of_modules(
   bodies: List<TypedBody<Type>>,
   wanted: List<Int>,
   opaque: (Bytes) -> Bool,
-  ends: Map<Bytes, Bool>,
-  stated: Map<Bytes, Bool>,
-  roots: Option<Map<Bytes, Bool>> = None,
+  ends: Set<Bytes>,
+  stated: Set<Bytes>,
+  roots: Option<Set<Bytes>> = None,
 ) -> List<Claim> / {abort.raise} = {
   let modelled = prover_modelled;
   let resolved = resolved_by_owner(
@@ -1441,18 +1441,17 @@ pub fn claims(
 
 pub fn checked_bodies(analysis: Analysis) -> LoweringTargets / {abort.raise} = {
   let rows = rows_of(analysis);
-  let functions = rows.definitions.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, row: KnownDefinitionRow|
-      if row.facts.len() == 0 { accumulator } else { accumulator.insert(row.name, true) },
+  let functions = rows.definitions.fold(Set::empty(),
+    |accumulator: Set<Bytes>, row: KnownDefinitionRow|
+      if row.facts.len() == 0 { accumulator } else { accumulator.insert(row.name) },
   );
-  let tests = rows.tests.fold(functions, |accumulator: Map<Bytes, Bool>, row: KnownTestRow|
-    if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner, true) });
+  let tests = rows.tests.fold(functions, |accumulator: Set<Bytes>, row: KnownTestRow|
+    if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner) });
   {
-    roots: rows.laws.fold(tests, |accumulator: Map<Bytes, Bool>, row: KnownLawRow|
-      if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner, true) }),
-    modules: analysis.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
-      accumulator.insert(m.name, true)),
+    roots: rows.laws.fold(tests, |accumulator: Set<Bytes>, row: KnownLawRow|
+      if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner) }),
+    modules: analysis.modules.fold(Set::empty(), |accumulator: Set<Bytes>, m: ParsedModule|
+      accumulator.insert(m.name)),
   }
 }
 
@@ -1483,10 +1482,10 @@ pub fn claims_in(
 }
 
 pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> List<TypedBody<Type>> / {abort.raise} = {
-  let walked = wanted.fold(Map::new(), |accumulator: Map<Bytes, Bool>, i: Int| {
+  let walked = wanted.fold(Set::empty(), |accumulator: Set<Bytes>, i: Int| {
     let m = analysis.modules.get(i);
-    m.module.items.fold(accumulator, |a: Map<Bytes, Bool>, item: Item|
-      match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name), true), _ -> a })
+    m.module.items.fold(accumulator, |a: Set<Bytes>, item: Item|
+      match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name)), _ -> a })
   });
   let rows = rows_of(analysis);
   let known = cache_from_rows(

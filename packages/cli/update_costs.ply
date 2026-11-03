@@ -1,8 +1,12 @@
+import compiler.codes (internal_error_code)
+import compiler.check.resolve.tables (error_unplaced)
 import sources (ProjectFiles)
-import compiler.emit.costs (Report, Costed, Site, ReturnMismatch, placed_span, report_of)
+import compiler.emit.costs (Report, Costed, Site, ReturnMismatch, placed_span, report_of, Verdict,
+                            Reuses, Copies, Undecided, CostedKind, CostedFunction, CostedTest,
+                            CostedLaw)
 import compiler.front.checking.promises (MeasureEntry, cost_walk_query)
 import compiler.check.resolve.tables (Source, Diagnostic, error_at, error_at_and)
-import compiler.syntax.parsing (Span, no_module, dummy_span, span_between)
+import compiler.syntax.parsing (Span, span_between)
 import compiler.unit (shipped)
 import compiler.load (Derives)
 import diagnostic (SourceText, position_of)
@@ -191,7 +195,7 @@ fn location_text(places: List<SourceText>, module: Int, offset: Int) -> String /
     },
   }
 
-fn count_verdict(d: Costed, verdict: Bytes) -> Int =
+fn count_verdict(d: Costed, verdict: Verdict) -> Int =
   d.sites.fold(0, |accumulator: Int, s: Site|
     if s.verdict == verdict { accumulator + 1 } else { accumulator })
 
@@ -202,22 +206,24 @@ fn append_count(n: Int, word: String, summary: String) -> String =
 
 fn tally(d: Costed) -> String =
   append_count(
-    count_verdict(d, b"unknown"),
+    count_verdict(d, Undecided),
     "unknown",
     append_count(
-      count_verdict(d, b"copies"),
+      count_verdict(d, Copies),
       "COPIES",
-      append_count(count_verdict(d, b"reuses"), "reuses", ""),
+      append_count(count_verdict(d, Reuses), "reuses", ""),
     ),
   )
 
 fn kind_of(d: Costed) -> String =
-  if d.item_kind == b"test" { " (test)" } else if d.item_kind == b"law" { " (law)" } else { "" }
+  match d.item_kind { CostedTest -> " (test)", CostedLaw -> " (law)", CostedFunction -> "" }
 
-fn colored_verdict(style: Style, verdict: Bytes) -> String =
-  if verdict == b"reuses" { green(style, "reuses ") }
-  else if verdict == b"copies" { red(style, "COPIES ") }
-  else { yellow(style, "unknown") }
+fn colored_verdict(style: Style, verdict: Verdict) -> String =
+  match verdict {
+    Reuses -> green(style, "reuses "),
+    Copies -> red(style, "COPIES "),
+    Undecided -> yellow(style, "unknown"),
+  }
 
 fn site_lines(
   style: Style,
@@ -254,13 +260,13 @@ fn definition_lines(
     site_lines(style, places, d, accumulator, site))
 }
 
-fn total(report: Report, verdict: Bytes) -> Int =
+fn total(report: Report, verdict: Verdict) -> Int =
   report.definitions.fold(0, |accumulator: Int, d: Costed| accumulator + count_verdict(d, verdict))
 
 fn summary(report: Report) -> String / {abort.raise} = {
-  let reuses = total(report, b"reuses");
-  let copies = total(report, b"copies");
-  let undecided = total(report, b"unknown");
+  let reuses = total(report, Reuses);
+  let copies = total(report, Copies);
+  let undecided = total(report, Undecided);
   Int::to_string(reuses + copies + undecided) ++ " updates: " ++ reuses.to_string() ++ " reuse, "
     ++ copies.to_string()
     ++ " copy, "
@@ -288,10 +294,8 @@ pub fn report_lines(
   }
 
 pub const unresolved: Diagnostic =
-  error_at(
-    b"E0505",
-    no_module,
-    dummy_span,
+  error_unplaced(
+    internal_error_code,
     b"the compiler could not determine which `update` calls in this program copy a list or array: the analysis did not finish",
     b"no `update` call was analyzed, so no `reuse` annotation was checked",
     [b"this is Ply's fault: the compiler's own `costs.ply` is what failed here"],
@@ -299,7 +303,7 @@ pub const unresolved: Diagnostic =
 
 fn reuse_violation(d: Costed, promise: Span, site: Site) -> Diagnostic = {
   let collection = if site.operation == b"Array::set" { b"array" } else { b"list" };
-  let what = if site.verdict == b"copies" { b"copies its ".concat(collection) }
+  let what = if site.verdict == Copies { b"copies its ".concat(collection) }
   else { b"cannot be shown to reuse the same ".concat(collection) };
   let note = if site.suggestion.len() == 0 {
     b"no edit inside this body removes the copy; the promise cannot be kept as written, so either restructure the update or drop `reuse`"
@@ -332,7 +336,7 @@ pub fn report_reuse_violations(report: Report) -> List<Diagnostic> =
       None -> accumulator,
       Some(promise) ->
         d.sites.fold(accumulator, |diagnostics: List<Diagnostic>, site: Site|
-          if site.verdict == b"reuses" || site.param >= 0 { diagnostics }
+          if site.verdict == Reuses || site.param != None { diagnostics }
           else { diagnostics.push(reuse_violation(d, promise, site)) }),
     })
 
@@ -404,7 +408,7 @@ test "a failed measure is placed at its clause, relative to the text of its unit
 fn example_sources() -> List<SourceText> =
   [{ path: "src/m.ply", text: b"fn f() -> Int = 1\nfn g() -> Int = 2\n" }]
 
-fn site(verdict: Bytes, reason: Bytes, fix: Bytes, param: Int) -> Site =
+fn site(verdict: Verdict, reason: Bytes, fix: Bytes, param: Option<Int>) -> Site =
   {
     start: 18,
     end: 29,
@@ -415,7 +419,7 @@ fn site(verdict: Bytes, reason: Bytes, fix: Bytes, param: Int) -> Site =
     param: param,
   }
 
-fn costed(kind: Bytes, sites: List<Site>, reuse: Option<Span>) -> Costed =
+fn costed(kind: CostedKind, sites: List<Site>, reuse: Option<Span>) -> Costed =
   {
     item_kind: kind,
     module: 0,
@@ -427,22 +431,22 @@ fn costed(kind: Bytes, sites: List<Site>, reuse: Option<Span>) -> Costed =
   }
 
 test "a definition's tally names only the verdicts it has, in one order" {
-  assert_eq(tally(costed(b"fn", [site(b"reuses", b"", b"", 0 - 1)], None)), "1 reuses");
+  assert_eq(tally(costed(CostedFunction, [site(Reuses, b"", b"", None)], None)), "1 reuses");
   assert_eq(
     tally(
       costed(
         b"fn",
         [
-          site(b"reuses", b"", b"", 0 - 1),
-          site(b"copies", b"", b"", 0 - 1),
-          site(b"unknown", b"", b"", 0 - 1),
+          site(Reuses, b"", b"", None),
+          site(Copies, b"", b"", None),
+          site(Undecided, b"", b"", None),
         ],
         None,
       ),
     ),
     "1 reuses, 1 COPIES, 1 unknown",
   );
-  assert_eq(tally(costed(b"fn", [], None)), "")
+  assert_eq(tally(costed(CostedFunction, [], None)), "")
 }
 
 test "a program that updates nothing is told so on one line" {
@@ -461,7 +465,7 @@ test "an update-cost report names each copying site by its file's base name and 
   let r: Report = {
     ok: true,
     rounds: 2,
-    definitions: [costed(b"fn", [site(b"copies", b"read again", b"bind it first", 0 - 1)], None)],
+    definitions: [costed(CostedFunction, [site(Copies, b"read again", b"bind it first", None)], None)],
     return_mismatches: [],
   };
   assert_eq(report_lines(plain, example_sources(), r), [
@@ -480,14 +484,14 @@ test "a `reuse fn` is rejected when its own body copies a value, but not when on
   let clean_report: Report = {
     ok: true,
     rounds: 1,
-    definitions: [costed(b"fn", [site(b"reuses", b"fine", b"", 0 - 1)], promise)],
+    definitions: [costed(CostedFunction, [site(Reuses, b"fine", b"", None)], promise)],
     return_mismatches: [],
   };
   assert_eq(report_reuse_violations(clean_report), []);
   let caller: Report = {
     ok: true,
     rounds: 1,
-    definitions: [costed(b"fn", [site(b"copies", b"a caller keeps it", b"", 0)], promise)],
+    definitions: [costed(CostedFunction, [site(Copies, b"a caller keeps it", b"", Some(0))], promise)],
     return_mismatches: [],
   };
   assert_eq(report_reuse_violations(caller), []);
@@ -495,7 +499,7 @@ test "a `reuse fn` is rejected when its own body copies a value, but not when on
     ok: true,
     rounds: 1,
     definitions: [
-      costed(b"fn", [site(b"copies", b"read again", b"`Map::update`", 0 - 1)], promise),
+      costed(CostedFunction, [site(Copies, b"read again", b"`Map::update`", None)], promise),
     ],
     return_mismatches: [],
   };
@@ -512,7 +516,7 @@ test "a `reuse fn` is rejected when its own body copies a value, but not when on
   let hopeless: Report = {
     ok: true,
     rounds: 1,
-    definitions: [costed(b"fn", [site(b"unknown", b"a call", b"", 0 - 1)], promise)],
+    definitions: [costed(CostedFunction, [site(Undecided, b"a call", b"", None)], promise)],
     return_mismatches: [],
   };
   assert_eq(report_reuse_violations(hopeless).map(|x: Diagnostic| x.message), [
@@ -524,7 +528,7 @@ test "a `reuse fn` is rejected when its own body copies a value, but not when on
     definitions: [
       costed(
         b"fn",
-        [{ ..site(b"copies", b"read again", b"", 0 - 1), operation: b"Array::set" }],
+        [{ ..site(Copies, b"read again", b"", None), operation: b"Array::set" }],
         promise,
       ),
     ],
@@ -539,7 +543,7 @@ test "a function without a `reuse` annotation is never rejected, even when the r
   let r: Report = {
     ok: true,
     rounds: 1,
-    definitions: [costed(b"fn", [site(b"copies", b"read again", b"", 0 - 1)], None)],
+    definitions: [costed(CostedFunction, [site(Copies, b"read again", b"", None)], None)],
     return_mismatches: [],
   };
   assert_eq(report_reuse_violations(r), [])

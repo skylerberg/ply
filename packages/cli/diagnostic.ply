@@ -1,5 +1,5 @@
 import compiler.syntax.parsing (Error, Warning, Note, Severity, severity_word)
-import compiler.check.resolve.tables (Diagnostic, Label, Fix, Edit)
+import compiler.check.resolve.tables (Diagnostic, Label, Fix, Edit, InSource, WholeFile, Unplaced)
 import std.json (Json, Member, Object, Null, Str, Bool, Number, Array, object)
 import compiler.syntax.lexer
 import std.bytes
@@ -25,13 +25,13 @@ pub fn shown(raised: RuntimeDiagnostic) -> Diagnostic / {abort.raise} = {
 
 pub fn diagnostic_of(
   severity: Severity,
-  code: String,
+  code: Bytes,
   message: String,
   labels: List<Label>,
   notes: List<String>,
 ) -> Diagnostic =
   {
-    code: Bytes::of_string(code),
+    code: code,
     labels: labels,
     text: b"",
     message: Bytes::of_string(message),
@@ -82,23 +82,31 @@ fn position_json(spot: Position) -> Json =
   ])
 
 fn label_json(places: List<SourceText>, label: Label) -> Option<Json> / {abort.raise} =
-  match source_at(places, label.module) {
-    None -> None,
-    Some(p) -> match slice_of(p.text, label.start, label.end) {
+  match label.place {
+    Unplaced -> None,
+    WholeFile(m) -> match source_at(places, m) {
       None -> None,
-      Some(text) ->
-        Some(
-          object([
-            { key: "file", value: Str(p.path) },
-            { key: "start", value: position_json(position_of(p.text, label.start)) },
-            { key: "end", value: position_json(position_of(p.text, label.end)) },
-            { key: "message", value: Str(String::of_bytes_lossy(label.text)) },
-            { key: "primary", value: Bool(label.primary) },
-            { key: "snippet", value: Str(String::of_bytes_lossy(text)) },
-          ]),
-        ),
+      Some(p) -> Some(spot_json(p, label, position_of(p.text, 0), position_of(p.text, 0), b"")),
+    },
+    InSource(s) -> match source_at(places, s.module) {
+      None -> None,
+      Some(p) -> match slice_of(p.text, s.start, s.end) {
+        None -> None,
+        Some(text) ->
+          Some(spot_json(p, label, position_of(p.text, s.start), position_of(p.text, s.end), text)),
+      },
     },
   }
+
+fn spot_json(p: SourceText, label: Label, start: Position, end: Position, text: Bytes) -> Json =
+  object([
+    { key: "file", value: Str(p.path) },
+    { key: "start", value: position_json(start) },
+    { key: "end", value: position_json(end) },
+    { key: "message", value: Str(String::of_bytes_lossy(label.text)) },
+    { key: "primary", value: Bool(label.primary) },
+    { key: "snippet", value: Str(String::of_bytes_lossy(text)) },
+  ])
 
 fn edit_json(places: List<SourceText>, e: Edit) -> Option<Json> / {abort.raise} =
   match source_at(places, e.module) {
@@ -206,14 +214,16 @@ fn snippet_lines(
   severity: Severity,
   place: SourceText,
   label: Label,
+  start: Int,
+  end: Int,
 ) -> List<String> / {abort.raise} = {
-  let at = position_of(place.text, label.start);
+  let at = position_of(place.text, start);
   let label_text = String::of_bytes_lossy(label.text);
   let tail = if label_text == "" { "" } else { " " ++ label_text };
   [
     "  --> " ++ place.path ++ ":" ++ at.line.to_string() ++ ":" ++ at.column.to_string(),
-    "   | " ++ line_text(place.text, label.start),
-    "   | " ++ colored(style, severity, carets(place.text, label.start, label.end)) ++ tail,
+    "   | " ++ line_text(place.text, start),
+    "   | " ++ colored(style, severity, carets(place.text, start, end)) ++ tail,
   ]
 }
 
@@ -223,11 +233,21 @@ fn label_lines(
   places: List<SourceText>,
   label: Label,
 ) -> List<String> / {abort.raise} =
-  match source_at(places, label.module) {
-    None -> [],
-    Some(p) -> match slice_of(p.text, label.start, label.end) {
+  match label.place {
+    Unplaced -> [],
+    WholeFile(m) -> match source_at(places, m) {
       None -> [],
-      Some(_) -> snippet_lines(style, severity, p, label),
+      Some(p) -> {
+        let label_text = String::of_bytes_lossy(label.text);
+        ["  --> " ++ p.path ++ if label_text == "" { "" } else { ": " ++ label_text }]
+      },
+    },
+    InSource(s) -> match source_at(places, s.module) {
+      None -> [],
+      Some(p) -> match slice_of(p.text, s.start, s.end) {
+        None -> [],
+        Some(_) -> snippet_lines(style, severity, p, label, s.start, s.end),
+      },
     },
   }
 
@@ -307,7 +327,7 @@ const mismatch: Diagnostic =
     Error,
     b"E0201",
     b"type mismatch: function body type",
-    [{ module: 0, start: 16, end: 19, primary: true, text: b"expected `Int`, found `String`" }],
+    [{ place: InSource({ module: 0, start: 16, end: 19 }), primary: true, text: b"expected `Int`, found `String`" }],
     [b"the body must return the written type"],
     [],
   )
@@ -351,7 +371,7 @@ test "`to_json` omits a label whose module does not exist or whose range is past
     Error,
     b"E0201",
     b"type mismatch: function body type",
-    [{ module: no_module, start: 0, end: 0, primary: true, text: b"nowhere" }],
+    [{ place: Unplaced, primary: true, text: b"nowhere" }],
     [],
     [],
   );
@@ -363,7 +383,7 @@ test "`to_json` omits a label whose module does not exist or whose range is past
     Error,
     b"E0201",
     b"type mismatch: function body type",
-    [{ module: 0, start: 900, end: 901, primary: true, text: b"past the end" }],
+    [{ place: InSource({ module: 0, start: 900, end: 901 }), primary: true, text: b"past the end" }],
     [b"the body must return the written type"],
     [],
   );
@@ -378,7 +398,7 @@ test "a span that cuts a character in half is still shown, on the line where the
     Error,
     b"E0201",
     b"type mismatch",
-    [{ module: 1, start: 4, end: 6, primary: true, text: b"here" }],
+    [{ place: InSource({ module: 1, start: 4, end: 6 }), primary: true, text: b"here" }],
     [],
     [],
   );
@@ -415,7 +435,7 @@ test "an empty span still gets one caret, and a suggested fix prints as its own 
     Warning,
     b"E0126",
     b"this needs a type",
-    [{ module: 0, start: 5, end: 5, primary: true, text: b"" }],
+    [{ place: InSource({ module: 0, start: 5, end: 5 }), primary: true, text: b"" }],
     [],
     [{ title: b"add the type", edits: [{ module: 0, start: 5, end: 5, text: b": Int" }] }],
   );
