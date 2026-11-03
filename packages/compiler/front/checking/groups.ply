@@ -846,13 +846,14 @@ pub fn group_result_of(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
     memo.provide(
       group_summary_query,
       input,
-      bin::encode(summary_of_group(result), group_summary_bin()),
+      bin::encode(owner_checks::group_flags(result), owner_checks::group_flags_bin()),
     );
     memo.provide(
       group_rows_query,
       input,
       bin::encode(
-        result.members.map(|m: owner_checks::MemberResult| encode_rows(m.result.rows)),
+        result.members.map(|m: owner_checks::MemberResult|
+          encode_rows(owner_checks::member_rows(m))),
         bin::list_bin(bin::bytes_bin()),
       ),
     );
@@ -1434,20 +1435,28 @@ pub fn imports_of(key: GroupKey) -> List<Imported> / {memo.read, abort.raise} =
     "a group's imports",
   )
 
+fn inferences_of(
+  named: ModuleKey,
+  members: List<OwnerFacts>,
+) -> List<owner_checks::OwnerInference> / {memo.read, abort.raise} =
+  members.map(|f: OwnerFacts|
+    {
+      owner: f.text.owner,
+      typed: inference_of(named, f.text.owner),
+      layout: item_layout([f.text]),
+    })
+
 fn called_in(
   key: GroupKey,
-  walked: List<{ owner: Bytes, typed: owner_checks::InferenceResult }>,
+  walked: List<owner_checks::OwnerInference>,
 ) -> List<Bytes> / {memo.read, abort.raise} =
-  walked.fold(
-    [],
-    |accumulator: List<Bytes>, w: { owner: Bytes, typed: owner_checks::InferenceResult }|
-      called_owners(w.owner, owner_checks::called_names(key.module, w.typed), |n: Bytes|
-        declared_of(key.module, key.shipped, key.tested, n)).fold(
-        accumulator,
-        |a: List<Bytes>, c: Bytes|
-          if key.owners.contains(c) || a.contains(c) { a } else { a.push(c) },
-      ),
-  )
+  walked.fold([], |accumulator: List<Bytes>, w: owner_checks::OwnerInference|
+    called_owners(w.owner, owner_checks::called_names(key.module, w.typed), |n: Bytes|
+      declared_of(key.module, key.shipped, key.tested, n)).fold(
+      accumulator,
+      |a: List<Bytes>, c: Bytes|
+        if key.owners.contains(c) || a.contains(c) { a } else { a.push(c) },
+    ))
 
 fn sibling_for_called(called: List<Bytes>) -> (Bytes) -> Sibling =
   |o: Bytes| if called.contains(o) { ByGroupResult } else { BySignature }
@@ -1462,9 +1471,10 @@ fn finalize_group(
   key: GroupKey,
   members: List<OwnerFacts>,
 ) -> CheckedGroup / {QueryEffects, abort.raise} = {
-  let walked = key.owners.map(|o: Bytes| { owner: o, typed: inference_of(named, o) });
+  let walked = inferences_of(named, members);
   let sibling = sibling_for_called(called_in(key, walked));
-  if walked.any(|w: owner_checks::OwnerInference| w.typed.rejected.len() > 0) {
+  if walked.fold(false, |found: Bool, w: owner_checks::OwnerInference|
+      found || owner_checks::inference_rejected(w.typed)) {
     let c = with_group_read(
       [{ named: named, members: members, imported: imports_of(key) }],
       sibling,
@@ -1537,11 +1547,8 @@ fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise}
   };
   {
     source: { named: named, members: members, imported: imports_of(key) },
-    sibling: if !cycle { always_entire } else {
-      sibling_for_called(
-        called_in(key, key.owners.map(|o: Bytes| { owner: o, typed: inference_of(named, o) })),
-      )
-    },
+    sibling: if !cycle { always_entire }
+    else { sibling_for_called(called_in(key, inferences_of(named, members))) },
   }
 }
 
@@ -1568,10 +1575,7 @@ pub fn signatures_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = 
     "the declarations whose signatures are checked together",
   );
   if !is_signature_unit(key) {
-    bin::encode(
-      { rejected: [], declared: no_stored_declarations },
-      owner_checks::signature_check_bin(),
-    )
+    bin::encode(owner_checks::no_signature_check, owner_checks::signature_check_bin())
   } else {
     let named = { module: key.module, shipped: key.shipped, tested: key.tested };
     let members = key.owners.map(|o: Bytes| shape_of(named, o));
@@ -2027,32 +2031,22 @@ pub fn module_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   result
 }
 
-pub type GroupSummary = { rejected: Bool, warned: Bool, later: Bool, uses: List<UseLink> }
-
-derive bin for GroupSummary
-
 pub const group_summary_query: Bytes = b"group summary"
-
-fn summary_of_group(g: owner_checks::GroupResult) -> GroupSummary =
-  {
-    rejected: g.rejected.len() > 0,
-    warned: g.members.any(|m: owner_checks::MemberResult| m.result.warnings.len() > 0),
-    later: g.members.any(|m: owner_checks::MemberResult|
-      m.result.tagged.len() + m.result.statements.len() > 0),
-    uses: g.members.fold([], |accumulator: List<UseLink>, m: owner_checks::MemberResult|
-      accumulator.concat(m.result.uses.map(link_of))),
-  }
 
 pub fn group_summary_result(input: Bytes) -> Bytes / {memo.write, abort.raise} =
   match memo.written_by(group_query, input) {
     Some(o) -> o,
-    None -> bin::encode(summary_of_group(owner_checks::no_group), group_summary_bin()),
+    None ->
+      bin::encode(
+        owner_checks::group_flags(owner_checks::no_group),
+        owner_checks::group_flags_bin(),
+      ),
   }
 
-fn group_summary_of(g: GroupKey) -> GroupSummary / {memo.read, abort.raise} =
+fn group_summary_of(g: GroupKey) -> owner_checks::GroupFlags / {memo.read, abort.raise} =
   decoded(
     memo.fetch(group_summary_query, bin::encode(g, group_key_bin())),
-    group_summary_bin(),
+    owner_checks::group_flags_bin(),
     "a group's summary",
   )
 
@@ -2074,8 +2068,9 @@ pub fn checked_law_outline(
     tested: named.tested,
     owner: b"law ".concat(written.name),
   };
-  group_listing_of(group_key_of(owner)).members.flat_map(|m: owner_checks::MemberResult|
-    m.result.laws).find(|l: LawOutline| l.name == written.name).unwrap_or(
+  group_listing_of(group_key_of(owner)).members.flat_map(owner_checks::member_laws).find(
+    |l: LawOutline| l.name == written.name,
+  ).unwrap_or(
     written,
   )
 }
@@ -2462,11 +2457,11 @@ pub fn module_summary_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise
   bin::encode(
     {
       rejected: read.problems.len() > 0 || header.len() > 0
-        || summaries.any(|g: GroupSummary| g.rejected),
-      warned: summaries.any(|g: GroupSummary| g.warned)
+        || summaries.any(|g: owner_checks::GroupFlags| g.rejected),
+      warned: summaries.any(|g: owner_checks::GroupFlags| g.warned)
         || (reports_unused(read)
         && any_unreached(
-          summaries.fold([], |accumulator: List<UseLink>, g: GroupSummary|
+          summaries.fold([], |accumulator: List<UseLink>, g: owner_checks::GroupFlags|
             accumulator.concat(g.uses)),
         )),
       functions: items.fold(0, |n: Int, item: OutlineItem|
@@ -2474,7 +2469,7 @@ pub fn module_summary_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise
       tests: items.fold(0, |n: Int, item: OutlineItem|
         match item { OutlinedTest(_) -> n + 1, _ -> n }),
       written: read.shape.written,
-      checked_later: summaries.any(|g: GroupSummary| g.later)
+      checked_later: summaries.any(|g: owner_checks::GroupFlags| g.later)
         || items.any(|i: OutlineItem| states_promise(i) || states_measure(i)),
       promises: items.any(states_promise),
       measures: items.any(states_measure),
