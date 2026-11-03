@@ -1,5 +1,4 @@
-import compiler.syntax.items (InstanceItem, HostInstance, KeyInstance, ReturnsFresh, ReturnsParam,
-                              ShowInstance)
+import compiler.syntax.items (KeyInstance, ReturnsFresh, ReturnsParam, ShowInstance)
 import compiler.syntax.items (effect_set_definition_bin, schema_definition_bin, SchemaDefinition,
                               SchemaItem)
 import compiler.check.resolve.tables (parameters_bin, mapped_place)
@@ -29,7 +28,7 @@ import compiler.syntax.items (EffectSetDefinition, EffectSetItem, Item, Function
                               spec_kind_bin, deriver_bin, instance_kind_bin, Visibility, Public,
                               visibility_bin)
 import compiler.syntax.expressions (Expression, BinaryExpression, Param, expression_span,
-                                    TaggedLiteral, prelude_module)
+                                    TaggedLiteral, prelude_module, prelude_hosts)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, LiteralWide, LiteralBool,
                                  LiteralString, LiteralBytes, LiteralEmbedded, LiteralFloat,
                                  LiteralDecimal, LiteralChar)
@@ -108,6 +107,7 @@ pub type EffectInfo = {
   nondet: Bool,
   operations: List<OperationInfo>,
   at: Location,
+  host: Option<Bytes>,
 }
 
 pub type ConstructorInfo = {
@@ -634,7 +634,6 @@ pub type StoredDeclarations = {
   sets: Map<Bytes, EffectSetDefinition>,
   schemas: Map<Bytes, SchemaDefinition>,
   parameters: Map<Bytes, Parameters>,
-  hosts: Map<Bytes, Bytes>,
 }
 
 pub const no_stored_declarations: StoredDeclarations =
@@ -646,7 +645,6 @@ pub const no_stored_declarations: StoredDeclarations =
     sets: Map::new(),
     schemas: Map::new(),
     parameters: Map::new(),
-    hosts: Map::new(),
   }
 
 fn located_elsewhere(at: Location) -> Location = { module: module_elsewhere, span: generated_span }
@@ -810,13 +808,6 @@ pub fn declarations_checked(
       |found: Map<Bytes, Parameters>, name: Bytes, p: Parameters|
         if own(name) { found.insert(name, p) } else { found },
     ),
-    hosts: parsed.module.items.fold(Map::new(), |found: Map<Bytes, Bytes>, item: Item|
-      match item {
-        InstanceItem(d) -> if d.kind == HostInstance {
-          found.insert(qualify(module, d.target.name), d.function.name)
-        } else { found },
-        _ -> found,
-      }),
   }
 }
 
@@ -829,7 +820,6 @@ pub fn declarations_joined(a: StoredDeclarations, b: StoredDeclarations) -> Stor
     sets: a.sets.merge(b.sets),
     schemas: a.schemas.merge(b.schemas),
     parameters: a.parameters.merge(b.parameters),
-    hosts: a.hosts.merge(b.hosts),
   }
 
 derive bin for RigidParam
@@ -859,7 +849,6 @@ pub effect elsewhere {
   read look_up_effect(name: Bytes) -> Option<EffectInfo>
   read look_up_constructor(name: Bytes) -> Option<ConstructorInfo>
   read look_up_definition(name: Bytes) -> Option<DefinitionFacts>
-  read look_up_host(name: Bytes) -> Option<Bytes>
 }
 
 pub fn with_no_other_definitions<a | e>(
@@ -872,7 +861,6 @@ pub fn with_no_other_definitions<a | e>(
     elsewhere.look_up_effect(name) -> None,
     elsewhere.look_up_constructor(name) -> None,
     elsewhere.look_up_definition(name) -> None,
-    elsewhere.look_up_host(name) -> None,
     mode_facts.look_up_modes(name) -> None,
     termination_facts.look_up_summary(name) -> None,
     termination_facts.look_up_ending(name) -> None,
@@ -1621,6 +1609,7 @@ pub const prelude_effects: List<EffectInfo> = {
       visibility: Public,
       nondet: true,
       at: none,
+      host: prelude_host(b"task"),
       operations: [
         prelude_operation(b"spawn", WriteMode, [0], [0], [body], task, open_effects(0)),
         prelude_operation(b"join", WriteMode, [0], [], [task], ta, abort_effects),
@@ -1649,6 +1638,7 @@ pub const prelude_effects: List<EffectInfo> = {
       visibility: Public,
       nondet: true,
       at: none,
+      host: prelude_host(b"clock"),
       operations: [
         prelude_operation(b"now", ReadMode, [], [], [], instant_type, no_effects),
         prelude_operation(b"sleep", WriteMode, [], [], [duration_type], unit_type, no_effects),
@@ -1661,6 +1651,7 @@ pub const prelude_effects: List<EffectInfo> = {
       visibility: Public,
       nondet: true,
       at: none,
+      host: prelude_host(b"random"),
       operations: [
         prelude_operation(b"next", WriteMode, [], [], [], int_type, no_effects),
         prelude_operation(b"below", WriteMode, [], [], [int_type], int_type, no_effects),
@@ -1673,6 +1664,7 @@ pub const prelude_effects: List<EffectInfo> = {
       visibility: Public,
       nondet: false,
       at: none,
+      host: prelude_host(b"sim"),
       operations: [prelude_operation(b"seed", ReadMode, [], [], [], int_type, no_effects)],
     },
     {
@@ -1682,6 +1674,7 @@ pub const prelude_effects: List<EffectInfo> = {
       visibility: Public,
       nondet: false,
       at: none,
+      host: prelude_host(b"abort"),
       operations: [prelude_operation(b"raise", RaiseMode, [0], [], [string_type], ta, no_effects)],
     },
     {
@@ -1691,6 +1684,7 @@ pub const prelude_effects: List<EffectInfo> = {
       visibility: Public,
       nondet: false,
       at: none,
+      host: prelude_host(b"diverges"),
       operations: [],
     },
     {
@@ -1700,10 +1694,23 @@ pub const prelude_effects: List<EffectInfo> = {
       visibility: Public,
       nondet: false,
       at: none,
+      host: prelude_host(scoped_effect),
       operations: [],
     },
   ]
 }
+
+fn prelude_host(served: Bytes) -> Option<Bytes> =
+  match prelude_hosts.find(|h: { effect: Bytes, module: Bytes, by: Bytes }| h.effect == served) {
+    Some(h) -> Some(qualify(h.module, h.by)),
+    None -> None,
+  }
+
+pub fn effect_host(name: Bytes) -> Option<Bytes> / {elsewhere.read} =
+  match prelude_effects.find(|e: EffectInfo| e.name == name) {
+    Some(e) -> e.host,
+    None -> match elsewhere.look_up_effect(name) { Some(e) -> e.host, None -> None },
+  }
 
 pub const simulated_effects: List<Effect> =
   prelude_effects.fold([], |accumulator: List<Effect>, effect_info: EffectInfo|
