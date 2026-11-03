@@ -40,21 +40,24 @@ pub type Runtime<t | e> = {
   interleave: (InterleavingRun) -> LawRun / e,
 }
 
+pub type Decided<a> = { claim: a, outcome: Outcome }
+
 pub fn discharged<a | e>(
   claims: List<ClaimToDischarge<a>>,
   world: ProverInput,
   sim: plan::Plan,
   runtime: Runtime<PlannedClaim<a> | e>,
-  report_outcome: (a, Outcome) -> Unit / e,
-) -> Unit / {abort.raise | e} = {
-  let needing = claims.fold([], |found: List<PlannedClaim<a>>, c: ClaimToDischarge<a>|
-    match plan_claim(c, world) {
-      Finished(o) -> {
-        report_outcome(c.reported_as, o);
-        found
+) -> List<Decided<a>> / {abort.raise | e} = {
+  let planned = claims.fold(
+    { finished: [], needing: [] },
+    |found: { finished: List<Decided<a>>, needing: List<PlannedClaim<a>> }, c: ClaimToDischarge<a>|
+      match plan_claim(c, world) {
+        Finished(o) ->
+          { ..found, finished: found.finished.push({ claim: c.reported_as, outcome: o }) },
+        NeedsPoints(p) -> { ..found, needing: found.needing.push({ claim: c, plan: p }) },
       },
-      NeedsPoints(p) -> found.push({ claim: c, plan: p }),
-    });
+  );
+  let needing = planned.needing;
   let batches = needing.map(|n: PlannedClaim<a>|
     {
       claim_index: n.claim.claim,
@@ -68,20 +71,25 @@ pub fn discharged<a | e>(
       asked: n,
     });
   let judged = if batches.len() == 0 { [] } else { (runtime.judge)(batches) };
-  judged.fold((), |_: Unit, j: JudgedBatch<PlannedClaim<a>>| {
-    let a = j.batch.asked.claim;
-    let p = j.batch.asked.plan;
-    let js = j.judgements;
-    report_outcome(a.reported_as, match p.kind {
-      LawPoints -> match admitted_points(a.obligation, p, js) {
-        Err(o) -> o,
-        Ok(points) -> search_interleavings(a, p, points, sim, runtime.interleave),
-      },
-      WitnessPoints(c) -> witness_outcome(a.obligation, p, js, c),
-      EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
-      CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
-    })
-  })
+  planned.finished.concat(
+    judged.map(|j: JudgedBatch<PlannedClaim<a>>| {
+      let a = j.batch.asked.claim;
+      let p = j.batch.asked.plan;
+      let js = j.judgements;
+      {
+        claim: a.reported_as,
+        outcome: match p.kind {
+          LawPoints -> match admitted_points(a.obligation, p, js) {
+            Err(o) -> o,
+            Ok(points) -> search_interleavings(a, p, points, sim, runtime.interleave),
+          },
+          WitnessPoints(c) -> witness_outcome(a.obligation, p, js, c),
+          EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
+          CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
+        },
+      }
+    }),
+  )
 }
 
 pub type PlannedClaim<a> = { claim: ClaimToDischarge<a>, plan: PointPlan }
@@ -534,33 +542,15 @@ fn no_runtime() -> Runtime<PlannedClaim<Int> | {abort.raise}> =
       panic("a claim that already has a result must not send a request to the runtime"),
   )
 
-effect reports {
-  write reported(claim: Int, outcome: Outcome) -> Unit
-}
-
 fn reported_outcomes<| e>(
   claims: List<ClaimToDischarge<Int>>,
   sim: plan::Plan,
   runtime: Runtime<PlannedClaim<Int> | e>,
 ) -> Map<Int, Outcome> / {abort.raise | e} =
-  handle {
-    discharged(
-      claims,
-      empty_prover_input,
-      sim,
-      {
-        judge: |bs: List<Batch<PlannedClaim<Int>>>| (runtime.judge)(bs),
-        interleave: |run: InterleavingRun| (runtime.interleave)(run),
-      },
-      |claim: Int, outcome: Outcome| reports.reported(claim, outcome),
-    )
-  } with {
-    var outcomes: Map<Int, Outcome> = Map::new(),
-    reports.reported(claim, outcome) -> {
-      outcomes = outcomes.insert(claim, outcome);
-    },
-    return _discharged -> outcomes,
-  }
+  discharged(claims, empty_prover_input, sim, runtime).fold(
+    Map::new(),
+    |outcomes: Map<Int, Outcome>, d: Decided<Int>| outcomes.insert(d.claim, d.outcome),
+  )
 
 fn run_one<| e>(
   obligation: Obligation,
@@ -808,47 +798,23 @@ test "one runtime request checks the inputs of all claims that need it, each cla
   )
 }
 
-effect events {
-  write heard(what: String) -> Unit
-}
-
-test "each claim is reported once when decided, and claims resolved statically are reported before the runtime is called" {
+test "each claim is decided once, and claims resolved statically come before those the runtime decides" {
   let passing = runtime_from_rule(|_mode: JudgeMode, _point: List<Value>| PointPassed);
-  let order = handle {
-    discharged(
-      [
-        {
-          claim: 4,
-          obligation: open_claim([int_binder("x")]),
-          resolved: undecided,
-          reported_as: 4,
-        },
-        {
-          claim: 5,
-          obligation: open_claim([int_binder("x")]),
-          resolved: Certified(ground_static_proof),
-          reported_as: 5,
-        },
-      ],
-      empty_prover_input,
-      plan::default_plan,
+  let decided = discharged(
+    [
+      { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided, reported_as: 4 },
       {
-        judge: |bs: List<Batch<PlannedClaim<Int>>>| {
-          events.heard("asked");
-          (passing.judge)(bs)
-        },
-        interleave: |run: InterleavingRun| (passing.interleave)(run),
+        claim: 5,
+        obligation: open_claim([int_binder("x")]),
+        resolved: Certified(ground_static_proof),
+        reported_as: 5,
       },
-      |claim: Int, _outcome: Outcome| events.heard(claim.to_string()),
-    )
-  } with {
-    var notes: List<String> = [],
-    events.heard(what) -> {
-      notes = notes.push(what);
-    },
-    return _outcomes -> notes,
-  };
-  assert_eq(order, ["5", "asked", "4"])
+    ],
+    empty_prover_input,
+    plan::default_plan,
+    passing,
+  );
+  assert_eq(decided.map(|d: Decided<Int>| d.claim), [5, 4])
 }
 
 fn lost_update_run(
