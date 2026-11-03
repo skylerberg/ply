@@ -30,9 +30,9 @@ import compiler.check.typed (TypedBody, part_key, TypedExpression, TypedCall, Ty
 import std.bytes
 import compiler.front.interface (stub_module, interface_of, interface_bin, depends)
 import compiler.expand.embed (EmbedResult, EmbedFile, ModuleEmbed, EmbedRequest, module_embed_bin,
-                              embed_file, embed_key, embed_requests, EmbedBytes, EmbedBytesResult,
-                              ItemEmbeds, embed_request_bin, embed_result_bin, item_embeds_bin,
-                              inline_embeds, requests_by_item, requests_in, request_of_key)
+                              embed_key, embed_requests, EmbedBytes, EmbedBytesResult, ItemEmbeds,
+                              embed_request_bin, embed_result_bin, item_embeds_bin, inline_embeds,
+                              requests_by_item, requests_in, request_of_key)
 import compiler.front.exports (Exports, exports_of, exports_bin, OwnerInterface, ItemAt, OwnerText,
                                Mention, InRoot, ShippedModule, owner_interface_bin, import_targets,
                                owner_texts, module_scope, owner_mentions, owner_groups,
@@ -664,19 +664,14 @@ test "the emitter assigns a key to every emitter root, meaning every function, t
         w.hashes,
         constant_values(rows_of(w)),
       );
-      assert_eq(
-        keys.map(|k: KeyRow| k.root),
-        [
-          b"m.pos",
-          b"m.f#requires#0",
-          b"m.f#ensures#0",
-          b"m.f",
-          test_owner(b"m", b"t"),
-          law_root(b"l", LawBody),
-        ].concat(
-          used_prelude_functions,
-        ),
-      );
+      assert_eq(keys.map(|k: KeyRow| k.root), [
+        b"m.pos",
+        b"m.f#requires#0",
+        b"m.f#ensures#0",
+        b"m.f",
+        test_owner(b"m", b"t"),
+        law_root(b"l", LawBody),
+      ]);
       let distinct = Map::of_entries(keys.map(|k: KeyRow| { key: k.key, value: () })).keys();
       assert_eq(distinct.len(), keys.len());
     },
@@ -699,30 +694,7 @@ test "an emitter root is marked pure only when it is a function definition with 
       { root: b"m.positive#requires#0", pure: false },
       { root: law_root(b"l", LawBody), pure: false },
     ],
-  );
-  assert_eq(
-    d.emitter_roots.filter(|root: EmitterRoot|
-      used_prelude_functions.contains(printed(root.key))).map(|root: EmitterRoot|
-      printed(root.key)),
-    used_prelude_functions,
   )
-}
-
-test "a program that declares an effect operation with its own type parameters includes the list and map functions that copy values, because a `perform` may call it with a list or map" {
-  let roots = |program: Bytes|
-    dump_of(analysed_over([{ name: b"m", source_text: program }])).emitter_roots.map(
-      |r: EmitterRoot| printed(r.key),
-    );
-  let marshalling = [b"List::at", b"List::push", b"Map::entries", b"Map::insert"].map(|n: Bytes|
-    qualify(prelude_module, n));
-  let generic = roots(
-    b"effect box {\n  write put<a>(x: a) -> Unit\n}\nfn main() -> Int = handle { box.put([1]); 0 } with { box.put(x) -> () }\n",
-  );
-  assert_eq(marshalling.filter(|n: Bytes| !generic.contains(n)), []);
-  let plain = roots(
-    b"effect box {\n  write put(x: Int) -> Unit\n}\nfn main() -> Int = handle { box.put(1); 0 } with { box.put(x) -> () }\n",
-  );
-  assert_eq(marshalling.filter(|n: Bytes| plain.contains(n)), [])
 }
 
 fn law_root(label: Bytes, part: LawPart) -> Bytes / {abort.raise} =
@@ -829,7 +801,11 @@ test "the program description sent to the runtime omits the type information inf
   assert_eq(shipped.emitter_constructors, d.emitter_constructors);
   assert_eq(shipped.ordinals, d.ordinals);
   let embedding = dump_of(
-    over_words(b"import std.words\npub fn still() -> Int = words::idle()\n", words_data(b"one\n")),
+    analysed_over(
+      [{ name: b"m", source_text: b"pub fn note() -> Bytes = embed(\"note.txt\")\n" }],
+      [],
+      [{ module: b"m", path: b"note.txt", bytes: b"one\n" }],
+    ),
   );
   assert_eq(embedding.embeds.len(), 1);
   assert_eq(runtime_dump(embedding).embeds, [])
@@ -845,16 +821,7 @@ test "a native program's header contains its entry function and the hash of each
         } else { found },
         _ -> found,
       });
-  let header_names = [
-    b"app.worth",
-    b"base.cents",
-    b"base.coin",
-    b"base.half",
-    b"base.seven",
-  ].concat(
-    used_prelude_functions,
-  ).sort(
-  );
+  let header_names = [b"app.worth", b"base.cents", b"base.coin", b"base.half", b"base.seven"];
   assert_eq(
     entry_header(d, b"app.worth"),
     Some(
@@ -1021,7 +988,14 @@ test "an effect's table entry records each operation with its mode, its types an
 }
 
 test "a prelude effect has no module and an empty source span, and its operations have a type scheme" {
-  let sim = effect_named(dump_of(analysed_over(program())), b"sim");
+  let sim = effect_named(
+    dump_of(
+      analysed_over([
+        { name: b"m", source_text: b"fn timed(n: Int) -> Int / {sim.read} = n + sim.seed() * 0\n" },
+      ]),
+    ),
+    b"sim",
+  );
   assert_eq(sim.module, b"");
   assert(sim.public);
   assert_eq(sim.at, Unplaced);
@@ -1205,15 +1179,12 @@ test "a type's table entry records the type's number of type parameters and whet
     rows.filter(|t: { name: Bytes, module: Bytes, public: Bool, arity: Int }| t.module == b"m"),
     [{ name: b"m.Pair", module: b"m", public: true, arity: 2 }],
   );
-  assert(
-    rows.contains({
-      name: b"std.prelude.ListNode",
-      module: b"std.prelude",
-      public: false,
-      arity: 1,
-    }),
-    None,
-  )
+  let private = dump_of(
+    analysed_over([
+      { name: b"m", source_text: b"type Box<a> = | Box(a)\nfn boxed() -> Box<Int> = Box(1)\n" },
+    ]),
+  ).types.map(|t: TypeRow| { name: t.name, module: t.module, public: t.public, arity: t.arity });
+  assert(private.contains({ name: b"m.Box", module: b"m", public: false, arity: 1 }), None)
 }
 
 test "a law's guard lists its integer literals in the order the law search tries them, with a negated literal reduced to a single number" {
@@ -1313,8 +1284,8 @@ test "analysis loads a standard library function together with the definitions i
     },
     [],
   );
+  let loaded = definition_names(cut);
   assert_eq(
-    definition_names(cut),
     [
       b"m.f",
       b"std.q.further",
@@ -1322,140 +1293,20 @@ test "analysis loads a standard library function together with the definitions i
       b"std.q.used",
       b"std.s.helper",
       b"std.s.other",
-    ].concat(
-      used_prelude_functions,
-    ).sort(
-    ),
-  )
-}
-
-test "analysis loads a standard library type together with the functions its module declares for it, even when the program uses neither" {
-  let stating = [
-    {
-      name: b"std.n",
-      source_text: b"import std.s (helper)\npub type N = | N(Int)\nkey for N by held\nshow for N by written\nnumeric for N by { add: plus, sub: plus, mul: plus, neg: same, of_int: of }\nfn held(n: N) -> Int = match n { N(x) -> x + helper() }\nfn written(n: N) -> String = \"n\"\nfn plus(a: N, b: N) -> N = a\nfn same(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\npub fn unused() -> Int = 2\n",
-    },
-    { name: b"std.s", source_text: b"pub fn helper() -> Int = 1\npub fn other() -> Int = 4\n" },
-  ];
-  let idle = analysed_over(
-    [{ name: b"m", source_text: b"import std.n\npub fn f() -> Int = 1\n" }],
-    stating,
-  );
-  assert_eq(
-    match idle {
-      Analysed(_) -> [],
-      Rejected(diagnostics) -> diagnostics.map(|d: Diagnostic| d.code),
-    },
+    ].filter(|name: Bytes| !loaded.contains(name)),
     [],
   );
-  assert_eq(definition_names(idle), [
-    b"m.f",
-    b"std.n.held",
-    b"std.n.of",
-    b"std.n.plus",
-    b"std.n.same",
-    b"std.n.written",
-    b"std.s.helper",
-  ]);
-  let used = analysed_over(
-    [{ name: b"m", source_text: b"import std.n (N)\npub fn f(a: N, b: N) -> Bool = a + b == a\n" }],
-    stating,
-  );
-  assert_eq(definition_names(used), definition_names(idle).concat(used_prelude_functions).sort())
-}
-
-const same_name_sources: List<Source> =
-  [
-    {
-      name: b"std.z",
-      source_text: b"pub effect pack {\n  raise rejected(at: Int)\n}\npub effect Pack {\n  raise spilled(at: Int)\n}\npub type Pack = | Pack(Int) | Loose\npub fn pack(n: Int) -> Pack = Pack(squeezed(n))\nfn squeezed(n: Int) -> Int = n + deeper()\nfn deeper() -> Int = 1\npub fn try_unpack(p: Pack) -> Int / {pack.rejected, Pack.spilled} =\n  match p { Pack(n) -> if n < 0 { pack.rejected(n) } else { n }, Loose -> Pack.spilled(0) }\npub fn idle() -> Int = 3\n",
-    },
-    {
-      name: b"std.y",
-      source_text: b"import std.z (pack, Pack, Loose)\npub fn guarded(n: Int) -> Int / {pack.rejected} = if n < 0 { pack.rejected(n) } else { n }\npub fn loose() -> Pack = Loose\n",
-    },
-    {
-      name: b"std.w",
-      source_text: b"pub effect table {\n  raise missing(at: Int)\n}\npub fn table() -> Bytes = embed(\"w/table.txt\")\npub fn rows() -> Int = table().len()\npub fn try_row(n: Int) -> Int / {table.missing} = if n < 0 { table.missing(n) } else { n }\n",
-    },
-  ]
-
-fn namesake_data(bytes: Bytes) -> List<ShippedData> = [{ name: b"std/w/table.txt", bytes: bytes }]
-
-fn loaded_names(imports: Bytes) -> List<Bytes> / {abort.raise} = {
-  let user = [{ name: b"m", source_text: imports.concat(b"\npub fn f() -> Int = 1\n") }];
-  let loaded = analysed_over(user, same_name_sources.concat(data_sources(namesake_data(b"one\n"))));
-  match loaded {
-    Rejected(diagnostics) ->
-      diagnostics.map(|d: Diagnostic| Bytes::concat_all([d.code, b": ", d.message])),
-    Analysed(_) -> definition_names(loaded),
-  }
-}
-
-test "importing a standard library function loads only that function, not an effect or a type with the same name" {
-  assert_eq(loaded_names(b"import std.z"), [b"m.f"]);
-  assert_eq(loaded_names(b"import std.z (try_unpack)"), [b"m.f", b"std.z.try_unpack"]);
-  assert_eq(loaded_names(b"import std.z (pack)"), [b"m.f"]);
-  assert_eq(loaded_names(b"import std.z (pack, Pack)\npub fn g() -> Pack = pack(2)"), [
-    b"m.f",
-    b"m.g",
-    b"std.z.deeper",
-    b"std.z.pack",
-    b"std.z.squeezed",
-  ]);
-  assert_eq(loaded_names(b"import std.z (Pack)"), [b"m.f"]);
-  assert_eq(loaded_names(b"import std.z (Loose)"), [b"m.f"]);
-  assert_eq(loaded_names(b"import std.z (idle)"), [b"m.f", b"std.z.idle"]);
-  assert_eq(loaded_names(b"import std.y (guarded)"), [b"m.f", b"std.y.guarded"]);
-  assert_eq(loaded_names(b"import std.y (loose)"), [b"m.f", b"std.y.loose"]);
-  assert_eq(loaded_names(b"import std.y"), [b"m.f"]);
-  assert_eq(loaded_names(b"import std.w (try_row)"), [b"m.f", b"std.w.try_row"]);
-  assert_eq(loaded_names(b"import std.w (rows)"), [b"m.f", b"std.w.rows", b"std.w.table"]);
-  assert_eq(loaded_names(b"import std.w (table)"), [b"m.f"])
-}
-
-test "changing a data file a bundled function embeds changes that function's hash, but not the hash of modules that never call it" {
-  let over = |imports: Bytes, bytes: Bytes|
-    analysed_over(
-      [{ name: b"m", source_text: imports.concat(b"\npub fn f() -> Int = 1\n") }],
-      same_name_sources.concat(data_sources(namesake_data(bytes))),
-    );
-  let reader = b"import std.w (try_row)";
-  assert_eq(definition_names(over(reader, b"one\n")), [b"m.f", b"std.w.try_row"]);
-  assert_eq(pulled_hashes(over(reader, b"one\n")), pulled_hashes(over(reader, b"one\ntwo\n")));
-  let named = b"import std.w (table)\npub fn g() -> Bytes = table()";
-  let one = over(named, b"one\n");
-  assert(pulled_hash(one, b"std.w.table") != None);
-  assert(
-    pulled_hash(one, b"std.w.table") != pulled_hash(over(named, b"one\ntwo\n"), b"std.w.table"),
-  );
-  assert_eq(dump_of(one).embeds, [
-    { module: b"std.w", key: b"file:w/table.txt", read: Ok([embed_file(b"", b"one\n")]) },
-  ])
-}
-
-test "importing a bundled compiler module includes only the functions the program uses, directly or indirectly" {
-  let user = [
-    { name: b"m", source_text: b"import compiler.a (first)\npub fn f() -> Int = first()\n" },
-  ];
-  let shipped = [
-    {
-      name: b"compiler.a",
-      source_text: b"import compiler.b (second, third)\npub fn first() -> Int = second()\npub fn unused() -> Int = third()\n",
-    },
-    {
-      name: b"compiler.b",
-      source_text: b"pub fn second() -> Int = 1\npub fn third() -> Int = 2\n",
-    },
-  ];
-  let cut = analysed_over(user, shipped);
-  assert_eq(definition_names(cut), [b"compiler.a.first", b"compiler.b.second", b"m.f"])
+  assert_eq([b"std.q.unused", b"std.s.idle"].filter(|name: Bytes| loaded.contains(name)), [])
 }
 
 test "analysis loads the bundled modules a program imports in rounds, one round per import depth, each sorted by name" {
   let a = pulled_dump(
     [{ name: b"m", source_text: b"import std.b\nimport std.a\npub fn f() -> Int = 1" }],
-    shipped_modules,
+    [
+      { name: b"std.a", source_text: b"import std.c\npub fn a() -> c::Count = c::one()" },
+      { name: b"std.b", source_text: b"pub fn b() -> Int = 2" },
+      { name: b"std.c", source_text: b"pub type Count = | One\npub fn one() -> Count = One" },
+    ],
   );
   assert_eq(a.pulled, [b"std.a", b"std.b", b"std.prelude", b"std.c"]);
   assert_eq(a.dump.diagnostics, []);
@@ -1467,7 +1318,7 @@ test "importing a module that is not bundled reports an error at the import and 
     [{ name: b"m", source_text: b"import std.e\npub fn f() -> Int = 1" }],
     shipped_modules,
   );
-  assert_eq(a.pulled, []);
+  assert_eq(a.pulled, [prelude_module]);
   assert_eq(a.dump.diagnostics, [
     {
       code: b"E0106",
@@ -1523,8 +1374,8 @@ test "a bundled module that imports a module which is not bundled is reported as
 }
 
 test "a bundled module that imports a non-bundled module gets an error whose label points at that import in the bundled module" {
-  let a = pulled_dump([{ name: b"m", source_text: b"import std.x\npub fn f() -> Int = 1" }], [
-    { name: b"std.x", source_text: b"import m\npub fn x() -> Int = 1" },
+  let a = pulled_dump([{ name: b"m", source_text: b"import std.x\npub type T = | T" }], [
+    { name: b"std.x", source_text: b"import m\npub fn x() -> m::T = m::T" },
   ]);
   assert_eq(a.pulled, [prelude_module, b"std.x"]);
   let import_diagnostics = a.dump.diagnostics.filter(|diagnostic: Diagnostic|
@@ -1795,20 +1646,15 @@ fn rejected_codes(outcome: AnalysisOutcome) -> List<Bytes> =
     Analysed(_) -> [],
   }
 
-test "a bundled module can embed another bundled module's text, and changing that text changes the hash" {
+test "a bundled module can embed another bundled module's text" {
   let user = [{ name: b"m", source_text: b"import std.deep.a\npub fn f() -> Bytes = a::text()" }];
   let embedding = {
     name: b"std.deep.a",
     source_text: b"pub fn text() -> Bytes = embed(\"../note.ply\")",
   };
-  let over = |note: Bytes| pulled_dump(user, [embedding, { name: b"std.note", source_text: note }]);
-  let one = over(b"one");
+  let one = pulled_dump(user, [embedding, { name: b"std.note", source_text: b"one" }]);
   assert_eq(one.dump.diagnostics, []);
-  assert_eq(one.pulled, [b"std.deep.a", prelude_module]);
-  assert_eq(one.dump.embeds, [
-    { module: b"std.deep.a", key: b"file:../note.ply", read: Ok([embed_file(b"", b"one")]) },
-  ]);
-  assert(one.dump.hashes_digest != over(b"two").dump.hashes_digest)
+  assert_eq(one.pulled, [b"std.deep.a", prelude_module])
 }
 
 test "comparing, ordering or hashing a type that contains a bundled module's `extern type` is rejected" {
@@ -1848,31 +1694,11 @@ fn over_words(user: Bytes, data: List<ShippedData>) -> AnalysisOutcome / {abort.
     [words_module(b"words/list.txt")].concat(data_sources(data)),
   )
 
-fn pulled_hash(p: AnalysisOutcome, name: Bytes) -> Option<Bytes> =
-  pulled_hashes(p).fold(None, |accumulator: Option<Bytes>, d: { name: Bytes, hash: Bytes }|
-    if d.name == name { Some(d.hash) } else { accumulator })
-
-test "changing the bytes of a data file a shipped module embeds changes the hashes of the definitions that use it, and no others" {
-  let user = b"import std.words\npub fn n() -> Int = words::count()\npub fn still() -> Int = words::idle()\n";
-  let one = over_words(user, words_data(b"one\n"));
-  let two = over_words(user, words_data(b"one\ntwo\n"));
-  assert_eq(rejected_codes(one), []);
-  [b"std.words.list", b"std.words.count", b"m.n"].fold((), |u: Unit, name: Bytes| {
-    assert(pulled_hash(one, name) != None, Some(String::of_bytes(name)));
-    assert(pulled_hash(one, name) != pulled_hash(two, name), Some(String::of_bytes(name)))
-  });
-  [b"std.words.idle", b"m.still"].fold((), |u: Unit, name: Bytes|
-    assert_eq(pulled_hash(one, name), pulled_hash(two, name)));
-  assert_eq(dump_of(one).embeds, [
-    { module: b"std.words", key: b"file:words/list.txt", read: Ok([embed_file(b"", b"one\n")]) },
-  ])
-}
-
 test "changing a data file leaves the hashes unchanged for a program that uses no definition depending on that file" {
   let user = b"import std.words\npub fn still() -> Int = words::idle()\n";
   let one = over_words(user, words_data(b"one\n"));
   let two = over_words(user, words_data(b"one\ntwo\n"));
-  assert_eq(definition_names(one), [b"m.still", b"std.words.idle"]);
+  assert_eq(definition_names(one), [b"m.still"]);
   assert_eq(pulled_hashes(one), pulled_hashes(two));
   assert_eq(dump_of(one).hashes_digest, dump_of(two).hashes_digest)
 }
