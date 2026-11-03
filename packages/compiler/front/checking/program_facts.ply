@@ -11,14 +11,11 @@ import compiler.front.exports (named_node)
 import compiler.front.facts (Argument, StatementSite, TaggedSite, callees_of, statement_site_bin,
                              tagged_site_bin, with_hashes)
 import compiler.front.rows (DeclaredEffect, DeclaredOperation, declared_effect_bin)
-import compiler.front.checking.world (CheckDefinition, ModuleKey)
-import compiler.front.checking.groups (TestHash, code_part, declared_effects_part,
-                                       hash_summary_query, imports_part, sites_part, tests_part)
-import compiler.front.checking.promises (hash_of_definition)
-
-pub type Modules = { root: Int, own: List<Bytes>, pulled: List<Bytes> }
-
-derive bin for Modules
+import compiler.front.checking.world (CheckDefinition, ModuleKey, Modules, modules_bin)
+import compiler.front.checking.groups (code_part, declared_effects_part, hashes_query, imports_part,
+                                       sites_part, tests_part)
+import compiler.front.checking.identity (identity_of)
+import compiler.store.hash.forms (DefinitionRun)
 
 fn own_key(module: Bytes) -> ModuleKey = { module: module, shipped: false, tested: false }
 
@@ -60,7 +57,9 @@ pub fn test_list(
         label: match labels.get(t.key) {
           Some(at) -> at,
           None ->
-            panic("the program holds no label of the test `" ++ String::of_bytes_lossy(t.key) ++ "`"),
+            panic(
+              "the program holds no label of the test `" ++ String::of_bytes_lossy(t.key) ++ "`",
+            ),
         },
       }),
     effects: effects.fold(
@@ -85,8 +84,11 @@ pub fn test_list_result(modules: Modules) -> Written / {memo.read, abort.raise} 
       {
         tests: read.tests.fold(found.tests, |tests: List<TestInfo>, t: TestInfo|
           tests.push({ ..t, index: tests.len(), at: { ..t.at, module: i } })),
-        labels: read.labels.fold(found.labels, |labels: Map<Bytes, Location>, key: Bytes, at: Location|
-          labels.insert(key, { ..at, module: i })),
+        labels: read.labels.fold(
+          found.labels,
+          |labels: Map<Bytes, Location>, key: Bytes, at: Location|
+            labels.insert(key, { ..at, module: i }),
+        ),
       }
     },
   );
@@ -98,23 +100,13 @@ pub fn test_list_result(modules: Modules) -> Written / {memo.read, abort.raise} 
       placed.tests,
       placed.labels,
       keys.fold(Map::new(), |found: Map<Bytes, Bool>, k: ModuleKey|
-        part_fetched(declared_effects_part(), k).fold(found, |m: Map<Bytes, Bool>, d: DeclaredEffect|
-          m.insert(d.name, d.nondet))),
-      keys.map(|k: ModuleKey| fetched(hash_summary_query(), k).record),
+        part_fetched(declared_effects_part(), k).fold(
+          found,
+          |m: Map<Bytes, Bool>, d: DeclaredEffect| m.insert(d.name, d.nondet),
+        )),
+      keys.map(|k: ModuleKey| fetched(hashes_query(), k).record),
     ),
   )
-}
-
-pub type TestIdentity = { run: Bytes, listing: Option<Bytes> }
-
-pub fn test_identities(
-  modules: Modules,
-  keys: List<Bytes>,
-) -> Map<Bytes, TestIdentity> / {memo.read, abort.raise} = {
-  let wanted = keys.fold(Map::new(), |found: Map<Bytes, Bool>, key: Bytes| found.insert(key, true));
-  keys_of(modules).fold(Map::new(), |found: Map<Bytes, TestIdentity>, k: ModuleKey|
-    fetched(hash_summary_query(), k).tests.fold(found, |m: Map<Bytes, TestIdentity>, t: TestHash|
-      if wanted.contains(t.key) { m.insert(t.key, { run: t.hash, listing: t.listing }) } else { m }))
 }
 
 pub type ProgramRollup = {
@@ -177,7 +169,10 @@ pub fn module_imports(modules: Modules) -> List<List<Int>> / {memo.read, abort.r
       match slots.get(name) { Some(i) -> found.push(i), None -> found }))
 }
 
-pub fn reached_modules(imports: List<List<Int>>, start: List<Int>) -> Map<Int, Bool> / {abort.raise} =
+pub fn reached_modules(
+  imports: List<List<Int>>,
+  start: List<Int>,
+) -> Map<Int, Bool> / {abort.raise} =
   iterate(
     { seen: Map::new(), work: start },
     imports.fold(start.len() + 1, |n: Int, edges: List<Int>| n + edges.len()),
@@ -195,11 +190,12 @@ pub fn names_reached(
   imports: List<List<Int>>,
   start: List<Bytes>,
 ) -> Map<Bytes, Bool> / {abort.raise} = {
-  let wanted = start.fold(Map::new(), |found: Map<Bytes, Bool>, name: Bytes| found.insert(name, true));
-  reached_modules(imports, range(0, names.len()).filter(|i: Int| wanted.contains(names.get(i)))).fold(
-    Map::new(),
-    |found: Map<Bytes, Bool>, i: Int, _: Bool| found.insert(names.get(i), true),
-  )
+  let wanted = start.fold(Map::new(), |found: Map<Bytes, Bool>, name: Bytes|
+    found.insert(name, true));
+  reached_modules(
+    imports,
+    range(0, names.len()).filter(|i: Int| wanted.contains(names.get(i))),
+  ).fold(Map::new(), |found: Map<Bytes, Bool>, i: Int, _: Bool| found.insert(names.get(i), true))
 }
 
 fn hashes_of_callees(
@@ -208,9 +204,20 @@ fn hashes_of_callees(
 ) -> Map<Bytes, Bytes> / {memo.read, abort.raise} = {
   let known = names_of(modules).fold(Map::new(), |found: Map<Bytes, Bool>, m: Bytes|
     found.insert(m, true));
-  callees.fold(Map::new(), |found: Map<Bytes, Bytes>, name: Bytes|
-    if found.contains(name) || !known.contains(named_node(name).module) { found }
-    else { match hash_of_definition(name) { Some(h) -> found.insert(name, h), None -> found } })
+  callees.fold(Map::new(), |found: Map<Bytes, Bytes>, name: Bytes| {
+    let module = named_node(name).module;
+    if found.contains(name) || !known.contains(module) { found } else {
+      match identity_of({
+          module: module,
+          shipped: !modules.own.contains(module),
+          tested: false,
+          subject: DefinitionRun(name),
+        }) {
+        Some(h) -> found.insert(name, h),
+        None -> found,
+      }
+    }
+  })
 }
 
 pub fn program_sites_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
