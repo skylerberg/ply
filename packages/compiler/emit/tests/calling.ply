@@ -8,11 +8,17 @@ import compiler.emit.keys (RootKey, InlinedLambda, Named, Root, Generic, LawPart
                            Specialisation, Evidence, key_types, definition_of)
 import compiler.front.checking.unit_programs (built, roots_built)
 import compiler.unit (unit_text)
-import compiler.emit.typed_ir.statics (StaticDefinition, StaticWords, FieldWord)
+import compiler.emit.typed_ir.statics (StaticDefinition, StaticWords, FieldWord, StaticStruct,
+                                       RawWord, EntryWord, named_by_content)
+import compiler.emit.code (Code, CodeLiteral)
+import compiler.emit.pieces (own_symbol)
+import compiler.emit.print (printed_function)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt)
+import compiler.syntax.parsing (generated_span)
 import compiler.emit.typed_ir (with_ownerships, reps_of, param_ownerships, LoopVariable, OfHandling)
 import compiler.emit.typed_ir.handling (SchedulerEvidence, Perform, HeapInstance)
 import compiler.emit.representations (BoundLambda, EmitParam, has_variables)
-import compiler.emit.lower.module_context (root_body, param_type)
+import compiler.emit.lower.module_context (ModuleContext, root_body, param_type)
 import compiler.check.typed (WholeBody)
 import compiler.emit.typed_ir (ZeroOperand, Representation, AsInt, AsBool, AsWord, AsImmediate,
                                AsFlattened, AsSum, AsListView, CaseAllocation, Variable, Arg,
@@ -28,14 +34,14 @@ import compiler.emit.typed_ir.containers (Rest, ItemAt)
 import compiler.emit.lower (lowered_fn, lowered_group)
 import compiler.emit.lower.base (GroupMember)
 import compiler.emit.lower.calling (known_body, lambdas_of, context_of)
-import compiler.emit.output (GenericCall, needs_specialisation)
-import compiler.emit.root_emission (built_form)
+import compiler.emit.output (GenericCall, DefinitionSymbol, needs_specialisation)
+import compiler.emit.root_emission (built_form, emitted_of, ir_tables, root_from_code)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.verify (ownership_fault)
 import compiler.emit.roots (symbol_of)
 import compiler.emit.emit_harness (Program, program_of, scheduled_program_of, printed_text,
                                    build_failure, built_c, shipped_lowered, recorded_in,
-                                   over_program)
+                                   over_program, lowered_in_empty_module)
 import compiler.emit.lower.representation (passing, ByReference, c_values_of, value_words)
 import compiler.emit.layout (max_flat_words)
 import compiler.emit.print.value_printing (signature_types)
@@ -2217,4 +2223,49 @@ test "a function passed through a module that does not import its effect still r
       assert_eq(opened.filter(|f: Bytes| f.index_of(b"ctx->bridge") != None).len(), 0)
     },
   }
+}
+
+const empty_module_context: ModuleContext =
+  { module: b"m", definitions: [], imports: [], release_build: false }
+
+fn literal_code(l: SourceLiteral) -> Code =
+  { node: CodeLiteral(l), span: generated_span, ty: int_type }
+
+test "a root is emitted with an `_entry` function that the runtime calls, and is recorded as defined with that entry" {
+  let e = lowered_in_empty_module(||
+    emitted_of(
+      root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7))),
+    ));
+  assert_eq(e.tables.defined.map(|d: DefinitionSymbol| d.entered), [true]);
+  assert_eq(e.text.index_of(symbol_of(b"m.f")), None);
+  assert(
+    e.text.index_of(
+        Bytes::concat_all([b"Word ", own_symbol(None), b"_entry(PlyCtx *ctx, const Word *args)"]),
+      )
+      != None,
+  )
+}
+
+test "a function that a static's type-descriptor entry points to is listed among the calls of the function body that uses the static" {
+  let dup = Named(b"m.dup#T");
+  let type_descriptor = named_by_content(
+    StaticStruct({
+      of: b"PlyType",
+      fields: [
+        RawWord(1),
+        RawWord(0),
+        RawWord(0),
+        EntryWord(dup),
+        RawWord(0),
+        RawWord(0),
+        RawWord(0),
+      ],
+    }),
+  );
+  let t = lowered_in_empty_module(|| {
+    let f = root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7)));
+    let counted = { ..insert_reference_counts(f), statics: [type_descriptor] };
+    ir_tables(counted, printed_function(counted))
+  });
+  assert(t.calls.contains(dup))
 }

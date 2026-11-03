@@ -7,7 +7,8 @@ import compiler.emit.code (Code, CodeLiteral, CodeVariable, NDefinition, NConstr
                            CodeRecordPattern, CodeListPattern, CodePatternField, Capture)
 import compiler.emit.moves (Moves, read_moved, capture_moved)
 import compiler.front.published (ClaimClause)
-import compiler.check.infer.checker (Builtin)
+import compiler.check.infer.checker (Builtin, elsewhere)
+import compiler.emit.representations (code_facts)
 import compiler.syntax.items (SpaceClause)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralString, LiteralBytes,
                                  LiteralEmbedded)
@@ -19,9 +20,11 @@ import context (Context, Definition, BodyWithMoves, constructor, signature, is_r
 import cost (Polynomial, ParameterRelation, Same, Part, Other, IndexBound, OnTail, OnIndex, zero,
              constant, size_of, plus, product, at_args, ceiling_of, callees, reachable,
              params_sized, arithmetic, definition_using_keyed_type, recursion_descent,
-             descent_calls, growth_preserved, is_length, stated_cost, context_owning,
+             descent_calls, growth_preserved, is_length, stated_cost, fixture_context,
              index_bound_of, takes_some, operation_relation, assumed, possible, literal_size,
              callback_calls, iterating_of, by_entry, natives, dominated_space)
+import compiler.emit.emit_harness (accepted_session)
+import compiler.front.checking (lowered_over)
 import domain (Sort, FunctionSort, NamedSort, RecordSort)
 import std.list
 import compiler.check.typed (binding_key)
@@ -92,7 +95,7 @@ pub fn space_clause_bound(
 pub fn space_bound(
   context: Context,
   definition: String,
-) -> Result<Polynomial, String> / {abort.raise} = {
+) -> Result<Polynomial, String> / {elsewhere.read, code_facts.read, abort.raise} = {
   let results = builtin_result_kinds;
   let reach = reachable(context, definition);
   let moved = moved_bodies(context.claims, reach);
@@ -1561,13 +1564,23 @@ fn callback(
     },
   }
 
-fn shown(source: Bytes, definition: String) -> Result<Bool, String> / {abort.raise} =
-  within_clause(
-    context_owning([{ name: b"m", source_text: source }], |_m: Bytes| true),
-    "m." ++ definition,
-  )
+fn with_fixture_context<a>(
+  sources: List<{ name: Bytes, source_text: Bytes }>,
+  owned: (Bytes) -> Bool,
+  body: (Context) -> a / {elsewhere.read, code_facts.read, abort.raise},
+) -> a / {abort.raise} = {
+  let fixture = accepted_session(sources);
+  lowered_over(fixture.program, || body(fixture_context(fixture, owned)))
+}
 
-fn within_clause(context: Context, name: String) -> Result<Bool, String> / {abort.raise} =
+fn shown(source: Bytes, definition: String) -> Result<Bool, String> / {abort.raise} =
+  with_fixture_context([{ name: b"m", source_text: source }], |_m: Bytes| true, |context: Context|
+    within_clause(context, "m." ++ definition))
+
+fn within_clause(
+  context: Context,
+  name: String,
+) -> Result<Bool, String> / {elsewhere.read, code_facts.read, abort.raise} =
   match context.claims.definitions.get(name) {
     None -> panic("the fixture has no definition with that name"),
     Some(d) -> match d.spec.filter(|c: ClaimClause| c.kind == SpaceClause) {
@@ -1649,8 +1662,8 @@ test "a function parameter's `space` name stands for the space that each call of
 }
 
 test "a call of the prelude's `map` on a list that another variable also uses needs the space its `space` bound states" {
-  let context = |bind_pattern: Bytes|
-    context_owning(
+  let within = |bind_pattern: Bytes|
+    with_fixture_context(
       [
         {
           name: b"m",
@@ -1662,9 +1675,10 @@ test "a call of the prelude's `map` on a list that another variable also uses ne
         },
       ],
       |m: Bytes| m == b"m",
+      |context: Context| within_clause(context, "m.f"),
     );
-  assert_eq(within_clause(context(b"xs.len()"), "m.f"), Ok(true));
-  assert_eq(within_clause(context(b"1"), "m.f"), Ok(false))
+  assert_eq(within(b"xs.len()"), Ok(true));
+  assert_eq(within(b"1"), Ok(false))
 }
 
 fn chain_source() -> Bytes = b"type Chain = | Link(Int, Chain) | End\n"
@@ -1781,7 +1795,7 @@ test "a fold copies its starting list only on the first call, and only when anot
 }
 
 test "a call to another package's definition uses the space its `space` bound states, when no other variable uses the arguments" {
-  let context = context_owning(
+  with_fixture_context(
     [
       {
         name: b"base",
@@ -1793,12 +1807,14 @@ test "a call to another package's definition uses the space its `space` bound st
       },
     ],
     |m: Bytes| m == b"app",
-  );
-  assert_eq(space_bound(context, "app.f"), Ok([Map::new().insert(0, 1)]));
-  assert_eq(
-    space_bound(context, "app.g"),
-    Err(
-      "`base.ones` may be called with arguments shared with other values, and its `space` bound assumes arguments that are not shared",
-    ),
+    |context: Context| {
+      assert_eq(space_bound(context, "app.f"), Ok([Map::new().insert(0, 1)]));
+      assert_eq(
+        space_bound(context, "app.g"),
+        Err(
+          "`base.ones` may be called with arguments shared with other values, and its `space` bound assumes arguments that are not shared",
+        ),
+      )
+    },
   )
 }
