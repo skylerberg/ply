@@ -30,8 +30,8 @@ import testing.schedule (Effect, Counts, ScheduledTest, counts, group_by_conflic
                          isolation_word, parallelism, cross_test_effects)
 import testing.delta (kind_word)
 import testing.diagnose (RankedChange)
-import testing.select (Cached, Changed, Decision, New, PreviousFailure, Reason, SameCode, Search,
-                       Unhashed, pass_keys_by_test, to_run, reason_word)
+import testing.select (Cached, Changed, Decision, New, Nondet, PreviousFailure, Reason, SameCode,
+                       Search, pass_keys_by_test, to_run, reason_word)
 import std.bytes
 import std.string
 import std.fmt (fixed_point)
@@ -62,7 +62,7 @@ pub type Case = {
   name: String,
   module: String,
   nondet: Bool,
-  hash: Option<String>,
+  hash: String,
   effects: String,
   listed: List<PrintedEffect>,
   seeded: Bool,
@@ -358,8 +358,7 @@ fn milliseconds_json(us: Int) -> Json =
 pub fn display_of(program: Program, case: Case) -> String =
   if program.modules.len() > 1 { case.key } else { case.name }
 
-fn short_of(hash: Option<String>) -> String / {abort.raise} =
-  match hash { Some(h) -> h.slice(0, 12), None -> "-".repeat(12) }
+fn short_of(hash: String) -> String / {abort.raise} = hash.slice(0, 12)
 
 fn dim_place(style: Style, places: List<SourceText>, at: Place) -> String / {abort.raise} =
   match location_text(places, at) { Some(text) -> "   " ++ dim(style, text), None -> "" }
@@ -376,19 +375,17 @@ fn location_json(places: List<SourceText>, diagnostic: Diagnostic) -> Json / {ab
 
 fn reason_key(reason: String) -> String = String::join(reason.split(" "), "_")
 
-fn reason_text(reason: String) -> String =
-  if reason == "new" { "this hash has never passed, so nothing is known about it" }
-  else if reason == "changed" {
-    "something the test read when it last passed has changed since, so that result can no longer be trusted"
-  } else if reason == "previous failure" {
-    "the last cached result is a failure, and a failure is never reused"
-  } else if reason == "cached" {
-    "this exact hash already passed; re-running cannot reveal anything new"
-  } else if reason == "same code" {
-    "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new"
-  } else if reason == "nondet" {
-    "a `test/nondet` test runs every time, because its effects can write"
-  } else { "no hash was produced, so no cached result can be trusted" }
+fn reason_text(reason: Reason) -> String =
+  match reason {
+    New -> "this hash has never passed, so nothing is known about it",
+    Changed(_) ->
+      "something the test read when it last passed has changed since, so that result can no longer be trusted",
+    PreviousFailure -> "the last cached result is a failure, and a failure is never reused",
+    Cached -> "this exact hash already passed; re-running cannot reveal anything new",
+    SameCode ->
+      "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new",
+    Nondet -> "a `test/nondet` test runs every time, because its effects can write",
+  }
 
 pub fn isolated_as(host_case_indices: List<Int>, case: Case) -> String =
   isolation_word(isolation_of(host_use_of(host_case_indices, case)))
@@ -619,23 +616,25 @@ fn case_line(
 
 fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
   let recorded = "a result is cached under the test's hash and the runtime version "
-    ++ short_of(Some(program.cache_stamp))
+    ++ short_of(program.cache_stamp)
     ++ ", and under the code the test ran together with the values it read from the system";
   ["", indent ++ dim(style, "key"), indent ++ "  " ++ dim(style, recorded)]
 }
 
-fn reasons_seen(program: Program, decided: RunDecision) -> List<String> =
-  program.cases.fold([], |accumulator: List<String>, case: Case| {
-    let reason = reason_word(reason_of(decided, case.index));
-    if accumulator.contains(reason) { accumulator } else { accumulator.push(reason) }
+fn reasons_seen(program: Program, decided: RunDecision) -> List<Reason> =
+  program.cases.fold([], |accumulator: List<Reason>, case: Case| {
+    let reason = reason_of(decided, case.index);
+    if accumulator.any(|seen: Reason| reason_word(seen) == reason_word(reason)) { accumulator }
+    else { accumulator.push(reason) }
   })
 
 fn reason_lines(style: Style, program: Program, decided: RunDecision) -> List<String> = {
   let seen = reasons_seen(program, decided);
   if seen.len() == 0 { [] } else {
     ["", indent ++ dim(style, "why")].concat(
-      seen.map(|reason: String|
-        indent ++ "  " ++ reason.pad_right(16, " ") ++ " " ++ dim(style, reason_text(reason))),
+      seen.map(|reason: Reason|
+        indent ++ "  " ++ reason_word(reason).pad_right(16, " ") ++ " "
+          ++ dim(style, reason_text(reason))),
     )
   }
 }
@@ -1119,11 +1118,11 @@ pub fn case_json(report: RunReport, case: Case, decided: RunDecision) -> Json / 
       { key: "key", value: Str(case.key) },
       { key: "name", value: Str(case.name) },
       { key: "module", value: Str(case.module) },
-      { key: "hash", value: string_or_null(case.hash) },
+      { key: "hash", value: Str(case.hash) },
       { key: "nondet", value: Bool(case.nondet) },
       { key: "selected", value: Bool(runs_test(decided, case.index)) },
       { key: "reason", value: Str(reason_key(reason_word(reason_of(decided, case.index)))) },
-      { key: "why", value: Str(reason_text(reason_word(reason_of(decided, case.index)))) },
+      { key: "why", value: Str(reason_text(reason_of(decided, case.index))) },
       { key: "changed_input", value: string_or_null(changed_read_of(decided, case.index)) },
       { key: "group", value: int_or_null(group_of(decided, case.index)) },
       { key: "outside_effects", value: Str(case.effects) },
@@ -1551,7 +1550,7 @@ test "a reason is written as separate words in the report line and with undersco
   assert_eq(reason_key(reason_word(PreviousFailure)), "previous_failure");
   assert_eq(reason_key(reason_word(New)), "new");
   assert_eq(reason_word(Changed("the file `a.ply`")), "changed");
-  assert_eq(reason_word(Unhashed), "unhashed")
+  assert_eq(reason_key(reason_word(SameCode)), "same_code")
 }
 
 test "a search report gives the interleavings explored, and how many a search ignoring time or pruning would have explored" {
@@ -1597,17 +1596,8 @@ test "a bounded naive count makes the ratio a lower bound" {
 }
 
 test "every reason has an explanation of its own" {
-  let lines = [New, Changed(""), PreviousFailure, Cached, SameCode, Unhashed].map(
-    |r: Reason| reason_word(r),
-  ).map(
-    reason_text,
-  );
-  assert_eq(
-    range(0, 6).filter(|i: Int|
-      range(0, 6).filter(|j: Int| lines.at_or(i, "") == lines.at_or(j, "")).len() == 1).len(
-    ),
-    6,
-  )
+  let lines = [New, Changed(""), PreviousFailure, Cached, SameCode, Nondet].map(reason_text);
+  assert(lines.all(|line: String| lines.filter(|other: String| other == line).len() == 1))
 }
 
 test "a failed load exits with code 2 and prints its errors with their count" {

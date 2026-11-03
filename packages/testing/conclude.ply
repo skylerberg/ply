@@ -1,4 +1,5 @@
 import std.list
+import std.set (Set)
 import select (Cached, Pass, Reason, passed_before)
 
 pub type SearchSummary = { explored: Int, exhaustive: Bool, exhausted: Bool, failed: Bool }
@@ -17,7 +18,7 @@ pub type Test = {
   index: Int,
   key: Bytes,
   seeded: Bool,
-  hash: Option<Bytes>,
+  hash: Bytes,
   start: Bytes,
   case: Bool,
 }
@@ -27,7 +28,6 @@ pub type RunSelection = {
   recorded: Map<Int, List<Bytes>>,
   codes: Map<Int, List<Bytes>>,
   reasons: Map<Int, Reason>,
-  out_of_scope: List<Int>,
 }
 
 pub type Record = | WrittenUnder(List<Bytes>) | Exhausted | Unobserved | Untraced
@@ -154,24 +154,21 @@ pub fn recorded_pass<d>(
           update: {
             passes: written.map(|k: Bytes| { key: k, trace: trace }),
             code_passes: coded.map(|k: Bytes| { key: k, trace: trace }),
-            records: match declared.hash {
-              Some(hash) -> if is_written(record) {
-                [
-                  {
-                    key: declared.key,
-                    record: {
-                      test: hash,
-                      era: era,
-                      start: declared.start,
-                      case: declared.case,
-                      passes: written,
-                      codes: coded,
-                    },
+            records: if is_written(record) {
+              [
+                {
+                  key: declared.key,
+                  record: {
+                    test: declared.hash,
+                    era: era,
+                    start: declared.start,
+                    case: declared.case,
+                    passes: written,
+                    codes: coded,
                   },
-                ]
-              } else { [] },
-              None -> [],
-            },
+                },
+              ]
+            } else { [] },
           },
         }
       },
@@ -249,13 +246,11 @@ pub fn undecided<d>(
   chosen: RunSelection,
   outcomes: List<Outcome<d>>,
 ) -> List<Bytes> = {
-  let proven = outcomes.fold(Map::new(), |accumulator: Map<Int, Bool>, o: Outcome<d>|
-    if o.status == "passed" { accumulator.insert(o.index, true) } else { accumulator });
-  let out = chosen.out_of_scope.fold(Map::new(), |accumulator: Map<Int, Bool>, i: Int|
-    accumulator.insert(i, true));
+  let proven = outcomes.fold(Set::empty(), |accumulator: Set<Int>, o: Outcome<d>|
+    if o.status == "passed" { accumulator.insert(o.index) } else { accumulator });
   tests.filter(|t: Test| {
     let green = match chosen.reasons.get(t.index) { Some(r) -> passed_before(r), None -> false };
-    !out.contains(t.index) && !green && !proven.contains(t.index)
+    !green && !proven.contains(t.index)
   }).map(|t: Test| t.key)
 }
 
@@ -343,7 +338,7 @@ fn a_test(index: Int, name: Bytes) -> Test =
     index: index,
     key: b"m." ++ name,
     seeded: false,
-    hash: Some(b"t" ++ Bytes::of_string(index.to_string())),
+    hash: b"t" ++ Bytes::of_string(index.to_string()),
     start: b"m." ++ name,
     case: false,
   }
@@ -356,11 +351,10 @@ fn select_all(tests: List<Test>) -> RunSelection =
   {
     groups: [tests.map(|t: Test| t.index)],
     recorded: tests.fold(Map::new(), |accumulator: Map<Int, List<Bytes>>, t: Test|
-      match t.hash { Some(h) -> accumulator.insert(t.index, [h]), None -> accumulator }),
+      accumulator.insert(t.index, [t.hash])),
     codes: tests.fold(Map::new(), |accumulator: Map<Int, List<Bytes>>, t: Test|
       accumulator.insert(t.index, [b"c" ++ Bytes::of_string(t.index.to_string())])),
     reasons: Map::new(),
-    out_of_scope: [],
   }
 
 fn passing(index: Int) -> TestResult<String> =
@@ -533,20 +527,6 @@ test "a passing test with no recorded keys is counted as passed but stores no pa
   assert_eq(c.passed, 1);
   assert_eq(c.outcomes.map(|o: Outcome<String>| o.recorded), [None]);
   assert_eq(c.store_update.passes, [])
-}
-
-test "a test outside the run's scope is not undecided" {
-  let chosen = { ..select_all(two_tests), out_of_scope: [1] };
-  let c = conclude_run(two_tests, snapshot, chosen, no_changes, [passing(0)]);
-  assert_eq(undecided(two_tests, chosen, c.outcomes), [])
-}
-
-test "a passing test with no hash is stored under its keys but gets no record naming the test" {
-  let unhashed = [{ ..a_test(0, b"adds"), hash: None }];
-  let chosen = { ..select_all(unhashed), recorded: Map::new().insert(0, [b"k"]) };
-  let c = conclude_run(unhashed, snapshot, chosen, no_changes, [passing(0)]);
-  assert_eq(c.store_update.passes, [pass_of(b"k")]);
-  assert_eq(c.store_update.records, [])
 }
 
 test "`conclude_run` stores a passing test that used the host with its trace of file reads, under both its test key and its code key" {

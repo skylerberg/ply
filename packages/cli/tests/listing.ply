@@ -1,19 +1,18 @@
 import progress
 import std.list
-import compiler.check.infer.checker (EffectInfo, Location, TestInfo)
+import compiler.check.infer.checker (EffectInfo, TestInfo, prelude_effects)
 import compiler.check.resolve.tables (Diagnostic, Source)
 import compiler.store.memo (memo)
 import compiler.emit.keys (RootKey, TestCases, root_name, root_text, test_key, test_roots)
 import compiler.front.checking (LoadInputs)
 import compiler.front.checking.identity (identity_of)
 import compiler.front.checking.view
-import compiler.front.checking.program_facts (ListedTest, TestList, names_of, names_reached,
-                                              test_list)
+import compiler.front.checking.program_facts (TestList, names_of, names_reached)
 import module_queries (LaterChecks)
-import compiler.front.facts (ProgramListing, test_labels)
+import compiler.front.facts (ProgramListing)
 import compiler.front.rows (Outline)
 import compiler.store.hash.forms
-import compiler.store.hash.forms (Identified, ModuleHashes, NodeRef, TestRun, InsidePackage,
+import compiler.store.hash.forms (Identified, NodeRef, TestRun, InsidePackage,
                                   hash_identities, identity_in)
 import compiler.syntax.parsing (generated_span)
 import diagnostic (SourceText)
@@ -24,35 +23,51 @@ pub type TestIdentity =
   | OverCases({ run: Bytes, listing: Bytes })
   | CaseOf({ parent: Bytes, run: Bytes })
 
-pub type SelectedTest = { info: TestInfo, label: Location, identity: TestIdentity }
+pub type SelectedTest = { info: TestInfo, identity: TestIdentity }
+
+pub type Determinism = | Deterministic | Nondeterministic
 
 pub type TestListing = {
   root: Int,
   names: List<Bytes>,
   tests: List<SelectedTest>,
-  effects: Map<Bytes, Bool>,
-  records: List<Bytes>,
+  effects: Map<Bytes, Determinism>,
   filtered_out: Int,
 }
 
-pub type TestReading = { listing: TestListing, later: LaterChecks, schema: Option<Diagnostic> }
+pub type TestReading = {
+  listing: TestListing,
+  later: LaterChecks,
+  schema: Option<Diagnostic>,
+  records: List<Bytes>,
+}
 
-pub type Selection = { tests: List<ListedTest>, filtered_out: Int }
+pub type Selection = { tests: List<TestInfo>, filtered_out: Int }
+
+pub type NamedEffect = { name: Bytes, nondet: Bool }
+
+fn determinism(nondet: Bool) -> Determinism = if nondet { Nondeterministic } else { Deterministic }
+
+pub fn effect_determinism(declared: List<NamedEffect>) -> Map<Bytes, Determinism> =
+  prelude_effects.map(|e: EffectInfo| { name: e.name, nondet: e.nondet }).concat(declared).fold(
+    Map::new(),
+    |found: Map<Bytes, Determinism>, e: NamedEffect| found.insert(e.name, determinism(e.nondet)),
+  )
 
 pub fn listing_of<| e>(
   list: TestList,
   selection: Selection,
   identity: (TestInfo) -> TestIdentity / e,
+  effects: Map<Bytes, Determinism>,
 ) -> TestListing / e =
   {
     root: list.root,
     names: list.names,
     tests: range(0, selection.tests.len()).map(|i: Int| {
       let t = selection.tests.get(i);
-      { info: { ..t.info, index: i }, label: t.label, identity: identity(t.info) }
+      { info: { ..t, index: i }, identity: identity(t) }
     }),
-    effects: list.effects,
-    records: list.records,
+    effects: effects,
     filtered_out: selection.filtered_out,
   }
 
@@ -94,18 +109,10 @@ pub fn roots_of_tests(listing: TestListing) -> List<RootKey> / {abort.raise} =
   listing.tests.fold([], |found: List<RootKey>, t: SelectedTest|
     found.concat(test_roots(t.info.module, t.info.name, t.info.cases)))
 
-pub fn test_list_of_program(w: ProgramListing) -> TestList / {abort.raise} =
-  test_list(
-    w.root,
-    w.outlines.map(|o: Outline| o.name),
-    w.checked.tests,
-    test_labels(w.outlines),
-    w.checked.effects.fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
-      found.insert(e.name, e.nondet)),
-    w.modules.map(|m: ModuleHashes| m.record),
-  )
+pub fn test_list_of_program(w: ProgramListing) -> TestList =
+  { root: w.root, names: w.outlines.map(|o: Outline| o.name), tests: w.checked.tests }
 
-pub fn in_run(list: TestList, t: ListedTest) -> Bool = t.info.at.module < list.root
+pub fn in_run(list: TestList, t: TestInfo) -> Bool = t.at.module < list.root
 
 pub fn listing_of_program(w: ProgramListing) -> TestListing / {abort.raise} = {
   let list = test_list_of_program(w);
@@ -122,8 +129,9 @@ pub fn listing_of_program(w: ProgramListing) -> TestListing / {abort.raise} = {
   };
   listing_of(
     list,
-    { tests: list.tests.filter(|t: ListedTest| in_run(list, t)), filtered_out: 0 },
+    { tests: list.tests.filter(|t: TestInfo| in_run(list, t)), filtered_out: 0 },
     identity,
+    effect_determinism(w.checked.effects.map(|e: EffectInfo| { name: e.name, nondet: e.nondet })),
   )
 }
 
@@ -147,7 +155,7 @@ pub fn view_of_imports(
   let names = names_of(t.modules);
   let reached = names_reached(
     names,
-    t.value.later.reading.sites.imports,
+    t.value.later.reading.imports,
     start.push(b"std.prelude"),
   );
   let included = range(0, names.len()).filter(|i: Int| reached.contains(names.get(i)));
@@ -174,19 +182,17 @@ test "only a test over cases has a root that lists its cases" {
     cases: false,
     effects: [],
     at: { module: 0, span: generated_span },
+    label: { module: 0, span: generated_span },
   };
   let over_cases = { ..plain, name: b"over", key: b"m.over", cases: true };
-  let list = test_list(
-    1,
-    [b"m"],
-    [plain, over_cases],
-    [plain, over_cases].fold(Map::new(), |found: Map<Bytes, Location>, t: TestInfo|
-      found.insert(t.key, t.at)),
+  let list = { root: 1, names: [b"m"], tests: [plain, over_cases] };
+  let listing = listing_of(
+    list,
+    { tests: list.tests, filtered_out: 0 },
+    |info: TestInfo|
+      if info.cases { OverCases({ run: b"r", listing: b"l" }) } else { PlainRun(b"r") },
     Map::new(),
-    [],
   );
-  let listing = listing_of(list, { tests: list.tests, filtered_out: 0 }, |info: TestInfo|
-    if info.cases { OverCases({ run: b"r", listing: b"l" }) } else { PlainRun(b"r") });
   let run = test_key(b"m", b"over");
   assert_eq(
     roots_of_tests(listing).map(|k: RootKey| root_text(root_name(k))),

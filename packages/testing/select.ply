@@ -9,7 +9,7 @@ pub type Row = {
   label: String,
   name: String,
   module: String,
-  hash: Option<Bytes>,
+  hash: Bytes,
   seeded: Bool,
   nondet: Bool,
 }
@@ -28,13 +28,10 @@ pub fn digest_of(s: Search) -> Bytes / {abort.raise} =
 
 pub fn per_root(s: Search) -> Bool = writes_seed_keys(s.mode, s.budget, s.steps, s.path)
 
-pub fn key_of(row: Row, s: Search) -> Option<Bytes> / {abort.raise} =
-  match row.hash {
-    None -> None,
-    Some(h) -> Some(result_key(h, row.seeded, digest_of(s), s.profile)),
-  }
+pub fn key_of(row: Row, s: Search) -> Bytes / {abort.raise} =
+  result_key(row.hash, row.seeded, digest_of(s), s.profile)
 
-pub fn keyed_per_root(row: Row, s: Search) -> Bool = row.seeded && row.hash != None && per_root(s)
+pub fn keyed_per_root(row: Row, s: Search) -> Bool = row.seeded && per_root(s)
 
 pub type StoredResult = | Passing | Moved(String) | Failing
 
@@ -43,8 +40,8 @@ pub type Case = {
   label: String,
   name: String,
   module: String,
-  hash: Option<Bytes>,
-  cache_key: Option<Bytes>,
+  hash: Bytes,
+  cache_key: Bytes,
   seeded: Bool,
   nondet: Bool,
   cached: Option<StoredResult>,
@@ -53,7 +50,7 @@ pub type Case = {
 
 pub fn case_of(
   row: Row,
-  cache_key: Option<Bytes>,
+  cache_key: Bytes,
   cached: Option<StoredResult>,
   pending_seeds: Option<List<Int>>,
 ) -> Case =
@@ -70,7 +67,7 @@ pub fn case_of(
     pending_seeds: pending_seeds,
   }
 
-pub type Reason = | New | Changed(String) | PreviousFailure | Cached | SameCode | Unhashed | Nondet
+pub type Reason = | New | Changed(String) | PreviousFailure | Cached | SameCode | Nondet
 
 pub type Pass = { key: Bytes, trace: Bytes }
 
@@ -81,8 +78,7 @@ pub fn passed_before(r: Reason) -> Bool = match r { Cached -> true, SameCode -> 
 pub fn runs(d: Decision) -> Bool = !passed_before(d.reason)
 
 pub fn reason_of(c: Case) -> Reason =
-  if c.nondet { Nondet }
-  else if c.cache_key == None { Unhashed } else {
+  if c.nondet { Nondet } else {
     match c.cached {
       None -> match c.pending_seeds {
         Some(roots) -> if roots.len() == 0 { Cached } else { New },
@@ -138,21 +134,18 @@ pub fn pass_keys_by_test(
 ) -> List<{ index: Int, keys: List<Bytes> }> / {abort.raise} = {
   let digest = digest_of(s);
   decisions.fold([], |accumulator: List<{ index: Int, keys: List<Bytes> }>, d: Decision|
-    match d.case.hash {
-      None -> accumulator,
-      Some(h) -> if !runs(d) { accumulator } else {
-        accumulator.push({
-          index: d.case.index,
-          keys: pass_keys(
-            h,
-            d.case.seeded,
-            digest,
-            per_root(s),
-            roots_to_search(d.case, s.roots),
-            s.profile,
-          ),
-        })
-      },
+    if !runs(d) { accumulator } else {
+      accumulator.push({
+        index: d.case.index,
+        keys: pass_keys(
+          d.case.hash,
+          d.case.seeded,
+          digest,
+          per_root(s),
+          roots_to_search(d.case, s.roots),
+          s.profile,
+        ),
+      })
     })
 }
 
@@ -163,12 +156,10 @@ pub fn code_keys(
 ) -> Map<Int, Bytes> / {abort.raise} = {
   let digest = digest_of(s);
   decisions.fold(Map::new(), |accumulator: Map<Int, Bytes>, d: Decision|
-    if d.case.hash == None { accumulator } else {
-      match codes.get(d.case.index) {
-        None -> accumulator,
-        Some(code) ->
-          accumulator.insert(d.case.index, code_key(code, d.case.seeded, digest, s.profile)),
-      }
+    match codes.get(d.case.index) {
+      None -> accumulator,
+      Some(code) ->
+        accumulator.insert(d.case.index, code_key(code, d.case.seeded, digest, s.profile)),
     })
 }
 
@@ -220,7 +211,6 @@ pub fn reason_word(r: Reason) -> String =
     PreviousFailure -> "previous failure",
     Cached -> "cached",
     SameCode -> "same code",
-    Unhashed -> "unhashed",
     Nondet -> "nondet",
   }
 
@@ -232,8 +222,8 @@ fn a_case(index: Int, cached: Option<StoredResult>) -> Case =
     label: "doubles",
     name: "m.doubles",
     module: "m",
-    hash: Some(a_hash),
-    cache_key: Some(a_hash),
+    hash: a_hash,
+    cache_key: a_hash,
     seeded: false,
     nondet: false,
     cached: cached,
@@ -246,7 +236,7 @@ const a_row: Row =
     label: "doubles",
     name: "m.doubles",
     module: "m",
-    hash: Some(a_hash),
+    hash: a_hash,
     seeded: false,
     nondet: false,
   }
@@ -273,32 +263,16 @@ test "only a stored passing result makes a test skip running" {
   assert_eq(reason(0, Some(Failing)), PreviousFailure)
 }
 
-test "a test with no hash runs, because there is no key to have a cached result under" {
-  assert_eq(reason_of({ ..a_case(0, Some(Passing)), cache_key: None }), Unhashed);
-  let row = {
-    index: 0,
-    label: "t",
-    name: "m.t",
-    module: "m",
-    hash: None,
-    seeded: true,
-    nondet: false,
-  };
-  assert_eq(key_of(row, dpor), None);
-  assert(!keyed_per_root(row, random(4)))
-}
-
 const code_hash: Bytes = b"\x77".repeat(32)
 
-test "a new test reuses a stored pass for the same code, runs again after a stored failure, and a test without a hash gets no key" {
+test "a new test reuses a stored pass for the same code, and runs again after a stored failure" {
   let decisions = decide([
     a_case(0, None),
     a_case(1, Some(Failing)),
     a_case(2, None),
     { ..a_case(3, None), nondet: true },
-    { ..a_case(4, None), hash: None, cache_key: None },
   ]);
-  let codes = range(0, 5).fold(Map::new(), |m: Map<Int, Bytes>, i: Int| m.insert(i, code_hash));
+  let codes = range(0, 4).fold(Map::new(), |m: Map<Int, Bytes>, i: Int| m.insert(i, code_hash));
   let keys = code_keys(decisions, codes, dpor);
   assert_eq(keys.keys(), [0, 1, 2, 3]);
   assert_eq(keys.get(0), keys.get(2));
@@ -312,12 +286,11 @@ test "a new test reuses a stored pass for the same code, runs again after a stor
     PreviousFailure,
     New,
     Nondet,
-    Unhashed,
   ]);
   assert_eq(returned.written_passes, [
     { key: result_key(a_hash, false, digest_of(dpor), dpor.profile), trace: b"read" },
   ]);
-  assert_eq(to_run(returned.decisions), [1, 2, 3, 4]);
+  assert_eq(to_run(returned.decisions), [1, 2, 3]);
   assert_eq(reused(returned.decisions), [{ index: 0, outcome: "passed" }])
 }
 
@@ -358,7 +331,7 @@ test "`reason_word` returns the word the report prints for each reason a test ru
   assert_eq(reason_word(PreviousFailure), "previous failure");
   assert_eq(reason_word(Cached), "cached");
   assert_eq(reason_word(SameCode), "same code");
-  assert_eq(reason_word(Unhashed), "unhashed")
+  assert_eq(reason_word(Nondet), "nondet")
 }
 
 test "`key_of` gives a randomly seeded test a key that depends on the search setting, and every test a key that depends on the profile" {
@@ -367,7 +340,7 @@ test "`key_of` gives a randomly seeded test a key that depends on the search set
     label: "t",
     name: "m.t",
     module: "m",
-    hash: Some(a_hash),
+    hash: a_hash,
     seeded: false,
     nondet: false,
   };
@@ -417,7 +390,7 @@ test "`pending_roots` returns the seeds whose own cache key has no stored pass, 
 test "a passing test is stored under its code hash, and a rerun of some seeds also stores a key for each seed it ran" {
   let hermetic = decide([a_case(0, None)]);
   assert_eq(pass_keys_by_test(hermetic, dpor), [
-    { index: 0, keys: [key_of(a_row, dpor).unwrap_or(b"")] },
+    { index: 0, keys: [key_of(a_row, dpor)] },
   ]);
   assert_eq(pass_keys_by_test(decide([a_case(0, Some(Passing))]), dpor), []);
   let seeded = { ..a_case(0, None), seeded: true, pending_seeds: Some([2, 3]) };
