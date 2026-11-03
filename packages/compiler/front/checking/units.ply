@@ -47,8 +47,8 @@ import compiler.store.handles (QueryOf, PartOf, KeyedPartOf, Written, written, w
 import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (lowering_rejected, always_enters, CalleeFacts, LoweredBatch, LoweredUnit,
-                      UnitCode, UnitSummary, RootSummary, CalleesRead, unit_code_bin,
-                      unit_summary_bin, root_summary_bin, no_callee_facts, with_callee,
+                      UnitCode, CalleeSummary, RootSummary, CalleesRead, unit_code_bin,
+                      callee_summary_bin, root_summary_bin, no_callee_facts, with_callee,
                       unit_lowered, part_library, enters, LoweringInput, lowering_input)
 
 pub type CodeUnit = | OfGroup(GroupKey) | OfRoot(RootAt) | NoCode
@@ -59,13 +59,15 @@ pub type Entries = { roots: List<RootKey>, tested: Bool }
 
 pub type PartMembers = { module: Bytes, label: Bytes, units: List<CodeUnit> }
 
-pub type RootLink = { root: RootName, unit: Bytes, calls: List<RootName> }
+pub type RootLink = { key: RootKey, unit: Int, calls: List<Int> }
 
-pub type UnitFailure = { unit: CodeUnit, reason: Bytes }
+pub type UnitFailure = { unit: Int, reason: Bytes }
+
+pub type ReachedPart = { module: Bytes, label: Bytes, members: List<Int> }
 
 pub type Reached = {
-  parts: List<PartMembers>,
-  roots: List<RootKey>,
+  units: List<CodeUnit>,
+  parts: List<ReachedPart>,
   links: List<RootLink>,
   failures: List<UnitFailure>,
 }
@@ -75,8 +77,8 @@ pub type MadePart = { identity: Bytes, foreign: Map<RootName, Prototype>, codes:
 pub type PartCode = { part: PartMembers, made: MadePart }
 
 pub type ProgramCode = {
+  units: List<CodeUnit>,
   parts: List<PartCode>,
-  roots: List<RootKey>,
   links: List<RootLink>,
   failures: List<UnitFailure>,
 }
@@ -93,19 +95,17 @@ derive bin for RootLink
 
 derive bin for UnitFailure
 
+derive bin for ReachedPart
+
 derive bin for Reached
 
 derive bin for MadePart
 
-derive bin for PartCode
-
-derive bin for ProgramCode
-
 pub fn code_query() -> QueryOf<CodeUnit, UnitCode> =
   { name: b"code", input: code_unit_bin(), output: unit_code_bin() }
 
-pub fn code_summary_part() -> PartOf<CodeUnit, UnitCode, UnitSummary> =
-  { query: code_query(), name: b"summary", output: unit_summary_bin() }
+fn code_callee_part() -> KeyedPartOf<CodeUnit, UnitCode, RootName, CalleeSummary> =
+  { query: code_query(), name: b"callee", key: root_name_bin(), output: callee_summary_bin() }
 
 fn code_failure_part() -> PartOf<CodeUnit, UnitCode, Option<Bytes>> =
   { query: code_query(), name: b"failure", output: bin::option_bin(bin::bytes_bin()) }
@@ -382,9 +382,12 @@ fn program_of_root(k: RootKey, tested: Bool) -> GroupKey / {memo.read, abort.rai
 
 type ProgramScope = { scope: emit::Scope, input: LoweringInput }
 
-type CalleesSeen = { roots: Set<RootName>, units: Set<CodeUnit> }
-
-type Lowering = { scopes: Map<Bytes, ProgramScope>, tested: Bool, seen: CalleesSeen }
+type Lowering = {
+  scopes: Map<Bytes, ProgramScope>,
+  tested: Bool,
+  unit: CodeUnit,
+  seen: Set<RootName>,
+}
 
 pub fn collect_constant_values(group: GroupKey) -> Written / {memo.read, abort.raise} =
   stored_rows(group).definitions.fold(
@@ -572,7 +575,7 @@ fn natives_here(s: Lowering, called: Set<Bytes>) -> List<Extern> / {memo.read, a
 fn failed_unit(reason: Bytes) -> LoweredUnit =
   {
     code: { results: [], requested: [], externs: [] },
-    summary: { published: [], needs: Map::new(), called: Map::new() },
+    callees: Map::new(),
     roots: [],
     failure: Some(reason),
   }
@@ -635,28 +638,23 @@ fn lowered_batches(
 fn has_published_signature(k: RootKey) -> Bool =
   match k { Generated(_, _) -> false, EntryPoint(_) -> false, _ -> true }
 
-fn summary_of(unit: CodeUnit) -> UnitSummary / {memo.read, abort.raise} =
-  fetch_part(code_summary_part(), unit)
-
 fn callee_read(
   s: Lowering,
   facts: CalleeFacts,
   k: RootKey,
-) -> CalleesRead<Lowering> / {memo.read, abort.raise} =
-  if !has_published_signature(k) || s.seen.roots.contains(root_name(k)) {
-    { state: s, facts: facts }
-  } else {
+) -> CalleesRead<Lowering> / {memo.read, abort.raise} = {
+  let name = root_name(k);
+  if !has_published_signature(k) || s.seen.contains(name) { { state: s, facts: facts } } else {
+    let state = { ..s, seen: s.seen.insert(name) };
     let callee = unit_of_root(k, s.tested);
-    let roots = s.seen.roots.insert(root_name(k));
-    if callee == NoCode || s.seen.units.contains(callee) {
-      { state: { ..s, seen: { ..s.seen, roots: roots } }, facts: facts }
-    } else {
-      {
-        state: { ..s, seen: { roots: roots, units: s.seen.units.insert(callee) } },
-        facts: with_callee(facts, summary_of(callee)),
+    if callee == NoCode || callee == s.unit { { state: state, facts: facts } } else {
+      match fetch_keyed_part(code_callee_part(), callee, name) {
+        Some(summary) -> { state: state, facts: with_callee(facts, name, summary) },
+        None -> { state: state, facts: facts },
       }
     }
   }
+}
 
 fn lowered_unit(
   unit: CodeUnit,
@@ -665,11 +663,7 @@ fn lowered_unit(
 ) -> LoweredUnit / {EmitReads, QueryEffects} =
   unit_lowered(
     roots,
-    {
-      scopes: Map::new(),
-      tested: tested,
-      seen: { roots: Set::empty(), units: Set::empty().insert(unit) },
-    },
+    { scopes: Map::new(), tested: tested, unit: unit, seen: Set::empty() },
     |s: Lowering, ks: List<RootKey>, ownership: Map<RootName, OwnershipSignature>|
       lowered_batches(s, ks, ownership),
     |s: Lowering, facts: CalleeFacts, ks: List<RootKey>|
@@ -693,17 +687,15 @@ pub fn lower_unit(unit: CodeUnit) -> Written / {QueryEffects, abort.raise} = {
     OfRoot(r) -> lowered_or_failed(unit, [r.key], r.tested),
     NoCode -> lowered_or_failed(unit, [], false),
   };
-  made.roots.fold(
-    with_part(
-      with_part(written(code_query(), made.code), code_summary_part(), made.summary),
-      code_failure_part(),
-      made.failure,
+  made.callees.fold(
+    made.roots.fold(
+      with_part(written(code_query(), made.code), code_failure_part(), made.failure),
+      |w: Written, r: RootSummary| with_keyed_part(w, code_root_part(), root_name(r.key), r),
     ),
-    |w: Written, r: RootSummary| with_keyed_part(w, code_root_part(), root_name(r.key), r),
+    |w: Written, name: RootName, summary: CalleeSummary|
+      with_keyed_part(w, code_callee_part(), name, summary),
   )
 }
-
-type ReachWalk = { units: Map<Bytes, CodeUnit>, links: List<RootLink>, failures: List<UnitFailure> }
 
 const copy_buckets: Int = 16
 
@@ -884,54 +876,65 @@ fn reached_roots(entries: Entries) -> ReachedWalk / {memo.read, abort.raise} =
       },
   )
 
+fn position_of<k>(positions: Map<k, Int>, key: k) -> Int / {abort.raise}
+  where derivable(ord, k)
+=
+  match positions.get(key) {
+    Some(i) -> i,
+    None -> panic("a reached unit or root is missing from the program it was reached in"),
+  }
+
+fn positions_of<k>(keys: List<k>) -> Map<k, Int>
+  where derivable(ord, k)
+= keys.fold(Map::new(), |m: Map<k, Int>, key: k| m.insert(key, m.len()))
+
 pub fn find_reachable_units(entries: Entries) -> Written / {memo.read, abort.raise} = {
   let walk = reached_roots(entries);
-  let reached = walk.visits;
-  let walked = reached.fold(
-    { units: Map::new(), links: [], failures: [] },
-    |w: ReachWalk, v: Visit<RootKey, ReachedRoot>| {
-      let at = bin::encode(v.value.unit, code_unit_bin());
-      {
-        ..w,
-        units: if v.value.unit == NoCode { w.units } else { w.units.insert(at, v.value.unit) },
-        links: w.links.push({
-          root: root_name(v.key),
-          unit: at,
-          calls: v.value.calls.map(root_name),
-        }),
-        failures: with_failure(w.failures, v.value.unit, walk.lowered),
-      }
-    },
-  );
-  let parts = walked.units.fold(
+  let coded = walk.visits.filter(|v: Visit<RootKey, ReachedRoot>| v.value.unit != NoCode);
+  let parts = coded.fold(
+    Set::empty(),
+    |found: Set<CodeUnit>, v: Visit<RootKey, ReachedRoot>| found.insert(v.value.unit),
+  ).elements(
+  ).fold(
     Map::new(),
-    |built: Map<Bytes, PartMembers>, _: Bytes, unit: CodeUnit| with_unit_part(built, unit),
+    with_unit_part,
   ).values(
   );
-  lowered_by_level(
-    walk.lowered,
-    parts.flat_map(|p: PartMembers| p.units).filter(|u: CodeUnit| !walk.lowered.contains(u)),
-  );
+  let units = parts.flat_map(|p: PartMembers| p.units);
+  lowered_by_level(walk.lowered, units.filter(|u: CodeUnit| !walk.lowered.contains(u)));
+  let unit_positions = positions_of(units);
+  let root_positions = positions_of(coded.map(|v: Visit<RootKey, ReachedRoot>| root_name(v.key)));
   written(reachable_query(), {
-    parts: parts,
-    roots: reached.map(|v: Visit<RootKey, ReachedRoot>| v.key),
-    links: walked.links,
-    failures: walked.failures,
+    units: units,
+    parts: parts.map(|p: PartMembers|
+      {
+        module: p.module,
+        label: p.label,
+        members: p.units.map(|u: CodeUnit| position_of(unit_positions, u)),
+      }),
+    links: coded.map(|v: Visit<RootKey, ReachedRoot>|
+      {
+        key: v.key,
+        unit: position_of(unit_positions, v.value.unit),
+        calls: v.value.calls.fold([], |found: List<Int>, c: RootKey|
+          match root_positions.get(root_name(c)) { Some(i) -> found.push(i), None -> found }),
+      }),
+    failures: coded.fold([], |found: List<UnitFailure>, v: Visit<RootKey, ReachedRoot>|
+      with_failure(found, position_of(unit_positions, v.value.unit), v.value.unit, walk.lowered)),
   })
 }
 
 fn with_failure(
   failures: List<UnitFailure>,
+  at: Int,
   unit: CodeUnit,
   lowered: Lowered,
 ) -> List<UnitFailure> / {abort.raise} =
-  if unit == NoCode { failures } else {
-    match lowered.get(unit) {
-      Some(Some(reason)) -> if failures.any(|f: UnitFailure| f.unit == unit) { failures }
-      else { failures.push({ unit: unit, reason: reason }) },
-      Some(None) -> failures,
-      None -> panic("a reached unit was not lowered"),
-    }
+  match lowered.get(unit) {
+    Some(Some(reason)) -> if failures.any(|f: UnitFailure| f.unit == at) { failures }
+    else { failures.push({ unit: at, reason: reason }) },
+    Some(None) -> failures,
+    None -> panic("a reached unit was not lowered"),
   }
 
 fn unit_code_of(unit: CodeUnit) -> UnitCode / {memo.read, abort.raise} = fetch(code_query(), unit)
@@ -1058,33 +1061,31 @@ pub fn entries_of(roots: List<RootKey>) -> Entries / {memo.read, abort.raise} =
 
 pub fn program_code(entries: Entries) -> ProgramCode / {memo.read, abort.raise} = {
   let reached = fetch(reachable_query(), entries);
+  let parts = reached.parts.map(|p: ReachedPart|
+    { module: p.module, label: p.label, units: p.members.map(|i: Int| reached.units.get(i)) });
   {
-    parts: list::zip(reached.parts, fetch_all(part_query(), reached.parts)).map(
+    units: reached.units,
+    parts: list::zip(parts, fetch_all(part_query(), parts)).map(
       |p: { first: PartMembers, second: MadePart }| { part: p.first, made: p.second },
     ),
-    roots: reached.roots,
     links: reached.links,
     failures: reached.failures,
   }
 }
 
-fn unit_digests(code: ProgramCode) -> Map<Bytes, Bytes> / {abort.raise} =
-  code.parts.fold(Map::new(), |found: Map<Bytes, Bytes>, p: PartCode|
-    range(0, p.part.units.len()).fold(found, |m: Map<Bytes, Bytes>, i: Int|
-      m.insert(bin::encode(p.part.units.get(i), code_unit_bin()), p.made.codes.get(i))))
+fn unit_digests(code: ProgramCode) -> List<Bytes> = code.parts.flat_map(|p: PartCode| p.made.codes)
+
+fn first_reached(code: ProgramCode) -> List<Int> =
+  code.links.fold(
+    { seen: Set::empty(), found: [] },
+    |s: { seen: Set<Int>, found: List<Int> }, l: RootLink|
+      if s.seen.contains(l.unit) { s }
+      else { { seen: s.seen.insert(l.unit), found: s.found.push(l.unit) } },
+  ).found
 
 pub fn reached_digests(code: ProgramCode) -> List<Bytes> / {abort.raise} = {
   let digests = unit_digests(code);
-  code.links.fold(
-    { seen: Set::empty(), found: [] },
-    |s: { seen: Set<Bytes>, found: List<Bytes> }, l: RootLink|
-      if s.seen.contains(l.unit) { s } else {
-        {
-          seen: s.seen.insert(l.unit),
-          found: match digests.get(l.unit) { Some(d) -> s.found.push(d), None -> s.found },
-        }
-      },
-  ).found
+  first_reached(code).map(|i: Int| digests.get(i))
 }
 
 pub fn code_failures(code: ProgramCode) -> List<Diagnostic> =
@@ -1094,46 +1095,38 @@ pub fn reached_codes(
   code: ProgramCode,
 ) -> Result<List<UnitCode>, List<Diagnostic>> / {memo.read, abort.raise} =
   match code_failures(code) {
-    [] ->
-      Ok(
-        code.links.map(|l: RootLink| l.unit).unique().fold(
-          [],
-          |found: List<UnitCode>, at: Bytes| {
-            let unit = decoded(at, code_unit_bin(), "a unit of code");
-            if unit == NoCode { found } else { found.push(unit_code_of(unit)) }
-          },
-        ),
-      ),
+    [] -> Ok(first_reached(code).map(|i: Int| unit_code_of(code.units.get(i)))),
     failed -> Err(failed),
   }
+
+type ClosureDigests = { by_link: Map<Int, Bytes>, by_root: Map<RootName, Bytes> }
 
 pub fn closure_codes(code: ProgramCode) -> Map<RootName, Bytes> / {abort.raise} = {
   let links = code.links;
   let digests = unit_digests(code);
-  let own = links.map(|l: RootLink| match digests.get(l.unit) { Some(d) -> d, None -> b"" });
-  let index = range(0, links.len()).fold(Map::new(), |m: Map<RootName, Int>, i: Int|
-    m.insert(links.get(i).root, i));
-  let edges = links.map(|l: RootLink|
-    l.calls.fold([], |found: List<Int>, c: RootName|
-      match index.get(c) { Some(j) -> found.push(j), None -> found }));
-  let below = graph::components({ out: edges }).fold(
-    Map::new(),
-    |done: Map<Int, Bytes>, component: List<Int>| {
+  let edges = links.map(|l: RootLink| l.calls);
+  graph::components({ out: edges }).fold(
+    { by_link: Map::new(), by_root: Map::new() },
+    |done: ClosureDigests, component: List<Int>| {
       let inside = component.fold(Set::empty(), |m: Set<Int>, i: Int| m.insert(i));
       let reached = component.fold([], |found: List<Bytes>, i: Int|
         edges.get(i).fold(found, |a: List<Bytes>, j: Int|
           if inside.contains(j) { a }
-          else { match done.get(j) { Some(d) -> a.push(d), None -> a } }));
+          else { match done.by_link.get(j) { Some(d) -> a.push(d), None -> a } }));
       let digest = blake3(
         Bytes::concat_all(
-          component.map(|i: Int| own.get(i)).sort().unique().concat(reached.sort().unique()),
+          component.map(|i: Int| digests.get(links.get(i).unit)).sort().unique().concat(
+            reached.sort().unique(),
+          ),
         ),
       );
-      component.fold(done, |m: Map<Int, Bytes>, i: Int| m.insert(i, digest))
+      component.fold(done, |m: ClosureDigests, i: Int|
+        {
+          by_link: m.by_link.insert(i, digest),
+          by_root: m.by_root.insert(root_name(links.get(i).key), digest),
+        })
     },
-  );
-  range(0, links.len()).fold(Map::new(), |found: Map<RootName, Bytes>, i: Int|
-    found.insert(links.get(i).root, match below.get(i) { Some(d) -> d, None -> b"" }))
+  ).by_root
 }
 
 pub fn codes_of_part(part: PartMembers) -> List<UnitCode> / {memo.read, abort.raise} =
@@ -1153,30 +1146,30 @@ pub fn part_text(
 fn linked_program(
   digests: Map<Bytes, Bytes>,
   calls: Map<Bytes, List<Bytes>>,
-) -> ProgramCode / {abort.raise} =
+) -> ProgramCode / {abort.raise} = {
+  let names = digests.keys();
+  let positions = positions_of(names);
+  let units = names.map(|n: Bytes| OfRoot({ key: Named(n), tested: false }));
   {
+    units: units,
     parts: [
       {
-        part: {
-          module: b"m",
-          label: b"",
-          units: digests.keys().map(|n: Bytes| OfRoot({ key: Named(n), tested: false })),
-        },
+        part: { module: b"m", label: b"", units: units },
         made: { identity: b"", foreign: Map::new(), codes: digests.values() },
       },
     ],
-    roots: [],
-    links: digests.keys().map(|n: Bytes|
+    links: range(0, names.len()).map(|i: Int|
       {
-        root: root_name(Named(n)),
-        unit: bin::encode(OfRoot({ key: Named(n), tested: false }), code_unit_bin()),
-        calls: match calls.get(n) {
-          Some(cs) -> cs.map(|c: Bytes| root_name(Named(c))),
+        key: Named(names.get(i)),
+        unit: i,
+        calls: match calls.get(names.get(i)) {
+          Some(cs) -> cs.map(|c: Bytes| position_of(positions, c)),
           None -> [],
         },
       }),
     failures: [],
   }
+}
 
 test "a root's code digest changes when anything it can call changes, and not otherwise" {
   let calls = Map::new().insert(b"f", [b"g"]).insert(b"g", [b"f"]);
