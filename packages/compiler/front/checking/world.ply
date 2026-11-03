@@ -3,7 +3,8 @@ import std.hash (blake3)
 import std.bytes
 import std.list
 import compiler.store.memo (memo, memo_store, Query, Queries, digest_of)
-import compiler.store.handles (QueryOf, QueryDefinition, Written, written)
+import compiler.store.handles (QueryOf, QueryDefinition, Written, written, fetched)
+import std.set (Set, set_bin)
 import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, InPackage, ShippedModule,
                                CheckInputs, owner_interface_bin, module_origin_bin)
 import compiler.check.infer.checker (StoredDeclarations)
@@ -13,7 +14,7 @@ import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_sha
                              encode_tables)
 import compiler.syntax.items (Module, ImportDeclaration, header, parse, parse_started,
                               import_declaration_bin, read_without_import, homes_declaring,
-                              unimported_of)
+                              home_names_in, unimported_of)
 import compiler.expand.derive (DeriverRequest, DeriverResponse, Failed, Unavailable, import_path,
                                derivation_at_bin, deriver_response_bin)
 import compiler.front.diagnostics (ParsedSource, parse_from)
@@ -26,7 +27,6 @@ import compiler.check.resolve.tables (Declarations, Source, ParsedModule, Diagno
                                       diagnostic_bin, path_span, source_bin)
 import compiler.syntax.parsing (Span, ParseStart, ParseOutput, span_bin, start)
 import compiler.syntax.lexer (Token)
-import compiler.store.hash.forms (OwnHashes, own_hashes_bin)
 
 pub type PackageLocation = { package: Int, relative: Bytes }
 
@@ -115,7 +115,6 @@ pub effect decode_cache {
   write cache_context(digest: Bytes, context: Context) -> Unit
   read text_read(key: Bytes) -> Option<ParsedText>
   write cache_text_read(key: Bytes, read: ParsedText) -> Unit
-  write evict_text_read(key: Bytes) -> Unit
   read imported_text(digest: Bytes) -> Option<Bytes>
   write cache_imported_text(digest: Bytes, text: Bytes) -> Unit
 }
@@ -172,9 +171,6 @@ pub fn with_decode_cache<a | e>(
     decode_cache.text_read(key) -> reads.get(key),
     decode_cache.cache_text_read(key, r) -> {
       reads = reads.insert(key, r);
-    },
-    decode_cache.evict_text_read(key) -> {
-      reads = reads.remove(key);
     },
     decode_cache.imported_text(digest) -> imports.get(digest),
     decode_cache.cache_imported_text(digest, t) -> {
@@ -391,7 +387,7 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
         if t.shipped { shipped_module_exists(t.module) }
         else { package_location_of(t.module) != None });
       let unimported = unimported_of(
-        read_without_import(module, lexed.input, || homes_declaring(shipped_text)),
+        read_without_import(module, lexed.input, || homes_declaring(home_names)),
         shipped_module_exists,
         imported_there.map(|t: ModuleKey| t.module),
       );
@@ -450,6 +446,15 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
   }
 }
 
+pub fn home_names_query() -> QueryOf<Bytes, Set<Bytes>> =
+  { name: b"home names", input: bin::bytes_bin(), output: set_bin(bin::bytes_bin()) }
+
+pub fn collect_home_names(home: Bytes) -> Written / {memo.read, abort.raise} =
+  written(home_names_query(), home_names_in(shipped_text(home)))
+
+fn home_names(home: Bytes) -> Set<Bytes> / {memo.read, abort.raise} =
+  fetched(home_names_query(), home)
+
 pub type ImportOf = { named: ModuleKey, span: Span }
 
 pub type ImportsOf = { imports: List<ImportOf> }
@@ -461,7 +466,7 @@ derive bin for ImportsOf
 pub fn imports_query() -> QueryOf<ModuleKey, ImportsOf> =
   { name: b"imports", input: module_key_bin(), output: imports_of_bin() }
 
-pub fn imports_result(query_key: ModuleKey) -> Written / {memo.read, abort.raise} = {
+pub fn list_imports(query_key: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let module = query_key.module;
   let placing = if query_key.shipped { None } else { package_location_of(module) };
   let text = if query_key.shipped { shipped_text(module) }
@@ -495,10 +500,6 @@ pub fn absent(module: Bytes) -> ModuleResult / {abort.raise} =
     shape: no_shape(module),
     tables: encode_tables(no_module_tables),
   }
-
-pub type HashResult = { own: OwnHashes, record: Bytes }
-
-derive bin for HashResult
 
 pub type Context = {
   imports: List<ImportDeclaration>,
