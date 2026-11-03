@@ -62,7 +62,7 @@ import std.string
 import compiler.check.guards (Guards, Contract, Clause)
 import compiler.check.borrowing (ParameterMode, ParameterModes, mode_facts, parameter_mode)
 import compiler.check.infer.walked (WalkedNode, WalkedTree)
-import compiler.check.typed (TypedRelease)
+import compiler.check.typed (TypedRelease, TypedBody, ConstantData, WholeBody, data_of)
 
 pub type Location = { module: Int, span: Span }
 
@@ -444,21 +444,65 @@ pub type SpecEnv = {
 
 pub type GroupDefinition = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
 
-pub type CachedDefinition = {
-  labels: List<Int>,
-  effects: List<Effect>,
-  performed: List<Effect>,
-  unbounded_effects: List<Effect>,
-  repeated_parameters: List<Int>,
-  ending: Termination,
-  summary: Summary,
-  raises: List<Raise>,
-  ownership_facts: Bytes,
-}
+pub type BodyFacts = { members: List<MemberSite>, types: TypeTable, bodies: List<TypedBody<Bytes>> }
 
-pub type CachedTest = { effects: List<Effect>, facts: Bytes }
+derive bin for BodyFacts
 
-pub type CachedFacts = { name: Bytes, facts: Bytes }
+pub const no_body_facts: BodyFacts = { members: [], types: Map::new(), bodies: [] }
+
+pub opaque type RecordedFacts = | RecordedFacts(Bytes)
+
+derive bin for RecordedFacts
+
+type FactsHead = { value: Option<ConstantData> }
+
+derive bin for FactsHead
+
+fn with_owner(facts: BodyFacts, module: Int, owner: Bytes) -> BodyFacts =
+  {
+    members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
+    types: facts.types,
+    bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
+  }
+
+pub fn whole_body_data(facts: BodyFacts) -> Option<ConstantData> / {abort.raise} =
+  match facts.bodies.find(|b: TypedBody<Bytes>| b.part == WholeBody) {
+    Some(b) -> data_of(b.body, facts.types),
+    None -> None,
+  }
+
+pub fn encode_facts(facts: BodyFacts) -> RecordedFacts / {abort.raise} =
+  RecordedFacts(
+    bin::encode({ value: whole_body_data(facts) }, facts_head_bin()).concat(
+      bin::encode(with_owner({ ..facts, types: Map::new() }, 0, b""), body_facts_bin()),
+    ),
+  )
+
+fn facts_head(recorded: Bytes) -> bin::Taken<FactsHead> / {abort.raise} =
+  match facts_head_bin().take(recorded, 0) {
+    Ok(t) -> t,
+    Err(_) -> panic("recorded facts whose head does not decode"),
+  }
+
+pub fn recorded_data(recorded: RecordedFacts) -> Option<ConstantData> / {abort.raise} =
+  match recorded { RecordedFacts(b) -> facts_head(b).value.value }
+
+pub fn decode_facts(
+  recorded: RecordedFacts,
+  module: Int,
+  owner: Bytes,
+) -> BodyFacts / {abort.raise} =
+  match recorded {
+    RecordedFacts(b) -> {
+      let head = facts_head(b);
+      match bin::decode(b.slice(head.at, b.len()), body_facts_bin()) {
+        Ok(f) -> with_owner(f, module, owner),
+        Err(_) -> panic("recorded facts whose bodies do not decode"),
+      }
+    },
+  }
+
+pub type CachedFacts = { name: Bytes, facts: Option<RecordedFacts> }
 
 derive bin for CachedFacts
 
@@ -470,8 +514,6 @@ pub const listing_type: Type =
   )
 
 pub type CheckCache = {
-  definitions: Map<Bytes, CachedDefinition>,
-  tests: Map<Bytes, CachedTest>,
   own_modules: Int,
   types: TypeTable,
   body_plan: BodyPlan,
@@ -479,8 +521,6 @@ pub type CheckCache = {
 
 pub fn empty_cache(own_modules: Int) -> CheckCache =
   {
-    definitions: Map::new(),
-    tests: Map::new(),
     own_modules: own_modules,
     types: Map::new(),
     body_plan: CheckEvery,
@@ -491,7 +531,7 @@ pub type BodyPlan =
   | CheckOnly(List<Bytes>)
   | ReuseBodies(Map<Bytes, ReusedBody>, List<MemberSite>)
 
-pub type ReusedBody = { body: CheckedBody, facts: Bytes }
+pub type ReusedBody = { body: CheckedBody, facts: Option<RecordedFacts> }
 
 pub type AliasFacts = {
   t: Type,
@@ -901,7 +941,6 @@ pub type Checker = {
   derived: Option<DeriveOrigin>,
   known: CheckCache,
   seeded: List<Bytes>,
-  cached_tests: List<Bytes>,
   current_definition: Bytes,
   binders: Map<Int, Int>,
   cached: List<CachedFacts>,
@@ -993,8 +1032,6 @@ pub type InferredBody = {
 pub type ClosedBody = {
   effects: Effects,
   label_params: Map<Bytes, Int>,
-  recorded: Option<CachedDefinition>,
-  count: Option<Count>,
   params: List<Type>,
   variable: Option<Int>,
   promised_bounded: List<{ entry: Effect, written: Bytes }>,

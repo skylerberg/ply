@@ -7,7 +7,7 @@ import compiler.syntax.type_syntax (mode_text)
 import compiler.emit.code (dump)
 import compiler.check.types (Scheme, scheme_bin, Effect, Type, effect_bin, NamedType, FunctionType,
                              RecordType, VariableType, effect_list_text, canonical_beside,
-                             canonical_in, relabelled, Printer, printer_new, print_type, Field,
+                             canonical_in, Printer, printer_new, print_type, Field,
                              canonical_effects, canonical_scheme, canonical_type, bool_type,
                              int_type, bytes_type, unit_type, NominalType, TypeTable, variables_in,
                              type_bin, type_table_bin)
@@ -17,14 +17,12 @@ import compiler.check.resolve.tables (Diagnostic, ParsedModule, qualify, Place, 
 import compiler.store.hash.forms (HashOutput, by_name, of_key)
 import compiler.store.hash.encoding (hex)
 import compiler.store.hash (digest)
-import compiler.check.infer (CheckOutput, BodyFacts, decode_facts, facts_by_owner, encode_facts,
-                             no_body_facts, body_facts_bin, is_pure_definition, types_named,
-                             recorded_data, whole_body_data)
-import compiler.check.infer.checker (TypeFacts)
+import compiler.check.infer (CheckOutput, facts_by_owner, is_pure_definition, types_named)
+import compiler.check.infer.checker (TypeFacts, BodyFacts, decode_facts, encode_facts,
+                                     no_body_facts, recorded_data, whole_body_data, RecordedFacts)
 import compiler.check.infer.checker (constructor_info_bin, instance_info_bin, numeric_info_bin,
                                      DefinitionInfo, SpecInfo, TestInfo, LawInfo, LawBinder,
-                                     EffectInfo, OperationInfo, ConstructorInfo, CheckCache,
-                                     empty_cache, CachedDefinition, CachedTest, CachedFacts,
+                                     EffectInfo, OperationInfo, ConstructorInfo, CachedFacts,
                                      WitnessOrder, listing_type, witness_order_bin, witness_params,
                                      InstanceInfo, NumericInfo)
 import compiler.check.typed (TypedBody, TypedExpression, TypedHandle, TypedClause, ConstantData,
@@ -171,7 +169,7 @@ fn waiting_operations(
   handler: Bytes,
   served: Bytes,
 ) -> List<Bytes> / {abort.raise} =
-  match decode_facts(encoded_facts(read, handler), 0, handler) {
+  match owner_facts(read, handler) {
     None -> [],
     Some(f) ->
       f.bodies.flat_map(|b: TypedBody<Bytes>| typed_expression_nodes(b.body)).fold(
@@ -1095,35 +1093,6 @@ fn const_sites(shape: ModuleShape) -> List<ConstSite> = {
     })
 }
 
-fn known_definitions(rows: List<KnownDefinitionRow>) -> Map<Bytes, CachedDefinition> =
-  rows.fold(Map::new(), |accumulator: Map<Bytes, CachedDefinition>, row: KnownDefinitionRow|
-    accumulator.insert(row.name, {
-      labels: row.scheme.label_variables,
-      effects: row.effects,
-      performed: row.performed,
-      unbounded_effects: row.repeated,
-      repeated_parameters: row.repeats,
-      ending: row.ending,
-      summary: row.summary,
-      raises: row.raises,
-      ownership_facts: row.facts,
-    }))
-
-fn known_tests(rows: List<KnownTestRow>) -> Map<Bytes, CachedTest> / {abort.raise} =
-  rows.fold(Map::new(), |accumulator: Map<Bytes, CachedTest>, r: KnownTestRow|
-    match relabelled(r.effects, [], []) {
-      Some(effects) -> accumulator.insert(r.key, { effects: effects, facts: r.body_facts }),
-      None -> accumulator,
-    })
-
-pub fn cache_from_rows(rows: Rows, own_modules: Int) -> CheckCache / {abort.raise} =
-  {
-    ..empty_cache(own_modules),
-    definitions: known_definitions(rows.definitions),
-    tests: known_tests(rows.tests),
-    types: rows.types,
-  }
-
 pub fn effect_hashes_of(
   declarations: Map<Bytes, Bytes>,
   effects: List<Effect>,
@@ -1153,7 +1122,7 @@ pub fn definition_known_row(
     ending: definition_info.ending,
     summary: definition_info.summary,
     raises: definition_info.raises,
-    facts: encoded_facts(read, definition_info.name),
+    facts: definition_facts(read, definition_info.name),
     scheme: canonical.scheme,
     value: constant_value(read, definition_info),
   }
@@ -1172,8 +1141,9 @@ fn constant_value(
 
 fn body_data(read: AllBodyFacts, owner: Bytes) -> Option<ConstantData> / {abort.raise} =
   match read.cached.get(owner) {
-    Some(recorded) -> recorded_data(recorded),
-    None -> match read.computed.get(owner) { Some(f) -> whole_body_data(f), None -> None },
+    Some(Some(recorded)) -> recorded_data(recorded),
+    Some(None) -> None,
+    None -> whole_body_data(computed_facts(read, owner)),
   }
 
 fn test_known_row(
@@ -1187,39 +1157,49 @@ fn test_known_row(
     hash: hash,
     effects: test_info.effects,
     owner: owner,
-    body_facts: encoded_facts(read, owner),
+    body_facts: encode_facts(computed_facts(read, owner)),
   }
 
-type AllBodyFacts = { cached: Map<Bytes, Bytes>, computed: Map<Bytes, BodyFacts> }
+type AllBodyFacts = { cached: Map<Bytes, Option<RecordedFacts>>, computed: Map<Bytes, BodyFacts> }
 
 pub fn all_body_facts(checked: CheckOutput) -> AllBodyFacts =
   {
-    cached: checked.cached.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, k: CachedFacts|
-      accumulator.insert(k.name, k.facts)),
+    cached: checked.cached.fold(
+      Map::new(),
+      |accumulator: Map<Bytes, Option<RecordedFacts>>, k: CachedFacts|
+        accumulator.insert(k.name, k.facts),
+    ),
     computed: facts_by_owner(checked.facts),
   }
 
-fn encoded_facts(read: AllBodyFacts, owner: Bytes) -> Bytes / {abort.raise} =
+fn computed_facts(read: AllBodyFacts, owner: Bytes) -> BodyFacts =
+  match read.computed.get(owner) { Some(f) -> f, None -> no_body_facts }
+
+fn definition_facts(read: AllBodyFacts, owner: Bytes) -> Option<RecordedFacts> / {abort.raise} =
   match read.cached.get(owner) {
     Some(recorded) -> recorded,
-    None -> encode_facts(match read.computed.get(owner) { Some(f) -> f, None -> no_body_facts }),
+    None -> Some(encode_facts(computed_facts(read, owner))),
+  }
+
+fn owner_facts(read: AllBodyFacts, owner: Bytes) -> Option<BodyFacts> / {abort.raise} =
+  match read.cached.get(owner) {
+    Some(Some(recorded)) -> Some(decode_facts(recorded, 0, owner)),
+    Some(None) -> None,
+    None -> Some(computed_facts(read, owner)),
   }
 
 pub fn types_of_rows(
   table: TypeTable,
   definitions: List<KnownDefinitionRow>,
-  others: List<Bytes>,
+  others: List<RecordedFacts>,
 ) -> TypeTable / {abort.raise} = {
-  let bodies = |accumulator: List<TypedBody<Bytes>>, recorded: Bytes|
-    match decode_facts(recorded, 0, b"") {
-      Some(f) -> accumulator.concat(f.bodies),
-      None -> accumulator,
-    };
+  let bodies = |accumulator: List<TypedBody<Bytes>>, recorded: RecordedFacts|
+    accumulator.concat(decode_facts(recorded, 0, b"").bodies);
   types_named(
     table,
     others.fold(
       definitions.fold([], |accumulator: List<TypedBody<Bytes>>, r: KnownDefinitionRow|
-        bodies(accumulator, r.facts)),
+        match r.facts { Some(recorded) -> bodies(accumulator, recorded), None -> accumulator }),
       bodies,
     ),
   )
@@ -1294,7 +1274,7 @@ fn rows_over(
   let tests = test_rows(checked, test_hash, read);
   let laws = checked.laws.map(|l: LawInfo| {
     let owner = law_owner(l.module, l.name);
-    { owner: owner, body_facts: encoded_facts(read, owner) }
+    { owner: owner, body_facts: encode_facts(computed_facts(read, owner)) }
   });
   {
     definitions: definitions,

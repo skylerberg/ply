@@ -91,7 +91,7 @@ import compiler.check.infer.checker (HoleSite, DeclaredAlias, DeclaredExtern, De
                                      OwnCall, MemberSite, TagUse, EffectsSource, WrittenEffects,
                                      InferredEffects, WidenedByError, NumericOperation,
                                      GroupInstantiation, Signature, RigidParam, MapKeySite,
-                                     ConstraintSite, SpecEnv, GroupDefinition, CachedDefinition,
+                                     ConstraintSite, SpecEnv, GroupDefinition,
                                      listing_type, CheckEvery, ReuseBodies, CheckOnly, ReusedBody,
                                      Checker, Inference, WithType, WithTypes, WithSignature,
                                      BoundSignatures, InferredBody, ClosedBody, TagRejection,
@@ -651,7 +651,7 @@ type Walk = { checker: Checker, bodies: Map<Int, ClosedBody>, signed: Map<Int, B
 
 type MemberChecked = { walk: Walk, undeclared: List<Effect>, callees: List<Bytes> }
 
-type MemberEffects = { undeclared: List<Effect>, callees: List<Int> }
+type MemberEffects = { function: Int, undeclared: List<Effect>, callees: List<Int> }
 
 type CheckedBodies = { walk: Walk, members: List<MemberEffects> }
 
@@ -666,12 +666,21 @@ fn checked_bodies(
     {
       walk: m.walk,
       members: pass.members.push({
+        function: i,
         undeclared: m.undeclared,
         callees: range(0, component.len()).filter(|k: Int|
           m.callees.contains(signed.names.get(component.get(k)))),
       }),
     }
   })
+
+type ReachedEffects = {
+  function: Int,
+  published: List<Effect>,
+  callees: List<Int>,
+  undeclared: List<Effect>,
+  reached: List<Effect>,
+}
 
 fn checked_component(
   start: Walk,
@@ -680,38 +689,47 @@ fn checked_component(
   check_member: (Walk, Int) -> MemberChecked / {abort.raise, elsewhere.read, mode_facts.read, other_modules.read},
 ) -> Walk / {abort.raise, elsewhere.read, mode_facts.read, other_modules.read} = {
   let first = checked_bodies(start, component, signed, check_member);
-  let found = first.members.map(|m: MemberEffects| m.undeclared);
+  let pool = first.members.fold([], |found: List<Effect>, m: MemberEffects|
+    effects_union(found, m.undeclared));
   let reached = effects_reached_in_group(
-    component.map(|i: Int|
-      resolve_effects_in(start.checker, signed.sigs.get(i).published_effects).listed),
-    first.members.map(|m: MemberEffects| m.callees),
-    found,
-    found.fold([], |pool: List<Effect>, effects: List<Effect>| effects_union(pool, effects)).len()
-      * found.len(),
+    first.members.map(|m: MemberEffects|
+      {
+        function: m.function,
+        published: resolve_effects_in(start.checker, signed.sigs.get(m.function).published_effects).listed,
+        callees: m.callees,
+        undeclared: m.undeclared,
+        reached: m.undeclared,
+      }),
+    pool.len() * first.members.len(),
   );
-  if all_covered(found, reached) { first.walk } else {
-    let bound = range(0, component.len()).fold(start.checker, |c: Checker, k: Int|
-      with_assumed_effects(c, signed, component.get(k), reached.get(k)));
+  if reached.all(|m: ReachedEffects| uncovered(m.undeclared, m.reached).len() == 0) {
+    first.walk
+  } else {
+    let bound = reached.fold(start.checker, |c: Checker, m: ReachedEffects|
+      with_assumed_effects(c, signed, m.function, m.reached));
     checked_bodies({ ..start, checker: bound }, component, signed, check_member).walk
   }
 }
 
-fn all_covered(known: List<List<Effect>>, reached: List<List<Effect>>) -> Bool =
-  zip(known, reached).all(|member: { first: List<Effect>, second: List<Effect> }|
-    uncovered(member.first, member.second).len() == 0)
+type Widening = { members: List<ReachedEffects>, grew: Bool }
+
+fn widened(members: List<ReachedEffects>) -> Widening / {abort.raise} =
+  members.fold({ members: [], grew: false }, |w: Widening, m: ReachedEffects| {
+    let reached = m.callees.fold(m.reached, |found: List<Effect>, callee: Int|
+      effects_union(found, uncovered(m.published, members.get(callee).reached)));
+    {
+      members: w.members.push({ ..m, reached: reached }),
+      grew: w.grew || uncovered(m.reached, reached).len() > 0,
+    }
+  })
 
 fn effects_reached_in_group(
-  published: List<List<Effect>>,
-  callees: List<List<Int>>,
-  reached: List<List<Effect>>,
+  members: List<ReachedEffects>,
   addable: Int,
-) -> List<List<Effect>> / {abort.raise} =
-  if addable <= 0 { reached } else {
-    let next = range(0, reached.len()).map(|k: Int|
-      callees.get(k).fold(reached.get(k), |found: List<Effect>, j: Int|
-        effects_union(found, uncovered(published.get(k), reached.get(j)))));
-    if all_covered(reached, next) { reached }
-    else { effects_reached_in_group(published, callees, next, addable - 1) }
+) -> List<ReachedEffects> / {abort.raise} =
+  if addable <= 0 { members } else {
+    let next = widened(members);
+    if !next.grew { members } else { effects_reached_in_group(next.members, addable - 1) }
   }
 
 fn with_assumed_effects(
@@ -1034,9 +1052,6 @@ fn instance_calls(
 fn effects_of_cached(effects: List<Effect>) -> Effects / {abort.raise} =
   { listed: effects_sorted(effects), variable: None }
 
-fn cached_rows(checker: Checker, name: Bytes) -> Option<CachedDefinition> =
-  checker.known.definitions.get(name)
-
 fn group_callee_kind(
   checker: Checker,
   qualified: List<Bytes>,
@@ -1147,11 +1162,11 @@ fn check_function(
       let o = reused_function(checker, parsed, definition, name, sig, member, reused);
       { checker: o.checker, body: o.body, left: Taken, undeclared: o.undeclared }
     },
-    None -> if !checks_body(checker, name) && cached_rows(checker, name) == None {
+    None -> if !checks_body(checker, name) {
       let recorded: Checker = {
         ..checker,
         seeded: checker.seeded.push(name),
-        cached: checker.cached.push({ name: name, facts: b"" }),
+        cached: checker.cached.push({ name: name, facts: None }),
       };
       let p = record_function(
         recorded,
@@ -1167,7 +1182,7 @@ fn check_function(
         left: FromSignature,
         undeclared: p.undeclared,
       }
-    } else { checked_or_cached(checker, parsed, definition, name, sig, member, stated, results) },
+    } else { inferred_function(checker, parsed, definition, name, sig, member, stated, results) },
   }
 
 type FunctionChecked = {
@@ -1230,7 +1245,7 @@ fn reused_function(
     _ -> panic("the checked function body refers to a label that its definition does not declare"),
   }
 
-fn checked_or_cached(
+fn inferred_function(
   checker: Checker,
   parsed: ParsedModule,
   definition: FnDefinition,
@@ -1240,63 +1255,7 @@ fn checked_or_cached(
   stated: Map<Bytes, InstanceFunctions>,
   results: (Bytes) -> Option<Type> / {abort.raise},
 ) -> FunctionChecked / {abort.raise, elsewhere.read, mode_facts.read, other_modules.read} = {
-  let cached_definition = cached_rows(checker, name);
-  let taken: Option<{ checker: Checker, effects: Effects, count: Count }> = match cached_definition {
-    None -> None,
-    Some(rows) -> match ((
-        relabelled(rows.effects, rows.labels, member.labels),
-        relabelled(rows.performed, rows.labels, member.labels),
-        relabelled(rows.unbounded_effects, rows.labels, member.labels),
-      )) {
-      (Some(effects), Some(performed), Some(scaling)) -> {
-        let u = unify_effects(checker.substitution, checker.fresh, sig.published_effects, {
-          ..effects_of_cached(effects),
-          variable: resolve_effects_in(checker, sig.published_effects).variable,
-        });
-        match u.error {
-          Some(_) -> None,
-          None -> {
-            let c: Checker = with_unified(checker, u);
-            Some({
-              checker: c,
-              effects: effects_of_cached(performed),
-              count: {
-                repeated_effects: effects_of_cached(scaling).listed,
-                sites: [],
-                repeats: rows.repeated_parameters,
-                variable_over: None,
-                recursed: None,
-                raises: rows.raises,
-              },
-            })
-          },
-        }
-      },
-      _ -> None,
-    },
-  };
-  let stepped: BodyStep = match taken {
-    Some(x) -> {
-      let recorded: Checker = {
-        ..x.checker,
-        seeded: x.checker.seeded.push(name),
-        cached: x.checker.cached.push({
-          name: name,
-          facts: match cached_definition { Some(rows) -> rows.ownership_facts, None -> b"" },
-        }),
-      };
-      let p = record_function(recorded, parsed, definition, name, sig, x.effects);
-      {
-        checker: p.checker,
-        body: {
-          ..body_of_signature(p.checker, sig, p.effects, p.written),
-          recorded: cached_definition,
-          count: Some(x.count),
-        },
-        undeclared: p.undeclared,
-      }
-    },
-    None -> {
+  let stepped: BodyStep = {
       let o: InferredBody = check_function_body(
         { ..checker, derived: derived_of(parsed, definition), current_definition: name },
         definition,
@@ -1413,12 +1372,11 @@ fn checked_or_cached(
         },
         undeclared: p.undeclared,
       }
-    },
   };
   {
     checker: record_spec_env(stepped.checker, definition, name, sig),
     body: stepped.body,
-    left: match taken { None -> BodyChecked, Some(_) -> Taken },
+    left: BodyChecked,
     undeclared: stepped.undeclared,
   }
 }
@@ -1805,8 +1763,6 @@ fn body_of_signature(
   {
     effects: effects,
     label_params: sig.label_params,
-    recorded: None,
-    count: None,
     params: sig.params.map(|ty: Type| resolve(checker, ty)),
     variable: published.variable,
     promised_bounded: sig.promised_bounded.map(|a: Effect| {
@@ -1865,12 +1821,7 @@ fn finish_group(
     b.tags.fold(c, |cc: Checker, u: TagRejection|
       if qualified.contains(u.name) { report(cc, u.rejection) } else { cc }));
   let counts = range(0, comp.len()).map(|slot: Int|
-    match bodies.get(slot).count {
-      Some(count) -> count,
-      None -> body_effect_count(tagged, definitions.get(slot), bodies.get(slot)),
-    });
-  let recorded = bodies.map(|b: ClosedBody| b.recorded);
-  let walked = recorded.fold(false, |any: Bool, k: Option<CachedDefinition>| any || k == None);
+    body_effect_count(tagged, definitions.get(slot), bodies.get(slot)));
   let names = bodies.map(|b: ClosedBody|
     b.names.fold(Map::new(), |callees_by_site: Map<Int, Callee>, x: NamedCallee|
       callees_by_site.insert(x.site, member_or(qualified, x.callee))));
@@ -1900,8 +1851,7 @@ fn finish_group(
         ),
       )
     }));
-  let read: Verdict = if !walked { { endings: [], summaries: [] } } else {
-    verdict({
+  let read: Verdict = verdict({
       definitions: range(0, definitions.len()).map(|slot: Int|
         expand_function_member_calls(
           definitions.get(slot),
@@ -1919,12 +1869,9 @@ fn finish_group(
         },
       ending_of: |n: Bytes| ending_named(tagged, n),
       summary_of: |n: Bytes| summary_named(tagged, n),
-    })
-  };
-  let ending_of = |slot: Int|
-    match recorded.get(slot) { Some(k) -> k.ending, None -> read.endings.get(slot) };
-  let summary_of = |slot: Int|
-    match recorded.get(slot) { Some(k) -> k.summary, None -> read.summaries.get(slot) };
+    });
+  let ending_of = |slot: Int| read.endings.get(slot);
+  let summary_of = |slot: Int| read.summaries.get(slot);
   let summarized: Checker = {
     ..tagged,
     summaries: range(0, comp.len()).fold(
@@ -3658,19 +3605,7 @@ pub fn check_tests(
             binders: item_binders(seen.resolved, seen.module, item),
           };
           let owner = test_owner(parsed.name, definition.name);
-          let effects: WithEffectList = match c.known.tests.get(
-              qualify(parsed.name, definition.name),
-            ) {
-            Some(cached) ->
-              {
-                checker: {
-                  ..c,
-                  cached_tests: c.cached_tests.push(qualify(parsed.name, definition.name)),
-                  cached: c.cached.push({ name: owner, facts: cached.facts }),
-                },
-                listed: effects_of_cached(cached.effects).listed,
-              },
-            None -> {
+          let effects: WithEffectList = {
               let c1: Checker = {
                 ..c,
                 type_params: Map::new(),
@@ -3737,7 +3672,6 @@ pub fn check_tests(
                 else { check_determinism(popped, definition, effects) },
                 listed: run_needs(effects),
               }
-            },
           };
           let checked: Checker = effects.checker;
           {

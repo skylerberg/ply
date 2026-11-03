@@ -14,15 +14,13 @@ import compiler.store.memo.engine (Run, reading, in_session, reachable_keys)
 import compiler.store.packs
 import compiler.unit (definition_hash)
 import compiler.front.owner_checks
-import compiler.check.types (tables_joined)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
 import compiler.front.rows (Rows, Outline)
 import compiler.front (Published, published, ShippedWants, shipped_wants_bin)
-import compiler.front.published (no_rows, decode_rows, analyse, analyse_with,
-                                 reserved_prefix_diagnostics)
+import compiler.front.published (decode_rows, reserved_prefix_diagnostics)
 import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_module_tables,
                              pulled_next, checked_program_over, analysis_identities, ToolchainTree)
-import compiler.front.diagnostics (parse_all, diagnostic_in_module, with_prelude_source)
+import compiler.front.diagnostics (diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
                               embed_snapshot, request_of_key, snapshot_embed, with_embed_snapshot)
 import compiler.front.pkg (PackageSources, read_packages, validated_packages_bin, without_locations)
@@ -48,7 +46,7 @@ import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, Mod
 import compiler.front.checking.promises (promise_queries, cost_walk_query, cost_return_query,
                                          cost_demands_query, cost_parameters_query,
                                          module_parameters_query, module_costs_query, measure_name,
-                                         measures_query)
+                                         measures_query, program_analysed)
 import compiler.front.checking.groups (module_contents_query, group_key_bin, module_rejected,
                                        listed_result, owners_result_bin, owners_query, calls_query,
                                        cycles_query, group_imports_query, visible_modules_query,
@@ -636,33 +634,26 @@ pub fn over_decoding<a | e>(
 pub fn queried_over(
   store: fs::MemFs,
   sources: List<Source>,
-) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
-  let done = queried_results(fresh_registry(), store, sources);
-  {
-    store: done.store,
-    run: done.run,
-    own_hashes: done.own_hashes,
-    results: done.results,
-    outcome: outcome_of(sources, done.results),
-  }
-}
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} =
+  queried_results(fresh_registry(), store, sources)
 
 pub fn queried_results(
   qs: CheckQueries,
   store: fs::MemFs,
   sources: List<Source>,
-) -> { store: fs::MemFs, run: Run, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
   let w = inputs_alone(sources);
   let done = over_decoding(
     store,
     prelude_frames,
     prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-    || query_alone(qs, w),
+    || query_outcome(qs, w),
   );
   {
     store: done.store,
     run: done.value.run,
+    outcome: done.value.outcome,
     own_hashes: done.value.own_hashes,
     results: done.value.results,
   }
@@ -754,24 +745,40 @@ fn query_alone(
     }
   })
 
-pub fn outcome_of(
-  sources: List<Source>,
+type QueriedOutcome = {
+  run: Run,
   results: List<CheckedModule>,
-) -> AnalysisOutcome / {abort.raise} =
+  own_hashes: OwnHashes,
+  outcome: AnalysisOutcome,
+}
+
+fn query_outcome(qs: CheckQueries, w: LoadInputs) -> QueriedOutcome / {RunEffects, abort.raise} =
+  in_session(qs, |run: Run| {
+    let done = reading(qs, run, || {
+      let loaded = hashed_load(w.own);
+      {
+        results: loaded.results,
+        own_hashes: loaded.own_hashes,
+        outcome: program_outcome(w.own, loaded.results),
+      }
+    });
+    {
+      run: done.run,
+      value: {
+        run: done.run,
+        results: done.value.results,
+        own_hashes: done.value.own_hashes,
+        outcome: done.value.outcome,
+      },
+    }
+  })
+
+pub fn program_outcome(
+  own: List<Bytes>,
+  results: List<CheckedModule>,
+) -> AnalysisOutcome / {SessionReads, abort.raise} =
   match rejected_first(results) {
-    [] ->
-      analyse_with(
-        parse_all(sources),
-        results.fold(no_rows, |accumulator: Rows, a: CheckedModule| {
-          let r = rows_of_result(a.result);
-          {
-            definitions: accumulator.definitions.concat(r.definitions),
-            tests: accumulator.tests.concat(r.tests),
-            laws: accumulator.laws.concat(r.laws),
-            types: tables_joined(accumulator.types, r.types),
-          }
-        }),
-      ),
+    [] -> program_analysed(own.map(|m: Bytes| { module: m, shipped: false, tested: true })),
     first ->
       Rejected(
         first.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
@@ -822,7 +829,7 @@ fn queried_in(
           lookup_input_alone(w, kind, at)
         },
         |_: Bytes| (),
-        || with_decode_cache(|| query_alone(qs, w)),
+        || with_decode_cache(|| query_outcome(qs, w)),
       ).value
     } with {
       var begun = company != Concurrent,
@@ -836,7 +843,7 @@ fn queried_in(
     tree: done.tree,
     run: done.value.run,
     own_hashes: done.value.own_hashes,
-    outcome: outcome_of(sources, done.value.results),
+    outcome: done.value.outcome,
   }
 }
 
@@ -1158,11 +1165,14 @@ test "a program whose imported module has a broken signature reports that module
     { name: b"lib", source_text: b"pub fn broken(n: Missing) -> Int = 1\n" },
     { name: b"app", source_text: b"import lib\npub fn go(n: Int) -> Int = lib::broken(n)\n" },
   ];
-  assert_eq(
-    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
-    outcome_summary(analyse(parse_all(sources))),
-  )
+  assert_eq(rejection_codes(queried_over(fs::mem_empty(), sources).outcome), [b"E0102"])
 }
+
+fn rejection_codes(outcome: AnalysisOutcome) -> List<Bytes> =
+  match outcome { Rejected(ds) -> ds.map(|d: Diagnostic| d.code), Analysed(_) -> [] }
+
+fn accepted(outcome: AnalysisOutcome) -> Bool =
+  match outcome { Analysed(_) -> true, Rejected(_) -> false }
 
 test "a comparison looks inside a type that another module declares" {
   let sources = [
@@ -1172,9 +1182,15 @@ test "a comparison looks inside a type that another module declares" {
       source_text: b"import lib\npub fn same(a: lib::Held, b: lib::Held) -> Bool = a == b\n",
     },
   ];
+  let alone = [
+    {
+      name: b"app",
+      source_text: b"pub type Held = { run: () -> Int }\npub fn same(a: Held, b: Held) -> Bool = a == b\n",
+    },
+  ];
   assert_eq(
-    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
-    outcome_summary(analyse(parse_all(sources))),
+    rejection_codes(queried_over(fs::mem_empty(), sources).outcome),
+    rejection_codes(queried_over(fs::mem_empty(), alone).outcome),
   )
 }
 
@@ -1196,10 +1212,7 @@ test "arithmetic works on a numeric type that another group declares" {
       ]),
     },
   ];
-  assert_eq(
-    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
-    outcome_summary(analyse(parse_all(sources))),
-  )
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
 }
 
 test "a group that calls a group with a type error is checked against its written signature, and the module reports the same errors as a whole-module check" {
@@ -1219,7 +1232,7 @@ test "a group that calls a group with a type error is checked against its writte
   let broken = queried_over(cold.store, source(b"n + true"));
   assert_eq(
     outcome_summary(broken.outcome),
-    outcome_summary(analyse(parse_all(source(b"n + true")))),
+    outcome_summary(queried_over(fs::mem_empty(), source(b"n + true")).outcome),
   )
 }
 
@@ -1613,10 +1626,7 @@ test "a type and another type's constructor may share a name" {
       ]),
     },
   ];
-  assert_eq(
-    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
-    outcome_summary(analyse(parse_all(sources))),
-  )
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
 }
 
 test "a signature may use an effect set whose effects live in a module it does not import" {
@@ -1631,10 +1641,7 @@ test "a signature may use an effect set whose effects live in a module it does n
       source_text: b"import sets (Counting, counted)\npub fn twice() -> Int / {Counting} = counted() + counted()\n",
     },
   ];
-  assert_eq(
-    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
-    outcome_summary(analyse(parse_all(sources))),
-  )
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
 }
 
 test "a signature that names a type keyed by its parameter implies that the parameter is ordered" {
@@ -1644,22 +1651,23 @@ test "a signature that names a type keyed by its parameter implies that the para
       source_text: b"pub opaque type Bag<a> = | Bag(Map<a, Unit>)\npub fn empty_bag<a>() -> Bag<a> = Bag(Map::new())\npub fn held<a>(b: Bag<a>, x: a) -> Bool = match b { Bag(m) -> m.contains(x) }\n",
     },
   ];
-  assert_eq(
-    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
-    outcome_summary(analyse(parse_all(sources))),
-  )
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
 }
 
-test "a module's stored interface and contracts equal those of a whole check" {
+test "a module's stored interface and contracts equal those its checked groups give" {
   let sources = [
     {
       name: b"lib",
       source_text: b"pub type Pair = { a: Int, b: Int }\npub effect log { write emit(Bytes) -> Unit }\nfn helper(x: Int) -> Int = x * 2\npub fn two(x: Int) -> Int requires x >= 0 ensures result > x = helper(x) + 1\npub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\npub fn mk(x: Int) -> Pair = { a: x, b: two(x) }\npub fn say(b: Bytes) -> Unit / {log.write} = log.emit(b)\n",
     },
   ];
-  let stored = read_over(sources, ||
-    published_module({ module: b"lib", shipped: false, tested: false }));
-  let whole = match analyse(parse_all(sources)) {
+  let read = read_over(sources, ||
+    {
+      stored: published_module({ module: b"lib", shipped: false, tested: false }),
+      analysed: program_analysed([{ module: b"lib", shipped: false, tested: true }]),
+    });
+  let stored = read.stored;
+  let whole = match read.analysed {
     Analysed(a) -> a,
     Rejected(_) -> panic("the sample program was rejected"),
   };

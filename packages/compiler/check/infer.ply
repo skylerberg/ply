@@ -48,15 +48,15 @@ import std.option
 import std.string
 import compiler.check.borrowing (ParameterMode, parameter_mode)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralEmbedded)
-import compiler.check.typed (ConstantData, LiteralData, constant_data_bin, data_of, TypedLiteral,
-                             TypedExpression, TypedBody, ReadLocal, ReadDefinition, ReadConstructor,
-                             ReadBuiltin, FilledLabel, LabelNamed, LabelParam, body_retyped,
-                             typed_body_bin, typed_expression_nodes, part_key, TypedRead,
-                             TypedUpdate, WholeBody, TypedParam, NumericWitness, ConcreteWitness,
-                             ParamWitness, witness_param_name, BodyPart, TypedCall, TypedLambda,
-                             TypedSimulate, TypedParallel, TypedHandle, TypedPerform, TypedClause,
-                             TypedThunk, TypedRelease, ReleaseAfter, ReleaseBefore,
-                             ReleaseUnwinding, ReleaseMissing, ReleaseFailing)
+import compiler.check.typed (LiteralData, TypedLiteral, TypedExpression, TypedBody, ReadLocal,
+                             ReadDefinition, ReadConstructor, ReadBuiltin, FilledLabel, LabelNamed,
+                             LabelParam, body_retyped, typed_body_bin, typed_expression_nodes,
+                             part_key, TypedRead, TypedUpdate, WholeBody, TypedParam,
+                             NumericWitness, ConcreteWitness, ParamWitness, witness_param_name,
+                             BodyPart, TypedCall, TypedLambda, TypedSimulate, TypedParallel,
+                             TypedHandle, TypedPerform, TypedClause, TypedThunk, TypedRelease,
+                             ReleaseAfter, ReleaseBefore, ReleaseUnwinding, ReleaseMissing,
+                             ReleaseFailing)
 import compiler.check.infer.walked (WalkedTree, WalkedReading, WalkedLocal, WalkedDefinition,
                                     WalkedConstructor, WalkedBuiltin, resolved)
 import compiler.check.infer.checker (OperationInfo, EffectInfo, ConstructorInfo,
@@ -64,7 +64,8 @@ import compiler.check.infer.checker (OperationInfo, EffectInfo, ConstructorInfo,
                                      DefinitionInfo, RaisingCall, RaisingFunctionValue,
                                      UnguardedBuiltin, RequirementNotShown, ZeroDivisor, Raise,
                                      TestInfo, LawBinder, LawInfo, MemberSite, WitnessOrder,
-                                     LabelApplication, CachedDefinition, CachedTest, CachedFacts,
+                                     LabelApplication, CachedFacts, BodyFacts, no_body_facts,
+                                     RecordedFacts, encode_facts, decode_facts, recorded_data,
                                      CheckCache, empty_cache, CheckEvery, Checker, CheckedBody,
                                      report, report_error_at, resolve, resolve_effects_in,
                                      abort_effect, definition_of, Builtin, builtin_of_extern,
@@ -112,7 +113,6 @@ pub type CheckOutput = {
   effects: List<EffectInfo>,
   constructors: List<ConstructorInfo>,
   seeded: List<Bytes>,
-  cached_tests: List<Bytes>,
   facts: EmitFacts,
   cached: List<CachedFacts>,
   instances: List<InstanceInfo>,
@@ -142,7 +142,6 @@ pub fn check_output_with(
       effects: out.checker.effects,
       constructors: constructors,
       seeded: out.checker.seeded,
-      cached_tests: out.checker.cached_tests,
       facts: facts,
       cached: out.checker.cached,
       instances: out.checker.instances,
@@ -211,12 +210,6 @@ pub type EmitFacts = {
 
 derive bin for EmitFacts
 
-pub type BodyFacts = { members: List<MemberSite>, types: TypeTable, bodies: List<TypedBody<Bytes>> }
-
-derive bin for BodyFacts
-
-pub const no_body_facts: BodyFacts = { members: [], types: Map::new(), bodies: [] }
-
 pub fn types_named(all: TypeTable, bodies: List<TypedBody<Bytes>>) -> TypeTable / {abort.raise} =
   subtable(
     all,
@@ -265,52 +258,6 @@ pub fn facts_by_owner(facts: EmitFacts) -> Map<Bytes, BodyFacts> = {
   facts.bodies.fold(called, |m: Map<Bytes, BodyFacts>, x: TypedBody<Bytes>|
     into(m, x.owner, |f: BodyFacts| { ..f, bodies: f.bodies.push(x) }))
 }
-
-fn with_owner(facts: BodyFacts, module: Int, owner: Bytes) -> BodyFacts =
-  {
-    members: facts.members.map(|x: MemberSite| { ..x, module: module, owner: owner }),
-    types: facts.types,
-    bodies: facts.bodies.map(|x: TypedBody<Bytes>| { ..x, module: module, owner: owner }),
-  }
-
-const facts_format: Int = 8
-
-type FactsHead = { value: Option<ConstantData> }
-
-derive bin for FactsHead
-
-pub fn whole_body_data(facts: BodyFacts) -> Option<ConstantData> / {abort.raise} =
-  match facts.bodies.find(|b: TypedBody<Bytes>| b.part == WholeBody) {
-    Some(b) -> data_of(b.body, facts.types),
-    None -> None,
-  }
-
-pub fn encode_facts(facts: BodyFacts) -> Bytes / {abort.raise} =
-  Bytes::concat_all([
-    byte_of_int(facts_format),
-    bin::encode({ value: whole_body_data(facts) }, facts_head_bin()),
-    bin::encode(with_owner({ ..facts, types: Map::new() }, 0, b""), body_facts_bin()),
-  ])
-
-fn facts_head(recorded: Bytes) -> Option<bin::Taken<FactsHead>> / {abort.raise} =
-  if recorded.len() == 0 || recorded.at(0) != facts_format { None }
-  else { match facts_head_bin().take(recorded, 1) { Ok(t) -> Some(t), Err(_) -> None } }
-
-pub fn recorded_data(recorded: Bytes) -> Option<ConstantData> / {abort.raise} =
-  match facts_head(recorded) { Some(t) -> t.value.value, None -> None }
-
-pub fn decode_facts(
-  recorded: Bytes,
-  module: Int,
-  owner: Bytes,
-) -> Option<BodyFacts> / {abort.raise} =
-  match facts_head(recorded) {
-    None -> None,
-    Some(t) -> match bin::decode(recorded.slice(t.at, recorded.len()), body_facts_bin()) {
-      Ok(f) -> Some(with_owner(f, module, owner)),
-      Err(_) -> None,
-    },
-  }
 
 fn restore_owners(checker: Checker) -> Checker =
   {
@@ -1015,49 +962,6 @@ fn dump_outcome(out: CheckResult) -> Bytes / {abort.raise} =
   if out.ok { dump_checked(out.checker) }
   else { b"X;".concat(dump_diagnostics(dedup_diagnostics(out.checker.diagnostics))) }
 
-fn cache_of(checker: Checker) -> CheckCache = {
-  let definitions = checker.definitions.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CachedDefinition>, definition_info: DefinitionInfo|
-      accumulator.insert(definition_info.name, {
-        labels: definition_info.scheme.label_variables,
-        effects: definition_info.effects,
-        performed: definition_info.performed,
-        unbounded_effects: definition_info.scaling,
-        repeated_parameters: definition_info.repeats,
-        ending: definition_info.ending,
-        summary: definition_info.summary,
-        raises: definition_info.raises,
-        ownership_facts: b"",
-      }),
-  );
-  let tests = checker.tests.fold(Map::new(), |accumulator: Map<Bytes, CachedTest>, t: TestInfo|
-    accumulator.insert(t.key, { effects: t.effects, facts: b"" }));
-  { ..checker.known, definitions: definitions, tests: tests, body_plan: CheckEvery }
-}
-
-pub type Dumps = { uncached: String, seeded: String }
-
-pub fn check_dumps(sources: List<Source>) -> Dumps / {abort.raise} = {
-  let head = dump_head(sources);
-  let both = match resolved_all(sources) {
-    Err(rejected) -> { uncached: rejected, seeded: rejected },
-    Ok(x) -> {
-      let first = check_program(x.resolution, x.modules);
-      let walked = dump_outcome(first);
-      {
-        uncached: walked,
-        seeded: if !first.ok { walked }
-        else { dump_outcome(check_program_with(x.resolution, x.modules, cache_of(first.checker))) },
-      }
-    },
-  };
-  {
-    uncached: String::of_bytes(head.concat(both.uncached)),
-    seeded: String::of_bytes(head.concat(both.seeded)),
-  }
-}
-
 test "`check_dump` writes each function, test, law, effect and type constructor of a program as a line of semicolon-separated fields" {
   assert_eq(
     check_dump([
@@ -1749,10 +1653,9 @@ test "recorded facts hold a body's data ahead of the body, and decode as they we
   assert_eq(recorded_data(of_literal(literal)), Some(LiteralData(literal)));
   assert_eq(recorded_data(of_literal(LiteralEmbedded(b"digest", 1))), None);
   assert_eq(recorded_data(encode_facts(no_body_facts)), None);
-  let decoded = |recorded: Bytes|
-    decode_facts(recorded, 0, b"m.kept").map(|f: BodyFacts| f.bodies.len());
-  assert_eq(decoded(of_literal(literal)), Some(1));
-  assert_eq(decoded(encode_facts(no_body_facts)), Some(0))
+  let decoded = |recorded: RecordedFacts| decode_facts(recorded, 0, b"m.kept").bodies.len();
+  assert_eq(decoded(of_literal(literal)), 1);
+  assert_eq(decoded(encode_facts(no_body_facts)), 0)
 }
 
 test "a `requires` clause or `law` may pass a pure callback to a function that is generic over effects" {
@@ -4085,18 +3988,6 @@ test "an effect listed twice in a function's effects appears once in its exporte
     effects: b"m.audit.write,m.log.write",
     performed: b"m.audit.note,m.log.emit",
   })
-}
-
-test "checking a program from its own exported interfaces gives the same result as checking it from scratch" {
-  let modules = [
-    {
-      name: b"m",
-      source_text: b"pub fn id<a>(x: a) -> a = x\nfn two() -> Int = id(2)\neffect log { write emit(Bytes) -> Unit }\nfn say(b: Bytes) -> Unit / { log.write } = log.emit(b)\nfn show<a>(x: a) -> Int where derivable(eq, a) = 1\ntest \"says\" { say(b\"x\") }",
-    },
-  ];
-  let dumps = check_dumps(modules);
-  assert_eq(dumps.seeded, dumps.uncached);
-  assert_eq(dumps.uncached, check_dump(modules))
 }
 
 test "a spec clause that calls a function with effects is rejected at that call" {
