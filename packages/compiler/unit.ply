@@ -34,11 +34,11 @@ import compiler.emit.representations (layout_variables, has_variables, is_scalar
                                       ShapeReads, with_no_shapes)
 import compiler.emit.lower.module_context (definition_called)
 import compiler.store.hash.template (emitted_code)
-import compiler.front.rows (Dump, EmitterRoot, ModuleRow, KnownDefinitionRow, DefinitionRow,
-                            SpecRow, TestRow, LawRow, BinderRow, EffectRow)
+import compiler.front.rows (Dump, EmitterRoot, ModuleRow, KnownDefinitionRow, LawRow, BinderRow,
+                            EffectRow)
 import compiler.emit.generated (MarshalledSums, marshalled_sums)
 import compiler.front.published (analyse, no_rows, dump_of)
-import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, KeyedRoot, LawBinders)
+import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, LawBinders)
 import compiler.front.facts (Analysis)
 import compiler.emit.reads (over_analysis)
 import compiler.front (analyse_pulling_std_with)
@@ -66,7 +66,6 @@ import std.fs (fs)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
-import compiler.syntax.items (RequiresClause, EnsuresClause, spec_kind_text)
 import compiler.syntax.expressions (prelude_module)
 import std.list (positions)
 
@@ -534,56 +533,8 @@ fn marshalling_of(types: List<Type>) -> MarshalledSums / {EmitReads} = {
   )
 }
 
-pub type RequestedRoots = { keys: List<RootKey>, unkeyed: List<Bytes> }
-
-pub fn requested_roots(dump: Dump) -> RequestedRoots / {abort.raise} = {
-  let results_and_keys = roots_by_row_name(dump);
-  dump.emitter_roots.fold(
-    { keys: [], unkeyed: [] },
-    |accumulator: RequestedRoots, r: EmitterRoot|
-      match results_and_keys.get(r.root) {
-        Some(k) -> { ..accumulator, keys: accumulator.keys.push(k) },
-        None -> { ..accumulator, unkeyed: accumulator.unkeyed.push(r.root) },
-      },
-  )
-}
-
-fn roots_by_row_name(dump: Dump) -> Map<Bytes, RootKey> / {abort.raise} = {
-  let results_and_keys = |m: Map<Bytes, RootKey>, k: RootKey| m.insert(root_text(root_name(k)), k);
-  let defined = dump.definitions.fold(Map::new(), |m: Map<Bytes, RootKey>, d: DefinitionRow|
-    d.spec.fold(
-      { m: results_and_keys(m, Named(d.name)), requires: 0, ensures: 0 },
-      |accumulator: { m: Map<Bytes, RootKey>, requires: Int, ensures: Int }, s: SpecRow|
-        if s.kind == RequiresClause {
-          {
-            ..accumulator,
-            m: results_and_keys(
-              accumulator.m,
-              Clause({ definition: Named(d.name), kind: Requires, n: accumulator.requires }),
-            ),
-            requires: accumulator.requires + 1,
-          }
-        } else if s.kind == EnsuresClause {
-          {
-            ..accumulator,
-            m: results_and_keys(
-              accumulator.m,
-              Clause({ definition: Named(d.name), kind: Ensures, n: accumulator.ensures }),
-            ),
-            ensures: accumulator.ensures + 1,
-          }
-        } else { accumulator },
-    ).m);
-  let tested = dump.tests.fold(defined, |m: Map<Bytes, RootKey>, t: TestRow| {
-    let run = test_key(t.module, t.name);
-    results_and_keys(results_and_keys(m, run), TestCases(run))
-  });
-  dump.laws.fold(tested, |m: Map<Bytes, RootKey>, l: LawRow|
-    results_and_keys(
-      results_and_keys(m, law_key(l.module, l.name, LawGuard)),
-      law_key(l.module, l.name, LawBody),
-    ))
-}
+pub fn requested_roots(dump: Dump) -> List<RootKey> =
+  dump.emitter_roots.map(|r: EmitterRoot| r.key)
 
 type Pools = { fields: List<Bytes>, lambdas: List<Bytes> }
 
@@ -1460,13 +1411,13 @@ pub type LoweringInput = {
 }
 
 pub fn lowering_input(
-  roots: List<KeyedRoot>,
+  roots: List<EmitterRoot>,
   definitions: List<KnownDefinitionRow>,
   laws: List<LawBinders>,
 ) -> LoweringInput / {abort.raise} =
   {
-    roots: roots.fold(Map::new(), |found: Map<RootName, EmitterRoot>, k: KeyedRoot|
-      found.insert(root_name(k.key), k.root)),
+    roots: roots.fold(Map::new(), |found: Map<RootName, EmitterRoot>, r: EmitterRoot|
+      found.insert(root_name(r.key), r)),
     schemes: definitions.fold(Map::new(), |found: Map<Bytes, Scheme>, row: KnownDefinitionRow|
       found.insert(row.name, row.scheme)),
     binders: laws.fold(Map::new(), |found: Map<RootName, List<Type>>, l: LawBinders|
@@ -1474,16 +1425,13 @@ pub fn lowering_input(
         m.insert(root_name(law_key(l.module, l.name, part)), l.types))),
   }
 
-pub fn lowering_input_of(dump: Dump) -> LoweringInput / {abort.raise} = {
-  let keys = roots_by_row_name(dump);
+pub fn lowering_input_of(dump: Dump) -> LoweringInput / {abort.raise} =
   lowering_input(
-    dump.emitter_roots.fold([], |found: List<KeyedRoot>, root: EmitterRoot|
-      match keys.get(root.root) { Some(k) -> found.push({ key: k, root: root }), None -> found }),
+    dump.emitter_roots,
     dump.rows.definitions,
     dump.laws.map(|l: LawRow|
       { module: l.module, name: l.name, types: l.binders.map(|b: BinderRow| b.ty) }),
   )
-}
 
 type Body = { text: Bytes, shared: List<SharedFunction> }
 
@@ -3219,9 +3167,7 @@ test "each root a program requests has a key built from its kind, and the key's 
   let analysed = analyse_pulling_std_with(user, [cases], no_rows).out;
   let dump = dump_of(analysed);
   let offers = requested_roots(dump);
-  assert_eq(offers.unkeyed, []);
-  assert_eq(offers.keys.map(printed), dump.emitter_roots.map(|r: EmitterRoot| r.root));
-  assert_eq(offers.keys.filter(|k: RootKey| module_of(k) == b"m"), [
+  assert_eq(offers.filter(|k: RootKey| module_of(k) == b"m"), [
     Named(b"m.f"),
     Named(b"m.none"),
     test_key(b"m", b"t"),
@@ -3233,7 +3179,7 @@ test "each root a program requests has a key built from its kind, and the key's 
     law_key(b"m", b"l", LawBody),
     law_key(b"m", b"s", LawBody),
   ]);
-  let mine = offers.keys.filter(|k: RootKey| module_of(k) == b"m");
+  let mine = offers.filter(|k: RootKey| module_of(k) == b"m");
   assert_eq(
     mine.filter(|k: RootKey|
       over_outcome(analysed, |_: Analysis| enters(lowering_input_of(dump), k))),
