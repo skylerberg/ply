@@ -12,14 +12,14 @@ pub effect memo {
   read external(kind: Bytes, at: Bytes) -> Option<Bytes>
   read fetch(query: Bytes, input: Bytes, part: Bytes) -> Option<Bytes>
   read fetch_all(query: Bytes, inputs: List<Bytes>, part: Bytes) -> List<Option<Bytes>>
-  read output_digest(query: Bytes, input: Bytes, part: Bytes) -> Bytes
+  read output_digest(query: Bytes, input: Bytes, part: Bytes) -> Option<Bytes>
   read stored_output(digest: Bytes) -> Option<Bytes>
   write fix(kind: Bytes, at: Bytes) -> Unit
 }
 
 pub type Dependency =
-  | ExternalDependency(Bytes, Bytes, Bytes)
-  | QueryDependency(Bytes, Bytes, Bytes)
+  | ExternalDependency({ kind: Bytes, at: Bytes, digest: Bytes })
+  | QueryDependency({ fact: Bytes, part: Bytes, digest: Option<Bytes> })
 
 pub type StoredFact = { parts: Map<Bytes, Bytes>, details: Bytes, depth: Int }
 
@@ -133,9 +133,6 @@ pub fn executed_count(run: Run) -> Int = run.ran.fold(0, |n: Int, _: Bytes, k: I
 pub fn digest_of(query_output: Option<Bytes>) -> Bytes =
   match query_output { Some(b) -> b"=".concat(blake3(b)), None -> b"-" }
 
-pub fn part_digest(parts: Map<Bytes, Bytes>, part: Bytes) -> Bytes =
-  match parts.get(part) { Some(d) -> d, None -> digest_of(None) }
-
 fn digests_of(output: Parts) -> Map<Bytes, Bytes> =
   output.fold(Map::new(), |found: Map<Bytes, Bytes>, name: Bytes, bytes: Bytes|
     found.insert(name, digest_of(Some(bytes))))
@@ -156,7 +153,7 @@ fn changed_tags(
   after.fold(before, |all: Map<Bytes, Bytes>, name: Bytes, d: Bytes| all.insert(name, d)).fold(
     Map::new(),
     |changed: Map<Bytes, Bool>, name: Bytes, _: Bytes|
-      if part_digest(before, name) == part_digest(after, name) { changed }
+      if before.get(name) == after.get(name) { changed }
       else { changed.insert(part_tag(name), true) },
   )
 
@@ -250,47 +247,53 @@ fn marked(key: Bytes) -> Unit / {memo_store.read, memo_store.write} =
 
 const fact_key_length: Int = 16
 
-fn dependent_of(edge: Bytes) -> Bytes / {abort.raise} = edge.slice(0, fact_key_length)
+type Reader = { dependent: Bytes, tag: Bytes }
 
-fn edge_tag(edge: Bytes) -> Bytes / {abort.raise} = edge.slice(fact_key_length, edge.len())
+fn reader_bytes(r: Reader) -> Bytes = r.dependent.concat(r.tag)
+
+fn reader_of(edge: Bytes) -> Reader / {abort.raise} =
+  { dependent: edge.slice(0, fact_key_length), tag: edge.slice(fact_key_length, edge.len()) }
 
 fn marked_edges(
   key: Bytes,
-  chosen: (Bytes) -> Bool / {abort.raise},
+  chosen: (Reader) -> Bool / {abort.raise},
 ) -> Unit / {memo_store.read, memo_store.write, abort.raise} = {
-  let deferred = memo_store.dependents(key).fold(false, |any: Bool, edge: Bytes|
-    if !chosen(edge) { any } else {
-      let d = dependent_of(edge);
+  let deferred = memo_store.dependents(key).fold(false, |any: Bool, edge: Bytes| {
+    let reader = reader_of(edge);
+    if !chosen(reader) { any } else {
+      let d = reader.dependent;
       if memo_store.deferred_kind(d) != None { true } else {
         marked(d);
         any
       }
-    });
+    }
+  });
   if deferred { memo_store.log_change(key) }
 }
 
 fn marked_dependents(key: Bytes) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
-  marked_edges(key, |_: Bytes| true)
+  marked_edges(key, |_: Reader| true)
 
 fn marked_readers(
   key: Bytes,
   changed: Map<Bytes, Bool>,
 ) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
-  if changed.len() > 0 { marked_edges(key, |edge: Bytes| changed.contains(edge_tag(edge))) }
+  if changed.len() > 0 { marked_edges(key, |r: Reader| changed.contains(r.tag)) }
 
 fn dependency_id(r: Dependency) -> Bytes / {abort.raise} =
-  match r {
-    QueryDependency(key, _, _) -> key,
-    ExternalDependency(kind, at, _) -> location_id(kind, at),
-  }
+  match r { QueryDependency(q) -> q.fact, ExternalDependency(e) -> location_id(e.kind, e.at) }
 
 type Edge = { on: Bytes, member: Bytes }
 
 fn edge_of(dependent: Bytes, r: Dependency) -> Edge / {abort.raise} =
   match r {
-    QueryDependency(key, part, _) -> { on: key, member: dependent.concat(part_tag(part)) },
-    ExternalDependency(kind, at, _) ->
-      { on: location_id(kind, at), member: dependent.concat(part_tag(main_part)) },
+    QueryDependency(q) ->
+      { on: q.fact, member: reader_bytes({ dependent: dependent, tag: part_tag(q.part) }) },
+    ExternalDependency(e) ->
+      {
+        on: location_id(e.kind, e.at),
+        member: reader_bytes({ dependent: dependent, tag: part_tag(main_part) }),
+      },
   }
 
 fn edges_of(dependent: Bytes, reads: List<Dependency>) -> Map<Bytes, Edge> / {abort.raise} =
@@ -592,7 +595,7 @@ pub fn query_output<| e>(
   }
 }
 
-pub type PartResults = { run: Run, outputs: List<Option<Bytes>>, digests: List<Bytes> }
+pub type PartResults = { run: Run, outputs: List<Option<Bytes>>, digests: List<Option<Bytes>> }
 
 pub fn part_outputs<| e>(
   queries: Queries<| e>,
@@ -607,7 +610,7 @@ pub fn part_outputs<| e>(
   {
     run: with_requested(fetched_run, fetched, part),
     outputs: fetched.map(|f: Fetched| f.output),
-    digests: fetched.map(|f: Fetched| part_digest(f.at.parts, part)),
+    digests: fetched.map(|f: Fetched| f.at.parts.get(part)),
   }
 }
 
@@ -620,7 +623,7 @@ fn with_requested(run: Run, fetched: List<Fetched>, part: Bytes) -> Run =
     requested_dependencies: fetched.fold(
       run.requested_dependencies,
       |all: List<Dependency>, f: Fetched|
-        all.push(QueryDependency(f.key, part, part_digest(f.at.parts, part))),
+        all.push(QueryDependency({ fact: f.key, part: part, digest: f.at.parts.get(part) })),
     ),
   }
 
@@ -832,15 +835,15 @@ fn reads_still_hold<| e>(
     reads.fold({ run: run, same: true }, |sofar: { run: Run, same: Bool }, r: Dependency|
       if !sofar.same { sofar } else {
         match r {
-          ExternalDependency(kind, at, digest) ->
-            { run: sofar.run, same: memo_store.external(kind, at).digest == digest },
-          QueryDependency(key, part, digest) -> match details_before(memo_store.fact(key)) {
+          ExternalDependency(e) ->
+            { run: sofar.run, same: memo_store.external(e.kind, e.at).digest == e.digest },
+          QueryDependency(q) -> match details_before(memo_store.fact(q.fact)) {
             None -> { run: sofar.run, same: false },
             Some(d) -> match queries.named.get(d.query) {
               None -> { run: sofar.run, same: false },
               Some(aq) -> {
-                let a = settled(queries, sofar.run, aq, key, d.input, left - 1);
-                { run: a.run, same: part_digest(a.at.parts, part) == digest }
+                let a = settled(queries, sofar.run, aq, q.fact, d.input, left - 1);
+                { run: a.run, same: a.at.parts.get(q.part) == q.digest }
               },
             },
           },
@@ -960,7 +963,7 @@ fn execute<| e>(
         let read = key_of(aq, query_input);
         let a = settled(queries, st.run, aq, read, query_input, left - 1);
         st = fact_read({ ..st, run: a.run }, read, part, a.at);
-        part_digest(a.at.parts, part)
+        a.at.parts.get(part)
       },
       memo.stored_output(digest) -> memo_store.output(digest),
       memo.fix(kind, at) -> memo_store.fix_input(kind, at),
@@ -993,7 +996,7 @@ fn world_read(
       st: {
         ..s,
         external_reads: s.external_reads.insert(seen, true),
-        reads: s.reads.push(ExternalDependency(kind, at, d)),
+        reads: s.reads.push(ExternalDependency({ kind: kind, at: at, digest: d })),
       },
     }
   }
@@ -1014,7 +1017,7 @@ fn fact_read(
       ..s,
       depth: max(s.depth, at.depth),
       query_reads: s.query_reads.insert(seen, true),
-      reads: s.reads.push(QueryDependency(read, part, part_digest(at.parts, part))),
+      reads: s.reads.push(QueryDependency({ fact: read, part: part, digest: at.parts.get(part) })),
     }
   }
 }
@@ -1034,11 +1037,11 @@ fn execution_ended<| e>(
 fn reads_moved(s: Execution) -> Bool =
   s.reads.any(|r: Dependency|
     match r {
-      QueryDependency(key, part, digest) -> match s.run.resolved.get(key) {
-        Some(at) -> part_digest(at.parts, part) != digest,
+      QueryDependency(q) -> match s.run.resolved.get(q.fact) {
+        Some(at) -> at.parts.get(q.part) != q.digest,
         None -> false,
       },
-      ExternalDependency(_, _, _) -> false,
+      ExternalDependency(_) -> false,
     })
 
 type Snapshot = {
@@ -1149,9 +1152,9 @@ fn grown(
 fn predicted(key: Bytes) -> List<Wanted> / {memo_store.read} =
   reads_in(details_before(memo_store.fact(key))).fold([], |found: List<Wanted>, r: Dependency|
     match r {
-      ExternalDependency(kind, at, _) -> found.push(WantedWorld(kind, at)),
-      QueryDependency(read, part, _) -> match details_before(memo_store.fact(read)) {
-        Some(d) -> found.push(WantedFact(d.query, d.input, part)),
+      ExternalDependency(e) -> found.push(WantedWorld(e.kind, e.at)),
+      QueryDependency(q) -> match details_before(memo_store.fact(q.fact)) {
+        Some(d) -> found.push(WantedFact(d.query, d.input, q.part)),
         None -> found,
       },
     })
@@ -1430,7 +1433,7 @@ fn attempted_body<| e>(
     memo.output_digest(name, read, part) -> match snapshot.facts.get(fact_key(name, read)) {
       Some(at) -> {
         performed = performed.push(ReadFact(fact_key(name, read), part));
-        part_digest(at.parts, part)
+        at.parts.get(part)
       },
       None -> unsettled.needed(WantedFact(name, read, part)),
     },
@@ -1490,10 +1493,7 @@ pub fn reachable_keys<| e>(
 ) -> List<Bytes> / {memo_store.read, abort.raise} = {
   let query_keys = |reads: List<Dependency>|
     reads.fold([], |keys: List<Bytes>, r: Dependency|
-      match r {
-        QueryDependency(key, _, _) -> keys.push(key),
-        ExternalDependency(_, _, _) -> keys,
-      });
+      match r { QueryDependency(q) -> keys.push(q.fact), ExternalDependency(_) -> keys });
   iterate(
     { seen: Map::new(), work: query_keys(run.requested_dependencies), next: 0, keys: [] },
     1099511627776,
