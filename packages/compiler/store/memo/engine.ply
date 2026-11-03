@@ -407,7 +407,7 @@ fn recomputed_level<| e>(
 ) -> Run / {memo_store.read, memo_store.write, abort.raise | e} = {
   let steps = level.fold([], |found: List<Step>, w: Waited|
     match details_before(memo_store.fact(w.key)) {
-      Some(d) -> if recomputable(queries, w.key, d) {
+      Some(d) -> if queries.named.contains(d.query) {
         found.push({ query: d.query, input: d.input })
       } else { found },
       None -> found,
@@ -417,16 +417,6 @@ fn recomputed_level<| e>(
   level.fold(done, |r: Run, w: Waited|
     if memo_store.is_out_of_date(w.key) { recompute(queries, r, w.key) } else { r })
 }
-
-fn recomputable<| e>(
-  queries: Queries<| e>,
-  key: Bytes,
-  d: FactDetails,
-) -> Bool / {memo_store.read} =
-  match ((memo_store.fact(key), queries.named.get(d.query))) {
-    (Some(_), Some(q)) -> q.product == None,
-    _ -> false,
-  }
 
 fn recompute<| e>(
   queries: Queries<| e>,
@@ -469,12 +459,24 @@ fn recompute<| e>(
     },
   }
 
+fn kinds_before<| e>(queries: Queries<| e>, kind: Bytes) -> List<Bytes> =
+  queries.named.fold([], |found: List<Bytes>, _: Bytes, q: Query<| e>|
+    match q.product {
+      Some(p) -> if p.kind != kind { found }
+      else { p.after.fold(found, |all: List<Bytes>, k: Bytes| all.push_unique(k)) },
+      None -> found,
+    })
+
 fn kind_caught_up<| e>(
   queries: Queries<| e>,
   run: Run,
   kind: Bytes,
 ) -> Run / {memo_store.read, memo_store.write, abort.raise | e} =
   if run.caught_up.contains(kind) { run } else {
+    let ready = kinds_before(queries, kind).fold(
+      { ..run, caught_up: run.caught_up.insert(kind) },
+      |r: Run, before: Bytes| kind_caught_up(queries, r, before),
+    );
     let of_kind = |key: Bytes| memo_store.deferred_kind(key) == Some(kind);
     memo_store.logged_changes(kind).fold((), |_: Unit, key: Bytes| {
       if of_kind(key) { marked(key) };
@@ -484,21 +486,27 @@ fn kind_caught_up<| e>(
       })
     });
     memo_store.push_products(kind);
-    let done = recomputed(queries, { ..run, caught_up: run.caught_up.insert(kind) });
+    let done = recomputed(queries, ready);
     memo_store.log_read(kind);
     done
   }
 
-fn product_caught_up<| e>(
-  queries: Queries<| e>,
-  run: Run,
-  product: Product,
-) -> Run / {memo_store.read, memo_store.write, abort.raise | e} =
-  kind_caught_up(
-    queries,
-    product.after.fold(run, |r: Run, kind: Bytes| kind_caught_up(queries, r, kind)),
-    product.kind,
-  )
+fn covers(reader: Option<Product>, kind: Bytes) -> Bool =
+  match reader { Some(own) -> own.kind == kind || own.after.contains(kind), None -> false }
+
+fn refuse_stale_read<| e>(reader: Query<| e>, read: Query<| e>) -> Unit / {abort.raise} =
+  match read.product {
+    None -> (),
+    Some(p) -> if !covers(reader.product, p.kind) {
+      panic(
+        "the query `" ++ String::of_bytes_lossy(reader.name) ++ "` reads `"
+          ++ String::of_bytes_lossy(read.name)
+          ++ "`, a product of the kind `"
+          ++ String::of_bytes_lossy(p.kind)
+          ++ "`, so it must be a product of that kind or of a kind that comes after it",
+      )
+    },
+  }
 
 pub fn query_output<| e>(
   queries: Queries<| e>,
@@ -523,7 +531,7 @@ pub fn part_outputs<| e>(
   part: Bytes,
 ) -> PartResults / {memo_store.read, memo_store.write, abort.raise | e} = {
   let q = query_of(queries, name);
-  let ready = match q.product { Some(p) -> product_caught_up(queries, run, p), None -> run };
+  let ready = match q.product { Some(p) -> kind_caught_up(queries, run, p.kind), None -> run };
   let { run: fetched_run, fetched } = fetched_together(
     queries,
     ready,
@@ -888,19 +896,23 @@ fn execute<| e>(
     },
     memo.fetch(name, query_input, part) -> {
       let aq = query_of(queries, name);
+      refuse_stale_read(q, aq);
       let read = key_of(aq, query_input);
       let a = fetched(queries, st.run, aq, read, query_input, part, left);
       st = fact_read({ ..st, run: a.run }, read, part, a.at);
       a.output
     },
     memo.fetch_all(name, inputs, part) -> {
-      let a = fetched_together(queries, st.run, query_of(queries, name), inputs, part, left);
+      let aq = query_of(queries, name);
+      refuse_stale_read(q, aq);
+      let a = fetched_together(queries, st.run, aq, inputs, part, left);
       st = a.fetched.fold({ ..st, run: a.run }, |s: Execution, f: Fetched|
         fact_read(s, f.key, part, f.at));
       a.fetched.map(|f: Fetched| f.output)
     },
     memo.output_digest(name, query_input, part) -> {
       let aq = query_of(queries, name);
+      refuse_stale_read(q, aq);
       let read = key_of(aq, query_input);
       let a = settled(queries, st.run, aq, read, query_input, left);
       st = fact_read({ ..st, run: a.run }, read, part, a.at);
@@ -1115,8 +1127,21 @@ fn computable<| e>(
   let q = query_of(queries, s.query);
   let key = key_of(q, s.input);
   if run.open.contains(key) { false }
-  else if memo_store.is_out_of_date(key) { q.product == None } else {
+  else if memo_store.is_out_of_date(key) { true } else {
     !run.resolved.contains(key) && memo_store.sealed(key) == None && memo_store.fact(key) == None
+  }
+}
+
+fn product_confirmed<| e>(
+  queries: Queries<| e>,
+  run: Run,
+  s: Step,
+) -> Run / {memo_store.read, memo_store.write, abort.raise | e} = {
+  let q = query_of(queries, s.query);
+  let key = key_of(q, s.input);
+  if q.product == None || run.open.contains(key) || !memo_store.is_out_of_date(key) { run } else {
+    let held = restored(queries, run, q, key, unlimited_steps);
+    match held.at { Some(at) -> remembered(held.run, q.name, key, at).run, None -> held.run }
   }
 }
 
@@ -1129,17 +1154,18 @@ fn computed_together<| e>(
   serially: (Run, Step) -> Run / {memo_store.read, memo_store.write, abort.raise | e},
 ) -> Run / {memo_store.read, memo_store.write, abort.raise | e} =
   if steps.len() < 2 { run } else {
+    let confirmed = steps.fold(run, |r: Run, s: Step| product_confirmed(queries, r, s));
     let waiting = steps.fold(
       { seen: Map::new(), found: [] },
       |w: { seen: Map<Bytes, Bool>, found: List<Step> }, s: Step| {
         let key = fact_key(s.query, s.input);
         let { seen, found } = w;
-        if seen.contains(key) || !computable(queries, run, s) { { seen: seen, found: found } }
+        if seen.contains(key) || !computable(queries, confirmed, s) { { seen: seen, found: found } }
         else { { seen: seen.insert(key, true), found: found.push(s) } }
       },
     ).found;
     let first = grown(
-      run,
+      confirmed,
       empty_snapshot,
       waiting.flat_map(|s: Step| predicted(fact_key(s.query, s.input))),
       waiting,
@@ -1313,7 +1339,7 @@ fn attempted<| e>(queries: Queries<| e>, snapshot: Snapshot, step: Step) -> Atte
     None -> Unfinished,
     Some(q) -> handle {
       handle {
-        attempted_body(q, snapshot, step.input)
+        attempted_body(queries, q, snapshot, step.input)
       } with {
         unsettled.needed(wanted) -> Needed(wanted),
         unsettled.unfinished() -> Unfinished,
@@ -1341,6 +1367,7 @@ fn snapshot_output(
   }
 
 fn attempted_body<| e>(
+  queries: Queries<| e>,
   q: Query<| e>,
   snapshot: Snapshot,
   input: Bytes,
@@ -1357,22 +1384,27 @@ fn attempted_body<| e>(
       None -> unsettled.needed(WantedWorld(kind, at)),
     },
     memo.fetch(name, read, part) -> {
+      refuse_stale_read(q, query_of(queries, name));
       let o = snapshot_output(snapshot, name, read, part);
       performed = performed.push(ReadFact(fact_key(name, read), part));
       o
     },
     memo.fetch_all(name, reads, part) -> {
+      refuse_stale_read(q, query_of(queries, name));
       let found = reads.map(|read: Bytes| snapshot_output(snapshot, name, read, part));
       performed = reads.fold(performed, |p: List<Performed>, read: Bytes|
         p.push(ReadFact(fact_key(name, read), part)));
       found
     },
-    memo.output_digest(name, read, part) -> match snapshot.facts.get(fact_key(name, read)) {
-      Some(at) -> {
-        performed = performed.push(ReadFact(fact_key(name, read), part));
-        at.parts.get(part)
-      },
-      None -> unsettled.needed(WantedFact(name, read, part)),
+    memo.output_digest(name, read, part) -> {
+      refuse_stale_read(q, query_of(queries, name));
+      match snapshot.facts.get(fact_key(name, read)) {
+        Some(at) -> {
+          performed = performed.push(ReadFact(fact_key(name, read), part));
+          at.parts.get(part)
+        },
+        None -> unsettled.needed(WantedFact(name, read, part)),
+      }
     },
     memo.stored_output(digest) -> match snapshot.outputs.get(digest) {
       Some(o) -> Some(o),
