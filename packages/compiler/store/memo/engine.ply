@@ -22,7 +22,7 @@ pub opaque type Run = new {
   resolved: Map<Bytes, Settled>,
   requested_dependencies: List<Dependency>,
   open: Set<Bytes>,
-  lowest_open: Option<Int>,
+  confirm_above: Option<Int>,
   trail: Trail,
   took: Map<Bytes, Int>,
   ran: Map<Bytes, Int>,
@@ -35,7 +35,7 @@ const new_run: Run =
     resolved: Map::new(),
     requested_dependencies: [],
     open: Set::empty(),
-    lowest_open: None,
+    confirm_above: None,
     trail: Started,
     took: Map::new(),
     ran: Map::new(),
@@ -131,9 +131,6 @@ fn marked_readers(
   changed: Set<Bytes>,
 ) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
   if !changed.is_empty() { marked_edges(key, |r: Reader| changed.contains(r.tag)) }
-
-fn dependency_id(r: Dependency) -> Bytes / {abort.raise} =
-  match r { QueryDependency(q) -> q.fact, ExternalDependency(e) -> location_id(e.kind, e.at) }
 
 type Edge = { on: Bytes, member: Bytes }
 
@@ -434,7 +431,13 @@ fn recompute<| e>(
             Some(done) -> done,
             None -> {
               deleted(key);
-              { ..run, resolved: Map::new(), open: Set::empty(), lowest_open: None, trail: Started }
+              {
+                ..run,
+                resolved: Map::new(),
+                open: Set::empty(),
+                confirm_above: None,
+                trail: Started,
+              }
             },
           }
         },
@@ -612,14 +615,14 @@ fn settled<| e>(
     match known(run, q.name, key) {
       KnownFact(a) -> a,
       UnknownFact -> run_opened(queries, run, q, key, input, true, left),
-      ReachesOpenFact(open) -> report_cycle(run, open, step),
+      UnconfirmedFact -> run_opened(queries, run, q, key, input, true, left),
     }
   }
 }
 
-type Recalled = | KnownFact({ run: Run, at: Settled }) | UnknownFact | ReachesOpenFact(Bytes)
+type Recalled = | KnownFact({ run: Run, at: Settled }) | UnknownFact | UnconfirmedFact
 
-fn known(run: Run, name: Bytes, key: Bytes) -> Recalled / {memo_store.read, abort.raise} =
+fn known(run: Run, name: Bytes, key: Bytes) -> Recalled / {memo_store.read} =
   if run.open.contains(key) || memo_store.is_out_of_date(key) { UnknownFact } else {
     match run.resolved.get(key) {
       Some(at) -> KnownFact({ run: run, at: at }),
@@ -628,36 +631,22 @@ fn known(run: Run, name: Bytes, key: Bytes) -> Recalled / {memo_store.read, abor
           KnownFact(remembered(run, name, key, { parts: parts, depth: 0, sealed: true })),
         None -> match memo_store.fact(key) {
           None -> UnknownFact,
-          Some(f) -> match open_reached(run, key, f) {
-            Some(open) -> ReachesOpenFact(open),
-            None ->
-              KnownFact(
-                remembered(run, name, key, { parts: f.parts, depth: f.depth, sealed: false }),
-              ),
+          Some(f) -> if needs_confirming(run, f) { UnconfirmedFact } else {
+            KnownFact(remembered(run, name, key, { parts: f.parts, depth: f.depth, sealed: false }))
           },
         },
       },
     }
   }
 
-fn open_reached(
-  run: Run,
-  key: Bytes,
-  fact: StoredFact,
-) -> Option<Bytes> / {memo_store.read, abort.raise} =
-  match run.lowest_open {
-    None -> None,
-    Some(lowest) -> if fact.depth <= lowest { None } else {
-      let reads_below = |f: StoredFact| memo_store.details(f.details).reads.map(dependency_id);
-      traverse(reads_below(fact), |below: Bytes|
-        match memo_store.fact(below) {
-          None -> { value: false, next: [] },
-          Some(f) -> if f.depth < lowest { { value: false, next: [] } }
-          else if run.open.contains(below) { { value: true, next: [] } }
-          else { { value: false, next: reads_below(f) } },
-        }).fold(None, |found: Option<Bytes>, v: Visit<Bytes, Bool>|
-        match found { Some(_) -> found, None -> if v.value { Some(v.key) } else { None } })
-    },
+fn needs_confirming(run: Run, fact: StoredFact) -> Bool =
+  match run.confirm_above { Some(depth) -> fact.depth > depth, None -> false }
+
+fn lowered_bound(bound: Option<Int>, key: Bytes) -> Option<Int> / {memo_store.read} =
+  match ((bound, memo_store.fact(key))) {
+    (Some(depth), Some(f)) -> Some(min(depth, f.depth)),
+    (None, Some(f)) -> Some(f.depth),
+    (unchanged, None) -> unchanged,
   }
 
 fn run_opened<| e>(
@@ -672,21 +661,17 @@ fn run_opened<| e>(
   let step = { query: q.name, input: input };
   if run.open.contains(key) { report_cycle(run, key, step) }
   else if left <= 0 { panic(too_many_open) } else {
-    let stored_depth = match memo_store.fact(key) { Some(f) -> Some(f.depth), None -> None };
     let opened = {
       ..run,
       open: run.open.insert(key),
-      lowest_open: match ((run.lowest_open, stored_depth)) {
-        (Some(a), Some(b)) -> Some(min(a, b)),
-        (Some(a), None) -> Some(a),
-        (None, b) -> b,
-      },
+      confirm_above: lowered_bound(run.confirm_above, key),
       trail: Then(run.trail, { key: key, step: step }),
     };
-    let unchanged = if may_restore { product_unchanged(queries, opened, q, key, left - 1) }
+    let unchanged = if may_restore { restored(queries, opened, q, key, left - 1) }
     else { { run: opened, at: None } };
     let done = match unchanged.at {
-      Some(at) -> { run: unchanged.run, at: at },
+      Some(at) ->
+        { run: { ..unchanged.run, took: incremented(unchanged.run.took, q.name) }, at: at },
       None -> execute(queries, unchanged.run, q, key, input, left - 1),
     };
     {
@@ -694,7 +679,7 @@ fn run_opened<| e>(
         ..done.run,
         resolved: done.run.resolved.insert(key, done.at),
         open: done.run.open.remove(key),
-        lowest_open: run.lowest_open,
+        confirm_above: run.confirm_above,
         trail: run.trail,
       },
       at: done.at,
@@ -713,27 +698,38 @@ fn reads_still_hold<| e>(
       match r {
         ExternalDependency(e) ->
           { run: sofar.run, same: memo_store.external(e.kind, e.at).digest == e.digest },
-        QueryDependency(q) -> match details_before(memo_store.fact(q.fact)) {
-          None -> { run: sofar.run, same: false },
-          Some(d) -> match queries.named.get(d.query) {
-            None -> { run: sofar.run, same: false },
-            Some(aq) -> {
-              let a = settled(queries, sofar.run, aq, q.fact, d.input, left);
-              { run: a.run, same: a.at.parts.get(q.part) == q.digest }
-            },
-          },
-        },
+        QueryDependency(q) -> query_read_holds(queries, sofar.run, q, left),
       }
     })
 
-fn product_unchanged<| e>(
+fn query_read_holds<| e>(
+  queries: Queries<| e>,
+  run: Run,
+  dependency: { fact: Bytes, part: Bytes, digest: Option<Bytes> },
+  left: Int,
+) -> { run: Run, same: Bool } / {memo_store.read, memo_store.write, abort.raise | e} =
+  if run.open.contains(dependency.fact) { { run: run, same: false } } else {
+    match details_before(memo_store.fact(dependency.fact)) {
+      None -> { run: run, same: false },
+      Some(d) -> match queries.named.get(d.query) {
+        None -> { run: run, same: false },
+        Some(aq) -> {
+          let a = settled(queries, run, aq, dependency.fact, d.input, left);
+          { run: a.run, same: a.at.parts.get(dependency.part) == dependency.digest }
+        },
+      },
+    }
+  }
+
+fn restored<| e>(
   queries: Queries<| e>,
   run: Run,
   q: Query<| e>,
   key: Bytes,
   left: Int,
-) -> { run: Run, at: Option<Settled> } / {memo_store.read, memo_store.write, abort.raise | e} =
-  match if q.product != None { memo_store.fact(key) } else { None } {
+) -> { run: Run, at: Option<Settled> } / {memo_store.read, memo_store.write, abort.raise | e} = {
+  let restorable = q.product != None || !memo_store.is_out_of_date(key);
+  match if restorable { memo_store.fact(key) } else { None } {
     None -> { run: run, at: None },
     Some(f) -> {
       let held = reads_still_hold(queries, run, memo_store.details(f.details).reads, left);
@@ -743,6 +739,7 @@ fn product_unchanged<| e>(
       }
     },
   }
+}
 
 fn report_cycle<a>(run: Run, first: Bytes, step: Step) -> a / {abort.raise} =
   panic(
@@ -947,19 +944,12 @@ effect unsettled {
 
 type Known = { run: Run, snapshot: Snapshot, added: Bool }
 
-fn opened_for(run: Run, waiting: List<Step>) -> Run / {memo_store.read, abort.raise} =
-  waiting.fold(run, |r: Run, s: Step| {
-    let key = fact_key(s.query, s.input);
-    {
-      ..r,
-      open: r.open.insert(key),
-      lowest_open: match ((r.lowest_open, memo_store.fact(key))) {
-        (Some(a), Some(f)) -> Some(min(a, f.depth)),
-        (None, Some(f)) -> Some(f.depth),
-        (lowest, None) -> lowest,
-      },
-    }
-  })
+fn bounded_by(run: Run, waiting: List<Step>) -> Run / {memo_store.read, abort.raise} =
+  {
+    ..run,
+    confirm_above: waiting.fold(run.confirm_above, |bound: Option<Int>, s: Step|
+      lowered_bound(bound, fact_key(s.query, s.input))),
+  }
 
 fn with_wanted(k: Known, wanted: Wanted) -> Known / {memo_store.read, abort.raise} =
   match wanted {
@@ -976,7 +966,7 @@ fn with_wanted(k: Known, wanted: Wanted) -> Known / {memo_store.read, abort.rais
         Some(at) -> with_part_output(k, at, part),
         None -> match known(k.run, name, key) {
           UnknownFact -> k,
-          ReachesOpenFact(_) -> k,
+          UnconfirmedFact -> k,
           KnownFact(a) -> {
             let with_fact = { ..k.snapshot, facts: k.snapshot.facts.insert(key, a.at) };
             match a.at.parts.get(part) {
@@ -1020,10 +1010,10 @@ fn grown(
   waiting: List<Step>,
 ) -> Known / {memo_store.read, abort.raise} = {
   let k = wanted.fold(
-    { run: opened_for(run, waiting), snapshot: snapshot, added: false },
+    { run: bounded_by(run, waiting), snapshot: snapshot, added: false },
     with_wanted,
   );
-  { ..k, run: { ..k.run, open: run.open, lowest_open: run.lowest_open } }
+  { ..k, run: { ..k.run, confirm_above: run.confirm_above } }
 }
 
 fn predicted(key: Bytes) -> List<Wanted> / {memo_store.read} =
