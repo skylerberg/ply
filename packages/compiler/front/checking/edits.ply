@@ -1,11 +1,10 @@
+import std.fs
 import std.bin
 import std.hash (blake3)
 import std.bytes
 import std.list
 import compiler.store.memo
-import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, reading,
-                            empty_memory_store, in_session, in_session_of, products_behind,
-                            query_stats)
+import compiler.store.memo (memo, Run, reading, in_session)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
@@ -49,13 +48,12 @@ import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, Ch
                                 outcome_summary, reject_embed, nothing_derived, over_decoding,
                                 queried_over, queried_under, prelude_frames, prelude_files,
                                 lookup_input_alone, inputs_alone, queried_results, outcome_of, Step,
-                                product_queries, check_sources, check_with_pack, layered,
-                                shipped_store, pack_of, module_of)
+                                product_queries, check_sources, layered, module_of, stopped_over)
 
 type Reference = { whole: OutcomeSummary, fixing: CachedHashes, results: List<CheckedModule> }
 
 fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
-  let fresh = queried_results(fresh_registry(), empty_memory_store, sources);
+  let fresh = queried_results(fresh_registry(), fs::mem_empty(), sources);
   {
     whole: outcome_summary(analyse(parse_all(sources))),
     fixing: fresh.fixing,
@@ -68,11 +66,11 @@ fn sources_key(sources: List<Source>) -> Bytes =
     sources.map(|s: Source| Bytes::concat_all([s.name, b"\x00", s.source_text, b"\x00"])),
   )
 
-type EditSession = { store: MemoryStore, references: Map<Bytes, Reference>, off: List<Bytes> }
+type EditSession = { store: fs::MemFs, references: Map<Bytes, Reference>, off: List<Bytes> }
 
 pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
   steps.fold(
-    { store: empty_memory_store, references: Map::new(), off: [] },
+    { store: fs::mem_empty(), references: Map::new(), off: [] },
     |s: EditSession, step: Step| {
       let warm = queried_over(s.store, step.sources);
       let now = outcome_summary(warm.outcome);
@@ -567,6 +565,18 @@ test "reusing cached results matches checking from scratch after a field is remo
   )
 }
 
+test "a check stopped at any write to the store leaves a store that the next check reads as a check from scratch would" {
+  let before = record_reads(b"a: Int, b: Int", b"f.a + f.b", b"{ a: 1, b: 2 }");
+  let after = record_reads(b"a: Int", b"f.a", b"{ a: 1 }");
+  let cold = queried_over(fs::mem_empty(), before).store;
+  let fresh = queried_over(fs::mem_empty(), after);
+  [0, 1, 2, 4, 8, 16, 32, 64].fold((), |_: Unit, writes: Int| {
+    let next = queried_over(stopped_over(cold, after, writes), after);
+    assert_eq(outcome_summary(next.outcome), outcome_summary(fresh.outcome));
+    assert_eq(next.fixing, fresh.fixing)
+  })
+}
+
 fn facts_reads(declarations: Bytes, total: Bytes, served: Bytes) -> List<Source> =
   [
     {
@@ -1001,7 +1011,7 @@ test "reusing cached results matches checking from scratch when a function's eff
   ];
   let moved = with_module(stale, b"lib", chain_lib(b"b"));
   assert_eq(disagreements([step(b"cold", stale), step(b"the callee's effects moved", moved)]), []);
-  let warm = queried_over(queried_over(empty_memory_store, stale).store, moved);
+  let warm = queried_over(queried_over(fs::mem_empty(), stale).store, moved);
   assert(match warm.outcome { Rejected(_) -> true, Analysed(_) -> false })
 }
 
@@ -1025,7 +1035,7 @@ test "`keep` written on an imported function, or dropped, leaves the result thro
     ]),
     [],
   );
-  let warm = queried_over(queried_over(empty_memory_store, borrowed).store, with_keep);
+  let warm = queried_over(queried_over(fs::mem_empty(), borrowed).store, with_keep);
   assert(match warm.outcome { Rejected(_) -> true, Analysed(_) -> false })
 }
 
@@ -1039,7 +1049,7 @@ test "deleting an unused function that another module imports by name is rejecte
     disagreements([step(b"cold", s0), step(b"warm", s0), step(b"the name deleted", gone)]),
     [],
   );
-  match queried_over(queried_over(empty_memory_store, s0).store, gone).outcome {
+  match queried_over(queried_over(fs::mem_empty(), s0).store, gone).outcome {
     Analysed(_) -> panic("an import of a deleted name checked"),
     Rejected(ds) ->
       assert(
@@ -1182,7 +1192,7 @@ const hashed_fixture: List<Source> =
 
 test "a program hashed from its modules' results has the same hashes and warnings as the program hashed in one pass" {
   [unedited_sources, hashed_fixture].fold((), |u: Unit, sources: List<Source>| {
-    let fixed = check_sources(empty_memory_store, sources, []);
+    let fixed = check_sources(fs::mem_empty(), sources, []);
     let whole = load_with_shipped(sources, []);
     match ((
         whole.hashed,
@@ -1206,7 +1216,7 @@ test "assembling a program from per-module check results gives the same definiti
   [unedited_sources, hashed_fixture, faceted, faceted.reverse()].fold(
     (),
     |u: Unit, sources: List<Source>| {
-      let fixed = check_sources(empty_memory_store, sources, []);
+      let fixed = check_sources(fs::mem_empty(), sources, []);
       match analyse_pulling_std_with(sources, [], no_rows).out {
         Rejected(_) -> panic("the fixture program was rejected by the checker"),
         Analysed(w) -> {
@@ -1288,7 +1298,7 @@ fn load_with_analysis(
   let text_of = |name: Bytes| texts.get(name);
   let names = shipped.map(|s: Source| s.name);
   let done = over_decoding(
-    empty_memory_store,
+    fs::mem_empty(),
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes|
@@ -1437,7 +1447,7 @@ test "a function body that calls a method on a value records the same check resu
       ],
     },
   ].fold((), |u: Unit, fixture: { names: Bool, sources: List<Source> }| {
-    let returned = check_sources(empty_memory_store, fixture.sources, []).cached_hashes.nodes.fold(
+    let returned = check_sources(fs::mem_empty(), fixture.sources, []).cached_hashes.nodes.fold(
       b"",
       |accumulator: Bytes, x: CachedNode| if x.name == b"m.f" { x.body } else { accumulator },
     );
@@ -1489,7 +1499,7 @@ test "reverting a failing edit gives the original result" {
         ]),
       },
     ];
-  let cold = queried_over(empty_memory_store, source(b"n + 1"));
+  let cold = queried_over(fs::mem_empty(), source(b"n + 1"));
   let broken = queried_over(cold.store, source(b"n + true"));
   assert_eq(
     outcome_summary(broken.outcome),
@@ -1539,7 +1549,7 @@ test "when a set of definitions fails to check, its hash is computed without the
 
 test "edits to mutually recursive functions give the result of a check from scratch" {
   let before = paired(b"true", b"n");
-  let cold = queried_over(empty_memory_store, before);
+  let cold = queried_over(fs::mem_empty(), before);
   assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = paired(b"n == 0", b"n");
   let warm = queried_over(cold.store, after);
@@ -1579,7 +1589,7 @@ fn recursive_types_sources(more: Bytes) -> List<Source> =
 
 test "mutually recursive functions give the result of a check from scratch after a type they reach through a sibling gains a variant" {
   let before = recursive_types_sources(b"");
-  let cold = queried_over(empty_memory_store, before);
+  let cold = queried_over(fs::mem_empty(), before);
   assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = recursive_types_sources(b" | Rest");
   let warm = queried_over(cold.store, after);
@@ -1636,10 +1646,10 @@ fn sized(kind: Bytes, at: Bytes) -> Option<Bytes> / {abort.raise} =
   }
 
 test "changing a type that other types derive functions from gives the result of a check from scratch" {
-  let cold = check_sources(empty_memory_store, derive_sources(b""), [], derived: sized);
+  let cold = check_sources(fs::mem_empty(), derive_sources(b""), [], derived: sized);
   let after = derive_sources(b" | Twig(List<Grove>)");
   let warm = check_sources(cold.store, after, [], derived: sized);
-  assert_eq(warm.results, check_sources(empty_memory_store, after, [], derived: sized).results)
+  assert_eq(warm.results, check_sources(fs::mem_empty(), after, [], derived: sized).results)
 }
 
 fn stack_queue_sources(stack: Bytes, queue: Bytes) -> List<Source> =
@@ -1659,7 +1669,7 @@ fn stack_queue_sources(stack: Bytes, queue: Bytes) -> List<Source> =
 
 test "edits to definitions that are not mutually recursive give the result of a check from scratch" {
   let before = stack_queue_sources(b"xs.len()", b"f.len()");
-  let cold = queried_over(empty_memory_store, before);
+  let cold = queried_over(fs::mem_empty(), before);
   assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = stack_queue_sources(b"xs.len() + 0", b"f.len()");
   let warm = queried_over(cold.store, after);
@@ -1692,7 +1702,7 @@ const sized_source: Bytes =
   b"import made\npub fn size() -> Int = made::made().area()\n\npub fn two() -> Int = [made::made(), made::made()].len()\n"
 
 test "adding a function to a type and changing its signature give the result of a check from scratch" {
-  let cold = queried_over(empty_memory_store, shaped(shapes_source, sized_source));
+  let cold = queried_over(fs::mem_empty(), shaped(shapes_source, sized_source));
   let added = queried_over(cold.store, shaped(shapes_source.concat(grown_source), sized_source));
   let resigned = edited(
     shaped(shapes_source.concat(grown_source), sized_source),
@@ -1739,7 +1749,7 @@ test "after each edit to a type's functions, a call on a value gives the same re
 }
 
 fn rejected_over(user: List<Source>, shipped: List<Source>) -> List<Bytes> / {abort.raise} =
-  check_sources(empty_memory_store, user, shipped).results.fold(
+  check_sources(fs::mem_empty(), user, shipped).results.fold(
     [],
     |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.message)),
@@ -1890,7 +1900,7 @@ fn lib_app_sources(lib: Bytes) -> List<Source> =
 
 test "a change to the query that assembles a module's result leaves the module's results the same" {
   let sources = lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n");
-  let cold = queried_over(empty_memory_store, sources);
+  let cold = queried_over(fs::mem_empty(), sources);
   let anew = b"module, defined anew";
   let fresh = fresh_registry();
   let qs = {
@@ -1934,9 +1944,9 @@ test "a definition whose cached result becomes outdated while other definitions 
     b"pub fn first() -> Int = sprout() + 2",
     b"pub fn go(n: Int) -> Int = lib::step(1) + shown(n)",
   );
-  let warm = queried_over(queried_over(empty_memory_store, before).store, after);
+  let warm = queried_over(queried_over(fs::mem_empty(), before).store, after);
   assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
-  assert_eq(warm.results, queried_over(empty_memory_store, after).results)
+  assert_eq(warm.results, queried_over(fs::mem_empty(), after).results)
 }
 
 test "editing a test and a definition it calls gives the same results as checking the edited module from scratch" {
@@ -1952,14 +1962,14 @@ test "editing a test and a definition it calls gives the same results as checkin
       source_text: b"fn scale(n: Int) -> Int = n * 2\nfn other(n: Int) -> Int = 1 + n\n\ntest \"doubles\" { assert_eq(scale(2) + other(0), 9) }\n",
     },
   ];
-  let warm = queried_over(queried_over(empty_memory_store, before).store, after);
-  assert_eq(tables_of(warm.results), tables_of(queried_over(empty_memory_store, after).results));
-  assert_eq(warm.results, queried_over(empty_memory_store, after).results)
+  let warm = queried_over(queried_over(fs::mem_empty(), before).store, after);
+  assert_eq(tables_of(warm.results), tables_of(queried_over(fs::mem_empty(), after).results));
+  assert_eq(warm.results, queried_over(fs::mem_empty(), after).results)
 }
 
 test "when an edit breaks several definitions, each reports the same error as a check from scratch" {
   let cold = queried_over(
-    empty_memory_store,
+    fs::mem_empty(),
     lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
   );
   let narrowed = lib_app_sources(b"pub fn step(n: Int, by: Int) -> Int = n + by\n");
@@ -1983,10 +1993,10 @@ test "adding a definition to a standard library module gives the hashes of a che
         ),
       },
     ];
-  let cold = check_sources(empty_memory_store, user, shapes(b""));
+  let cold = check_sources(fs::mem_empty(), user, shapes(b""));
   let added = shapes(b"pub fn spare() -> Int = 5\n");
   let warm = check_sources(cold.store, user, added);
-  assert_eq(warm.cached_hashes, check_sources(empty_memory_store, user, added).cached_hashes)
+  assert_eq(warm.cached_hashes, check_sources(fs::mem_empty(), user, added).cached_hashes)
 }
 
 test "import cycles and self-imports are rejected with the same errors whether checked from scratch or from the cache" {
@@ -2020,7 +2030,7 @@ test "a body error stays where it is written, and modules that import it are che
       source_text: b"pub fn alone() -> Int = nothing()\n\npub fn other() -> Int = 2\n",
     },
   ];
-  let cold = queried_over(empty_memory_store, sources);
+  let cold = queried_over(fs::mem_empty(), sources);
   assert_eq(sorted_bytes(rejected_first(cold.results).map(|a: CheckedModule| a.module)), [
     b"aside",
     b"lib",
@@ -2033,7 +2043,7 @@ test "a body error stays where it is written, and modules that import it are che
   let warm = queried_over(cold.store, mended);
   assert_eq(
     outcome_summary(warm.outcome),
-    outcome_summary(queried_over(empty_memory_store, mended).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), mended).outcome),
   )
 }
 
@@ -2075,9 +2085,9 @@ fn beside_a_comment(size: Int, comment: Bytes) -> List<Source> =
     })
 
 fn apart_position(
-  store: MemoryStore,
+  store: fs::MemFs,
   comment: Bytes,
-) -> { store: MemoryStore, at: Int } / {abort.raise} = {
+) -> { store: fs::MemFs, at: Int } / {abort.raise} = {
   let w = inputs_alone(beside_a_comment(2, comment));
   let qs = fresh_registry();
   let done = over_decoding(
@@ -2103,7 +2113,7 @@ fn reported_by_view(
   let w = inputs_alone(sources);
   let qs = fresh_registry();
   over_decoding(
-    empty_memory_store,
+    fs::mem_empty(),
     prelude_frames,
     prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
@@ -2143,7 +2153,7 @@ test "the view reports errors in each module that has them, and warnings as a lo
   assert(warned.len() > 0);
   assert_eq(
     warned,
-    check_sources(empty_memory_store, spare, []).warnings.map(|d: Diagnostic| d.message),
+    check_sources(fs::mem_empty(), spare, []).warnings.map(|d: Diagnostic| d.message),
   )
 }
 
@@ -2168,7 +2178,7 @@ test "a function with a type error still uses the helper it calls, so only the h
 }
 
 test "a listing read after a comment shows the positions the comment moved" {
-  let before = apart_position(empty_memory_store, b"");
+  let before = apart_position(fs::mem_empty(), b"");
   let after = apart_position(before.store, b"// A comment.\n");
   assert_eq(after.at, before.at + b"// A comment.\n".len())
 }
