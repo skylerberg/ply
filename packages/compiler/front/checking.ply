@@ -10,8 +10,8 @@ import compiler.store.memo (memo, main_only, main_part)
 import compiler.store.handles (fetch, fetch_all)
 import compiler.store.database
 import compiler.store.database (WriteLimit, Finished, Stopped, Stored, NotKept)
-import compiler.store.memo.store (QueriesId, queries_id)
-import compiler.store.memo.engine (Run, ShippedFact, reading, in_session, shipped_facts)
+import compiler.store.memo.store (interfaces)
+import compiler.store.memo.engine (Run, QueryStats, reading, in_session, query_stats)
 import compiler.store.packs
 import compiler.unit (definition_hash)
 import compiler.front.owner_checks
@@ -551,11 +551,10 @@ pub fn nothing_derived(kind: Bytes, at: Bytes) -> Option<Bytes> = None
 pub fn over_decoding<a | e>(
   store: fs::MemFs,
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
-  world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {RunEffects, abort.raise},
 ) -> { store: fs::MemFs, value: a } / {abort.raise | e} = {
-  let done = database::with_store_in_memory(store, read, world, look, || with_decode_cache(work));
+  let done = database::with_store_in_memory(store, read, look, || with_decode_cache(work));
   { store: done.tree, value: done.value }
 }
 
@@ -574,7 +573,6 @@ pub fn queried_results(
   let done = over_decoding(
     store,
     prelude_frames,
-    prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     || query_outcome(qs, w),
   );
@@ -586,8 +584,6 @@ pub fn queried_results(
     results: done.value.results,
   }
 }
-
-pub const prelude_files: Bytes = b"the shipped files"
 
 pub const prelude_pack: packs::PackFiles = shipped_pack([])
 
@@ -669,7 +665,6 @@ pub fn session_over<a>(
   let done = over_decoding(
     program.store,
     |part: packs::PackPart| packs::frame_in(Some(pack), part),
-    prelude_files,
     |kind: Bytes, at: Bytes|
       lookup_input(
         w,
@@ -882,13 +877,11 @@ fn queried_in(
       database::with_database[abs](
         "s",
         prelude_frames,
-        prelude_files,
         |kind: Bytes, at: Bytes| {
           if raced.is_first_lookup() {
             database::with_database[abs](
               "s",
               prelude_frames,
-              prelude_files,
               |k: Bytes, a: Bytes| lookup_input_alone(w, k, a),
               |_: Bytes| (),
               || with_decode_cache(|| query_alone(qs, w).run),
@@ -927,7 +920,6 @@ pub fn checked_with_write_limit(
       store,
       limit,
       prelude_frames,
-      prelude_files,
       |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
       || with_decode_cache(|| query_alone(qs, w).own_hashes),
     ) {
@@ -974,7 +966,6 @@ fn stored_results(name: Bytes) -> List<Bytes> / {abort.raise} = {
   let store = over_decoding(
     fs::mem_empty(),
     prelude_frames,
-    prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
       in_session(qs, |run: Run| {
@@ -1047,7 +1038,6 @@ fn embedding_queried(
   let done = over_decoding(
     fs::mem_empty(),
     packs::no_pack,
-    b"",
     |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
     || query_alone(fresh_registry(), w),
   );
@@ -1291,7 +1281,6 @@ fn session_over_embeds<[r]>(
   database::with_database[r](
     "s",
     packs::no_pack,
-    b"",
     |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
     |_: Bytes| (),
     ||
@@ -1368,7 +1357,6 @@ pub fn check_under(
         match found { Some(b) -> fetching.fetch(b), None -> () };
         found
       },
-      prelude_files,
       |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at, derived: derived),
       || {
         in_session(qs, |run: Run| {
@@ -1504,8 +1492,7 @@ test "a group that calls a group with a type error is checked against its writte
 
 type ShippedStore = {
   store: fs::MemFs,
-  queries: QueriesId,
-  facts: List<ShippedFact>,
+  interfaces: Map<Bytes, Set<Bytes>>,
   rejected: List<CheckedModule>,
 }
 
@@ -1515,21 +1502,15 @@ fn shipped_store(shipped: List<Source>) -> ShippedStore / {abort.raise} = {
   let done = over_decoding(
     fs::mem_empty(),
     packs::no_pack,
-    b"",
     |kind: Bytes, at: Bytes| lookup_input_shipping(nowhere, shipped, kind, at),
     ||
       in_session(qs, |run: Run| {
         let all = reading(qs, run, ||
           check_shipped_modules(with_prelude_source(shipped).map(|s: Source| s.name)));
-        { run: all.run, value: { facts: shipped_facts(qs, all.run), rejected: all.value } }
+        { run: all.run, value: all.value }
       }),
   );
-  {
-    store: done.store,
-    queries: queries_id(qs),
-    facts: done.value.facts,
-    rejected: done.value.rejected,
-  }
+  { store: done.store, interfaces: interfaces(qs), rejected: done.value }
 }
 
 test "computing the shipped modules' results names each one that fails" {
@@ -1569,7 +1550,7 @@ test "a compiler module imports another below the compiler's root by its full na
 
 pub fn shipped_pack(shipped: List<Source>) -> packs::PackFiles / {abort.raise} = {
   let built = shipped_store(shipped);
-  database::pack_in_memory(built.store, built.facts, built.queries, prelude_files)
+  database::pack_in_memory(built.store, built.interfaces)
 }
 
 test "a module whose text fails to parse outside its items is rejected with the parse error" {
@@ -1813,6 +1794,28 @@ test "a program checked over a prebuilt store of shipped results gives the resul
   let load = check_with_pack(fs::mem_empty(), Some(shipped_pack(shipped)), user, shipped);
   assert_eq(load.results, check_sources(fs::mem_empty(), user, shipped).results)
 }
+
+test "a program over a shipped pack checks its groups again after an edit to a shipped module it imports, and checks none after an edit to one it does not" {
+  let shipped = [
+    { name: b"std.used", source_text: b"pub fn one() -> Int = 1\n" },
+    { name: b"std.apart", source_text: b"pub fn two() -> Int = 2\n" },
+  ];
+  let user = [
+    { name: b"main", source_text: b"import std.used (one)\npub fn main() -> Int = one()\n" },
+  ];
+  let pack = Some(shipped_pack(shipped));
+  let first = check_with_pack(fs::mem_empty(), pack, user, shipped);
+  let groups_after = |name: Bytes, text: Bytes|
+    query_stats(check_with_pack(first.store, pack, user, with_text(shipped, name, text)).run).fold(
+      0,
+      |n: Int, s: QueryStats| if s.query == b"group" { n + s.ran } else { n },
+    );
+  assert_eq(groups_after(b"std.apart", b"pub fn two() -> Int = 3\n"), 0);
+  assert(groups_after(b"std.used", b"pub fn one() -> Bool = true\n") > 0, None)
+}
+
+fn with_text(sources: List<Source>, name: Bytes, text: Bytes) -> List<Source> =
+  sources.map(|s: Source| if s.name == name { { ..s, source_text: text } } else { s })
 
 test "a shipped module's imports are checked as an importing module sees them, ignoring imports used only by its tests" {
   let user = [

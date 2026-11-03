@@ -64,20 +64,6 @@ pub fn data(name: &str) -> Option<&'static [u8]> {
     ply_pack::installed().bytes(&data_path_of(name)?)
 }
 
-pub fn digests() -> String {
-    let mut lines: Vec<String> = names()
-        .into_iter()
-        .filter_map(|name| Some(format!("{name}.ply {}\n", digest_of(&name)?)))
-        .chain(
-            data_names()
-                .into_iter()
-                .filter_map(|name| Some(format!("{name} {}\n", digest_of(&name)?))),
-        )
-        .collect();
-    lines.sort();
-    lines.concat()
-}
-
 pub fn digest() -> ply_pack::Digest {
     ply_pack::installed().digest_below(&[ply_pack::STD, ply_pack::COMPILER])
 }

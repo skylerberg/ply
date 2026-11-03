@@ -19,7 +19,7 @@ pub effect recent_reads {
   write keep_table(name: Bytes, rows: SortedTable) -> Unit
 }
 
-pub type Tree = | Facts | Dependents | Inputs | Codes | Records | Cursors | PackUsed
+pub type Tree = | Facts | Dependents | Inputs | Codes | Records | Cursors
 
 pub type LogEntry = { offset: Int, changes: List<Bytes> }
 
@@ -40,22 +40,15 @@ pub type Database = {
   writing: SegmentWriter,
   written_results: Map<Bytes, PayloadPlace>,
   log_floor: Int,
+  base: Option<Segment>,
 }
 
-const schema: Bytes = b"ply fact database 13".blake3()
+const schema: Bytes = b"ply fact database 14".blake3()
 
 type Table = | ChangesTable | LogEndTable | ResultsTable | TreeTable(Tree)
 
 fn tree_number(tree: Tree) -> Int =
-  match tree {
-    Facts -> 1,
-    Dependents -> 2,
-    Inputs -> 3,
-    Codes -> 4,
-    Records -> 5,
-    Cursors -> 6,
-    PackUsed -> 7,
-  }
+  match tree { Facts -> 1, Dependents -> 2, Inputs -> 3, Codes -> 4, Records -> 5, Cursors -> 6 }
 
 fn table_number(table: Table) -> Int =
   match table {
@@ -76,7 +69,6 @@ const all_tables: List<Table> =
     TreeTable(Codes),
     TreeTable(Records),
     TreeTable(Cursors),
-    TreeTable(PackUsed),
   ]
 
 type PayloadPlace = { at: Int, size: Int }
@@ -108,8 +100,30 @@ fn loaded_rows<[r]>(
 
 fn manifest_of(basis: Basis) -> Manifest = match basis { Extending(m) -> m, Replacing(m) -> m }
 
-fn readable_segments(db: Database) -> List<Segment> =
-  match db.basis { Extending(m) -> m.segments, Replacing(_) -> [] }
+fn readable_segments(db: Database) -> List<Segment> = {
+  let own = match db.basis { Extending(m) -> m.segments, Replacing(_) -> [] };
+  match db.base { Some(seg) -> [seg].concat(own), None -> own }
+}
+
+pub fn with_base(db: Database, base: Segment) -> Database = { ..db, base: Some(base) }
+
+pub fn without_base(db: Database) -> Database = { ..db, base: None }
+
+pub const base_trees: List<Tree> = [Facts, Dependents, Inputs, Codes]
+
+pub fn tree_number_of(tree: Tree) -> Int = table_number(TreeTable(tree))
+
+pub fn tree_table<[r]>(
+  db: Database,
+  tree: Tree,
+) -> SortedTable / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  segments::sorted_table(
+    entries_under[r](db, tree, b"").fold(
+      Map::new(),
+      |rows: Map<Bytes, Bytes>, key: Bytes, value: Bytes|
+        rows.insert(key, bin::encode(Present(value), stored_entry_bin())),
+    ),
+  )
 
 fn segments_kept(basis: Basis, now: Manifest) -> Int =
   match basis { Extending(_) -> now.segments.len(), Replacing(_) -> 0 }
@@ -179,6 +193,7 @@ fn fresh_database(dir: String, manifest: Manifest) -> Database =
     writing: segments::new_writer,
     written_results: Map::new(),
     log_floor: 0,
+    base: None,
   }
 
 pub opaque type Opening = | Opening({ dir: String, run: Option<String> })
@@ -274,6 +289,21 @@ pub fn value_of<[r]>(
   match pending_in(db, tree).get(key) {
     Some(entry) -> present_value(entry),
     None -> stored_value[r](db, tree, key),
+  }
+
+pub fn from_base<[r]>(
+  db: Database,
+  tree: Tree,
+  key: Bytes,
+) -> Bool / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match db.base {
+    None -> false,
+    Some(base) ->
+      pending_in(db, tree).get(key) == None
+        && (match stored_row[r](db, TreeTable(tree), key) {
+          Some(found) -> found.token == base.token,
+          None -> false,
+        }),
   }
 
 fn prefix_end(prefix: Bytes) -> Option<Bytes> / {abort.raise} = {
@@ -574,6 +604,7 @@ fn written_over<[r]>(
           merge_tail[r](
             {
               ..fresh_database(db.dir, m),
+              base: db.base,
               log_end: db.log_end,
               log_floor: db.log_floor,
               run: db.run,
@@ -631,7 +662,7 @@ fn kept_in_merge(
       ResultsTable -> live_results.contains(key),
       TreeTable(_) -> match decoded(value, stored_entry_bin()) {
         Present(_) -> true,
-        Removed -> false,
+        Removed -> match db.base { Some(_) -> true, None -> false },
       },
     },
   }

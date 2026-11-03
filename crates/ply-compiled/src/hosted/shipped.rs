@@ -12,7 +12,6 @@ pub trait Ships: Send + Sync {
     fn names(&self) -> Vec<String>;
     fn module(&self, name: &str) -> Option<&'static [u8]>;
     fn read_pack(&self, part: PackPart) -> Option<Vec<u8>>;
-    fn digests(&self) -> String;
     fn stamps(&self) -> String;
     fn definitions(&self) -> String;
 }
@@ -41,10 +40,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
         runtime_native(
             "shipped_answer",
             rt_shipped_answer as unsafe extern "C" fn(_, _, _, _, _) -> _,
-        ),
-        runtime_native(
-            "shipped_digests",
-            rt_shipped_digests as unsafe extern "C" fn(_) -> _,
         ),
         runtime_native(
             "shipped_version",
@@ -135,12 +130,6 @@ pub unsafe extern "C" fn rt_shipped_answer(
             _ => None,
         };
         c.given(found(part.and_then(|part| ships.read_pack(part))))
-    })
-}
-
-pub unsafe extern "C" fn rt_shipped_digests(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_digests", |c, ships| {
-        c.given(ships.digests().into_bytes())
     })
 }
 

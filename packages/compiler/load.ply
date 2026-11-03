@@ -403,12 +403,11 @@ fn in_temporary_store<a | e>(
   read_embed: keep (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {ReadsShipped, abort.raise | e},
   derived: keep (Bytes, Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e},
   work: (CheckQueries, Run) -> { run: Run, value: a } / {RunEffects, abort.raise},
-) -> a / {ReadsShipped, shipped.digests, shipped.stamps, shipped.definitions, abort.raise | e} = {
+) -> a / {ReadsShipped, shipped.stamps, shipped.definitions, abort.raise | e} = {
   let qs = query_registry();
   database::with_store_in_memory(
     fs::mem_empty(),
     pack_frame,
-    shipped.digests(),
     looking_up(w, read_embed, derived),
     || with_decode_cache(|| in_session(qs, |run: Run| work(qs, run))),
   ).value
@@ -426,7 +425,6 @@ fn open_memo_store<a, [r], [s]>(
   database::with_database[r](
     dir,
     pack_frame,
-    shipped.digests(),
     looking_up(w, read_embed, derived),
     |_: Bytes| (),
     || with_decode_cache(|| in_session(qs, |run: Run| work(qs, w, run))),
@@ -687,16 +685,20 @@ pub fn load<[r]>(
     },
   }
 
-pub effect set Derives = {shipped.names, shipped.module, shipped.digests, shipped.read_pack, shipped.stamps, shipped.definitions, shipped.runtime, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
+pub effect set Derives = {shipped.names, shipped.module, shipped.read_pack, shipped.stamps, shipped.definitions, shipped.runtime, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
 
-type DeriverModule = { name: Bytes, text: Bytes }
+type DeriverModule = { name: Bytes, text: Bytes, shipped: Bool }
 
 pub fn derivation_result(
   ask: DeriverRequest,
   own: Map<Bytes, Bytes>,
 ) -> DeriverResponse / {Derives, abort.raise} = {
   let modules = deriver_modules(ask.module, own);
-  run_derivation(ask, deriver_key(ask.module, modules), modules)
+  run_derivation(
+    ask,
+    deriver_key(ask.module, modules),
+    modules.filter(|r: DeriverModule| !r.shipped),
+  )
 }
 
 fn deriver_key(module: Bytes, modules: List<DeriverModule>) -> Bytes / {Derives, abort.raise} =
@@ -704,7 +706,6 @@ fn deriver_key(module: Bytes, modules: List<DeriverModule>) -> Bytes / {Derives,
     Bytes::concat_all([
       blake3(shipped.definitions()),
       shipped_runtime().identity,
-      blake3(shipped.digests()),
       module,
       b"\x00",
       Bytes::concat_all(
@@ -713,15 +714,22 @@ fn deriver_key(module: Bytes, modules: List<DeriverModule>) -> Bytes / {Derives,
     ]),
   )
 
-fn deriver_modules(module: Bytes, own: Map<Bytes, Bytes>) -> List<DeriverModule> / {abort.raise} =
+fn deriver_modules(
+  module: Bytes,
+  own: Map<Bytes, Bytes>,
+) -> List<DeriverModule> / {shipped.module, abort.raise} =
   traverse([module], |name: Bytes|
-    match if is_shipped(name) { None } else { own.get(name) } {
+    match if is_shipped(name) { shipped.module(String::of_bytes_lossy(name)) }
+      else { own.get(name) } {
       Some(text) -> {
         let imports = match header(text) {
           Some(head) -> head.imports,
           None -> parse(text).node.imports,
         };
-        { value: Some({ name: name, text: text }), next: imports.map(import_path) }
+        {
+          value: Some({ name: name, text: text, shipped: is_shipped(name) }),
+          next: imports.map(import_path),
+        }
       },
       None -> { value: None, next: [] },
     }).fold([], |modules: List<DeriverModule>, v: Visit<Bytes, Option<DeriverModule>>|
@@ -966,12 +974,11 @@ test "`deriver_modules` returns the project's own modules that a deriver module 
 }
 
 pub fn forbid_derivers<a | e>(
-  work: () -> a / {shipped.digests, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e},
+  work: () -> a / {shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e},
 ) -> a / {abort.raise | e} =
   handle {
     work()
   } with {
-    shipped.digests() -> b"",
     shipped.run_root(library, root, arguments, timeout_ms) ->
       panic("a test's load runs no deriver"),
     compilers.find[cc]() -> panic("a test's load runs no deriver"),

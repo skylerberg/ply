@@ -65,10 +65,6 @@ impl ply_compiled::hosted::shipped::Ships for Shipping {
         }
     }
 
-    fn digests(&self) -> String {
-        crate::shipped_modules::digests()
-    }
-
     fn stamps(&self) -> String {
         STAMPS.get().cloned().unwrap_or_default()
     }

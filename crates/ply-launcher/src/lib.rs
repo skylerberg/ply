@@ -94,8 +94,6 @@ const STAMPS: &str = "stamps";
 
 const DEFINITIONS: &str = "definitions";
 
-const DIGESTS: &str = "digests";
-
 const RUNTIME_SOURCES: &str = env!("PLY_RUNTIME_SOURCES");
 
 pub fn stamps() -> String {
@@ -168,7 +166,6 @@ fn lay_out(dir: &Path, stamps: &str, definitions: &str) -> std::io::Result<()> {
     }
     write_atomically(&dir.join(STAMPS), stamps.as_bytes())?;
     write_atomically(&dir.join(DEFINITIONS), definitions.as_bytes())?;
-    write_atomically(&dir.join(DIGESTS), shipped_modules::digests().as_bytes())?;
     write_atomically(&dir.join(SHIPPED_MARKER), b"ok")
 }
 

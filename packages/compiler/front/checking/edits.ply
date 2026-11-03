@@ -5,7 +5,7 @@ import std.bytes
 import std.list
 import compiler.store.memo
 import compiler.store.memo (memo)
-import compiler.store.memo.engine (Run, reading, in_session)
+import compiler.store.memo.engine (Run, QueryStats, reading, in_session, query_stats)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
@@ -45,9 +45,9 @@ import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, Ch
                                 facts_of_result, checked_program_from_results, query_load,
                                 hashed_all, cycles_among, root_warnings, rejected_first,
                                 OutcomeSummary, outcome_summary, reject_embed, nothing_derived,
-                                over_decoding, queried_over, prelude_frames, prelude_files,
-                                lookup_input_alone, inputs_alone, Step, check_sources, layered,
-                                module_of, checked_with_write_limit, listed_module, analysed_over)
+                                over_decoding, queried_over, prelude_frames, lookup_input_alone,
+                                inputs_alone, Step, check_sources, layered, module_of,
+                                checked_with_write_limit, listed_module, analysed_over)
 import compiler.store.database (AllWrites, FailAfter, same_database_in_memory)
 
 type Reference = { outcome: OutcomeSummary, own_hashes: OwnHashes }
@@ -310,7 +310,6 @@ fn identified_over(
   let done = over_decoding(
     store,
     prelude_frames,
-    prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
       in_session(qs, |run: Run|
@@ -394,6 +393,45 @@ test "a definition's proof identity changes when a transparent callee in an impo
   let second = identified_over(first.store, after, proof_subject);
   assert(second.identity != first.identity, None);
   assert_eq(second.identity, identified_over(fs::mem_empty(), after, proof_subject).identity)
+}
+
+type GroupsChecked = { store: fs::MemFs, groups: Int }
+
+fn groups_checked_over(store: fs::MemFs, sources: List<Source>) -> GroupsChecked / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run| {
+        let read = reading(qs, run, || query_load(w.own, [], false, listed_module).results.len());
+        {
+          run: read.run,
+          value: query_stats(read.run).fold(0, |n: Int, s: QueryStats|
+            if s.query == b"group" { n + s.ran } else { n }),
+        }
+      }),
+  );
+  { store: done.store, groups: done.value }
+}
+
+test "adding an unused function to a module that another module calls into checks no more groups than adding it to a module nothing imports" {
+  let before = [
+    { name: b"n", source_text: b"pub fn far(x: Int) -> Int = x + 1\n" },
+    { name: b"m", source_text: b"import n\npub fn caller(x: Int) -> Int = n::far(x) * 2\n" },
+    { name: b"z", source_text: b"pub fn alone(x: Int) -> Int = x\n" },
+  ];
+  let cold = groups_checked_over(fs::mem_empty(), before);
+  let added = |module: Bytes, last_line: Bytes|
+    groups_checked_over(
+      cold.store,
+      edited(before, module, last_line, last_line.concat(b"fn added() -> Int = 1\n")),
+    ).groups;
+  let apart = added(b"z", b"= x\n");
+  assert(apart > 0, None);
+  assert_eq(added(b"n", b"x + 1\n"), apart)
 }
 
 fn promised(helper: Bytes, two: Bytes, other: Bytes) -> List<Source> =
@@ -1430,7 +1468,6 @@ fn load_with_analysis(
   let done = over_decoding(
     fs::mem_empty(),
     packs::no_pack,
-    b"",
     |kind: Bytes, at: Bytes|
       lookup_input(w, text_of, text_of, || names, reject_embed, nothing_derived, kind, at),
     || {
@@ -2003,7 +2040,6 @@ fn listed_under(
   let done = over_decoding(
     store,
     prelude_frames,
-    prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
       in_session(qs, |run: Run|
@@ -2208,7 +2244,6 @@ fn apart_position(
   let done = over_decoding(
     store,
     prelude_frames,
-    prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
       in_session(qs, |run: Run|
@@ -2230,7 +2265,6 @@ fn reported_by_view(
   over_decoding(
     fs::mem_empty(),
     prelude_frames,
-    prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
       in_session(qs, |run: Run|

@@ -1,9 +1,6 @@
 import std.bin
-import std.set (Set)
 import std.hash (blake3)
 import compiler.store.segments
-import compiler.store.memo (Query, main_only, plain_queries)
-import compiler.store.memo.store (QueriesId, queries_id, queries_id_bin)
 
 pub const store_file: String = "store"
 
@@ -13,17 +10,28 @@ pub type Range = { offset: Int, len: Int }
 
 derive bin for Range
 
-pub type Index = { queries: QueriesId, id: Bytes, files: Bytes, records: Range, results: Range }
+pub type PlacedTable = { table: Int, at: Range }
+
+derive bin for PlacedTable
+
+pub type Index = { id: Bytes, tables: List<PlacedTable>, results: Range }
 
 derive bin for Index
 
-const index_magic: Bytes = b"PLYPACK\x07"
+const index_magic: Bytes = b"PLYPACK\x09"
 
-pub fn index_bytes(i: Index) -> Bytes / {abort.raise} =
-  index_magic.concat(bin::encode(i, index_bin()))
+pub type PackFiles = { store: Bytes, index: Bytes }
+
+pub type PackPart = | WholeIndex | StoreFrame(Range)
+
+pub type PackTable = { table: Int, rows: segments::SortedTable }
+
+pub type Pack = { id: Bytes, tables: List<PackTable>, results: segments::SortedTable }
 
 pub fn damaged_pack<a>(what: String) -> a / {abort.raise} =
   panic("the shipped pack is damaged: " ++ what)
+
+fn index_bytes(i: Index) -> Bytes / {abort.raise} = index_magic.concat(bin::encode(i, index_bin()))
 
 fn index_from(b: Bytes) -> Option<Index> / {abort.raise} =
   if b.len() < 8 || b.slice(0, 8) != index_magic { None } else {
@@ -33,101 +41,11 @@ fn index_from(b: Bytes) -> Option<Index> / {abort.raise} =
     }
   }
 
-fn frame_range(table: segments::SortedTable, key: Bytes) -> Option<Range> / {abort.raise} =
-  match segments::value_in(table, key) {
-    Some(value) -> match bin::decode(value, range_bin()) {
-      Ok(at) -> Some(at),
-      Err(_) -> damaged_pack("a frame's range does not decode"),
-    },
-    None -> None,
-  }
-
-pub fn output_key(digest: Bytes) -> Option<Bytes> =
-  if digest.len() == 33 { Some(digest.slice(1, 33)) } else { None }
-
-pub fn is_trusted(i: Index, queries: QueriesId, shipped_files: Bytes) -> Bool =
-  shipped_files.len() > 0 && i.queries == queries && i.files == shipped_files
-
-pub type PackWriter = { frames: List<Bytes>, end: Int }
-
-pub const new_writer: PackWriter = { frames: [], end: 0 }
-
-pub fn append_frame(w: PackWriter, frame: Bytes) -> { writing: PackWriter, at: Range } =
-  {
-    writing: { frames: w.frames.push(frame), end: w.end + frame.len() },
-    at: { offset: w.end, len: frame.len() },
-  }
-
-pub type PackFiles = { store: Bytes, index: Bytes }
-
-pub fn finish(
-  w: PackWriter,
-  records: Map<Bytes, Range>,
-  results: Map<Bytes, Range>,
-  record_outputs: Map<Bytes, Bytes>,
-  queries: QueriesId,
-  files: Bytes,
-) -> PackFiles / {abort.raise} = {
-  let rows = |m: Map<Bytes, Range>|
-    segments::table_bytes(
-      segments::sorted_table(
-        m.fold(Map::new(), |table: Map<Bytes, Bytes>, k: Bytes, at: Range|
-          table.insert(k, bin::encode(at, range_bin()))),
-      ),
-    );
-  let r = append_frame(w, rows(records));
-  let a = append_frame(r.writing, rows(results));
-  let id = blake3(
-    Bytes::concat_all(
-      record_outputs.fold([b"ply.pack\x00"], |accumulator: List<Bytes>, k: Bytes, d: Bytes|
-        accumulator.push(blake3(k)).push(blake3(d))),
-    ),
-  );
-  {
-    store: Bytes::concat_all(a.writing.frames),
-    index: index_bytes({ queries: queries, id: id, files: files, records: r.at, results: a.at }),
-  }
-}
-
-pub type PackPart = | WholeIndex | StoreFrame(Range)
-
-pub type PackReader = {
-  index: Option<Index>,
-  records: Option<segments::SortedTable>,
-  results: Option<segments::SortedTable>,
-}
-
-pub const empty_reader: PackReader = { index: None, records: None, results: None }
-
-pub fn open_reader<| e>(
+fn table_at<| e>(
   read: (PackPart) -> Option<Bytes> / {abort.raise | e},
-) -> PackReader / {abort.raise | e} =
-  {
-    index: match read(WholeIndex) { Some(b) -> index_from(b), None -> None },
-    records: None,
-    results: None,
-  }
-
-type PackTable = | RecordsTable | ResultsTable
-
-fn range_of(i: Index, table: PackTable) -> Range =
-  match table { RecordsTable -> i.records, ResultsTable -> i.results }
-
-fn cached_table(p: PackReader, table: PackTable) -> Option<segments::SortedTable> =
-  match table { RecordsTable -> p.records, ResultsTable -> p.results }
-
-fn with_table(p: PackReader, table: PackTable, rows: segments::SortedTable) -> PackReader =
-  match table {
-    RecordsTable -> { ..p, records: Some(rows) },
-    ResultsTable -> { ..p, results: Some(rows) },
-  }
-
-fn read_table<| e>(
-  i: Index,
-  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
-  table: PackTable,
+  at: Range,
 ) -> segments::SortedTable / {abort.raise | e} =
-  match read(StoreFrame(range_of(i, table))) {
+  match read(StoreFrame(at)) {
     None -> damaged_pack("a table its index names cannot be read"),
     Some(bytes) -> match segments::decoded_table(bytes) {
       Some(rows) -> rows,
@@ -135,52 +53,68 @@ fn read_table<| e>(
     },
   }
 
-fn frame_of<| e>(
-  rows: segments::SortedTable,
+pub fn opened<| e>(
+  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
+) -> Option<Pack> / {abort.raise | e} =
+  match match read(WholeIndex) { Some(b) -> index_from(b), None -> None } {
+    None -> None,
+    Some(i) ->
+      Some({
+        id: i.id,
+        tables: i.tables.map(|t: PlacedTable| { table: t.table, rows: table_at(read, t.at) }),
+        results: table_at(read, i.results),
+      }),
+  }
+
+pub fn result<| e>(
+  pack: Pack,
   read: (PackPart) -> Option<Bytes> / {abort.raise | e},
   key: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} =
-  match frame_range(rows, key) {
+  match segments::value_in(pack.results, key) {
     None -> None,
-    Some(at) -> match read(StoreFrame(at)) {
-      Some(bytes) -> Some(bytes),
-      None -> damaged_pack("a frame its table names cannot be read"),
-    },
-  }
-
-fn lookup<| e>(
-  p: PackReader,
-  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
-  key: Bytes,
-  table: PackTable,
-) -> { reading: PackReader, bytes: Option<Bytes> } / {abort.raise | e} =
-  match p.index {
-    None -> { reading: p, bytes: None },
-    Some(i) -> match cached_table(p, table) {
-      Some(rows) -> { reading: p, bytes: frame_of(rows, read, key) },
-      None -> {
-        let rows = read_table(i, read, table);
-        { reading: with_table(p, table, rows), bytes: frame_of(rows, read, key) }
+    Some(value) -> match bin::decode(value, range_bin()) {
+      Err(_) -> damaged_pack("a result's range does not decode"),
+      Ok(at) -> match read(StoreFrame(at)) {
+        Some(bytes) -> Some(bytes),
+        None -> damaged_pack("a result its table names cannot be read"),
       },
     },
   }
 
-pub fn record<| e>(
-  p: PackReader,
-  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
-  key: Bytes,
-) -> { reading: PackReader, bytes: Option<Bytes> } / {abort.raise | e} =
-  lookup(p, read, key, RecordsTable)
+type Written = { frames: List<Bytes>, end: Int }
 
-pub fn output<| e>(
-  p: PackReader,
-  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
-  digest: Bytes,
-) -> { reading: PackReader, bytes: Option<Bytes> } / {abort.raise | e} =
-  match output_key(digest) {
-    Some(name) -> lookup(p, read, name, ResultsTable),
-    None -> { reading: p, bytes: None },
+fn appended(w: Written, frame: Bytes) -> { written: Written, at: Range } =
+  {
+    written: { frames: w.frames.push(frame), end: w.end + frame.len() },
+    at: { offset: w.end, len: frame.len() },
   }
+
+pub fn written(tables: List<PackTable>, results: Map<Bytes, Bytes>) -> PackFiles / {abort.raise} = {
+  let placed = results.fold(
+    { written: { frames: [], end: 0 }, ranges: Map::new() },
+    |sofar: { written: Written, ranges: Map<Bytes, Bytes> }, key: Bytes, bytes: Bytes| {
+      let a = appended(sofar.written, bytes);
+      { written: a.written, ranges: sofar.ranges.insert(key, bin::encode(a.at, range_bin())) }
+    },
+  );
+  let indexed = appended(
+    placed.written,
+    segments::table_bytes(segments::sorted_table(placed.ranges)),
+  );
+  let laid = tables.fold(
+    { written: indexed.written, placed: [] },
+    |sofar: { written: Written, placed: List<PlacedTable> }, t: PackTable| {
+      let a = appended(sofar.written, segments::table_bytes(t.rows));
+      { written: a.written, placed: sofar.placed.push({ table: t.table, at: a.at }) }
+    },
+  );
+  let store = Bytes::concat_all(laid.written.frames);
+  {
+    store: store,
+    index: index_bytes({ id: blake3(store), tables: laid.placed, results: indexed.at }),
+  }
+}
 
 pub fn frame_in(p: Option<PackFiles>, part: PackPart) -> Option<Bytes> =
   match p {
@@ -195,103 +129,29 @@ pub fn frame_in(p: Option<PackFiles>, part: PackPart) -> Option<Bytes> =
 
 pub fn no_pack(_: PackPart) -> Option<Bytes> = None
 
-fn queries_of(names: List<Bytes>) -> QueriesId =
-  queries_id(
-    plain_queries(
-      names.fold(Map::new(), |named: Map<Bytes, Query<| {}>>, name: Bytes|
-        named.insert(name, {
-          name: name,
-          hash: name,
-          body: main_only,
-          persistent: true,
-          product: None,
-          interface: Set::empty(),
-        })),
-    ),
-  )
-
-fn test_pack(
-  records: List<{ key: Bytes, bytes: Bytes }>,
-  results: List<{ key: Bytes, bytes: Bytes }>,
-  files: Bytes,
-) -> PackFiles / {abort.raise} = {
-  let placing = |w: PackWriter, m: Map<Bytes, Range>, items: List<{ key: Bytes, bytes: Bytes }>|
-    items.fold(
-      { writing: w, placed: m },
-      |accumulator: { writing: PackWriter, placed: Map<Bytes, Range> }, it: { key: Bytes, bytes: Bytes }| {
-        let f = append_frame(accumulator.writing, it.bytes);
-        { writing: f.writing, placed: accumulator.placed.insert(it.key, f.at) }
-      },
-    );
-  let r = placing(new_writer, Map::new(), records);
-  let a = placing(r.writing, Map::new(), results);
-  finish(
-    a.writing,
-    r.placed,
-    a.placed,
-    records.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, it: { key: Bytes, bytes: Bytes }|
-      accumulator.insert(it.key, blake3(it.bytes))),
-    queries_of([b"queries"]),
-    files,
-  )
-}
-
-test "a pack's index decodes to the value that was encoded, a damaged index raises, and another format's index is no index" {
-  let i = {
-    queries: queries_of([b"s"]),
-    id: b"id",
-    files: b"a.ply 00\n",
-    records: { offset: 7, len: 44 },
-    results: { offset: 51, len: 0 },
-  };
-  assert_eq(index_from(index_bytes(i)), Some(i));
-  let b = index_bytes(i);
-  let read = |bytes: Bytes| handle { Some(index_from(bytes)) } with { abort.raise(_) -> None };
-  assert_eq(read(b.slice(0, b.len() - 1)), None);
-  assert_eq(read(b.concat(b"x")), None);
-  assert_eq(read(b"PLYPACK\x01"), Some(None))
-}
-
-test "each record and long result of a pack is found by its key, and no other" {
-  let a = b"a".blake3();
-  let b = b"b".blake3();
-  let long = b"=".concat(b"long".blake3());
-  let written = test_pack(
-    [{ key: b, bytes: b"record b" }, { key: a, bytes: b"record a" }],
-    [{ key: long.slice(1, 33), bytes: b"a longer result" }],
-    b"files",
+test "a pack's tables and results read back by their numbers and keys, and no others" {
+  let rows = segments::sorted_table(Map::new().insert(b"k", b"v"));
+  let written = written(
+    [{ table: 4, rows: rows }],
+    Map::new().insert(b"one", b"first result").insert(b"two", b"second result"),
   );
   let read = |part: PackPart| frame_in(Some(written), part);
-  let p = open_reader(read);
-  let first = record(p, read, a);
-  assert_eq(first.bytes, Some(b"record a"));
-  assert_eq(record(first.reading, read, b).bytes, Some(b"record b"));
-  assert_eq(record(first.reading, read, b"c".blake3()).bytes, None);
-  assert_eq(output(first.reading, read, long).bytes, Some(b"a longer result"));
-  assert_eq(output(first.reading, read, b"=".concat(b"short".blake3())).bytes, None);
-  assert_eq(record(empty_reader, read, a).bytes, None)
-}
-
-test "a pack's records are reused only when the queries and the files match those the pack was written from" {
-  let written = test_pack([{ key: b"a".blake3(), bytes: b"r" }], [], b"files one");
-  let i = match open_reader(|part: PackPart| frame_in(Some(written), part)).index {
-    Some(x) -> x,
-    None -> panic("the index reads"),
+  match opened(read) {
+    None -> panic("the pack opens"),
+    Some(pack) -> {
+      assert_eq(pack.tables.map(|t: PackTable| t.table), [4]);
+      assert_eq(segments::value_in(pack.tables.get(0).rows, b"k"), Some(b"v"));
+      assert_eq(result(pack, read, b"two"), Some(b"second result"));
+      assert_eq(result(pack, read, b"three"), None)
+    },
   };
-  assert(is_trusted(i, queries_of([b"queries"]), b"files one"));
-  assert(!is_trusted(i, queries_of([b"other queries"]), b"files one"));
-  assert(!is_trusted(i, queries_of([b"queries"]), b"files two"));
-  assert(!is_trusted(i, queries_of([b"queries"]), b""))
+  assert(opened(no_pack) == None, None)
 }
 
-test "a pack whose store is cut short raises when a record is looked up, rather than reading as absent" {
-  let written = test_pack([{ key: b"a".blake3(), bytes: b"record a" }], [], b"files");
-  let cut = { ..written, store: written.store.slice(0, 8) };
+test "a pack whose store is cut short raises when it is opened, rather than reading as empty" {
+  let written = written([], Map::new().insert(b"one", b"a result"));
+  let cut = { ..written, store: written.store.slice(0, 2) };
   let read = |part: PackPart| frame_in(Some(cut), part);
-  let looked = handle {
-    Some(record(open_reader(read), read, b"a".blake3()).bytes)
-  } with {
-    abort.raise(_) -> None,
-  };
-  assert_eq(looked, None)
+  let opened_cut = handle { Some(opened(read)) } with { abort.raise(_) -> None };
+  assert_eq(opened_cut, None)
 }
