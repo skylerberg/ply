@@ -19,7 +19,7 @@ import compiler.check.typed (TypedExpression, pattern_binders, TypedLiteral, Typ
                              typed_expression_nodes_folded, NumericWitness, ConcreteWitness,
                              ParamWitness, StatedWitness, witness_param_name, TypedRelease,
                              NodeHolder, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
-                             ReleaseMissing, ReleaseFailing, binding_key, holder_key)
+                             ReleaseMissing, ReleaseFailing, binding_key, holder_key, refutable)
 import compiler.expand.rewrite (witness_code, declared_witness_name, numeric_operator_code)
 import std.derive.children
 import std.list
@@ -442,7 +442,9 @@ type Stack = {
   failure_reasons: List<Bytes>,
 }
 
-type HandlerVariable = { name: Bytes, at: Int, ty: Type, depth: Int }
+type HandlerVariable = { name: Bytes, at: Int, ty: Type, depth: Int, continuations: Continuations }
+
+type Continuations = | NoContinuations | BindsContinuations
 
 type Binder = { name: Bytes, depth: Int, slot: Int, ty: Type }
 
@@ -1239,6 +1241,9 @@ fn handled(
     }
   };
   let outer_held = b.stack.handler_variables;
+  let continuations = if clauses.any(|c: TypedClause<Type>| c.continuation != None) {
+    BindsContinuations
+  } else { NoContinuations };
   let with_handler_variables = |st: Stack|
     {
       ..st,
@@ -1250,6 +1255,7 @@ fn handled(
             at: accumulator.len() - outer_held.len(),
             ty: v.ty,
             depth: st.frames.len() - 1,
+            continuations: continuations,
           }),
       ),
     };
@@ -1356,6 +1362,72 @@ fn handler_variable(stack: Stack, name: Bytes) -> Option<HandlerVariable> =
 
 fn handler_variable_read(h: HandlerVariable, span: Span) -> Code =
   { ..internal_builtin_call(b"?handler_var", [int_code(h.at)], h.ty), span: span }
+
+fn handler_variable_assigned(
+  h: HandlerVariable,
+  assignment: { name: Bytes, value: TypedExpression<Type>, span: Span },
+  accumulator: BlockAccumulator,
+) -> BlockAccumulator / {abort.raise} =
+  if h.continuations == BindsContinuations || may_observe_variable(assignment.value, h.name) {
+    let o = lower_in(assignment.value, accumulator.stack);
+    {
+      statements: accumulator.statements.push(
+        CodeDo({
+          code: {
+            ..internal_builtin_call(b"?handler_set", [int_code(h.at), o.code], unit_type),
+            span: assignment.span,
+          },
+        }),
+      ),
+      stack: o.stack,
+    }
+  } else {
+    let depth = depth_of(accumulator.stack);
+    let taken = CodeLet({
+      name: h.name,
+      slot: top_frame(accumulator.stack).names.len(),
+      value: {
+        ..internal_builtin_call(b"?handler_take", [int_code(h.at)], h.ty),
+        span: assignment.span,
+      },
+    });
+    let o = lower_in(assignment.value, bind_in_stack(accumulator.stack, h.name));
+    let refilled = {
+      ..internal_builtin_call(b"?handler_init", [int_code(h.at), o.code], unit_type),
+      span: assignment.span,
+    };
+    {
+      statements: accumulator.statements.push(
+        CodeDo({
+          code: {
+            node: CodeBlock({ statements: [taken], tail: Some(refilled) }),
+            span: assignment.span,
+            ty: unit_type,
+          },
+        }),
+      ),
+      stack: unscope_stack(o.stack, depth),
+    }
+  }
+
+fn may_observe_variable(value: TypedExpression<Type>, name: Bytes) -> Bool =
+  typed_expression_nodes_folded(value, false, |found: Bool, x: TypedExpression<Type>|
+    found || x.releases.len() > 0
+      || (match x.node {
+        TypedCall(c) -> c.effects.listed.len() > 0 || c.effects.variable != None,
+        TypedPerform(_) -> true,
+        TypedUnary(u) -> u.witness != None,
+        TypedBinary(b) -> b.witness != None || b.operation == b"div" || b.operation == b"rem",
+        TypedBlock(b) ->
+          b.statements.any(|s: TypedStatement<Type>|
+            match s {
+              TypedLet(l) -> refutable(l.pattern),
+              TypedLetElse(_) -> true,
+              TypedDo(_) -> false,
+              TypedAssign(a) -> a.name == name,
+            }),
+        _ -> false,
+      }))
 
 fn snapshotted(
   e: TypedExpression<Type>,
@@ -1571,34 +1643,20 @@ fn lower_from(
       let o = lower_in(x, accumulator.stack);
       next({ statements: accumulator.statements.push(CodeDo({ code: o.code })), stack: o.stack })
     },
-    Some(TypedAssign(a)) -> {
-      let o = lower_in(a.value, accumulator.stack);
-      match handler_variable(o.stack, a.name) {
-        Some(h) ->
-          next({
-            statements: accumulator.statements.push(
-              CodeDo({
-                code: {
-                  ..internal_builtin_call(b"?handler_set", [int_code(h.at), o.code], unit_type),
-                  span: a.span,
-                },
-              }),
-            ),
-            stack: o.stack,
-          }),
-        None ->
-          next({
-            ..accumulator,
-            stack: failing(
-              o.stack,
-              Bytes::concat_all([
-                b"an assignment to `",
-                a.name,
-                b"`, which is not a variable of any clause of the handler",
-              ]),
-            ),
-          }),
-      }
+    Some(TypedAssign(a)) -> match handler_variable(accumulator.stack, a.name) {
+      Some(h) -> next(handler_variable_assigned(h, a, accumulator)),
+      None ->
+        next({
+          ..accumulator,
+          stack: failing(
+            lower_in(a.value, accumulator.stack).stack,
+            Bytes::concat_all([
+              b"an assignment to `",
+              a.name,
+              b"`, which is not a variable of any clause of the handler",
+            ]),
+          ),
+        }),
     },
   }
 }
