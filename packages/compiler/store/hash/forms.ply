@@ -36,11 +36,11 @@ import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, TestItem
                               numeric_by, member_of, member_name)
 import compiler.check.resolve.tables (module_index, ParsedModule, Resolution, Binding,
                                       ModuleBinding, Diagnostic, qualify)
-import std.bytes (u32_le)
+import std.bytes (u32_le, ascii_of_int)
 import std.hash (blake3)
 import std.list
 import std.option
-import std.graph (condensation, breadth_first)
+import std.graph (Condensation, condensation, breadth_first)
 import std.bytes
 import std.string
 import compiler.check.infer.checker (MemberSite)
@@ -303,16 +303,18 @@ const clause_domain: Bytes = b"ply.clause.2"
 
 const contract_domain: Bytes = b"ply.contract.4"
 
-const identity_domain: Bytes = b"ply.identity.2"
+const identity_domain: Bytes = b"ply.identity.3"
 
-const node_domain: Bytes = b"ply.node.1"
+const node_domain: Bytes = b"ply.node.2"
+
+const shape_domain: Bytes = b"ply.shape.1"
 
 const rejected_domain: Bytes = b"ply.rejected.1"
 
 pub fn own_hash(payload: Bytes) -> Bytes = blake3(own_domain.concat(payload))
 
-pub fn spec_hash(owner: Bytes, kind: Int, index: Int, payload: Bytes) -> Bytes / {abort.raise} =
-  blake3(Bytes::concat_all([clause_domain, owner, byte_of_int(kind), u32_le(index), payload]))
+pub fn spec_hash(kind: Int, index: Int, payload: Bytes) -> Bytes / {abort.raise} =
+  blake3(Bytes::concat_all([clause_domain, byte_of_int(kind), u32_le(index), payload]))
 
 pub type CallChoices = | ChosenCalls(List<Choice>) | PendingCalls(List<CallResolution>)
 
@@ -368,17 +370,6 @@ pub fn joined_identities(parts: List<Identities>) -> Identities =
       }),
   )
 
-type Digested = { own: List<Bytes>, reached: List<Bytes> }
-
-derive bin for Digested
-
-fn digest_of(domain: Bytes, own: List<Bytes>, reached: List<Bytes>) -> Bytes / {abort.raise} =
-  blake3(
-    domain.concat(
-      bin::encode({ own: own.sort().unique(), reached: reached.sort().unique() }, digested_bin()),
-    ),
-  )
-
 pub type Boundary = | InsidePackage | OutsidePackage
 
 pub type Origin = | FromSubject(Identified) | FromDefinition(NodeRef)
@@ -427,7 +418,7 @@ fn nexts(references: List<NodeRef>, inside: Reading, outside: Reading) -> List<N
 
 fn nexts_of(d: DefinitionHash, reading: Reading) -> List<Next> =
   match reading {
-    ReadsBody -> nexts(d.uses.concat(d.clause_uses), ReadsBody, ReadsBody),
+    ReadsBody -> nexts(d.uses, ReadsBody, ReadsBody),
     ReadsContract ->
       nexts(d.contract_uses, ReadsContract, ReadsContract).concat(
         nexts(d.clause_uses, ReadsBody, ReadsBody),
@@ -442,30 +433,47 @@ fn first_reads(policy: Policy, uses: List<NodeRef>) -> List<Next> =
     ProofPolicy -> nexts(uses, ReadsProof, ReadsContract),
   }
 
-fn own_of(d: DefinitionHash, reading: Reading) -> List<Bytes> =
+fn shapes_of(d: DefinitionHash, reading: Reading) -> List<Bytes> =
   match reading {
-    ReadsBody -> [d.hash].concat(d.clauses),
-    ReadsContract -> [d.contract],
-    ReadsProof -> [d.hash].concat(d.clauses),
+    ReadsBody -> [d.shapes.body],
+    ReadsContract -> [d.shapes.contract],
+    ReadsProof -> [d.shapes.body].concat(d.shapes.clauses),
+  }
+
+fn hole_counts(d: DefinitionHash, reading: Reading) -> List<Int> =
+  match reading {
+    ReadsBody -> [d.uses.len()],
+    ReadsContract -> [d.contract_uses.len(), d.clause_uses.len()],
+    ReadsProof -> [d.uses.len(), d.clause_uses.len()],
   }
 
 type ReadNode = { definition: DefinitionHash, reading: Reading }
 
-type NodeEntry = { definition: Bytes, reading: Reading, own: List<Bytes> }
+type NodeEntry = { kind: HeldKind, reading: Reading, shapes: List<Bytes>, holes: List<Int> }
 
 derive bin for NodeEntry
 
-fn entry_of(node: ReadNode) -> Bytes / {abort.raise} =
-  bin::encode(
-    {
-      definition: definition_key(node.definition.name, node.definition.kind),
-      reading: node.reading,
-      own: own_of(node.definition, node.reading),
-    },
-    node_entry_bin(),
-  )
+fn entry_of(node: ReadNode) -> NodeEntry =
+  {
+    kind: node.definition.kind,
+    reading: node.reading,
+    shapes: shapes_of(node.definition, node.reading),
+    holes: hole_counts(node.definition, node.reading),
+  }
 
 type Resolved = | LocalNode(Int) | KnownIdentity(Bytes)
+
+type Filler = | Outside(Bytes) | InCycle | CycleMember(Int)
+
+derive bin for Filler
+
+type PlacedNode = { entry: NodeEntry, fillers: List<Filler> }
+
+derive bin for PlacedNode
+
+type SubjectEntry = { policy: Int, shapes: List<Bytes>, fillers: List<Bytes> }
+
+derive bin for SubjectEntry
 
 fn identity_read(found: ReadIdentities, reading: Reading) -> Bytes =
   match reading {
@@ -474,15 +482,13 @@ fn identity_read(found: ReadIdentities, reading: Reading) -> Bytes =
     ReadsProof -> found.proof,
   }
 
-fn rejected_identity(reference: NodeRef) -> Bytes / {abort.raise} =
-  digest_of(rejected_domain, [definition_key(reference.name, reference.kind)], [])
+fn rejected_identity() -> Bytes = blake3(rejected_domain)
 
 fn local_nodes(targets: List<Resolved>) -> List<Int> =
   targets.flat_map(|t: Resolved| match t { LocalNode(n) -> [n], KnownIdentity(_) -> [] })
 
-fn known_identities(targets: List<Resolved>) -> List<Bytes> =
-  targets.flat_map(|t: Resolved|
-    match t { LocalNode(_) -> [], KnownIdentity(identity) -> [identity] })
+fn policy_number(policy: Policy) -> Int =
+  match policy { BodyPolicy -> 0, ContractPolicy -> 1, ProofPolicy -> 2 }
 
 type World = { at: Map<Bytes, Int>, definitions: List<DefinitionHash> }
 
@@ -492,6 +498,40 @@ fn world_of(definitions: List<DefinitionHash>) -> World =
     if w.at.contains(key) { w }
     else { { at: w.at.insert(key, w.definitions.len()), definitions: w.definitions.push(d) } }
   })
+
+fn component_identity(
+  condensed: Condensation,
+  targets: List<List<Resolved>>,
+  entries: List<NodeEntry>,
+  found: List<Bytes>,
+  c: Int,
+) -> Bytes / {abort.raise} = {
+  let filled = |n: Int, inside: (Int) -> Filler|
+    {
+      entry: entries.get(n),
+      fillers: targets.get(n).map(|t: Resolved|
+        match t {
+          KnownIdentity(identity) -> Outside(identity),
+          LocalNode(m) -> {
+            let at = condensed.component.get(m);
+            if at == c { inside(m) } else { Outside(found.get(at)) }
+          },
+        }),
+    };
+  let ordered = condensed.members.get(c).sort_by_key(|n: Int|
+    blake3(bin::encode(filled(n, |_: Int| InCycle), placed_node_bin())));
+  let position = range(0, ordered.len()).fold(Map::new(), |at: Map<Int, Int>, k: Int|
+    at.insert(ordered.get(k), k));
+  blake3(
+    node_domain.concat(
+      bin::encode(
+        ordered.map(|n: Int|
+          filled(n, |m: Int| CycleMember(match position.get(m) { Some(k) -> k, None -> 0 }))),
+        bin::list_bin(placed_node_bin()),
+      ),
+    ),
+  )
+}
 
 pub fn world_identities<| e>(
   own: OwnHashes,
@@ -508,7 +548,7 @@ pub fn world_identities<| e>(
       Some(i) -> LocalNode(node_at(i, reading)),
       None -> match beyond(next.reference) {
         HashedElsewhere(found) -> KnownIdentity(identity_read(found, reading)),
-        RejectedElsewhere -> KnownIdentity(rejected_identity(next.reference)),
+        RejectedElsewhere -> KnownIdentity(rejected_identity()),
       },
     }
   };
@@ -518,21 +558,12 @@ pub fn world_identities<| e>(
     let origin = FromDefinition({ name: node.definition.name, kind: node.definition.kind });
     nexts_of(node.definition, node.reading).map(|next: Next| resolved(origin, next))
   });
+  let entries = nodes.map(entry_of);
   let condensed = condensation({ out: targets.map(local_nodes) });
   let component_identities = range(0, condensed.members.len()).fold(
     [],
-    |found: List<Bytes>, c: Int| {
-      let members = condensed.members.get(c);
-      found.push(
-        digest_of(
-          node_domain,
-          members.map(|n: Int| entry_of(nodes.get(n))),
-          condensed.graph.out.get(c).map(|lower: Int| found.get(lower)).concat(
-            members.flat_map(|n: Int| known_identities(targets.get(n))),
-          ),
-        ),
-      )
-    },
+    |found: List<Bytes>, c: Int|
+      found.push(component_identity(condensed, targets, entries, found, c)),
   );
   let identity_at = |n: Int| component_identities.get(condensed.component.get(n));
   let identity_of_target = |t: Resolved|
@@ -551,43 +582,55 @@ pub fn world_identities<| e>(
     }),
     subjects: begun_of(own).map(|begun: Begun| {
       let origin = FromSubject(begun.subject);
+      let policy = policy_of(begun.subject);
       {
         subject: begun.subject,
-        identity: digest_of(
-          identity_domain,
-          [begun.own],
-          first_reads(policy_of(begun.subject), begun.uses).map(|next: Next|
-            identity_of_target(resolved(origin, next))),
+        identity: blake3(
+          identity_domain.concat(
+            bin::encode(
+              {
+                policy: policy_number(policy),
+                shapes: begun.shapes,
+                fillers: first_reads(policy, begun.uses).map(|next: Next|
+                  identity_of_target(resolved(origin, next))),
+              },
+              subject_entry_bin(),
+            ),
+          ),
         ),
       }
     }),
   }
 }
 
-type Begun = { subject: Identified, own: Bytes, uses: List<NodeRef> }
+type Begun = { subject: Identified, shapes: List<Bytes>, uses: List<NodeRef> }
 
 fn begun_of(own: OwnHashes) -> List<Begun> = {
   let definitions = own.definitions.flat_map(|d: DefinitionHash| {
     let itself = { name: d.name, kind: d.kind };
-    let contract: Begun = { subject: DefinitionContract(itself), own: d.contract, uses: [itself] };
+    let contract: Begun = { subject: DefinitionContract(itself), shapes: [], uses: [itself] };
     if d.kind != HeldValue { [contract] } else {
       [
         contract,
-        { subject: DefinitionRun(d.name), own: d.hash, uses: [itself] },
-        { subject: DefinitionProof(d.name), own: d.hash, uses: [itself] },
+        {
+          subject: DefinitionRun(d.name),
+          shapes: d.shapes.clauses,
+          uses: [itself].concat(d.clause_uses),
+        },
+        { subject: DefinitionProof(d.name), shapes: [], uses: [itself] },
       ]
     }
   });
   let tests = own.tests.flat_map(|t: TestHash| {
-    let run: Begun = { subject: TestRun(t.key), own: t.hash, uses: t.uses };
+    let run: Begun = { subject: TestRun(t.key), shapes: [t.shape], uses: t.uses };
     match t.listing {
-      Some(l) -> [run, { subject: TestListing(t.key), own: l.hash, uses: l.uses }],
+      Some(l) -> [run, { subject: TestListing(t.key), shapes: [l.shape], uses: l.uses }],
       None -> [run],
     }
   });
   let laws = own.laws.flat_map(|l: LawHash| {
-    let run: Begun = { subject: LawRun(l.key), own: l.hash, uses: l.uses };
-    [run, { subject: LawProof(l.key), own: l.hash, uses: l.uses }]
+    let run: Begun = { subject: LawRun(l.key), shapes: [l.shape], uses: l.uses };
+    [run, { subject: LawProof(l.key), shapes: [l.shape], uses: l.uses }]
   });
   definitions.concat(tests).concat(laws)
 }
@@ -684,19 +727,23 @@ pub type DefinitionHash = {
   clause_uses: List<NodeRef>,
   contract_uses: List<NodeRef>,
   transparent: Bool,
+  shapes: Shapes,
 }
 
-pub type ListingHash = { hash: Bytes, uses: List<NodeRef> }
+pub type Shapes = { body: Bytes, text: FramedBody, clauses: List<Bytes>, contract: Bytes }
+
+pub type ListingHash = { hash: Bytes, shape: Bytes, uses: List<NodeRef> }
 
 pub type TestHash = {
   key: Bytes,
   hash: Bytes,
+  shape: Bytes,
   body: FramedBody,
   uses: List<NodeRef>,
   listing: Option<ListingHash>,
 }
 
-pub type LawHash = { key: Bytes, hash: Bytes, uses: List<NodeRef> }
+pub type LawHash = { key: Bytes, hash: Bytes, shape: Bytes, uses: List<NodeRef> }
 
 pub type OwnHashes = {
   definitions: List<DefinitionHash>,
@@ -705,6 +752,8 @@ pub type OwnHashes = {
 }
 
 pub const no_own_hashes: OwnHashes = { definitions: [], tests: [], laws: [] }
+
+derive bin for Shapes
 
 derive bin for DefinitionHash
 
@@ -736,18 +785,43 @@ fn unique_ints(xs: List<Int>) -> List<Int> =
   xs.fold([], |accumulator: List<Int>, x: Int|
     if accumulator.contains(x) { accumulator } else { accumulator.push(x) })
 
+fn shaped_form(template: Template, holes: List<Int>) -> FilledForm / {abort.raise} = {
+  let position = range(0, holes.len()).fold(Map::new(), |at: Map<Int, Int>, k: Int|
+    if at.contains(holes.get(k)) { at } else { at.insert(holes.get(k), k) });
+  fill(
+    renumbered(template, |node: Int|
+      match position.get(node) {
+        Some(k) -> k,
+        None -> panic("a form refers to a definition that is not among its holes"),
+      }),
+    range(0, holes.len()).map(|k: Int| b"#".concat(ascii_of_int(k))),
+  )
+}
+
+fn shaped(template: Template, holes: List<Int>) -> Bytes / {abort.raise} =
+  shaped_form(template, holes).bytes
+
+fn shape_hash(text: Bytes) -> Bytes = blake3(shape_domain.concat(text))
+
+fn shape_of(template: Template, holes: List<Int>) -> Bytes / {abort.raise} =
+  shape_hash(shaped(template, holes))
+
 pub fn own_hashes(forms: HashInput) -> OwnHashes / {abort.raise} = {
   let names = forms.names.map(|r: NodeRef| r.name);
   let named = |vs: List<Int>| vs.map(|v: Int| forms.names.get(v));
   let test_hash_of = |x: HashItem| {
     let own = fill(x.form.form, names);
+    let holes = references(x.form.form);
     {
       key: x.key,
       hash: own_hash(own.bytes),
+      shape: shape_of(x.form.form, holes),
       body: single_body(own),
-      uses: named(references(x.form.form)),
-      listing: x.form.listing.map(|l: Template|
-        { hash: own_hash(fill(l, names).bytes), uses: named(references(l)) }),
+      uses: named(holes),
+      listing: x.form.listing.map(|l: Template| {
+        let listed = references(l);
+        { hash: own_hash(fill(l, names).bytes), shape: shape_of(l, listed), uses: named(listed) }
+      }),
     }
   };
   {
@@ -757,29 +831,58 @@ pub fn own_hashes(forms: HashInput) -> OwnHashes / {abort.raise} = {
       let reference = forms.names.get(d.node);
       let clause_references = d.form.clauses.fold([], |accumulator: List<Int>, c: ClauseForm|
         accumulator.concat(references(c.form)));
+      let holes = references(d.form.form);
+      let clause_holes = unique_ints(clause_references);
+      let contract_holes = unique_ints(contract_references(d.form, reference.kind));
+      let shaped_body = shaped_form(d.form.form, holes);
+      let body_shape = shape_hash(shaped_body.bytes);
       {
         name: reference.name,
         kind: reference.kind,
         hash: hash,
         body: single_body(own),
-        contract: contract_of(d.form, reference.kind, names, hash, own.bytes),
+        contract: contract_of(
+          d.form,
+          reference.kind,
+          |t: Template| fill(t, names).bytes,
+          hash,
+          own.bytes,
+        ),
         clauses: range(0, d.form.clauses.len()).map(|i: Int| {
           let clause = d.form.clauses.get(i);
-          spec_hash(hash, clause.kind, i, fill(clause.form, names).bytes)
+          spec_hash(clause.kind, i, fill(clause.form, names).bytes)
         }),
-        uses: named(references(d.form.form)),
-        clause_uses: named(unique_ints(clause_references)),
-        contract_uses: named(unique_ints(contract_references(d.form, reference.kind))),
+        uses: named(holes),
+        clause_uses: named(clause_holes),
+        contract_uses: named(contract_holes),
         transparent: d.form.transparent,
+        shapes: {
+          body: body_shape,
+          text: single_body(shaped_body),
+          clauses: d.form.clauses.map(|c: ClauseForm| shape_of(c.form, clause_holes)),
+          contract: {
+            let contract_and_clauses = contract_holes.concat(clause_holes);
+            contract_of(
+              d.form,
+              reference.kind,
+              |t: Template| shaped(t, contract_and_clauses),
+              body_shape,
+              if d.form.transparent { shaped(d.form.form, contract_and_clauses) } else { b"" },
+            )
+          },
+        },
       }
     }),
     tests: forms.tests.map(test_hash_of),
-    laws: forms.laws.map(|x: HashItem|
+    laws: forms.laws.map(|x: HashItem| {
+      let holes = references(x.form.form);
       {
         key: x.key,
         hash: own_hash(fill(x.form.form, names).bytes),
-        uses: named(references(x.form.form)),
-      }),
+        shape: shape_of(x.form.form, holes),
+        uses: named(holes),
+      }
+    }),
   }
 }
 
@@ -790,12 +893,11 @@ derive bin for ContractText
 fn contract_of(
   form: NodeForm,
   kind: HeldKind,
-  names: List<Bytes>,
+  filled: (Template) -> Bytes / {abort.raise},
   hash: Bytes,
   payload: Bytes,
 ) -> Bytes / {abort.raise} =
   if kind != HeldValue { hash } else {
-    let filled = |t: Template| fill(t, names).bytes;
     let text: ContractText = {
       signature: form.signature.map(filled),
       clauses: form.clauses.map(|c: ClauseForm| filled(c.form)),

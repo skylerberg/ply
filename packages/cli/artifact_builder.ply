@@ -16,7 +16,9 @@ import compiler.front.rows (DeclaredEffect, Outline, OutlineItem, OutlinedFuncti
                             OutlinedLaw, OutlinedType, OutlinedEffect)
 import compiler.syntax.items (Visibility, Public, Private)
 import compiler.store.hash.forms (ClosureEntry, HashOutput, NodeRef, by_name, build_closure,
-                                  definition_key, FramedBody, framed_body_bin)
+                                  definition_key, FramedBody, framed_body_bin, world_identities,
+                                  DefinitionHash, DefinitionIdentities, RejectedElsewhere,
+                                  InsidePackage, Origin, ChosenCalls)
 import compiler.store.hash.graph (HeldEffect, HeldKind, HeldType, HeldValue)
 import compiler.store.hash.printer (Printed, Unprintable, PrintedDefinition, DefinitionRole,
                                     WrittenWith, FromShippedModule, print_bodies)
@@ -185,6 +187,37 @@ fn bodies_of(h: HashOutput, pairs: List<NamedHash>) -> Map<Bytes, FramedBody> = 
         None -> accumulator,
       },
     })
+}
+
+type StoredName = { name: Bytes, identity: Bytes, body: Bytes, text: FramedBody }
+
+fn stored_names(
+  h: HashOutput,
+  closure_entries: List<ClosureEntry>,
+) -> List<StoredName> / {abort.raise} = {
+  let identities = world_identities(
+    h.own,
+    |_: NodeRef| RejectedElsewhere,
+    |_: Origin, _: NodeRef| InsidePackage,
+  ).definitions.fold(Map::new(), |found: Map<Bytes, Bytes>, d: DefinitionIdentities|
+    found.insert(definition_key(d.reference.name, d.reference.kind), d.identities.body));
+  let texts = h.own.definitions.fold(
+    Map::new(),
+    |found: Map<Bytes, FramedBody>, d: DefinitionHash|
+      found.insert(definition_key(d.name, d.kind), d.shapes.text),
+  );
+  closure_entries.fold(Map::new(), |found: Map<Bytes, StoredName>, x: ClosureEntry| {
+    let key = definition_key(x.reference.name, x.reference.kind);
+    match ((identities.get(key), texts.get(key))) {
+      (Some(identity), Some(text)) -> match body_key(text) {
+        Some(body) ->
+          found.insert(key, { name: x.reference.name, identity: identity, body: body, text: text }),
+        None -> found,
+      },
+      _ -> found,
+    }
+  }).values(
+  )
 }
 
 fn pairs_of(closure_entries: List<ClosureEntry>) -> List<NamedHash> =
@@ -364,7 +397,9 @@ fn closures_of(closure_entries: List<ClosureEntry>) -> List<Dependencies> / {abo
   )
 }
 
-fn bodies_section(bodies: Map<Bytes, FramedBody>) -> Section / {abort.raise} =
+fn bodies_section(stored: List<StoredName>) -> Section / {abort.raise} = {
+  let bodies = stored.fold(Map::new(), |found: Map<Bytes, FramedBody>, x: StoredName|
+    found.insert(x.body, x.text));
   {
     name: b"bodies",
     count: bodies.keys().len(),
@@ -375,27 +410,30 @@ fn bodies_section(bodies: Map<Bytes, FramedBody>) -> Section / {abort.raise} =
       }),
     ),
   }
+}
 
-fn named_sections(pairs: List<NamedHash>) -> List<Section> = {
-  let laid = pairs.fold(
+const name_record_bytes: Int = 72
+
+fn named_sections(stored: List<StoredName>) -> List<Section> = {
+  let laid = stored.fold(
     { strings: b"", placed: Map::new(), records: [] },
-    |accumulator: { strings: Bytes, placed: Map<Bytes, Int>, records: List<Bytes> }, pair: NamedHash| {
-      let known = accumulator.placed.get(pair.name);
+    |accumulator: { strings: Bytes, placed: Map<Bytes, Int>, records: List<Bytes> }, x: StoredName| {
+      let known = accumulator.placed.get(x.name);
       let offset = match known { Some(o) -> o, None -> accumulator.strings.len() };
       {
         strings: match known {
           Some(_) -> accumulator.strings,
-          None -> accumulator.strings.concat(pair.name),
+          None -> accumulator.strings.concat(x.name),
         },
-        placed: accumulator.placed.insert(pair.name, offset),
+        placed: accumulator.placed.insert(x.name, offset),
         records: accumulator.records.push(
-          Bytes::concat_all([u32_le(offset), u32_le(pair.name.len()), pair.hash]),
+          Bytes::concat_all([u32_le(offset), u32_le(x.name.len()), x.identity, x.body]),
         ),
       }
     },
   );
   [
-    { name: b"names", count: pairs.len(), payload: Bytes::concat_all(laid.records) },
+    { name: b"names", count: stored.len(), payload: Bytes::concat_all(laid.records) },
     { name: b"strings", count: laid.strings.len(), payload: laid.strings },
   ]
 }
@@ -429,6 +467,7 @@ pub fn build_artifact(
       let closure = build_closure(hashes, roots);
       let pairs = pairs_of(closure);
       let bodies = bodies_of(hashes, pairs);
+      let stored = stored_names(hashes, closure);
       match pairs.filter(|pair: NamedHash| !bodies.contains(pair.hash)) {
         [_, ..] ->
           Err(
@@ -441,11 +480,12 @@ pub fn build_artifact(
           Ok(files) -> match closure_unit(listing, program, closure) {
             Err(diagnostics) -> Err(rejection(diagnostics)),
             Ok(unit) -> {
-              let entry_hash = match definitions.get(Bytes::of_string(entry)) {
-                Some(h) -> h,
+              let entry_hash = match stored.find(|x: StoredName|
+                  x.name == Bytes::of_string(entry)) {
+                Some(x) -> x.identity,
                 None -> b"",
               };
-              let sections = named_sections(pairs).push(closure_section(files));
+              let sections = named_sections(stored).push(closure_section(files));
               let runnable_section = bin::encode(
                 {
                   entry: entry,
@@ -464,16 +504,16 @@ pub fn build_artifact(
                 startup: startup,
                 head: header_of(entry_hash),
                 sections: flatten([
-                  [bodies_section(bodies)],
+                  [bodies_section(stored)],
                   sections,
                   [
                     { name: b"runnable", count: 1, payload: runnable_section },
                     { name: b"unit", count: 1, payload: gzip::gzip(unit) },
                   ],
                 ]),
-                definitions: bodies.keys().len(),
-                names: pairs.map(|pair: NamedHash|
-                  { name: String::of_bytes(pair.name), hash: pair.hash.hex_of() }),
+                definitions: stored.len(),
+                names: stored.map(|x: StoredName|
+                  { name: String::of_bytes(x.name), hash: x.identity.hex_of() }),
                 closures: if include_closures { closures_of(closure) } else { [] },
               })
             },
@@ -648,7 +688,7 @@ fn overrun_error(path: String, what: String, at: Int) -> Diagnostic =
     [],
   )
 
-type Name = { name: String, hash: Bytes }
+type Name = { name: String, hash: Bytes, body: Bytes }
 
 fn read_names(
   path: String,
@@ -658,7 +698,7 @@ fn read_names(
 ) -> Result<List<Name>, Diagnostic> =
   match names {
     None -> Ok([]),
-    Some(p) -> if p.len != p.count * 40 {
+    Some(p) -> if p.len != p.count * name_record_bytes {
       Err(invalid_artifact(path, "the namespace section is the wrong size", []))
     } else {
       let text = match strings { Some(s) -> payload(b, s), None -> b"" };
@@ -666,7 +706,7 @@ fn read_names(
         match accumulator {
           Err(_) -> accumulator,
           Ok(done) -> {
-            let at = p.at + i * 40;
+            let at = p.at + i * name_record_bytes;
             match match ((b.u32_at(at), b.u32_at(at + 4))) {
                 (Some(start), Some(length)) -> text.slice_at(start, length),
                 _ -> None,
@@ -679,6 +719,7 @@ fn read_names(
                     done.push({
                       name: name,
                       hash: match b.slice_at(at + 8, 32) { Some(h) -> h, None -> b"" },
+                      body: match b.slice_at(at + 40, 32) { Some(h) -> h, None -> b"" },
                     }),
                   ),
               },
@@ -829,17 +870,8 @@ pub fn open_artifact(
                         ],
                       ),
                     )
-                  } else if !bodies.contains(o.entry) {
-                    Err(
-                      invalid_artifact(
-                        path,
-                        "the entry point `" ++ short(o.entry)
-                          ++ "` is not among the artifact's definitions",
-                        [],
-                      ),
-                    )
                   } else {
-                    match names.filter(|n: Name| !bodies.contains(n.hash)) {
+                    match names.filter(|n: Name| !bodies.contains(n.body)) {
                       [n, ..] ->
                         Err(
                           invalid_artifact(
@@ -886,7 +918,7 @@ pub fn open_artifact(
                               entry_hash: o.entry,
                               digest: short_digest(computed),
                               definitions: bodies.keys().len(),
-                              names: names,
+                              names: names.map(|n: Name| { name: n.name, hash: n.hash }),
                               runnable: runnable,
                               unit: unit,
                             }),
@@ -992,17 +1024,17 @@ test "`closures_of` lists the definitions each stored definition depends on, tre
 }
 
 test "`named_sections` stores each distinct name's text once, and every record with that name refers to that text" {
-  let laid = named_sections([
-    { name: b"m.T", hash: Bytes::concat_all(range(0, 32).map(|_i: Int| b"\x01")) },
-    { name: b"m.T", hash: Bytes::concat_all(range(0, 32).map(|_i: Int| b"\x02")) },
-    { name: b"m.f", hash: Bytes::concat_all(range(0, 32).map(|_i: Int| b"\x03")) },
-  ]);
+  let stored = |name: Bytes, n: Int| {
+    let filled = Bytes::concat_all(range(0, 32).map(|_i: Int| byte_of_int(n)));
+    { name: name, identity: filled, body: filled, text: { calls: ChosenCalls([]), form: b"" } }
+  };
+  let laid = named_sections([stored(b"m.T", 1), stored(b"m.T", 2), stored(b"m.f", 3)]);
   match laid {
     [names, strings] -> {
       assert_eq(strings.payload, b"m.Tm.f");
       assert_eq(names.count, 3);
-      assert_eq(names.payload.u32_at(40), Some(0));
-      assert_eq(names.payload.u32_at(80), Some(3))
+      assert_eq(names.payload.u32_at(name_record_bytes), Some(0));
+      assert_eq(names.payload.u32_at(2 * name_record_bytes), Some(3))
     },
     _ -> panic("two sections"),
   }
