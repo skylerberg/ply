@@ -106,7 +106,7 @@ pub type Outcome = | Passed | Failed(String)
 pub type Entry = {
   name: String,
   kind: EntryKind,
-  hash: String,
+  hash: Option<String>,
   file: String,
   location: Option<String>,
   interface: Interface,
@@ -115,6 +115,10 @@ pub type Entry = {
   body: Option<Int>,
   outcome: Option<Outcome>,
 }
+
+type IdentifiedTest = { info: TestInfo, run: Bytes }
+
+type InspectedTest = { info: TestInfo, run: Bytes, passed: Bool }
 
 pub type DefinitionFacts = { name: Bytes, facts: List<RecordedFact> }
 
@@ -129,7 +133,7 @@ fn facts_matching(
   listing: ProgramListing,
   query: String,
 ) -> List<DefinitionFacts> / {memo.read, fact_inspection.read, abort.raise} =
-  listing.checked.definitions.filter(|d: DefinitionInfo| matches_query(query, d.name, b"")).map(
+  listing.checked.definitions.filter(|d: DefinitionInfo| matches_query(query, d.name, None)).map(
     |d: DefinitionInfo|
       {
         name: d.name,
@@ -364,6 +368,12 @@ type Field = { label: String, value: String }
 
 fn short_hash(hash: String) -> String = if hash.len() < 12 { hash } else { hash.slice(0, 12) }
 
+fn shown_hash(hash: Option<String>) -> String =
+  match hash { Some(h) -> short_hash(h), None -> "no hash" }
+
+fn hash_json(hash: Option<String>) -> Json =
+  match hash { Some(h) -> Str(short_hash(h)), None -> Null }
+
 fn kind_text(k: EntryKind) -> String =
   match k {
     FnEntry -> "fn",
@@ -439,7 +449,7 @@ fn field_line(label: String, value: String) -> String =
   indent ++ "  " ++ label.pad_right(10, " ") ++ " " ++ value
 
 fn entry_lines(style: Style, entry: Entry) -> List<String> / {abort.raise} = {
-  let head = indent ++ bold(style, title_of(entry)) ++ "  " ++ dim(style, short_hash(entry.hash))
+  let head = indent ++ bold(style, title_of(entry)) ++ "  " ++ dim(style, shown_hash(entry.hash))
     ++ "  "
     ++ kind_text(entry.kind)
     ++ "  "
@@ -475,7 +485,7 @@ fn body_json(b: Option<Int>) -> Json =
 fn entry_json(e: Entry) -> Json =
   object([
     { key: "name", value: Str(title_of(e)) },
-    { key: "hash", value: Str(short_hash(e.hash)) },
+    { key: "hash", value: hash_json(e.hash) },
     { key: "kind", value: Str(kind_text(e.kind)) },
     { key: "file", value: Str(e.file) },
     { key: "location", value: string_or_null(e.location) },
@@ -688,11 +698,12 @@ fn clear_store<[r]>(
   }
 }
 
-fn matches_query(query: String, name: Bytes, hash: Bytes) -> Bool / {abort.raise} = {
+fn matches_query(query: String, name: Bytes, hash: Option<Bytes>) -> Bool / {abort.raise} = {
   let full = String::of_bytes_lossy(name);
   let segments = full.split(".");
   full == query || segments.at_or(segments.len() - 1, "") == query
-    || (query.len() >= 4 && hash.hex_of().starts_with(query.ascii_lower()))
+    || (query.len() >= 4
+      && (match hash { Some(h) -> h.hex_of().starts_with(query.ascii_lower()), None -> false }))
 }
 
 fn file_location(
@@ -724,7 +735,7 @@ fn matches_in(
   places: List<SourceText>,
   w: ProgramListing,
   query: String,
-  proven: Set<Bytes>,
+  tests: List<InspectedTest>,
 ) -> List<Entry> / {abort.raise} = {
   let definitions = by_name(w.hashes.definitions);
   let declarations = by_name(w.hashes.declarations);
@@ -733,18 +744,16 @@ fn matches_in(
     Map::new(),
     |accumulator: Map<Bytes, Int>, b: StoredBody| accumulator.insert(b.hash, b.body.len()),
   );
-  let hash_of = |name: Bytes, m: Map<Bytes, Bytes>| match m.get(name) { Some(h) -> h, None -> b"" };
-  let body_of = |hash: Bytes| bodies.get(hash);
+  let shown = |hash: Option<Bytes>| match hash { Some(h) -> Some(h.hex_of()), None -> None };
   let functions = w.checked.definitions.fold([], |accumulator: List<Entry>, d: DefinitionInfo| {
-    let hash = hash_of(d.name, definitions);
+    let hash = definitions.get(d.name);
     if !matches_query(query, d.name, hash) { accumulator } else {
       let at = file_location(places, d.at);
-      let row = if definitions.contains(d.name) { Some(definition_known_row(d, read)) }
-      else { None };
+      let row = match hash { Some(_) -> Some(definition_known_row(d, read)), None -> None };
       accumulator.push({
         name: String::of_bytes_lossy(d.name),
         kind: FnEntry,
-        hash: hash.hex_of(),
+        hash: shown(hash),
         file: at.file,
         location: at.location,
         interface: FunctionInterface(match row {
@@ -759,7 +768,7 @@ fn matches_in(
             ),
           None -> [],
         },
-        body: body_of(hash),
+        body: match hash { Some(h) -> bodies.get(h), None -> None },
         outcome: None,
       })
     }
@@ -770,13 +779,13 @@ fn matches_in(
       match item {
         OutlinedType(t) -> {
           let name = qualify(o.name, t.name);
-          let hash = hash_of(name, declarations);
+          let hash = declarations.get(name);
           if !matches_query(query, name, hash) { a } else {
             let at = file_location(places, { module: i, span: t.span });
             a.push({
               name: String::of_bytes_lossy(name),
               kind: TypeEntry,
-              hash: hash.hex_of(),
+              hash: shown(hash),
               file: at.file,
               location: at.location,
               interface: TypeInterface(
@@ -800,13 +809,13 @@ fn matches_in(
       })
   });
   let effects = w.checked.effects.fold(types, |accumulator: List<Entry>, e: EffectInfo| {
-    let hash = hash_of(e.name, declarations);
+    let hash = declarations.get(e.name);
     if !matches_query(query, e.name, hash) { accumulator } else {
       let at = file_location(places, e.at);
       accumulator.push({
         name: String::of_bytes_lossy(e.name),
         kind: EffectEntry,
-        hash: hash.hex_of(),
+        hash: shown(hash),
         file: at.file,
         location: at.location,
         interface: EffectInterface(e.nondet, e.operations.map(operation_of)),
@@ -821,16 +830,17 @@ fn matches_in(
     Map::new(),
     |accumulator: Map<Bytes, KnownTestRow>, r: KnownTestRow| accumulator.insert(r.key, r),
   );
-  w.checked.tests.fold(effects, |accumulator: List<Entry>, t: TestInfo| {
-    let hash = match w.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" };
-    if !matches_query(query, t.name, hash) && !matches_query(query, t.key, hash) { accumulator }
+  tests.fold(effects, |accumulator: List<Entry>, inspected: InspectedTest| {
+    let t = inspected.info;
+    let run = Some(inspected.run);
+    if !matches_query(query, t.name, run) && !matches_query(query, t.key, run) { accumulator }
     else {
       let at = file_location(places, t.at);
       let row = rows.get(t.key);
       accumulator.push({
         name: String::of_bytes_lossy(t.name),
         kind: TestEntry(t.nondet),
-        hash: hash.hex_of(),
+        hash: shown(run),
         file: at.file,
         location: at.location,
         interface: TestInterface(t.nondet),
@@ -843,7 +853,7 @@ fn matches_in(
           None -> [],
         },
         body: None,
-        outcome: if proven.contains(t.key) { Some(Passed) } else { None },
+        outcome: if inspected.passed { Some(Passed) } else { None },
       })
     }
   })
@@ -853,19 +863,23 @@ fn inspect_store<[r]>(
   place: project_store::StoreLocation,
   places: List<SourceText>,
   listing: ProgramListing,
-  runs: Map<Bytes, Bytes>,
+  tests: List<IdentifiedTest>,
   query: String,
 ) -> Matches / {fs.read[r], abort.raise} = {
   let c = tables::open_cache[r](place.dir, place.stamps);
-  let proven = runs.fold(Set::empty(), |accumulator: Set<Bytes>, key: Bytes, run: Bytes|
-    match tables::pass_record(c, key).value {
-      Some(r) -> if r.test_hash == run { accumulator.insert(key) } else { accumulator },
-      None -> accumulator,
+  let inspected = tests.map(|t: IdentifiedTest|
+    {
+      info: t.info,
+      run: t.run,
+      passed: match tables::pass_record(c, t.info.key).value {
+        Some(r) -> r.test_hash == t.run,
+        None -> false,
+      },
     });
   {
     directory: display_path(place, ""),
     warnings: project_store::diagnostics_of(tables::warnings(c)),
-    entries: matches_in(places, listing, query, proven),
+    entries: matches_in(places, listing, query, inspected),
     facts: [],
   }
 }
@@ -891,10 +905,8 @@ pub fn run(
           let own = Set::of_list(modules.own);
           {
             listing: listing,
-            runs: listing.checked.tests.filter(|t: TestInfo| own.contains(t.module)).fold(
-              Map::new(),
-              |found: Map<Bytes, Bytes>, t: TestInfo|
-                found.insert(t.key, run_of(stored_identity(t))),
+            tests: listing.checked.tests.filter(|t: TestInfo| own.contains(t.module)).map(
+              |t: TestInfo| { info: t, run: run_of(stored_identity(t)) },
             ),
             facts: facts_matching(listing, flags.query),
           }
@@ -905,8 +917,8 @@ pub fn run(
         let places = places_of(opened);
         let read = opened.value;
         let found = if cwd {
-          inspect_store[cwd](place, places, read.listing, read.runs, flags.query)
-        } else { inspect_store[abs](place, places, read.listing, read.runs, flags.query) };
+          inspect_store[cwd](place, places, read.listing, read.tests, flags.query)
+        } else { inspect_store[abs](place, places, read.listing, read.tests, flags.query) };
         Ok({ ..found, facts: read.facts })
       },
     })
@@ -931,7 +943,7 @@ const an_entry: Entry =
   {
     name: "m.active",
     kind: FnEntry,
-    hash: "9f2c1a4e8b03c7d5e6f70819a2b3c4d5",
+    hash: Some("9f2c1a4e8b03c7d5e6f70819a2b3c4d5"),
     file: "m.ply",
     location: Some("m.ply:4:1"),
     interface: FunctionInterface("(Int) -> List<Int>"),
@@ -1061,10 +1073,13 @@ test "a test's result line says whether the test has a recorded pass at its curr
 }
 
 test "a name declared twice is ordered by name, then hash, then file" {
-  let alpha: Entry = { ..an_entry, name: "alpha.shared", hash: "bb", file: "alpha.ply" };
-  let beta: Entry = { ..an_entry, name: "beta.shared", hash: "aa", file: "beta.ply" };
-  let fake: Entry = { ..an_entry, name: "alpha.shared", hash: "aa", file: "alpha.ply" };
-  assert_eq(sorted_entries([beta, alpha, fake]).map(|entry: Entry| entry.hash), ["aa", "bb", "aa"]);
+  let alpha: Entry = { ..an_entry, name: "alpha.shared", hash: Some("bb"), file: "alpha.ply" };
+  let beta: Entry = { ..an_entry, name: "beta.shared", hash: Some("aa"), file: "beta.ply" };
+  let fake: Entry = { ..an_entry, name: "alpha.shared", hash: Some("aa"), file: "alpha.ply" };
+  assert_eq(
+    sorted_entries([beta, alpha, fake]).map(|entry: Entry| entry.hash),
+    [Some("aa"), Some("bb"), Some("aa")],
+  );
   assert_eq(sorted_entries([alpha, fake, beta]).map(|entry: Entry| entry.name), [
     "alpha.shared",
     "alpha.shared",
