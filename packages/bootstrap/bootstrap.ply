@@ -18,6 +18,7 @@ import std.hash (blake3)
 import std.json
 import std.json (Array, Json, Object, Str)
 import std.list
+import std.set (Set)
 import std.path (join, parent, strip_root)
 import std.pkg (ToolchainParts)
 import std.process (process)
@@ -96,30 +97,82 @@ fn entered(
   }
 }
 
-fn definition_line(row: Json) -> Option<{ name: String, hash: String }> =
+type ListedDefinition = { name: String, hash: String, closure: List<String> }
+
+fn listed_definition(row: Json) -> Option<ListedDefinition> =
   match row {
-    Object(members) -> match ((members.get("name"), members.get("hash"))) {
-      (Some(Str(name)), Some(Str(hash))) -> Some({ name: name, hash: hash }),
+    Object(members) -> match ((members.get("name"), members.get("hash"), members.get("closure"))) {
+      (Some(Str(name)), Some(Str(hash)), Some(Array(reached))) ->
+        Some({
+          name: name,
+          hash: hash,
+          closure: reached.fold([], |names: List<String>, n: Json|
+            match n { Str(text) -> names.push(text), _ -> names }),
+        }),
       _ -> None,
     },
     _ -> None,
   }
 
+fn hashed_without_closure(row: Json) -> Bool =
+  match row {
+    Object(members) -> match ((members.get("hash"), members.get("closure"))) {
+      (Some(Str(_)), Some(Array(_))) -> false,
+      (Some(Str(_)), _) -> true,
+      _ -> false,
+    },
+    _ -> false,
+  }
+
+fn listed_hashes(rows: List<Json>, into: Map<String, String>) -> Map<String, String> =
+  rows.fold(into, |found: Map<String, String>, row: Json|
+    match row {
+      Object(members) -> match ((members.get("name"), members.get("hash"))) {
+        (Some(Str(name)), Some(Str(hash))) -> found.insert(name, hash),
+        _ -> found,
+      },
+      _ -> found,
+    })
+
+fn closure_identity(d: ListedDefinition, hashes: Map<String, String>) -> String / {abort.raise} =
+  blake3(
+    Bytes::concat_all(
+      Set::of_list(d.closure.push(d.name)).elements().map(|name: String|
+        Bytes::of_string(match hashes.get(name) {
+          Some(hash) -> name ++ " " ++ hash ++ "\n",
+          None -> name ++ "\n",
+        })),
+    ),
+  ).hex_of(
+  )
+
 fn definitions_of(listing: Bytes) -> Result<Bytes, String> / {abort.raise} =
   match json::parse(listing) {
     Ok(Object(members)) -> match members.get("definitions") {
       Some(Array(rows)) -> {
-        let held = rows.fold(Map::new(), |accumulator: Map<String, String>, row: Json|
-          match definition_line(row) {
-            Some(d) -> accumulator.insert(d.name, d.hash),
-            None -> accumulator,
-          });
-        Ok(
-          Bytes::concat_all(
-            held.fold([], |lines: List<Bytes>, name: String, hash: String|
-              lines.push(Bytes::of_string(name ++ " " ++ hash ++ "\n"))),
-          ),
-        )
+        let declared = match members.get("declarations") {
+          Some(Array(declarations)) -> listed_hashes(declarations, Map::new()),
+          _ -> Map::new(),
+        };
+        let hashes = listed_hashes(rows, declared);
+        let listed = rows.fold([], |found: List<ListedDefinition>, row: Json|
+          match listed_definition(row) { Some(d) -> found.push(d), None -> found });
+        if rows.any(hashed_without_closure) {
+          Err(
+            "the listing of definitions holds no closures: list them with `ply hash --json --dependencies`",
+          )
+        } else {
+          Ok(
+            Bytes::concat_all(
+              listed.fold(Map::new(), |by_name: Map<String, String>, d: ListedDefinition|
+                by_name.insert(d.name, closure_identity(d, hashes))).fold(
+                [],
+                |lines: List<Bytes>, name: String, identity: String|
+                  lines.push(Bytes::of_string(name ++ " " ++ identity ++ "\n")),
+              ),
+            ),
+          )
+        }
       },
       _ -> Err("the listing of definitions holds none"),
     },
@@ -631,17 +684,40 @@ test "a unit is entered by the runtime's tool, which is handed its arguments in 
   assert_eq(ask(1).result, None)
 }
 
-test "a listing of definitions reads as name and hash lines, in one order however it was listed" {
-  let row = |name: String, hash: String|
-    "{\"name\":\"" ++ name ++ "\",\"module\":\"m\",\"hash\":\"" ++ hash ++ "\"}";
-  let read = |rows: List<String>|
-    definitions_of(
-      Bytes::of_string("{\"definitions\":[" ++ String::join(rows, ",") ++ "],\"tests\":[]}"),
-    );
-  let lines = Ok(b"m.a 01\nm.b 02\n");
-  assert_eq(read([row("m.a", "01"), row("m.b", "02")]), lines);
-  assert_eq(read([row("m.b", "02"), row("m.a", "01")]), lines);
-  assert_eq(read(["{\"name\":\"m.c\",\"hash\":null}", row("m.a", "01")]), Ok(b"m.a 01\n"));
+test "each listed definition is named by a digest of everything it reaches, in name order" {
+  let row = |name: String, hash: String, closure: List<String>|
+    "{\"name\":\"" ++ name ++ "\",\"hash\":\"" ++ hash ++ "\",\"closure\":["
+      ++ String::join(closure.map(|c: String| "\"" ++ c ++ "\""), ",")
+      ++ "]}";
+  let read = |b_hash: String, t_hash: String| {
+    let listing = "{\"definitions\":[" ++ row("m.b", b_hash, []) ++ ","
+      ++ row("m.a", "01", ["m.b", "m.T"])
+      ++ "],\"declarations\":[{\"name\":\"m.T\",\"hash\":\""
+      ++ t_hash
+      ++ "\"}],\"tests\":[]}";
+    match definitions_of(Bytes::of_string(listing)) {
+      Ok(lines) -> lines.split(b"\n").filter(|l: Bytes| l.len() > 0),
+      Err(reason) -> panic(reason),
+    }
+  };
+  let first = read("02", "09");
+  assert_eq(first.map(|l: Bytes| l.slice(0, 4)), [b"m.a ", b"m.b "]);
+  assert(
+    read("03", "09").get(0) != first.get(0),
+    Some("a callee's change left its caller's entry alone"),
+  );
+  assert(
+    read("02", "08").get(0) != first.get(0),
+    Some("a type's change left its user's entry alone"),
+  );
+  assert_eq(read("02", "09"), first);
+  assert(
+    definitions_of(b"{\"definitions\":[{\"name\":\"m.a\",\"hash\":\"01\"}],\"tests\":[]}")
+      == Err(
+        "the listing of definitions holds no closures: list them with `ply hash --json --dependencies`",
+      ),
+    None,
+  );
   assert(definitions_of(b"{}") == Err("the listing of definitions holds none"), None);
   assert(definitions_of(b"not json") == Err("the listing of definitions does not read"), None)
 }
