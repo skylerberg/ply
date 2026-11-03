@@ -19,7 +19,9 @@ import std.graph
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
                                     UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
-                                    EffectExpression, ReadMode, type_span, is_raise, no_generics)
+                                    EffectExpression, EffectsMember, EffectMember,
+                                    EffectSetMember, ReadMode, type_span, is_raise, no_generics)
+import compiler.syntax.fmt
 import compiler.syntax.items (ExternDefinition, names_type)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, EffectSetItem, ExternItem, is_shipped, is_builtin,
@@ -69,6 +71,7 @@ import compiler.expand.rewrite (MemberCallee, WrittenOut, InField, expand_functi
                                 CompilerNative, compiler_natives)
 import compiler.check.member (CallsFunction, CallsField)
 import compiler.emit.layout (intrinsic_named)
+import compiler.emit.roots (builtin_helper)
 import compiler.emit.c (width_named)
 import compiler.emit.keys (test_owner, law_owner)
 import compiler.check.infer.derivability (ContainsFunction, ContainsHandle, Unconstrained,
@@ -141,6 +144,52 @@ fn names_read(definition: FnDefinition) -> List<QName> =
       _ -> accumulator,
     })
 
+fn reject_colliding_externs(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise} =
+  if !is_shipped(parsed.name) { checker } else {
+    parsed.module.items.fold(
+      { checker: checker, owners: Map::new() },
+      |accumulator: { checker: Checker, owners: Map<Bytes, Identifier> }, item: Item|
+        match item {
+          ExternItem(definition) ->
+            if intrinsic_named(qualify(parsed.name, definition.name.name)) != None { accumulator }
+            else {
+              let helper = builtin_helper(definition.name.name);
+              match accumulator.owners.get(helper) {
+                None -> { ..accumulator, owners: accumulator.owners.insert(helper, definition.name) },
+                Some(first) -> if first.name == definition.name.name
+                    && !is_builtin(parsed.name, parsed.module, definition) { accumulator } else {
+                  {
+                    ..accumulator,
+                    checker: report_error_at_and(
+                      accumulator.checker,
+                      b"E0157",
+                      definition.name.span,
+                      Bytes::concat_all([
+                        b"`extern fn ",
+                        definition.name.name,
+                        b"` and `extern fn ",
+                        first.name,
+                        b"` both name the C function `",
+                        helper,
+                        b"`",
+                      ]),
+                      b"declared again here",
+                      { module: accumulator.checker.module, span: first.span },
+                      b"first declared here",
+                      [b"rename one of them, so that each extern names its own C function"],
+                    ),
+                  }
+                },
+              }
+            },
+          _ -> accumulator,
+        },
+    ).checker
+  }
+
 pub type ModuleSignatures = {
   functions: List<FnDefinition>,
   names: List<Bytes>,
@@ -153,7 +202,11 @@ pub fn bind_signatures(
   parsed: ParsedModule,
 ) -> { checker: Checker, signed: ModuleSignatures } / {abort.raise, elsewhere.read, other_modules.read} = {
   let collected = parsed.module.items.fold(
-    { checker: reject_externs(checker, parsed), functions: [], names: [] },
+    {
+      checker: reject_colliding_externs(reject_externs(checker, parsed), parsed),
+      functions: [],
+      names: [],
+    },
     |accumulator: { checker: Checker, functions: List<FnDefinition>, names: List<Bytes> }, item: Item|
       match item {
         FunctionItem(definition) -> if accumulator.names.contains(definition.name.name) {
@@ -1130,6 +1183,7 @@ fn bind_signature(
       scheme: scheme,
       effects: resolve_effects_in(bound, s.sig.published_effects).listed,
       performed: [],
+      removable: [],
       effects_source: effects_source_of(definition, []),
       scaling: [],
       repeats: [],
@@ -1718,6 +1772,7 @@ fn record_function(
         scheme: scheme,
         effects: effects.listed,
         performed: body_effects.listed,
+        removable: [],
         effects_source: effects_source_of(definition, undeclared.listed),
         scaling: [],
         repeats: [],
@@ -1894,38 +1949,69 @@ fn finish_group(
   let raised_inside = counts.fold(false, |any: Bool, count: Count| any || count.raises.len() > 0)
     && counts.fold(true, |inside: Bool, count: Count|
       inside && count.raises.fold(true, |ok: Bool, r: Raise| ok && raised_within(qualified, r)));
-  let published: Checker = range(0, comp.len()).fold(divergence_checked, |c: Checker, slot: Int|
-    match definition_of(c, qualified.get(slot)) {
-      None -> c,
-      Some(info) -> {
-        let definition = definitions.get(slot);
-        let count = counts.get(slot);
-        let performed = if raised_inside { info.performed.filter(|a: Effect| !is_abort(a)) }
-        else { info.performed };
-        let counted = if current_module(c).role == Dependency { bodies.get(slot).written } else {
-          {
-            scaling: info.effects.fold([], |accumulator: List<Effect>, w: Effect|
-              if count.repeated_effects.fold(false, |b: Bool, a: Effect|
-                  b || effects_cover([w], a)) { accumulator.push(w) }
-              else { accumulator }),
-            repeats: count.repeats,
-          }
-        };
-        set_definition(noted_unperformed(c, definition, bodies.get(slot), performed), {
-          ..info,
-          performed: performed,
-          scaling: counted.scaling,
-          repeats: counted.repeats,
-          ending: ending_of(slot),
-          summary: summary_of(slot),
-          raises: if raised_inside || definition.constant != None { [] } else { count.raises },
-        })
-      },
+  let members = range(0, comp.len()).fold([], |found: List<JudgedMember>, slot: Int|
+    match definition_of(divergence_checked, qualified.get(slot)) {
+      None -> found,
+      Some(info) ->
+        found.push({
+          slot: slot,
+          info: info,
+          performed: if raised_inside { info.performed.filter(|a: Effect| !is_abort(a)) }
+          else { info.performed },
+          sites: bodies.get(slot).performs.map(|site: PerformSite|
+            { ..site, entry: resolve_effect(divergence_checked.substitution, site.entry) }),
+          row: judged_row(divergence_checked, definitions.get(slot), bodies.get(slot)),
+        }),
     });
+  let published: Checker = unperformed_in_group(divergence_checked, members).fold(
+    divergence_checked,
+    |c: Checker, judgement: MemberJudgement| {
+      let slot = judgement.member.slot;
+      let info = judgement.member.info;
+      let definition = definitions.get(slot);
+      let count = counts.get(slot);
+      let counted = if current_module(c).role == Dependency { bodies.get(slot).written } else {
+        {
+          scaling: info.effects.fold([], |accumulator: List<Effect>, w: Effect|
+            if count.repeated_effects.fold(false, |b: Bool, a: Effect|
+                b || effects_cover([w], a)) { accumulator.push(w) }
+            else { accumulator }),
+          repeats: count.repeats,
+        }
+      };
+      set_definition(noted_unperformed(c, definition, judgement), {
+        ..info,
+        performed: judgement.member.performed,
+        removable: removed_effects(judgement.unused),
+        scaling: counted.scaling,
+        repeats: counted.repeats,
+        ending: ending_of(slot),
+        summary: summary_of(slot),
+        raises: if raised_inside || definition.constant != None { [] } else { count.raises },
+      })
+    },
+  );
   { ..published, group_definitions: [] }
 }
 
-type WrittenEffects = { span: Span, bounded: Bool, effects: List<Effect> }
+type WrittenMember = { member: EffectsMember, effects: List<Effect> }
+
+type JudgedRow = { row: EffectsExpression, written: List<WrittenMember> }
+
+type JudgedMember = {
+  slot: Int,
+  info: DefinitionInfo,
+  performed: List<Effect>,
+  sites: List<PerformSite>,
+  row: Option<JudgedRow>,
+}
+
+type MemberJudgement = { member: JudgedMember, unused: List<WrittenMember> }
+
+type CalleeEffects = { declared: List<Effect>, open: Bool, removed: List<Effect> }
+
+fn member_span(member: EffectsMember) -> Span =
+  match member { EffectMember(a) -> a.span, EffectSetMember(set) -> set.span }
 
 fn written_entry(
   checker: Checker,
@@ -1937,23 +2023,21 @@ fn written_entry(
     None -> [],
   }
 
-fn written_effects(
+fn written_members(
   checker: Checker,
   row: EffectsExpression,
   body: ClosedBody,
-) -> List<WrittenEffects> / {abort.raise, elsewhere.read, other_modules.read} = {
+) -> List<WrittenMember> / {abort.raise, elsewhere.read, other_modules.read} = {
   let sets = if row.aliases.len() == 0 { [] } else { named_sets(checker) };
   let written_in_row = |a: EffectExpression|
     a.span.start >= row.span.start && a.span.end <= row.span.end;
   let from_set = |a: EffectExpression| row.aliases.any(|set: QName| set.span.start == a.span.start);
   row.listed.filter(|a: EffectExpression| written_in_row(a) && !from_set(a)).map(
-    |a: EffectExpression|
-      { span: a.span, bounded: a.bounded, effects: written_entry(checker, body, a) },
+    |a: EffectExpression| { member: EffectMember(a), effects: written_entry(checker, body, a) },
   ).concat(
     row.aliases.map(|set: QName|
       {
-        span: set.span,
-        bounded: false,
+        member: EffectSetMember(set),
         effects: sets.filter(|s: NamedSet| s.name == set.name.name).flat_map(
           |s: NamedSet| s.listed,
         ).concat(
@@ -1965,79 +2049,184 @@ fn written_effects(
   )
 }
 
-fn narrowing_edits(
+fn judged_row(
   checker: Checker,
   definition: FnDefinition,
-  row: EffectsExpression,
-  items: List<WrittenEffects>,
-  unused: List<WrittenEffects>,
-) -> Option<List<Edit>> / {abort.raise} = {
-  let spans = items.map(|item: WrittenEffects| item.span).sort_by(|a: Span, b: Span|
-    a.start < b.start);
-  let idle = |s: Span| unused.any(|item: WrittenEffects| item.span.start == s.start);
-  let removed = |text: Bytes|
-    { module: checker.module, start: row.span.start, end: row.span.end, text: text };
-  if unused.any(|item: WrittenEffects| item.bounded) { None } else if unused.len() < spans.len() {
-    Some(
-      range(0, spans.len()).filter(|i: Int| idle(spans.get(i))).map(|i: Int|
-        if range(i + 1, spans.len()).any(|k: Int| !idle(spans.get(k))) {
-          { ..removed(b""), start: spans.get(i).start, end: spans.get(i + 1).start }
-        } else { { ..removed(b""), start: spans.get(i - 1).end, end: spans.get(i).end } }),
-    )
-  } else {
+  body: ClosedBody,
+) -> Option<JudgedRow> / {abort.raise, elsewhere.read, other_modules.read} = {
+  let current = current_module(checker);
+  let parsed = current.parsed;
+  match definition.effects {
+    None -> None,
+    Some(row) -> if current.role == Dependency || derived_of(parsed, definition) != None
+        || schema_of(parsed.module, definition) != None
+        || checker.holes.any(|site: HoleSite|
+          site.owner == qualify(parsed.name, definition.name.name)) { None }
+    else { Some({ row: row, written: written_members(checker, row, body) }) },
+  }
+}
+
+fn removed_effects(unused: List<WrittenMember>) -> List<Effect> =
+  unused.flat_map(|item: WrittenMember| item.effects)
+
+fn unperformed_in_group(
+  checker: Checker,
+  members: List<JudgedMember>,
+) -> List<MemberJudgement> / {abort.raise, elsewhere.read} = {
+  let everything = members.map(|m: JudgedMember|
+    {
+      member: m,
+      unused: match m.row {
+        Some(judged) -> judged.written.filter(|item: WrittenMember| item.effects.len() > 0),
+        None -> [],
+      },
+    });
+  let size = |judgements: List<MemberJudgement>|
+    judgements.fold(0, |n: Int, j: MemberJudgement| n + j.unused.len());
+  iterate(everything, size(everything) + 1, |assumed: List<MemberJudgement>| {
+    let next = assumed.map(|j: MemberJudgement|
+      { member: j.member, unused: unused_under(checker, assumed, j.member) });
+    if size(next) == size(assumed) { Stop(next) } else { Continue(next) }
+  })
+}
+
+fn unused_under(
+  checker: Checker,
+  assumed: List<MemberJudgement>,
+  member: JudgedMember,
+) -> List<WrittenMember> / {abort.raise, elsewhere.read} =
+  match member.row {
+    None -> [],
+    Some(judged) ->
+      judged.written.filter(|item: WrittenMember|
+        item.effects.len() > 0
+          && !member.performed.any(|a: Effect|
+            effects_cover(item.effects, a)
+              && !reached_only_through_removed(checker, assumed, member, a))),
+  }
+
+fn reached_only_through_removed(
+  checker: Checker,
+  assumed: List<MemberJudgement>,
+  member: JudgedMember,
+  performed: Effect,
+) -> Bool / {abort.raise, elsewhere.read} = {
+  let through = member.sites.filter(|site: PerformSite| effect_covers(performed, site.entry));
+  through.len() > 0 && through.all(|site: PerformSite|
+    match site.source {
+      PerformViaCall(callee) -> match callee_effects(checker, assumed, callee) {
+        Some(effects) -> removes(effects, site.entry),
+        None -> false,
+      },
+      _ -> false,
+    })
+}
+
+fn callee_effects(
+  checker: Checker,
+  assumed: List<MemberJudgement>,
+  callee: Bytes,
+) -> Option<CalleeEffects> / {elsewhere.read} =
+  match assumed.find(|j: MemberJudgement| j.member.info.name == callee) {
+    Some(j) -> Some(declared_beside(j.member.info, removed_effects(j.unused))),
+    None -> match checked_callee(checker, callee) {
+      Some(d) -> Some(declared_beside(d, d.removable)),
+      None -> None,
+    },
+  }
+
+fn checked_callee(checker: Checker, callee: Bytes) -> Option<DefinitionInfo> / {elsewhere.read} =
+  match checker.definition_index.get(callee) {
+    Some(_) -> definition_of(checker, callee),
+    None -> if env_lookup(checker.env, callee) != None { None }
+    else { definition_of(checker, callee) },
+  }
+
+fn declared_beside(d: DefinitionInfo, removed: List<Effect>) -> CalleeEffects =
+  { declared: d.effects, open: d.scheme.effect_variables.len() > 0, removed: removed }
+
+fn removes(callee: CalleeEffects, entry: Effect) -> Bool = {
+  let matches = |a: Effect| effect_covers({ ..a, resource: AnyResource }, entry);
+  !callee.open && callee.removed.any(matches)
+    && !callee.declared.any(|a: Effect| matches(a) && !effects_cover(callee.removed, a))
+}
+
+fn narrowing_edit(
+  checker: Checker,
+  definition: FnDefinition,
+  judged: JudgedRow,
+  unused: List<WrittenMember>,
+) -> Edit / {abort.raise} = {
+  let row = judged.row;
+  let kept = judged.written.filter(|item: WrittenMember|
+    !unused.any(|u: WrittenMember| member_span(u.member).start == member_span(item.member).start));
+  let replaced = |start: Int, text: Bytes|
+    { module: checker.module, start: start, end: row.span.end, text: text };
+  let narrowed: EffectsExpression = {
+    ..row,
+    listed: kept.fold([], |listed: List<EffectExpression>, item: WrittenMember|
+      match item.member { EffectMember(a) -> listed.push(a), EffectSetMember(_) -> listed }),
+    aliases: kept.fold([], |aliases: List<QName>, item: WrittenMember|
+      match item.member { EffectMember(_) -> aliases, EffectSetMember(set) -> aliases.push(set) }),
+  };
+  if kept.len() > 0 { replaced(row.span.start, fmt::braced_effects_text(narrowed)) } else {
     match ((row.variable, definition.return_type)) {
-      (Some(t), _) -> if row.variable_bounded { None } else { Some([removed(t.name)]) },
-      (None, Some(return_type)) -> Some([{ ..removed(b""), start: type_span(return_type).end }]),
-      (None, None) -> None,
+      (Some(t), _) -> replaced(row.span.start, fmt::effect_variable_text(t, row.variable_bounded)),
+      (None, Some(return_type)) -> replaced(type_span(return_type).end, b""),
+      (None, None) -> replaced(row.span.start, b"{}"),
     }
   }
 }
 
+fn narrowing_title(definition: FnDefinition, unused: List<WrittenMember>) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    b"remove `",
+    Bytes::join(
+      unused.sort_by(|a: WrittenMember, b: WrittenMember|
+        member_span(a.member).start < member_span(b.member).start).map(|item: WrittenMember|
+        fmt::effects_member_text(item.member)),
+      b"`, `",
+    ),
+    b"` from the effects of `",
+    definition.name.name,
+    b"`",
+  ])
+
 fn noted_unperformed(
   checker: Checker,
   definition: FnDefinition,
-  body: ClosedBody,
-  performed: List<Effect>,
-) -> Checker / {abort.raise, elsewhere.read, other_modules.read} = {
-  let current = current_module(checker);
-  let parsed = current.parsed;
-  match definition.effects {
-    None -> checker,
-    Some(row) -> if current.role == Dependency || derived_of(parsed, definition) != None
-        || schema_of(parsed.module, definition) != None { checker } else {
-      let items = written_effects(checker, row, body);
-      let unused = items.filter(|item: WrittenEffects|
-        item.effects.len() > 0 && !performed.any(|a: Effect| effects_cover(item.effects, a)));
-      let unfinished = checker.holes.any(|site: HoleSite|
-        site.owner == qualify(parsed.name, definition.name.name));
-      if unused.len() == 0 || unfinished { checker } else {
-        let warning: Diagnostic = {
-          code: unperformed_effect_code,
-          labels: unused.map(|item: WrittenEffects|
-            label_at(checker.module, item.span, true, b"never performed")),
-          text: b"",
-          message: Bytes::concat_all([
-            b"`",
-            definition.name.name,
-            b"` declares effects its body never performs",
-          ]),
-          notes_text: [],
-          severity: Warning,
-          fixes: NoFix,
-        };
-        {
-          ..checker,
-          unperformed: checker.unperformed.push(
-            match narrowing_edits(checker, definition, row, items, unused) {
-              Some(edits) -> with_fix(warning, b"remove them from the effects", edits),
-              None -> warning,
-            },
+  judgement: MemberJudgement,
+) -> Checker / {abort.raise} =
+  match ((judgement.member.row, judgement.unused)) {
+    (None, _) -> checker,
+    (Some(_), []) -> checker,
+    (Some(judged), unused) -> {
+      let warning: Diagnostic = {
+        code: unperformed_effect_code,
+        labels: unused.map(|item: WrittenMember|
+          label_at(checker.module, member_span(item.member), true, b"never performed")),
+        text: b"",
+        message: Bytes::concat_all([
+          b"`",
+          definition.name.name,
+          b"` declares effects its body never performs",
+        ]),
+        notes_text: [],
+        severity: Warning,
+        fixes: NoFix,
+      };
+      {
+        ..checker,
+        unperformed: checker.unperformed.push(
+          with_fix(
+            warning,
+            narrowing_title(definition, unused),
+            [narrowing_edit(checker, definition, judged, unused)],
           ),
-        }
+        ),
       }
     },
   }
-}
 
 fn split_labels(scheme: Scheme, definition: FnDefinition, signature: Signature) -> Scheme = {
   let ids = definition.generics.labels.fold([], |accumulator: List<Int>, identifier: Identifier|

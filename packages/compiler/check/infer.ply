@@ -174,6 +174,7 @@ fn canonical_definition(d: DefinitionInfo) -> DefinitionInfo / {abort.raise} = {
     [
       d.effects,
       d.performed,
+      d.removable,
       d.scaling,
       d.promised_bounded,
       error_widening(d.effects_source),
@@ -186,6 +187,7 @@ fn canonical_definition(d: DefinitionInfo) -> DefinitionInfo / {abort.raise} = {
     scheme: c.scheme,
     effects: canonical_in(c, d.effects),
     performed: canonical_in(c, d.performed),
+    removable: canonical_in(c, d.removable),
     scaling: canonical_in(c, d.scaling),
     promised_bounded: canonical_in(c, d.promised_bounded),
     effects_source: match d.effects_source {
@@ -5169,6 +5171,18 @@ test "an `extern fn` outside a shipped module is rejected" {
   )
 }
 
+test "two externs of a shipped module whose C functions share a name are each rejected after the first" {
+  assert_eq(
+    codes_of([
+      {
+        name: b"std.native",
+        source_text: b"pub type Pair = | Pair(Int, Int)\npub extern fn pair_left(p: Pair) -> Int\npub extern fn Pair::left(p: Pair) -> Int\npub extern fn pair_right(p: Pair) -> Int\npub extern fn Pair::right(p: Pair) -> Int\npub extern fn pair_sum(p: Pair) -> Int\n",
+      },
+    ]),
+    [b"E0157", b"E0157"],
+  )
+}
+
 test "a public extern of a shipped module is callable by its qualified or imported name, and a private extern only inside that module" {
   let native = {
     name: b"std.native",
@@ -7517,6 +7531,77 @@ test "a function that performs less may be a parameter's default, as it may be a
 test "a raise reached only by a call back into the group is not performed" {
   let src = b"pub fn f(n: Int) -> Int / {abort.raise} = if n <= 0 { 0 } else { f(n - 1) }";
   assert_eq(unperformed_in(src), [b"abort.raise"])
+}
+
+fn unperformed_chain(rows: { inner: Bytes, middle: Bytes, outer: Bytes }) -> Bytes =
+  with_effects(
+    Bytes::concat_all([
+      b"pub fn inner() -> Int",
+      rows.inner,
+      b" = 1\npub fn middle() -> Int",
+      rows.middle,
+      b" = inner()\npub fn outer() -> Int",
+      rows.outer,
+      b" = middle()\n",
+    ]),
+  )
+
+const declared_chain: { inner: Bytes, middle: Bytes, outer: Bytes } =
+  { inner: b" / {log.emit}", middle: b" / {log.emit}", outer: b" / {log.emit}" }
+
+fn every_fix_applied(source: Bytes, fixes: List<Fix>) -> Bytes / {abort.raise} =
+  fixes.flat_map(fix_edits).sort_by(|a: Edit, b: Edit| a.start > b.start).fold(
+    source,
+    |s: Bytes, e: Edit| Bytes::concat_all([s.slice(0, e.start), e.text, s.slice(e.end, s.len())]),
+  )
+
+test "an effect that a chain of callers declares and no link performs is reported at every link in one check" {
+  assert_eq(
+    valid_module_checker(unperformed_chain(declared_chain)).unperformed.map(|d: Diagnostic|
+      d.message).sort(),
+    [
+      b"`inner` declares effects its body never performs",
+      b"`middle` declares effects its body never performs",
+      b"`outer` declares effects its body never performs",
+    ],
+  );
+  assert_eq(
+    unperformed_in(unperformed_chain(declared_chain).concat(
+      b"pub fn loud() -> Int / {log.emit} = { log.emit(b\"x\"); outer() }\n",
+    )),
+    [b"log.emit", b"log.emit", b"log.emit"],
+  )
+}
+
+test "one pass of fixes clears a whole chain of unperformed effects, and each fix names its function and effects" {
+  let source = unperformed_chain(declared_chain);
+  let fixes = fixes_of(valid_module_checker(source).unperformed);
+  assert_eq(fixes.map(|fix: Fix| fix.title).sort(), [
+    b"remove `log.emit` from the effects of `inner`",
+    b"remove `log.emit` from the effects of `middle`",
+    b"remove `log.emit` from the effects of `outer`",
+  ]);
+  let fixed = every_fix_applied(source, fixes);
+  assert_eq(fixed, unperformed_chain({ inner: b"", middle: b"", outer: b"" }));
+  assert_eq(unperformed_in(fixed), [])
+}
+
+test "a callee that performs the effect keeps every caller's declaration" {
+  assert_eq(
+    unperformed_in(with_effects(
+      b"pub fn inner() -> Int / {log.emit} = { log.emit(b\"x\"); 1 }\npub fn outer() -> Int / {log.emit} = inner()\n",
+    )),
+    [],
+  )
+}
+
+test "functions that call each other and declare an effect neither performs are both reported" {
+  assert_eq(
+    unperformed_in(with_effects(
+      b"pub fn even(n: Int) -> Bool / {log.emit} = if n <= 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool / {log.emit} = if n <= 0 { false } else { even(n - 1) }\n",
+    )),
+    [b"log.emit", b"log.emit"],
+  )
 }
 
 test "a label the signature binds is the label the body performs on" {
