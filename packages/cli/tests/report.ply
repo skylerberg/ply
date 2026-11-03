@@ -1,6 +1,5 @@
 import std.set (Set)
-import compiler.check.resolve.tables (InSource, WholeFile, Unplaced)
-import compiler.front.emitter_input (no_module_span)
+import compiler.check.resolve.tables (InSource, Place, Unplaced)
 import args (Flags)
 import std.list (dedup)
 import std.cli (Parsed, has, parse_nat, value, values_of)
@@ -10,7 +9,7 @@ import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (ProgramListing, listing_of)
 import compiler.front.published (analyse)
-import compiler.front.rows (ModuleSpan)
+import compiler.front.rows (location_place)
 import compiler.check.infer.checker (TestInfo)
 import compiler.check.resolve.tables (Diagnostic, Label, error_with_labels)
 import compiler.check.types
@@ -38,7 +37,6 @@ import std.string
 import std.fmt (fixed_point)
 import claims (location_text)
 import signature (effect_texts)
-import proof.context (set_of)
 import proof.obligation (plural)
 import std.option
 
@@ -130,7 +128,7 @@ pub fn conflicting_effects_text(case: Case) -> String =
   "{" ++ String::join(shared_texts(case), ", ") ++ "}"
 
 pub fn classes_of(program: Program, runs: List<Int>) -> List<List<Int>> / {abort.raise} =
-  group_by_conflict(scheduled_of(program, set_of(runs)))
+  group_by_conflict(scheduled_of(program, Set::of_list(runs)))
 
 fn scheduled_of(program: Program, running: Set<Int>) -> List<ScheduledTest> =
   program.cases.filter(|case: Case| running.contains(case.index)).map(|case: Case|
@@ -151,7 +149,7 @@ pub fn run_decision_of(
   classes: List<List<Int>>,
 ) -> RunDecision / {abort.raise} = {
   let runs = to_run(decisions).filter(|i: Int| case_of(program, i) != None);
-  let running = set_of(runs);
+  let running = Set::of_list(runs);
   {
     search: search,
     sim: sim,
@@ -238,7 +236,12 @@ pub type Outcome = {
   performs: Int,
 }
 
-pub type Site = { task: String, definition: Option<String>, access: String, at: Option<ModuleSpan> }
+pub type SourceSpan = { module: Int, start: Int, end: Int }
+
+pub type Site = { task: String, definition: Option<String>, access: String, at: Option<SourceSpan> }
+
+pub fn source_place(span: Option<SourceSpan>) -> Place =
+  match span { Some(s) -> InSource(s), None -> Unplaced }
 
 pub type Race = { left: Site, right: Site, step: Int }
 
@@ -358,18 +361,8 @@ pub fn display_of(program: Program, case: Case) -> String =
 fn short_of(hash: Option<String>) -> String / {abort.raise} =
   match hash { Some(h) -> h.slice(0, 12), None -> "-".repeat(12) }
 
-fn dim_place(
-  style: Style,
-  places: List<SourceText>,
-  a: Option<ModuleSpan>,
-) -> String / {abort.raise} =
-  match a {
-    None -> "",
-    Some(spot) -> match location_text(places, spot) {
-      Some(text) -> "   " ++ dim(style, text),
-      None -> "",
-    },
-  }
+fn dim_place(style: Style, places: List<SourceText>, at: Place) -> String / {abort.raise} =
+  match location_text(places, at) { Some(text) -> "   " ++ dim(style, text), None -> "" }
 
 pub fn primary_of(diagnostic: Diagnostic) -> Option<Label> =
   diagnostic.labels.fold(None, |accumulator: Option<Label>, label: Label|
@@ -378,17 +371,10 @@ pub fn primary_of(diagnostic: Diagnostic) -> Option<Label> =
       None -> if label.primary { Some(label) } else { None },
     })
 
-fn label_at(label: Label) -> ModuleSpan =
-  match label.place {
-    InSource(s) -> s,
-    WholeFile(m) -> { module: m, start: 0, end: 0 },
-    Unplaced -> no_module_span,
-  }
-
 fn location_json(places: List<SourceText>, diagnostic: Diagnostic) -> Json / {abort.raise} =
   match primary_of(diagnostic) {
     None -> Null,
-    Some(l) -> editor_location_json(places, label_at(l)),
+    Some(l) -> editor_location_json(places, l.place),
   }
 
 fn reason_key(reason: String) -> String = String::join(reason.split(" "), "_")
@@ -484,8 +470,7 @@ fn compiled_line(style: Style, b: Backend) -> List<String> =
         indent
           ++ dim(
             style,
-            "loaded the compiled test library in " ++ ns_as_ms_tenths(nanos)
-              ++ "ms, after compiling its C",
+            "loaded the compiled test library in " ++ ns_as_ms_tenths(nanos) ++ "ms",
           ),
       ],
   }
@@ -920,7 +905,7 @@ pub fn secondary_lines(
   diagnostic: Diagnostic,
 ) -> List<String> / {abort.raise} =
   diagnostic.labels.filter(|label: Label| !label.primary).map(|label: Label|
-    "    " ++ String::of_bytes_lossy(label.text) ++ dim_place(style, places, Some(label_at(label))))
+    "    " ++ String::of_bytes_lossy(label.text) ++ dim_place(style, places, label.place))
 
 pub fn at_lines(
   style: Style,
@@ -929,7 +914,7 @@ pub fn at_lines(
 ) -> List<String> / {abort.raise} =
   match primary_of(diagnostic) {
     None -> [],
-    Some(l) -> match location_text(places, label_at(l)) {
+    Some(l) -> match location_text(places, l.place) {
       None -> [],
       Some(text) -> ["    at " ++ dim(style, text)],
     },
@@ -945,7 +930,7 @@ fn site_line(
     ++ (match site.definition { Some(d) -> d, None -> "-" })
     ++ "   "
     ++ site.access
-    ++ dim_place(style, places, site.at)
+    ++ dim_place(style, places, source_place(site.at))
 
 fn race_lines(
   style: Style,
@@ -1025,13 +1010,16 @@ fn painted(style: Style, line: String) -> String =
   else if line.starts_with("@@") { dim(style, line) }
   else { line }
 
+fn changed_place(d: ChangeDiff) -> Place =
+  match d.at { Some(l) -> location_place(l), None -> Unplaced }
+
 fn diff_lines(
   style: Style,
   places: List<SourceText>,
   d: ChangeDiff,
 ) -> List<String> / {abort.raise} = {
   let head = "  " ++ bold(style, d.name) ++ " (" ++ kind_word(d.change) ++ ")"
-    ++ dim_place(style, places, d.at);
+    ++ dim_place(style, places, changed_place(d));
   let body = match d.diff {
     None -> ["    " ++ dim(style, "its text from when the test last passed is not stored")],
     Some(text) -> {
@@ -1234,7 +1222,7 @@ fn outcome_json(program: Program, outcome: Outcome, d: RunDecision) -> Json / {a
   ])
 }
 
-fn span_json(a: Option<ModuleSpan>) -> Json =
+fn span_json(a: Option<SourceSpan>) -> Json =
   match a {
     None -> Null,
     Some(at) ->
@@ -1303,7 +1291,7 @@ fn diff_json(program: Program, d: ChangeDiff) -> Json / {abort.raise} =
     { key: "change", value: Str(kind_word(d.change)) },
     {
       key: "location",
-      value: match d.at { Some(at) -> editor_location_json(program.places, at), None -> Null },
+      value: editor_location_json(program.places, changed_place(d)),
     },
     { key: "diff", value: string_or_null(d.diff) },
   ])

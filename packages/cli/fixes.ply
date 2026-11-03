@@ -1,118 +1,118 @@
-import compiler.check.resolve.tables (Diagnostic, Fix, Edit, error_with_labels, with_added_effects,
-                                      insertion)
-import diagnostic (SourceText, position_of)
+import compiler.check.resolve.tables (Fix, insertion)
+import diagnostic (position_of)
+import sources (File)
 import std.json (Json, Str, Array, Null, object)
 import std.bytes
 import std.list
 import std.string
 
-pub type Fixed = { texts: List<Bytes>, applied: List<Fix> }
+pub type FileEdit = { file: File, start: Int, end: Int, text: Bytes }
 
-fn within(texts: List<Bytes>, edit: Edit) -> Bool =
-  match texts.at(edit.module) {
-    Some(text) -> 0 <= edit.start && edit.start <= edit.end && edit.end <= text.len(),
-    None -> false,
-  }
+pub type PlacedFix = { fix: Fix, edits: List<FileEdit> }
 
-fn touches(a: Edit, b: Edit) -> Bool = a.module == b.module && a.start <= b.end && b.start <= a.end
+pub type FixedFile = { file: File, text: Bytes }
 
-fn fits(texts: List<Bytes>, taken: List<Fix>, fix: Fix) -> Bool =
+pub type Fixed = { files: List<FixedFile>, applied: List<PlacedFix> }
+
+fn touches(a: FileEdit, b: FileEdit) -> Bool =
+  a.file.at == b.file.at && a.start <= b.end && b.start <= a.end
+
+fn fits(taken: List<PlacedFix>, fix: PlacedFix) -> Bool =
   fix.edits.len() > 0
-    && fix.edits.all(|edit: Edit|
-      within(texts, edit) && !taken.any(|t: Fix| t.edits.any(|x: Edit| touches(x, edit))))
+    && fix.edits.all(|edit: FileEdit|
+      !taken.any(|t: PlacedFix| t.edits.any(|x: FileEdit| touches(x, edit))))
 
-fn applied(text: Bytes, edits: List<Edit>) -> Bytes / {abort.raise} =
-  edits.sort_by(|a: Edit, b: Edit| a.start > b.start).fold(text, |t: Bytes, edit: Edit|
+fn applied(text: Bytes, edits: List<FileEdit>) -> Bytes / {abort.raise} =
+  edits.sort_by(|a: FileEdit, b: FileEdit| a.start > b.start).fold(text, |t: Bytes, edit: FileEdit|
     Bytes::concat_all([t.slice(0, edit.start), edit.text, t.slice(edit.end, t.len())]))
 
-pub fn fixed(texts: List<Bytes>, diagnostics: List<Diagnostic>) -> Fixed / {abort.raise} = {
-  let taken = diagnostics.flat_map(|d: Diagnostic| d.fixes).fold(
-    [],
-    |found: List<Fix>, fix: Fix| if fits(texts, found, fix) { found.push(fix) } else { found },
-  );
-  let edits = taken.flat_map(|fix: Fix| fix.edits);
+pub fn fixed(fixes: List<PlacedFix>) -> Fixed / {abort.raise} = {
+  let taken = fixes.fold([], |found: List<PlacedFix>, fix: PlacedFix|
+    if fits(found, fix) { found.push(fix) } else { found });
+  let edits = taken.flat_map(|fix: PlacedFix| fix.edits);
+  let files = edits.fold([], |found: List<File>, edit: FileEdit|
+    if found.any(|f: File| f.at == edit.file.at) { found } else { found.push(edit.file) });
   {
-    texts: range(0, texts.len()).map(|m: Int|
-      applied(texts.get(m), edits.filter(|edit: Edit| edit.module == m))),
+    files: files.map(|file: File|
+      { file: file, text: applied(file.text, edits.filter(|e: FileEdit| e.file.at == file.at)) }),
     applied: taken,
   }
 }
 
-fn place_of(files: List<SourceText>, fix: Fix) -> String / {abort.raise} =
+fn place_of(fix: PlacedFix) -> String / {abort.raise} =
   match fix.edits.at(0) {
-    Some(edit) -> match files.at(edit.module) {
-      Some(file) -> file.path ++ ":" ++ position_of(file.text, edit.start).line.to_string(),
-      None -> "",
-    },
+    Some(edit) ->
+      edit.file.path ++ ":" ++ position_of(edit.file.text, edit.start).line.to_string(),
     None -> "",
   }
 
 fn backticked(names: List<Bytes>) -> String =
   String::join(names.map(|name: Bytes| "`" ++ String::of_bytes_lossy(name) ++ "`"), ", ")
 
-fn change_line(files: List<SourceText>, fix: Fix) -> String / {abort.raise} =
-  match fix.adds {
+fn change_line(fix: PlacedFix) -> String / {abort.raise} =
+  match fix.fix.adds {
     Some(a) ->
       "added " ++ backticked(a.effects) ++ " to " ++ backticked([a.function]) ++ " at "
-        ++ place_of(files, fix)
+        ++ place_of(fix)
         ++ (if a.calls.len() == 0 { "" } else { ", for its call to " ++ backticked(a.calls) }),
-    None -> "fixed " ++ place_of(files, fix) ++ ": " ++ String::of_bytes_lossy(fix.title),
+    None -> "fixed " ++ place_of(fix) ++ ": " ++ String::of_bytes_lossy(fix.fix.title),
   }
 
-pub fn change_lines(files: List<SourceText>, fixes: List<Fix>) -> List<String> / {abort.raise} =
-  fixes.map(|fix: Fix| change_line(files, fix))
+pub fn change_lines(fixes: List<PlacedFix>) -> List<String> / {abort.raise} = fixes.map(change_line)
 
 fn names_json(names: List<Bytes>) -> Json =
   Array(names.map(|name: Bytes| Str(String::of_bytes_lossy(name))))
 
-fn change_json(files: List<SourceText>, fix: Fix) -> Json / {abort.raise} =
+fn change_json(fix: PlacedFix) -> Json / {abort.raise} =
   object([
-    { key: "at", value: Str(place_of(files, fix)) },
-    { key: "title", value: Str(String::of_bytes_lossy(fix.title)) },
+    { key: "at", value: Str(place_of(fix)) },
+    { key: "title", value: Str(String::of_bytes_lossy(fix.fix.title)) },
     {
       key: "function",
-      value: match fix.adds { Some(a) -> Str(String::of_bytes_lossy(a.function)), None -> Null },
+      value: match fix.fix.adds { Some(a) -> Str(String::of_bytes_lossy(a.function)), None -> Null },
     },
     {
       key: "effects",
-      value: match fix.adds { Some(a) -> names_json(a.effects), None -> Array([]) },
+      value: match fix.fix.adds { Some(a) -> names_json(a.effects), None -> Array([]) },
     },
-    { key: "calls", value: match fix.adds { Some(a) -> names_json(a.calls), None -> Array([]) } },
+    {
+      key: "calls",
+      value: match fix.fix.adds { Some(a) -> names_json(a.calls), None -> Array([]) },
+    },
   ])
 
-pub fn changes_json(files: List<SourceText>, fixes: List<Fix>) -> Json / {abort.raise} =
-  Array(fixes.map(|fix: Fix| change_json(files, fix)))
+pub fn changes_json(fixes: List<PlacedFix>) -> Json / {abort.raise} = Array(fixes.map(change_json))
 
-fn effect_fix(module: Int, at: Int, function: Bytes, calls: List<Bytes>) -> Diagnostic =
-  with_added_effects(
-    error_with_labels(b"E0302", b"", [], []),
-    b"add `e` to the effects",
-    [insertion(module, at, b"e")],
-    { function: function, effects: [b"e"], calls: calls },
-  )
+fn a_file(path: String, text: Bytes) -> File =
+  { path: path, module: "m", text: text, at: { label: "cwd", path: path } }
 
-test "`fixed` applies the fixes of every diagnostic at once, each to its own text, and names the call each added effect is for" {
-  let texts = [b"fn c() -> Int / {} = 1\n", b"fn b() -> Int / {} = c()\n"];
-  let result = fixed(texts, [effect_fix(0, 17, b"c", []), effect_fix(1, 17, b"b", [b"c"])]);
-  assert_eq(result.texts, [b"fn c() -> Int / {e} = 1\n", b"fn b() -> Int / {e} = c()\n"]);
-  assert_eq(
-    change_lines(
-      [{ path: "c.ply", text: texts.get(0) }, { path: "b.ply", text: texts.get(1) }],
-      result.applied,
-    ),
-    ["added `e` to `c` at c.ply:1", "added `e` to `b` at b.ply:1, for its call to `c`"],
-  )
+fn effect_fix(file: File, at: Int, function: Bytes, calls: List<Bytes>) -> PlacedFix =
+  {
+    fix: {
+      title: b"add `e` to the effects",
+      edits: [insertion(0, at, b"e")],
+      adds: Some({ function: function, effects: [b"e"], calls: calls }),
+    },
+    edits: [{ file: file, start: at, end: at, text: b"e" }],
+  }
+
+test "`fixed` applies the fixes of every diagnostic at once, each to its own file, and names the call each added effect is for" {
+  let c = a_file("c.ply", b"fn c() -> Int / {} = 1\n");
+  let b = a_file("b.ply", b"fn b() -> Int / {} = c()\n");
+  let result = fixed([effect_fix(c, 17, b"c", []), effect_fix(b, 17, b"b", [b"c"])]);
+  assert_eq(result.files.map(|f: FixedFile| f.text), [
+    b"fn c() -> Int / {e} = 1\n",
+    b"fn b() -> Int / {e} = c()\n",
+  ]);
+  assert_eq(change_lines(result.applied), [
+    "added `e` to `c` at c.ply:1",
+    "added `e` to `b` at b.ply:1, for its call to `c`",
+  ])
 }
 
-test "`fixed` leaves out a fix that touches an edit already taken, or that edits text it was not given" {
-  let texts = [b"fn c() -> Int / {} = 1\n"];
-  let result = fixed(texts, [
-    effect_fix(0, 17, b"c", []),
-    effect_fix(0, 17, b"c", []),
-    effect_fix(1, 0, b"d", []),
-  ]);
-  assert_eq(result.texts, [b"fn c() -> Int / {e} = 1\n"]);
-  assert_eq(change_lines([{ path: "c.ply", text: texts.get(0) }], result.applied), [
-    "added `e` to `c` at c.ply:1",
-  ])
+test "`fixed` leaves out a fix that touches an edit already taken" {
+  let c = a_file("c.ply", b"fn c() -> Int / {} = 1\n");
+  let result = fixed([effect_fix(c, 17, b"c", []), effect_fix(c, 17, b"c", [])]);
+  assert_eq(result.files.map(|f: FixedFile| f.text), [b"fn c() -> Int / {e} = 1\n"]);
+  assert_eq(change_lines(result.applied), ["added `e` to `c` at c.ply:1"])
 }

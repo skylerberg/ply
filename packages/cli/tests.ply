@@ -11,7 +11,7 @@ import compiler.front (analyse_pulling_std_with)
 import compiler.front.rows (KeyRow, EmitterRoot)
 import compiler.store.hash.forms (ItemKeyed, reach)
 import compiler.emit.keys (TestCases, root_name, root_text, test_key, test_owner)
-import compiler.check.resolve.tables (Label, error_with_labels)
+import compiler.check.resolve.tables (InSource, Label, error_with_labels)
 import diagnostic (SourceText, diagnostic_of)
 import report (indent)
 import std.json (Null, Bool, to_string)
@@ -39,9 +39,10 @@ import tests.report (PrintedEffect, Phases, Entry, Case, RunDecision, conflictin
                      summary_line, secondary_lines, at_lines, seed_lines, change_text, case_json,
                      placed_cases, fault_json, test_output)
 import tests.concluded (entry_of, job_of, run_job, fault_of, replay_of)
-import tests.cases (CasedTest, Scope, scope_of, over_cases, expand_cases, expanded_program,
-                    ExpandedTests)
-import tests.listing (TestListing, TestRecord, listing_of_program, run_hash, test_at)
+import tests.cases (Scope, scope_of, selection_of, expand_cases, expanded_program, ExpandedTests)
+import tests.listing (TestListing, SelectedTest, listing_of_program, run_hash, test_at,
+                      test_list_of_program)
+import compiler.front.checking.program_facts (ListedTest, TestList)
 import tests.run (rows_of, case_view)
 
 const a_source_texts: List<SourceText> =
@@ -107,12 +108,17 @@ fn scoped(w: TestListing, argv: List<String>) -> Scope / {abort.raise} =
     None,
   )
 
-fn selected_case_indices(
-  w: TestListing,
+fn selected_cases(
+  list: TestList,
   argv: List<String>,
   named: Option<List<String>>,
-) -> List<Int> / {abort.raise} =
-  over_cases(w, from_argv("test", argv).filters, named).map(|c: CasedTest| c.index)
+) -> List<Bytes> / {abort.raise} =
+  selection_of(
+    list,
+    from_argv("test", argv).filters,
+    options_from(parsed(["test"].concat(argv))).shard,
+    named,
+  ).tests.filter(|t: ListedTest| t.info.cases).map(|t: ListedTest| t.info.key)
 
 fn a_program(cases: List<Case>) -> Program =
   {
@@ -874,7 +880,6 @@ test "a run reports only the tests that match `--filter`, and counts the tests i
   let scope = scoped(w, ["--filter", "alpha"]);
   assert_eq(scope.visible, [0]);
   assert_eq(scope.filtered_out, 2);
-  assert_eq(scope.out, []);
   assert_eq(scoped(w, ["--filter", "m.gam", "--filter", "alpha"]).visible, [0, 2]);
   assert_eq(scoped(w, []).visible, [0, 1, 2])
 }
@@ -906,22 +911,23 @@ test "`--shard` puts each test and each case in exactly one shard, even when `--
         == parts.at_or(k - 1, []).filter(|i: Int| i == 2 || i >= 11)),
   );
   assert_eq(scoped(over.listing, ["--shard", "1/1"]).visible, range(0, 13));
-  assert_eq(selected_case_indices(whole, ["--shard", "3/3"], None), [1])
+  assert_eq(selected_cases(list_with_cases, ["--shard", "3/3"], None), [b"m.holds {n}"])
 }
 
 test "a run lists a test with cases only when a filter could match one of its cases" {
-  let whole = program_with_cases;
-  let listing = |filter: String| selected_case_indices(whole, ["--filter", filter], None);
+  let listing = |filter: String| selected_cases(list_with_cases, ["--filter", filter], None);
   assert_eq(listing("std.show."), []);
-  assert_eq(listing("m."), [1]);
-  assert_eq(listing("holds 1"), [1]);
-  assert_eq(selected_case_indices(whole, [], Some(["n"])), [])
+  assert_eq(listing("m."), [b"m.holds {n}"]);
+  assert_eq(listing("holds 1"), [b"m.holds {n}"]);
+  assert_eq(selected_cases(list_with_cases, [], Some(["n"])), [])
 }
 
 const cases_source: Bytes =
   b"fn table() -> List<Int> = [1, 2]\nfn held(n: Int) -> Bool = n > 0\ntest \"plain\" { assert(held(1)) }\ntest \"holds {n}\" for n: Int in table() { assert(held(n)) }\n"
 
 const program_with_cases: TestListing = listing_of_program(checked_program(cases_source))
+
+const list_with_cases: TestList = test_list_of_program(checked_program(cases_source))
 
 fn checked_program(source: Bytes) -> ProgramListing / {abort.raise} =
   listing_of(framed_program(source))
@@ -952,12 +958,12 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
       Ok([{ label: "holds 1", identity: b"one" }, { label: "holds 2", identity: b"two" }]),
     ),
   );
-  assert_eq(over.listing.tests.map(|t: TestRecord| t.info.key), [
+  assert_eq(over.listing.tests.map(|t: SelectedTest| t.info.key), [
     b"m.plain",
     b"m.holds 1",
     b"m.holds 2",
   ]);
-  assert_eq(over.listing.tests.map(|t: TestRecord| t.info.index), [0, 1, 2]);
+  assert_eq(over.listing.tests.map(|t: SelectedTest| t.info.index), [0, 1, 2]);
   assert_eq(over.entries.map(|e: Entry| e.test), [0, 1, 1]);
   assert_eq(over.entries.map(|e: Entry| e.key), [b"m.plain", b"m.holds {n}", b"m.holds {n}"]);
   assert_eq(over.entries.map(|e: Entry| e.case), [
@@ -974,7 +980,7 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
   });
   assert(hashes.get(b"m.holds 1") != hashes.get(b"m.holds 2"), None);
   let reachable_functions = |a: ProgramListing|
-    reach(a.hashes, [ItemKeyed(b"m.holds 1")]).functions.keys();
+    reach(a.hashes, [ItemKeyed(b"m.holds 1")]).functions;
   let expanded = expanded_program(program, Map::new().insert(0, 0), over);
   assert(
     reachable_functions(expanded.analysis).contains(b"m.table")
@@ -987,8 +993,8 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
 }
 
 fn hashes_by_key(analysis: TestListing) -> Map<Bytes, Bytes> =
-  analysis.tests.fold(Map::new(), |found: Map<Bytes, Bytes>, t: TestRecord|
-    match run_hash(t) { Some(h) -> found.insert(t.info.key, h), None -> found })
+  analysis.tests.fold(Map::new(), |found: Map<Bytes, Bytes>, t: SelectedTest|
+    found.insert(t.info.key, run_hash(t)))
 
 fn listing(labels: List<String>) -> Result<List<ListedCase>, KnownFailure> =
   Ok(labels.map(|l: String| { label: l, identity: Bytes::of_string(l) }))
@@ -1004,7 +1010,7 @@ fn entry_descriptions(over: ExpandedTests) -> List<String> =
 test "tests over cases may share a label, but each case in a module needs its own label" {
   let source = b"test \"plain\" { () }\ntest \"holds {n}\" for n: Int in [1, 2] { () }\ntest \"holds {n}\" for n: Int in [3] { () }\n";
   let whole = listing_of_program(checked_program(source));
-  assert_eq(whole.tests.map(|t: TestRecord| t.info.key), [
+  assert_eq(whole.tests.map(|t: SelectedTest| t.info.key), [
     b"m.plain",
     b"m.holds {n}",
     b"m.holds {n} (2)",
@@ -1013,7 +1019,7 @@ test "tests over cases may share a label, but each case in a module needs its ow
     whole,
     Map::new().insert(1, listing(["holds 1", "holds 2"])).insert(2, listing(["holds 3"])),
   );
-  assert_eq(apart.listing.tests.map(|t: TestRecord| t.info.key), [
+  assert_eq(apart.listing.tests.map(|t: SelectedTest| t.info.key), [
     b"m.plain",
     b"m.holds 1",
     b"m.holds 2",
@@ -1079,7 +1085,7 @@ test "a test whose cases could not be listed stays one test, and fails with the 
     failure: { diagnostic: diagnostic_of(Error, b"E0502", "division by zero", [], []), values: [] },
   };
   let over = expand_cases(whole, Map::new().insert(1, Err(reason)));
-  assert_eq(over.listing.tests.map(|t: TestRecord| t.info.key), [b"m.plain", b"m.holds {n}"]);
+  assert_eq(over.listing.tests.map(|t: SelectedTest| t.info.key), [b"m.plain", b"m.holds {n}"]);
   assert_eq(hashes_by_key(over.listing), hashes_by_key(whole));
   let p = a_program(
     cases_of_whole(over.listing).map(|case: Case|

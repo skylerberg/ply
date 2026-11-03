@@ -1,84 +1,120 @@
 import progress
-import std.set (Set)
 import std.list
 import compiler.check.infer.checker (EffectInfo, Location, TestInfo)
 import compiler.check.resolve.tables (Diagnostic, Source)
+import compiler.store.memo (memo)
 import compiler.emit.keys (RootKey, TestCases, root_name, root_text, test_key, test_roots)
 import compiler.front.checking (LoadInputs)
-import compiler.front.checking.identity (TestIdentity)
+import compiler.front.checking.identity (identity_of)
 import compiler.front.checking.view
 import compiler.front.checking.program_facts (ListedTest, TestList, names_of, names_reached,
                                               test_list)
-import compiler.front.checking.view (NamedRollup)
-import compiler.front.checking.world (Modules)
 import module_queries (LaterChecks)
-import compiler.front.facts (ProgramListing, test_label_spans)
-import compiler.front.rows (DeclaredEffect, Outline)
-import compiler.store.hash.forms (ModuleHashes)
-import compiler.syntax.parsing (Span, generated_span)
 import compiler.front.facts (ProgramListing, test_labels)
 import compiler.front.rows (Outline)
-import compiler.store.hash.forms (ModuleHashes, of_key)
-import compiler.syntax.parsing (dummy_span)
-import compiler.store.hash.forms (ModuleHashes, SubjectIdentity, TestRun, TestListing)
+import compiler.store.hash.forms
+import compiler.store.hash.forms (Identified, ModuleHashes, TestRun, of_key)
+import compiler.syntax.parsing (generated_span)
 import diagnostic (SourceText)
 import program (ProgramStore, Session, in_program_store)
 
-pub type TestRecord = { info: TestInfo, label: Location, identity: Option<TestIdentity> }
+pub type TestIdentity =
+  | PlainRun(Bytes)
+  | OverCases({ run: Bytes, listing: Bytes })
+  | CaseOf({ parent: Bytes, run: Bytes })
+
+pub type SelectedTest = { info: TestInfo, label: Location, identity: TestIdentity }
 
 pub type TestListing = {
   root: Int,
   names: List<Bytes>,
-  tests: List<TestRecord>,
+  tests: List<SelectedTest>,
   effects: Map<Bytes, Bool>,
   records: List<Bytes>,
+  filtered_out: Int,
 }
 
 pub type TestReading = { listing: TestListing, later: LaterChecks, schema: Option<Diagnostic> }
 
-pub fn selected_listing(list: TestList, identities: Map<Bytes, TestIdentity>) -> TestListing =
+pub type Selection = { tests: List<ListedTest>, filtered_out: Int }
+
+pub fn listing_of<| e>(
+  list: TestList,
+  selection: Selection,
+  identity: (TestInfo) -> TestIdentity / e,
+) -> TestListing / e =
   {
     root: list.root,
     names: list.names,
-    tests: list.tests.map(|t: ListedTest|
-      { info: t.info, label: t.label, identity: identities.get(t.info.key) }),
+    tests: range(0, selection.tests.len()).map(|i: Int| {
+      let t = selection.tests.get(i);
+      { info: { ..t.info, index: i }, label: t.label, identity: identity(t.info) }
+    }),
     effects: list.effects,
     records: list.records,
+    filtered_out: selection.filtered_out,
   }
 
-pub fn test_at(listing: TestListing, i: Int) -> Option<TestRecord> = listing.tests.at(i)
+pub fn stored_identity(info: TestInfo) -> TestIdentity / {memo.read, abort.raise} = {
+  let identified = |subject: Identified|
+    match identity_of({ module: info.module, shipped: false, tested: false, subject: subject }) {
+      Some(identity) -> identity,
+      None ->
+        panic(
+          "the checker listed the test `" ++ String::of_bytes_lossy(info.key)
+            ++ "`, but its module holds no identity for it",
+        ),
+    };
+  let run = identified(TestRun(info.key));
+  if info.cases { OverCases({ run: run, listing: identified(forms::TestListing(info.key)) }) }
+  else { PlainRun(run) }
+}
 
-pub fn run_hash(t: TestRecord) -> Option<Bytes> = t.identity.map(|x: TestIdentity| x.run)
+pub fn run_of(identity: TestIdentity) -> Bytes =
+  match identity { PlainRun(run) -> run, OverCases(o) -> o.run, CaseOf(c) -> c.run }
+
+pub fn run_hash(t: SelectedTest) -> Bytes = run_of(t.identity)
+
+pub fn test_at(listing: TestListing, i: Int) -> Option<SelectedTest> = listing.tests.at(i)
 
 pub fn hash_at(listing: TestListing, i: Int) -> Option<String> / {abort.raise} =
-  match test_at(listing, i) {
-    Some(t) -> match run_hash(t) { Some(h) -> Some(h.hex_of()), None -> None },
-    None -> None,
-  }
+  test_at(listing, i).map(|t: SelectedTest| run_hash(t).hex_of())
 
 pub fn test_root_at(listing: TestListing, i: Int) -> Option<RootKey> / {abort.raise} =
   match test_at(listing, i) { Some(t) -> Some(test_key(t.info.module, t.info.name)), None -> None }
 
-pub fn infos_of(listing: TestListing) -> List<TestInfo> = listing.tests.map(|t: TestRecord| t.info)
+pub fn infos_of(listing: TestListing) -> List<TestInfo> = listing.tests.map(|t: SelectedTest| t.info)
 
 pub fn roots_of_tests(listing: TestListing) -> List<RootKey> / {abort.raise} =
-  listing.tests.fold([], |found: List<RootKey>, t: TestRecord|
+  listing.tests.fold([], |found: List<RootKey>, t: SelectedTest|
     found.concat(test_roots(t.info.module, t.info.name, t.info.cases)))
 
-pub fn listing_of_program(w: ProgramListing) -> TestListing / {abort.raise} =
-  selected_listing(
-    test_list(
-      w.root,
-      w.outlines.map(|o: Outline| o.name),
-      w.checked.tests,
-      test_labels(w.outlines),
-      w.checked.effects.fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
-        found.insert(e.name, e.nondet)),
-      w.modules.map(|m: ModuleHashes| m.record),
-    ),
-    w.hashes.tests.fold(Map::new(), |found: Map<Bytes, TestIdentity>, key: Bytes, run: Bytes|
-      found.insert(key, { run: run, listing: of_key(w.hashes.listing_hashes, key) })),
+pub fn test_list_of_program(w: ProgramListing) -> TestList / {abort.raise} =
+  test_list(
+    w.root,
+    w.outlines.map(|o: Outline| o.name),
+    w.checked.tests,
+    test_labels(w.outlines),
+    w.checked.effects.fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
+      found.insert(e.name, e.nondet)),
+    w.modules.map(|m: ModuleHashes| m.record),
   )
+
+pub fn in_run(list: TestList, t: ListedTest) -> Bool = t.info.at.module < list.root
+
+pub fn listing_of_program(w: ProgramListing) -> TestListing / {abort.raise} = {
+  let list = test_list_of_program(w);
+  let identity = |info: TestInfo| {
+    let run = of_key(w.hashes.tests, info.key);
+    if info.cases { OverCases({ run: run, listing: of_key(w.hashes.listing_hashes, info.key) }) }
+    else { PlainRun(run) }
+  };
+  listing_of(
+    list,
+    { tests: list.tests.filter(|t: ListedTest| in_run(list, t)), filtered_out: 0 },
+    identity,
+  )
+}
 
 pub fn sources_named(names: List<Bytes>, places: List<SourceText>) -> List<Source> / {abort.raise} =
   range(0, names.len()).map(|i: Int|
@@ -129,18 +165,17 @@ test "only a test over cases has a root that lists its cases" {
     at: { module: 0, span: generated_span },
   };
   let over_cases = { ..plain, name: b"over", key: b"m.over", cases: true };
-  let listing = selected_listing(
-    test_list(
-      1,
-      [b"m"],
-      [plain, over_cases],
-      [plain, over_cases].fold(Map::new(), |found: Map<Bytes, Location>, t: TestInfo|
-        found.insert(t.key, t.at)),
-      Map::new(),
-      [],
-    ),
+  let list = test_list(
+    1,
+    [b"m"],
+    [plain, over_cases],
+    [plain, over_cases].fold(Map::new(), |found: Map<Bytes, Location>, t: TestInfo|
+      found.insert(t.key, t.at)),
     Map::new(),
+    [],
   );
+  let listing = listing_of(list, { tests: list.tests, filtered_out: 0 }, |info: TestInfo|
+    if info.cases { OverCases({ run: b"r", listing: b"l" }) } else { PlainRun(b"r") });
   let run = test_key(b"m", b"over");
   assert_eq(
     roots_of_tests(listing).map(|k: RootKey| root_text(root_name(k))),

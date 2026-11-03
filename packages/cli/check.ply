@@ -1,6 +1,6 @@
 import progress (progress)
 import progress
-import sources (ProjectFiles, File, load_resolved)
+import sources (ProjectFiles, Project, load_resolved)
 import std.set (Set)
 import compiler.codes (hole_code)
 import compiler.load (Derives)
@@ -16,13 +16,12 @@ import literals (evaluation, site_errors)
 import units (EmbeddedFiles)
 import diagnostic (SourceText, all_to_json, to_text)
 import program (Phases, Refusal, Session, ModuleReport, module_reports, definitions_in_order,
-                own_tests, location_of, places_of, session, session_over)
+                own_tests, location_of, places_of, placed_fixes, session_over)
 import paths (write_file)
-import fixes (change_lines, changes_json)
+import fixes (FixedFile, change_lines, changes_json)
 import fixes
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
-import compiler.front.checking.world (Modules)
 import compiler.front.checking.world (Modules)
 import module_queries (LaterChecks, later_checks)
 import compiler.store.memo (memo)
@@ -681,21 +680,24 @@ fn check_output(
   }
 }
 
+type CheckRun = { output: CommandOutput, reported: List<Diagnostic> }
+
 fn with_later_checks(
   style: Style,
   flags: Flags,
   reported: Reported,
   s: Session<CheckReading>,
   later: LaterChecks,
-) -> CommandOutput / {cost_checker.report, evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} = {
+) -> CheckRun / {cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} = {
   let promised = s.summary.promises;
   let promises = promises_read(s, later.facts, promised || flags.costs);
   let unkept = if promised || promises.unproved.len() > 0 { promise_errors(promises) }
   else { match promises.report { Some(r) -> if r.ok { [] } else { [unresolved] }, None -> [] } };
   let broken = if unkept.len() > 0 { unkept }
   else { site_errors(s, later.reading, reported.places) };
-  if broken.len() > 0 { rejected(style, "check", broken, reported.places) }
-  else { check_output(style, flags, reported, promises) }
+  if broken.len() > 0 {
+    { output: rejected(style, "check", broken, reported.places), reported: broken }
+  } else { { output: check_output(style, flags, reported, promises), reported: reported.warnings } }
 }
 
 fn refused_output(flags: Flags, r: Refusal) -> CommandOutput / {abort.raise} = {
@@ -744,39 +746,26 @@ fn reported_of(s: Session<CheckReading>) -> Reported / {fs.read_file[shipped]} =
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} =
-  if flags.fix { fixed_run(flags) } else { checked(flags) }
-
-fn fixed_run(
-  flags: Flags,
-) -> CommandOutput / {process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let project = load_resolved(flags.paths);
-  let found = match progress::silently(||
-      session_over(
-        flags.paths,
-        project,
-        time.elapsed_ms(),
-        flags.verify_dependencies,
-        |_: Modules, _: ProgramSummary| (),
-      )) {
-    Err(r) -> r.diagnostics,
-    Ok(s) -> s.warnings,
-  };
-  let result = fixes::fixed(project.files.map(|file: File| file.text), found);
-  let unwritten = range(0, project.files.len()).fold([], |errors: List<String>, i: Int| {
-    let file = project.files.get(i);
-    let text = result.texts.get(i);
-    if text == file.text || write_file(file.at, text) { errors }
-    else { errors.push("error: " ++ file.path ++ ": could not write") }
-  });
-  let places = project.files.map(|file: File| { path: file.path, text: file.text });
-  let output = checked(flags);
+  if flags.fix { check_and_fix(flags, project) } else { checked(flags, project).output }
+}
+
+fn check_and_fix(
+  flags: Flags,
+  project: Project,
+) -> CommandOutput / {process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let result = fixes::fixed(placed_fixes(project, checked(flags, project).reported));
+  let unwritten = result.files.fold([], |errors: List<String>, f: FixedFile|
+    if write_file(f.file.at, f.text) { errors }
+    else { errors.push("error: " ++ f.file.path ++ ": could not write") });
+  let output = checked(flags, load_resolved(flags.paths)).output;
   {
     json: match output.json {
-      Object(members) -> Object(members.insert("fixed", changes_json(places, result.applied))),
+      Object(members) -> Object(members.insert("fixed", changes_json(result.applied))),
       other -> other,
     },
-    lines: change_lines(places, result.applied).concat(output.lines),
+    lines: change_lines(result.applied).concat(output.lines),
     errs: output.errs.concat(unwritten),
     code: if unwritten.len() == 0 { output.code } else { compile_error },
   }
@@ -784,15 +773,25 @@ fn fixed_run(
 
 fn checked(
   flags: Flags,
-) -> CommandOutput / {process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} =
+  project: Project,
+) -> CheckRun / {process.err[proc], shipped.read_pack, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, shipped.report_view_used} =
   match progress::reporting("checking", ||
-      session(flags.paths, flags.verify_dependencies, |modules: Modules, read: ProgramSummary|
-        check_reading(flags, modules, read))) {
-    Err(r) -> refused_output(flags, r),
+      session_over(
+        flags.paths,
+        project,
+        time.elapsed_ms(),
+        flags.verify_dependencies,
+        |modules: Modules, read: ProgramSummary| check_reading(flags, modules, read),
+      )) {
+    Err(r) -> { output: refused_output(flags, r), reported: r.diagnostics },
     Ok(s) -> {
       let reported = reported_of(s);
       match s.value.later {
-        None -> check_output(style_of(flags), flags, reported, no_promises),
+        None ->
+          {
+            output: check_output(style_of(flags), flags, reported, no_promises),
+            reported: s.warnings,
+          },
         Some(later) -> with_later_checks(style_of(flags), flags, reported, s, later),
       }
     },

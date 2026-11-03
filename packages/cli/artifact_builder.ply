@@ -1,6 +1,5 @@
 import std.set (Set)
 import compiler.codes (internal_error_code)
-import compiler.front.emitter_input (no_module_span)
 import builder (Rejection)
 import entries
 import entries (Runnable, runnable_bin)
@@ -12,10 +11,10 @@ import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected, RootPlace, checked_program_of)
 import compiler.front.facts (ProgramListing, listing_of)
 import compiler.front.published (analyse)
-import compiler.front.rows (DeclaredEffect, ModuleSpan)
+import compiler.front.rows (DeclaredEffect)
 import compiler.store.hash.forms (ClosureEntry, HashOutput, by_name, build_closure, walk,
                                   definition_key)
-import compiler.store.hash.graph (HeldKind, HeldType, HeldValue)
+import compiler.store.hash.graph (HeldEffect, HeldKind, HeldType, HeldValue)
 import compiler.store.hash.printer (Printed, Unprintable, PrintedDefinition, print_bodies)
 import compiler.store.hash (body_key)
 import compiler.store.hash.encoding (hex)
@@ -25,7 +24,7 @@ import compiler.store.plyx (Header, SectionLocation, Section, decode, digest_of,
 import compiler.store.segments (read_u32)
 import compiler.check.infer.checker (DefinitionInfo)
 import compiler.check.types (Effect, effect_list_text)
-import compiler.check.resolve.tables (Diagnostic, error_at, qualify)
+import compiler.check.resolve.tables (Diagnostic, Unplaced, error_unplaced, qualify)
 import compiler.unit (compiler_roots, identity_of, shipped)
 import compiler.emit.abi (Native)
 import compiler.emit.print.unit_header (bound_functions)
@@ -36,7 +35,6 @@ import std.gzip
 import std.hash (blake3)
 import std.list
 import std.string
-import compiler.syntax.parsing (no_module, generated_span, Span)
 
 pub type Named = { name: String, hash: String }
 
@@ -104,8 +102,6 @@ pub fn with_library_units<a | e>(
 ) -> a / {abort.raise, emit.code, fs.read[cwd], fs.read[abs], shipped.runtime, shipped.definitions | e} =
   handle { body() } with { artifacts.unit(program, names) -> library_unit(program, names) }
 
-const no_span: Span = generated_span
-
 fn short(hash: Bytes) -> String / {abort.raise} = hash.hex_of().slice(0, 12)
 
 fn short_digest(d: Bytes) -> String / {abort.raise} = digest_text(d).slice(0, 15)
@@ -113,30 +109,24 @@ fn short_digest(d: Bytes) -> String / {abort.raise} = digest_text(d).slice(0, 15
 fn rejection(diagnostics: List<Diagnostic>) -> Rejection = { diagnostics: diagnostics, places: [] }
 
 fn internal_error(message: String, notes: List<Bytes>) -> Diagnostic =
-  error_at(
+  error_unplaced(
     internal_error_code,
-    no_module,
-    no_span,
     Bytes::of_string(message),
     b"this is Ply's fault, not the program's",
     notes.push(b"nothing was built"),
   )
 
 fn invalid_artifact(path: String, message: String, notes: List<Bytes>) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0443",
-    no_module,
-    no_span,
     Bytes::of_string(message),
     Bytes::of_string("in `" ++ path ++ "`"),
     notes.push(b"rebuild it with `ply build`, or transfer the file again"),
   )
 
 fn version_mismatch(path: String, message: String) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0444",
-    no_module,
-    no_span,
     Bytes::of_string(message),
     Bytes::of_string("in `" ++ path ++ "`"),
     [b"rebuild the artifact with this `ply`; re-transferring it will not help"],
@@ -212,10 +202,8 @@ fn joined_names(names: List<Bytes>) -> Bytes =
     })
 
 fn no_body(absent: List<Bytes>) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0443",
-    no_module,
-    no_span,
     Bytes::of_string(
       absent.len().to_string()
         ++ " of the entry point's definitions are missing their compiled code",
@@ -225,10 +213,8 @@ fn no_body(absent: List<Bytes>) -> Diagnostic =
   )
 
 fn unhashed(name: Bytes) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0443",
-    no_module,
-    no_span,
     Bytes::concat_all([b"`", name, b"` has no definition hash, so nothing could be built from it"]),
     b"this entry point was not hashed",
     [],
@@ -254,7 +240,7 @@ fn printed_files(
       let m = module_of(x.reference.name);
       if shipped_names.contains(m) { accumulator.insert(m) } else { accumulator }
     },
-  ).keys(
+  ).elements(
   );
   match print_bodies(
       pairs_of(closure_entries).fold([], |found: List<PrintedDefinition>, pair: NamedHash|
@@ -283,7 +269,7 @@ fn printed_files(
 
 fn names_of_pairs(pairs: List<NamedHash>) -> List<Bytes> =
   pairs.fold(Set::empty(), |accumulator: Set<Bytes>, pair: NamedHash|
-    accumulator.insert(pair.name)).keys(
+    accumulator.insert(pair.name)).elements(
   )
 
 fn closures_of(closure_entries: List<ClosureEntry>) -> List<Dependencies> / {abort.raise} = {
@@ -298,7 +284,7 @@ fn closures_of(closure_entries: List<ClosureEntry>) -> List<Dependencies> / {abo
           accumulator.insert(definition_key(x.reference.name, x.reference.kind), {
             name: String::of_bytes(x.reference.name),
             dependencies: walk(edges, [i]).fold(Set::empty(), |seen: Set<Bytes>, j: Int|
-              seen.insert(name_at(j))).keys(
+              seen.insert(name_at(j))).elements(
             ).map(
               String::of_bytes,
             ),
@@ -443,8 +429,8 @@ fn closure_unit(
   let modules = closure.fold(Set::empty(), |found: Set<Bytes>, x: ClosureEntry|
     found.insert(module_of(x.reference.name)));
   units::whole_text(
-    { ..program, modules: modules.keys().len() },
-    names.keys().map(|n: Bytes| keys::Named(n)),
+    { ..program, modules: modules.size() },
+    names.elements().map(|n: Bytes| keys::Named(n)),
   )
 }
 
@@ -457,13 +443,13 @@ fn closure_runnable(
   {
     roots: whole.roots.fold(Map::new(), |found: Map<Bytes, RootPlace>, r: RootPlace|
       if keys::definition_of_root(r.key).map(|n: Bytes| reached.contains(n)) == Some(true) {
-        found.insert(r.root, { ..r, at: no_module_span })
+        found.insert(r.root, { ..r, at: Unplaced })
       } else { found }).values(
     ),
     declared: whole.declared.fold(
       Map::new(),
       |found: Map<Bytes, DeclaredEffect>, e: DeclaredEffect|
-        if reached.contains(e.name) { found.insert(e.name, { ..e, at: no_module_span }) }
+        if reached.contains(e.name) { found.insert(e.name, { ..e, at: Unplaced }) }
         else { found },
     ).values(
     ),
@@ -881,10 +867,10 @@ test "`pairs_of` returns a name and hash pair for both a function and a declarat
 
 test "`closures_of` lists the definitions each stored definition depends on, treating an effect declaration and a function of the same name as separate" {
   let closure_entries = [
-    closure_entry(b"m.main", false, b"\x01", [1]),
-    closure_entry(b"m.gz", true, b"\x02", []),
-    closure_entry(b"m.gz", false, b"\x03", [3]),
-    closure_entry(b"m.written", false, b"\x04", []),
+    closure_entry(b"m.main", HeldValue, b"\x01", [1]),
+    closure_entry(b"m.gz", HeldEffect, b"\x02", []),
+    closure_entry(b"m.gz", HeldValue, b"\x03", [3]),
+    closure_entry(b"m.written", HeldValue, b"\x04", []),
   ];
   assert_eq(closures_of(closure_entries), [
     { name: "m.gz", dependencies: ["m.gz"] },
@@ -892,16 +878,6 @@ test "`closures_of` lists the definitions each stored definition depends on, tre
     { name: "m.main", dependencies: ["m.gz", "m.main"] },
     { name: "m.written", dependencies: ["m.written"] },
   ])
-}
-
-test "a function and an effect of one name each say whether their module exports them" {
-  let exports = {
-    functions: Map::new().insert(b"m.gz", false),
-    declarations: Map::new().insert(b"m.gz"),
-  };
-  assert(exported(exports, closure_entry(b"m.gz", true, b"\x02", [])));
-  assert(!exported(exports, closure_entry(b"m.gz", false, b"\x03", [])));
-  assert(exported(exports, closure_entry(b"abort", true, b"\x07", [])))
 }
 
 test "`named_sections` stores each distinct name's text once, and every record with that name refers to that text" {
