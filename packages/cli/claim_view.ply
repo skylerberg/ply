@@ -2,10 +2,12 @@ import progress
 import std.set (Set)
 import compiler.check.resolve.tables (Place, InSource, WholeFile, Unplaced, in_module, place_module,
                                       source_span)
-import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (Analysis, analysis_identities)
 import compiler.front.exports (ItemAt)
-import compiler.front.checking (LoadInputs, read_over, analysed_over)
+import compiler.front.checking (LoadInputs, InMemory, in_memory, read_over, lowered_over)
+import compiler.front.checking.units (with_code_reads)
+import compiler.emit.emit_harness (accepted_session)
+import compiler.emit.representations (code_facts)
 import compiler.front.checking.promises (ClaimsProgram, ClaimsAnalysed, ClaimsRejected,
                                          PlacedModule, claims_analysed)
 import compiler.check.resolve.tables (placed_in)
@@ -14,9 +16,10 @@ import compiler.check.resolve.tables (Source, Diagnostic, Edit, Label, ParsedMod
 import compiler.store.hash.forms (Identities)
 import compiler.emit.costs (placed_span)
 import compiler.syntax.parsing (span_between)
-import compiler.check.infer.checker (DefinitionInfo)
+import compiler.check.infer.checker (DefinitionInfo, elsewhere)
 import claims (Claim, ClaimPlace, ClaimsEntry, Collection, DischargeResult, NotCompiled, OwnClaims,
-               PendingClaim, Rejection, StaticProver, claim_bin, discharge_library, discharging,
+               PendingClaim, Rejection, StaticProver, WantedClaim, claim_bin, discharge_library,
+               discharging,
                lacks_proof, laws_by_key, evidence_keys, no_static_prover, own_claims, proof_store,
                static_prover_of)
 import compiler.front.checking.view
@@ -59,7 +62,7 @@ pub fn discharge_claims(
       discharge_library(program, laws_by_key(s.value.later.rollup.laws), collection, pending),
   }
 
-pub type ClaimedProgram = { mine: OwnClaims, statics: StaticProver }
+pub type ClaimedProgram<| e> = { mine: OwnClaims, statics: StaticProver<| e> }
 
 pub type ModuleClaims = {
   claims: List<Claim>,
@@ -267,12 +270,13 @@ fn claims_of_program(
   }
 }
 
-fn claimed_with_view(
+fn claimed_with_view<| e>(
   c: ClaimClosure,
   names: List<Bytes>,
   known: List<KnownModule>,
   open: List<KnownModule>,
-) -> Result<ClaimedProgram, List<Diagnostic>> / {proof_store.record_claims, abort.raise} = {
+  in_session: keep (() -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}) -> List<WantedClaim> / {abort.raise | e},
+) -> Result<ClaimedProgram<| e>, List<Diagnostic>> / {proof_store.record_claims, abort.raise} = {
   let w = c.analysis;
   let owned = |m: Bytes| names.contains(m);
   let built = prover_input_of(w, c.identities, owned);
@@ -306,7 +310,7 @@ fn claimed_with_view(
   let mine = claims_of_program(names, built.world, current, pairs);
   Ok({
     mine: { ..mine, warnings: mine.warnings.concat(store_warnings) },
-    statics: static_prover_of(w, mine.world, owned),
+    statics: static_prover_of(w, mine.world, owned, in_session),
   })
 }
 
@@ -316,7 +320,8 @@ pub fn claimed_modules<| e>(
   inputs: ClaimInputs,
   every_module: Bool,
   closure: (List<Bytes>) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise | e},
-) -> Result<ClaimedProgram, List<Diagnostic>> / {shipped.definitions, proof_store.module_claims, proof_store.record_claims, proof_store.cached, abort.raise | e} = {
+  in_session: keep (() -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}) -> List<WantedClaim> / {abort.raise | e},
+) -> Result<ClaimedProgram<| e>, List<Diagnostic>> / {shipped.definitions, proof_store.module_claims, proof_store.record_claims, proof_store.cached, abort.raise | e} = {
   let identity = identity_of(shipped.definitions(), [b"claims.own_claims"]);
   let known = range(0, inputs.names.len()).map(|i: Int| known_module(identity, inputs, i));
   let open = known.filter(|k: KnownModule| wants_view(k, every_module));
@@ -334,7 +339,7 @@ pub fn claimed_modules<| e>(
   } else {
     match closure(open.map(|k: KnownModule| k.name)) {
       Err(diagnostics) -> Err(diagnostics),
-      Ok(c) -> claimed_with_view(c, inputs.names, known, open),
+      Ok(c) -> claimed_with_view(c, inputs.names, known, open, in_session),
     }
   }
 }
@@ -370,6 +375,13 @@ pub fn claims_closure(
     s.modules.own.take(s.modules.root),
   )
 
+pub fn proving_in_store(
+  s: Session<ClaimReading>,
+) -> (() -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}) -> List<WantedClaim> / {ProgramStore, abort.raise} =
+  |work: () -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}|
+    progress::silently(||
+      in_program_store(s.place, |_: LoadInputs| with_code_reads(true, work))).value
+
 fn closure_over(
   sources: List<Source>,
   open: List<Bytes>,
@@ -379,12 +391,6 @@ fn closure_over(
       claims_analysed(open.map(|m: Bytes| { module: m, shipped: false, tested: true }))),
     sources.map(|s: Source| s.name),
   )
-
-fn whole_analysis(sources: List<Source>) -> Analysis / {abort.raise} =
-  match analysed_over(sources) {
-    Analysed(w) -> w,
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-  }
 
 const claimed_sources: List<Source> =
   [
@@ -402,7 +408,11 @@ const claimed_sources: List<Source> =
 fn claim_keys(w: Analysis, identities: Identities) -> List<String> / {abort.raise} =
   prover_input_of(w, identities, |m: Bytes| true).world.obligations.map(|o: Obligation| o.key)
 
-fn proved_claims(w: Analysis, identities: Identities) -> List<String> / {abort.raise} = {
+fn proved_claims(
+  program: InMemory,
+  w: Analysis,
+  identities: Identities,
+) -> List<String> / {abort.raise} = {
   let owned = |m: Bytes| [b"app", b"lib", b"other"].contains(m);
   let world = prover_input_of(w, identities, owned).world;
   let p = prover_of(
@@ -410,22 +420,24 @@ fn proved_claims(w: Analysis, identities: Identities) -> List<String> / {abort.r
     world,
     default_prove_budget,
   );
-  world.obligations.filter(|o: Obligation|
-    match diagnosis_of(p, o) {
-      Some(d) -> match d.decision { Proved(_) -> true, _ -> false },
-      None -> false,
-    }).map(|o: Obligation| o.owner)
+  lowered_over(program, ||
+    world.obligations.filter(|o: Obligation|
+      match diagnosis_of(p, o) {
+        Some(d) -> match d.decision { Proved(_) -> true, _ -> false },
+        None -> false,
+      }).map(|o: Obligation| o.owner))
 }
 
 test "the claims of the open modules, checked by group, are the claims of the whole program and prove the same" {
-  let whole = whole_analysis(claimed_sources);
-  let identities = analysis_identities(whole);
+  let whole = accepted_session(claimed_sources);
+  let identities = analysis_identities(whole.analysis);
   match closure_over(claimed_sources, [b"app", b"lib", b"other"]) {
     Err(_) -> panic("the claims of a checked program were rejected"),
     Ok(c) -> {
-      assert_eq(claim_keys(c.analysis, c.identities), claim_keys(whole, identities));
-      assert(proved_claims(whole, identities).contains("app.four"));
-      assert_eq(proved_claims(c.analysis, c.identities), proved_claims(whole, identities));
+      assert_eq(claim_keys(c.analysis, c.identities), claim_keys(whole.analysis, identities));
+      let proved = proved_claims(whole.program, whole.analysis, identities);
+      assert(proved.contains("app.four"));
+      assert_eq(proved_claims(whole.program, c.analysis, c.identities), proved);
       assert_eq(c.analysis.modules.map(|m: ParsedModule| m.name).take(3), [
         b"app",
         b"lib",
@@ -499,7 +511,7 @@ fn modules_with_claims(size: Int, edited: Bytes) -> List<Source> =
 
 type RecordedClaims = {
   written: Map<Bytes, ClaimsEntry>,
-  claimed: Result<ClaimedProgram, List<Diagnostic>>,
+  claimed: Result<ClaimedProgram<| {}>, List<Diagnostic>>,
 }
 
 fn claimed_over(
@@ -512,7 +524,13 @@ fn claimed_over(
     texts: sources.map(|s: Source| s.source_text.blake3()),
   };
   handle {
-    claimed_modules(inputs, false, |open: List<Bytes>| closure_over(sources, open))
+    claimed_modules(
+      inputs,
+      false,
+      |open: List<Bytes>| closure_over(sources, open),
+      |work: () -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}|
+        lowered_over(in_memory(sources), work),
+    )
   } with {
     var written = Map::new(),
     shipped.definitions() -> b"claims.own_claims 00\n",

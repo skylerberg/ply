@@ -23,7 +23,8 @@ import compiler.front.rows (LawRow)
 import compiler.emit.keys as root_keys
 import compiler.emit.keys (Clause, ClauseKind, LawBody, LawGuard, LawPart, Named, Requires, RootKey,
                            law_key, root_name, root_text)
-import compiler.check.infer.checker (DefinitionInfo)
+import compiler.check.infer.checker (DefinitionInfo, elsewhere)
+import compiler.emit.representations (code_facts)
 import compiler.cc
 import compiler.check.resolve.tables (Diagnostic, InSource, Place, error_with_labels, place_bin)
 import signature (provenance)
@@ -202,24 +203,24 @@ pub type StaticProverResult = {
 
 pub type StaticAnswer = { resolved: StaticResult, diagnosis: Option<StaticProverResult> }
 
-pub type StaticProver = {
-  result: (List<LookedUp>, Bool, Int) -> List<WantedClaim> / {abort.raise},
-}
+pub type StaticProver<| e> =
+  (List<LookedUp>, Bool, Int) -> List<WantedClaim> / {abort.raise | e}
 
 const unattempted: StaticAnswer = { resolved: not_attempted, diagnosis: None }
 
-pub fn static_prover_of(
+pub fn static_prover_of<| e>(
   analysis: Analysis,
   world: ProverInput,
   owned: keep (Bytes) -> Bool,
-) -> StaticProver =
-  {
-    result: |looked: List<LookedUp>, static_prover: Bool, budget: Int| {
-      let obligations = somes(
-        looked.map(|c: LookedUp|
-          if static_prover || uncached(c.cached) { c.obligation } else { None }),
-      );
-      if obligations.len() == 0 { looked.map(|c: LookedUp| answered(c, unattempted)) } else {
+  in_session: keep (() -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}) -> List<WantedClaim> / {abort.raise | e},
+) -> StaticProver<| e> =
+  |looked: List<LookedUp>, static_prover: Bool, budget: Int| {
+    let obligations = somes(
+      looked.map(|c: LookedUp|
+        if static_prover || uncached(c.cached) { c.obligation } else { None }),
+    );
+    if obligations.len() == 0 { looked.map(|c: LookedUp| answered(c, unattempted)) } else {
+      in_session(|| {
         let p: Prover = prover_of(
           claims_for(analysis, modules_of(analysis, obligations), owned),
           world,
@@ -237,15 +238,13 @@ pub fn static_prover_of(
             } else if uncached(c.cached) { { resolved: static_result(p, o), diagnosis: None } }
             else { unattempted },
           }))
-      }
-    },
+      })
+    }
   }
 
-pub fn no_static_prover(static_prover: Option<StaticProverResult>) -> StaticProver =
-  {
-    result: |looked: List<LookedUp>, include_results: Bool, budget: Int|
-      looked.map(|c: LookedUp| answered(c, { resolved: not_attempted, diagnosis: static_prover })),
-  }
+pub fn no_static_prover<| e>(static_prover: Option<StaticProverResult>) -> StaticProver<| e> =
+  |looked: List<LookedUp>, include_results: Bool, budget: Int|
+    looked.map(|c: LookedUp| answered(c, { resolved: not_attempted, diagnosis: static_prover }))
 
 fn static_prover_result_of(d: Diagnosis) -> StaticProverResult =
   {
@@ -521,7 +520,7 @@ fn proof_record(decided: DecidedClaim) -> Option<{ key: String, evidence: Bytes 
 pub fn decide_claims<| e>(
   collection: Collection,
   wanted: List<Claim>,
-  statics: StaticProver,
+  statics: StaticProver<| e>,
   static_prover: Bool,
   discharge: (List<PendingClaim>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
 ) -> Result<Verdicts, Rejection> / {abort.raise, proof_store.cached, proof_store.record, decisions.known | e} = {
@@ -531,7 +530,7 @@ pub fn decide_claims<| e>(
   );
   let looked = wanted.fold([], |found: List<LookedUp>, claim: Claim|
     found.push(looked_up(found.len(), claim, obligations.get(claim.key))));
-  let claims = (statics.result)(looked, static_prover, collection.plan.prove_budget);
+  let claims = statics(looked, static_prover, collection.plan.prove_budget);
   claims.fold((), |_: Unit, c: WantedClaim|
     match c.cached { Some(o) -> decisions.known(row_of(c, o)), None -> () });
   let ran = handle {
