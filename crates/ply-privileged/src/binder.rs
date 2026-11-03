@@ -5,7 +5,6 @@ use ply_core::Diagnostic;
 use ply_core::host::HostBinding;
 use ply_host::observe::Recorder;
 use ply_host::tls;
-use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -77,10 +76,6 @@ impl ply_compiled::entry::Binder for Binder {
             w.str(s.name());
         });
     }
-
-    fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String> {
-        ply_host::observe::moved(trace, &GrantedContext::of(grants).world(), caller)
-    }
 }
 
 fn credentials_of(grants: &Grants) -> Result<tls::Credentials, Vec<Diagnostic>> {
@@ -149,7 +144,6 @@ impl Bound for Borrowed {
 struct GrantedContext {
     roots: Vec<(String, PathBuf)>,
     binding: String,
-    config: BTreeMap<String, String>,
 }
 
 impl GrantedContext {
@@ -162,16 +156,9 @@ impl GrantedContext {
                     .collect()
             })
             .unwrap_or_default();
-        let config = (grants.named("config"))
-            .filter_map(|fields| match fields {
-                [key, value, kind] if kind == "plain" => Some((key.clone(), value.clone())),
-                _ => None,
-            })
-            .collect();
         GrantedContext {
             roots,
             binding: binding_digest(grants),
-            config,
         }
     }
 
@@ -179,7 +166,6 @@ impl GrantedContext {
         ply_host::observe::World {
             roots: &self.roots,
             binding: self.binding.clone(),
-            config: &self.config,
             binary: ply_host::observe::Binary {
                 shipped: &crate::shipped::module_digest,
                 program: crate::shipped::program_digest(),

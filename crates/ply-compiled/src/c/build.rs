@@ -209,13 +209,15 @@ fn finish_units(libraries: Vec<Library>) -> Result<Native> {
     for (unit, helpers) in units.iter().zip(bound) {
         bind(unit, helpers, &functions);
     }
-    let mut roots: Vec<(u64, Symbol)> = (units.iter())
-        .flat_map(|unit| unit.taken().iter())
-        .map(|row| (root_id(row.name()), Symbol::new(row.name())))
+    let mut sites: Vec<&Symbol> = (exports.iter()).flat_map(|said| &said.sites).collect();
+    sites.sort();
+    sites.dedup();
+    let mut roots: Vec<(u64, Symbol)> = (sites.into_iter())
+        .map(|site| (root_id(site.as_str()), site.clone()))
         .collect();
     roots.sort_by_key(|(id, _)| *id);
     if roots.windows(2).any(|w| w[0].0 == w[1].0) {
-        bail!("two roots of this unit share a site id");
+        bail!("two sites of this program share a site id");
     }
     let roots = (roots.into_iter().enumerate())
         .map(|(at, (id, name))| Root {

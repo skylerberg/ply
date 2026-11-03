@@ -37,9 +37,12 @@ pub struct Exports {
     pub modules: usize,
     pub fields: Vec<Symbol>,
     pub entered: Vec<String>,
+    pub sites: Vec<Symbol>,
 }
 
 pub const ENTERED: &str = "entered ";
+
+pub const SITE: &str = "site ";
 
 impl Exports {
     pub fn bound(&self) -> Result<Vec<*mut std::ffi::c_void>, RuntimeMismatch> {
@@ -94,6 +97,9 @@ impl Exports {
         for root in &self.entered {
             out.push_str(&format!("{ENTERED}{root}\n"));
         }
+        for site in &self.sites {
+            out.push_str(&format!("{SITE}{site}\n"));
+        }
         out
     }
 
@@ -132,9 +138,13 @@ impl Exports {
         }
         let fields = decode_fields(s, &mut at)?;
         let mut entered = Vec::new();
+        let mut sites = Vec::new();
         while at < s.len() {
-            if let Some(root) = line(s, &mut at)?.strip_prefix(ENTERED) {
+            let said = line(s, &mut at)?;
+            if let Some(root) = said.strip_prefix(ENTERED) {
                 entered.push(root.to_string());
+            } else if let Some(site) = said.strip_prefix(SITE) {
+                sites.push(Symbol::new(site));
             }
         }
         Some(Exports {
@@ -143,6 +153,7 @@ impl Exports {
             modules,
             fields,
             entered,
+            sites,
         })
     }
 

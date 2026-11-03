@@ -155,6 +155,7 @@ pub fn exports_of(defs: &[Def]) -> Laid {
             modules: 1,
             fields: Vec::new(),
             entered: Vec::new(),
+            sites: Vec::new(),
         },
         lambdas: Vec::new(),
         taken: defs
