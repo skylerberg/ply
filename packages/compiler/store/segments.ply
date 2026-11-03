@@ -1,3 +1,4 @@
+import std.set (Set)
 import std.fs
 import std.fs (fs)
 import std.hash (checksum)
@@ -534,12 +535,39 @@ pub fn sweep<[r]>(
     } else { true });
   if !running {
     let own = manifest_name(schema);
-    let listed_segments = manifest[r](dir, schema).segments.map(|s: Segment| segment_name(s.token));
+    let previous = previous_manifest[r](dir, names, own);
+    let kept_manifests = match previous { Some(p) -> [own, p.name], None -> [own] };
+    let kept_segments = manifest[r](dir, schema).segments.concat(match previous {
+      Some(p) -> p.manifest.segments,
+      None -> [],
+    }).map(|s: Segment| segment_name(s.token));
     names.fold((), |_: Unit, name: String|
-      if (name.starts_with("manifest-") && name != own)
-          || (name.starts_with("seg-") && !listed_segments.contains(name)) { removed(name) })
+      if (name.starts_with("manifest-") && !kept_manifests.contains(name))
+          || (name.starts_with("seg-") && !kept_segments.contains(name)) { removed(name) })
   }
 }
+
+type PreviousManifest = { name: String, manifest: Manifest, modified: Int }
+
+fn previous_manifest<[r]>(
+  dir: String,
+  names: List<String>,
+  own: String,
+) -> Option<PreviousManifest> / {fs.read[r], abort.raise} =
+  names.fold(None, |newest: Option<PreviousManifest>, name: String|
+    if !name.starts_with("manifest-") || name == own || name.len() != own.len() { newest } else {
+      match ((fs.read_file[r](dir ++ "/" ++ name), fs.modified_ms[r](dir ++ "/" ++ name))) {
+        (Some(bytes), Some(modified)) -> match manifest_from(bytes) {
+          Some(m) -> match newest {
+            Some(n) -> if n.modified >= modified { newest }
+            else { Some({ name: name, manifest: m, modified: modified }) },
+            None -> Some({ name: name, manifest: m, modified: modified }),
+          },
+          None -> newest,
+        },
+        _ -> newest,
+      }
+    })
 
 const test_shapes: Bytes = b"shapes".blake3()
 
@@ -704,6 +732,10 @@ const other_shapes: Bytes = b"other shapes".blake3()
 
 fn two_schemas_and_another_run() -> fs::MemResult<Option<String>> / {abort.raise} =
   fs::on_mem[abs](fs::mem_of([]), || {
+    let x = write_test_segment[abs]("s", oldest_shapes, b"token--x", [
+      { key: b"x".blake3(), value: b"oldest" },
+    ]);
+    commit[abs]("s", oldest_shapes, x);
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     commit[abs]("s", test_shapes, a);
     write_segment[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
@@ -729,13 +761,20 @@ fn swept(tree: fs::MemFs) -> fs::MemFs / {abort.raise} =
 fn ended(tree: fs::MemFs, run: Option<String>) -> fs::MemFs / {abort.raise} =
   fs::on_mem[abs](tree, || end_run[abs](run)).tree
 
-test "a sweep removes every other schema's manifest and every segment its own manifest does not list once no other run is active" {
+test "a sweep keeps its own schema and the one used before it, and removes every other manifest and every segment neither lists, once no other run is active" {
   let made = two_schemas_and_another_run();
-  assert_eq(names_in(swept(ended(made.tree, made.value)), "s"), [
-    manifest_name(test_shapes),
-    segment_name(b"token--a"),
-  ])
+  assert_eq(
+    Set::of_list(names_in(swept(ended(made.tree, made.value)), "s")),
+    Set::of_list([
+      manifest_name(test_shapes),
+      manifest_name(other_shapes),
+      segment_name(b"token--a"),
+      segment_name(b"token--o"),
+    ]),
+  )
 }
+
+const oldest_shapes: Bytes = b"oldest shapes".blake3()
 
 test "a sweep removes nothing while another run is active, whatever that run's schema" {
   let made = two_schemas_and_another_run();
