@@ -6,7 +6,7 @@ import compiler.store.memo (memo)
 import compiler.store.handles (QueryOf, Written, written, fetch, product_definition)
 import compiler.check.infer.checker (Checked, CheckReads, DefinitionInfo, EffectInfo, TypeFacts,
                                      elsewhere, StoredDeclarations, declarations_joined,
-                                     no_stored_declarations)
+                                     no_stored_declarations, builtin_constructors, prelude_effects)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
 import compiler.emit.representations (type_names, lowering)
 import compiler.front.facts (Analysis, PlacedTables, checked_of_parts, hashed_analysis)
@@ -263,22 +263,58 @@ fn hashed_nodes(o: OwnerKey) -> List<DefinitionHash> / {memo.read, abort.raise} 
 fn states_clauses(o: OwnerKey) -> Bool / {memo.read, abort.raise} =
   hashed_nodes(o).any(|n: DefinitionHash| n.clauses.len() > 0)
 
-fn references_of(o: OwnerKey) -> List<NodeRef> / {memo.read, abort.raise} =
+type References = { body: List<NodeRef>, clauses: List<NodeRef> }
+
+fn references_of(o: OwnerKey) -> References / {memo.read, abort.raise} =
   if is_test_or_law(o.owner) {
     let own = group_hashes_of(unit_key_of(o));
-    own.tests.flat_map(test_uses).concat(own.laws.flat_map(|l: LawHash| l.uses))
-  } else { hashed_nodes(o).flat_map(|n: DefinitionHash| n.uses.concat(n.clause_uses)) }
+    { body: own.tests.flat_map(test_uses), clauses: own.laws.flat_map(|l: LawHash| l.uses) }
+  } else {
+    let nodes = hashed_nodes(o);
+    {
+      body: nodes.flat_map(|n: DefinitionHash| n.uses),
+      clauses: nodes.flat_map(|n: DefinitionHash| n.clause_uses),
+    }
+  }
 
-fn functions_used_by(o: OwnerKey) -> List<OwnerKey> / {memo.read, abort.raise} =
-  references_of(o).fold([], |accumulator: List<OwnerKey>, r: NodeRef|
+fn functions_named(references: List<NodeRef>) -> List<OwnerKey> / {memo.read, abort.raise} =
+  references.fold([], |accumulator: List<OwnerKey>, r: NodeRef|
     if r.kind != HeldValue { accumulator } else { accumulator.concat(owners_of_function(r.name)) })
 
+type Need = | NeedsContract | NeedsBody
+
+type Wanted = { owner: OwnerKey, need: Need }
+
+fn wanted_as(need: Need, owners: List<OwnerKey>) -> List<Wanted> =
+  owners.map(|o: OwnerKey| { owner: o, need: need })
+
+fn functions_used_by(o: OwnerKey) -> List<OwnerKey> / {memo.read, abort.raise} = {
+  let references = references_of(o);
+  functions_named(references.body.concat(references.clauses))
+}
+
+fn wanted_expanded(w: Wanted) -> { value: Bool, next: List<Wanted> } / {memo.read, abort.raise} =
+  if in_root(w.owner.module) {
+    { value: true, next: wanted_as(NeedsContract, functions_used_by(w.owner)) }
+  } else { outside_expanded(w.owner, w.need) }
+
+fn outside_expanded(
+  o: OwnerKey,
+  need: Need,
+) -> { value: Bool, next: List<Wanted> } / {memo.read, abort.raise} =
+  match need {
+    NeedsBody -> { value: true, next: wanted_as(NeedsBody, functions_used_by(o)) },
+    NeedsContract -> if !states_clauses(o) { { value: false, next: [] } }
+    else { { value: true, next: wanted_as(NeedsBody, functions_named(references_of(o).clauses)) } },
+  }
+
 fn bodies_reached(start: List<OwnerKey>) -> Map<NameInModule, OwnerKey> / {memo.read, abort.raise} =
-  traverse(start, |o: OwnerKey| {
-    let root = in_root(o.module);
-    { value: root || states_clauses(o), next: if root { functions_used_by(o) } else { [] } }
-  }).fold(Map::new(), |found: Map<NameInModule, OwnerKey>, v: Visit<OwnerKey, Bool>|
-    if !v.value { found } else { found.insert({ module: v.key.module, name: v.key.owner }, v.key) })
+  traverse(wanted_as(NeedsContract, start), wanted_expanded).fold(
+    Map::new(),
+    |found: Map<NameInModule, OwnerKey>, v: Visit<Wanted, Bool>|
+      if !v.value { found }
+      else { found.insert({ module: v.key.owner.module, name: v.key.owner.owner }, v.key.owner) },
+  )
 
 fn with_loaded_owner(found: Map<Bytes, LoadedOwners>, o: OwnerKey) -> Map<Bytes, LoadedOwners> =
   found.insert(o.module, match found.get(o.module) {
@@ -333,8 +369,11 @@ fn with_stored_tables(
     checked: {
       ..a.checked,
       definitions: read.definitions,
-      effects: read.effects,
-      constructors: a.checked.constructors.concat(known.constructors).unique(),
+      effects: prelude_effects.concat(read.effects).unique(),
+      constructors: builtin_constructors().concat(a.checked.constructors).concat(
+        known.constructors,
+      ).unique(
+      ),
       instances: a.checked.instances.concat(known.instances).unique(),
       numeric_types: a.checked.numeric_types.concat(known.numeric).unique(),
     },
@@ -442,6 +481,11 @@ fn stored_analysis(groups: List<LoadedOwners>) -> GroupsAnalysed / {SessionReads
                     [],
                     read.declared,
                     unreached(resolved.uses),
+                    range(0, resolved.modules.len()).map(|i: Int|
+                      match groups.at(i) {
+                        Some(g) -> owners_result_of(g.named).shape.unimported,
+                        None -> [],
+                      }),
                   ),
                   hash_output(hash_layout(resolved.index), read.own),
                 ),
