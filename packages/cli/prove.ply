@@ -25,7 +25,6 @@ import std.machine as entering
 import proof.obligation (Binding, Certificate, InternalError, Frame, Reason, Open, Outcome, Proved,
                          NoWrites, Raised, Refuted, Stopped, Unproved, Vacuous, frame_summary,
                          plural, stopped_summary)
-import proof.decide (StaticResult)
 import proof.keys (claim_key, run_key)
 import proof.evidence (evidence_bytes)
 import std.bytes
@@ -36,14 +35,14 @@ import claims (OwnClaims, LoadResult, Options, proof_store, discharging, decisio
                exit_code_of, collected_part, collection_of, coverage_head, coverage_json,
                decide_claims, count_internal_errors, diagnostics_of, count_proved, no_static_prover,
                obligation_json, once_each, own_claims, plan_json, proved, quantifier,
-               failure_output, count_refuted, bindings_text, row_head, rows_of, seconds,
-               StaticProver, static_prover_of, uncovered_lines, count_unproved, detail_indent,
+               failure_output, count_refuted, bindings_text, row_head, seconds, StaticProver,
+               PendingClaim, static_prover_of, uncovered_lines, count_unproved, detail_indent,
                count_vacuous)
 import proof.obligation (Coverage, Cost, Ensures, Fresh, FromProof, Kind, Law, cache_status_word)
 import builder (builder)
 import std.fs (fs)
 import std.time (time)
-import compiler.check.resolve.tables (Diagnostic, InSource, NoFix)
+import compiler.check.resolve.tables (Diagnostic, NoFix)
 import diagnostic (SourceText, all_to_json)
 import report (CommandOutput, indent, ok_code, schema_version, count_of, printed, reuse_members,
                warned_lines, with_front_end)
@@ -56,21 +55,15 @@ import std.process (process)
 import std.string
 import semantics (semantics)
 
-fn selected_claims(collection: Collection, flags: Flags) -> List<Int> / {abort.raise} = {
+fn selected_claims(collection: Collection, flags: Flags) -> List<Claim> / {abort.raise} = {
   let modules = module_names(collection.modules);
-  let claims = collection.claims;
-  range(0, claims.len()).fold([], |accumulator: List<Int>, i: Int|
-    match claims.at(i) {
-      None -> accumulator,
-      Some(c) -> {
-        let module = match collection.modules.at(c.module) {
-          Some(m) -> String::of_bytes_lossy(m),
-          None -> "",
-        };
-        if matches_filters(flags.filters, modules, module, c.owner) { accumulator.push(i) }
-        else { accumulator }
-      },
-    })
+  collection.claims.filter(|c: Claim| {
+    let module = match collection.modules.at(c.place.module) {
+      Some(m) -> String::of_bytes_lossy(m),
+      None -> "",
+    };
+    matches_filters(flags.filters, modules, module, c.owner)
+  })
 }
 
 fn internal_errors_word(rows: List<Row>) -> String / {abort.raise} =
@@ -160,7 +153,7 @@ fn filtered_lines(style: Style, filtered_out: Int) -> List<String> =
 fn opening_lines(
   style: Style,
   collection: Collection,
-  wanted: List<Int>,
+  wanted: List<Claim>,
 ) -> List<String> / {abort.raise} =
   [coverage_head(collection.definitions.len(), count_specified(collection))].concat(
     filtered_lines(style, collection.claims.len() - wanted.len()),
@@ -189,8 +182,8 @@ fn summary_json(rows: List<Row>) -> Json =
 
 fn document(
   collection: Collection,
-  rows: List<Row>,
   v: Verdicts,
+  include_static_prover: Bool,
   code: Int,
   filtered_out: Int,
   warnings: List<Diagnostic>,
@@ -206,18 +199,14 @@ fn document(
     { key: "cached", value: int(v.cached) },
     { key: "filtered_out", value: int(filtered_out) },
     { key: "duration_ms", value: Number(v.duration_ms) },
-    { key: "summary", value: summary_json(rows) },
+    { key: "summary", value: summary_json(v.rows) },
     {
       key: "obligations",
       value: Array(
-        rows.map(|row: Row|
-          obligation_json(row, collection.places, match v.static_prover_results {
-            Some(_) -> true,
-            None -> false,
-          })),
+        v.rows.map(|row: Row| obligation_json(row, collection.places, include_static_prover)),
       ),
     },
-    { key: "diagnostics", value: all_to_json(diagnostics_of(rows), collection.places) },
+    { key: "diagnostics", value: all_to_json(diagnostics_of(v.rows), collection.places) },
     { key: "warnings", value: all_to_json(warnings, collection.places) },
   ])
 
@@ -225,15 +214,14 @@ fn prove_output(
   style: Style,
   flags: Flags,
   collection: Collection,
-  rows: List<Row>,
   v: Verdicts,
   filtered_out: Int,
 ) -> CommandOutput / {abort.raise} = {
   let warnings = once_each(collection.warnings.concat(v.warnings));
-  let code = exit_code_of(rows);
+  let code = exit_code_of(v.rows);
   {
-    json: document(collection, rows, v, code, filtered_out, warnings),
-    lines: closing_lines(style, flags, rows, v, warnings),
+    json: document(collection, v, flags.static_prover, code, filtered_out, warnings),
+    lines: closing_lines(style, flags, v.rows, v, warnings),
     errs: [],
     code: code,
   }
@@ -244,7 +232,7 @@ fn prove_collection<| e>(
   flags: Flags,
   collection: Collection,
   statics: StaticProver,
-  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
+  discharge: (Collection, List<PendingClaim>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
 ) -> CommandOutput / {process.out[proc], abort.raise, proof_store.record, proof_store.cached | e} = {
   let wanted = selected_claims(collection, flags);
   printed(opening_lines(style, collection, wanted));
@@ -254,22 +242,14 @@ fn prove_collection<| e>(
       wanted,
       statics,
       flags.static_prover,
-      |runs: List<Int>, resolved: List<StaticResult>| discharge(collection, runs, resolved),
+      |pending: List<PendingClaim>| discharge(collection, pending),
     )
   } with {
     decisions.known(row) -> printed(row_lines(style, flags, collection.places, row)),
   };
   match fixture_discharge {
     Err(reason) -> failure_output(style, "prove", reason),
-    Ok(v) ->
-      prove_output(
-        style,
-        flags,
-        collection,
-        rows_of(collection.claims, wanted, v),
-        v,
-        collection.claims.len() - wanted.len(),
-      ),
+    Ok(v) -> prove_output(style, flags, collection, v, collection.claims.len() - wanted.len()),
   }
 }
 
@@ -311,8 +291,8 @@ pub fn run(
                     { places: places, warnings: opened.warnings },
                     c.mine,
                     c.statics,
-                    |collection: Collection, runs: List<Int>, resolved: List<StaticResult>|
-                      discharge_claims(opened, collection, runs, resolved),
+                    |collection: Collection, pending: List<PendingClaim>|
+                      discharge_claims(opened, collection, pending),
                   ),
               }),
             members,
@@ -330,7 +310,7 @@ fn prove_over<| e>(
   got: LoadResult,
   mine: OwnClaims,
   statics: StaticProver,
-  discharge: (Collection, List<Int>, List<StaticResult>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
+  discharge: (Collection, List<PendingClaim>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
 ) -> CommandOutput / {process.out[proc], abort.raise, proof_store.record, proof_store.cached | e} =
   prove_collection(style, flags, collection_of(got, mine, options), statics, discharge)
 
@@ -364,26 +344,23 @@ fn own_claims_of(c: Result<Collection, Rejection>) -> OwnClaims =
       },
   }
 
-fn verdicts(outcomes: List<Outcome>) -> DischargeResult =
-  { outcomes: outcomes, duration_ms: Decimal::of_int(0), warnings: [] }
-
 fn prove_fixture(
   flags: Flags,
   c: Result<Collection, Rejection>,
-  v: Result<DischargeResult, Rejection>,
+  v: Result<List<Outcome>, Rejection>,
 ) -> CommandOutput / {abort.raise} = prove_fixture_cached(flags, c, v, [None, None])
 
 fn prove_fixture_cached(
   flags: Flags,
   c: Result<Collection, Rejection>,
-  v: Result<DischargeResult, Rejection>,
+  v: Result<List<Outcome>, Rejection>,
   cache_contents: List<Option<String>>,
 ) -> CommandOutput / {abort.raise} = prove_fixture_with_reach(flags, c, v, cache_contents, None)
 
 fn prove_fixture_with_reach(
   flags: Flags,
   c: Result<Collection, Rejection>,
-  v: Result<DischargeResult, Rejection>,
+  v: Result<List<Outcome>, Rejection>,
   cache_contents: List<Option<String>>,
   static_prover: Option<claims::StaticProverResult>,
 ) -> CommandOutput / {abort.raise} =
@@ -398,8 +375,7 @@ fn prove_fixture_with_reach(
           got,
           own_claims_of(c),
           no_static_prover(static_prover),
-          |collection: Collection, runs: List<Int>, _resolved: List<StaticResult>|
-            fixture_discharge(v, runs),
+          |collection: Collection, pending: List<PendingClaim>| fixture_discharge(v, pending),
         ),
     }
   } with {
@@ -421,7 +397,7 @@ const one_claim: List<Claim> = [a_claim("m.one", Ensures(0))]
 const one_proved: List<Outcome> = [proved([Congruence], 2)]
 
 test "`ply prove` prints the coverage summary first, then one line per claim, then the totals" {
-  let result = prove_fixture(bare, Ok(a_collection(one_claim)), Ok(verdicts(one_proved)));
+  let result = prove_fixture(bare, Ok(a_collection(one_claim)), Ok(one_proved));
   assert_eq(result.code, 0);
   assert_eq(result.errs, []);
   assert_eq(result.lines, [
@@ -434,7 +410,7 @@ test "`ply prove` prints the coverage summary first, then one line per claim, th
 }
 
 test "a refuted claim is exit 1, and says where it fails" {
-  let result = prove_fixture(bare, Ok(a_collection(one_claim)), Ok(verdicts([Refuted(a_counter)])));
+  let result = prove_fixture(bare, Ok(a_collection(one_claim)), Ok([Refuted(a_counter)]));
   assert_eq(result.code, 1);
   assert_eq(result.lines, [
     "   1 definition · 1 of them have a claim · 0 do not",
@@ -460,8 +436,8 @@ test "before the run finishes, `ply prove` has printed only the coverage summary
           got,
           own_claims_of(Ok(a_collection(one_claim))),
           no_static_prover(None),
-          |collection: Collection, runs: List<Int>, _resolved: List<StaticResult>|
-            fixture_discharge(Ok(verdicts(one_proved)), runs),
+          |collection: Collection, pending: List<PendingClaim>|
+            fixture_discharge(Ok(one_proved), pending),
         ),
     }
   } with {
@@ -481,23 +457,19 @@ test "before the run finishes, `ply prove` has printed only the coverage summary
 }
 
 fn fixture_discharge(
-  v: Result<DischargeResult, Rejection>,
-  runs: List<Int>,
+  v: Result<List<Outcome>, Rejection>,
+  pending: List<PendingClaim>,
 ) -> Result<DischargeResult, Rejection> / {discharging.decided} =
   match v {
     Err(reason) -> Err(reason),
-    Ok(d) ->
-      Ok({
-        ..d,
-        outcomes: runs.fold([], |out: List<Outcome>, i: Int|
-          match d.outcomes.at(i) {
-            Some(o) -> {
-              discharging.decided(i, o);
-              out.push(o)
-            },
-            None -> out,
-          }),
-      }),
+    Ok(outcomes) -> {
+      pending.fold((), |_: Unit, claim: PendingClaim|
+        match outcomes.at(claim.wanted.at) {
+          Some(o) -> discharging.decided(claim, o),
+          None -> (),
+        });
+      Ok({ duration_ms: Decimal::of_int(0), warnings: [] })
+    },
   }
 
 fn cached_evidence(word: Option<String>, c: Option<Certificate>) -> Option<Bytes> / {abort.raise} =
@@ -515,15 +487,15 @@ fn cached_evidence(word: Option<String>, c: Option<Certificate>) -> Option<Bytes
 
 fn certificate_for(
   c: Result<Collection, Rejection>,
-  v: Result<DischargeResult, Rejection>,
+  v: Result<List<Outcome>, Rejection>,
   key: String,
 ) -> Option<Certificate> / {abort.raise} =
   match ((c, v)) {
-    (Ok(x), Ok(d)) ->
+    (Ok(x), Ok(outcomes)) ->
       range(0, x.claims.len()).fold(None, |found: Option<Certificate>, i: Int|
         match found {
           Some(_) -> found,
-          None -> match ((x.claims.at(i), d.outcomes.at(i))) {
+          None -> match ((x.claims.at(i), outcomes.at(i))) {
             (Some(claim), Some(Proved(cert))) -> if claim_key(Bytes::of_hex(claim.key)).hex_of()
                 == key
                 || run_key(Bytes::of_hex(claim.run_key)).hex_of() == key { Some(cert) }
@@ -538,7 +510,7 @@ test "a vacuous claim is exit 1" {
   let result = prove_fixture(
     bare,
     Ok(a_collection(one_claim)),
-    Ok(verdicts([Vacuous({ guard: InSource({ module: 0, start: 3, end: 7 }) })])),
+    Ok([Vacuous]),
   );
   assert_eq(result.code, 1);
   assert_eq(
@@ -552,11 +524,9 @@ test "`ply prove` exits 1 for an unproved claim and prints where the prover gave
   let result = prove_fixture(
     bare,
     Ok(a_collection(one_claim)),
-    Ok(
-      verdicts([
-        Unproved(Open({ spent: false, stopped: [{ kind: "recursive_call", about: Some("m.f") }] })),
-      ]),
-    ),
+    Ok([
+      Unproved(Open({ spent: false, stopped: [{ kind: "recursive_call", about: Some("m.f") }] })),
+    ]),
   );
   assert_eq(result.code, 1);
   assert_eq(result.lines, [
@@ -579,7 +549,7 @@ test "a prover internal error is reported as a Ply bug, not as an unproved claim
   let result = prove_fixture(
     bare,
     Ok(a_collection(one_claim)),
-    Ok(verdicts([InternalError(a_fault)])),
+    Ok([InternalError(a_fault)]),
   );
   assert_eq(result.code, 1);
   assert(
@@ -607,7 +577,7 @@ test "`--filter` proves only the matching claims and reports how many claims wer
   let result = prove_fixture(
     from_argv("prove", ["--filter=two"]),
     Ok(a_collection(two)),
-    Ok(verdicts(one_proved.concat(one_proved))),
+    Ok(one_proved.concat(one_proved)),
   );
   assert_eq(result.lines.filter(|l: String| l.contains("m.two ensures #0")).len(), 1);
   assert_eq(result.lines.filter(|l: String| l.contains("m.one ensures #0")).len(), 0);
@@ -624,7 +594,7 @@ test "repeating `--filter` proves the claims matching any of the filters and ski
   let result = prove_fixture(
     from_argv("prove", ["--filter=one", "--filter=three"]),
     Ok(a_collection(three)),
-    Ok(verdicts(one_proved.concat(one_proved))),
+    Ok(one_proved.concat(one_proved)),
   );
   assert_eq(
     result.lines.filter(|l: String|
@@ -640,7 +610,7 @@ test "`ply prove --json` output has `command` and `exit_code` fields and records
   let result = prove_fixture(
     from_argv("prove", ["--json"]),
     Ok(a_collection(one_claim)),
-    Ok(verdicts(one_proved)),
+    Ok(one_proved),
   );
   let text = to_string(result.json);
   assert(text.contains("\"command\":\"prove\""));
@@ -659,7 +629,7 @@ test "`--explain` shows whether each result came from the cache, and which decla
   let result = prove_fixture_cached(
     from_argv("prove", ["--explain"]),
     Ok(a_collection([wide])),
-    Ok(verdicts(one_proved)),
+    Ok(one_proved),
     [Some("proof"), None],
   );
   assert_eq(result.lines.at_or(3, ""), "       from: cached proof");
@@ -674,22 +644,22 @@ test "`prove` shows the schema name of a claim built from a schema under `--json
   let listed = prove_fixture(
     from_argv("prove", ["--json"]),
     Ok(a_collection([made])),
-    Ok(verdicts(one_proved)),
+    Ok(one_proved),
   );
   assert(to_string(listed.json).contains("\"schema\":\"lib.round_trip\""));
   let explained = prove_fixture(
     from_argv("prove", ["--explain"]),
     Ok(a_collection([made])),
-    Ok(verdicts(one_proved)),
+    Ok(one_proved),
   );
   let says = |result: CommandOutput| result.lines.contains("       schema: lib.round_trip");
   assert(says(explained));
-  assert(says(prove_fixture(bare, Ok(a_collection([made])), Ok(verdicts([Refuted(a_counter)])))));
-  assert(!says(prove_fixture(bare, Ok(a_collection([made])), Ok(verdicts(one_proved)))));
+  assert(says(prove_fixture(bare, Ok(a_collection([made])), Ok([Refuted(a_counter)]))));
+  assert(!says(prove_fixture(bare, Ok(a_collection([made])), Ok(one_proved))));
   let written = prove_fixture(
     from_argv("prove", ["--json"]),
     Ok(a_collection([a_claim("m.round trip", Law(Some("round trip")))])),
-    Ok(verdicts(one_proved)),
+    Ok(one_proved),
   );
   assert(!to_string(written.json).contains("\"schema\""))
 }
@@ -708,7 +678,7 @@ test "under `--static-prover` each claim's JSON includes the static prover's dec
   let fresh = prove_fixture_with_reach(
     prove_collection,
     Ok(a_collection(one_claim)),
-    Ok(verdicts(proved_by_run)),
+    Ok(proved_by_run),
     [None, None],
     Some(static_prover),
   );
@@ -716,7 +686,7 @@ test "under `--static-prover` each claim's JSON includes the static prover's dec
   let cached = prove_fixture_with_reach(
     prove_collection,
     Ok(a_collection(one_claim)),
-    Ok(verdicts(proved_by_run)),
+    Ok(proved_by_run),
     [None, Some("run")],
     Some(static_prover),
   );
@@ -725,7 +695,7 @@ test "under `--static-prover` each claim's JSON includes the static prover's dec
   let unasked = prove_fixture(
     from_argv("prove", ["--json"]),
     Ok(a_collection(one_claim)),
-    Ok(verdicts(one_proved)),
+    Ok(one_proved),
   );
   assert(!to_string(unasked.json).contains("\"static_prover\""))
 }
@@ -734,7 +704,7 @@ test "`prove` reuses a cached proof, with no warnings, for a claim whose proof u
   let result = prove_fixture_cached(
     from_argv("prove", ["--explain", "--json"]),
     Ok(a_collection(one_claim)),
-    Ok(verdicts(proved_by_run)),
+    Ok(proved_by_run),
     [None, Some("run")],
   );
   assert(result.lines.filter(|l: String| l == "       from: cached proof").len() == 1);
@@ -746,7 +716,7 @@ test "a cache entry stored under the wrong kind of key is rejected, and `ply pro
   let result = prove_fixture_cached(
     from_argv("prove", ["--explain", "--json"]),
     Ok(a_collection(one_claim)),
-    Ok(verdicts(one_proved)),
+    Ok(one_proved),
     [None, Some("proof")],
   );
   assert(result.lines.filter(|l: String| l == "       from: cache rejected").len() == 1);
@@ -773,7 +743,7 @@ test "when the program fails to compile, `ply prove` prints the compile error, c
   let result = prove_fixture(
     bare,
     Err(NotCompiled({ diagnostics: [d], places: [] })),
-    Ok(verdicts([])),
+    Ok([]),
   );
   assert_eq(result.code, 2);
   assert_eq(result.lines, []);
@@ -793,7 +763,7 @@ test "a cache that would not open at all is reported without a compilation tally
   let result = prove_fixture(
     bare,
     Err(CacheUnavailable({ diagnostics: [d], places: [] })),
-    Ok(verdicts([])),
+    Ok([]),
   );
   assert_eq(result.code, 2);
   assert_eq(result.errs, ["Error[E0501]: could not open the cache"])

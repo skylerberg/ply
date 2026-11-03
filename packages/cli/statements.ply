@@ -1,5 +1,6 @@
 import compiler.codes (undeclared_sql_name_code, unsupported_sql_code)
-import compiler.front.checking.program_facts (ProgramSites, reached_modules)
+import compiler.front.checking.program_facts (CalleeIdentity, ProgramSites, reached_modules,
+                                              run_identity)
 import compiler.front.facts (StatementSite, Argument, TextArgument, CallArgument, RowArgument,
                              TaggedArgument, ListArgument, ConstructorArgument, OtherArgument,
                              statement_modules, RowField, RowRead, ScalarRead, OptionalRead,
@@ -126,7 +127,7 @@ pub fn check_sites(
           accumulator.push({
             site: site,
             check: check,
-            identity: statement_identity(check, sites.callee_hashes),
+            identity: statement_identity(check, sites.callee_identities),
             schemas: reachable_schemas,
           })
         },
@@ -213,14 +214,14 @@ fn joined_keys(keys: List<Option<Bytes>>) -> Option<Bytes> =
 fn argument_key(
   a: Argument,
   left: Int,
-  hashes: Map<Bytes, Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
 ) -> Option<Bytes> / {abort.raise} =
   if left <= 0 { Some(b"?") } else {
     match a {
       TextArgument(b) -> Some(b"t".concat(length_prefixed(b))),
       CallArgument(c) -> match ((
-          hashes.get(c.callee),
-          joined_keys(c.args.map(|x: Argument| argument_key(x, left - 1, hashes))),
+          run_identity(identities, c.callee),
+          joined_keys(c.args.map(|x: Argument| argument_key(x, left - 1, identities))),
         )) {
         (Some(hash), Some(arguments)) ->
           Some(
@@ -236,7 +237,7 @@ fn argument_key(
       },
       RowArgument(_) -> Some(b"r"),
       TaggedArgument(t) ->
-        hashes.get(t.callee).map(|hash: Bytes|
+        run_identity(identities, t.callee).map(|hash: Bytes|
           Bytes::concat_all([
             b"g",
             length_prefixed(t.callee),
@@ -245,7 +246,7 @@ fn argument_key(
             Bytes::concat_all(t.parts.map(length_prefixed)),
           ])),
       ListArgument(items) ->
-        joined_keys(items.map(|x: Argument| argument_key(x, left - 1, hashes))).map(
+        joined_keys(items.map(|x: Argument| argument_key(x, left - 1, identities))).map(
           |inner: Bytes|
             Bytes::concat_all([b"l", length_prefixed(ascii_of_int(items.len())), inner]),
         ),
@@ -277,17 +278,21 @@ pub fn check_result_key(toolchain: Bytes, identity: Bytes) -> Bytes / {abort.rai
     ),
   )
 
-fn schema_key(schema: Option<ConstSite>, hashes: Map<Bytes, Bytes>) -> Option<Bytes> =
+fn schema_key(
+  schema: Option<ConstSite>,
+  identities: Map<Bytes, CalleeIdentity>,
+) -> Option<Bytes> / {abort.raise} =
   match schema {
     None -> Some(b"n"),
-    Some(s) -> hashes.get(s.name).map(|hash: Bytes| b"s".concat(length_prefixed(hash))),
+    Some(s) ->
+      run_identity(identities, s.name).map(|hash: Bytes| b"s".concat(length_prefixed(hash))),
   }
 
 pub fn statement_identity(
   a: StatementCheck,
-  hashes: Map<Bytes, Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
 ) -> Option<Bytes> / {abort.raise} =
-  match ((schema_key(a.schema, hashes), argument_key(a.statement, 64, hashes))) {
+  match ((schema_key(a.schema, identities), argument_key(a.statement, 64, identities))) {
     (Some(schema), Some(statement)) ->
       Some(
         Bytes::concat_all([

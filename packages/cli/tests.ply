@@ -5,7 +5,8 @@ import args (from_argv)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.published (no_rows, analyse)
 import compiler.front.emitter_input (Analysed, Rejected, view_dump, checked_program_of)
-import compiler.front.facts (CheckedProgram, ProgramListing, listing_of)
+import compiler.front.facts
+import compiler.front.facts (CheckedProgram, ProgramListing)
 import compiler.front (analyse_pulling_std_with)
 import compiler.front.rows (KeyRow, EmitterRoot)
 import compiler.store.hash.forms (ItemKeyed, reach)
@@ -38,8 +39,8 @@ import tests.report (PrintedEffect, Phases, Entry, Case, RunDecision, conflictin
                      summary_line, secondary_lines, at_lines, seed_lines, change_text, case_json,
                      placed_cases, fault_json, test_output)
 import tests.concluded (entry_of, job_of, run_job, fault_of, replay_of)
-import tests.cases (Scope, scope_of, selection_of, expand_cases, expanded_program, ExpandedTests)
-import tests.listing (TestListing, SelectedTest, listing_of_program, run_hash, test_at,
+import tests.cases (scope_of, selection_of, expand_cases, expanded_program, ExpandedTests)
+import tests.listing (TestListing, SelectedTest, listing_of, listing_of_program, run_hash, test_at,
                       test_list_of_program)
 import compiler.front.checking.program_facts (TestList)
 import compiler.check.infer.checker (TestInfo)
@@ -100,13 +101,41 @@ const an_opening: Opening = { operations: 0, digest: "", tests_using_host: [], w
 
 const a_test_run: TestRun = tester::start_run(options_from(parsed(["test"])))
 
-fn scoped(w: TestListing, argv: List<String>) -> Scope / {abort.raise} =
-  scope_of(
-    w,
-    from_argv("test", argv).filters,
-    options_from(parsed(["test"].concat(argv))).shard,
-    None,
-  )
+type Scoped = { visible: List<Bytes>, filtered_out: Int }
+
+fn scoped(
+  program: ProgramListing,
+  argv: List<String>,
+  cases: Map<Bytes, Result<List<ListedCase>, KnownFailure>>,
+) -> Scoped / {abort.raise} = {
+  let filters = from_argv("test", argv).filters;
+  let shard = options_from(parsed(["test"].concat(argv))).shard;
+  let list = test_list_of_program(program);
+  let whole = listing_of_program(program);
+  let selected = listing_of(
+    list,
+    selection_of(list, filters, shard, None),
+    |info: TestInfo| match whole.tests.find(|t: SelectedTest| t.info.key == info.key) {
+      Some(t) -> t.identity,
+      None -> panic("every selected test is in the whole listing"),
+    },
+    Map::new(),
+  );
+  let listings = range(0, selected.tests.len()).fold(
+    Map::new(),
+    |found: Map<Int, Result<List<ListedCase>, KnownFailure>>, i: Int|
+      match cases.get(selected.tests.get(i).info.key) {
+        Some(listed) -> found.insert(i, listed),
+        None -> found,
+      },
+  );
+  let over = expand_cases(selected, listings);
+  let scope = scope_of(over.listing, filters, shard, None);
+  {
+    visible: scope.visible.map(|i: Int| over.listing.tests.get(i).info.key),
+    filtered_out: scope.filtered_out,
+  }
+}
 
 fn selected_cases(
   list: TestList,
@@ -777,13 +806,16 @@ test "a seeded test searches only the seeds not yet searched, and a test without
   })
 }
 
-fn analysed_as(name: String, source: String) -> TestListing / {abort.raise} =
+fn program_named(name: String, source: String) -> ProgramListing / {abort.raise} =
   match analyse(
       parse_all([{ name: Bytes::of_string(name), source_text: Bytes::of_string(source) }]),
     ) {
-    Analysed(w) -> listing_of_program(listing_of(checked_program_of(w))),
+    Analysed(w) -> facts::listing_of(checked_program_of(w)),
     Rejected(_) -> panic("the fixture checks"),
   }
+
+fn analysed_as(name: String, source: String) -> TestListing / {abort.raise} =
+  listing_of_program(program_named(name, source))
 
 fn analysed(source: String) -> TestListing / {abort.raise} = analysed_as("", source)
 
@@ -870,44 +902,42 @@ test "a test that uses `simulate` is run over many schedules, and a test that do
 }
 
 test "a run reports only the tests that match `--filter`, and counts the tests it excluded" {
-  let w = analysed_as(
+  let program = program_named(
     "m",
     "test \"alpha\" { assert_eq(1, 1) }\ntest \"beta\" { assert_eq(2, 2) }\ntest \"gamma\" { assert_eq(3, 3) }\n",
   );
-  let scope = scoped(w, ["--filter", "alpha"]);
-  assert_eq(scope.visible, [0]);
+  let run = |argv: List<String>| scoped(program, argv, Map::new());
+  let scope = run(["--filter", "alpha"]);
+  assert_eq(scope.visible, [b"m.alpha"]);
   assert_eq(scope.filtered_out, 2);
-  assert_eq(scoped(w, ["--filter", "m.gam", "--filter", "alpha"]).visible, [0, 2]);
-  assert_eq(scoped(w, []).visible, [0, 1, 2])
+  assert_eq(run(["--filter", "m.gam", "--filter", "alpha"]).visible, [b"m.alpha", b"m.gamma"]);
+  assert_eq(run([]).visible, [b"m.alpha", b"m.beta", b"m.gamma"])
 }
 
 test "`--shard` puts each test and each case in exactly one shard, even when `--filter` is also given" {
-  let whole = program_with_cases;
-  let over = expand_cases(
-    whole,
-    Map::new().insert(
-      1,
-      Ok(
-        range(0, 12).map(|n: Int|
-          { label: "holds " ++ n.to_string(), identity: Bytes::of_string(n.to_string()) }),
-      ),
+  let program = checked_program(cases_source);
+  let cases = Map::new().insert(
+    b"m.holds {n}",
+    Ok(
+      range(0, 12).map(|n: Int|
+        { label: "holds " ++ n.to_string(), identity: Bytes::of_string(n.to_string()) }),
     ),
   );
   let part = |k: Int, more: List<String>|
-    scoped(over.listing, ["--shard", k.to_string() ++ "/3"].concat(more));
+    scoped(program, ["--shard", k.to_string() ++ "/3"].concat(more), cases);
   let parts = [1, 2, 3].map(|k: Int| part(k, []).visible);
-  assert(parts.all(|shard_indices: List<Int>| shard_indices.len() > 0));
-  assert(
-    range(0, 13).all(|i: Int|
-      parts.filter(|shard_indices: List<Int>| shard_indices.contains(i)).len() == 1),
-  );
-  assert_eq(part(2, []).filtered_out, 13 - parts.at_or(1, []).len());
+  let every = [b"m.plain"].concat(range(0, 12).map(|n: Int|
+    Bytes::of_string("m.holds " ++ n.to_string())));
+  assert(parts.all(|keys: List<Bytes>| keys.len() > 0));
+  assert(every.all(|key: Bytes| parts.filter(|keys: List<Bytes>| keys.contains(key)).len() == 1));
+  assert_eq(part(2, []).filtered_out, every.len() - parts.at_or(1, []).len());
+  let matching = [b"m.holds 1", b"m.holds 10", b"m.holds 11"];
   assert(
     [1, 2, 3].all(|k: Int|
       part(k, ["--filter", "holds 1"]).visible
-        == parts.at_or(k - 1, []).filter(|i: Int| i == 2 || i >= 11)),
+        == parts.at_or(k - 1, []).filter(|key: Bytes| matching.contains(key))),
   );
-  assert_eq(scoped(over.listing, ["--shard", "1/1"]).visible, range(0, 13));
+  assert_eq(scoped(program, ["--shard", "1/1"], cases).visible, every);
   assert_eq(selected_cases(list_with_cases, ["--shard", "3/3"], None), [b"m.holds {n}"])
 }
 
@@ -927,7 +957,7 @@ const program_with_cases: TestListing = listing_of_program(checked_program(cases
 const list_with_cases: TestList = test_list_of_program(checked_program(cases_source))
 
 fn checked_program(source: Bytes) -> ProgramListing / {abort.raise} =
-  listing_of(framed_program(source))
+  facts::listing_of(framed_program(source))
 
 fn framed_program(source: Bytes) -> CheckedProgram / {abort.raise} =
   match analyse_pulling_std_with(

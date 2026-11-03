@@ -16,14 +16,14 @@ import compiler.store.hash.forms (Identities)
 import compiler.emit.costs (placed_span)
 import compiler.syntax.parsing (span_between)
 import compiler.check.infer.checker (DefinitionInfo)
-import claims (Claim, ClaimsEntry, Collection, DischargeResult, NotCompiled, OwnClaims, Rejection,
-               StaticProver, claim_bin, discharge_library, discharging, lacks_proof, laws_by_key,
-               evidence_keys, no_static_prover, own_claims, proof_store, static_prover_of)
+import claims (Claim, ClaimPlace, ClaimsEntry, Collection, DischargeResult, NotCompiled, OwnClaims,
+               PendingClaim, Rejection, StaticProver, claim_bin, discharge_library, discharging,
+               lacks_proof, laws_by_key, evidence_keys, no_static_prover, own_claims, proof_store,
+               static_prover_of)
 import compiler.front.checking.view
 import compiler.front.checking.view (LaterReading)
 import compiler.front.checking.world (Modules)
 import compiler.store.memo (memo)
-import proof.decide (StaticResult)
 import std.machine as entering
 import std.time (time)
 import units
@@ -31,8 +31,9 @@ import units (EmbeddedFiles, emit)
 import compiler.unit (identity_of, shipped)
 import program (ProgramStore, Session, front_end, in_program_store)
 import proof.obligation (Builds, Definition, Kind, Law, WrittenLaw, definition_bin, written_law_bin)
-import proof.prover_input (Obligation, ProverInput, Static, Unhandled, empty_prover_input,
+import proof.prover_input (Obligation, ProverInput, ProverInputResult, empty_prover_input,
                            prover_input_of, written_before)
+import proof.discharge (guard_place)
 import proof.static_prover (claims_for, diagnosis_of, modules_of, prover_of)
 import proof.decide (Proved)
 import proof.goal (default_prove_budget)
@@ -51,19 +52,12 @@ pub fn claim_reading(modules: Modules) -> ClaimReading / {memo.read, abort.raise
 pub fn discharge_claims(
   s: Session<ClaimReading>,
   collection: Collection,
-  runs: List<Int>,
-  resolved: List<StaticResult>,
+  pending: List<PendingClaim>,
 ) -> Result<DischargeResult, Rejection> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.code, emit.libraries, discharging.decided, EmbeddedFiles, abort.raise} =
   match units::code_program_of(s, s.value.later.rollup) {
     Err(diagnostics) -> Err(NotCompiled({ diagnostics: diagnostics, places: collection.places })),
     Ok(program) ->
-      discharge_library(
-        program,
-        laws_by_key(s.value.later.rollup.laws),
-        collection,
-        runs,
-        resolved,
-      ),
+      discharge_library(program, laws_by_key(s.value.later.rollup.laws), collection, pending),
   }
 
 pub type ClaimedProgram = { mine: OwnClaims, statics: StaticProver }
@@ -122,13 +116,21 @@ fn placed_diagnostic(placing: Map<Int, Placement>, d: Diagnostic) -> Diagnostic 
     }),
   }
 
-fn placed_own(fresh: OwnClaims, placing: Map<Int, Placement>) -> OwnClaims =
+fn claim_place(placing: Map<Int, Placement>, o: Obligation) -> ClaimPlace =
   {
-    ..fresh,
-    claims: fresh.claims.map(|c: Claim|
-      { ..c, module: placed_module(placing, c.module), at: placed_place(placing, c.at) }),
-    warnings: fresh.warnings.map(|d: Diagnostic| placed_diagnostic(placing, d)),
+    module: placed_module(placing, o.module),
+    at: placed_place(placing, o.at),
+    guard: placed_place(placing, guard_place(o)),
   }
+
+fn placed_own(
+  w: Analysis,
+  built: ProverInputResult,
+  placing: Map<Int, Placement>,
+) -> OwnClaims / {abort.raise} = {
+  let fresh = own_claims(w, built, |o: Obligation| claim_place(placing, o));
+  { ..fresh, warnings: fresh.warnings.map(|d: Diagnostic| placed_diagnostic(placing, d)) }
+}
 
 type KnownModule = { name: Bytes, index: Int, identity: Bytes, claims: Option<ModuleClaims> }
 
@@ -157,44 +159,30 @@ fn known_module(
   }
 }
 
+fn in_slot(place: ClaimPlace, index: Int) -> ClaimPlace =
+  { module: index, at: in_module(place.at, index), guard: in_module(place.guard, index) }
+
 fn placed_claims(c: ModuleClaims, index: Int) -> ModuleClaims =
   {
     ..c,
-    claims: c.claims.map(|claim: Claim| { ..claim, module: index, at: in_module(claim.at, index) }),
+    claims: c.claims.map(|claim: Claim| { ..claim, place: in_slot(claim.place, index) }),
     warnings: c.warnings.map(|d: Diagnostic| placed_in(d, index)),
   }
 
 fn wants_view(known: KnownModule, every_module: Bool) -> Bool / {proof_store.cached, abort.raise} =
   every_module || (match known.claims { None -> true, Some(c) -> c.claims.any(lacks_proof) })
 
-type WorldClaim = { claim: Claim, obligation: Obligation }
-
-fn placeholder_obligation(c: Claim) -> Obligation =
-  {
-    key: c.key,
-    run_key: c.run_key,
-    owner: c.owner,
-    kind: c.kind,
-    module: c.module,
-    at: c.at,
-    binders: [],
-    result: None,
-    variables: [],
-    guards: [],
-    literals: [],
-    effects: None,
-    frame: c.frame,
-    strategy: Static(Unhandled("")),
-    identities: [],
-  }
+type WorldClaim = { claim: Claim, obligation: Option<Obligation> }
 
 fn kind_rank(k: Kind) -> Int = match k { Law(_) -> 2, Builds(_) -> 1, _ -> 0 }
 
 fn comes_first(a: WorldClaim, b: WorldClaim) -> Bool = {
-  let x = a.claim;
-  let y = b.claim;
-  kind_rank(x.kind) < kind_rank(y.kind)
-    || (kind_rank(x.kind) == kind_rank(y.kind)
+  let x = a.claim.place;
+  let y = b.claim.place;
+  let x_rank = kind_rank(a.claim.kind);
+  let y_rank = kind_rank(b.claim.kind);
+  x_rank < y_rank
+    || (x_rank == y_rank
     && (x.module < y.module || (x.module == y.module && !written_before(y.at, x.at))))
 }
 
@@ -237,7 +225,7 @@ fn fresh_by_module(
       found.insert(String::of_bytes_lossy(d.name), d.module),
   );
   {
-    claims: fresh.claims.group_by(|c: Claim| c.module),
+    claims: fresh.claims.group_by(|c: Claim| c.place.module),
     laws: fresh.laws.group_by(|l: WrittenLaw| law_module(known, l.key)),
     warnings: warnings_by_module(fresh.warnings),
     definitions: fresh.definitions.fold(
@@ -268,7 +256,7 @@ fn claims_of_program(
 ) -> OwnClaims = {
   let stored = held.fold([], |found: List<WorldClaim>, c: ModuleClaims|
     found.concat(
-      c.claims.map(|claim: Claim| { claim: claim, obligation: placeholder_obligation(claim) }),
+      c.claims.map(|claim: Claim| { claim: claim, obligation: None }),
     ));
   let all = stored.concat(fresh).sort_by(comes_first);
   {
@@ -277,7 +265,7 @@ fn claims_of_program(
       found.concat(c.definitions)),
     laws: held.fold([], |found: List<WrittenLaw>, c: ModuleClaims| found.concat(c.laws)),
     warnings: held.fold([], |found: List<Diagnostic>, c: ModuleClaims| found.concat(c.warnings)),
-    world: { ..world, obligations: all.map(|w: WorldClaim| w.obligation) },
+    world: { ..world, obligations: somes(all.map(|w: WorldClaim| w.obligation)) },
     modules: names,
   }
 }
@@ -291,7 +279,7 @@ fn claimed_with_view(
   let w = c.analysis;
   let owned = |m: Bytes| names.contains(m);
   let built = prover_input_of(w, c.identities, owned);
-  let fresh = placed_own(own_claims(w, built), placements(c.placed, names));
+  let fresh = placed_own(w, built, placements(c.placed, names));
   let opened = open.fold(Map::new(), |found: Map<Bytes, Int>, k: KnownModule|
     found.insert(k.name, k.index));
   let by_module = fresh_by_module(fresh, w, names, opened);
@@ -315,8 +303,8 @@ fn claimed_with_view(
     else { match k.claims { Some(claimed) -> found.push(claimed), None -> found } });
   let pairs = range(0, fresh.claims.len()).fold([], |found: List<WorldClaim>, i: Int| {
     let claim = fresh.claims.get(i);
-    if !opened.contains(names.at_or(claim.module, b"")) { found }
-    else { found.push({ claim: claim, obligation: built.world.obligations.get(i) }) }
+    if !opened.contains(names.at_or(claim.place.module, b"")) { found }
+    else { found.push({ claim: claim, obligation: Some(built.world.obligations.get(i)) }) }
   });
   let mine = claims_of_program(names, built.world, current, pairs);
   Ok({
@@ -458,16 +446,14 @@ test "the claims of the open modules, checked by group, are the claims of the wh
   }
 }
 
-test "a claim checked by group keeps its place in its file" {
+test "a claim checked by group keeps its place and its guard's place in its file" {
   match closure_over(claimed_sources, [b"app"]) {
     Err(_) -> panic("the claims of a checked program were rejected"),
     Ok(c) -> {
       let names = [b"app", b"lib", b"other"];
       let fresh = placed_own(
-        own_claims(
-          c.analysis,
-          prover_input_of(c.analysis, c.identities, |m: Bytes| names.contains(m)),
-        ),
+        c.analysis,
+        prover_input_of(c.analysis, c.identities, |m: Bytes| names.contains(m)),
         placements(c.placed, names),
       );
       let text = claimed_sources.get(0).source_text;
@@ -475,10 +461,12 @@ test "a claim checked by group keeps its place in its file" {
       assert(four.len() > 0);
       assert(
         four.all(|claim: Claim|
-          match claim.at {
-            InSource(at) ->
-              claim.module == 0 && at.module == 0 && text.slice(at.start, at.end).len() > 0
-                && text.slice(0, at.start).index_of(b"pub fn four") != None,
+          match ((claim.place.at, claim.place.guard)) {
+            (InSource(at), InSource(guard)) ->
+              claim.place.module == 0 && at.module == 0 && text.slice(at.start, at.end).len() > 0
+                && text.slice(0, at.start).index_of(b"pub fn four") != None
+                && guard.module == 0
+                && text.slice(guard.start, guard.end) == b"n > 0 && n < 1000",
             _ -> false,
           }),
       )
@@ -580,7 +568,9 @@ test "a module loaded without the others keeps its place among all modules" {
   match claimed_over(modules_with_claims(3, b"n + 2").reverse(), first).claimed {
     Ok(c) -> {
       let named = |claim: Claim|
-        claim.owner.starts_with(String::of_bytes_lossy(c.mine.modules.get(claim.module)) ++ ".");
+        claim.owner.starts_with(
+          String::of_bytes_lossy(c.mine.modules.get(claim.place.module)) ++ ".",
+        );
       assert(c.mine.claims.len() > 0 && c.mine.claims.all(named))
     },
     Err(_) -> panic("the claims of a program with no errors do not load"),
