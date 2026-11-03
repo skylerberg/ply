@@ -28,7 +28,9 @@ import compiler.check.infer.checker (ConstructorInfo)
 import std.bytes (u32_be)
 import std.hash (blake3)
 import paths
-import program (ProgramPlace, Session, in_program_store, store_of)
+import program (ProgramPlace, Session, in_program_store)
+import project_store (DatabasePlace, InWorkingDirectory, AtAbsolutePath, database_place, databases)
+import compiler.store.fact_store (Opening)
 import std.env (env)
 import sources
 import std.fs (fs)
@@ -38,9 +40,13 @@ import std.time (time)
 
 pub type CodeProgram = { place: ProgramPlace, inputs: Map<Bytes, Bytes>, roots: Map<Bytes, Place> }
 
+pub type CodeSource =
+  | HeldInMemory(Map<Bytes, Bytes>)
+  | InDatabase({ place: DatabasePlace, opening: Opening })
+
 pub type Emitted = {
   code: ProgramCode,
-  held: Map<Bytes, Bytes>,
+  source: CodeSource,
   place: ProgramPlace,
   inputs: Map<Bytes, Bytes>,
 }
@@ -81,7 +87,7 @@ pub fn library_of(
 
 pub fn emitting<a | e>(
   body: () -> a / {emit.code, emit.compiled, emit.libraries | e},
-) -> a / {abort.raise, Emits, EmbedSnapshot | e} =
+) -> a / {abort.raise, Emits, EmbedSnapshot, databases.open | e} =
   handle {
     body()
   } with {
@@ -132,22 +138,35 @@ fn with_codes(
 fn code_of(
   program: CodeProgram,
   roots: List<RootKey>,
-) -> Emitted / {Emits, EmbedSnapshot, abort.raise} = {
+) -> Emitted / {Emits, EmbedSnapshot, databases.open, abort.raise} = {
   let found = progress::silently(||
     in_program_store(program.place, |_: LoadInputs|
       with_codes(program_code(entries_of(roots)), program.place.store == None))).value;
-  { code: found.code, held: found.held, place: program.place, inputs: program.inputs }
+  {
+    code: found.code,
+    source: match program.place.store {
+      None -> HeldInMemory(found.held),
+      Some(r) -> {
+        let place = database_place(r);
+        InDatabase({ place: place, opening: databases.open(place) })
+      },
+    },
+    place: program.place,
+    inputs: program.inputs,
+  }
 }
 
 fn stored_codes(
   e: Emitted,
   digests: List<Bytes>,
 ) -> Map<Bytes, Bytes> / {fs.read[cwd], fs.read[abs], abort.raise} =
-  match e.place.store {
-    None -> e.held,
-    Some(r) ->
-      kept_codes(if r.label == "cwd" { database::outputs_by_digest[cwd](store_of(r), digests) }
-      else { database::outputs_by_digest[abs](store_of(r), digests) }),
+  match e.source {
+    HeldInMemory(held) -> held,
+    InDatabase(stored) ->
+      kept_codes(match stored.place {
+        InWorkingDirectory(_) -> database::outputs_by_digest[cwd](stored.opening, digests),
+        AtAbsolutePath(_) -> database::outputs_by_digest[abs](stored.opening, digests),
+      }),
   }
 
 fn kept_codes(outputs: Map<Bytes, database::StoredOutput>) -> Map<Bytes, Bytes> / {abort.raise} =

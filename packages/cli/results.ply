@@ -12,6 +12,9 @@ import compiler.store.hash.forms (DefinitionHash, ModuleHashes, ModuleRecord, No
 import compiler.check.resolve.tables (Diagnostic)
 import compiler.store.hash.graph (HeldValue)
 import project_store
+import project_store (InWorkingDirectory, AtAbsolutePath, databases)
+import compiler.store.database (database_in, open_database)
+import compiler.store.fact_store (Opening)
 import paths
 import store.tables
 import store.fake (run_in_memory)
@@ -30,18 +33,22 @@ pub type OpenStore = { place: project_store::StoreLocation, cache: tables::Cache
 
 pub fn store_for(
   paths: List<paths::ResolvedPath>,
-) -> OpenStore / {semantics.cached, fs.read[cwd], fs.read[abs], fs.read_file[shipped], abort.raise} =
+) -> OpenStore / {databases.open, semantics.cached, fs.read[cwd], fs.read[abs], fs.read_file[shipped], abort.raise} =
   open_store(paths, project_store::shipped_stamps())
 
 pub fn open_store(
   paths: List<paths::ResolvedPath>,
   stamps: tables::Stamps,
-) -> OpenStore / {fs.read[cwd], fs.read[abs], abort.raise} = {
+) -> OpenStore / {databases.open, fs.read[cwd], fs.read[abs], abort.raise} = {
   let place = project_store::store_location_of(paths, stamps);
+  let database = project_store::database_place_of(place);
+  let opening = databases.open(database);
   {
     place: place,
-    cache: if place.label == "cwd" { tables::open_cache[cwd](place.dir, stamps) }
-    else { tables::open_cache[abs](place.dir, stamps) },
+    cache: match database {
+      InWorkingDirectory(_) -> tables::open_cache[cwd](opening, stamps),
+      AtAbsolutePath(_) -> tables::open_cache[abs](opening, stamps),
+    },
   }
 }
 
@@ -595,6 +602,8 @@ const an_update: StoreUpdate =
 
 const some_stamps: tables::Stamps = { runtime_digest: "runtime", code: "code" }
 
+fn cache_database() -> Opening / {fs.write[mem]} = open_database[mem](database_in("cache"))
+
 const original_definition: { hash: Bytes, text: Bytes } =
   { hash: blake3(b"m.f"), text: b"fn f() -> Int = 1\n" }
 
@@ -604,14 +613,14 @@ fn read_back(
 ) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
   run_in_memory(mem_empty(), || {
     let c0 = store_pass(
-      tables::open_cache[mem]("cache", some_stamps),
+      tables::open_cache[mem](cache_database(), some_stamps),
       [original_definition],
       [a_module],
       [a_module.record],
     );
     let c1 = tables::flush_cache[mem](put_update(c0, f, seen));
-    let r = tables::open_cache[mem]("cache", some_stamps);
-    let moved = tables::open_cache[mem]("cache", { ..some_stamps, runtime_digest: "another" });
+    let r = tables::open_cache[mem](cache_database(), some_stamps);
+    let moved = tables::open_cache[mem](cache_database(), { ..some_stamps, runtime_digest: "another" });
     {
       passes: read_pass_traces(r, [hashed("t key"), hashed("other")]).value,
       codes: code_passes_over(r, [hashed("t code"), hashed("t key")]).value,
@@ -646,7 +655,7 @@ test "a stored run reads back its passing results, baselines and whether each te
 
 test "a baseline is not returned when the module record it was made from is missing from the cache" {
   let back = run_in_memory(mem_empty(), || {
-    let c = put_update(tables::open_cache[mem]("cache", some_stamps), an_update, []);
+    let c = put_update(tables::open_cache[mem](cache_database(), some_stamps), an_update, []);
     last_passes_over(tables::put_snapshot(c, [a_module.record]), [b"m.t"]).value
   }).value;
   assert_eq(back, [None])
@@ -655,13 +664,13 @@ test "a baseline is not returned when the module record it was made from is miss
 test "opening the cache under a different runtime digest drops the stored baselines and passing results but still returns the definition texts" {
   let back = run_in_memory(mem_empty(), || {
     let recorded = store_pass(
-      tables::open_cache[mem]("cache", some_stamps),
+      tables::open_cache[mem](cache_database(), some_stamps),
       [original_definition],
       [a_module],
       [a_module.record],
     );
     let c1 = tables::flush_cache[mem](put_update(recorded, an_update, []));
-    let moved = tables::open_cache[mem]("cache", { ..some_stamps, runtime_digest: "another" });
+    let moved = tables::open_cache[mem](cache_database(), { ..some_stamps, runtime_digest: "another" });
     {
       baselines: last_passes_over(moved, [b"m.t"]).value,
       texts: read_texts(moved, [original_definition.hash]).value,
@@ -693,7 +702,7 @@ test "a run after a crash stores the passes its journal finished, returns the te
   let back = run_in_memory(mem_empty(), || {
     let opened = {
       place: { label: "mem", dir: "cache", root: "", stamps: some_stamps },
-      cache: tables::open_cache[mem]("cache", some_stamps),
+      cache: tables::open_cache[mem](cache_database(), some_stamps),
     };
     let j = journal_of(opened);
     let rows = tables::rows_written(opened.cache, |c: tables::Cache| put_update(c, an_update, []));
@@ -710,7 +719,7 @@ test "a run after a crash stores the passes its journal finished, returns the te
     let begun = begun_journal[mem](opened, j);
     {
       interrupted: begun.interrupted,
-      passes: read_pass_traces(tables::open_cache[mem]("cache", some_stamps), [
+      passes: read_pass_traces(tables::open_cache[mem](cache_database(), some_stamps), [
         hashed("t key"),
       ]).value,
       left: recovery_of(read_journal[mem](j), some_stamps),

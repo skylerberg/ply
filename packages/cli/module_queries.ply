@@ -11,7 +11,9 @@ import compiler.store.memo.engine (Run, QueryStats, reachable_keys, missing_coun
                                    in_session, query_stats)
 import compiler.store.memo.store (QueriesId, queries_id)
 import compiler.store.database
+import compiler.store.database (StoreOutcome, StoreProblem)
 import compiler.store.packs
+import project_store (DatabasePlace, InWorkingDirectory, AtAbsolutePath, databases)
 import compiler.unit (shipped, pack_frame)
 import compiler.front.checking (CheckedModule, PackageFile, LoadInputs, LoadResults, query_load,
                                 declaring_in, documented_all, evaluator_of, hashed_all,
@@ -107,18 +109,18 @@ pub type Opened<a> = {
   value: a,
   tallies: List<QueryStats>,
   missing_results: Int,
-  damage: Option<String>,
+  problems: List<StoreProblem>,
 }
 
 type SessionRead<a> = { value: a, tallies: List<QueryStats>, missing_results: Int }
 
-fn opened_from<a>(w: LoadInputs, done: database::StoreOutcome<SessionRead<a>>) -> Opened<a> =
+fn opened_from<a>(w: LoadInputs, done: StoreOutcome<SessionRead<a>>) -> Opened<a> =
   {
     inputs: w,
     value: done.value.value,
     tallies: done.value.tallies,
     missing_results: done.value.missing_results,
-    damage: done.damage,
+    problems: done.problems,
   }
 
 fn read_session<a>(
@@ -138,30 +140,29 @@ fn read_session<a>(
     }
   })
 
-pub fn stored_session<a, [r]>(
-  dir: String,
+pub fn stored_session<a>(
+  place: DatabasePlace,
   project: Project,
   work: (LoadInputs) -> a / {SessionReads, fact_inspection.read, abort.raise},
-) -> Opened<a> / {fs.read[abs], toolchain.read, fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Derives, progress.write, abort.raise} = {
+) -> Opened<a> / {databases.open, toolchain.read, fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Derives, progress.write, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
-  opened_from(
-    w,
-    database::with_database[r](
-      dir,
-      pack_frame,
-      shipped_files(),
-      |kind: Bytes, at: Bytes|
-        read_project_input(
-          w,
-          |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-          kind,
-          at,
-        ),
-      |query: Bytes| progress.computed(query),
-      || with_decode_cache(|| read_session(qs, w, work)),
-    ),
-  )
+  let opening = databases.open(place);
+  let look = |kind: Bytes, at: Bytes|
+    read_project_input(
+      w,
+      |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
+      kind,
+      at,
+    );
+  let noted = |query: Bytes| progress.computed(query);
+  let session = || with_decode_cache(|| read_session(qs, w, work));
+  opened_from(w, match place {
+    InWorkingDirectory(_) ->
+      database::with_opened_database[cwd](opening, pack_frame, shipped_files(), look, noted, session),
+    AtAbsolutePath(_) ->
+      database::with_opened_database[abs](opening, pack_frame, shipped_files(), look, noted, session),
+  })
 }
 
 pub type PromiseFacts = { costs: List<Report>, measures: List<MeasureEntry> }
@@ -213,7 +214,7 @@ pub fn temporary_session<a>(
         ),
       || with_decode_cache(|| read_session(qs, w, work)),
     ).value,
-    damage: None,
+    problems: [],
   })
 }
 
@@ -222,7 +223,7 @@ pub type ShippedResults = { queries: QueriesId, keys: List<Bytes>, rejected: Lis
 pub fn shipped_results<[r]>(
   store_dir: String,
   shipped: List<Bytes>,
-) -> ShippedResults / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], Derives, abort.raise} = {
+) -> StoreOutcome<ShippedResults> / {fs.list_dir[shipped], fs.read[r], fs.write[r], fs.read_file[shipped], Derives, abort.raise} = {
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   let wanted = Set::of_list(shipped_queries);
@@ -255,7 +256,7 @@ pub fn shipped_results<[r]>(
             },
           }
         })),
-  ).value
+  )
 }
 
 pub fn write_shipped_pack<[r]>(
