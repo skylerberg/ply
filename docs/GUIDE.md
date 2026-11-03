@@ -2495,7 +2495,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | command | options |
 | --- | --- |
 | `ply new PATH` | `--name NAME`, `--lib` |
-| `ply check [path]` | `--types` (each definition's type and effects), `--costs` (where an update to a value copies it instead of changing it in place, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
+| `ply check [path]` | `--fix` (apply every diagnostic's fixes to the files, then check again), `--types` (each definition's type and effects), `--costs` (where an update to a value copies it instead of changing it in place, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
 | `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--explain`, `--watch`, `--coverage` |
 | `ply run [path] [-- ARGS]` | `--seed`, `--timeout`, `--profile`, `--explain`, `--require-signer KEY`, and the flags for choosing the program's hosts (the handlers that supply its real effects), for tracing, and for draining on shutdown. `ARGS` is what `process.args` returns. A `.plyx` path runs a built program. |
 | `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--explain`, `--static-prover`, `--workspace`, `--verify-dependencies`, simulation flags |
@@ -2635,7 +2635,9 @@ explain --all` lists them all.
 
 Under `--json`, a diagnostic with a known fix includes `fixes`. Each fix has a `title` and `edits`,
 and each edit replaces the text from `start` to `end` of `file` with `text`. On a terminal, a fix is
-shown as a `= fix:` line. A runtime diagnostic, such as a failed assertion, cuts a long value short
+shown as a `= fix:` line. When a body performs an effect its signature lacks, every caller that does
+not handle the effect gets its own error and fix in the same run, so `ply check --fix` fixes the
+whole chain at once. A runtime diagnostic, such as a failed assertion, cuts a long value short
 with `… N more`; under `--json` the whole value is in `values`.
 
 ## 19. Limits and sharp edges
