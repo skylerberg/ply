@@ -1,0 +1,159 @@
+import std.bin
+import compiler.store.memo (memo, Parts, digest_of, main_part)
+
+pub type QueryOf<i, o> = { name: Bytes, input: bin::BinCodec<i>, output: bin::BinCodec<o> }
+
+pub type PartOf<i, q, o> = { query: QueryOf<i, q>, name: Bytes, output: bin::BinCodec<o> }
+
+pub type KeyedPartOf<i, q, k, o> = {
+  query: QueryOf<i, q>,
+  name: Bytes,
+  key: bin::BinCodec<k>,
+  output: bin::BinCodec<o>,
+}
+
+pub type Written = { parts: Parts }
+
+pub type QueryDefinition<| e> = {
+  name: Bytes,
+  definition: Bytes,
+  body: (Bytes) -> Parts / {memo.read, memo.write, abort.raise | e},
+}
+
+pub fn main_part_of<i, o>(q: QueryOf<i, o>) -> PartOf<i, o, o> =
+  { query: q, name: main_part, output: q.output }
+
+fn keyed_name<i, q, k, o>(p: KeyedPartOf<i, q, k, o>, key: k) -> Bytes / {abort.raise} =
+  Bytes::concat_all([p.name, b"\x00", bin::encode(key, p.key)])
+
+fn decoded_output<a>(bytes: Bytes, codec: bin::BinCodec<a>, query: Bytes) -> a / {abort.raise} =
+  match bin::decode(bytes, codec) {
+    Ok(x) -> x,
+    Err(e) ->
+      panic(
+        "the stored result of the query `" ++ String::of_bytes_lossy(query) ++ "` does not decode: "
+          ++ e.message,
+      ),
+  }
+
+fn missing<a>(query: Bytes, part: Bytes) -> a / {abort.raise} =
+  panic(
+    "the query `" ++ String::of_bytes_lossy(query) ++ "` wrote no part `"
+      ++ String::of_bytes_lossy(part)
+      ++ "`",
+  )
+
+fn present<a>(found: Option<a>, query: Bytes, part: Bytes) -> a / {abort.raise} =
+  match found { Some(x) -> x, None -> missing(query, part) }
+
+pub fn fetched<i, o>(q: QueryOf<i, o>, input: i) -> o / {memo.read, abort.raise} =
+  part_fetched(main_part_of(q), input)
+
+pub fn all_fetched<i, o>(q: QueryOf<i, o>, inputs: List<i>) -> List<o> / {memo.read, abort.raise} =
+  memo.fetch_all(q.name, inputs.map(|x: i| bin::encode(x, q.input)), main_part).map(
+    |found: Option<Bytes>| decoded_output(present(found, q.name, main_part), q.output, q.name),
+  )
+
+pub fn fetched_digest<i, o>(q: QueryOf<i, o>, input: i) -> Bytes / {memo.read, abort.raise} =
+  memo.output_digest(q.name, bin::encode(input, q.input), main_part)
+
+pub fn part_fetched<i, q, o>(p: PartOf<i, q, o>, input: i) -> o / {memo.read, abort.raise} =
+  decoded_output(
+    present(
+      memo.fetch(p.query.name, bin::encode(input, p.query.input), p.name),
+      p.query.name,
+      p.name,
+    ),
+    p.output,
+    p.query.name,
+  )
+
+pub fn keyed_part_fetched<i, q, k, o>(
+  p: KeyedPartOf<i, q, k, o>,
+  input: i,
+  key: k,
+) -> Option<o> / {memo.read, abort.raise} =
+  match memo.fetch(p.query.name, bin::encode(input, p.query.input), keyed_name(p, key)) {
+    Some(b) -> Some(decoded_output(b, p.output, p.query.name)),
+    None -> None,
+  }
+
+pub fn part_fetched_once<i, q, o | e>(
+  p: PartOf<i, q, o>,
+  input: i,
+  cached: (Bytes) -> Option<o> / e,
+  cache: (Bytes, o) -> Unit / e,
+) -> o / {memo.read, abort.raise | e} =
+  present(
+    fetched_once(p.query.name, bin::encode(input, p.query.input), p.name, p.output, cached, cache),
+    p.query.name,
+    p.name,
+  )
+
+pub fn keyed_part_fetched_once<i, q, k, o | e>(
+  p: KeyedPartOf<i, q, k, o>,
+  input: i,
+  key: k,
+  cached: (Bytes) -> Option<o> / e,
+  cache: (Bytes, o) -> Unit / e,
+) -> Option<o> / {memo.read, abort.raise | e} =
+  fetched_once(
+    p.query.name,
+    bin::encode(input, p.query.input),
+    keyed_name(p, key),
+    p.output,
+    cached,
+    cache,
+  )
+
+fn fetched_once<o | e>(
+  query: Bytes,
+  input: Bytes,
+  part: Bytes,
+  codec: bin::BinCodec<o>,
+  cached: (Bytes) -> Option<o> / e,
+  cache: (Bytes, o) -> Unit / e,
+) -> Option<o> / {memo.read, abort.raise | e} = {
+  let digest = memo.output_digest(query, input, part);
+  if digest == digest_of(None) { None } else {
+    match cached(digest) {
+      Some(value) -> Some(value),
+      None -> match match memo.stored_output(digest) {
+          Some(b) -> Some(b),
+          None -> memo.fetch(query, input, part),
+        } {
+        None -> None,
+        Some(b) -> {
+          let value = decoded_output(b, codec, query);
+          cache(digest, value);
+          Some(value)
+        },
+      },
+    }
+  }
+}
+
+pub fn written<i, o>(q: QueryOf<i, o>, output: o) -> Written / {abort.raise} =
+  { parts: Map::new().insert(main_part, bin::encode(output, q.output)) }
+
+pub fn with_part<i, q, o>(w: Written, p: PartOf<i, q, o>, value: o) -> Written / {abort.raise} =
+  { parts: w.parts.insert(p.name, bin::encode(value, p.output)) }
+
+pub fn with_keyed_part<i, q, k, o>(
+  w: Written,
+  p: KeyedPartOf<i, q, k, o>,
+  key: k,
+  value: o,
+) -> Written / {abort.raise} =
+  { parts: w.parts.insert(keyed_name(p, key), bin::encode(value, p.output)) }
+
+pub fn query_definition<i, o | e>(
+  q: QueryOf<i, o>,
+  definition: Bytes,
+  body: keep (i) -> Written / {memo.read, memo.write, abort.raise | e},
+) -> QueryDefinition<| e> =
+  {
+    name: q.name,
+    definition: definition,
+    body: |input: Bytes| body(decoded_output(input, q.input, q.name)).parts,
+  }

@@ -2,7 +2,8 @@ import std.bin
 import std.hash (blake3)
 import std.bytes
 import std.list
-import compiler.store.memo (memo, memo_store, Query, Queries)
+import compiler.store.memo (memo, memo_store, Query, Queries, digest_of)
+import compiler.store.handles (QueryOf, QueryDefinition, Written, written)
 import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, InPackage, ShippedModule,
                                CheckInputs, owner_interface_bin, module_origin_bin)
 import compiler.check.infer.checker (StoredDeclarations)
@@ -130,6 +131,8 @@ pub effect set SessionReads = {memo.read, decode_cache.read, decode_cache.write}
 
 pub type CheckQuery = Query<| {decode_cache.read, decode_cache.write}>
 
+pub type CheckDefinition = QueryDefinition<| {decode_cache.read, decode_cache.write}>
+
 pub type CheckQueries = Queries<| {decode_cache.read, decode_cache.write}>
 
 pub fn check_queries(named: Map<Bytes, CheckQuery>) -> CheckQueries =
@@ -192,9 +195,9 @@ test "a second read of a parsed text reads the same derivations again" {
       read = read.push(at);
       None
     },
-    memo.fetch(query, input) -> b"",
-    memo.fetch_all(query, inputs) -> inputs.map(|_: Bytes| b""),
-    memo.output_digest(query, input) -> b"",
+    memo.fetch(query, input, part) -> None,
+    memo.fetch_all(query, inputs, part) -> inputs.map(|_: Bytes| None),
+    memo.output_digest(query, input, part) -> digest_of(None),
     memo.stored_output(digest) -> None,
     return done -> read,
   };
@@ -266,23 +269,6 @@ fn imported_once(text: Bytes) -> Bytes / {decode_cache.read, decode_cache.write,
   }
 }
 
-pub fn context_once(named: ModuleKey) -> Context / {SessionReads, abort.raise} = {
-  let input = bin::encode(named, module_key_bin());
-  let digest = memo.output_digest(context_query, input);
-  match decode_cache.context(digest) {
-    Some(c) -> c,
-    None -> {
-      let c = decoded(
-        match memo.stored_output(digest) { Some(b) -> b, None -> memo.fetch(context_query, input) },
-        context_bin(),
-        "a module's context",
-      );
-      decode_cache.cache_context(digest, c);
-      c
-    },
-  }
-}
-
 pub fn decoded<a>(b: Bytes, codec: bin::BinCodec<a>, what: String) -> a / {abort.raise} =
   match bin::decode(b, codec) {
     Ok(x) -> x,
@@ -347,8 +333,6 @@ fn target_of(
 
 pub fn shipped_for(asker_shipped: Bool, name: Bytes) -> Bool / {memo.read, abort.raise} =
   asker_shipped || package_location_of(name) == None
-
-pub const module_query: Bytes = b"module"
 
 pub type ModuleRead = {
   source: Source,
@@ -462,8 +446,6 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
   }
 }
 
-pub const imports_query: Bytes = b"imports"
-
 pub type ImportOf = { named: ModuleKey, span: Span }
 
 pub type ImportsOf = { imports: List<ImportOf> }
@@ -472,31 +454,30 @@ derive bin for ImportOf
 
 derive bin for ImportsOf
 
-pub fn imports_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let query_key = decoded(input, module_key_bin(), "a module's name");
+pub fn imports_query() -> QueryOf<ModuleKey, ImportsOf> =
+  { name: b"imports", input: module_key_bin(), output: imports_of_bin() }
+
+pub fn imports_result(query_key: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let module = query_key.module;
   let placing = if query_key.shipped { None } else { package_location_of(module) };
   let text = if query_key.shipped { shipped_text(module) }
   else { match placing { Some(_) -> memo.external(text_kind, module), None -> None } };
-  bin::encode(
-    {
-      imports: match text {
-        None -> [],
-        Some(module_text) -> {
-          let raw = match header(module_text) { Some(m) -> m, None -> parse(module_text).node };
-          let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
-          let prefix = if query_key.shipped { b"" } else { prefix_in(build_packages(), package) };
-          raw.imports.fold([], |accumulator: List<ImportOf>, d: ImportDeclaration| {
-            let t = target_of(query_key.shipped, prefix, package, d);
-            let there = if t.shipped { shipped_module_exists(t.module) }
-            else { package_location_of(t.module) != None };
-            if there { accumulator.push({ named: t, span: path_span(d) }) } else { accumulator }
-          })
-        },
+  written(imports_query(), {
+    imports: match text {
+      None -> [],
+      Some(module_text) -> {
+        let raw = match header(module_text) { Some(m) -> m, None -> parse(module_text).node };
+        let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
+        let prefix = if query_key.shipped { b"" } else { prefix_in(build_packages(), package) };
+        raw.imports.fold([], |accumulator: List<ImportOf>, d: ImportDeclaration| {
+          let t = target_of(query_key.shipped, prefix, package, d);
+          let there = if t.shipped { shipped_module_exists(t.module) }
+          else { package_location_of(t.module) != None };
+          if there { accumulator.push({ named: t, span: path_span(d) }) } else { accumulator }
+        })
       },
     },
-    imports_of_bin(),
-  )
+  })
 }
 
 pub fn absent(module: Bytes) -> ModuleResult / {abort.raise} =
@@ -536,5 +517,3 @@ pub type Setting = {
 derive bin for Setting
 
 derive bin for Context
-
-pub const context_query: Bytes = b"context"
