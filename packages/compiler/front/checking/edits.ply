@@ -27,20 +27,22 @@ import compiler.expand.embed (EmbedFile, embed_file)
 import compiler.check.resolve.tables (Source, Diagnostic, backticked)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo)
 import compiler.front.checking.view
-import compiler.store.hash.forms (CachedNode, CachedHashes, hash_input_bin, cached_node_bin,
-                                  joined_cached_hashes)
+import compiler.store.hash.forms (DefinitionHash, OwnHashes, joined_module_hashes, definition_key,
+                                  TestRun)
+import compiler.store.hash.graph (HeldValue)
+import compiler.front.checking.identity (SubjectKey, identity_of)
 import compiler.store.hash (body_key, checked_body)
 import std.gen
 import compiler.front.checking.world (PackageLocation, ModuleKey, InterfaceKey, Embedding,
                                       ModuleResult, package_location_bin, module_key_bin,
                                       interface_key_bin, embedding_bin, QueryEffects, CheckQuery,
                                       decoded, setting_bin, deriver_kind)
-import compiler.front.checking.groups (GroupKey, hash_summary_query, module_listing_query,
+import compiler.front.checking.groups (GroupKey, module_listing_query,
                                        module_rollup_query, owner_key_bin, group_key_bin,
                                        owners_result_bin, owners_query, cycles_query, group_query,
                                        signatures_query, typed_query, group_hash_query, owner_facts,
                                        always_entire, imports_of, current, current_unit, group_of,
-                                       group_hash_inputs, hashes_query, tables_of_result,
+                                       hashes_query, tables_of_result,
                                        sorted_bytes, program_summary_query, module_query)
 import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, CheckedModule,
                                 facts_of_result, checked_program_from_results, query_load,
@@ -52,13 +54,13 @@ import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, Ch
                                 product_queries, check_sources, check_with_pack, layered,
                                 shipped_store, pack_of, module_of)
 
-type Reference = { whole: OutcomeSummary, fixing: CachedHashes, results: List<CheckedModule> }
+type Reference = { whole: OutcomeSummary, own_hashes: OwnHashes, results: List<CheckedModule> }
 
 fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
   let fresh = queried_results(fresh_registry(), empty_memory_store, sources);
   {
     whole: outcome_summary(analyse(parse_all(sources))),
-    fixing: fresh.fixing,
+    own_hashes: fresh.own_hashes,
     results: fresh.results,
   }
 }
@@ -83,7 +85,7 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
       };
       let same_outcome = r.results == warm.results
         || now == outcome_summary(outcome_of(step.sources, r.results));
-      let agrees = same_outcome && warm.fixing == r.fixing
+      let agrees = same_outcome && warm.own_hashes == r.own_hashes
         && (match r.whole {
           PublicationSummary(_) -> now == r.whole,
           RejectionSummary(_) -> match now {
@@ -95,15 +97,15 @@ pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
         store: warm.store,
         references: s.references.insert(key, r),
         off: if agrees { s.off } else {
-          s.off.push(Bytes::concat_all([step.what, hash_differences(warm.fixing, r.fixing)]))
+          s.off.push(Bytes::concat_all([step.what, hash_differences(warm.own_hashes, r.own_hashes)]))
         },
       }
     },
   ).off
 
-fn hash_differences(warm: CachedHashes, fresh: CachedHashes) -> Bytes = {
-  let by = |f: CachedHashes|
-    f.nodes.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, x: CachedNode|
+fn hash_differences(warm: OwnHashes, fresh: OwnHashes) -> Bytes = {
+  let by = |f: OwnHashes|
+    f.definitions.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, x: DefinitionHash|
       accumulator.insert(x.name, x.hash));
   let w = by(warm);
   let c = by(fresh);
@@ -310,6 +312,59 @@ const reworked: { steps: List<Step>, last: List<Source> } = {
     ],
     last: s6,
   }
+}
+
+type IdentityRun = { store: MemoryStore, own: OwnHashes, identity: Option<Bytes> }
+
+fn identified_over(
+  store: MemoryStore,
+  sources: List<Source>,
+  subject: SubjectKey,
+) -> IdentityRun / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    prelude_files,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          let all = query_load(w.own, [], false, module_of);
+          {
+            own: joined_module_hashes(hashed_all(w.own, all.pulled, false)),
+            identity: identity_of(subject),
+          }
+        })),
+  );
+  { store: done.store, own: done.value.own, identity: done.value.identity }
+}
+
+test "after a body edit, every other definition keeps its stored hash, and the identity of a test that reaches the edit changes" {
+  let before = [
+    {
+      name: b"m",
+      source_text: b"pub fn first(x: Int) -> Int = x * 3\npub fn caller(x: Int) -> Int = first(x) + 1\npub fn apart(x: Int) -> Int = x - 1\ntest \"calls\" { assert_eq(caller(1), 4) }\n",
+    },
+    { name: b"n", source_text: b"import m\npub fn far(x: Int) -> Int = m::caller(x) + 1\n" },
+  ];
+  let after = edited(before, b"m", b"x * 3", b"x * 5");
+  let calls = { module: b"m", shipped: false, tested: false, subject: TestRun(b"m.calls") };
+  let first = identified_over(empty_memory_store, before, calls);
+  let second = identified_over(first.store, after, calls);
+  let hashes = |own: OwnHashes|
+    own.definitions.fold(Map::new(), |found: Map<Bytes, Bytes>, d: DefinitionHash|
+      found.insert(definition_key(d.name, d.kind), d.hash));
+  let was = hashes(first.own);
+  let now = hashes(second.own);
+  let edited_key = definition_key(b"m.first", HeldValue);
+  assert(was.contains(definition_key(b"n.far", HeldValue)), None);
+  assert(was.get(edited_key) != now.get(edited_key), None);
+  assert_eq(was.remove(edited_key), now.remove(edited_key));
+  assert(first.identity != None, None);
+  assert(first.identity != second.identity, None);
+  assert_eq(second.identity, identified_over(empty_memory_store, after, calls).identity)
 }
 
 test "reusing cached results matches checking from scratch after edits to bodies, signatures, `pub` and imports" {
@@ -1180,24 +1235,16 @@ const hashed_fixture: List<Source> =
     },
   ]
 
-test "a program hashed from its modules' results has the same hashes and warnings as the program hashed in one pass" {
+test "a program checked one module at a time gives the same warnings as the program hashed in one pass" {
   [unedited_sources, hashed_fixture].fold((), |u: Unit, sources: List<Source>| {
     let fixed = check_sources(empty_memory_store, sources, []);
-    let whole = load_with_shipped(sources, []);
-    match ((
-        whole.hashed,
-        checked_staged(whole, no_rows).out,
-        load_with_shipped(sources, [], fixed: fixed.cached_hashes).hashed,
-      )) {
-      (Ok(read), Analysed(checked), Ok(taken)) -> {
-        assert_eq(taken.hashes, checked.hashes);
-        assert_eq(taken.unused, []);
+    match load_with_shipped(sources, []).hashed {
+      Ok(read) ->
         assert_eq(
           owner_checks::diagnostic_summaries(fixed.warnings),
           owner_checks::diagnostic_summaries(read.unused),
-        )
-      },
-      _ -> panic("the fixture hashes"),
+        ),
+      Err(_) -> panic("the fixture hashes"),
     }
   })
 }
@@ -1212,7 +1259,7 @@ test "assembling a program from per-module check results gives the same definiti
         Analysed(w) -> {
           let returned = assembled_program(
             fixed.results.map(|a: CheckedModule| facts_of_result(a.result)),
-            fixed.cached_hashes,
+            fixed.own_hashes,
             with_prelude_source([]).fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
               accumulator.insert(s.name, s.source_text)),
             true,
@@ -1301,7 +1348,7 @@ fn load_with_analysis(
           {
             results: all.results,
             pulled: all.pulled,
-            fixing: joined_cached_hashes(hashed_all(w.own, all.pulled, tested)),
+            own_hashes: joined_module_hashes(hashed_all(w.own, all.pulled, tested)),
           }
         }))
     },
@@ -1311,7 +1358,7 @@ fn load_with_analysis(
     { root: b"", manifest: None, supplied: [] },
     done.results.fold(Map::new(), |accumulator: Map<Bytes, ModuleShape>, a: CheckedModule|
       accumulator.insert(a.module, a.result.shape)),
-    done.fixing,
+    done.own_hashes,
     done.pulled,
     names,
     texts,
@@ -1437,9 +1484,9 @@ test "a function body that calls a method on a value records the same check resu
       ],
     },
   ].fold((), |u: Unit, fixture: { names: Bool, sources: List<Source> }| {
-    let returned = check_sources(empty_memory_store, fixture.sources, []).cached_hashes.nodes.fold(
+    let returned = check_sources(empty_memory_store, fixture.sources, []).own_hashes.definitions.fold(
       b"",
-      |accumulator: Bytes, x: CachedNode| if x.name == b"m.f" { x.body } else { accumulator },
+      |accumulator: Bytes, x: DefinitionHash| if x.name == b"m.f" { x.body } else { accumulator },
     );
     match analyse_pulling_std_with(fixture.sources, [], no_rows).out {
       Rejected(_) -> panic("the fixture program was rejected by the checker"),
@@ -1986,7 +2033,7 @@ test "adding a definition to a standard library module gives the hashes of a che
   let cold = check_sources(empty_memory_store, user, shapes(b""));
   let added = shapes(b"pub fn spare() -> Int = 5\n");
   let warm = check_sources(cold.store, user, added);
-  assert_eq(warm.cached_hashes, check_sources(empty_memory_store, user, added).cached_hashes)
+  assert_eq(warm.own_hashes, check_sources(empty_memory_store, user, added).own_hashes)
 }
 
 test "import cycles and self-imports are rejected with the same errors whether checked from scratch or from the cache" {

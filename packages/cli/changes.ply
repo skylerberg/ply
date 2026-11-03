@@ -2,8 +2,8 @@ import compiler.front.published (no_rows)
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
 import compiler.front.facts (OneModule, ProgramListing, listing_of)
 import compiler.front.rows (ModuleSpan, Outline, OutlinedType, OutlineItem, location_span)
-import compiler.store.hash.forms (CachedHashes, CachedNode, CachedTest, ItemKeyed, no_cached_hashes,
-                                  reach)
+import compiler.store.hash.forms (OwnHashes, DefinitionHash, TestHash, ItemKeyed, reach)
+import compiler.store.hash.graph (HeldValue)
 import compiler.check.infer (CheckOutput)
 import compiler.check.infer.checker (DefinitionInfo, EffectInfo, Location, TestInfo)
 import compiler.check.resolve.tables (Source, qualify)
@@ -194,18 +194,18 @@ fn texts_at(
 
 pub fn module_texts(
   one: OneModule,
-  hashes: CachedHashes,
+  hashes: OwnHashes,
   source: Source,
 ) -> List<StoredText> / {abort.raise} = {
   let p = locations(one.outlines, one.checked);
   texts_at(
     [source],
-    hashes.nodes.map(|n: CachedNode|
+    hashes.definitions.map(|n: DefinitionHash|
       {
         hash: n.hash,
-        at: (if n.declaration { p.declarations } else { p.values }).get(n.name),
+        at: (if n.kind == HeldValue { p.values } else { p.declarations }).get(n.name),
       }).concat(
-      hashes.tests.map(|t: CachedTest| { hash: t.hash, at: p.tests.get(t.key) }),
+      hashes.tests.map(|t: TestHash| { hash: t.hash, at: p.tests.get(t.key) }),
     ),
   )
 }
@@ -277,7 +277,6 @@ fn tree_of_source(source: String) -> Tree / {abort.raise} = {
     { root: b"", manifest: None, supplied: [] },
     [],
     true,
-    no_cached_hashes,
     [],
   );
   match loaded.out {
@@ -361,12 +360,8 @@ fn kinds(before: String, after: String, key: String) -> List<String> / {abort.ra
 const leaf_edited: String =
   "fn leaf(n: Int) -> Int = n + 2\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
 
-test "editing a function marks it as edited, and marks the functions that call it as derived, meaning changed only because a function they call changed" {
-  assert_eq(kinds(call_chain_source, leaf_edited, "chain"), [
-    "leaf edited",
-    "mid derived",
-    "top derived",
-  ]);
+test "editing a function marks it as edited, and the functions that call it keep their hashes" {
+  assert_eq(kinds(call_chain_source, leaf_edited, "chain"), ["leaf edited"]);
   assert_eq(
     over(tree_of_source(call_chain_source), tree_of_source(leaf_edited), "chain", every).delta.own,
     None,
@@ -396,7 +391,7 @@ test "an added definition is added, and the one that calls it edited" {
     "fn mid(n: Int) -> Int = leaf(n) + 1",
     "fn bump(n: Int) -> Int = n\nfn mid(n: Int) -> Int = bump(leaf(n)) + 1",
   );
-  assert_eq(kinds(call_chain_source, added, "chain"), ["bump added", "mid edited", "top derived"])
+  assert_eq(kinds(call_chain_source, added, "chain"), ["bump added", "mid edited"])
 }
 
 fn zero_padded(i: Int) -> String = if i < 10 { "00" ++ i.to_string() } else { "0" ++ i.to_string() }
@@ -411,11 +406,8 @@ fn deep(depth: Int, leaf: String) -> String =
     ++ depth.to_string()
     ++ ") }\n"
 
-test "in a chain of 64 functions, editing the last one reports it as edited and the 63 functions that call it as derived (changed only through it)" {
-  let k = kinds(deep(64, "n + 1"), deep(64, "n + 2"), "deep");
-  assert_eq(k.filter(|x: String| x.ends_with(" edited")), ["f000 edited"]);
-  assert_eq(k.filter(|x: String| x.ends_with(" derived")).len(), 63);
-  assert_eq(k.filter(|x: String| x.starts_with("std.")), [])
+test "in a chain of 64 functions, editing the last one reports only that function as changed" {
+  assert_eq(kinds(deep(64, "n + 1"), deep(64, "n + 2"), "deep"), ["f000 edited"])
 }
 
 const handled_source: String =
@@ -427,7 +419,7 @@ test "editing an effect handler reports only the definition containing the handl
   ])
 }
 
-test "editing an effect declaration reports the declaration as edited and the functions that use the effect as derived (changed only because the effect changed)" {
+test "editing an effect declaration reports the declaration as edited, and the functions that use the effect keep their hashes" {
   let after = handled_source.replace(
     "}\nfn lookup",
     "  read peek[users](key: Int) -> Int\n}\nfn lookup",
@@ -438,9 +430,6 @@ test "editing an effect declaration reports the declaration as edited and the fu
       { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
     [
       { name: "db", declaration: true, kind: Edited },
-      { name: "lookup", declaration: false, kind: Derived },
-      { name: "seeded", declaration: false, kind: Derived },
-      { name: "twice", declaration: false, kind: Derived },
     ],
   )
 }
@@ -455,7 +444,7 @@ test "a rename beside an edit shows the old name removed and the new one added" 
   ])
 }
 
-test "when a function and a type share a name, reordering the type's variants reports the type as edited, not the function" {
+test "when a function and a type share a name, reordering the type's variants reports only the type as edited" {
   let collide = "type Amount = Cents(Int) | Dollars(Int)\nfn Amount(n: Int) -> Int = n + 1\nfn use_it(a: Amount) -> Int = match a { Cents(c) -> c, Dollars(d) -> d * 100 }\ntest \"t\" { assert_eq(use_it(Cents(5)), 5) }\n";
   let swapped = collide.replace("Cents(Int) | Dollars(Int)", "Dollars(Int) | Cents(Int)");
   let o = over(tree_of_source(collide), tree_of_source(swapped), "t", every);
@@ -464,7 +453,6 @@ test "when a function and a type share a name, reordering the type's variants re
       { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
     [
       { name: "Amount", declaration: true, kind: Edited },
-      { name: "use_it", declaration: false, kind: Derived },
     ],
   )
 }

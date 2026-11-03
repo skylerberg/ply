@@ -27,18 +27,16 @@ import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, 
                               ReturnsParam, Public, HostInstance)
 import compiler.syntax.fmt (module_text)
 import compiler.syntax.literal_printer (float_text, decimal_text)
-import compiler.check.resolve.tables (qualify, default_binder, backticked)
+import compiler.check.resolve.tables (default_binder, module_of_name)
 import std.bin
 import std.bytes (ascii_of_int)
-import std.hash (blake3)
 import std.list
 import std.option
 import std.bytes
 import std.string
-import compiler.store.hash.encoding (hex, Choice, Slot)
-import compiler.store.hash.forms (member_hash)
+import compiler.store.hash.encoding (hex, Choice)
 import compiler.store.hash.stored
-import compiler.store.hash.stored (Reference, Hashed, Member, Itself, ByName, FreeName, Literal,
+import compiler.store.hash.stored (FreeName, Literal,
                                    IntLiteral, FixedLiteral, WideLiteral, BoolLiteral,
                                    StringLiteral, BytesLiteral, EmbeddedLiteral, FloatLiteral,
                                    DecimalLiteral, CharLiteral, UnitLiteral, Local, Defined,
@@ -56,71 +54,32 @@ import compiler.store.hash.stored (Reference, Hashed, Member, Itself, ByName, Fr
                                    Sum, Nominal, Extern, FunctionOf, TypeOf, EffectOf, TestOf,
                                    LawOf, SpecOf, Stored, stored_bin)
 
-type Envelope = { kind: Int, class: Int, picks: Int, at: Int }
 
-pub fn envelope(body: Bytes) -> Option<Envelope> = {
-  let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
-  let framed = |class: Int, from: Int|
-    match body.u32_at(from) {
-      Some(n) -> if from + 4 + n > body.len() { None }
-      else { Some({ kind: kind, class: class, picks: from + 4, at: from + 4 + n }) },
+type Envelope = { picks: Int, at: Int }
+
+pub fn envelope(body: Bytes) -> Option<Envelope> =
+  if body.len() == 0 || body.at(0) != 0 { None } else {
+    match body.u32_at(1) {
+      Some(n) -> if 5 + n > body.len() { None } else { Some({ picks: 5, at: 5 + n }) },
       None -> None,
-    };
-  if kind == 0 { framed(0, 1) }
-  else if kind == 1 { match body.u32_at(1) { Some(class) -> framed(class, 5), None -> None } }
-  else { None }
-}
+    }
+  }
 
-pub fn picks_of(body: Bytes, e: Envelope) -> List<List<Choice>> / {abort.raise} = {
+pub fn picks_of(body: Bytes, e: Envelope) -> List<Choice> / {abort.raise} = {
   let read = |at: Int| match body.u32_at(at) { Some(n) -> n, None -> panic("a malformed body") };
-  iterate(
-    { at: e.picks, lists: [] },
-    e.at - e.picks + 1,
-    |s: { at: Int, lists: List<List<Choice>> }|
-      if s.at >= e.at { Stop(s.lists) } else {
-        let list = range(0, read(s.at)).fold(
-          { at: s.at + 4, choices: [] },
-          |accumulator: { at: Int, choices: List<Choice> }, _i: Int| {
-            let k = read(accumulator.at);
-            {
-              at: accumulator.at + 4 + 4 * k,
-              choices: accumulator.choices.push({
-                targets: range(0, k).map(|j: Int| read(accumulator.at + 4 + 4 * j)),
-              }),
-            }
-          },
-        );
-        Continue({ at: list.at, lists: s.lists.push(list.choices) })
-      },
-  )
-}
-
-fn members_of(packed: Bytes) -> Option<List<Bytes>> / {abort.raise} =
-  match packed.u32_at(0) {
-    None -> None,
-    Some(n) -> {
-      let read = range(0, n).fold(
-        Some({ at: 4, members: [] }),
-        |accumulator: Option<{ at: Int, members: List<Bytes> }>, _i: Int|
-          match accumulator {
-            None -> None,
-            Some(s) -> match packed.u32_at(s.at) {
-              None -> None,
-              Some(len) -> if s.at + 4 + len > packed.len() { None } else {
-                Some({
-                  at: s.at + 4 + len,
-                  members: s.members.push(packed.slice(s.at + 4, s.at + 4 + len)),
-                })
-              },
-            },
-          },
-      );
-      match read {
-        Some(s) -> if s.at == packed.len() { Some(s.members) } else { None },
-        None -> None,
+  range(0, read(e.picks)).fold(
+    { at: e.picks + 4, choices: [] },
+    |accumulator: { at: Int, choices: List<Choice> }, _i: Int| {
+      let k = read(accumulator.at);
+      {
+        at: accumulator.at + 4 + 4 * k,
+        choices: accumulator.choices.push({
+          targets: range(0, k).map(|j: Int| read(accumulator.at + 4 + 4 * j)),
+        }),
       }
     },
-  }
+  ).choices
+}
 
 fn stored_of(bytes: Bytes, name: Bytes) -> Stored / {abort.raise} =
   match bin::decode(bytes, stored_bin()) {
@@ -138,38 +97,15 @@ pub type PrintError = { message: Bytes, notes: List<Bytes> }
 
 pub type PrintResult = | Printed(List<{ module: Bytes, text: Bytes }>) | Unprintable(PrintError)
 
-type Part = {
-  members: List<Bytes>,
-  picks: List<List<Choice>>,
-  hashes: List<Bytes>,
-  names: List<Bytes>,
-  public: List<Bool>,
-  module: Bytes,
-  binder: Bytes,
-  printed: Bool,
-}
+pub type PrintedDefinition = { name: Bytes, body: Bytes }
 
-type Layout = {
-  parts: List<Part>,
-  by_hash: Map<Bytes, List<Slot>>,
-  source_names: Map<Bytes, Map<Bytes, Bool>>,
-  constants: Map<Bytes, Bool>,
-}
+type Layout = { printed: Map<Bytes, Bool>, shipped: Map<Bytes, Bool>, constants: Map<Bytes, Bool>, binders: Map<Bytes, Bytes> }
 
-type BodyPrinter = {
-  layout: Layout,
-  part: Int,
-  module: Bytes,
-  graph: Map<Bytes, List<Bytes>>,
-  source_names: Map<Bytes, Bool>,
-}
-
-fn source_names_key(name: Bytes, hash: Bytes) -> Bytes = hash.concat(name)
+type BodyPrinter = { layout: Layout, module: Bytes }
 
 type NameState = {
   imports: Map<Bytes, Bytes>,
   missing: Map<Bytes, Bool>,
-  slots: Map<Bytes, Int>,
   picks: List<Choice>,
   call_index: Int,
 }
@@ -193,8 +129,6 @@ fn effect_variable_label(level: Int) -> Bytes = b"_e".concat(ascii_of_int(level)
 fn label_name(level: Int) -> Bytes = b"_r".concat(ascii_of_int(level))
 
 fn space_name(at: Int) -> Bytes = b"_s".concat(ascii_of_int(at))
-
-fn short_hex(h: Bytes) -> Bytes / {abort.raise} = hex(h).slice(0, 12)
 
 fn identifier(name: Bytes) -> Identifier = { name: name, span: dummy_span }
 
@@ -236,247 +170,73 @@ fn named_if_any<a, b>(
     },
   }
 
-fn nameable(layout: Layout, slot: Slot, own: Bytes) -> Bool / {abort.raise} = {
-  let p = layout.parts.get(slot.part);
-  p.module == own || p.printed || p.public.get(slot.class)
-}
+fn known(printer: BodyPrinter, naming: NameState, reference: Bytes) -> NameState =
+  if printer.layout.printed.contains(reference)
+    || printer.layout.shipped.contains(module_of_name(reference)) { naming }
+  else { { ..naming, missing: naming.missing.insert(reference, true) } }
 
-fn is_reachable(g: Map<Bytes, List<Bytes>>, from: Bytes, target: Bytes) -> Bool = {
-  let walked = range(0, g.len() + 1).fold(
-    { seen: [from], frontier: [from] },
-    |accumulator: { seen: List<Bytes>, frontier: List<Bytes> }, _round: Int|
-      accumulator.frontier.fold(
-        { seen: accumulator.seen, frontier: [] },
-        |out: { seen: List<Bytes>, frontier: List<Bytes> }, m: Bytes|
-          List::fold(
-            match g.get(m) { Some(xs) -> xs, None -> [] },
-            out,
-            |o: { seen: List<Bytes>, frontier: List<Bytes> }, n: Bytes|
-              if o.seen.contains(n) { o }
-              else { { seen: o.seen.push(n), frontier: o.frontier.push(n) } },
-          ),
-      ),
-  );
-  walked.seen.contains(target)
-}
-
-fn pick(
-  layout: Layout,
-  g: Map<Bytes, List<Bytes>>,
-  mine: Map<Bytes, Bytes>,
-  h: Bytes,
-  own: Bytes,
-  wanted: (Slot) -> Bool / {abort.raise},
-) -> Option<Slot> / {abort.raise} = {
-  let edges = g.insert(own, mine.keys());
-  let safe = |s: Slot| {
-    let p = layout.parts.get(s.part);
-    p.module == own || mine.contains(p.module) || !is_reachable(edges, p.module, own)
-  };
-  let score = |s: Slot| {
-    let p = layout.parts.get(s.part);
-    (if p.module == own { 0 } else { 4 }) + (if mine.contains(p.module) { 0 } else { 2 })
-      + (if p.printed { 0 } else { 1 })
-  };
-  match layout.by_hash.get(h) {
-    None -> None,
-    Some(found) -> {
-      let named = found.filter(|s: Slot| nameable(layout, s, own) && wanted(s));
-      let pool = match named.filter(safe) { [] -> named, homes -> homes };
-      pool.fold(None, |best: Option<Slot>, s: Slot|
-        match best { Some(b) -> if score(s) < score(b) { Some(s) } else { best }, None -> Some(s) })
-    },
-  }
-}
-
-type Target = { hash: Bytes, member_index: Int }
-
-fn target_of(
-  printer: BodyPrinter,
-  naming: NameState,
-  reference: Reference,
-) -> NamedNode<Target> / {abort.raise} =
-  match reference {
-    Hashed(hash) ->
-      {
-        naming: if printer.layout.by_hash.contains(hash) { naming }
-        else { { ..naming, missing: naming.missing.insert(hash, true) } },
-        node: { hash: hash, member_index: 0 - 1 },
-      },
-    Member(class) -> {
-      let hashes = if printer.part < 0 { [] }
-      else { printer.layout.parts.get(printer.part).hashes };
-      if class >= hashes.len() { panic("a reference to a member this component does not have") }
-      else { { naming: naming, node: { hash: hashes.get(class), member_index: class } } }
-    },
-    Itself -> panic("a stored definition refers to itself without using a hash"),
-    ByName(_) ->
-      panic("a stored definition refers to another definition by name instead of by hash"),
+fn imported(printer: BodyPrinter, naming: NameState, module: Bytes) -> NameState / {abort.raise} =
+  if module == printer.module { naming } else {
+    { ..naming, imports: naming.imports.insert(module, binder_of(printer.layout, module)) }
   }
 
-fn named(
-  printer: BodyPrinter,
-  naming: NameState,
-  target: Target,
-  constructor: Option<Bytes>,
-) -> NamedNode<QName> / {abort.raise} = {
-  let meant = |slot: Slot| {
-    let part = printer.layout.parts.get(slot.part);
-    printer.source_names.contains(qualify(part.module, part.names.get(slot.class)))
-  };
-  let has_source_name = match printer.layout.by_hash.get(target.hash) {
-    Some(slots) -> slots.filter(meant).len() > 0,
-    None -> false,
-  };
-  let found = if target.member_index >= 0 {
-    Some({ part: printer.part, class: target.member_index })
-  } else {
-    pick(printer.layout, printer.graph, naming.imports, target.hash, printer.module, |slot: Slot|
-      !has_source_name || meant(slot))
-  };
-  match found {
-    None ->
-      {
-        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
-        node: unqualified(match constructor {
-          Some(given) -> given,
-          None -> short_hex(target.hash),
-        }),
-      },
-    Some(slot) -> {
-      let part = printer.layout.parts.get(slot.part);
-      let name = match constructor { Some(given) -> given, None -> part.names.get(slot.class) };
-      if part.module == printer.module { { naming: naming, node: unqualified(name) } } else {
-        {
-          naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
-          node: { module: Some(identifier(part.binder)), name: identifier(name), span: dummy_span },
-        }
-      }
-    },
-  }
-}
+fn binder_of(layout: Layout, module: Bytes) -> Bytes / {abort.raise} =
+  match layout.binders.get(module) { Some(b) -> b, None -> default_binder(module) }
 
 fn reference_named(
   printer: BodyPrinter,
   naming: NameState,
-  reference: Reference,
+  reference: Bytes,
   constructor: Option<Bytes>,
 ) -> NamedNode<QName> / {abort.raise} = {
-  let target = target_of(printer, naming, reference);
-  named(printer, target.naming, target.node, constructor)
-}
-
-fn with_import(
-  printer: BodyPrinter,
-  naming: NameState,
-  target: Target,
-) -> NameState / {abort.raise} =
-  if target.member_index >= 0 { naming } else {
-    match pick(
-        printer.layout,
-        printer.graph,
-        naming.imports,
-        target.hash,
-        printer.module,
-        |_: Slot| true,
-      ) {
-      None -> naming,
-      Some(slot) -> {
-        let part = printer.layout.parts.get(slot.part);
-        if part.module == printer.module { naming }
-        else { { ..naming, imports: naming.imports.insert(part.module, part.binder) } }
+  let module = module_of_name(reference);
+  let name = match constructor { Some(given) -> given, None -> default_binder(reference) };
+  let seen = imported(printer, known(printer, naming, reference), module);
+  if module == printer.module { { naming: seen, node: unqualified(name) } } else {
+    {
+      naming: seen,
+      node: {
+        module: Some(identifier(binder_of(printer.layout, module))),
+        name: identifier(name),
+        span: dummy_span,
       },
     }
   }
+}
 
-fn names_body(
-  layout: Layout,
-  module: Bytes,
-  hash: Bytes,
-  name: Bytes,
-  own: Bytes,
-) -> Bool / {abort.raise} =
-  match layout.by_hash.get(hash) {
-    None -> false,
-    Some(found) ->
-      found.fold(false, |already_named: Bool, s: Slot| {
-        let p = layout.parts.get(s.part);
-        already_named
-          || (p.module == module && p.names.get(s.class) == name && nameable(layout, s, own))
-      }),
-  }
+fn with_import(printer: BodyPrinter, naming: NameState, reference: Bytes) -> NameState / {abort.raise} =
+  imported(printer, known(printer, naming, reference), module_of_name(reference))
 
 fn tag_binder(
   printer: BodyPrinter,
   naming: NameState,
-  target: Target,
   parser: Bytes,
-  filler: Option<Bytes>,
 ) -> NamedNode<Identifier> / {abort.raise} = {
-  let layout = printer.layout;
-  let found = pick(
-    layout,
-    printer.graph,
-    naming.imports,
-    target.hash,
-    printer.module,
-    |slot: Slot| {
-      let part = layout.parts.get(slot.part);
-      part.module != printer.module && part.names.get(slot.class) == parser && part.binder != b"f"
-        && part.binder != b"b"
-        && (match filler {
-          None -> true,
-          Some(hash) -> names_body(layout, part.module, hash, b"fill", printer.module),
-        })
-    },
-  );
-  match found {
-    None ->
-      {
-        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
-        node: identifier(short_hex(target.hash)),
-      },
-    Some(slot) -> {
-      let part = layout.parts.get(slot.part);
-      {
-        naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
-        node: identifier(part.binder),
-      }
-    },
+  let module = module_of_name(parser);
+  let seen = known(printer, naming, parser);
+  if module == printer.module {
+    { naming: { ..seen, missing: seen.missing.insert(parser, true) }, node: identifier(default_binder(parser)) }
+  } else {
+    { naming: imported(printer, seen, module), node: identifier(binder_of(printer.layout, module)) }
   }
 }
 
 fn effect_named(
   printer: BodyPrinter,
   naming: NameState,
-  performed: EffectReference<Reference, Int>,
+  performed: EffectReference<Bytes>,
 ) -> NamedNode<QName> / {abort.raise} =
   match performed {
     EffectUnbound(free) -> { naming: naming, node: free_name(free) },
-    Declared(reference, slot) -> {
-      let target = target_of(printer, naming, reference);
-      match target.naming.slots.get(target.node.hash) {
-        Some(was) -> if was != slot {
-          panic(
-            "two different effects share one declaration, so a definition stored by hash cannot distinguish them",
-          )
-        } else { named(printer, target.naming, target.node, None) },
-        None ->
-          named(
-            printer,
-            { ..target.naming, slots: target.naming.slots.insert(target.node.hash, slot) },
-            target.node,
-            None,
-          ),
-      }
-    },
+    Declared(reference) -> reference_named(printer, naming, reference, None),
   }
+
 
 fn value_named(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  value: Value<Reference, Int>,
+  value: Value<Bytes, Int>,
 ) -> NamedNode<QName> / {abort.raise} =
   match value.named {
     Local(level) -> if level >= depth.values { panic("a local that is not in scope") }
@@ -501,25 +261,25 @@ fn types_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  types: List<Type<Reference, Int>>,
+  types: List<Type<Bytes>>,
 ) -> NamedNode<List<TypeExpression>> / {abort.raise} =
-  named_in_turn(naming, types, |so_far: NameState, each: Type<Reference, Int>|
+  named_in_turn(naming, types, |so_far: NameState, each: Type<Bytes>|
     type_of(printer, so_far, depth, each))
 
 fn optional_type_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  annotation: Option<Type<Reference, Int>>,
+  annotation: Option<Type<Bytes>>,
 ) -> NamedNode<Option<TypeExpression>> / {abort.raise} =
-  named_if_any(naming, annotation, |so_far: NameState, present: Type<Reference, Int>|
+  named_if_any(naming, annotation, |so_far: NameState, present: Type<Bytes>|
     type_of(printer, so_far, depth, present))
 
 fn type_named(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  name: stored::TypeName<Reference>,
+  name: stored::TypeName<Bytes>,
 ) -> NamedNode<QName> / {abort.raise} =
   match name {
     TypeParameter(level) -> if level >= depth.types { panic("a type parameter out of scope") }
@@ -532,7 +292,7 @@ fn type_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  original: Type<Reference, Int>,
+  original: Type<Bytes>,
 ) -> NamedNode<TypeExpression> / {abort.raise} =
   match original {
     Applied(TypeParameter(level), _, arguments) -> if level >= depth.types || arguments.len() > 0 {
@@ -560,7 +320,7 @@ fn type_of(
       let spelled_effect_lists = named_in_turn(
         spelled.naming,
         rows,
-        |so_far: NameState, effects: Effects<Reference, Int>|
+        |so_far: NameState, effects: Effects<Bytes>|
           effects_of(printer, so_far, depth, effects),
       );
       {
@@ -594,7 +354,7 @@ fn type_of(
       let spelled = named_in_turn(
         naming,
         fields,
-        |so_far: NameState, field: stored::TypeField<Reference, Int>| {
+        |so_far: NameState, field: stored::TypeField<Bytes>| {
           let field_type = type_of(printer, so_far, depth, field.field_type);
           { naming: field_type.naming, node: { name: identifier(field.name), ty: field_type.node } }
         },
@@ -611,9 +371,9 @@ fn optional_effects_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  effects: Option<Effects<Reference, Int>>,
+  effects: Option<Effects<Bytes>>,
 ) -> NamedNode<Option<EffectsExpression>> / {abort.raise} =
-  named_if_any(naming, effects, |so_far: NameState, present: Effects<Reference, Int>|
+  named_if_any(naming, effects, |so_far: NameState, present: Effects<Bytes>|
     effects_of(printer, so_far, depth, present))
 
 type Labelled = { resource: Option<Identifier>, every: Bool, binder: Option<Identifier> }
@@ -632,7 +392,7 @@ fn effect_expression_named(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  performed: EffectReference<Reference, Int>,
+  performed: EffectReference<Bytes>,
   mode: Mode,
   operation: Option<Identifier>,
   label: Option<Label>,
@@ -658,12 +418,12 @@ fn effects_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  effects: Effects<Reference, Int>,
+  effects: Effects<Bytes>,
 ) -> NamedNode<EffectsExpression> / {abort.raise} = {
   let printed = named_in_turn(
     naming,
     effects.listed,
-    |so_far: NameState, entry: stored::Effect<Reference, Int>|
+    |so_far: NameState, entry: stored::Effect<Bytes>|
       match entry {
         Moded(performed, mode, label, bounded) ->
           effect_expression_named(printer, so_far, depth, performed, mode, None, label, bounded),
@@ -723,11 +483,11 @@ fn patterns_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  originals: List<stored::Pattern<Reference, Int>>,
+  originals: List<stored::Pattern<Bytes, Int>>,
 ) -> BoundPatterns / {abort.raise} =
   originals.fold(
     { naming: naming, depth: depth, node: [] },
-    |accumulator: BoundPatterns, original: stored::Pattern<Reference, Int>| {
+    |accumulator: BoundPatterns, original: stored::Pattern<Bytes, Int>| {
       let bound = pattern_of(printer, accumulator.naming, accumulator.depth, original);
       { naming: bound.naming, depth: bound.depth, node: accumulator.node.push(bound.node) }
     },
@@ -737,7 +497,7 @@ fn pattern_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  original: stored::Pattern<Reference, Int>,
+  original: stored::Pattern<Bytes, Int>,
 ) -> BoundPattern / {abort.raise} = {
   let span = dummy_span;
   match original {
@@ -785,7 +545,7 @@ fn pattern_of(
     RecordPattern(fields, rest) -> {
       let bound = fields.fold(
         { naming: naming, depth: depth, node: [] },
-        |accumulator: { naming: NameState, depth: Depth, node: List<{ name: Identifier, pattern: Pattern }> }, field: stored::PatternField<Reference, Int>| {
+        |accumulator: { naming: NameState, depth: Depth, node: List<{ name: Identifier, pattern: Pattern }> }, field: stored::PatternField<Bytes, Int>| {
           let field_bound = pattern_of(
             printer,
             accumulator.naming,
@@ -838,9 +598,9 @@ fn pattern_of(
   }
 }
 
-type StoredExpression = stored::Expression<Reference, Int, Int, Unit>
+type StoredExpression = stored::Expression<Bytes, Int, Unit>
 
-type StoredStatement = stored::Statement<Reference, Int, Int, Unit>
+type StoredStatement = stored::Statement<Bytes, Int, Unit>
 
 fn expressions_of(
   printer: BodyPrinter,
@@ -864,12 +624,12 @@ fn fields_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  fields: List<stored::RecordField<Reference, Int, Int, Unit>>,
+  fields: List<stored::RecordField<Bytes, Int, Unit>>,
 ) -> NamedNode<List<RecordLiteralField>> / {abort.raise} =
   named_in_turn(
     naming,
     fields,
-    |so_far: NameState, field: stored::RecordField<Reference, Int, Int, Unit>| {
+    |so_far: NameState, field: stored::RecordField<Bytes, Int, Unit>| {
       let value = expression_of(printer, so_far, depth, field.value);
       { naming: value.naming, node: { name: identifier(field.name), value: value.node } }
     },
@@ -879,7 +639,7 @@ fn on_value_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  call: stored::OnValueCall<Reference, Int, Int, Unit>,
+  call: stored::OnValueCall<Bytes, Int, Unit>,
 ) -> NamedNode<Expression> / {abort.raise} = {
   let span = dummy_span;
   let base = expression_of(printer, naming, depth, call.base);
@@ -932,10 +692,8 @@ fn on_value_of(
     },
     Among(references) ->
       {
-        naming: references.fold(after, |n: NameState, reference: Reference| {
-          let target = target_of(printer, n, reference);
-          with_import(printer, target.naming, target.node)
-        }),
+        naming: references.fold(after, |n: NameState, reference: Bytes|
+          with_import(printer, n, reference)),
         node: on_value(call.name),
       },
   }
@@ -943,7 +701,7 @@ fn on_value_of(
 
 fn reads_constant(printer: BodyPrinter, callee: StoredExpression) -> Bool =
   match callee {
-    Variable({ named: Defined(Hashed(hash)), .. }) -> printer.layout.constants.contains(hash),
+    Variable({ named: Defined(name), .. }) -> printer.layout.constants.contains(name),
     _ -> false,
   }
 
@@ -997,7 +755,7 @@ fn expression_of(
       let spelled_annotations = named_in_turn(
         naming,
         annotations,
-        |so_far: NameState, annotation: Option<Type<Reference, Int>>|
+        |so_far: NameState, annotation: Option<Type<Bytes>>|
           optional_type_of(printer, so_far, depth, annotation),
       );
       let spelled_body = expression_of(
@@ -1069,7 +827,7 @@ fn expression_of(
       let spelled_arms = named_in_turn(
         spelled_scrutinee.naming,
         arms,
-        |so_far: NameState, arm: stored::Arm<Reference, Int, Int, Unit>| {
+        |so_far: NameState, arm: stored::Arm<Bytes, Int, Unit>| {
           let bound = pattern_of(printer, so_far, depth, arm.pattern);
           let guard = optional_expression_of(printer, bound.naming, bound.depth, arm.guard);
           let body = expression_of(printer, guard.naming, bound.depth, arm.body);
@@ -1164,7 +922,7 @@ fn expression_of(
     },
     Tagged(parser, text) -> {
       let parser_target = parsed_by(printer, naming, parser);
-      let tag = tag_binder(printer, parser_target.naming, parser_target.node, b"literal", None);
+      let tag = tag_binder(printer, parser_target.naming, parser_target.node);
       {
         naming: tag.naming,
         node: TaggedLiteralExpression({
@@ -1179,17 +937,11 @@ fn expression_of(
     Filled(parser, filler, head, holes) -> {
       let parser_target = parsed_by(printer, naming, parser);
       let filler_target = parsed_by(printer, parser_target.naming, filler);
-      let tag = tag_binder(
-        printer,
-        filler_target.naming,
-        parser_target.node,
-        b"compile",
-        Some(filler_target.node.hash),
-      );
+      let tag = tag_binder(printer, filler_target.naming, parser_target.node);
       let spelled_holes = named_in_turn(
         tag.naming,
         holes,
-        |so_far: NameState, hole: stored::FilledHole<Reference, Int, Int, Unit>| {
+        |so_far: NameState, hole: stored::FilledHole<Bytes, Int, Unit>| {
           let value = expression_of(printer, so_far, depth, hole.value);
           { naming: value.naming, node: { value: value.node, text: hole.text, quoted: span } }
         },
@@ -1233,7 +985,7 @@ fn expression_of(
       };
       let statements = entries.fold(
         { naming: naming, depth: depth, node: [] },
-        |accumulator: { naming: NameState, depth: Depth, node: List<Statement> }, entry: stored::Entry<Reference, Int, Int, Unit>|
+        |accumulator: { naming: NameState, depth: Depth, node: List<Statement> }, entry: stored::Entry<Bytes, Int, Unit>|
           match entry {
             One(statement) -> append_statement(accumulator, statement),
             Commuting(_, members) -> members.fold(accumulator, append_statement),
@@ -1260,10 +1012,10 @@ fn expression_of(
 fn parsed_by(
   printer: BodyPrinter,
   naming: NameState,
-  value: Value<Reference, Int>,
-) -> NamedNode<Target> / {abort.raise} =
+  value: Value<Bytes, Int>,
+) -> NamedNode<Bytes> / {abort.raise} =
   match value.named {
-    Defined(reference) -> target_of(printer, naming, reference),
+    Defined(reference) -> { naming: known(printer, naming, reference), node: reference },
     _ ->
       panic(
         "a literal with a tag must name a defined function to parse it, but the tag names something else",
@@ -1274,7 +1026,7 @@ fn handle_of(
   printer: BodyPrinter,
   naming: NameState,
   depth: Depth,
-  handled: stored::StoredHandle<Reference, Int, Int, Unit>,
+  handled: stored::StoredHandle<Bytes, Int, Unit>,
 ) -> NamedNode<Expression> / {abort.raise} = {
   let span = dummy_span;
   let level = depth.values;
@@ -1301,7 +1053,7 @@ fn handle_of(
   let clauses = named_in_turn(
     body.naming,
     handled.clauses,
-    |so_far: NameState, clause: stored::HandlerClause<Reference, Int, Int, Unit>| {
+    |so_far: NameState, clause: stored::HandlerClause<Bytes, Int, Unit>| {
       let effect_name = effect_named(printer, so_far, clause.effect);
       let labelled_by = labelled(depth, clause.label);
       let bound = level_after_variables + clause.parameters;
@@ -1525,7 +1277,7 @@ fn items_of(
           let spelled = named_in_turn(
             naming,
             variants,
-            |so_far: NameState, variant: stored::Variant<Reference, Int>| {
+            |so_far: NameState, variant: stored::Variant<Bytes>| {
               let fields = types_of(printer, so_far, depth, variant.fields);
               {
                 naming: fields.naming,
@@ -1549,7 +1301,7 @@ fn items_of(
       let instances = named_in_turn(
         body.naming,
         declared.through,
-        |so_far: NameState, through: stored::InstanceFunction<Reference, Int>| {
+        |so_far: NameState, through: stored::InstanceFunction<Bytes, Int>| {
           let function_name = value_named(printer, so_far, depth, through.by);
           {
             naming: function_name.naming,
@@ -1565,7 +1317,7 @@ fn items_of(
       let arithmetic = named_in_turn(
         instances.naming,
         declared.numerics,
-        |so_far: NameState, operation: stored::Numeric<Reference, Int>| {
+        |so_far: NameState, operation: stored::Numeric<Bytes, Int>| {
           let function_name = value_named(printer, so_far, depth, operation.function);
           {
             naming: function_name.naming,
@@ -1600,7 +1352,7 @@ fn items_of(
       let operations = named_in_turn(
         naming,
         declared.operations,
-        |so_far: NameState, operation: stored::Operation<Reference, Int>| {
+        |so_far: NameState, operation: stored::Operation<Bytes>| {
           let depth = { values: 0, types: operation.types, effects: 0, labels: 0 };
           let parameters = types_of(printer, so_far, depth, operation.parameters);
           let returned = type_of(printer, parameters.naming, depth, operation.returned);
@@ -1683,249 +1435,15 @@ fn items_of(
 fn items_text(items: List<Item>) -> Bytes / {abort.raise} =
   module_text({ doc: None, imports: [], items: items })
 
-type Holder = { module: Bytes, simple: Bytes, public: Bool }
-
-type Component = {
-  members: List<Bytes>,
-  picks: List<List<Choice>>,
-  hashes: List<Bytes>,
-  id: Bytes,
-  key: Bytes,
-}
-
-type Copied = { module: Bytes, names: List<Bytes>, public: List<Bool> }
-
-type PartitionState = {
-  seen: Map<Bytes, Bool>,
-  hash_by_name: Map<Bytes, Bytes>,
-  parts: List<Part>,
-  error: Option<PrintError>,
-}
-
 type Sheet = { items: List<Bytes>, imports: Map<Bytes, Bytes> }
 
-fn some_error(message: Bytes, notes: List<Bytes>) -> Option<PrintError> =
-  Some({ message: message, notes: notes })
+type Read = { form: Stored, picks: List<Choice> }
 
-fn component_of(body: Bytes) -> Component / {abort.raise} =
+fn read_body(body: Bytes, name: Bytes) -> Read / {abort.raise} =
   match envelope(body) {
-    None -> panic("a stored body of a kind this build does not read"),
-    Some(e) -> {
-      let payload = body.slice(e.at, body.len());
-      let id = blake3(payload);
-      if e.kind == 0 {
-        { members: [payload], picks: picks_of(body, e), hashes: [id], id: id, key: id }
-      } else {
-        match members_of(payload) {
-          Some(ms) -> if e.class >= ms.len() { panic("a malformed component body") } else {
-            {
-              members: ms,
-              picks: picks_of(body, e),
-              hashes: range(0, ms.len()).map(|i: Int| member_hash(id, i)),
-              id: id,
-              key: member_hash(id, e.class),
-            }
-          },
-          None -> panic("a malformed component body"),
-        }
-      }
-    },
+    Some(e) -> { form: stored_of(body.slice(e.at, body.len()), name), picks: picks_of(body, e) },
+    None -> panic("a stored body whose calls are not all resolved cannot be printed"),
   }
-
-pub fn stored_forms(body: Bytes) -> List<Stored> / {abort.raise} = {
-  let component = component_of(body);
-  component.members.map(|member: Bytes| stored_of(member, short_hex(component.key)))
-}
-
-fn kind_of(member: Bytes, name: Bytes) -> Int / {abort.raise} =
-  match stored_of(member, name) {
-    FunctionOf(_) -> 0,
-    TypeOf(_) -> 1,
-    EffectOf(_) -> 2,
-    TestOf(_) -> 3,
-    LawOf(_) -> 4,
-    SpecOf(_) -> 5,
-  }
-
-fn listed(ns: List<Holder>) -> Bytes / {abort.raise} =
-  backticked(ns.map(|n: Holder| qualify(n.module, n.simple)), b", ")
-
-fn named_of(
-  names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
-  keys: Map<Bytes, Bool>,
-) -> { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<PrintError> } / {abort.raise} =
-  names.fold(
-    { named: Map::new(), bad: None },
-    |accumulator: { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<PrintError> }, n: { name: Bytes, hash: Bytes, public: Bool }|
-      match accumulator.bad {
-        Some(_) -> accumulator,
-        None -> {
-          let simple = default_binder(n.name);
-          if simple.len() == n.name.len() {
-            {
-              ..accumulator,
-              bad: some_error(Bytes::concat_all([b"`", n.name, b"` has no module prefix"]), []),
-            }
-          } else if !keys.contains(n.hash) {
-            {
-              ..accumulator,
-              bad: some_error(
-                Bytes::concat_all([b"`", n.name, b"` has no definition in the store"]),
-                [],
-              ),
-            }
-          } else {
-            let module = n.name.slice(0, n.name.len() - simple.len() - 1);
-            let had = match accumulator.named.get(n.hash) { Some(m) -> m, None -> Map::new() };
-            {
-              ..accumulator,
-              named: accumulator.named.insert(
-                n.hash,
-                had.insert(Bytes::concat_all([module, b"\x00", simple]), {
-                  module: module,
-                  simple: simple,
-                  public: n.public,
-                }),
-              ),
-            }
-          }
-        },
-      },
-  )
-
-fn split_by_module(classes: List<List<Holder>>) -> Option<List<Copied>> / {abort.raise} =
-  if classes.len() == 1 {
-    Some(
-      classes.get(0).map(|n: Holder| { module: n.module, names: [n.simple], public: [n.public] }),
-    )
-  } else {
-    let by_module = range(0, classes.len()).fold(
-      Map::new(),
-      |accumulator: Map<Bytes, List<List<Holder>>>, c: Int|
-        classes.get(c).fold(accumulator, |a: Map<Bytes, List<List<Holder>>>, n: Holder| {
-          let rows = match a.get(n.module) {
-            Some(r) -> r,
-            None -> classes.map(|k: List<Holder>| []),
-          };
-          a.insert(n.module, rows.set(c, rows.get(c).push(n)))
-        }),
-    );
-    by_module.fold(
-      Some([]),
-      |accumulator: Option<List<Copied>>, m: Bytes, rows: List<List<Holder>>|
-        match accumulator {
-          None -> None,
-          Some(out) -> {
-            let count = rows.get(0).len();
-            if rows.fold(false, |b: Bool, r: List<Holder>| b || r.len() != count) { None } else {
-              Some(
-                range(0, count).fold(out, |o: List<Copied>, k: Int|
-                  o.push({
-                    module: m,
-                    names: rows.map(|r: List<Holder>| r.get(k).simple),
-                    public: rows.map(|r: List<Holder>| r.get(k).public),
-                  })),
-              )
-            }
-          },
-        },
-    )
-  }
-
-fn add_component(
-  accumulator: PartitionState,
-  component: Component,
-  named: Map<Bytes, Map<Bytes, Holder>>,
-  shipped: List<Bytes>,
-) -> PartitionState / {abort.raise} = {
-  let classes = component.hashes.map(|h: Bytes|
-    match named.get(h) { Some(m) -> m.values(), None -> [] });
-  let checked: PartitionState = range(0, component.hashes.len()).fold(
-    accumulator,
-    |a: PartitionState, i: Int|
-      match a.error {
-        Some(_) -> a,
-        None -> {
-          let all = classes.get(i);
-          let h = component.hashes.get(i);
-          if all.len() == 0 {
-            {
-              ..a,
-              error: some_error(
-                Bytes::concat_all([b"the definition `", short_hex(h), b"` has no name"]),
-                [],
-              ),
-            }
-          } else {
-            let kind = kind_of(
-              component.members.get(i),
-              qualify(all.get(0).module, all.get(0).simple),
-            );
-            if kind == 2 && all.len() > 1 {
-              {
-                ..a,
-                error: some_error(
-                  listed(all).concat(
-                    b" are one effect declaration, so a body cannot say which it performs",
-                  ),
-                  [b"make the declarations differ, or keep one of them"],
-                ),
-              }
-            } else {
-              all.fold(a, |b: PartitionState, n: Holder| {
-                let q = qualify(n.module, n.simple);
-                let key = byte_of_int(kind).concat(q);
-                match b.hash_by_name.get(key) {
-                  Some(other) -> if other == h || is_some(b.error) { b } else {
-                    {
-                      ..b,
-                      error: some_error(
-                        Bytes::concat_all([b"`", q, b"` names two different definitions"]),
-                        [],
-                      ),
-                    }
-                  },
-                  None -> { ..b, hash_by_name: b.hash_by_name.insert(key, h) },
-                }
-              })
-            }
-          }
-        },
-      },
-  );
-  match checked.error {
-    Some(_) -> checked,
-    None -> match split_by_module(classes) {
-      None ->
-        {
-          ..checked,
-          error: some_error(
-            listed(classes.fold([], |o: List<Holder>, ns: List<Holder>| o.concat(ns))).concat(
-              b" are a mutually recursive group in which two definitions are identical, so a call cannot tell which of them it calls",
-            ),
-            [b"make the definitions differ, or keep one of them"],
-          ),
-        },
-      Some(cs) ->
-        {
-          ..checked,
-          parts: cs.fold(checked.parts, |ps: List<Part>, copied: Copied|
-            ps.push({
-              members: component.members,
-              picks: component.picks,
-              hashes: component.hashes,
-              names: copied.names,
-              public: copied.public,
-              module: copied.module,
-              binder: default_binder(copied.module),
-              printed: !shipped.contains(copied.module),
-            })),
-        },
-    },
-  }
-}
-
-fn is_some(o: Option<PrintError>) -> Bool = match o { Some(_) -> true, None -> false }
 
 fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
   let sharing = modules.fold(Map::new(), |accumulator: Map<Bytes, Int>, m: Bytes|
@@ -1964,140 +1482,8 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
   done.out
 }
 
-fn layout_of(parts: List<Part>, meant: Map<Bytes, Map<Bytes, Bool>>) -> Layout / {abort.raise} = {
-  let bound = binders(
-    parts.fold(Map::new(), |accumulator: Map<Bytes, Bool>, part: Part|
-      accumulator.insert(part.module, true)).keys(
-    ),
-  );
-  let placed = parts.map(|part: Part|
-    { ..part, binder: match bound.get(part.module) { Some(b) -> b, None -> part.binder } });
-  {
-    parts: placed,
-    by_hash: range(0, placed.len()).fold(
-      Map::new(),
-      |accumulator: Map<Bytes, List<Slot>>, u: Int| {
-        let hashes = placed.get(u).hashes;
-        range(0, hashes.len()).fold(accumulator, |a: Map<Bytes, List<Slot>>, c: Int|
-          a.insert(
-            hashes.get(c),
-            List::push(match a.get(hashes.get(c)) { Some(xs) -> xs, None -> [] }, {
-              part: u,
-              class: c,
-            }),
-          ))
-      },
-    ),
-    source_names: meant,
-    constants: placed.fold(Map::new(), |acc: Map<Bytes, Bool>, part: Part|
-      range(0, part.members.len()).fold(acc, |found: Map<Bytes, Bool>, c: Int|
-        match stored_of(part.members.get(c), part.module) {
-          FunctionOf(function) -> if function.constant { found.insert(part.hashes.get(c), true) }
-          else { found },
-          _ -> found,
-        })),
-  }
-}
-
-fn fresh_naming(
-  imports: Map<Bytes, Bytes>,
-  missing: Map<Bytes, Bool>,
-  picks: List<Choice>,
-) -> NameState =
-  { imports: imports, missing: missing, slots: Map::new(), picks: picks, call_index: 0 }
-
-fn print_parts(
-  layout: Layout,
-) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> } / {abort.raise} =
-  range(0, layout.parts.len()).fold(
-    { modules: Map::new(), missing: Map::new(), graph: Map::new() },
-    |accumulator: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
-      let p = layout.parts.get(u);
-      if !p.printed { accumulator } else {
-        let x = {
-          layout: layout,
-          part: u,
-          module: p.module,
-          graph: accumulator.graph,
-          source_names: Map::new(),
-        };
-        let walked = range(0, p.members.len()).fold(
-          { imports: Map::new(), missing: accumulator.missing, texts: [] },
-          |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, c: Int| {
-            let name = p.names.get(c);
-            let printer = {
-              ..x,
-              source_names: match layout.source_names.get(
-                  source_names_key(qualify(p.module, name), p.hashes.get(c)),
-                ) {
-                Some(names) -> names,
-                None -> Map::new(),
-              },
-            };
-            let g = items_of(
-              printer,
-              fresh_naming(w.imports, w.missing, match p.picks.at(c) { Some(x) -> x, None -> [] }),
-              stored_of(p.members.get(c), qualify(p.module, name)),
-              name,
-            );
-            {
-              imports: g.naming.imports,
-              missing: g.naming.missing,
-              texts: w.texts.push(items_text(g.node)),
-            }
-          },
-        );
-        let had = match accumulator.modules.get(p.module) {
-          Some(m) -> m,
-          None -> { items: [], imports: Map::new() },
-        };
-        let imports = had.imports.merge(walked.imports.remove(p.module));
-        {
-          modules: accumulator.modules.insert(p.module, {
-            items: had.items.concat(walked.texts),
-            imports: imports,
-          }),
-          missing: walked.missing,
-          graph: accumulator.graph.insert(p.module, imports.keys()),
-        }
-      }
-    },
-  )
-
-fn print_tests(
-  layout: Layout,
-  g: Map<Bytes, List<Bytes>>,
-  tests: List<Bytes>,
-  missing: Map<Bytes, Bool>,
-) -> { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> } / {abort.raise} = {
-  let x = { layout: layout, part: 0 - 1, module: b"", graph: g, source_names: Map::new() };
-  range(0, tests.len()).fold(
-    { imports: Map::new(), missing: missing, texts: [] },
-    |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, i: Int| {
-      let body = tests.get(i);
-      let label = b"t".concat(ascii_of_int(i));
-      match envelope(body) {
-        Some(e) -> if e.kind != 0 { panic("a stored test is not a single definition") } else {
-          let t = items_of(
-            x,
-            fresh_naming(w.imports, w.missing, match picks_of(body, e).at(0) {
-              Some(p) -> p,
-              None -> [],
-            }),
-            stored_of(body.slice(e.at, body.len()), label),
-            label,
-          );
-          {
-            imports: t.naming.imports,
-            missing: t.naming.missing,
-            texts: w.texts.push(items_text(t.node)),
-          }
-        },
-        None -> panic("a stored test is not a single definition"),
-      }
-    },
-  )
-}
+fn fresh_naming(imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, picks: List<Choice>) -> NameState =
+  { imports: imports, missing: missing, picks: picks, call_index: 0 }
 
 fn sheet_text(sheet: Sheet) -> Bytes / {abort.raise} =
   Bytes::concat_all(
@@ -2114,78 +1500,82 @@ fn sheet_text(sheet: Sheet) -> Bytes / {abort.raise} =
     ),
   )
 
+type Printing = { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool> }
+
+fn printed_into(
+  layout: Layout,
+  done: Printing,
+  module: Bytes,
+  output: Bytes,
+  name: Bytes,
+  body: Bytes,
+) -> Printing / {abort.raise} = {
+  let read = read_body(body, name);
+  let had = match done.modules.get(output) { Some(m) -> m, None -> { items: [], imports: Map::new() } };
+  let g = items_of(
+    { layout: layout, module: module },
+    fresh_naming(had.imports, done.missing, read.picks),
+    read.form,
+    default_binder(name),
+  );
+  {
+    modules: done.modules.insert(output, {
+      items: had.items.push(items_text(g.node)),
+      imports: g.naming.imports.remove(module),
+    }),
+    missing: g.naming.missing,
+  }
+}
+
+pub fn stored_form(body: Bytes) -> Stored / {abort.raise} = read_body(body, b"a stored body").form
+
 pub fn print_bodies(
-  bodies: List<Bytes>,
-  names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
+  definitions: List<PrintedDefinition>,
   tests: List<Bytes>,
   shipped: List<Bytes>,
-  meant: List<{ name: Bytes, hash: Bytes, names: List<Bytes> }> = [],
-) -> PrintResult / {abort.raise} = {
-  let comps = bodies.map(component_of);
-  let n = named_of(
-    names,
-    comps.fold(Map::new(), |accumulator: Map<Bytes, Bool>, component: Component|
-      accumulator.insert(component.key, true)),
-  );
-  let parted: PartitionState = match n.bad {
-    Some(_) -> { seen: Map::new(), hash_by_name: Map::new(), parts: [], error: n.bad },
-    None ->
-      comps.fold(
-        { seen: Map::new(), hash_by_name: Map::new(), parts: [], error: None },
-        |accumulator: PartitionState, component: Component|
-          if is_some(accumulator.error) || accumulator.seen.contains(component.id) { accumulator }
-          else {
-            add_component(
-              { ..accumulator, seen: accumulator.seen.insert(component.id, true) },
-              component,
-              n.named,
-              shipped,
-            )
-          },
-      ),
-  };
-  match parted.error {
-    Some(r) -> Unprintable(r),
+) -> PrintResult / {abort.raise} =
+  match definitions.find(|d: PrintedDefinition| module_of_name(d.name).len() == 0) {
+    Some(d) ->
+      Unprintable({ message: Bytes::concat_all([b"`", d.name, b"` has no module prefix"]), notes: [] }),
     None -> {
-      let l = layout_of(
-        parted.parts,
-        meant.fold(
-          Map::new(),
-          |accumulator: Map<Bytes, Map<Bytes, Bool>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|
-            accumulator.insert(
-              source_names_key(n.name, n.hash),
-              n.names.fold(Map::new(), |names_so_far: Map<Bytes, Bool>, name: Bytes|
-                names_so_far.insert(name, true)),
-            ),
+      let shipped_modules = shipped.fold(Map::new(), |m: Map<Bytes, Bool>, s: Bytes| m.insert(s, true));
+      let layout = {
+        printed: definitions.fold(Map::new(), |m: Map<Bytes, Bool>, d: PrintedDefinition|
+          m.insert(d.name, true)),
+        shipped: shipped_modules,
+        constants: definitions.fold(Map::new(), |m: Map<Bytes, Bool>, d: PrintedDefinition|
+          match read_body(d.body, d.name).form {
+            FunctionOf(function) -> if function.constant { m.insert(d.name, true) } else { m },
+            _ -> m,
+          }),
+        binders: binders(
+          definitions.fold(Map::new(), |m: Map<Bytes, Bool>, d: PrintedDefinition|
+            m.insert(module_of_name(d.name), true)).keys(),
         ),
+      };
+      let printed = definitions.fold(
+        { modules: Map::new(), missing: Map::new() },
+        |done: Printing, d: PrintedDefinition| {
+          let module = module_of_name(d.name);
+          if shipped_modules.contains(module) { done }
+          else { printed_into(layout, done, module, module, d.name, d.body) }
+        },
       );
-      let printed = print_parts(l);
-      let t = print_tests(l, printed.graph, tests, printed.missing);
-      let missing = t.missing.keys();
+      let all = range(0, tests.len()).fold(printed, |done: Printing, i: Int|
+        printed_into(layout, done, b"", b"ply_tests", b"t".concat(ascii_of_int(i)), tests.get(i)));
+      let missing = all.missing.keys();
       if missing.len() > 0 {
         Unprintable({
           message: ascii_of_int(missing.len()).concat(
             b" definitions are used by a printed definition but are missing from the definitions being printed",
           ),
-          notes: [
-            b"missing: ".concat(
-              Bytes::join(missing.take(min(8, missing.len())).map(short_hex), b", "),
-            ),
-          ],
+          notes: [b"missing: ".concat(Bytes::join(missing.take(min(8, missing.len())), b", "))],
         })
       } else {
-        let texts = printed.modules.fold(
-          [],
-          |accumulator: List<{ module: Bytes, text: Bytes }>, m: Bytes, sheet: Sheet|
-            accumulator.push({ module: m, text: sheet_text(sheet) }),
-        );
-        Printed(if tests.len() == 0 { texts } else {
-          texts.push({
-            module: b"ply_tests",
-            text: sheet_text({ items: t.texts, imports: t.imports }),
-          })
-        })
+        Printed(
+          all.modules.fold([], |accumulator: List<{ module: Bytes, text: Bytes }>, m: Bytes, sheet: Sheet|
+            accumulator.push({ module: m, text: sheet_text(sheet) })),
+        )
       }
     },
   }
-}

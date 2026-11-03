@@ -17,7 +17,8 @@ import compiler.syntax.items (Item, FunctionItem, TypeItem, LawItem, CostClause,
                               InvariantInstance)
 import compiler.syntax.expressions (Expression, NameExpression, Param, expression_span,
                                     expression_nodes)
-import compiler.store.hash.forms (HashOutput, NodeRef, ItemKeyed, references_in)
+import compiler.store.hash.forms (HashOutput, NodeRef, ItemKeyed, references_in, identity_in,
+                                  DefinitionRun, LawRun, SubjectIdentity, with_identities)
 import compiler.store.hash.encoding (hex)
 import std.hash (blake3)
 import compiler.check.resolve.tables (Diagnostic, ParsedModule, error_at, qualify)
@@ -126,25 +127,24 @@ pub fn prover_input_of(
       |accumulator: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }|
         accumulator.insert(s.name, s.hashes),
     );
-  let keys = by_name(analysis.hashes.spec_checks);
-  let runs = by_name(analysis.hashes.specs);
+  let keys = clause_keys(analysis.hashes);
   let definitions = analysis.checked.definitions.filter(|d: DefinitionInfo| owned(d.module));
   let schemas = schema_definitions(analysis.modules);
   let laws = analysis.checked.laws.filter(|l: LawInfo| owned(l.module));
   let clauses = definitions.fold(
     { obligations: [], warnings: [] },
     |accumulator: CollectedObligations, d: DefinitionInfo|
-      clauses_of(accumulator, d, written, requires, keys, runs, closing),
+      clauses_of(accumulator, d, written, requires, keys, closing),
   );
   let stating = invariants_of(analysis.checked.instances);
   let values = if stating.len() == 0 { Map::new() } else { values_named(analysis.modules) };
   let built = definitions.fold(clauses, |accumulator: CollectedObligations, d: DefinitionInfo|
     builds_of(accumulator, d, written, stating, values, analysis.hashes, closing));
   let collected = laws.fold(built, |accumulator: CollectedObligations, l: LawInfo|
-    law_of(accumulator, l, analysis.hashes.laws, wheres, closing));
+    law_of(accumulator, l, law_keys(analysis.hashes), wheres, closing));
   let imports = imports_of(analysis.modules);
   let trusted = analysis.checked.laws.filter(|l: LawInfo|
-    !owned(l.module) && !l.has_guard && analysis.hashes.law_texts.contains(l.key));
+    !owned(l.module) && !l.has_guard && analysis.hashes.laws.contains(l.key));
   let imported_law_hashes = |o: Obligation|
     match o.kind {
       Cost(_) -> [],
@@ -193,7 +193,7 @@ pub fn defined(ds: List<DefinitionInfo>, h: HashOutput) -> List<Definition> / {a
     |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
       accumulator.insert(x.name, x.hash),
   );
-  let clauses = h.spec_texts.fold(
+  let clauses = h.specs.fold(
     Map::new(),
     |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
       accumulator.insert(x.name, x.hashes),
@@ -218,7 +218,7 @@ fn sentences_of(ls: List<LawInfo>, h: HashOutput) -> List<WrittenLaw> / {abort.r
       Some(hash) ->
         accumulator.push({
           key: String::of_bytes_lossy(l.key),
-          text: hashed_text(match h.law_texts.get(l.key) { Some(t) -> t, None -> hash }),
+          text: hashed_text(hash),
           mentions: references_in(h, ItemKeyed(l.key)).fold(
             [],
             |ns: List<Bytes>, r: NodeRef| ns.push_unique(r.name),
@@ -612,7 +612,6 @@ fn clauses_of(
   written: Map<Bytes, List<Bytes>>,
   clauses: Map<Bytes, Clauses>,
   keys: Map<Bytes, List<Bytes>>,
-  runs: Map<Bytes, List<Bytes>>,
   closing: OpaqueTypes,
 ) -> CollectedObligations / {abort.raise} = {
   let claimed = d.spec.filter(|s: SpecInfo| s.kind != RequiresClause);
@@ -642,7 +641,6 @@ fn clauses_of(
       closing,
     );
     let hashed = match keys.get(d.name) { Some(hs) -> hs, None -> [] };
-    let ran = match runs.get(d.name) { Some(hs) -> hs, None -> [] };
     claimed.fold(
       { owed: accumulator, ensures: 0, costs: 0, spaces: 0 },
       |st: { owed: CollectedObligations, ensures: Int, costs: Int, spaces: Int }, clause: SpecInfo| {
@@ -668,9 +666,7 @@ fn clauses_of(
                 ..st.owed,
                 obligations: st.owed.obligations.push({
                   key: String::of_bytes_lossy(hex(key)),
-                  run_key: String::of_bytes_lossy(
-                    hex(match ran.at(clause.index) { Some(r) -> r, None -> key }),
-                  ),
+                  run_key: String::of_bytes_lossy(hex(key)),
                   owner: String::of_bytes_lossy(d.name),
                   kind: match clause.kind {
                     CostClause -> Cost(st.costs),
@@ -916,8 +912,10 @@ fn builds_of(
       closing,
       d.module,
     );
-    let check = h.checks.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
-      if x.name == d.name { x.hash } else { found });
+    match identity_in(h, DefinitionRun(d.name)) {
+      None ->
+        { ..accumulator, warnings: accumulator.warnings.push(unhashed(d.name, d.at.module, d.at.span)) },
+      Some(check) ->
     owed_for.fold(accumulator, |a: CollectedObligations, i: { type_name: Bytes, by: Bytes }| {
       let typed = h.declarations.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
         if x.name == i.type_name { x.hash } else { found });
@@ -943,9 +941,25 @@ fn builds_of(
           identities: [],
         }),
       }
-    })
+    }),
+    }
   }
 }
+
+fn clause_keys(h: HashOutput) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+  h.specs.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }|
+      match identity_in(h, DefinitionRun(s.name)) {
+        Some(identity) ->
+          accumulator.insert(s.name, s.hashes.map(|c: Bytes| blake3(identity.concat(c)))),
+        None -> accumulator,
+      },
+  )
+
+fn law_keys(h: HashOutput) -> Map<Bytes, Bytes> =
+  h.identities.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: SubjectIdentity|
+    match s.subject { LawRun(key) -> accumulator.insert(key, s.identity), _ -> accumulator })
 
 fn keys_of(instances: List<InstanceInfo>) -> List<{ type_name: String, by: String }> =
   instances.fold([], |accumulator: List<{ type_name: String, by: String }>, x: InstanceInfo|
@@ -1016,8 +1030,10 @@ fn measures_of(modules: List<ParsedModule>) -> Map<Bytes, Expression> =
 pub fn whole_of(source: Bytes) -> Analysis / {abort.raise} =
   match analyse(parse_all([{ name: b"m", source_text: source }])) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> w,
+    Analysed(w) -> identified(w),
   }
+
+pub fn identified(w: Analysis) -> Analysis / {abort.raise} = { ..w, hashes: with_identities(w.hashes) }
 
 pub fn every(m: Bytes) -> Bool = true
 
@@ -1284,7 +1300,7 @@ test "outside the module that defines an opaque type, the prover never builds va
   ];
   let built = match analyse_pulling_std_with(user, shipped, no_rows, cut_unused: false).out {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> prover_input_of(w, every),
+    Analysed(w) -> prover_input_of(identified(w), every),
   };
   let made = |owner: String|
     owned_by(built.world.obligations, owner).get(0).binders.map(|b: Binder| b.constructible);
@@ -1385,7 +1401,7 @@ test "a claim's prover input built from stored group results equals the one a wh
   let owned = |m: Bytes| m == b"lib" || m == b"app";
   let whole = match analyse(parse_all(sources)) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> prover_input_of(w, owned),
+    Analysed(w) -> prover_input_of(identified(w), owned),
   };
   match read_over(sources, ||
       claims_analysed([
@@ -1415,7 +1431,7 @@ fn app_law_key(source: Bytes) -> String / {abort.raise} =
       ]),
     ) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> match prover_input_of(w, |m: Bytes| m == b"app").world.obligations.fold(
+    Analysed(w) -> match prover_input_of(identified(w), |m: Bytes| m == b"app").world.obligations.fold(
         None,
         |found: Option<String>, o: Obligation|
           if o.owner == "app.uses" { Some(o.key) } else { found },
