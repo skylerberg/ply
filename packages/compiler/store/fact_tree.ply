@@ -1,4 +1,5 @@
 import std.bin
+import std.set (Set)
 import std.bytes
 import std.gen
 import std.list
@@ -101,6 +102,51 @@ fn entries_within<| e>(
       },
     }
   }
+
+fn any_within<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  prefix: Bytes,
+  counted: (Bytes) -> Bool,
+  room: Int,
+) -> Bool / {abort.raise | e} =
+  if room <= 0 { too_deep() } else {
+    match root {
+      None -> false,
+      Some(found) -> match load(found.hash) {
+        Bucket(entries) ->
+          entries.any(|entry: TreeEntry| entry.key.starts_with(prefix) && counted(entry.key)),
+        Branch(branch) -> {
+          let wanted = prefix.len() * 2;
+          let known = min(branch.depth, wanted);
+          if shared_nibbles(branch.common, prefix, 0, known) < known { false }
+          else if branch.depth < wanted {
+            any_within(
+              load,
+              child_at(branch, nibble(prefix, branch.depth)),
+              prefix,
+              counted,
+              room - 1,
+            )
+          } else {
+            branch.children.any(|child: TreeChild|
+              any_within(load, Some(child.root), prefix, counted, room - 1))
+          }
+        },
+      },
+    }
+  }
+
+/// Whether the tree holds an entry whose key starts with `prefix` and that `counted` accepts.
+///
+/// The walk stops at the first such entry, so its cost does not grow with the number of entries
+/// under the prefix.
+pub fn any_under<| e>(
+  load: (Bytes) -> TreeNode / e,
+  root: Option<TreeRoot>,
+  prefix: Bytes,
+  counted: (Bytes) -> Bool,
+) -> Bool / {abort.raise | e} = any_within(load, root, prefix, counted, tree_height)
 
 pub fn entries_under<| e>(
   load: (Bytes) -> TreeNode / e,
@@ -368,6 +414,27 @@ test "`find` and `entries_under` agree with the entries, for keys that share a l
         find(load, end.root, key) == end.model.get(key)
       });
       groups_agree && keys_agree
+    },
+    cases: 25,
+  )
+}
+
+test "`any_under` says whether some entry under a prefix is counted, as listing the entries would" {
+  gen::check(
+    gen::list_of(gen::below(100000), 400),
+    |draws: List<Int>| {
+      let end = draws.fold({ root: None, nodes: Map::new(), model: Map::new() }, grown);
+      let load = |hash: Bytes| node_in(end.nodes, hash);
+      range(0, 6).all(|group: Int| {
+        let prefix = byte_of_int(group).concat(b"\x00\x00\x00");
+        let listed = entries_under(load, end.root, prefix);
+        let chosen = range(0, 29).fold(Set::empty(), |keys: Set<Bytes>, m: Int|
+          keys.insert(pair_key(group, m * 7)));
+        let counted = |key: Bytes| chosen.contains(key);
+        any_under(load, end.root, prefix, |_: Bytes| true) == (listed != [])
+          && any_under(load, end.root, prefix, counted)
+          == listed.any(|entry: TreeEntry| counted(entry.key))
+      })
     },
     cases: 25,
   )
