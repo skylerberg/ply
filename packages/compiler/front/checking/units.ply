@@ -2,6 +2,7 @@ import std.set (Set)
 import std.bin
 import std.bytes
 import std.graph
+import std.graph (Visit, traverse)
 import std.hash (blake3)
 import std.list
 import compiler.check.infer.definitions (Extern, extern_bin, module_externs)
@@ -574,9 +575,6 @@ pub fn lower_unit(unit: CodeUnit) -> Written / {QueryEffects, abort.raise} = {
 }
 
 type ReachWalk = {
-  work: List<RootKey>,
-  next: Int,
-  seen: Set<RootName>,
   units: Map<Bytes, CodeUnit>,
   modules: Map<Bytes, ModuleUnits>,
   links: List<RootLink>,
@@ -640,37 +638,26 @@ fn with_unit_part(
   { walk: placed.walk, parts: built.parts.insert(key, part) }
 }
 
+type ReachedRoot = { unit: CodeUnit, summary: Option<UnitSummary>, calls: List<RootKey> }
+
 pub fn find_reachable_units(entries: Entries) -> Written / {memo.read, abort.raise} = {
-  let walked = iterate(
-    {
-      work: entries.roots,
-      next: 0,
-      seen: Set::empty(),
-      units: Map::new(),
-      modules: Map::new(),
-      links: [],
-      failures: [],
+  let reached = traverse(entries.roots, |k: RootKey| {
+    let unit = unit_of_root(k, entries.tested);
+    let summary = if unit == NoCode { None } else { Some(summary_of(unit)) };
+    let calls = match summary { Some(s) -> roots_called(s, k), None -> [] };
+    { value: { unit: unit, summary: summary, calls: calls }, next: calls }
+  });
+  let walked = reached.fold(
+    { units: Map::new(), modules: Map::new(), links: [], failures: [] },
+    |w: ReachWalk, v: Visit<RootKey, ReachedRoot>| {
+      let at = bin::encode(v.value.unit, code_unit_bin());
+      {
+        ..w,
+        units: if v.value.unit == NoCode { w.units } else { w.units.insert(at, v.value.unit) },
+        links: w.links.push({ root: root_name(v.key), unit: at, calls: v.value.calls.map(root_name) }),
+        failures: with_failure(w.failures, v.value.unit, v.value.summary),
+      }
     },
-    1099511627776,
-    |w: ReachWalk|
-      match w.work.at(w.next) {
-        None -> Stop(w),
-        Some(k) -> if w.seen.contains(root_name(k)) { Continue({ ..w, next: w.next + 1 }) } else {
-          let unit = unit_of_root(k, entries.tested);
-          let at = bin::encode(unit, code_unit_bin());
-          let summary = if unit == NoCode { None } else { Some(summary_of(unit)) };
-          let calls = match summary { Some(s) -> roots_called(s, k), None -> [] };
-          Continue({
-            ..w,
-            next: w.next + 1,
-            seen: w.seen.insert(root_name(k)),
-            units: if unit == NoCode { w.units } else { w.units.insert(at, unit) },
-            work: calls.fold(w.work, |all: List<RootKey>, c: RootKey| all.push(c)),
-            links: w.links.push({ root: root_name(k), unit: at, calls: calls.map(root_name) }),
-            failures: with_failure(w.failures, unit, summary),
-          })
-        },
-      },
   );
   let built = walked.units.fold(
     { walk: walked, parts: Map::new() },
@@ -678,7 +665,7 @@ pub fn find_reachable_units(entries: Entries) -> Written / {memo.read, abort.rai
   );
   written(reachable_query(), {
     parts: built.parts.values(),
-    roots: walked.work.unique(),
+    roots: reached.map(|v: Visit<RootKey, ReachedRoot>| v.key),
     links: walked.links,
     failures: walked.failures,
   })

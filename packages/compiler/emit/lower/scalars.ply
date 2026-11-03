@@ -14,9 +14,10 @@ import compiler.emit.typing (unknown_type)
 import compiler.syntax.parsing (Span)
 import compiler.emit.c (Width, width_named, folded_constant, is_bitwise)
 import std.bytes (ascii_of_int)
-import compiler.emit.representations (EmitReads, ShapeReads, code_facts, SumConstructor,
-                                      has_variables, type_variables, compared_by_root, keyed_sum,
-                                      numeric_sum, nullary_sum, generic_sum, written_sum, at_args,
+import std.graph (Visit, traverse)
+import compiler.emit.representations (EmitReads, ShapeReads, code_facts, has_variables,
+                                      type_variables, compared_by_root, keyed_sum, numeric_sum,
+                                      nullary_sum, generic_sum, written_sum, sum_fields,
                                       release_effects)
 import compiler.check.infer.expression (retained_type)
 import compiler.emit.output (Exact, Scalar, float_literal_bits)
@@ -604,36 +605,27 @@ type OperatorClass =
   | WordOperands(Type)
 
 pub fn comparison_built(t: Type, order: Bool) -> Bool / {EmitReads} =
-  iterate({ todo: [t], seen: [] }, 1 << 24, |s: { todo: List<Type>, seen: List<Bytes> }|
-    match s.todo {
-      [] -> Stop(true),
-      [x, ..rest] -> match x {
-        FunctionType(_) -> if order { Stop(false) } else { Continue({ ..s, todo: rest }) },
-        _ -> match class_of(x) {
-          RecordOperands(fs) -> Continue({ ..s, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
-          ContainerOperands(w) -> Continue({ ..s, todo: rest.concat(type_args(w)) }),
-          SumOperands(w) -> match w {
-            NamedType(c) -> if s.seen.contains(c.name) || keyed_sum(c.name) {
-              Continue({ ..s, todo: rest })
-            } else {
-              let cs = match code_facts.sum_named(c.name) { Some(found) -> found, None -> [] };
-              Continue({
-                todo: rest.concat(
-                  cs.fold([], |accumulator: List<Type>, k: SumConstructor|
-                    accumulator.concat(k.fields.map(|f: Type| at_args(f, k.params, c.args)))),
-                ),
-                seen: s.seen.push(c.name),
-              })
-            },
-            _ -> Continue({ ..s, todo: rest }),
-          },
-          WordOperands(w) -> if w == retained_type || w == unit_type || w == RecordType([])
-              || (!order && is_secret(w)) { Continue({ ..s, todo: rest }) }
-          else { Stop(false) },
-          _ -> Continue({ ..s, todo: rest }),
-        },
+  traverse([t], |x: Type| compared_within(x, order)).all(|v: Visit<Type, Bool>| v.value)
+
+fn compared_within(x: Type, order: Bool) -> { value: Bool, next: List<Type> } / {EmitReads} =
+  match x {
+    FunctionType(_) -> { value: !order, next: [] },
+    _ -> match class_of(x) {
+      RecordOperands(fs) -> { value: true, next: fs.map(|f: Field| f.ty) },
+      ContainerOperands(w) -> { value: true, next: type_args(w) },
+      SumOperands(w) -> match w {
+        NamedType(c) -> if keyed_sum(c.name) { { value: true, next: [] } }
+        else { { value: true, next: sum_fields(c) } },
+        _ -> { value: true, next: [] },
       },
-    })
+      WordOperands(w) -> {
+        value: w == retained_type || w == unit_type || w == RecordType([])
+          || (!order && is_secret(w)),
+        next: [],
+      },
+      _ -> { value: true, next: [] },
+    },
+  }
 
 fn type_args(t: Type) -> List<Type> = match t { NamedType(c) -> c.args, _ -> [] }
 

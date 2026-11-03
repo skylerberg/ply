@@ -1,4 +1,5 @@
 import std.set (Set)
+import std.graph (Visit, traverse)
 import compiler.syntax.parsing (Identifier)
 import compiler.emit.code (Code)
 import compiler.syntax.items (FnDefinition)
@@ -101,21 +102,14 @@ pub fn tail_reachable_definitions(
   read_of: (Bytes) -> Option<DefinitionBody> / {EmitReads},
   from: Bytes,
 ) -> Set<Bytes> / {EmitReads} =
-  iterate(
-    { seen: Set::empty(), work: [from] },
-    1000000,
-    |r: { seen: Set<Bytes>, work: List<Bytes> }|
-      match r.work {
-        [] -> Stop(r),
-        [n, ..rest] -> if r.seen.contains(n) { Continue({ ..r, work: rest }) } else {
-          let next = match read_of(n) {
-            Some(w) -> tail_calls(s, w.code, []).map(|t: TailCall| t.full),
-            None -> [],
-          };
-          Continue({ seen: r.seen.insert(n), work: rest.concat(next) })
-        },
+  traverse([from], |n: Bytes|
+    {
+      value: (),
+      next: match read_of(n) {
+        Some(w) -> tail_calls(s, w.code, []).map(|t: TailCall| t.full),
+        None -> [],
       },
-  ).seen
+    }).fold(Set::empty(), |reached: Set<Bytes>, v: Visit<Bytes, Unit>| reached.insert(v.key))
 
 pub fn tail_loop_of(
   s: ModuleContext,
@@ -123,24 +117,17 @@ pub fn tail_loop_of(
   read_of: (Bytes) -> Option<DefinitionBody> / {EmitReads},
   key: RootKey,
 ) -> List<RootKey> / {EmitReads} = {
-  let targets_by_root = iterate(
-    { pairs: Map::new(), work: [key] },
-    1000000,
-    |r: { pairs: Map<RootName, TailCallTargets>, work: List<RootKey> }|
-      match r.work {
-        [] -> Stop(r),
-        [k, ..rest] -> if r.pairs.contains(root_name(k)) { Continue({ ..r, work: rest }) } else {
-          let t = match read_of(site_owner_text(k)) {
-            Some(w) -> tail_call_targets(s, w, key_types(k)),
-            None -> { key: k, out: [], grown: [] },
-          };
-          Continue({
-            pairs: r.pairs.insert(root_name(k), { ..t, key: k }),
-            work: rest.concat(t.out),
-          })
-        },
-      },
-  ).pairs;
+  let targets_by_root = traverse([key], |k: RootKey| {
+    let t = match read_of(site_owner_text(k)) {
+      Some(w) -> tail_call_targets(s, w, key_types(k)),
+      None -> { key: k, out: [], grown: [] },
+    };
+    { value: { ..t, key: k }, next: t.out }
+  }).fold(
+    Map::new(),
+    |pairs: Map<RootName, TailCallTargets>, v: Visit<RootKey, TailCallTargets>|
+      if pairs.contains(root_name(v.key)) { pairs } else { pairs.insert(root_name(v.key), v.value) },
+  );
   targets_by_root.fold((), |_: Unit, _: RootName, p: TailCallTargets| {
     let caller = site_owner_text(p.key);
     match p.grown.find(|callee: Bytes|
@@ -160,19 +147,18 @@ pub fn tail_loop_of(
         ),
     }
   });
-  let back = iterate(
-    Set::empty().insert(root_name(key)),
-    targets_by_root.len() + 1,
-    |seen: Set<RootName>| {
-      let more = targets_by_root.fold(
-        seen,
-        |accumulator: Set<RootName>, n: RootName, p: TailCallTargets|
-          if accumulator.contains(n)
-              || !p.out.any(|k: RootKey| accumulator.contains(root_name(k))) { accumulator }
-          else { accumulator.insert(n) },
-      );
-      if more.size() == seen.size() { Stop(seen) } else { Continue(more) }
-    },
+  let callers = targets_by_root.fold(
+    Map::new(),
+    |accumulator: Map<RootName, List<RootName>>, n: RootName, p: TailCallTargets|
+      p.out.fold(accumulator, |a: Map<RootName, List<RootName>>, k: RootKey| {
+        let had = match a.get(root_name(k)) { Some(found) -> found, None -> [] };
+        a.insert(root_name(k), had.push(n))
+      }),
+  );
+  let back = traverse([root_name(key)], |n: RootName|
+    { value: (), next: match callers.get(n) { Some(found) -> found, None -> [] } }).fold(
+    Set::empty(),
+    |reached: Set<RootName>, v: Visit<RootName, Unit>| reached.insert(v.key),
   );
   let members = targets_by_root.fold(
     [],

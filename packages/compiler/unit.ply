@@ -1,4 +1,5 @@
 import std.set (Set)
+import std.graph (Visit, traverse)
 import compiler.codes (internal_error_code)
 import compiler.syntax.parsing (Error)
 import compiler.store.hash.encoding (hex)
@@ -1765,6 +1766,10 @@ fn generic_bodies(
       _ -> accumulator,
     })
 
+type NeedOf = { root: RootName, need: Need }
+
+type GenericCallSite = { caller: RootName, call: GenericCall }
+
 fn extended_needs(
   bodies: Map<RootName, Tables>,
   closed: Map<RootName, List<Need>>,
@@ -1774,19 +1779,23 @@ fn extended_needs(
     |accumulator: Map<RootName, List<Need>>, n: RootName, t: Tables|
       accumulator.insert(n, t.generics.needs),
   );
-  let needs_count = |needs: Map<RootName, List<Need>>|
-    bodies.fold(0, |c: Int, n: RootName, _: Tables|
-      c + (match needs.get(n) { Some(ns) -> ns.len(), None -> 0 }));
-  let most = bodies.fold(1, |accumulator: Int, _: RootName, t: Tables|
-    accumulator + 2 * t.generics.calls.fold(1, |n: Int, c: GenericCall| n + c.args.len()));
-  iterate(start, most, |needs: Map<RootName, List<Need>>| {
-    let next = bodies.fold(
-      needs,
-      |accumulator: Map<RootName, List<Need>>, n: RootName, t: Tables|
-        t.generics.calls.fold(accumulator, |a: Map<RootName, List<Need>>, call: GenericCall|
-          with_callee_needs(a, n, call, needs)),
-    );
-    if needs_count(next) == needs_count(needs) { Stop(needs) } else { Continue(next) }
+  let sites = bodies.fold(
+    Map::new(),
+    |accumulator: Map<RootName, List<GenericCallSite>>, n: RootName, t: Tables|
+      t.generics.calls.fold(accumulator, |a: Map<RootName, List<GenericCallSite>>, call: GenericCall| {
+        let callee = root_name(call.callee);
+        let had = match a.get(callee) { Some(found) -> found, None -> [] };
+        a.insert(callee, had.push({ caller: n, call: call }))
+      }),
+  );
+  let from = start.fold([], |roots: List<NeedOf>, n: RootName, ns: List<Need>|
+    roots.concat(ns.map(|need: Need| { root: n, need: need })));
+  traverse(from, |at: NeedOf| {
+    let callers = match sites.get(at.root) { Some(found) -> found, None -> [] };
+    { value: (), next: callers.flat_map(|site: GenericCallSite| caller_needs(site, at.need)) }
+  }).fold(start, |needs: Map<RootName, List<Need>>, v: Visit<NeedOf, Unit>| {
+    let had = match needs.get(v.key.root) { Some(ns) -> ns, None -> [] };
+    if had.contains(v.key.need) { needs } else { needs.insert(v.key.root, had.push(v.key.need)) }
   })
 }
 
@@ -1829,6 +1838,8 @@ fn with_unemitted_rejected(
       )
     } else { accumulator.insert(n, a) })
 
+type CalledParameter = { root: RootName, parameter: Int }
+
 fn extended_called(
   bodies: Map<RootName, Tables>,
   closed: Map<RootName, List<Int>>,
@@ -1843,52 +1854,41 @@ fn extended_called(
     |accumulator: Map<RootName, List<Int>>, n: RootName, g: Generics|
       accumulator.insert(n, g.called_parameters),
   );
-  let calls_count = |called: Map<RootName, List<Int>>|
-    alone.fold(0, |c: Int, n: RootName, _: Generics|
-      c + (match called.get(n) { Some(cs) -> cs.len(), None -> 0 }));
-  let most = alone.fold(1, |accumulator: Int, _: RootName, g: Generics|
-    accumulator + g.passes.len());
-  iterate(start, most, |called: Map<RootName, List<Int>>| {
-    let next = alone.fold(
-      called,
-      |accumulator: Map<RootName, List<Int>>, n: RootName, g: Generics|
-        g.passes.fold(accumulator, |a: Map<RootName, List<Int>>, pass: ForwardedParameter| {
-          let theirs = match called.get(root_name(pass.callee)) { Some(cs) -> cs, None -> [] };
-          let mine = match a.get(n) { Some(cs) -> cs, None -> [] };
-          if theirs.contains(pass.at) && !mine.contains(pass.param) {
-            a.insert(n, mine.push(pass.param))
-          } else { a }
-        }),
-    );
-    if calls_count(next) == calls_count(called) { Stop(called) } else { Continue(next) }
-  })
+  let forwards = alone.fold(
+    Map::new(),
+    |accumulator: Map<CalledParameter, List<CalledParameter>>, n: RootName, g: Generics|
+      g.passes.fold(accumulator, |a: Map<CalledParameter, List<CalledParameter>>, pass: ForwardedParameter| {
+        let theirs = { root: root_name(pass.callee), parameter: pass.at };
+        let had = match a.get(theirs) { Some(found) -> found, None -> [] };
+        a.insert(theirs, had.push({ root: n, parameter: pass.param }))
+      }),
+  );
+  let from = start.fold([], |roots: List<CalledParameter>, n: RootName, ps: List<Int>|
+    roots.concat(ps.map(|p: Int| { root: n, parameter: p })));
+  traverse(from, |at: CalledParameter|
+    { value: (), next: match forwards.get(at) { Some(found) -> found, None -> [] } }).fold(
+    start,
+    |called: Map<RootName, List<Int>>, v: Visit<CalledParameter, Unit>| {
+      let had = match called.get(v.key.root) { Some(ps) -> ps, None -> [] };
+      if had.contains(v.key.parameter) { called }
+      else { called.insert(v.key.root, had.push(v.key.parameter)) }
+    },
+  )
 }
 
-fn with_callee_needs(
-  accumulator: Map<RootName, List<Need>>,
-  n: RootName,
-  call: GenericCall,
-  needs: Map<RootName, List<Need>>,
-) -> Map<RootName, List<Need>> = {
-  let callee = match needs.get(root_name(call.callee)) { Some(ns) -> ns, None -> [] };
-  callee.fold(accumulator, |a: Map<RootName, List<Need>>, need: Need|
-    match call.args.at(need.var) {
-      None -> a,
-      Some(arg) -> {
-        let variables = match need.reads {
-          Exact -> type_variables(arg),
-          Layout -> layout_variables(arg),
-          Scalar -> match arg { VariableType(v) -> if v >= 0 { [v] } else { [] }, _ -> [] },
-          EffectsGeneric -> [],
-        };
-        variables.fold(a, |m: Map<RootName, List<Need>>, v: Int| {
-          let had = match m.get(n) { Some(ns) -> ns, None -> [] };
-          let more = { var: v, reads: need.reads };
-          if had.contains(more) { m } else { m.insert(n, had.push(more)) }
-        })
-      },
-    })
-}
+fn caller_needs(site: GenericCallSite, need: Need) -> List<NeedOf> =
+  match site.call.args.at(need.var) {
+    None -> [],
+    Some(arg) -> {
+      let variables = match need.reads {
+        Exact -> type_variables(arg),
+        Layout -> layout_variables(arg),
+        Scalar -> match arg { VariableType(v) -> if v >= 0 { [v] } else { [] }, _ -> [] },
+        EffectsGeneric -> [],
+      };
+      variables.map(|v: Int| { root: site.caller, need: { var: v, reads: need.reads } })
+    },
+  }
 
 fn call_specialisation(
   call: GenericCall,

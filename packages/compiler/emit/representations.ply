@@ -1,4 +1,5 @@
 import std.set (Set)
+import std.graph (Visit, traverse)
 import compiler.check.infer.checker (CallShape, call_shape, elsewhere, ConstructorInfo, TypeFacts,
                                      builtin_constructors)
 import compiler.check.infer.definitions (Extern)
@@ -272,96 +273,65 @@ pub fn sums_around<| e>(
   sum_of: (Bytes) -> Option<List<SumConstructor>> / {abort.raise | e},
   names: List<Bytes>,
 ) -> Map<Bytes, List<SumConstructor>> / {abort.raise | e} =
-  iterate(
-    { work: names, seen: Set::empty(), sums: Map::new() },
-    walk_bound,
-    |w: { work: List<Bytes>, seen: Set<Bytes>, sums: Map<Bytes, List<SumConstructor>> }|
-      match w.work {
-        [] -> Stop(w.sums),
-        [name, ..rest] -> if w.seen.contains(name) { Continue({ ..w, work: rest }) } else {
-          let seen = w.seen.insert(name);
-          match sum_of(name) {
-            Some(cs) ->
-              Continue({
-                work: cs.fold(rest, |found: List<Bytes>, c: SumConstructor|
-                  c.fields.fold(found, |f: List<Bytes>, t: Type| f.concat(type_names(t)))),
-                seen: seen,
-                sums: w.sums.insert(name, cs),
-              }),
-            None -> Continue({ ..w, work: rest, seen: seen }),
-          }
-        },
+  traverse(names, |name: Bytes| {
+    let found = sum_of(name);
+    {
+      value: found,
+      next: match found {
+        Some(cs) ->
+          cs.fold([], |inside: List<Bytes>, c: SumConstructor|
+            c.fields.fold(inside, |names_in: List<Bytes>, t: Type| names_in.concat(type_names(t)))),
+        None -> [],
       },
+    }
+  }).fold(
+    Map::new(),
+    |sums: Map<Bytes, List<SumConstructor>>, v: Visit<Bytes, Option<List<SumConstructor>>>|
+      match v.value { Some(cs) -> sums.insert(v.key, cs), None -> sums },
   )
-
-const walk_bound: Int = 1099511627776
 
 fn release_effects_of(type_name: Bytes) -> Option<Effects> / {ShapeReads} =
   match code_facts.released_by(type_name) { Some(r) -> r.effects, None -> None }
 
 pub fn release_effects(ty: Type) -> Effects / {ShapeReads} = {
-  let effects = iterate(
-    { todo: [ty], seen: [], listed: [] },
-    walk_bound,
-    |w: { todo: List<Type>, seen: List<Bytes>, listed: List<Effect> }|
-      match w.todo {
-        [] -> Stop(w.listed),
-        [t, ..rest] -> match t {
-          NamedType(c) -> if is_label_or_effects(t) { Continue({ ..w, todo: rest }) } else {
-            match release_effects_of(c.name) {
-              Some(r) -> Continue({ ..w, todo: rest, listed: effects_union(w.listed, r.listed) }),
-              None -> {
-                let args = rest.concat(c.args);
-                if w.seen.contains(c.name) { Continue({ ..w, todo: args }) } else {
-                  match code_facts.sum_named(c.name) {
-                    Some(cs) ->
-                      Continue({
-                        ..w,
-                        todo: cs.fold(args, |accumulator: List<Type>, k: SumConstructor|
-                          accumulator.concat(constructor_fields_at(k, c.args))),
-                        seen: w.seen.push(c.name),
-                      }),
-                    None -> Continue({ ..w, todo: args }),
-                  }
-                }
-              },
-            }
-          },
-          RecordType(fs) -> Continue({ ..w, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
-          NominalType(n) -> Continue({ ..w, todo: rest.concat(n.fields.map(|f: Field| f.ty)) }),
-          _ -> Continue({ ..w, todo: rest }),
-        },
-      },
-  );
+  let effects = traverse([ty], released_within).fold([], |listed: List<Effect>, v: Visit<Type, List<Effect>>|
+    effects_union(listed, v.value));
   { listed: effects, variable: None }
 }
 
+fn released_within(t: Type) -> { value: List<Effect>, next: List<Type> } / {ShapeReads} =
+  match t {
+    NamedType(c) -> if is_label_or_effects(t) { { value: [], next: [] } } else {
+      match release_effects_of(c.name) {
+        Some(r) -> { value: r.listed, next: [] },
+        None -> { value: [], next: c.args.concat(sum_fields(c)) },
+      }
+    },
+    RecordType(fs) -> { value: [], next: fs.map(|f: Field| f.ty) },
+    NominalType(n) -> { value: [], next: n.fields.map(|f: Field| f.ty) },
+    _ -> { value: [], next: [] },
+  }
+
 pub fn contains_resource(ty: Type) -> Bool / {ShapeReads} =
-  iterate({ todo: [ty], seen: [] }, walk_bound, |w: { todo: List<Type>, seen: List<Bytes> }|
-    match w.todo {
-      [] -> Stop(false),
-      [t, ..rest] -> match t {
-        VariableType(_) -> Stop(true),
-        NamedType(c) -> if is_label_or_effects(t) { Continue({ ..w, todo: rest }) }
-        else if code_facts.released_by(c.name) != None { Stop(true) } else {
-          let args = rest.concat(c.args);
-          if w.seen.contains(c.name) { Continue({ ..w, todo: args }) } else {
-            match code_facts.sum_named(c.name) {
-              Some(cs) ->
-                Continue({
-                  todo: cs.fold(args, |accumulator: List<Type>, k: SumConstructor|
-                    accumulator.concat(constructor_fields_at(k, c.args))),
-                  seen: w.seen.push(c.name),
-                }),
-              None -> Continue({ ..w, todo: args }),
-            }
-          }
-        },
-        RecordType(fs) -> Continue({ ..w, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
-        NominalType(n) -> Continue({ ..w, todo: rest.concat(n.fields.map(|f: Field| f.ty)) }),
-        FunctionType(_) -> Continue({ ..w, todo: rest }),
-      },
-    })
+  traverse([ty], resources_within).any(|v: Visit<Type, Bool>| v.value)
+
+fn resources_within(t: Type) -> { value: Bool, next: List<Type> } / {ShapeReads} =
+  match t {
+    VariableType(_) -> { value: true, next: [] },
+    NamedType(c) -> if is_label_or_effects(t) { { value: false, next: [] } }
+    else if code_facts.released_by(c.name) != None { { value: true, next: [] } }
+    else { { value: false, next: c.args.concat(sum_fields(c)) } },
+    RecordType(fs) -> { value: false, next: fs.map(|f: Field| f.ty) },
+    NominalType(n) -> { value: false, next: n.fields.map(|f: Field| f.ty) },
+    FunctionType(_) -> { value: false, next: [] },
+  }
+
+pub fn sum_fields(c: { name: Bytes, args: List<Type> }) -> List<Type> / {ShapeReads} =
+  match code_facts.sum_named(c.name) {
+    Some(cs) ->
+      cs.fold([], |fields: List<Type>, k: SumConstructor| fields.concat(constructor_fields_at(k, c.args))),
+    None -> [],
+  }
 
 pub fn constructor_fields_at(c: SumConstructor, args: List<Type>) -> List<Type> =
   c.fields.map(|f: Type| at_args(f, c.params, args))
@@ -524,7 +494,7 @@ pub fn type_names(ty: Type) -> List<Bytes> =
       ),
   }
 
-fn recursive_groups(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, RecursiveGroup> = {
+fn recursive_groups(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, RecursiveGroup> / {abort.raise} = {
   let inline = params_in_place(sums);
   let inner_sums = |cs: List<SumConstructor>|
     cs.fold([], |accumulator: List<Bytes>, c: SumConstructor|
@@ -542,9 +512,8 @@ fn recursive_groups(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, Recurs
       Some(hs) -> hs.filter(|h: Bytes| cyclic.contains(h)),
       None -> [],
     }));
-  let steps = within.fold(0, |n: Int, _: Bytes, hs: List<Bytes>| n + hs.len());
   let reach = cyclic.fold(Map::new(), |m: Map<Bytes, Set<Bytes>>, n: Bytes|
-    m.insert(n, reachable(within, n, 2 * steps + 1)));
+    m.insert(n, reachable(within, n)));
   let is_reachable = |from: Bytes, to: Bytes|
     match reach.get(from) { Some(r) -> r.contains(to), None -> false };
   cyclic.fold(Map::new(), |m: Map<Bytes, RecursiveGroup>, n: Bytes|
@@ -678,17 +647,12 @@ fn on_cycles(inner_sums: Map<Bytes, List<Bytes>>) -> List<Bytes> = {
   names.filter(|n: Bytes| match ended.open.get(n) { Some(k) -> k > 0, None -> false })
 }
 
-fn reachable(inner_sums: Map<Bytes, List<Bytes>>, from: Bytes, bound: Int) -> Set<Bytes> = {
+fn reachable(inner_sums: Map<Bytes, List<Bytes>>, from: Bytes) -> Set<Bytes> / {abort.raise} = {
   let next = |n: Bytes| match inner_sums.get(n) { Some(hs) -> hs, None -> [] };
-  range(0, bound).fold(
-    { seen: Set::empty(), todo: next(from), at: 0 },
-    |s: { seen: Set<Bytes>, todo: List<Bytes>, at: Int }, _: Int|
-      match s.todo.at(s.at) {
-        None -> s,
-        Some(n) -> if s.seen.contains(n) { { ..s, at: s.at + 1 } }
-        else { { seen: s.seen.insert(n), todo: s.todo.concat(next(n)), at: s.at + 1 } },
-      },
-  ).seen
+  traverse(next(from), |n: Bytes| { value: (), next: next(n) }).fold(
+    Set::empty(),
+    |reached: Set<Bytes>, v: Visit<Bytes, Unit>| reached.insert(v.key),
+  )
 }
 
 pub fn constructor_sums(rows: List<ConstructorRow>) -> Map<Bytes, List<SumConstructor>> =

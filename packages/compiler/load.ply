@@ -1,4 +1,5 @@
 import std.set (Set)
+import std.graph (Visit, traverse)
 import compiler.check.resolve.tables (error_unplaced)
 import compiler.front.published (no_rows, dump_of)
 import compiler.front.rows (Dump, EmitterConstructor, module_of, HashTableRow, DefinitionHashRow)
@@ -34,7 +35,7 @@ import compiler.cc (compilers, toolchain, WrittenPart)
 import std.bin
 import std.value
 import std.value (Value, VCtor, VStr, VRecord, VList)
-import compiler.front.pkg (PackageSources, SuppliedPackage, git_spec, roots_wanted)
+import compiler.front.pkg (PackageSources, SuppliedPackage, git_spec, dependency_roots)
 import compiler.check.resolve.tables (placed_in)
 import compiler.check.resolve.tables (Source, Diagnostic, Label)
 import compiler.unit
@@ -167,31 +168,35 @@ fn git_dependency_error(key: Bytes) -> Diagnostic =
 
 fn packages_of<[r]>(
   root: Package,
-) -> Result<List<Package>, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
-  iterate(Ok([]), 4096, |accumulator: Result<List<Package>, List<Diagnostic>>|
-    match accumulator {
-      Err(e) -> Stop(Err(e)),
-      Ok(read) -> {
-        let known = read.push(root).map(|p: Package| Bytes::of_string(p.root));
-        match roots_wanted(known, [root].concat(read).map(supplied_of)) {
-          [] -> Stop(Ok(read)),
-          next ->
-            Continue(
-              next.fold(Ok(read), |got: Result<List<Package>, List<Diagnostic>>, key: Bytes|
-                match got {
-                  Err(e) -> Err(e),
-                  Ok(so_far) -> match git_spec(key) {
-                    Some(_) -> Err([git_dependency_error(key)]),
-                    None -> match package_at[r](String::of_bytes(key)) {
-                      Err(e) -> Err(e),
-                      Ok(p) -> Ok(so_far.push(p)),
-                    },
-                  },
-                }),
-            ),
-        }
+) -> Result<List<Package>, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} = {
+  let program_root = Bytes::of_string(root.root);
+  let read = traverse([program_root], |key: Bytes| {
+    let package = if key == program_root { Ok(root) } else { dependency_at[r](key) };
+    {
+      value: package,
+      next: match package {
+        Ok(p) -> dependency_roots(program_root, supplied_of(p)),
+        Err(_) -> [],
       },
-    })
+    }
+  });
+  read.drop(1).fold(
+    Ok([]),
+    |accumulator: Result<List<Package>, List<Diagnostic>>, v: Visit<Bytes, Result<Package, List<Diagnostic>>>|
+      match accumulator {
+        Ok(packages) -> match v.value { Ok(p) -> Ok(packages.push(p)), Err(e) -> Err(e) },
+        Err(errors) -> match v.value { Ok(_) -> accumulator, Err(e) -> Err(errors.concat(e)) },
+      },
+  )
+}
+
+fn dependency_at<[r]>(
+  key: Bytes,
+) -> Result<Package, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
+  match git_spec(key) {
+    Some(_) -> Err([git_dependency_error(key)]),
+    None -> package_at[r](String::of_bytes(key)),
+  }
 
 fn embed_target(file: String, path: String) -> String = normalize(join(parent(file), path))
 
