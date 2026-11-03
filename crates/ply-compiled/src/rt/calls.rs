@@ -26,6 +26,12 @@ pub unsafe extern "C" fn rt_keep_constant(ctx: *mut Ctx, index: I64, kept: Word)
     }
 }
 
+pub unsafe extern "C" fn rt_failed_call(ctx: *mut Ctx, root: I64, start: I64, end: I64) {
+    let c = unsafe { &mut *ctx };
+    let site = c.span_at(root.0, start.0, end.0);
+    c.failed_through_call(site);
+}
+
 pub unsafe extern "C" fn rt_const_failed(ctx: *mut Ctx) {
     let c = unsafe { &mut *ctx };
     if c.failed == FAILED_PENDING_RAISE {
