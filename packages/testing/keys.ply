@@ -1,15 +1,21 @@
 import std.bytes (u32_le, u64_le)
 import std.hash (blake3)
 import std.list
+import compiler.cc (Profile)
+import compiler.cc
 
 const sim_domain: Bytes = b"ply.sim.key.1"
 const seed_domain: Bytes = b"ply.sim.seed.1"
 const plan_domain: Bytes = b"ply.sim.plan.1"
 const code_domain: Bytes = b"ply.pass.code.1"
 const case_domain: Bytes = b"ply.test.case.1"
+const build_domain: Bytes = b"ply.test.build.1"
 
 pub fn case_hash(test_hash: Bytes, identity: Bytes) -> Bytes =
   blake3(Bytes::concat_all([case_domain, test_hash, identity]))
+
+fn built(identity: Bytes, profile: Profile) -> Bytes / {abort.raise} =
+  blake3(Bytes::concat_all([build_domain, identity, cc::profile_identity(profile)]))
 
 pub fn plan_digest(
   mode: String,
@@ -53,17 +59,31 @@ fn insert_at<a>(xs: List<a>, position: Int, x: a) -> List<a> / {abort.raise} = {
   after.fold(before.push(x), |accumulator: List<a>, y: a| accumulator.push(y))
 }
 
-pub fn sim_key(test_hash: Bytes, plan_digest: Bytes) -> Bytes =
+fn sim_key(test_hash: Bytes, plan_digest: Bytes) -> Bytes =
   blake3(Bytes::concat_all([sim_domain, test_hash, plan_digest]))
 
-pub fn seed_key(test_hash: Bytes, seed: Bytes) -> Bytes =
-  blake3(Bytes::concat_all([seed_domain, test_hash, seed]))
+pub fn seed_key(test_hash: Bytes, seed: Bytes, profile: Profile) -> Bytes / {abort.raise} =
+  blake3(Bytes::concat_all([seed_domain, built(test_hash, profile), seed]))
 
-pub fn result_key(test_hash: Bytes, seeded: Bool, plan_digest: Bytes) -> Bytes =
-  if seeded { sim_key(test_hash, plan_digest) } else { test_hash }
+pub fn result_key(
+  test_hash: Bytes,
+  seeded: Bool,
+  plan_digest: Bytes,
+  profile: Profile,
+) -> Bytes / {abort.raise} = {
+  let hash = built(test_hash, profile);
+  if seeded { sim_key(hash, plan_digest) } else { hash }
+}
 
-pub fn code_key(code: Bytes, seeded: Bool, plan_digest: Bytes) -> Bytes =
-  blake3(Bytes::concat_all([code_domain, code, if seeded { plan_digest } else { b"" }]))
+pub fn code_key(
+  code: Bytes,
+  seeded: Bool,
+  plan_digest: Bytes,
+  profile: Profile,
+) -> Bytes / {abort.raise} =
+  blake3(
+    Bytes::concat_all([code_domain, built(code, profile), if seeded { plan_digest } else { b"" }]),
+  )
 
 pub fn seed_bytes(root: Int, path: List<Int>) -> Bytes / {abort.raise} =
   Bytes::concat_all([u64_le(root), u32_le(path.len()), Bytes::concat_all(path.map(u16_le))])
@@ -79,12 +99,13 @@ pub fn pass_keys(
   plan_digest: Bytes,
   per_root: Bool,
   roots_run: List<Int>,
+  profile: Profile,
 ) -> List<Bytes> / {abort.raise} =
-  if !seeded { [test_hash] } else {
+  if !seeded { [result_key(test_hash, false, plan_digest, profile)] } else {
     let roots = if per_root {
-      normal_roots(roots_run).map(|root: Int| seed_key(test_hash, seed_bytes(root, [])))
+      normal_roots(roots_run).map(|root: Int| seed_key(test_hash, seed_bytes(root, []), profile))
     } else { [] };
-    roots.push(sim_key(test_hash, plan_digest))
+    roots.push(result_key(test_hash, true, plan_digest, profile))
   }
 
 fn mode_byte(mode: String) -> Bytes =
@@ -161,46 +182,54 @@ test "equivalent spellings of a search plan give one digest, and changing any fi
 
 test "a code key is derived from the code a test ran, and from the plan for a seeded test, and differs from the result key" {
   let digest = plan_digest("dpor", 256, 100000, [0], []);
-  assert_eq(
-    code_key(sevens, false, digest).hex_of(),
-    "281b88250e878728e3f8997211687023636266f17128dd808473aec0bcfd21ab",
+  let other = plan_digest("random", 1, 100000, [0], []);
+  let profile = cc::development();
+  assert_eq(code_key(sevens, false, digest, profile), code_key(sevens, false, other, profile));
+  assert(code_key(sevens, true, digest, profile) != code_key(sevens, true, other, profile), None);
+  assert(code_key(sevens, false, digest, profile) != code_key(sevens, true, digest, profile), None);
+  assert(
+    code_key(sevens, false, digest, profile) != result_key(sevens, false, digest, profile),
+    None,
   );
-  assert_eq(
-    code_key(sevens, true, digest).hex_of(),
-    "7164baef0ab4b1df775f3d6fcbf839050523e042c66914d8027fbfa04daf3a0d",
+  assert(
+    code_key(a_hash, false, digest, profile) != code_key(sevens, false, digest, profile),
+    None,
   );
-  assert(code_key(sevens, false, digest) != result_key(sevens, false, digest), None);
-  assert(code_key(a_hash, false, digest) != code_key(sevens, false, digest), None)
-}
-
-test "a seeded test's key is its hash and its plan, and a hermetic one is its hash" {
-  let hash = a_hash;
-  let digest = plan_digest("dpor", 256, 100000, [0], []);
-  assert_eq(
-    sim_key(hash, digest),
-    b"\x48\x37\x11\x8d\xfc\xd9\xe6\x3b\x95\x62\xfd\xf6\x85\xb6\x7c\x6b\x67\x6b\x9a\xc4\xa8\x9b\xcf\x47\x63\xd4\x08\x3b\xdc\xc6\x5e\x76",
-  );
-  assert_eq(result_key(hash, false, digest), hash);
-  assert_eq(result_key(hash, true, digest), sim_key(hash, digest));
-  assert(result_key(hash, true, digest) != hash);
-  assert_eq(
-    sim_key(sevens, plan_digest("random", 1, 100000, [0, 1, 2, 3], [])).hex_of(),
-    "b3651fcad22fb580be85f11d16da747cf852606ff5f41fa6534eeafa8b60d15f",
-  );
-  assert_eq(
-    sim_key(sevens, plan_digest("once", 1, 100000, [7], [3, 0, 2])).hex_of(),
-    "3f21a7298fee33790cb225495102c7c00c2a78ed45c90dea0322273813ae2621",
+  assert(
+    code_key(sevens, false, digest, profile) != code_key(sevens, false, digest, cc::release()),
+    None,
   )
 }
 
-test "a per-seed key is derived only from the test's hash and the seed" {
-  assert_eq(
-    seed_key(a_hash, seed_bytes(0, [])),
-    b"\xfe\xcb\x3e\x1e\xca\x97\x25\x92\xb9\x28\x82\xdd\xa8\x5c\xca\xd3\xb2\xeb\x7f\x57\xc4\xe1\x80\x36\x32\x01\xf1\x14\x50\x89\x64\x61",
+test "a seeded test's key depends on its plan, and a hermetic one's does not" {
+  let hash = a_hash;
+  let digest = plan_digest("dpor", 256, 100000, [0], []);
+  let other = plan_digest("random", 1, 100000, [0, 1, 2, 3], []);
+  let profile = cc::development();
+  assert(
+    sim_key(hash, digest)
+      == b"\x48\x37\x11\x8d\xfc\xd9\xe6\x3b\x95\x62\xfd\xf6\x85\xb6\x7c\x6b\x67\x6b\x9a\xc4\xa8\x9b\xcf\x47\x63\xd4\x08\x3b\xdc\xc6\x5e\x76",
+    None,
   );
-  assert_eq(
-    seed_key(sevens, seed_bytes(3, [])).hex_of(),
-    "3163e508582674f72866bc99df149a2c884e8a6c50dcef9ddeca4803c1545d46",
+  assert_eq(result_key(hash, false, digest, profile), result_key(hash, false, other, profile));
+  assert(result_key(hash, true, digest, profile) != result_key(hash, true, other, profile), None);
+  assert(result_key(hash, true, digest, profile) != result_key(hash, false, digest, profile), None)
+}
+
+test "a per-seed key is derived from the test's hash, the seed and the profile" {
+  let profile = cc::development();
+  assert(
+    seed_key(a_hash, seed_bytes(0, []), profile) != seed_key(sevens, seed_bytes(0, []), profile),
+    None,
+  );
+  assert(
+    seed_key(a_hash, seed_bytes(0, []), profile) != seed_key(a_hash, seed_bytes(3, []), profile),
+    None,
+  );
+  assert(
+    seed_key(a_hash, seed_bytes(0, []), profile)
+      != seed_key(a_hash, seed_bytes(0, []), cc::release()),
+    None,
   )
 }
 
@@ -212,15 +241,35 @@ test "`writes_seed_keys` is true only for a `random` search with one run per see
   assert(!writes_seed_keys("dpor", 1, default_steps, []))
 }
 
-test "a pass is stored under the test's hash, or for a seeded test under its plan key and the key of each seed it ran" {
+test "a pass is stored under the test's result key, and for a seeded test also under the key of each seed it ran" {
   let hash = sevens;
+  let profile = cc::development();
   let dpor = plan_digest("dpor", 256, 100000, [0, 1, 2], []);
-  assert_eq(pass_keys(hash, false, dpor, false, [0, 1, 2]), [hash]);
-  assert_eq(pass_keys(hash, true, dpor, false, [0, 1, 2]), [sim_key(hash, dpor)]);
+  assert_eq(pass_keys(hash, false, dpor, false, [0, 1, 2], profile), [
+    result_key(hash, false, dpor, profile),
+  ]);
+  assert_eq(pass_keys(hash, true, dpor, false, [0, 1, 2], profile), [
+    result_key(hash, true, dpor, profile),
+  ]);
   let four = plan_digest("random", 1, 100000, [0, 1, 2, 3], []);
-  assert_eq(pass_keys(hash, true, four, true, [3, 2]), [
-    seed_key(hash, seed_bytes(2, [])),
-    seed_key(hash, seed_bytes(3, [])),
-    sim_key(hash, four),
+  assert_eq(pass_keys(hash, true, four, true, [3, 2], profile), [
+    seed_key(hash, seed_bytes(2, []), profile),
+    seed_key(hash, seed_bytes(3, []), profile),
+    result_key(hash, true, four, profile),
   ])
+}
+
+test "a test's result key differs between two profiles and is the same under one profile" {
+  let digest = plan_digest("dpor", 256, 100000, [0], []);
+  [false, true].fold((), |_: Unit, seeded: Bool| {
+    assert(
+      result_key(sevens, seeded, digest, cc::development())
+        != result_key(sevens, seeded, digest, cc::release()),
+      None,
+    );
+    assert_eq(
+      result_key(sevens, seeded, digest, cc::release()),
+      result_key(sevens, seeded, digest, cc::release()),
+    )
+  })
 }

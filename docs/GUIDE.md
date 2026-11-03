@@ -142,8 +142,6 @@ its callers only if what they can see of it changed, such as whether it returns.
 cached result only if it would compute exactly that result itself. It recomputes results that a
 different `ply` cached (`W0603`).
 
-`--no-cache` ignores the cache.
-
 ## 2. A tour of Ply
 
 This section shows the main features in one pass. Each part links to its full description.
@@ -1756,7 +1754,6 @@ only while those are unchanged.
 | `--explain` | why each test was selected, which input changed, and where the time went |
 | `--filter TEXT` | run tests whose `<module>.<label>` contains `TEXT`; repeatable. Tests whose `<module>.<label>` does not contain `TEXT` do not run. The trailing dot in `std.json.` is part of the text, so the filter matches every test in the module `std.json` and no test in a module such as `std.jsonl`. |
 | `--shard K/N` | run part `K` of `N`; each test is always in the same part |
-| `--no-cache` | ignore recorded results |
 | `--watch` | run again whenever a source file, or a file the last run embedded, changes |
 
 `ply hash` prints definitions' hashes.
@@ -2332,7 +2329,7 @@ the running `ply`.
 
 ```
 $ ply build . --entry app.serve -o app.plyx
-$ ply build . --digest              # print `b3:...`; write no file
+$ ply build . --digest              # print `b3:...`; write no `.plyx`
 $ ply build . --diff old.plyx       # what a rebuild would change
 $ ply run app.plyx
 ```
@@ -2499,10 +2496,10 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | --- | --- |
 | `ply new PATH` | `--name NAME`, `--lib` |
 | `ply check [path]` | `--types` (each definition's type and effects), `--costs` (where an update to a value copies it instead of changing it in place, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage` |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--explain`, `--watch`, `--coverage` |
 | `ply run [path] [-- ARGS]` | `--seed`, `--timeout`, `--profile`, `--explain`, `--require-signer KEY`, and the flags for choosing the program's hosts (the handlers that supply its real effects), for tracing, and for draining on shutdown. `ARGS` is what `process.args` returns. A `.plyx` path runs a built program. |
-| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--static-prover`, `--workspace`, `--verify-dependencies`, simulation flags |
-| `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--prove-budget`, `--timeout`, simulation flags |
+| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--explain`, `--static-prover`, `--workspace`, `--verify-dependencies`, simulation flags |
+| `ply review [path]` | `--changed` (default), `--accept`, `--prove-budget`, `--timeout`, simulation flags |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY`, `--verify` |
 | `ply hosts [path]` | the flags for choosing the program's hosts (the handlers that supply its real effects), for tracing, and for draining on shutdown, and `--digest` |
 | `ply doc NAME [path]` | for a definition: its signature, doc comment, clauses (the separate cases of its body), location, hash and the laws (the properties declared about it) that use it. For a type: its fields or variants and its functions. For an effect: its operations. For a module: its exports. |
@@ -2531,7 +2528,7 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 
 ### 17.4 Reusing results
 
-After a change, commands check again only what depends on it. `--no-cache` checks from scratch.
+After a change, commands check again only what depends on it.
 
 ### 17.5 Compiling
 

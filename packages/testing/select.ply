@@ -1,5 +1,7 @@
 import std.bytes
 import std.list
+import compiler.cc (Profile)
+import compiler.cc
 import keys (code_key, pass_keys, plan_digest, result_key, seed_bytes, seed_key, writes_seed_keys)
 
 pub type Row = {
@@ -12,15 +14,25 @@ pub type Row = {
   nondet: Bool,
 }
 
-pub type Search = { mode: String, roots: List<Int>, budget: Int, steps: Int, path: List<Int> }
+pub type Search = {
+  mode: String,
+  roots: List<Int>,
+  budget: Int,
+  steps: Int,
+  path: List<Int>,
+  profile: Profile,
+}
 
 pub fn digest_of(s: Search) -> Bytes / {abort.raise} =
   plan_digest(s.mode, s.budget, s.steps, s.roots, s.path)
 
 pub fn per_root(s: Search) -> Bool = writes_seed_keys(s.mode, s.budget, s.steps, s.path)
 
-pub fn key_of(row: Row, digest: Bytes) -> Option<Bytes> =
-  match row.hash { None -> None, Some(h) -> Some(result_key(h, row.seeded, digest)) }
+pub fn key_of(row: Row, s: Search) -> Option<Bytes> / {abort.raise} =
+  match row.hash {
+    None -> None,
+    Some(h) -> Some(result_key(h, row.seeded, digest_of(s), s.profile)),
+  }
 
 pub fn keyed_per_root(row: Row, s: Search) -> Bool = row.seeded && row.hash != None && per_root(s)
 
@@ -97,8 +109,9 @@ pub fn seed_keys(
   test_hash: Bytes,
   roots: List<Int>,
   path: List<Int>,
+  profile: Profile,
 ) -> List<Bytes> / {abort.raise} =
-  roots.map(|root: Int| seed_key(test_hash, seed_bytes(root, path)))
+  roots.map(|root: Int| seed_key(test_hash, seed_bytes(root, path), profile))
 
 pub fn roots_to_search(c: Case, roots: List<Int>) -> List<Int> =
   match c.pending_seeds {
@@ -130,7 +143,14 @@ pub fn pass_keys_by_test(
       Some(h) -> if !runs(d) { accumulator } else {
         accumulator.push({
           index: d.case.index,
-          keys: pass_keys(h, d.case.seeded, digest, per_root(s), roots_to_search(d.case, s.roots)),
+          keys: pass_keys(
+            h,
+            d.case.seeded,
+            digest,
+            per_root(s),
+            roots_to_search(d.case, s.roots),
+            s.profile,
+          ),
         })
       },
     })
@@ -146,7 +166,8 @@ pub fn code_keys(
     if d.case.hash == None { accumulator } else {
       match codes.get(d.case.index) {
         None -> accumulator,
-        Some(code) -> accumulator.insert(d.case.index, code_key(code, d.case.seeded, digest)),
+        Some(code) ->
+          accumulator.insert(d.case.index, code_key(code, d.case.seeded, digest, s.profile)),
       }
     })
 }
@@ -219,12 +240,31 @@ fn a_case(index: Int, cached: Option<StoredResult>) -> Case =
     pending_seeds: None,
   }
 
+const a_row: Row =
+  {
+    index: 0,
+    label: "doubles",
+    name: "m.doubles",
+    module: "m",
+    hash: Some(a_hash),
+    seeded: false,
+    nondet: false,
+  }
+
 fn reason(index: Int, cached: Option<StoredResult>) -> Reason = reason_of(a_case(index, cached))
 
 fn random(roots: Int) -> Search =
-  { mode: "random", roots: range(0, roots), budget: 1, steps: 100000, path: [] }
+  {
+    mode: "random",
+    roots: range(0, roots),
+    budget: 1,
+    steps: 100000,
+    path: [],
+    profile: cc::development(),
+  }
 
-const dpor: Search = { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] }
+const dpor: Search =
+  { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [], profile: cc::development() }
 
 test "only a stored passing result makes a test skip running" {
   assert_eq(reason(0, Some(Passing)), Cached);
@@ -244,7 +284,7 @@ test "a test with no hash runs, because there is no key to have a cached result 
     seeded: true,
     nondet: false,
   };
-  assert_eq(key_of(row, digest_of(dpor)), None);
+  assert_eq(key_of(row, dpor), None);
   assert(!keyed_per_root(row, random(4)))
 }
 
@@ -274,7 +314,9 @@ test "a new test reuses a stored pass for the same code, runs again after a stor
     Nondet,
     Unhashed,
   ]);
-  assert_eq(returned.written_passes, [{ key: a_hash, trace: b"read" }]);
+  assert_eq(returned.written_passes, [
+    { key: result_key(a_hash, false, digest_of(dpor), dpor.profile), trace: b"read" },
+  ]);
   assert_eq(to_run(returned.decisions), [1, 2, 3, 4]);
   assert_eq(reused(returned.decisions), [{ index: 0, outcome: "passed" }])
 }
@@ -319,7 +361,7 @@ test "`reason_word` returns the word the report prints for each reason a test ru
   assert_eq(reason_word(Unhashed), "unhashed")
 }
 
-test "`key_of` gives a randomly seeded test a key that depends on the search setting, and any other test its code hash" {
+test "`key_of` gives a randomly seeded test a key that depends on the search setting, and every test a key that depends on the profile" {
   let row = {
     index: 0,
     label: "t",
@@ -329,11 +371,12 @@ test "`key_of` gives a randomly seeded test a key that depends on the search set
     seeded: false,
     nondet: false,
   };
-  assert_eq(key_of(row, digest_of(dpor)), Some(a_hash));
+  assert_eq(key_of(row, dpor), key_of(row, random(4)));
+  assert(key_of(row, dpor) != key_of(row, { ..dpor, profile: cc::release() }));
   let seeded = { ..row, seeded: true };
-  let four = key_of(seeded, digest_of(random(4)));
-  assert(four != Some(a_hash));
-  assert(four != key_of(seeded, digest_of(random(8))));
+  let four = key_of(seeded, random(4));
+  assert(four != key_of(row, random(4)));
+  assert(four != key_of(seeded, random(8)));
   assert(keyed_per_root(seeded, random(4)));
   assert(!keyed_per_root(seeded, dpor));
   assert(!keyed_per_root(row, random(4)))
@@ -368,39 +411,25 @@ test "`pending_roots` returns the seeds whose own cache key has no stored pass, 
     2,
   ]);
   assert_eq(pending_roots([4, 5], []), [4, 5]);
-  assert_eq(seed_keys(a_hash, [0, 1, 2], []).len(), 3)
+  assert_eq(seed_keys(a_hash, [0, 1, 2], [], dpor.profile).len(), 3)
 }
 
 test "a passing test is stored under its code hash, and a rerun of some seeds also stores a key for each seed it ran" {
   let hermetic = decide([a_case(0, None)]);
-  assert_eq(pass_keys_by_test(hermetic, dpor), [{ index: 0, keys: [a_hash] }]);
+  assert_eq(pass_keys_by_test(hermetic, dpor), [
+    { index: 0, keys: [key_of(a_row, dpor).unwrap_or(b"")] },
+  ]);
   assert_eq(pass_keys_by_test(decide([a_case(0, Some(Passing))]), dpor), []);
   let seeded = { ..a_case(0, None), seeded: true, pending_seeds: Some([2, 3]) };
   let four = random(4);
   let keys = pass_keys_by_test(
-    decide([
-      {
-        ..seeded,
-        cache_key: key_of(
-          {
-            index: 0,
-            label: "doubles",
-            name: "m.doubles",
-            module: "m",
-            hash: Some(a_hash),
-            seeded: true,
-            nondet: false,
-          },
-          digest_of(four),
-        ),
-      },
-    ]),
+    decide([{ ..seeded, cache_key: key_of({ ..a_row, seeded: true }, four) }]),
     four,
   );
   assert_eq(keys.map(|f: { index: Int, keys: List<Bytes> }| f.keys.len()), [3]);
   assert_eq(keys.map(|f: { index: Int, keys: List<Bytes> }| f.keys).get(0), [
-    seed_keys(a_hash, [2], []).get(0),
-    seed_keys(a_hash, [3], []).get(0),
-    result_key(a_hash, true, digest_of(four)),
+    seed_keys(a_hash, [2], [], four.profile).get(0),
+    seed_keys(a_hash, [3], [], four.profile).get(0),
+    result_key(a_hash, true, digest_of(four), four.profile),
   ])
 }

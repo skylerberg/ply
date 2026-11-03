@@ -17,8 +17,8 @@ import testing.select (Pass)
 import claims (proof_store, AcceptResult, ClaimsEntry)
 import std.env (env)
 import proof.obligation (ClaimSnapshot)
-import tester (result_cache, LastPass, StoreResult, ListingRequest, CasesListed, ListedCase,
-               StartedTest, listed_case_bin)
+import tester (result_cache, LastPass, ListingRequest, CasesListed, ListedCase, StartedTest,
+               listed_case_bin)
 import sources
 import std.path (strip_root)
 import semantics (semantics)
@@ -27,9 +27,8 @@ pub type OpenStore = { place: project_store::StoreLocation, cache: tables::Cache
 
 pub fn store_for(
   paths: List<paths::ResolvedPath>,
-  no_cache: Bool,
-) -> Option<OpenStore> / {semantics.cached, fs.read[cwd], fs.read[abs], fs.read_file[shipped], abort.raise} =
-  if no_cache { None } else { Some(open_store(paths, project_store::shipped_stamps())) }
+) -> OpenStore / {semantics.cached, fs.read[cwd], fs.read[abs], fs.read_file[shipped], abort.raise} =
+  open_store(paths, project_store::shipped_stamps())
 
 pub fn open_store(
   paths: List<paths::ResolvedPath>,
@@ -280,62 +279,40 @@ fn begun_journal<[r]>(
 }
 
 fn appended(
-  journal: Option<Journal>,
+  journal: Journal,
   entry: JournalEntry,
-) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} =
-  match journal {
-    None -> (),
-    Some(j) -> {
-      let _ = if j.label == "cwd" { fs.append[cwd](j.path, framed(entry)) }
-      else { fs.append[abs](j.path, framed(entry)) };
-      ()
-    },
-  }
+) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} = {
+  let _ = if journal.label == "cwd" { fs.append[cwd](journal.path, framed(entry)) }
+  else { fs.append[abs](journal.path, framed(entry)) };
+  ()
+}
 
-fn ended_journal(journal: Option<Journal>) -> Unit / {fs.write[cwd], fs.write[abs]} =
-  match journal {
-    None -> (),
-    Some(j) -> {
-      let _ = if j.label == "cwd" { fs.remove[cwd](j.path) } else { fs.remove[abs](j.path) };
-      ()
-    },
-  }
+fn ended_journal(journal: Journal) -> Unit / {fs.write[cwd], fs.write[abs]} = {
+  let _ = if journal.label == "cwd" { fs.remove[cwd](journal.path) }
+  else { fs.remove[abs](journal.path) };
+  ()
+}
 
-fn finished_rows(
-  journal: Option<Journal>,
-  update: StoreUpdate,
-) -> List<JournalRow> / {abort.raise} =
-  match journal {
-    None -> [],
-    Some(j) -> tables::rows_written(j.base, |c: tables::Cache| put_update(c, update, [])),
-  }
+fn finished_rows(journal: Journal, update: StoreUpdate) -> List<JournalRow> / {abort.raise} =
+  tables::rows_written(journal.base, |c: tables::Cache| put_update(c, update, []))
 
 pub fn with_result_cache<a | e>(
-  opened_store: Option<OpenStore>,
+  opened_store: OpenStore,
   go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} = {
-  let begun = match opened_store {
-    None -> None,
-    Some(k) ->
-      Some(if k.place.label == "cwd" { begun_journal[cwd](k, journal_of(k)) }
-      else { begun_journal[abs](k, journal_of(k)) }),
-  };
-  let journal = begun.map(|b: { store: OpenStore, interrupted: List<StartedTest> }|
-    journal_of(b.store));
-  let result = journaled(
-    begun.map(|b: { store: OpenStore, interrupted: List<StartedTest> }| b.store),
-    match begun { Some(b) -> b.interrupted, None -> [] },
-    journal,
-    go,
-  );
+  let begun = if opened_store.place.label == "cwd" {
+    begun_journal[cwd](opened_store, journal_of(opened_store))
+  } else { begun_journal[abs](opened_store, journal_of(opened_store)) };
+  let journal = journal_of(begun.store);
+  let result = journaled(begun.store, begun.interrupted, journal, go);
   ended_journal(journal);
   result
 }
 
 fn journaled<a | e>(
-  opened_store: Option<OpenStore>,
+  opened_store: OpenStore,
   interrupted: List<StartedTest>,
-  journal: Option<Journal>,
+  journal: Journal,
   go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
   handle {
@@ -347,92 +324,62 @@ fn journaled<a | e>(
       appended(journal, Started({ key: running.key, hash: running.hash })),
     result_cache.finished(key, update) ->
       appended(journal, Finished({ key: key, rows: finished_rows(journal, update) })),
-    result_cache.open_warnings() -> match store_state {
-      None -> [],
-      Some(k) -> {
-        store_state = Some(without_warnings(k));
-        cache_warnings(k.cache)
-      },
+    result_cache.open_warnings() -> {
+      let warnings = cache_warnings(store_state.cache);
+      store_state = without_warnings(store_state);
+      warnings
     },
-    result_cache.passes(keys) -> match store_state {
-      None -> keys.map(|key: Bytes| None),
-      Some(k) -> {
-        let o = read_pass_traces(k.cache, keys);
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.passes(keys) -> {
+      let o = read_pass_traces(store_state.cache, keys);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.code_passes(keys) -> match store_state {
-      None -> keys.map(|key: Bytes| None),
-      Some(k) -> {
-        let o = code_passes_over(k.cache, keys);
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.code_passes(keys) -> {
+      let o = code_passes_over(store_state.cache, keys);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.known(hashes) -> match store_state {
-      None -> hashes.map(|h: Bytes| false),
-      Some(k) -> hashes.map(|h: Bytes| tables::knows_definition(k.cache, h)),
+    result_cache.known(hashes) ->
+      hashes.map(|h: Bytes| tables::knows_definition(store_state.cache, h)),
+    result_cache.baselines(keys) -> {
+      let o = last_passes_over(store_state.cache, keys);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.baselines(keys) -> match store_state {
-      None -> keys.map(|key: Bytes| None),
-      Some(k) -> {
-        let o = last_passes_over(k.cache, keys);
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.texts(hashes) -> {
+      let o = read_texts(store_state.cache, hashes);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.texts(hashes) -> match store_state {
-      None -> hashes.map(|h: Bytes| None),
-      Some(k) -> {
-        let o = read_texts(k.cache, hashes);
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.unstored(hashes) -> unstored_in(store_state.cache, hashes),
+    result_cache.has_records(records) ->
+      records.map(|r: Bytes| tables::has_module_record(store_state.cache, r)),
+    result_cache.history(texts, modules, snapshot) -> {
+      store_state = {
+        ..store_state,
+        cache: store_pass(store_state.cache, texts, modules, snapshot),
+      };
     },
-    result_cache.unstored(hashes) -> match store_state {
-      None -> [],
-      Some(k) -> unstored_in(k.cache, hashes),
+    result_cache.store_results(f, seen) -> {
+      let c = if store_state.place.label == "cwd" { flush_update[cwd](store_state.cache, f, seen) }
+      else { flush_update[abs](store_state.cache, f, seen) };
+      store_state = without_warnings({ ..store_state, cache: c });
+      cache_warnings(c)
     },
-    result_cache.has_records(records) -> match store_state {
-      None -> records.map(|r: Bytes| true),
-      Some(k) -> records.map(|r: Bytes| tables::has_module_record(k.cache, r)),
+    result_cache.listings(requests) -> {
+      let o = listings_over(store_state.cache, requests);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.history(texts, modules, snapshot) -> match store_state {
-      None -> (),
-      Some(k) -> {
-        store_state = Some({ ..k, cache: store_pass(k.cache, texts, modules, snapshot) });
-      },
-    },
-    result_cache.store_results(f, seen) -> match store_state {
-      None -> { unflushed: None, warnings: [] },
-      Some(k) -> {
-        let c = if k.place.label == "cwd" { flush_update[cwd](k.cache, f, seen) }
-        else { flush_update[abs](k.cache, f, seen) };
-        store_state = Some(without_warnings({ ..k, cache: c }));
-        { unflushed: None, warnings: cache_warnings(c) }
-      },
-    },
-    result_cache.listings(requests) -> match store_state {
-      None -> requests.map(|r: ListingRequest| None),
-      Some(k) -> {
-        let o = listings_over(k.cache, requests);
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
-    },
-    result_cache.keep_listings(listed) -> match store_state {
-      None -> (),
-      Some(k) -> {
-        store_state = Some({
-          ..k,
-          cache: listed.fold(k.cache, |c: tables::Cache, l: CasesListed|
-            tables::put_case_listing(c, l.test, {
-              listing: l.listing,
-              cases: bin::encode(l.cases, bin::list_bin(listed_case_bin())),
-            })),
-        });
-      },
+    result_cache.keep_listings(listed) -> {
+      store_state = {
+        ..store_state,
+        cache: listed.fold(store_state.cache, |c: tables::Cache, l: CasesListed|
+          tables::put_case_listing(c, l.test, {
+            listing: l.listing,
+            cases: bin::encode(l.cases, bin::list_bin(listed_case_bin())),
+          })),
+      };
     },
   }
 
@@ -460,17 +407,11 @@ fn listings_over(
 fn cached_over(cache: tables::Cache, keys: List<String>) -> List<Option<Bytes>> / {abort.raise} =
   keys.map(|key: String| tables::evidence(cache, Bytes::of_hex(key)).value)
 
-fn cached_of(
-  opened_store: Option<OpenStore>,
-  keys: List<String>,
-) -> List<Option<Bytes>> / {abort.raise} =
-  match opened_store { None -> keys.map(|k: String| None), Some(k) -> cached_over(k.cache, keys) }
-
-type StoreWrite = { store: Option<OpenStore>, diagnostics: List<Diagnostic> }
+type StoreWrite = { store: OpenStore, diagnostics: List<Diagnostic> }
 
 fn after_write(k: OpenStore, cache: tables::Cache) -> StoreWrite =
   {
-    store: Some({ ..k, cache: { ..cache, store: { ..cache.store, warnings: [] } } }),
+    store: { ..k, cache: { ..cache, store: { ..cache.store, warnings: [] } } },
     diagnostics: project_store::diagnostics_of(tables::warnings(cache)),
   }
 
@@ -482,51 +423,36 @@ fn flushed(
   else { tables::flush_cache[abs](cache) })
 
 fn record_evidence(
-  opened_store: Option<OpenStore>,
+  k: OpenStore,
   entries: List<{ key: String, evidence: Bytes }>,
 ) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
-  match opened_store {
-    None -> { store: None, diagnostics: [] },
-    Some(k) ->
-      flushed(
-        k,
-        entries.fold(k.cache, |cache: tables::Cache, e: { key: String, evidence: Bytes }|
-          tables::put_evidence(cache, Bytes::of_hex(e.key), e.evidence)),
-      ),
-  }
+  flushed(
+    k,
+    entries.fold(k.cache, |cache: tables::Cache, e: { key: String, evidence: Bytes }|
+      tables::put_evidence(cache, Bytes::of_hex(e.key), e.evidence)),
+  )
 
-fn claims_of(
-  opened_store: Option<OpenStore>,
-  module: Bytes,
-  identity: Bytes,
-) -> Option<Bytes> / {abort.raise} =
-  match opened_store {
+fn claims_of(k: OpenStore, module: Bytes, identity: Bytes) -> Option<Bytes> / {abort.raise} =
+  match tables::module_claims(k.cache, module).value {
+    Some(c) -> if c.identity == identity { Some(c.claims) } else { None },
     None -> None,
-    Some(k) -> match tables::module_claims(k.cache, module).value {
-      Some(c) -> if c.identity == identity { Some(c.claims) } else { None },
-      None -> None,
-    },
   }
 
 fn record_claims(
-  opened_store: Option<OpenStore>,
+  k: OpenStore,
   entries: List<ClaimsEntry>,
 ) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
-  match opened_store {
-    None -> { store: None, diagnostics: [] },
-    Some(k) ->
-      flushed(
-        k,
-        entries.fold(k.cache, |cache: tables::Cache, e: ClaimsEntry|
-          tables::put_module_claims(cache, e.module, {
-            identity: e.identity,
-            claims: e.claims,
-            evidence: e.evidence,
-          })),
-      ),
-  }
+  flushed(
+    k,
+    entries.fold(k.cache, |cache: tables::Cache, e: ClaimsEntry|
+      tables::put_module_claims(cache, e.module, {
+        identity: e.identity,
+        claims: e.claims,
+        evidence: e.evidence,
+      })),
+  )
 
-fn baselines_over(
+fn baselines_of(
   cache: tables::Cache,
   names: List<String>,
 ) -> List<{ name: String, record: ClaimSnapshot }> / {abort.raise} =
@@ -540,48 +466,38 @@ fn baselines_over(
         }),
     })
 
-fn baselines_of(
-  opened_store: Option<OpenStore>,
-  names: List<String>,
-) -> List<{ name: String, record: ClaimSnapshot }> / {abort.raise} =
-  match opened_store { None -> [], Some(k) -> baselines_over(k.cache, names) }
-
 fn accepted_of(
-  opened_store: Option<OpenStore>,
+  k: OpenStore,
   records: List<{ name: String, record: ClaimSnapshot }>,
-) -> { store: Option<OpenStore>, accepted: AcceptResult } / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
-  match opened_store {
-    None -> { store: None, accepted: { definitions: records.len(), stored: false, warnings: [] } },
-    Some(k) -> {
-      let w = flushed(
-        k,
-        records.fold(k.cache, |cache: tables::Cache, r: { name: String, record: ClaimSnapshot }|
-          tables::put_review(cache, Bytes::of_string(r.name), {
-            definition: Bytes::of_hex(r.record.definition_hash),
-            specs: r.record.specs.map(Bytes::of_hex),
-          })),
-      );
-      {
-        store: w.store,
-        accepted: {
-          definitions: records.len(),
-          stored: !w.diagnostics.fold(false, |hit: Bool, diagnostic: Diagnostic|
-            hit || diagnostic.code == b"W0601"),
-          warnings: w.diagnostics,
-        },
-      }
+) -> { store: OpenStore, accepted: AcceptResult } / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} = {
+  let w = flushed(
+    k,
+    records.fold(k.cache, |cache: tables::Cache, r: { name: String, record: ClaimSnapshot }|
+      tables::put_review(cache, Bytes::of_string(r.name), {
+        definition: Bytes::of_hex(r.record.definition_hash),
+        specs: r.record.specs.map(Bytes::of_hex),
+      })),
+  );
+  {
+    store: w.store,
+    accepted: {
+      definitions: records.len(),
+      stored: !w.diagnostics.fold(false, |hit: Bool, diagnostic: Diagnostic|
+        hit || diagnostic.code == b"W0601"),
+      warnings: w.diagnostics,
     },
   }
+}
 
 pub fn with_evidence<a | e>(
-  opened_store: Option<OpenStore>,
+  opened_store: OpenStore,
   go: () -> a / {proof_store.cached, proof_store.record, proof_store.module_claims, proof_store.record_claims | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
   handle {
     go()
   } with {
     var store_state = opened_store,
-    proof_store.cached(keys) -> cached_of(store_state, keys),
+    proof_store.cached(keys) -> cached_over(store_state.cache, keys),
     proof_store.record(entries) -> {
       let w = record_evidence(store_state, entries);
       store_state = w.store;
@@ -596,14 +512,14 @@ pub fn with_evidence<a | e>(
   }
 
 pub fn with_review<a | e>(
-  opened_store: Option<OpenStore>,
+  opened_store: OpenStore,
   go: () -> a / {proof_store.cached, proof_store.record, proof_store.module_claims, proof_store.record_claims, proof_store.baselines, proof_store.accepted | e},
 ) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
   handle {
     go()
   } with {
     var store_state = opened_store,
-    proof_store.cached(keys) -> cached_of(store_state, keys),
+    proof_store.cached(keys) -> cached_over(store_state.cache, keys),
     proof_store.record(entries) -> {
       let w = record_evidence(store_state, entries);
       store_state = w.store;
@@ -615,7 +531,7 @@ pub fn with_review<a | e>(
       store_state = w.store;
       w.diagnostics
     },
-    proof_store.baselines(names) -> baselines_of(store_state, names),
+    proof_store.baselines(names) -> baselines_of(store_state.cache, names),
     proof_store.accepted(records) -> {
       let a = accepted_of(store_state, records);
       store_state = a.store;
