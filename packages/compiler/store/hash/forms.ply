@@ -1194,24 +1194,36 @@ pub type HashLayout = {
 
 pub fn hash_layout(index: Index) -> HashLayout =
   {
-    nodes: index.nodes.map(|node: Node| { name: node.name, kind: node_kind(node) }),
+    nodes: index.nodes.filter(declared_here).map(|node: Node|
+      { name: node.name, kind: node_kind(node) }),
     order: index.order,
     tests: index.tests.map(|t: TestNode| { key: t.key, cases: t.definition.cases != None }),
     laws: index.laws.map(|l: LawNode| l.key),
   }
 
+fn declared_here(node: Node) -> Bool = match node.body { NodeElsewhere(_) -> false, _ -> true }
+
+type LaidNodes = { nodes: List<NodeRef>, keys: Map<Bytes, Int> }
+
+fn with_referenced(laid: LaidNodes, refs: List<NodeRef>) -> LaidNodes =
+  refs.fold(laid, |found: LaidNodes, r: NodeRef| {
+    let key = definition_key(r.name, r.kind);
+    if found.keys.contains(key) { found }
+    else { { nodes: found.nodes.push(r), keys: found.keys.insert(key, found.nodes.len()) } }
+  })
+
 pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise} = {
-  let keys = range(0, sk.nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
-    let node = sk.nodes.get(v);
-    accumulator.insert(definition_key(node.name, node.kind), v)
-  });
-  let in_layout = |refs: List<NodeRef>|
-    refs.fold([], |within: List<Int>, r: NodeRef|
-      match keys.get(definition_key(r.name, r.kind)) { Some(w) -> within.push(w), None -> within });
+  let declared = {
+    nodes: sk.nodes,
+    keys: range(0, sk.nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
+      let node = sk.nodes.get(v);
+      accumulator.insert(definition_key(node.name, node.kind), v)
+    }),
+  };
   let by_node = own.definitions.fold(
     Map::new(),
     |accumulator: Map<Int, DefinitionHash>, d: DefinitionHash|
-      match keys.get(definition_key(d.name, d.kind)) {
+      match declared.keys.get(definition_key(d.name, d.kind)) {
         Some(v) -> accumulator.insert(v, d),
         None -> accumulator,
       },
@@ -1220,17 +1232,38 @@ pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise}
     accumulator.insert(t.key, t));
   let laws = own.laws.fold(Map::new(), |accumulator: Map<Bytes, LawHash>, l: LawHash|
     accumulator.insert(l.key, l));
+  let laid = sk.order.fold(declared, |found: LaidNodes, e: IndexEntry|
+    with_referenced(found, match e {
+      DefinitionEntry(v) -> match by_node.get(v) {
+        Some(d) -> d.uses.concat(d.clause_uses),
+        None -> [],
+      },
+      TestEntry(i) -> match tests.get(sk.tests.get(i).key) { Some(t) -> test_uses(t), None -> [] },
+      LawEntry(i) -> match laws.get(sk.laws.get(i)) { Some(l) -> l.uses, None -> [] },
+    }));
+  let nodes = laid.nodes;
+  let in_layout = |refs: List<NodeRef>|
+    refs.map(|r: NodeRef| of_key(laid.keys, definition_key(r.name, r.kind)));
   let tested = sk.tests.fold([], |accumulator: List<TestHash>, t: { key: Bytes, cases: Bool }|
     match tests.get(t.key) { Some(x) -> accumulator.push(x), None -> accumulator });
   let lawful = sk.laws.fold([], |accumulator: List<LawHash>, key: Bytes|
     match laws.get(key) { Some(x) -> accumulator.push(x), None -> accumulator });
   let test_keys = tested.map(|t: TestHash| t.key);
   let law_keys = lawful.map(|l: LawHash| l.key);
-  let edges = range(0, sk.nodes.len()).map(|v: Int|
+  let edges = range(0, nodes.len()).map(|v: Int|
     match by_node.get(v) { Some(d) -> in_layout(d.uses), None -> [] });
-  let names_at = |refs: List<Int>| refs.map(|r: Int| sk.nodes.get(r).name);
+  let names_at = |refs: List<Int>| refs.map(|r: Int| nodes.get(r).name);
   let test_refs = tested.map(|t: TestHash| in_layout(test_uses(t)));
   let law_refs = lawful.map(|l: LawHash| in_layout(l.uses));
+  let laid_out = {
+    definitions: sk.order.fold([], |found: List<DefinitionHash>, e: IndexEntry|
+      match e {
+        DefinitionEntry(v) -> match by_node.get(v) { Some(d) -> found.push(d), None -> found },
+        _ -> found,
+      }),
+    tests: tested,
+    laws: lawful,
+  };
   let start: HashOutput = {
     definitions: [],
     declarations: [],
@@ -1239,19 +1272,16 @@ pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise}
     specs: [],
     dependencies: [],
     refs: {
-      nodes: sk.nodes,
+      nodes: nodes,
       edges: edges,
-      functions: range(0, sk.nodes.len()).fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Int>, v: Int| {
-          let node = sk.nodes.get(v);
-          if node.kind == HeldValue { accumulator.insert(node.name, v) } else { accumulator }
-        },
-      ),
-      declared: range(0, sk.nodes.len()).fold(
+      functions: range(0, nodes.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, v: Int| {
+        let node = nodes.get(v);
+        if node.kind == HeldValue { accumulator.insert(node.name, v) } else { accumulator }
+      }),
+      declared: range(0, nodes.len()).fold(
         Map::new(),
         |accumulator: Map<Bytes, List<Int>>, v: Int| {
-          let node = sk.nodes.get(v);
+          let node = nodes.get(v);
           if is_declared_kind(node.kind) { append_at(accumulator, node.name, [v]) }
           else { accumulator }
         },
@@ -1267,7 +1297,7 @@ pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise}
           Some(_) -> append_at(accumulator, t.key, in_layout(t.uses)),
           None -> accumulator,
         }),
-      clauses: range(0, sk.nodes.len()).map(|v: Int|
+      clauses: range(0, nodes.len()).map(|v: Int|
         match by_node.get(v) { Some(d) -> in_layout(d.clause_uses), None -> [] }),
       listings: tested.fold(Map::new(), |accumulator: Map<Bytes, List<Int>>, t: TestHash|
         match t.listing {
@@ -1277,7 +1307,7 @@ pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise}
     },
     bodies: [],
     test_bodies: by_key(test_keys, tested.map(|t: TestHash| t.body)),
-    own: own,
+    own: laid_out,
   };
   sk.order.fold(
     { out: start, dependencies_at: Map::new() },
