@@ -23,25 +23,23 @@ import compiler.emit.keys (RootKey, Named, Specialisation, Generated, Test, Test
 import compiler.emit.output (Output, RootOutput, Prototype, prototype_bin)
 import compiler.emit.representations (BoundLambda, Imported, EmitReads, over_code_facts,
                                       stored_sources, lowering, code_facts)
-import compiler.emit.roots (root_id)
+import compiler.emit.roots (root_id, builtin_helper)
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
 import compiler.front.checking.groups (GroupKey, group_key_bin, module_groups, resolved_group_of,
                                        stored_lowering, declared_of, owners_result_of, stored_rows,
                                        OwnersResult, module_owners, group_key_of, owner_facts,
                                        checked_law_outline, over_full_names, module_key_in,
-                                       forms_part)
+                                       calls_part)
 import compiler.front.owner_checks (MemberResult)
 import compiler.front.checking.world (module_read, ModuleKey, module_key_bin, decoded, QueryEffects,
                                       RunEffects, CheckQuery, decode_cache, package_location_of,
                                       CheckDefinition, SessionReads, code_products)
-import compiler.front.emitter_input (GroupLowering)
+import compiler.front.emitter_input (GroupLowering, BodyCalls)
 import compiler.check.resolve.tables (Diagnostic)
 import compiler.front.exports (Mention, mention_bin, OwnerInterface)
 import compiler.front.rows (OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
                             KnownDefinitionRow)
 import compiler.store.hash.template (emitted_code)
-import compiler.store.hash.forms (NodeRef)
-import compiler.store.hash.graph (HeldValue)
 import compiler.store.memo (memo)
 import compiler.store.handles (QueryOf, PartOf, KeyedPartOf, Written, written, with_part,
                                with_keyed_part, fetch, fetch_all, fetch_all_part, fetch_digest,
@@ -49,9 +47,9 @@ import compiler.store.handles (QueryOf, PartOf, KeyedPartOf, Written, written, w
 import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (lowering_rejected, always_enters, CalleeFacts, LoweredBatch, LoweredUnit,
-                      UnitCode, UnitSummary, RootSummary, unit_code_bin, unit_summary_bin,
-                      root_summary_bin, no_callee_facts, with_callee, unit_lowered, part_library,
-                      enters, LoweringInput, lowering_input)
+                      UnitCode, UnitSummary, RootSummary, CalleesRead, unit_code_bin,
+                      unit_summary_bin, root_summary_bin, no_callee_facts, with_callee,
+                      unit_lowered, part_library, enters, LoweringInput, lowering_input)
 
 pub type CodeUnit = | OfGroup(GroupKey) | OfRoot(RootAt) | NoCode
 
@@ -232,26 +230,38 @@ const fewest_groups_in_a_chunk: Int = 32
 
 const most_groups_in_a_chunk: Int = 256
 
+fn first_owner(g: RootedGroup) -> Bytes = g.group.owners.at_or(0, b"")
+
 fn chunked(module: Bytes, groups: List<RootedGroup>) -> List<GroupRoots> =
-  groups.fold({ out: [], label: b"", groups: 0 }, |accumulator: Chunking, g: RootedGroup| {
-    let first = g.group.owners.at_or(0, b"");
-    let picked = root_id(qualify(module, first)) & (1 << chunk_rule_bits) - 1 == 0;
-    let opens = accumulator.label == b""
-      || (accumulator.groups >= fewest_groups_in_a_chunk && picked)
-      || accumulator.groups >= most_groups_in_a_chunk;
-    let label = if opens { first } else { accumulator.label };
-    {
-      out: accumulator.out.push({ group: g.group, roots: g.roots, chunk: label }),
-      label: label,
-      groups: if opens { 1 } else { accumulator.groups + 1 },
-    }
-  }).out
+  match groups {
+    [] -> [],
+    [opening, ..rest] ->
+      rest.fold(
+        {
+          out: [{ group: opening.group, roots: opening.roots, chunk: first_owner(opening) }],
+          label: first_owner(opening),
+          groups: 1,
+        },
+        |accumulator: Chunking, g: RootedGroup| {
+          let first = first_owner(g);
+          let picked = root_id(qualify(module, first)) & (1 << chunk_rule_bits) - 1 == 0;
+          let opens = (accumulator.groups >= fewest_groups_in_a_chunk && picked)
+            || accumulator.groups >= most_groups_in_a_chunk;
+          let label = if opens { first } else { accumulator.label };
+          {
+            out: accumulator.out.push({ group: g.group, roots: g.roots, chunk: label }),
+            label: label,
+            groups: if opens { 1 } else { accumulator.groups + 1 },
+          }
+        },
+      ).out,
+  }
 
 fn owner_places(owners: List<Bytes>) -> Map<Bytes, Int> =
   owners.fold(Map::new(), |at: Map<Bytes, Int>, o: Bytes| at.insert(o, at.len()))
 
 fn placed_first(places: Map<Bytes, Int>, g: RootedGroup) -> Int =
-  match places.get(g.group.owners.at_or(0, b"")) { Some(i) -> i, None -> 0 }
+  match places.get(first_owner(g)) { Some(i) -> i, None -> 0 }
 
 pub fn list_module_units(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let read = owners_result_of(named);
@@ -372,7 +382,9 @@ fn program_of_root(k: RootKey, tested: Bool) -> GroupKey / {memo.read, abort.rai
 
 type ProgramScope = { scope: emit::Scope, input: LoweringInput }
 
-type Lowering = { scopes: Map<Bytes, ProgramScope>, tested: Bool }
+type CalleesSeen = { roots: Set<RootName>, units: Set<CodeUnit> }
+
+type Lowering = { scopes: Map<Bytes, ProgramScope>, tested: Bool, seen: CalleesSeen }
 
 pub fn collect_constant_values(group: GroupKey) -> Written / {memo.read, abort.raise} =
   stored_rows(group).definitions.fold(
@@ -381,10 +393,10 @@ pub fn collect_constant_values(group: GroupKey) -> Written / {memo.read, abort.r
       match r.value { Some(v) -> with_keyed_part(w, constant_part(), r.name, v), None -> w },
   )
 
-pub fn module_natives_query() -> QueryOf<ModuleKey, List<Extern>> =
-  { name: b"module natives", input: module_key_bin(), output: bin::list_bin(extern_bin()) }
+pub fn module_natives_query() -> QueryOf<ModuleKey, Unit> =
+  { name: b"module natives", input: module_key_bin(), output: bin::unit_bin() }
 
-fn native_part() -> KeyedPartOf<ModuleKey, List<Extern>, Bytes, Extern> =
+fn native_part() -> KeyedPartOf<ModuleKey, Unit, Bytes, Extern> =
   { query: module_natives_query(), name: b"native", key: bin::bytes_bin(), output: extern_bin() }
 
 pub fn list_module_natives(key: ModuleKey) -> Written / {QueryEffects, abort.raise} = {
@@ -392,12 +404,16 @@ pub fn list_module_natives(key: ModuleKey) -> Written / {QueryEffects, abort.rai
     Some(m) -> module_externs(m.source.name, m.parsed.module),
     None -> [],
   };
-  externs.fold_right(written(module_natives_query(), externs), |e: Extern, w: Written|
-    with_keyed_part(w, native_part(), e.name, e))
+  externs.fold_right(written(module_natives_query(), ()), |e: Extern, w: Written|
+    with_keyed_part(w, native_part(), builtin_helper(e.name), e))
 }
 
-fn natives_of(module: Bytes, tested: Bool) -> List<Extern> / {memo.read, abort.raise} =
-  fetch(module_natives_query(), module_key_in(module, tested))
+fn module_native(
+  module: Bytes,
+  helper: Bytes,
+  tested: Bool,
+) -> Option<Extern> / {memo.read, abort.raise} =
+  fetch_keyed_part(native_part(), module_key_in(module, tested), helper)
 
 fn constant_value(named: Mention, tested: Bool) -> Option<ConstantData> / {memo.read, abort.raise} = {
   let module = module_key_in(named.module, tested);
@@ -491,10 +507,10 @@ fn program_scope(
 fn native_read(name: Bytes, tested: Bool) -> Option<Extern> / {memo.read, abort.raise} = {
   let module = module_of_name(name);
   let short = if module.len() == 0 { name } else { name.slice(module.len() + 1, name.len()) };
-  fetch_keyed_part(
-    native_part(),
-    module_key_in(if module.len() == 0 { prelude_module } else { module }, tested),
-    short,
+  module_native(
+    if module.len() == 0 { prelude_module } else { module },
+    builtin_helper(short),
+    tested,
   )
 }
 
@@ -525,15 +541,33 @@ pub fn with_code_reads<a | e>(
       body,
     ))
 
-fn natives_here(s: Lowering) -> List<Extern> / {memo.read, abort.raise} =
-  s.scopes.values().fold([prelude_module], |modules: List<Bytes>, p: ProgramScope|
+fn modules_in_scope(s: Lowering) -> List<Bytes> =
+  s.scopes.values().fold([], |modules: List<Bytes>, p: ProgramScope|
     p.scope.modules.map(|m: ParsedModule| m.name).concat(
       p.scope.module_scopes.flat_map(|t: emit::ModuleScope| t.imports.map(|i: Imported| i.module)),
     ).fold(modules, |found: List<Bytes>, m: Bytes|
-      if found.contains(m) { found } else { found.push(m) })).fold(
-    declared_natives,
-    |found: List<Extern>, m: Bytes| found.concat(natives_of(m, s.tested)),
-  )
+      if m == prelude_module || found.contains(m) { found } else { found.push(m) }))
+
+fn native_here(
+  modules: List<Bytes>,
+  helper: Bytes,
+  tested: Bool,
+) -> Option<Extern> / {memo.read, abort.raise} =
+  match module_native(prelude_module, helper, tested) {
+    Some(e) -> Some(e),
+    None -> match declared_natives.find(|e: Extern| builtin_helper(e.name) == helper) {
+      Some(e) -> Some(e),
+      None ->
+        modules.fold(None, |found: Option<Extern>, m: Bytes|
+          match found { Some(_) -> found, None -> module_native(m, helper, tested) }),
+    },
+  }
+
+fn natives_here(s: Lowering, called: Set<Bytes>) -> List<Extern> / {memo.read, abort.raise} = {
+  let modules = modules_in_scope(s);
+  called.elements().fold([], |found: List<Extern>, helper: Bytes|
+    match native_here(modules, helper, s.tested) { Some(e) -> found.push(e), None -> found })
+}
 
 fn failed_unit(reason: Bytes) -> LoweredUnit =
   {
@@ -605,15 +639,23 @@ fn summary_of(unit: CodeUnit) -> UnitSummary / {memo.read, abort.raise} =
   fetch_part(code_summary_part(), unit)
 
 fn callee_read(
-  unit: CodeUnit,
-  tested: Bool,
+  s: Lowering,
   facts: CalleeFacts,
   k: RootKey,
-) -> CalleeFacts / {memo.read, abort.raise} =
-  if !has_published_signature(k) || facts.read.contains(root_name(k)) { facts } else {
-    let seen = { ..facts, read: facts.read.insert(root_name(k)) };
-    let callee = unit_of_root(k, tested);
-    if callee == unit || callee == NoCode { seen } else { with_callee(seen, summary_of(callee)) }
+) -> CalleesRead<Lowering> / {memo.read, abort.raise} =
+  if !has_published_signature(k) || s.seen.roots.contains(root_name(k)) {
+    { state: s, facts: facts }
+  } else {
+    let callee = unit_of_root(k, s.tested);
+    let roots = s.seen.roots.insert(root_name(k));
+    if callee == NoCode || s.seen.units.contains(callee) {
+      { state: { ..s, seen: { ..s.seen, roots: roots } }, facts: facts }
+    } else {
+      {
+        state: { ..s, seen: { roots: roots, units: s.seen.units.insert(callee) } },
+        facts: with_callee(facts, summary_of(callee)),
+      }
+    }
   }
 
 fn lowered_unit(
@@ -623,11 +665,16 @@ fn lowered_unit(
 ) -> LoweredUnit / {EmitReads, QueryEffects} =
   unit_lowered(
     roots,
-    { scopes: Map::new(), tested: tested },
+    {
+      scopes: Map::new(),
+      tested: tested,
+      seen: { roots: Set::empty(), units: Set::empty().insert(unit) },
+    },
     |s: Lowering, ks: List<RootKey>, ownership: Map<RootName, OwnershipSignature>|
       lowered_batches(s, ks, ownership),
-    |facts: CalleeFacts, ks: List<RootKey>|
-      ks.fold(facts, |f: CalleeFacts, k: RootKey| callee_read(unit, tested, f, k)),
+    |s: Lowering, facts: CalleeFacts, ks: List<RootKey>|
+      ks.fold({ state: s, facts: facts }, |r: CalleesRead<Lowering>, k: RootKey|
+        callee_read(r.state, r.facts, k)),
     |k: RootKey| inlined_lambdas(k).len() > 0 && unit_of_root(k, tested) == unit,
     natives_here,
   )
@@ -723,9 +770,7 @@ fn unit_tested(unit: CodeUnit) -> Bool =
 
 fn roots_called_before_lowering(unit: CodeUnit) -> List<RootKey> / {memo.read, abort.raise} =
   match unit {
-    OfGroup(g) ->
-      fetch_part(forms_part(), g).forms.names.fold([], |found: List<RootKey>, named: NodeRef|
-        if named.kind == HeldValue { found.push(Named(named.name)) } else { found }),
+    OfGroup(g) -> fetch_part(calls_part(), g).flat_map(|b: BodyCalls| b.calls.map(Named)),
     OfRoot(r) -> match r.key { EntryPoint(entered) -> [entered], other -> [unspecialised(other)] },
     NoCode -> [],
   }

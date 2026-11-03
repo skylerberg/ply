@@ -216,9 +216,6 @@ fn natives_of(bodies: List<UnitBody>) -> Set<Bytes> =
   bodies.fold(Set::empty(), |accumulator: Set<Bytes>, k: UnitBody|
     k.tables.natives.fold(accumulator, |m: Set<Bytes>, n: Bytes| m.insert(n)))
 
-fn called_externs(called: Set<Bytes>, natives: List<Extern>) -> List<Extern> / {abort.raise} =
-  natives.filter(|e: Extern| called.contains(builtin_helper(e.name)))
-
 fn kinds_text(n: Native) -> Bytes =
   Bytes::concat_all([
     b"takes [",
@@ -1533,17 +1530,12 @@ pub type CalleeFacts = {
   ownership: Map<RootName, OwnershipSignature>,
   needs: Map<RootName, List<Need>>,
   called: Map<RootName, List<Int>>,
-  read: Set<RootName>,
 }
 
 pub const no_callee_facts: CalleeFacts =
-  {
-    published: Map::new(),
-    ownership: Map::new(),
-    needs: Map::new(),
-    called: Map::new(),
-    read: Set::empty(),
-  }
+  { published: Map::new(), ownership: Map::new(), needs: Map::new(), called: Map::new() }
+
+pub type CalleesRead<s> = { state: s, facts: CalleeFacts }
 
 pub fn with_callee(facts: CalleeFacts, s: UnitSummary) -> CalleeFacts =
   {
@@ -1559,7 +1551,6 @@ pub fn with_callee(facts: CalleeFacts, s: UnitSummary) -> CalleeFacts =
       m.insert(n, x)),
     called: s.called.fold(facts.called, |m: Map<RootName, List<Int>>, n: RootName, x: List<Int>|
       m.insert(n, x)),
-    read: facts.read,
   }
 
 type UnitWalk<s> = {
@@ -1606,19 +1597,19 @@ pub fn unit_lowered<s | e>(
   roots: List<RootKey>,
   start: s,
   ask: (s, List<RootKey>, Map<RootName, OwnershipSignature>) -> { state: s, batches: List<LoweredBatch> } / {abort.raise | e},
-  callees_read: (CalleeFacts, List<RootKey>) -> CalleeFacts / {abort.raise | e},
+  callees_read: (s, CalleeFacts, List<RootKey>) -> CalleesRead<s> / {abort.raise | e},
   belongs: (RootKey) -> Bool / {abort.raise | e},
-  natives_here: (s) -> List<Extern> / {abort.raise | e},
+  natives_here: (s, Set<Bytes>) -> List<Extern> / {abort.raise | e},
 ) -> LoweredUnit / {EmitReads | e} = {
-  let seeded = callees_read(no_callee_facts, roots.map(unspecialised));
-  let first = ask(start, roots, seeded.ownership);
+  let seeded = callees_read(start, no_callee_facts, roots.map(unspecialised));
+  let first = ask(seeded.state, roots, seeded.facts.ownership);
   let settled = iterate(
     with_lowered(
       {
         results: Map::new(),
         keys: Map::new(),
         batches: Map::new(),
-        facts: seeded,
+        facts: seeded.facts,
         needs: Map::new(),
         called: Map::new(),
         state: first.state,
@@ -1629,8 +1620,12 @@ pub fn unit_lowered<s | e>(
     ),
     66,
     |w: UnitWalk<s>| {
-      let facts = w.results.fold(w.facts, |f: CalleeFacts, _: RootName, a: Output|
-        callees_read(f, callees_named(a)));
+      let read = w.results.fold(
+        { state: w.state, facts: w.facts },
+        |r: CalleesRead<s>, _: RootName, a: Output|
+          callees_read(r.state, r.facts, callees_named(a)),
+      );
+      let facts = read.facts;
       let published = published_signatures(facts.published, w.results);
       let names = w.results.keys();
       let bodies = generic_bodies(w.results, w.keys, names);
@@ -1652,17 +1647,20 @@ pub fn unit_lowered<s | e>(
         });
       let stale = stale_of(w.results, published, w.keys);
       let asking = more.values().concat(stale);
-      let walked = { ..w, facts: facts, needs: needs, called: called };
+      let walked = { ..w, facts: facts, needs: needs, called: called, state: read.state };
       if asking.len() == 0 { Stop(walked) } else {
-        let got = ask(w.state, asking, merged_ownership(facts.ownership, w.results));
+        let got = ask(read.state, asking, merged_ownership(facts.ownership, w.results));
         Continue(with_lowered(walked, asking, got.state, got.batches))
       }
     },
   );
-  unit_finished(settled, natives_here(settled.state))
+  unit_finished(settled, |called: Set<Bytes>| natives_here(settled.state, called))
 }
 
-fn unit_finished<s>(w: UnitWalk<s>, natives_here: List<Extern>) -> LoweredUnit / {EmitReads} = {
+fn unit_finished<s | e>(
+  w: UnitWalk<s>,
+  externs_called: (Set<Bytes>) -> List<Extern> / {abort.raise | e},
+) -> LoweredUnit / {EmitReads | e} = {
   let resolved = generic_calls_specialised(w.results, w.keys, w.needs, w.called);
   let outputs = with_unemitted_rejected(resolved.results, w.keys, resolved.unemitted);
   let finished = outputs.fold(
@@ -1698,7 +1696,7 @@ fn unit_finished<s>(w: UnitWalk<s>, natives_here: List<Extern>) -> LoweredUnit /
           } else { accumulator },
           None -> accumulator,
         }),
-      externs: called_externs(called_natives, natives_here).fold(
+      externs: externs_called(called_natives).fold(
         Map::new(),
         |m: Map<Bytes, Extern>, x: Extern| m.insert(x.name, x),
       ).values(
