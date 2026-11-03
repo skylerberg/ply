@@ -100,18 +100,12 @@ fn a_cached_result_is_the_bytes_at_an_offset_and_length_within_a_bundled_cache_f
     ))
     .expect("the pack reads")
     .expect("the binary carries one");
-    assert_eq!(
-        pack.result("store", 0, one.len()),
-        Some(b"one record".to_vec())
-    );
-    assert_eq!(
-        pack.result("store", one.len(), two.len()),
-        Some(b"another".to_vec())
-    );
-    assert_eq!(pack.result("index", 0, 0), Some(b"index".to_vec()));
-    assert_eq!(pack.result("store", store.len(), 1), None);
-    assert_eq!(pack.result("store", one.len(), two.len() + 1), None);
-    assert_eq!(pack.result("records", 0, 0), None);
+    assert_eq!(pack.store_frame(0, one.len()), Some(one.clone()));
+    assert_eq!(pack.store_frame(one.len(), two.len()), Some(two.clone()));
+    assert_eq!(pack.store_frame(one.len(), 0), Some(Vec::new()));
+    assert_eq!(pack.index(), Some(b"index".to_vec()));
+    assert_eq!(pack.store_frame(store.len(), 1), None);
+    assert_eq!(pack.store_frame(one.len(), two.len() + 1), None);
 }
 
 #[test]

@@ -7,7 +7,9 @@ const MODULE: &str = ".ply";
 
 pub const COMPILER: &str = "compiler";
 
-pub const ANSWERS: &str = "answers";
+const PACK_INDEX: &str = "answers/index";
+
+const PACK_STORE: &str = "answers/store";
 
 const MAGIC: &[u8; 8] = b"PLYPACK1";
 const TRAILER: usize = 8 + 8 + MAGIC.len();
@@ -71,14 +73,14 @@ impl Pack {
             .map(|entry| &self.mapped[entry.at..entry.at + entry.len])
     }
 
-    pub fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
-        let file = self.bytes(&format!("{ANSWERS}/{path}"))?;
-        let end = if len == 0 {
-            file.len()
-        } else {
-            offset.checked_add(len)?
-        };
-        file.get(offset..end).map(<[u8]>::to_vec)
+    pub fn index(&self) -> Option<Vec<u8>> {
+        self.bytes(PACK_INDEX).map(<[u8]>::to_vec)
+    }
+
+    pub fn store_frame(&self, offset: usize, len: usize) -> Option<Vec<u8>> {
+        self.bytes(PACK_STORE)?
+            .get(offset..offset.checked_add(len)?)
+            .map(<[u8]>::to_vec)
     }
 
     pub fn text(&self, path: &str) -> Option<&str> {
