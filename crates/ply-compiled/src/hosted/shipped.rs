@@ -11,10 +11,15 @@ use std::sync::{Arc, Mutex, OnceLock};
 pub trait Ships: Send + Sync {
     fn names(&self) -> Vec<String>;
     fn module(&self, name: &str) -> Option<&'static [u8]>;
-    fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>>;
+    fn read_pack(&self, part: PackPart) -> Option<Vec<u8>>;
     fn digests(&self) -> String;
     fn stamps(&self) -> String;
     fn definitions(&self) -> String;
+}
+
+pub enum PackPart {
+    WholeIndex,
+    StoreFrame { offset: usize, len: usize },
 }
 
 static SHIPS: OnceLock<Box<dyn Ships>> = OnceLock::new();
@@ -120,11 +125,16 @@ pub unsafe extern "C" fn rt_shipped_answer(
         let Some(path) = text_at(c, p, n) else {
             return TakenBytes(0);
         };
-        let frame = match (usize::try_from(offset.0), usize::try_from(len.0)) {
-            (Ok(offset), Ok(len)) => ships.result(&path, offset, len),
+        let part = match (
+            path.as_str(),
+            usize::try_from(offset.0),
+            usize::try_from(len.0),
+        ) {
+            ("index", _, _) => Some(PackPart::WholeIndex),
+            ("store", Ok(offset), Ok(len)) => Some(PackPart::StoreFrame { offset, len }),
             _ => None,
         };
-        c.given(found(frame))
+        c.given(found(part.and_then(|part| ships.read_pack(part))))
     })
 }
 

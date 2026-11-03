@@ -1,3 +1,4 @@
+use ply_compiled::hosted::shipped::PackPart;
 use std::sync::OnceLock;
 
 static STAMPS: OnceLock<String> = OnceLock::new();
@@ -57,8 +58,11 @@ impl ply_compiled::hosted::shipped::Ships for Shipping {
             .or_else(|| crate::shipped_modules::data(name))
     }
 
-    fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>> {
-        ply_pack::installed().result(path, offset, len)
+    fn read_pack(&self, part: PackPart) -> Option<Vec<u8>> {
+        match part {
+            PackPart::WholeIndex => ply_pack::installed().index(),
+            PackPart::StoreFrame { offset, len } => ply_pack::installed().store_frame(offset, len),
+        }
     }
 
     fn digests(&self) -> String {
