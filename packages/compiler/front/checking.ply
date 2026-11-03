@@ -5,8 +5,8 @@ import std.list
 import std.fs
 import std.fs (fs)
 import compiler.store.memo
-import compiler.store.memo (memo, MemoryStore, Run, reading, empty_memory_store, with_memory_store,
-                            in_session, Product, main_only, main_part)
+import compiler.store.memo (memo, Run, reading, in_session, Product, main_only, main_part,
+                            reachable_keys)
 import compiler.store.handles (fetched, all_fetched)
 import compiler.store.memo_files
 import compiler.store.packs
@@ -621,25 +621,27 @@ pub fn reject_embed(package: Int, module: Bytes, want: EmbedRequest) -> EmbedByt
 pub fn nothing_derived(kind: Bytes, at: Bytes) -> Option<Bytes> = None
 
 pub fn over_decoding<a | e>(
-  store: MemoryStore,
+  store: fs::MemFs,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {RunEffects, abort.raise},
-) -> { store: MemoryStore, value: a } / {abort.raise | e} =
-  with_memory_store(store, read, world, look, || with_decode_cache(work))
+) -> { store: fs::MemFs, value: a } / {abort.raise | e} = {
+  let done = memo_files::with_store_in_memory(store, read, world, look, || with_decode_cache(work));
+  { store: done.tree, value: done.value }
+}
 
 pub fn queried_over(
-  store: MemoryStore,
+  store: fs::MemFs,
   sources: List<Source>,
-) -> { store: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} =
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} =
   queried_under(fresh_registry(), store, sources)
 
 pub fn queried_results(
   qs: CheckQueries,
-  store: MemoryStore,
+  store: fs::MemFs,
   sources: List<Source>,
-) -> { store: MemoryStore, run: Run, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
+) -> { store: fs::MemFs, run: Run, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
   let w = inputs_alone(sources);
   let done = over_decoding(
     store,
@@ -653,9 +655,9 @@ pub fn queried_results(
 
 pub fn queried_under(
   qs: CheckQueries,
-  store: MemoryStore,
+  store: fs::MemFs,
   sources: List<Source>,
-) -> { store: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
   let done = queried_results(qs, store, sources);
   {
     store: done.store,
@@ -668,7 +670,7 @@ pub fn queried_under(
 
 pub const prelude_files: Bytes = b"the shipped files"
 
-pub const prelude_pack: Option<packs::PackFiles> = pack_of(shipped_store([]))
+pub const prelude_pack: Option<packs::PackFiles> = shipped_pack([])
 
 pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} =
   packs::frame_in(prelude_pack, path, offset, len)
@@ -680,7 +682,7 @@ pub fn read_over<a>(
   let w = inputs_alone(sources);
   let qs = fresh_registry();
   over_decoding(
-    empty_memory_store,
+    fs::mem_empty(),
     prelude_frames,
     prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
@@ -836,24 +838,37 @@ fn queried_in(
   }
 }
 
+pub fn stopped_over(
+  store: fs::MemFs,
+  sources: List<Source>,
+  writes: Int,
+) -> fs::MemFs / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  fs::on_mem_failing[abs](store, writes, ||
+    memo_files::with_memo_store[abs](
+      memo_files::memory_dir,
+      prelude_frames,
+      prelude_files,
+      |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+      || with_decode_cache(|| query_alone(qs, w).fixing),
+    )).tree
+}
+
 effect raced {
   write is_first_lookup() -> Bool
 }
 
 pub fn files_differing(steps: List<Step>, company: StoreSharing) -> List<Bytes> / {abort.raise} =
   range(0, steps.len()).fold(
-    { tree: fs::mem_of([]), store: empty_memory_store, off: [] },
-    |s: { tree: fs::MemFs, store: MemoryStore, off: List<Bytes> }, i: Int| {
+    { tree: fs::mem_empty(), off: [] },
+    |s: { tree: fs::MemFs, off: List<Bytes> }, i: Int| {
       let step = steps.get(i);
       let recorded = queried_in(s.tree, step.sources, company, i);
-      let queried = queried_over(s.store, step.sources);
-      let agrees = outcome_summary(recorded.outcome) == outcome_summary(queried.outcome)
-        && recorded.fixing == queried.fixing;
-      {
-        tree: recorded.tree,
-        store: queried.store,
-        off: if agrees { s.off } else { s.off.push(step.what) },
-      }
+      let fresh = queried_over(fs::mem_empty(), step.sources);
+      let agrees = outcome_summary(recorded.outcome) == outcome_summary(fresh.outcome)
+        && recorded.fixing == fresh.fixing;
+      { tree: recorded.tree, off: if agrees { s.off } else { s.off.push(step.what) } }
     },
   ).off
 
@@ -865,21 +880,22 @@ test "every query whose results the toolchain ships caches its results" {
 
 fn stored_results(name: Bytes) -> List<Bytes> / {abort.raise} = {
   let store = check_sources(
-    empty_memory_store,
+    fs::mem_empty(),
     layered(b"pub fn step(n: Int) -> Int = n + 1\n"),
     [],
   ).store;
-  memo::fact_records(store).fold([], |accumulator: List<Bytes>, _key: Bytes, r: memo::FactRecord|
-    if r.query != name { accumulator } else {
-      match r.parts.get(main_part) {
-        Some(d) -> match store.outputs.get(d) {
-          Some(out) -> accumulator.push(out),
-          None -> accumulator,
-        },
-        None -> accumulator,
-      }
-    })
+  let digests = memo_files::facts_in_memory(store).values().flat_map(|r: memo_files::FactRecord|
+    if r.query != name { [] } else { match r.parts.get(main_part) { Some(d) -> [d], None -> [] } });
+  memo_files::outputs_in_memory(store, digests).values()
 }
+
+fn stored_outputs(store: fs::MemFs) -> List<Bytes> / {abort.raise} =
+  memo_files::outputs_in_memory(
+    store,
+    memo_files::facts_in_memory(store).values().flat_map(|r: memo_files::FactRecord|
+      r.parts.values()),
+  ).values(
+  )
 
 fn results_round_trip<a>(results: List<Bytes>, codec: bin::BinCodec<a>) -> Bool / {abort.raise} =
   results.len() > 0
@@ -911,7 +927,7 @@ test "a module's hashes read back as they were recorded" {
 fn embedding_queried(
   source_text: Bytes,
   files: Map<Bytes, Bytes>,
-) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
+) -> { store: fs::MemFs, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
   let w = inputs_alone([{ name: b"m", source_text: source_text }]);
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
@@ -920,7 +936,7 @@ fn embedding_queried(
       None -> Err(b"no file is there"),
     };
   let done = over_decoding(
-    empty_memory_store,
+    fs::mem_empty(),
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
@@ -949,7 +965,7 @@ test "a module's stored results refer to an embedded file by its digest and neve
     done.results.map(|a: CheckedModule| a.result.shape.embeds.map(|e: ModuleEmbed| e.read)),
     [[Ok([embed_file(b"", big)])]],
   );
-  let largest = done.store.outputs.fold(0, |most: Int, _: Bytes, result: Bytes|
+  let largest = stored_outputs(done.store).fold(0, |most: Int, result: Bytes|
     if result.len() > most { result.len() } else { most });
   assert(
     largest < big.len() / 10,
@@ -1017,7 +1033,7 @@ test "a third session in a command reads the embedded file the second session re
 }
 
 type CheckedSources = {
-  store: MemoryStore,
+  store: fs::MemFs,
   run: Run,
   results: List<CheckedModule>,
   cached_hashes: CachedHashes,
@@ -1026,7 +1042,7 @@ type CheckedSources = {
 }
 
 pub fn check_sources(
-  store: MemoryStore,
+  store: fs::MemFs,
   sources: List<Source>,
   shipped: List<Source>,
   derived: (Bytes, Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
@@ -1034,7 +1050,7 @@ pub fn check_sources(
   check_with_pack(store, prelude_pack, sources, shipped, derived: derived)
 
 pub fn check_with_pack(
-  store: MemoryStore,
+  store: fs::MemFs,
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
@@ -1044,7 +1060,7 @@ pub fn check_with_pack(
 
 pub fn check_under(
   qs: CheckQueries,
-  store: MemoryStore,
+  store: fs::MemFs,
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
@@ -1130,7 +1146,7 @@ test "a program whose imported module has a broken signature reports that module
     { name: b"app", source_text: b"import lib\npub fn go(n: Int) -> Int = lib::broken(n)\n" },
   ];
   assert_eq(
-    outcome_summary(queried_over(empty_memory_store, sources).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
     outcome_summary(analyse(parse_all(sources))),
   )
 }
@@ -1144,7 +1160,7 @@ test "a comparison looks inside a type that another module declares" {
     },
   ];
   assert_eq(
-    outcome_summary(queried_over(empty_memory_store, sources).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
     outcome_summary(analyse(parse_all(sources))),
   )
 }
@@ -1168,7 +1184,7 @@ test "arithmetic works on a numeric type that another group declares" {
     },
   ];
   assert_eq(
-    outcome_summary(queried_over(empty_memory_store, sources).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
     outcome_summary(analyse(parse_all(sources))),
   )
 }
@@ -1186,7 +1202,7 @@ test "a group that calls a group with a type error is checked against its writte
         ]),
       },
     ];
-  let cold = queried_over(empty_memory_store, source(b"n + 1"));
+  let cold = queried_over(fs::mem_empty(), source(b"n + 1"));
   let broken = queried_over(cold.store, source(b"n + true"));
   assert_eq(
     outcome_summary(broken.outcome),
@@ -1194,32 +1210,34 @@ test "a group that calls a group with a type error is checked against its writte
   )
 }
 
-pub fn shipped_store(shipped: List<Source>) -> MemoryStore / {abort.raise} =
-  shipped_store_results(shipped).store
+type ShippedStore = { store: fs::MemFs, keys: List<Bytes>, rejected: List<CheckedModule> }
 
-fn shipped_store_results(
-  shipped: List<Source>,
-) -> { store: MemoryStore, value: List<CheckedModule> } / {abort.raise} = {
+fn shipped_store(shipped: List<Source>) -> ShippedStore / {abort.raise} = {
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  over_decoding(
-    empty_memory_store,
+  let wanted = shipped_queries.fold(Map::new(), |found: Map<Bytes, Bool>, name: Bytes|
+    found.insert(name, true));
+  let done = over_decoding(
+    fs::mem_empty(),
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes| lookup_input_shipping(nowhere, shipped, kind, at),
     || {
       let qs = fresh_registry();
-      in_session(qs, |run: Run|
-        reading(qs, run, ||
-          check_shipped_modules(with_prelude_source(shipped).map(|s: Source| s.name))))
+      in_session(qs, |run: Run| {
+        let all = reading(qs, run, ||
+          check_shipped_modules(with_prelude_source(shipped).map(|s: Source| s.name)));
+        { run: all.run, value: { keys: reachable_keys(qs, wanted, all.run), rejected: all.value } }
+      })
     },
-  )
+  );
+  { store: done.store, keys: done.value.keys, rejected: done.value.rejected }
 }
 
 test "computing the shipped modules' results names each one that fails" {
-  let rejected = shipped_store_results([
+  let rejected = shipped_store([
     { name: b"std.a", source_text: b"pub fn a() -> Int = 1\n" },
     { name: b"std.b", source_text: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
-  ]).value;
+  ]).rejected;
   assert_eq(rejected.map(|x: CheckedModule| x.module), [b"std.b"]);
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), [
     [b"E0202"],
@@ -1234,7 +1252,7 @@ test "a compiler module imports another below the compiler's root by its full na
       source_text: b"import compiler.syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
     },
   ];
-  let rejected = shipped_store_results(shipped).value;
+  let rejected = shipped_store(shipped).rejected;
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), []);
   let user = [
     {
@@ -1242,7 +1260,7 @@ test "a compiler module imports another below the compiler's root by its full na
       source_text: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n",
     },
   ];
-  let f = check_sources(empty_memory_store, user, shipped);
+  let f = check_sources(fs::mem_empty(), user, shipped);
   assert_eq(
     f.results.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
       accumulator.concat(a.result.rejected)),
@@ -1250,25 +1268,13 @@ test "a compiler module imports another below the compiler's root by its full na
   )
 }
 
-pub fn pack_of(store: MemoryStore) -> Option<packs::PackFiles> / {abort.raise} = {
-  let records = memo::fact_records(store);
-  let wanted = shipped_queries.fold(Map::new(), |found: Map<Bytes, Bool>, name: Bytes|
-    found.insert(name, true));
+pub fn shipped_pack(shipped: List<Source>) -> Option<packs::PackFiles> / {abort.raise} = {
+  let built = shipped_store(shipped);
   Some(
-    memo::pack_memory_store(
-      {
-        ..store,
-        facts: records.fold(
-          Map::new(),
-          |accumulator: Map<Bytes, memo::StoredFact>, k: Bytes, r: memo::FactRecord|
-            match store.facts.get(k) {
-              Some(f) -> if wanted.contains(r.query) { accumulator.insert(k, f) }
-              else { accumulator },
-              None -> accumulator,
-            },
-        ),
-      },
-      fresh_registry(),
+    memo_files::pack_in_memory(
+      built.store,
+      built.keys,
+      memo::queries_id(fresh_registry()),
       prelude_files,
     ),
   )
@@ -1276,7 +1282,7 @@ pub fn pack_of(store: MemoryStore) -> Option<packs::PackFiles> / {abort.raise} =
 
 test "a module whose text fails to parse outside its items is rejected with the parse error" {
   let checked = check_sources(
-    empty_memory_store,
+    fs::mem_empty(),
     [{ name: b"m", source_text: b"fn f() -> Int = 1\n\n/// below nothing\n" }],
     [],
   );
@@ -1289,7 +1295,7 @@ test "a module whose text fails to parse outside its items is rejected with the 
 test "a cycle whose signatures are rejected reports each error once" {
   let codes = |text: String|
     check_sources(
-      empty_memory_store,
+      fs::mem_empty(),
       [{ name: b"m", source_text: Bytes::of_string(text) }],
       [],
     ).results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code));
@@ -1317,7 +1323,7 @@ test "a cycle whose signatures are rejected reports each error once" {
 
 test "an effect set cycle and a type error in a function that uses the set are both reported" {
   let codes = check_sources(
-    empty_memory_store,
+    fs::mem_empty(),
     [
       {
         name: b"m",
@@ -1332,7 +1338,7 @@ test "an effect set cycle and a type error in a function that uses the set are b
 
 test "a failed import is reported once, uses of its names are not, and other errors still are" {
   let codes = check_sources(
-    empty_memory_store,
+    fs::mem_empty(),
     [
       {
         name: b"m",
@@ -1347,7 +1353,7 @@ test "a failed import is reported once, uses of its names are not, and other err
 
 test "a `const` that reads itself, holds a function or performs an effect is rejected with one E0156" {
   let codes = |text: Bytes|
-    check_sources(empty_memory_store, [{ name: b"m", source_text: text }], []).results.flat_map(
+    check_sources(fs::mem_empty(), [{ name: b"m", source_text: text }], []).results.flat_map(
       |a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code),
     );
   assert_eq(codes(b"const f: Int = f + 1\n"), [b"E0156"]);
@@ -1370,7 +1376,7 @@ test "an opaque record from another module cannot be built from a literal, and t
   };
   let rejected = |use_site: Bytes|
     check_sources(
-      empty_memory_store,
+      fs::mem_empty(),
       [
         lib,
         {
@@ -1399,7 +1405,7 @@ test "an opaque record from another module cannot be built from a literal, and t
 test "a module with an error in one group still reports the warnings of its other groups" {
   let codes = |text: String|
     check_sources(
-      empty_memory_store,
+      fs::mem_empty(),
       [{ name: b"m", source_text: Bytes::of_string(text) }],
       [],
     ).results.flat_map(|a: CheckedModule|
@@ -1426,7 +1432,7 @@ test "a module with an error in one group still reports the warnings of its othe
 
 test "a function whose type parameter is named like a rejected function is checked and callable" {
   let rejected = check_sources(
-    empty_memory_store,
+    fs::mem_empty(),
     [
       { name: b"n", source_text: b"pub type Wrapper = W(Float)\n" },
       {
@@ -1442,7 +1448,7 @@ test "a function whose type parameter is named like a rejected function is check
 test "a group that reads a rejected unit of its module still reports its own error" {
   let text = "type Count = Int\n\ntype Span = new { from: Int, to: Int }\n\nfn more(a: Count, b: Count) -> Count = a\n\nnumeric for Count by { add: more, sub: more, mul: more, neg: more, of_int: more }\n\nnumeric for Span by { add: more, sub: more, mul: more, neg: more, of_int: more }\n";
   let rejected = check_sources(
-    empty_memory_store,
+    fs::mem_empty(),
     [{ name: b"m", source_text: Bytes::of_string(text) }],
     [],
   ).results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.message));
@@ -1464,7 +1470,7 @@ test "a group's fix edits the module's file where its warning points" {
   ;
   let source = Bytes::of_string(text);
   let warned = check_sources(
-    empty_memory_store,
+    fs::mem_empty(),
     [
       { name: b"lib", source_text: b"pub fn first() -> Int = 1\n" },
       { name: b"m", source_text: source },
@@ -1489,8 +1495,8 @@ test "a program checked over a prebuilt store of shipped results gives the resul
   let user = [
     { name: b"main", source_text: b"import std.pair (both)\npub fn main() -> Bool = both(3)\n" },
   ];
-  let load = check_with_pack(empty_memory_store, pack_of(shipped_store(shipped)), user, shipped);
-  assert_eq(load.results, check_sources(empty_memory_store, user, shipped).results)
+  let load = check_with_pack(fs::mem_empty(), shipped_pack(shipped), user, shipped);
+  assert_eq(load.results, check_sources(fs::mem_empty(), user, shipped).results)
 }
 
 test "a shipped module's imports are checked as an importing module sees them, ignoring imports used only by its tests" {
@@ -1505,7 +1511,7 @@ test "a shipped module's imports are checked as an importing module sees them, i
     { name: b"std.b", source_text: b"pub fn one() -> Int = 1\n" },
     { name: b"std.c", source_text: b"pub fn spare() -> Int = 3\n" },
   ];
-  let f = check_sources(empty_memory_store, user, shipped);
+  let f = check_sources(fs::mem_empty(), user, shipped);
   assert_eq(
     f.results.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
       accumulator.concat(a.result.rejected)),
@@ -1520,7 +1526,7 @@ test "a module reports the errors of a definition with an error, and none from t
       source_text: b"fn pick() -> Int = missing()\n\nfn read() -> Int = 1\n\nfn main() -> Int = pick() + read()\n",
     },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.message))),
@@ -1530,7 +1536,7 @@ test "a module reports the errors of a definition with an error, and none from t
 
 test "an import of a module that does not exist fails the importing module even when nothing uses the import" {
   let sources = [{ name: b"app", source_text: b"import nonesuch\npub fn f() -> Int = 1\n" }];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
@@ -1544,7 +1550,7 @@ test "two imports that give the same module name fail their module even when nei
     { name: b"lib.net", source_text: b"pub fn y() -> Int = 2\n" },
     { name: b"app", source_text: b"import net\nimport lib.net\npub fn f() -> Int = 1\n" },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
@@ -1560,7 +1566,7 @@ test "a name two imports select fails their module, though its module exports it
       source_text: b"import base (T)\nimport base (T, f)\npub fn g() -> Bool = f() == f()\n",
     },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
@@ -1573,7 +1579,7 @@ test "a name a module selects that its module does not declare fails the module"
     { name: b"lib", source_text: b"pub fn used() -> Int = 1\n" },
     { name: b"app", source_text: b"import lib (used, gone)\nfn go() -> Int = used()\n" },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
@@ -1594,7 +1600,7 @@ test "a type and another type's constructor may share a name" {
     },
   ];
   assert_eq(
-    outcome_summary(queried_over(empty_memory_store, sources).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
     outcome_summary(analyse(parse_all(sources))),
   )
 }
@@ -1612,7 +1618,7 @@ test "a signature may use an effect set whose effects live in a module it does n
     },
   ];
   assert_eq(
-    outcome_summary(queried_over(empty_memory_store, sources).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
     outcome_summary(analyse(parse_all(sources))),
   )
 }
@@ -1625,7 +1631,7 @@ test "a signature that names a type keyed by its parameter implies that the para
     },
   ];
   assert_eq(
-    outcome_summary(queried_over(empty_memory_store, sources).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), sources).outcome),
     outcome_summary(analyse(parse_all(sources))),
   )
 }

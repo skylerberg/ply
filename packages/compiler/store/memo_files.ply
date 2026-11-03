@@ -2,17 +2,20 @@ import std.bin
 import std.fs
 import std.fs (fs)
 import std.list
+import std.hash (blake3)
 import compiler.store.fact_store
 import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, fact_damage,
                                   recent_reads, with_recent_reads)
 import compiler.store.memo
-import compiler.store.memo (ExternalInput, FactDetails, PackBuild, StoredFact, StoredInput, Waiting,
+import compiler.store.memo (Dependency, ExternalInput, FactDetails, PackBuild, Parts, Product,
+                            Query, Run, SealedInput, Step, StoredFact, StoredInput, Waiting,
                             deferred_kind, empty_pack_build, fact_details_bin, finished_pack,
-                            first_waiting, in_session, is_inline, location_id, lowest_waiting,
-                            main_part, memo, memo_store, nothing_left_waiting, nothing_waiting,
-                            query, sealed_lookup, sealed_record_of, fixed_digest, input_id,
-                            session_input, session_inputs, stored_fact_bin, stored_input_bin,
-                            with_mark, with_packed_fact, with_session_inputs, without_mark)
+                            first_waiting, in_session, in_session_of, is_inline, location_id,
+                            lowest_waiting, main_only, main_part, memo, memo_store,
+                            nothing_left_waiting, nothing_waiting, plain_queries, query_output,
+                            sealed_lookup, sealed_record_of, fixed_digest, input_id, session_input,
+                            session_inputs, stored_fact_bin, stored_input_bin, with_mark,
+                            with_packed_fact, with_session_inputs, without_mark)
 import compiler.store.packs
 import compiler.store.segments
 import compiler.store.segments (Committed, LockHeld, StoreChanged, WriteFailed)
@@ -84,17 +87,19 @@ fn results_of_facts(
       Err(_) -> live,
     })
 
+fn inputs_of<[r]>(
+  db: Database,
+) -> List<StoredInput> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  fact_store::entries_under[r](db, Inputs, b"").values().map(|b: Bytes|
+    undecoded(b, stored_input_bin()))
+
 fn live_results<[r]>(
   db: Database,
 ) -> Map<Bytes, Bool> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  fact_store::entries_under[r](db, Inputs, b"").values().fold(
+  inputs_of[r](db).fold(
     results_of_facts(Map::new(), fact_store::entries_under[r](db, Facts, b"").values()),
-    |live: Map<Bytes, Bool>, b: Bytes| {
-      match fixed_digest(undecoded(b, stored_input_bin())) {
-        Some(d) -> live.insert(result_key(d), true),
-        None -> live,
-      }
-    },
+    |live: Map<Bytes, Bool>, input: StoredInput|
+      match fixed_digest(input) { Some(d) -> live.insert(result_key(d), true), None -> live },
   )
 
 fn fixed_input<[r]>(
@@ -214,9 +219,7 @@ fn over_database<a, [r] | e>(
       st = { ..st, dependent_counts: st.dependent_counts.insert(key, count) };
       count > 0
     },
-    memo_store.inputs() ->
-      fact_store::entries_under[r](st.db, Inputs, b"").values().map(|b: Bytes|
-        undecoded(b, stored_input_bin())),
+    memo_store.inputs() -> inputs_of[r](st.db),
     memo_store.facts_of(prefix) -> fact_store::entries_under[r](st.db, Facts, prefix).keys(),
     memo_store.code(name) -> fact_store::value_of[r](st.db, Codes, code_key(name)),
     memo_store.external(kind, at) -> looked(st.db, kind, at),
@@ -533,6 +536,82 @@ pub fn write_pack<[r]>(
       { written: finished_pack(laid, queries, files), records: laid.records.len() }
     }))
 
+pub type FactRecord = {
+  query: Bytes,
+  input: Bytes,
+  reads: List<Dependency>,
+  parts: Map<Bytes, Bytes>,
+}
+
+fn fact_records<[r]>(dir: String) -> Map<Bytes, FactRecord> / {fs.read[r], abort.raise} =
+  with_recent_reads(||
+    fact_store::undamaged(|| {
+      let db = fact_store::read_only[r](dir);
+      fact_store::entries_under[r](db, Facts, b"").fold(
+        Map::new(),
+        |found: Map<Bytes, FactRecord>, key: Bytes, b: Bytes| {
+          let fact = undecoded(b, stored_fact_bin());
+          match fact_store::result_of[r](db, fact.details) {
+            None -> found,
+            Some(encoded) -> {
+              let details = undecoded(encoded, fact_details_bin());
+              found.insert(key, {
+                query: details.query,
+                input: details.input,
+                reads: details.reads,
+                parts: fact.parts,
+              })
+            },
+          }
+        },
+      )
+    }))
+
+fn stored_inputs<[r]>(dir: String) -> List<StoredInput> / {fs.read[r], abort.raise} =
+  with_recent_reads(|| fact_store::undamaged(|| inputs_of[r](fact_store::read_only[r](dir))))
+
+pub const memory_dir: String = "store"
+
+pub fn with_store_in_memory<a | e>(
+  tree: fs::MemFs,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> fs::MemResult<a> / {abort.raise | e} = {
+  let ran = fs::on_mem[memory](tree, ||
+    with_memo_store[memory](memory_dir, read, world, look, work));
+  match ran.value.damage {
+    Some(reason) -> panic("the fact database held in memory is damaged: " ++ reason),
+    None -> { value: ran.value.value, tree: ran.tree },
+  }
+}
+
+fn read_in_memory<a>(
+  tree: fs::MemFs,
+  read: (String) -> a / {fs.read[memory], abort.raise},
+) -> a / {abort.raise} = fs::on_mem[memory](tree, || read(memory_dir)).value
+
+pub fn facts_in_memory(tree: fs::MemFs) -> Map<Bytes, FactRecord> / {abort.raise} =
+  read_in_memory(tree, |dir: String| fact_records[memory](dir))
+
+pub fn inputs_in_memory(tree: fs::MemFs) -> List<StoredInput> / {abort.raise} =
+  read_in_memory(tree, |dir: String| stored_inputs[memory](dir))
+
+pub fn outputs_in_memory(
+  tree: fs::MemFs,
+  digests: List<Bytes>,
+) -> Map<Bytes, Bytes> / {abort.raise} =
+  read_in_memory(tree, |dir: String| outputs_by_digest[memory](dir, digests))
+
+pub fn pack_in_memory(
+  tree: fs::MemFs,
+  keys: List<Bytes>,
+  queries: Bytes,
+  files: Bytes,
+) -> packs::PackFiles / {abort.raise} =
+  read_in_memory(tree, |dir: String| write_pack[memory](dir, keys, queries, files).written)
+
 fn quoted(input: Bytes) -> Bytes / {memo.read, abort.raise} =
   match memo.fetch(b"text", input, main_part) {
     Some(text) -> Bytes::concat_all([b"\"", text, b"\""]),
@@ -541,7 +620,7 @@ fn quoted(input: Bytes) -> Bytes / {memo.read, abort.raise} =
 
 fn test_queries() -> memo::Queries<| {}> =
   memo::plain_queries(
-    Map::new().insert(b"text", query(b"text", b"t1", memo::read_file)).insert(
+    Map::new().insert(b"text", query(b"text", b"t1", read_file)).insert(
       b"quoted",
       query(b"quoted", b"q1", quoted),
     ),
@@ -700,4 +779,530 @@ test "a pack holds the facts of the keys it is built from, and a trusted run use
         }),
     ));
   assert_eq(used.value.value, { output: Bytes::concat_all([b"\"", long, b"\""]), ran: 0 })
+}
+
+fn query(
+  name: Bytes,
+  hash: Bytes,
+  body: keep (Bytes) -> Bytes / {memo.read, memo.write, abort.raise},
+) -> Query<| {}> =
+  {
+    name: name,
+    hash: hash,
+    body: |input: Bytes| main_only(body(input)),
+    persistent: true,
+    product: None,
+  }
+
+fn read_file(input: Bytes) -> Bytes / {memo.read} =
+  match memo.external(b"file", input) { Some(text) -> text, None -> b"" }
+
+fn fetched_main(name: Bytes, input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  match memo.fetch(name, input, main_part) {
+    Some(o) -> o,
+    None -> panic("a query returned no main part"),
+  }
+
+type TestWorld = { files: Map<Bytes, Bytes>, store: fs::MemFs }
+
+fn world_of(files: List<{ at: Bytes, text: Bytes }>) -> TestWorld =
+  {
+    files: files.fold(Map::new(), |found: Map<Bytes, Bytes>, f: { at: Bytes, text: Bytes }|
+      found.insert(f.at, f.text)),
+    store: fs::mem_empty(),
+  }
+
+fn edited(w: TestWorld, at: Bytes, text: Bytes) -> TestWorld =
+  { ..w, files: w.files.insert(at, text) }
+
+type Answered = { output: Bytes, ran: List<Bytes>, steps: List<Step>, world: TestWorld }
+
+fn fetched_in(
+  named: Map<Bytes, Query<| {}>>,
+  w: TestWorld,
+  name: Bytes,
+  input: Bytes,
+) -> Answered / {abort.raise} = {
+  let queries = plain_queries(named);
+  let done = with_store_in_memory(
+    w.store,
+    packs::no_pack,
+    b"",
+    |_: Bytes, at: Bytes| w.files.get(at),
+    ||
+      in_session(queries, |run: Run| {
+        let a = query_output(queries, run, name, input);
+        { run: a.run, value: { output: a.output, steps: a.run.inputs } }
+      }),
+  );
+  {
+    output: done.value.output,
+    ran: done.value.steps.map(|s: Step| s.query),
+    steps: done.value.steps,
+    world: { ..w, store: done.tree },
+  }
+}
+
+fn length_of(input: Bytes) -> Bytes / {memo.read} =
+  Bytes::of_string(read_file(input).len().to_string())
+
+fn length_label(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  b"long ".concat(fetched_main(b"length", input))
+
+fn lengths(length_code: Bytes) -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"length", query(b"length", length_code, length_of)).insert(
+    b"label",
+    query(b"label", b"l1", length_label),
+  )
+
+fn four() -> TestWorld = world_of([{ at: b"a", text: b"four" }])
+
+fn fixed_reader(code: Bytes) -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(
+    b"read",
+    query(b"read", code, |input: Bytes| {
+      let found = memo.external(b"file", input);
+      memo.fix(b"file", input);
+      match found { Some(b) -> b, None -> b"" }
+    }),
+  )
+
+fn picker() -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(
+    b"pick",
+    query(b"pick", b"p1", |input: Bytes| {
+      let chosen = match memo.external(b"file", input) { Some(b) -> b, None -> b"" };
+      match memo.external(b"file", chosen) { Some(b) -> b, None -> b"" }
+    }),
+  )
+
+test "a fixed input keeps the value it was read with, so a query that runs again reads that value" {
+  let first = fetched_in(fixed_reader(b"r1"), four(), b"read", b"a");
+  let again = fetched_in(fixed_reader(b"r2"), edited(first.world, b"a", b"FOUR"), b"read", b"a");
+  assert_eq([first.output, again.output], [b"four", b"four"])
+}
+
+test "an input that no fact reads any more is deleted" {
+  let w = world_of([
+    { at: b"choice", text: b"a" },
+    { at: b"a", text: b"A" },
+    { at: b"b", text: b"B" },
+  ]);
+  let first = fetched_in(picker(), w, b"pick", b"choice");
+  let moved = fetched_in(picker(), edited(first.world, b"choice", b"b"), b"pick", b"choice");
+  assert_eq([first.output, moved.output], [b"A", b"B"]);
+  assert_eq(
+    inputs_in_memory(moved.world.store).flat_map(|i: StoredInput|
+      match i { ExternalInput(e) -> [e.at], SealedInput(_) -> [] }).filter(|at: Bytes| at == b"a"),
+    [],
+  )
+}
+
+fn unkept_text(text: Bytes) -> Map<Bytes, Query<| {}>> = {
+  let made = query(b"text", b"t1", |input: Bytes| {
+    let _ = memo.external(b"file", input);
+    text
+  });
+  Map::new().insert(b"text", { ..made, persistent: false })
+}
+
+test "a result made again that differs from its record is rejected" {
+  let long = b"long ".repeat(1000);
+  let first = fetched_in(unkept_text(long), four(), b"text", b"a");
+  assert_eq(
+    handle {
+      Some(fetched_in(unkept_text(long.concat(b"!")), first.world, b"text", b"a").output)
+    } with {
+      abort.raise(_) -> None,
+    },
+    None,
+  )
+}
+
+effect looking {
+  write looked_at(at: Bytes) -> Unit
+}
+
+fn doubled_length(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  read_file(input).concat(fetched_main(b"length", input))
+
+fn input_looks(
+  store: fs::MemFs,
+  input: Bytes,
+) -> { store: fs::MemFs, looks: List<Bytes> } / {abort.raise} = {
+  let q = lengths(b"h1").insert(b"doubled", query(b"doubled", b"d1", doubled_length));
+  handle {
+    with_store_in_memory(
+      store,
+      packs::no_pack,
+      b"",
+      |_: Bytes, at: Bytes| {
+        looking.looked_at(at);
+        Some(at)
+      },
+      || in_session_of(plain_queries(q), b"doubled", input),
+    ).tree
+  } with {
+    var looks: List<Bytes> = [],
+    looking.looked_at(at) -> {
+      looks = looks.push(at);
+    },
+    return final_store -> { store: final_store, looks: looks },
+  }
+}
+
+test "a run reads each input once, in the update and in every query that reads it" {
+  let first = input_looks(fs::mem_empty(), b"a");
+  assert_eq(first.looks, [b"a"]);
+  assert_eq(input_looks(first.store, b"a").looks, [b"a"])
+}
+
+test "a run with no changed input runs no query" {
+  let q = lengths(b"h1");
+  let first = fetched_in(q, four(), b"label", b"a");
+  assert_eq(first.output, b"long 4");
+  assert_eq(first.ran.len(), 2);
+  assert_eq(fetched_in(q, first.world, b"label", b"a").ran, [])
+}
+
+test "a result that comes out the same stops a change from reaching its dependents" {
+  let q = lengths(b"h1");
+  let first = fetched_in(q, four(), b"label", b"a");
+  let same = fetched_in(q, edited(first.world, b"a", b"FOUR"), b"label", b"a");
+  assert_eq(same.output, b"long 4");
+  assert_eq(same.ran, [b"length"]);
+  let longer = fetched_in(q, edited(same.world, b"a", b"forty"), b"label", b"a");
+  assert_eq(longer.output, b"long 5");
+  assert_eq(longer.ran, [b"length", b"label"])
+}
+
+test "a change reaches every stored dependent, including ones this command does not ask for" {
+  let q = lengths(b"h1");
+  let first = fetched_in(q, four(), b"label", b"a");
+  let elsewhere = fetched_in(q, edited(first.world, b"a", b"forty"), b"length", b"a");
+  assert_eq(elsewhere.ran, [b"length", b"label"]);
+  assert_eq(fetched_in(q, elsewhere.world, b"label", b"a").ran, [])
+}
+
+test "a query whose code changed runs again, and its dependents stop there if its result is the same" {
+  let first = fetched_in(lengths(b"h1"), four(), b"label", b"a");
+  let moved = fetched_in(lengths(b"h2"), first.world, b"label", b"a");
+  assert_eq(moved.ran, [b"length"]);
+  assert_eq(fetched_in(lengths(b"h2"), moved.world, b"label", b"a").ran, [])
+}
+
+fn split_lines(input: Bytes) -> Parts / {memo.read, abort.raise} = {
+  let lines = read_file(input).split(b"\n");
+  range(0, lines.len()).fold(main_only(b"lines"), |parts: Parts, i: Int|
+    parts.insert(Bytes::of_string(i.to_string()), lines.get(i)))
+}
+
+fn line_shouted(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  match memo.fetch(b"split", input.slice(0, 1), input.slice(1, input.len())) {
+    Some(line) -> line.concat(b"!"),
+    None -> b"no line!",
+  }
+
+fn line_queries() -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"split", { ..query(b"split", b"s1", read_file), body: split_lines }).insert(
+    b"shout",
+    query(b"shout", b"o1", line_shouted),
+  )
+
+fn lines_world(text: Bytes) -> TestWorld = world_of([{ at: b"f", text: text }])
+
+fn shouted(a: Answered) -> List<Bytes> =
+  a.steps.filter(|s: Step| s.query == b"shout").map(|s: Step| s.input)
+
+test "a reader of one part is not recomputed when another part of the same fact changes" {
+  let q = line_queries();
+  let first = fetched_in(q, lines_world(b"one\ntwo"), b"shout", b"f0");
+  let second = fetched_in(q, first.world, b"shout", b"f1");
+  assert_eq([first.output, second.output], [b"one!", b"two!"]);
+  let edit = fetched_in(q, edited(second.world, b"f", b"one\nTWO"), b"shout", b"f0");
+  assert_eq(edit.output, b"one!");
+  assert_eq(shouted(edit), [b"f1"])
+}
+
+test "a reader that found no part is recomputed when the part appears" {
+  let q = line_queries();
+  let first = fetched_in(q, lines_world(b"one"), b"shout", b"f1");
+  assert_eq(first.output, b"no line!");
+  let grown = fetched_in(q, edited(first.world, b"f", b"one\ntwo"), b"shout", b"f2");
+  assert_eq(shouted(grown), [b"f1", b"f2"]);
+  assert_eq(fetched_in(q, grown.world, b"shout", b"f1").output, b"two!")
+}
+
+test "a part its query stops returning is gone, and its readers see what a fresh build sees" {
+  let q = line_queries();
+  let first = fetched_in(q, lines_world(b"one\ntwo"), b"shout", b"f1");
+  let shorter = fetched_in(q, edited(first.world, b"f", b"one"), b"shout", b"f1");
+  assert_eq(shorter.output, b"no line!");
+  assert_eq(shorter.output, fetched_in(q, lines_world(b"one"), b"shout", b"f1").output)
+}
+
+fn gated(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  if read_file(b"gate") == b"open" { fetched_main(b"inner", input) } else { b"closed" }
+
+fn inner(input: Bytes) -> Bytes / {memo.read} = read_file(b"inner").concat(b"!")
+
+fn gated_queries() -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"gated", query(b"gated", b"g1", gated)).insert(
+    b"inner",
+    query(b"inner", b"i1", inner),
+  )
+
+test "a fact that nothing uses any more is deleted" {
+  let q = gated_queries();
+  let first = fetched_in(q, world_of([{ at: b"gate", text: b"open" }]), b"gated", b"x");
+  let closed = fetched_in(q, edited(first.world, b"gate", b"shut"), b"gated", b"x");
+  assert_eq(fetched_in(q, edited(closed.world, b"inner", b"new"), b"gated", b"x").ran, [])
+}
+
+fn guarded(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  if read_file(b"cycle") == b"yes" { b"reported" } else { fetched_main(b"walk", input) }
+
+fn walked(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  if read_file(b"cycle") == b"yes" { panic("the walk never ends") } else { b"walked" }
+
+fn guarded_queries() -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"guard", query(b"guard", b"g1", guarded)).insert(
+    b"walk",
+    query(b"walk", b"w1", walked),
+  )
+
+test "a recomputation that fails deletes its fact, and the run ends as a build from nothing ends" {
+  let q = guarded_queries();
+  let first = fetched_in(q, world_of([{ at: b"cycle", text: b"no" }]), b"guard", b"x");
+  assert_eq(first.output, b"walked");
+  let looped = fetched_in(q, edited(first.world, b"cycle", b"yes"), b"guard", b"x");
+  assert_eq(looped.output, b"reported");
+  assert_eq(
+    facts_in_memory(looped.world.store),
+    facts_in_memory(
+      fetched_in(q, world_of([{ at: b"cycle", text: b"yes" }]), b"guard", b"x").world.store,
+    ),
+  )
+}
+
+fn ring_a(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  if read_file(b"ring") == b"on" { fetched_main(b"b", input) } else { b"a" }
+
+fn ring_b(input: Bytes) -> Bytes / {memo.read, abort.raise} = fetched_main(b"a", input)
+
+test "a query that asks for its own result fails after an edit as it fails in a fresh build" {
+  let q = Map::new().insert(b"a", query(b"a", b"a1", ring_a)).insert(
+    b"b",
+    query(b"b", b"b1", ring_b),
+  );
+  let first = fetched_in(q, world_of([{ at: b"ring", text: b"off" }]), b"b", b"x");
+  assert_eq(first.output, b"a");
+  let ringed = edited(first.world, b"ring", b"on");
+  let tried = |w: TestWorld|
+    handle { Some(fetched_in(q, w, b"b", b"x").output) } with { abort.raise(_) -> None };
+  assert_eq(tried(ringed), None);
+  assert_eq(tried({ ..ringed, store: fs::mem_empty() }), None)
+}
+
+fn cascading(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  blake3(fetched_main(b"length", input))
+
+const hash_kind: Option<Product> = Some({ kind: b"hash", after: [] })
+
+fn product_queries() -> Map<Bytes, Query<| {}>> =
+  lengths(b"h1").insert(b"hash", { ..query(b"hash", b"p1", cascading), product: hash_kind })
+
+test "an edit leaves a product alone until a command asks for it, and then updates it from the log" {
+  let q = product_queries();
+  let first = fetched_in(q, four(), b"hash", b"a");
+  let moved = fetched_in(q, edited(first.world, b"a", b"forty"), b"length", b"a");
+  assert_eq(moved.ran, [b"length"]);
+  let later = fetched_in(q, moved.world, b"hash", b"a");
+  assert_eq(later.ran, [b"hash"]);
+  assert_eq(later.output, blake3(b"5"));
+  assert_eq(fetched_in(q, later.world, b"hash", b"a").ran, [])
+}
+
+fn doc_of(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  b"doc ".concat(fetched_main(b"length", input))
+
+fn two_kinds() -> Map<Bytes, Query<| {}>> =
+  product_queries().insert(b"doc", {
+    ..query(b"doc", b"d1", doc_of),
+    product: Some({ kind: b"doc", after: [] }),
+  })
+
+test "each kind of product catches up by itself, so asking for one leaves the other behind" {
+  let q = two_kinds();
+  let hashed = fetched_in(q, four(), b"hash", b"a");
+  let both = fetched_in(q, hashed.world, b"doc", b"a");
+  let moved = fetched_in(q, edited(both.world, b"a", b"forty"), b"hash", b"a");
+  assert_eq(moved.ran, [b"length", b"hash"]);
+  assert_eq(fetched_in(q, moved.world, b"doc", b"a").ran, [b"doc"])
+}
+
+test "a product whose code changed runs when a command asks for it" {
+  let labelled = fetched_in(product_queries(), four(), b"label", b"a");
+  let first = fetched_in(product_queries(), labelled.world, b"hash", b"a");
+  let q = lengths(b"h1").insert(b"hash", {
+    ..query(b"hash", b"p2", cascading),
+    product: hash_kind,
+  });
+  assert_eq(fetched_in(q, first.world, b"length", b"a").ran, []);
+  assert_eq(fetched_in(q, first.world, b"hash", b"a").ran, [b"hash"])
+}
+
+fn over_two(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  Bytes::concat_all([fetched_main(b"length", input), fetched_main(b"label", input)])
+
+test "a query with two paths to a change runs once, after both paths" {
+  let q = lengths(b"h1").insert(b"both", query(b"both", b"b1", over_two));
+  let first = fetched_in(q, four(), b"both", b"a");
+  let moved = fetched_in(q, edited(first.world, b"a", b"forty"), b"both", b"a");
+  assert_eq(moved.output, b"5long 5");
+  assert_eq(moved.ran, [b"length", b"label", b"both"])
+}
+
+fn shout_text(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  fetched_main(b"text", input).concat(b"!")
+
+test "a result that is not stored is computed again, even when an earlier version of its fact would hold" {
+  let long = b"long ".repeat(1000);
+  let longer = b"longer ".repeat(1000);
+  let q = Map::new().insert(b"text", {
+    ..query(b"text", b"t1", read_file),
+    persistent: false,
+  }).insert(
+    b"shout",
+    query(b"shout", b"o1", shout_text),
+  );
+  let first = fetched_in(q, world_of([{ at: b"a", text: long }]), b"shout", b"a");
+  let moved = fetched_in(q, edited(first.world, b"a", longer), b"shout", b"a");
+  let undone = fetched_in(q, edited(moved.world, b"a", long), b"shout", b"a");
+  assert_eq(undone.output, long.concat(b"!"))
+}
+
+test "a large result of a query that does not keep its results is computed again when needed" {
+  let long = b"long ".repeat(1000);
+  let q = Map::new().insert(b"text", {
+    ..query(b"text", b"t1", read_file),
+    persistent: false,
+  }).insert(
+    b"shout",
+    query(b"shout", b"o1", shout_text),
+  );
+  let first = fetched_in(q, world_of([{ at: b"a", text: long }]), b"shout", b"a");
+  let text = fetched_in(q, first.world, b"text", b"a");
+  assert_eq(text.output, long);
+  assert_eq(text.ran, [b"text"])
+}
+
+test "a fact in a trusted pack is used as it is, and a project records what it used" {
+  let q = lengths(b"h1");
+  let source = fetched_in(q, four(), b"length", b"a").world;
+  let qs = plain_queries(q);
+  let pack = pack_in_memory(
+    source.store,
+    facts_in_memory(source.store).keys(),
+    memo::queries_id(qs),
+    b"files",
+  );
+  let read = |path: String, offset: Int, len: Int| packs::frame_in(Some(pack), path, offset, len);
+  let done = with_store_in_memory(fs::mem_empty(), read, b"files", |_: Bytes, _: Bytes| None, ||
+    in_session(qs, |run: Run| {
+      let a = query_output(qs, run, b"label", b"a");
+      { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
+    }));
+  assert_eq(done.value, { output: b"long 4", ran: [b"label"] });
+  assert_eq(
+    inputs_in_memory(done.tree).map(|i: StoredInput|
+      match i { SealedInput(_) -> true, ExternalInput(_) -> false }),
+    [true],
+  )
+}
+
+test "a fact that used a sealed fact is recomputed when a new pack changes that fact" {
+  let q = lengths(b"h1");
+  let pack_of = |w: TestWorld, files: Bytes| {
+    let built = fetched_in(q, w, b"length", b"a").world;
+    let written = pack_in_memory(
+      built.store,
+      facts_in_memory(built.store).keys(),
+      memo::queries_id(plain_queries(q)),
+      files,
+    );
+    |path: String, offset: Int, len: Int| packs::frame_in(Some(written), path, offset, len)
+  };
+  let older = pack_of(four(), b"old");
+  let newer = pack_of(world_of([{ at: b"a", text: b"forty" }]), b"new");
+  let run_with = |store: fs::MemFs, read: (String, Int, Int) -> Option<Bytes> / {abort.raise}, files: Bytes|
+    with_store_in_memory(store, read, files, |_: Bytes, _: Bytes| None, ||
+      in_session_of(plain_queries(q), b"label", b"a"));
+  let first = run_with(fs::mem_empty(), older, b"old");
+  assert_eq(first.value, b"long 4");
+  assert_eq(run_with(first.tree, newer, b"new").value, b"long 5")
+}
+
+fn together(name: Bytes, input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  Bytes::join(
+    memo.fetch_all(name, input.split(b","), main_part).map(|o: Option<Bytes>|
+      match o { Some(b) -> b, None -> panic("a query returned no main part") }),
+    b",",
+  )
+
+fn one_by_one(name: Bytes, input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  Bytes::join(input.split(b",").map(|read: Bytes| fetched_main(name, read)), b",")
+
+fn counted_down(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  if input.len() <= 1 { read_file(input) }
+  else { fetched_main(b"down", input.slice(1, input.len())).concat(input.slice(0, 1)) }
+
+fn batched(
+  fetch_many: keep (Bytes, Bytes) -> Bytes / {memo.read, abort.raise},
+) -> Map<Bytes, Query<| {}>> =
+  lengths(b"h1").insert(b"down", query(b"down", b"d1", counted_down)).insert(
+    b"lengths",
+    query(b"lengths", b"s1", |input: Bytes| fetch_many(b"length", input)),
+  ).insert(
+    b"labels",
+    query(b"labels", b"s2", |input: Bytes| fetch_many(b"label", input)),
+  ).insert(
+    b"downs",
+    query(b"downs", b"s3", |input: Bytes| fetch_many(b"down", input)),
+  )
+
+const three_files: List<{ at: Bytes, text: Bytes }> =
+  [{ at: b"a", text: b"four" }, { at: b"b", text: b"seven" }, { at: b"c", text: b"ten" }]
+
+fn same_facts(a: Answered, b: Answered) -> Unit / {abort.raise} = {
+  assert_eq(a.output, b.output);
+  assert_eq(facts_in_memory(a.world.store), facts_in_memory(b.world.store))
+}
+
+test "facts fetched together store the outputs and reads that fetching them one at a time stores" {
+  let w = world_of(three_files);
+  let apart = fetched_in(batched(together), w, b"lengths", b"a,b,c");
+  assert_eq(apart.output, b"4,5,3");
+  same_facts(apart, fetched_in(batched(one_by_one), w, b"lengths", b"a,b,c"))
+}
+
+test "facts of one depth recomputed together after an edit end as a build from nothing ends" {
+  let first = fetched_in(batched(together), world_of(three_files), b"lengths", b"a,b,c");
+  let moved = edited(edited(first.world, b"a", b"forty"), b"c", b"eleven");
+  let after = fetched_in(batched(together), moved, b"lengths", b"a,b,c");
+  assert_eq(after.output, b"5,5,6");
+  same_facts(
+    after,
+    fetched_in(batched(together), { ..moved, store: fs::mem_empty() }, b"lengths", b"a,b,c"),
+  )
+}
+
+test "a fact fetched together whose body needs a fact not yet computed still comes out right" {
+  let w = world_of(three_files);
+  let labels = fetched_in(batched(together), w, b"labels", b"a,b");
+  assert_eq(labels.output, b"long 4,long 5");
+  same_facts(labels, fetched_in(batched(one_by_one), w, b"labels", b"a,b"));
+  let downs = fetched_in(batched(together), w, b"downs", b"cba,a,ba");
+  assert_eq(downs.output, b"fourbc,four(),fourb");
+  same_facts(downs, fetched_in(batched(one_by_one), w, b"downs", b"cba,a,ba"))
 }
