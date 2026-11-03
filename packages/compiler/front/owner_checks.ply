@@ -276,23 +276,29 @@ pub fn member_facts(
 ) -> { facts: EmitFacts, cached: List<CachedFacts> } / {abort.raise} =
   position_free(m.result, |r: OwnerResult| { facts: r.tables.facts, cached: r.tables.cached })
 
-pub fn is_rejected(ds: InGroup<List<Diagnostic>>) -> Bool / {abort.raise} =
-  position_free(ds, |xs: List<Diagnostic>| xs.len() > 0)
+pub fn is_rejected(state: GroupState) -> Bool =
+  match state { GroupChecked -> false, GroupRejected -> true, GroupUnresolved -> true }
+
+fn uses_known(state: GroupState) -> Bool =
+  match state { GroupChecked -> true, GroupRejected -> true, GroupUnresolved -> false }
 
 pub fn member_laws(m: MemberResult) -> List<LawOutline> / {abort.raise} =
   position_free(m.result, |r: OwnerResult| r.laws)
 
-pub type GroupFlags = { rejected: Bool, warned: Bool, later: Bool, uses: List<UseLink> }
+pub type GroupFlags = { state: GroupState, warned: Bool, later: Bool, uses: List<UseLink> }
 
 derive bin for GroupFlags
 
+pub fn unused_known(flags: List<GroupFlags>) -> Bool =
+  flags.all(|g: GroupFlags| uses_known(g.state))
+
 pub fn group_flags(g: GroupResult) -> GroupFlags / {abort.raise} =
   g.members.fold(
-    { rejected: is_rejected(g.rejected), warned: false, later: false, uses: [] },
+    { state: g.state, warned: false, later: false, uses: [] },
     |found: GroupFlags, m: MemberResult|
       position_free(m.result, |r: OwnerResult|
         {
-          rejected: found.rejected,
+          state: found.state,
           warned: found.warned || r.warnings.len() > 0,
           later: found.later || r.tagged.len() + r.statements.len() > 0,
           uses: found.uses.concat(r.uses.map(link_of)),
@@ -321,10 +327,14 @@ pub type MemberResult = { owner: Bytes, result: InGroup<OwnerResult> }
 
 derive bin for OwnerResult
 derive bin for MemberResult
+derive bin for GroupState
 derive bin for GroupResult
+
+pub type GroupState = | GroupChecked | GroupRejected | GroupUnresolved
 
 pub type GroupResult = {
   members: List<MemberResult>,
+  state: GroupState,
   rejected: InGroup<List<Diagnostic>>,
   forms: HashInput,
   embeds: List<ModuleEmbed>,
@@ -334,6 +344,7 @@ pub type GroupResult = {
 pub const no_group: GroupResult =
   {
     members: [],
+    state: GroupChecked,
     rejected: InGroup([]),
     forms: { names: [], definitions: [], tests: [], laws: [] },
     embeds: [],
@@ -360,6 +371,7 @@ pub fn listed_group(a: GroupResult) -> GroupResult / {abort.raise} =
 pub fn facts_of_group(a: GroupResult) -> GroupResult / {abort.raise} =
   {
     ..no_group,
+    state: a.state,
     members: a.members.map(|m: MemberResult|
       {
         owner: m.owner,
@@ -473,8 +485,8 @@ pub fn group_result(
   let spots = items.map(|x: ItemAt| { at: item_position(x), len: x.len, rel: x.from });
   let back = { from: 0, to: 0, by: |p: Int| group_offset(spots, p) };
   let placed = placement(items, item_position);
-  let uses = List::group_by(check.resolved.uses, |r: UseNode|
-    owner_placed(placed, r.module, r.span));
+  let found = match check.resolved { Some(r) -> r, None -> { uses: [], embeds: [] } };
+  let uses = List::group_by(found.uses, |r: UseNode| owner_placed(placed, r.module, r.span));
   let resolved = {
     members: members.map(|o: OwnerText|
       {
@@ -484,11 +496,16 @@ pub fn group_result(
           uses: relocated_uses(share_in(uses, o.owner), item_ranges(items, o.owner, item_position)),
         }),
       }),
+    state: match ((check.resolved, check.checked)) {
+      (None, _) -> GroupUnresolved,
+      (Some(_), None) -> GroupRejected,
+      (Some(_), Some(_)) -> GroupChecked,
+    },
     rejected: InGroup(
       check.diagnostics.map(|d: Diagnostic| moved_diagnostic(in_own_slot(d, 0, spots), back)),
     ),
     forms: no_group.forms,
-    embeds: embeds_wanted(check.resolved.embeds, module, members),
+    embeds: embeds_wanted(found.embeds, module, members),
     declared: check.declared,
   };
   match check.checked {
@@ -653,8 +670,17 @@ pub type SignatureCheck = { rejected: InGroup<List<Diagnostic>>, declared: Store
 
 derive bin for SignatureCheck
 
-pub fn signature_check_of(result: GroupResult) -> SignatureCheck =
-  { rejected: result.rejected, declared: result.declared }
+pub fn signature_check_of(
+  result: GroupResult,
+  shapes: List<OwnerText>,
+  texts: List<OwnerText>,
+) -> SignatureCheck / {abort.raise} =
+  {
+    rejected: InGroup(
+      rejected_in(result.rejected, item_layout(shapes), laid_out(item_layout(texts), 0)),
+    ),
+    declared: result.declared,
+  }
 
 pub fn inference_errors(
   members: List<OwnerInference>,
@@ -940,6 +966,18 @@ pub type AssembledModule = {
 
 pub type PositionedGroup = { items: List<ItemAt>, result: GroupResult }
 
+pub type PositionedSignatures = { items: List<ItemAt>, rejected: InGroup<List<Diagnostic>> }
+
+fn primary_place(d: Diagnostic) -> Option<Place> =
+  d.labels.find(|l: Label| l.primary).map(|l: Label| l.place)
+
+fn same_error(a: Diagnostic, b: Diagnostic) -> Bool =
+  a.code == b.code && a.message == b.message && primary_place(a) == primary_place(b)
+
+fn distinct_errors(ds: List<Diagnostic>) -> List<Diagnostic> =
+  ds.fold([], |kept: List<Diagnostic>, d: Diagnostic|
+    if kept.any(|k: Diagnostic| same_error(k, d)) { kept } else { kept.push(d) })
+
 fn ranked<a>(xs: List<a>, rank: (a) -> Int / {abort.raise}) -> List<a> / {abort.raise} =
   range(0, xs.len()).map(|i: Int| { rank: rank(xs.get(i)), at: i }).sort_by(
     |a: { rank: Int, at: Int }, b: { rank: Int, at: Int }|
@@ -962,6 +1000,7 @@ pub fn assembled(
   order: List<Bytes>,
   recorded: List<Bytes>,
   groups: List<PositionedGroup>,
+  signatures: List<PositionedSignatures>,
   unused: Bool,
 ) -> AssembledModule / {abort.raise} = {
   let at = |names: List<Bytes>|
@@ -1113,14 +1152,20 @@ pub fn assembled(
         types_joined(accumulator, a.rows.types)),
     },
     warnings: ranked(
-      gathered(owners, |a: OwnerResult| a.warnings).concat(if unused {
-        unreached(gathered(owners, |a: OwnerResult| a.uses))
-      } else { [] }),
+      gathered(owners, |a: OwnerResult| a.warnings).concat(
+        if unused && groups.all(|g: PositionedGroup| uses_known(g.result.state)) {
+          unreached(gathered(owners, |a: OwnerResult| a.uses))
+        } else { [] },
+      ),
       diagnostic_start,
     ),
     rejected: ranked(
-      groups.fold([], |accumulator: List<Diagnostic>, g: PositionedGroup|
-        accumulator.concat(rejected_in(g.result.rejected, g.items, g.items))).unique(
+      distinct_errors(
+        groups.fold([], |accumulator: List<Diagnostic>, g: PositionedGroup|
+          accumulator.concat(rejected_in(g.result.rejected, g.items, g.items))).concat(
+          signatures.fold([], |accumulator: List<Diagnostic>, x: PositionedSignatures|
+            accumulator.concat(rejected_in(x.rejected, x.items, x.items))),
+        ),
       ),
       diagnostic_start,
     ),
