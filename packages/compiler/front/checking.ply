@@ -1,3 +1,4 @@
+import compiler.emit.representations (EmitReads, failing_on_lowering)
 import std.set (Set)
 import std.bin
 import std.hash (blake3)
@@ -57,7 +58,7 @@ import compiler.front.checking.groups (module_contents_query, group_key_bin, mod
                                        owner_hash_query, module_listing_query, module_listing_bin,
                                        checked_module, module_own_hashes)
 
-import compiler.front.checking.units (code_queries, code_product_queries)
+import compiler.front.checking.units (code_queries, code_product_queries, with_code_reads)
 import compiler.front.checking.interfaces (interface_queries, published_module)
 import compiler.front.checking.program_facts (program_queries)
 import compiler.front.interface (module_interface_of)
@@ -656,20 +657,68 @@ pub const prelude_pack: packs::PackFiles = shipped_pack([])
 pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} =
   packs::frame_in(Some(prelude_pack), path, offset, len)
 
+pub type FileAt = { module: Bytes, path: Bytes, bytes: Bytes }
+
+pub type InMemory = {
+  store: fs::MemFs,
+  sources: List<Source>,
+  shipped: List<Source>,
+  files: List<FileAt>,
+}
+
+pub fn in_memory(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+) -> InMemory =
+  { store: fs::mem_empty(), sources: sources, shipped: shipped, files: files }
+
+pub fn session_over<a>(
+  program: InMemory,
+  work: (List<Bytes>) -> a / {SessionReads, abort.raise},
+) -> { program: InMemory, value: a } / {abort.raise} = {
+  let w = inputs_alone(program.sources);
+  let qs = fresh_registry();
+  let all = with_prelude_source(program.shipped);
+  let text_of = |name: Bytes|
+    match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.source_text), None -> None };
+  let read = |package: Int, module: Bytes, want: EmbedRequest|
+    match program.files.find(|f: FileAt| f.module == module && f.path == want.path) {
+      Some(f) -> Ok([{ name: b"", bytes: f.bytes }]),
+      None -> Err(b"no file is there"),
+    };
+  let done = over_decoding(
+    program.store,
+    prelude_frames,
+    prelude_files,
+    |kind: Bytes, at: Bytes|
+      lookup_input(w, text_of, text_of, || all.map(|s: Source| s.name), read, nothing_derived, kind, at),
+    || in_session(qs, |run: Run| reading(qs, run, || work(w.own))),
+  );
+  { program: { ..program, store: done.store }, value: done.value }
+}
+
 pub fn read_over<a>(
   sources: List<Source>,
   work: () -> a / {SessionReads, abort.raise},
-) -> a / {abort.raise} = {
-  let w = inputs_alone(sources);
-  let qs = fresh_registry();
-  over_decoding(
-    fs::mem_empty(),
-    prelude_frames,
-    prelude_files,
-    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-    || in_session(qs, |run: Run| reading(qs, run, work)),
-  ).value
+) -> a / {abort.raise} = session_over(in_memory(sources), |_: List<Bytes>| work()).value
+
+pub type CheckedInMemory = { program: InMemory, outcome: AnalysisOutcome }
+
+pub fn checked_in_memory(program: InMemory) -> CheckedInMemory / {abort.raise} = {
+  let done = session_over(program, |own: List<Bytes>|
+    program_outcome(own, query_load(own, [], false, module_of).results));
+  { program: done.program, outcome: done.value }
 }
+
+pub fn analysed_over(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+) -> AnalysisOutcome / {abort.raise} = checked_in_memory(in_memory(sources, shipped, files)).outcome
+
+pub fn lowered_over<a>(program: InMemory, body: () -> a / {EmitReads}) -> a / {abort.raise} =
+  session_over(program, |_: List<Bytes>| failing_on_lowering(|| with_code_reads(true, || body()))).value
 
 pub fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
   load_inputs_of(

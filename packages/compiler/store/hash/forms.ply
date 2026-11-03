@@ -52,7 +52,7 @@ import compiler.store.hash.graph (NodeBody, NodeEffect, NodeFn, NodeType, Node, 
                                   instances_in, value_target, constructor_target, type_target,
                                   effect_target)
 import compiler.store.hash.encoding (Choice, CallSite, Known, CallResolution, Pending,
-                                     call_resolution_bin, spec_tag)
+                                     call_resolution_bin, spec_tag, choice_bin)
 import compiler.store.hash.stored (Template, TestOf, template_bin)
 import compiler.store.hash.template (node_template, test_template, law_template, spec_template,
                                      expression_template, renumbered, emitted_code)
@@ -312,48 +312,22 @@ pub fn own_hash(payload: Bytes) -> Bytes = blake3(own_domain.concat(payload))
 pub fn spec_hash(owner: Bytes, kind: Int, index: Int, payload: Bytes) -> Bytes / {abort.raise} =
   blake3(Bytes::concat_all([clause_domain, owner, byte_of_int(kind), u32_le(index), payload]))
 
-pub fn encoded_resolutions(picks: List<Choice>) -> Bytes = {
-  let inner = u32_le(picks.len()).concat(
-    Bytes::concat_all(
-      picks.map(|c: Choice|
-        u32_le(c.targets.len()).concat(Bytes::concat_all(c.targets.map(u32_le)))),
-    ),
-  );
-  u32_le(inner.len()).concat(inner)
-}
+pub type CallChoices = | ChosenCalls(List<Choice>) | PendingCalls(List<CallResolution>)
 
-pub fn pending_resolutions_bin() -> bin::BinCodec<List<CallResolution>> =
-  bin::list_bin(call_resolution_bin())
+derive bin for CallChoices
 
-pub type BodyCalls = | CallsResolved | CallsPending
+pub type FramedBody = { calls: CallChoices, form: Bytes }
 
-pub type FramedBody = { calls: BodyCalls, picks: Int, at: Int }
+derive bin for FramedBody
 
-pub fn body_head(calls: BodyCalls) -> Bytes =
-  match calls { CallsResolved -> b"\x00", CallsPending -> b"\x02" }
-
-pub fn framed_body(body: Bytes) -> Option<FramedBody> = {
-  let framed = |calls: BodyCalls|
-    match body.u32_at(1) {
-      Some(n) -> if 5 + n > body.len() { None }
-      else { Some({ calls: calls, picks: 5, at: 5 + n }) },
-      None -> None,
-    };
-  if body.len() == 0 { None }
-  else if body.at(0) == 0 { framed(CallsResolved) }
-  else if body.at(0) == 2 { framed(CallsPending) }
-  else { None }
-}
-
-pub fn single_body(f: FilledForm) -> Bytes / {abort.raise} =
-  match Option::traverse(f.chosen, |p: CallResolution|
-      match p { Known(c) -> Some(c), Pending(_) -> None }) {
-    Some(choices) ->
-      Bytes::concat_all([body_head(CallsResolved), encoded_resolutions(choices), f.bytes]),
-    None -> {
-      let open = bin::encode(f.chosen, pending_resolutions_bin());
-      Bytes::concat_all([body_head(CallsPending), u32_le(open.len()), open, f.bytes])
+pub fn single_body(f: FilledForm) -> FramedBody =
+  {
+    calls: match Option::traverse(f.chosen, |p: CallResolution|
+        match p { Known(c) -> Some(c), Pending(_) -> None }) {
+      Some(choices) -> ChosenCalls(choices),
+      None -> PendingCalls(f.chosen),
     },
+    form: f.bytes,
   }
 
 pub type Identified =
@@ -640,12 +614,8 @@ pub type HashOutput = {
   specs: List<{ name: Bytes, hashes: List<Bytes> }>,
   dependencies: List<{ name: Bytes, names: List<Bytes> }>,
   refs: Refs,
-  bodies: List<{ name: Bytes, body: Bytes }>,
-  test_bodies: Map<Bytes, Bytes>,
-  test_refs: Map<Bytes, List<Int>>,
-  test_runs: Map<Bytes, List<Int>>,
-  law_refs: Map<Bytes, List<Int>>,
-  listing_hashes: Map<Bytes, Bytes>,
+  bodies: List<{ name: Bytes, body: FramedBody }>,
+  test_bodies: Map<Bytes, FramedBody>,
   own: OwnHashes,
 }
 
@@ -707,7 +677,7 @@ pub type DefinitionHash = {
   name: Bytes,
   kind: HeldKind,
   hash: Bytes,
-  body: Bytes,
+  body: FramedBody,
   contract: Bytes,
   clauses: List<Bytes>,
   uses: List<NodeRef>,
@@ -720,7 +690,7 @@ pub type ListingHash = { hash: Bytes, uses: List<NodeRef> }
 pub type TestHash = {
   key: Bytes,
   hash: Bytes,
-  body: Bytes,
+  body: FramedBody,
   uses: List<NodeRef>,
   listing: Option<ListingHash>,
 }
@@ -1307,11 +1277,6 @@ pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise}
     },
     bodies: [],
     test_bodies: by_key(test_keys, tested.map(|t: TestHash| t.body)),
-    test_refs: by_key(test_keys, test_refs),
-    test_runs: by_key(test_keys, tested.map(|t: TestHash| ids(t.uses))),
-    law_refs: by_key(law_keys, law_refs),
-    listing_hashes: tested.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, t: TestHash|
-      match t.listing { Some(l) -> accumulator.insert(t.key, l.hash), None -> accumulator }),
     own: own,
   };
   sk.order.fold(
@@ -1360,7 +1325,7 @@ pub fn own_hashes_of(
   let own = hashes.own;
   let bodies = hashes.bodies.fold(
     Map::new(),
-    |m: Map<Bytes, Bytes>, b: { name: Bytes, body: Bytes }| m.insert(b.name, b.body),
+    |m: Map<Bytes, FramedBody>, b: { name: Bytes, body: FramedBody }| m.insert(b.name, b.body),
   );
   let defined = own.definitions.fold(
     Map::new(),

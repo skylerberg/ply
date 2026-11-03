@@ -2,7 +2,7 @@ import std.set (Set)
 import std.graph (Visit, traverse)
 import compiler.check.infer.checker (with_no_other_definitions, CheckReads, StoredDeclarations,
                                      no_stored_declarations, BodyFacts, decode_facts, no_body_facts,
-                                     RecordedFacts)
+                                     RecordedFacts, BodyRecord, RecordedHere, CheckedElsewhere)
 import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, generated_span, moved_by,
                                 parse_diagnostic, parse_label, start)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, TestItem, LawItem, SumBody,
@@ -27,8 +27,8 @@ import compiler.check.resolve.scopes (find)
 import compiler.check.resolve.defaults (make_all_visible, ResolvedProgram)
 import compiler.store.hash.graph (Index, TestNode, LawNode, Node, NodeFn)
 import compiler.store.hash.forms (HashOutput, build_index, by_name, reachable_functions, Subject,
-                                  FunctionNamed, DeclarationNamed, ItemKeyed)
-import compiler.store.hash (UseNode, hashed_and_unused, body_key, checked_hashes)
+                                  FunctionNamed, DeclarationNamed, ItemKeyed, FramedBody)
+import compiler.store.hash (UseNode, hashed_and_unused, body_key)
 import compiler.store.hash.printer (print_bodies, Printed, Unprintable, WrittenWith,
                                     FromShippedModule)
 import compiler.check.typed
@@ -65,7 +65,7 @@ import compiler.front.rows (Cut, KeyRow, EmitterRoot, KnownDefinitionRow, KnownT
                             Rows, known_definition_row_bin, rows_bin, DefinitionRow, TestRow,
                             DefinitionHashRow, HashTableRow, Dump, normalized_diagnostic)
 import compiler.front.facts (Analysis, GroupAnalysis, PackageTables, hashed_analysis,
-                             package_tables, tree_named, home_of, ToolchainTree, NoTree)
+                             package_tables, home_of, ToolchainTree, NoTree)
 import compiler.front.emitter_input (test_root_at, checked_program_of, view_dump, Analysed,
                                      AnalysisOutcome, Rejected, InferredFacts, inferred_facts_of,
                                      rows_from)
@@ -141,6 +141,19 @@ fn gathered(
     },
   }
 
+fn gathered_definition(
+  g: GatheredFacts,
+  owner: Bytes,
+  record: Option<BodyRecord>,
+  asked: Bool,
+  module: Int,
+) -> GatheredFacts / {abort.raise} =
+  match record {
+    None -> gathered(g, owner, None, module),
+    Some(RecordedHere(r)) -> gathered(g, owner, Some(r), module),
+    Some(CheckedElsewhere) -> if asked { gathered(g, owner, None, module) } else { g },
+  }
+
 pub fn facts_read(
   rows: Rows,
   w: InferredFacts,
@@ -153,8 +166,8 @@ pub fn facts_read(
     match here.get(w.modules.get(i)) { Some(j) -> accumulator.insert(i, j), None -> accumulator });
   let definitions = rows.definitions.fold(
     Map::new(),
-    |accumulator: Map<Bytes, RecordedFacts>, row: KnownDefinitionRow|
-      match row.facts { Some(r) -> accumulator.insert(row.name, r), None -> accumulator },
+    |accumulator: Map<Bytes, BodyRecord>, row: KnownDefinitionRow|
+      accumulator.insert(row.name, row.facts),
   );
   let tests = rows.tests.fold(
     Map::new(),
@@ -184,7 +197,9 @@ pub fn facts_read(
             FunctionItem(d) -> {
               let owner = qualify(m.name, d.name.name);
               if !wants(roots, owner) { accumulator }
-              else { gathered(accumulator, owner, definitions.get(owner), i) }
+              else {
+                gathered_definition(accumulator, owner, definitions.get(owner), roots != None, i)
+              }
             },
             TestItem(d) -> {
               let owner = test_owner(m.name, d.name);
@@ -339,7 +354,7 @@ const interface_digest_prefix: Bytes = b"ply.interface.1"
 pub fn interface_digest(i: DefinitionInterface) -> Bytes / {abort.raise} =
   blake3(interface_digest_prefix.concat(bin::encode(i, definition_interface_bin())))
 
-pub type StoredBody = { hash: Bytes, body: Bytes }
+pub type StoredBody = { hash: Bytes, body: FramedBody }
 
 pub type PublishedInterface = { name: Bytes, hash: Bytes, interface: Bytes }
 
@@ -365,50 +380,13 @@ pub fn interfaces_of(
 }
 
 pub fn stored_bodies(hashes: HashOutput) -> List<StoredBody> / {abort.raise} =
-  hashes.bodies.fold([], |accumulator: List<StoredBody>, b: { name: Bytes, body: Bytes }|
+  hashes.bodies.fold([], |accumulator: List<StoredBody>, b: { name: Bytes, body: FramedBody }|
     match body_key(b.body) {
       Some(hash) -> accumulator.push({ hash: hash, body: b.body }),
       None -> accumulator,
     })
 
 pub type StubCuts = { name: Bytes, cuts: List<Cut> }
-
-pub fn analyse(parsed: List<ParsedSource>) -> AnalysisOutcome / {abort.raise} = analyse_with(parsed)
-
-pub fn analyse_with(
-  parsed: List<ParsedSource>,
-  packages: PackageSources = { root: b"", manifest: None, supplied: [] },
-) -> AnalysisOutcome / {abort.raise} = {
-  let clo = closure(packages, parsed.map(|p: ParsedSource| p.name));
-  let closed = clo.modules.fold(
-    parsed,
-    |accumulator: List<ParsedSource>, m: { pkg: Int, source: Source }|
-      accumulator.push({ ..parse_at(accumulator.len(), m.source), text: m.source.source_text }),
-  );
-  let all = if closed.any(|p: ParsedSource| p.name == prelude_module) { closed } else {
-    let source = prelude_source::text;
-    closed.push(
-      untested({
-        ..parse_at(closed.len(), { name: prelude_module, source_text: source }),
-        text: source,
-      }),
-    )
-  };
-  let texts = all.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, p: ParsedSource|
-    accumulator.insert(p.name, p.text));
-  let declared = homes_declaring(|h: Bytes| home_names_in(texts.get(h)));
-  let unimported = if !home_modules.any(|h: Bytes| texts.contains(h))
-      && !texts.contains(scheduler_module) { Map::new() } else {
-    missing_imports(all.map(|p: ParsedSource| { name: p.name, source_text: p.text }), declared)
-  };
-  analyse_closure(
-    all,
-    clo,
-    parsed.len(),
-    tree_named(parsed.map(|p: ParsedSource| p.name)),
-    unimported,
-  )
-}
 
 pub fn missing_imports(
   sources: List<Source>,
@@ -616,23 +594,6 @@ pub fn resolved_closure(
   }
 }
 
-pub fn checked_closure(h: HashedProgram, body_plan: BodyPlan) -> AnalysisOutcome / {abort.raise} = {
-  let check = with_no_other_definitions(|| type_check(h.resolved, body_plan, h.unused));
-  match check.checked {
-    None -> Rejected(check.diagnostics),
-    Some(a) ->
-      Analysed({
-        ..hashed_analysis(a, sited_hashes(h.hashes, a.modules, a.checked)),
-        unimported: h.unimported,
-        manifest: match h.closure.packages.at(0) { Some(p) -> p.manifest, None -> None },
-        packages: h.packages,
-        locked_packages: pins_of(h.closure, h.resolved.embeds),
-        stub_cuts: h.cuts,
-        embed_items: h.embed_items,
-      }),
-  }
-}
-
 pub fn type_check(
   group: ResolvedGroup,
   body_plan: BodyPlan,
@@ -650,22 +611,6 @@ pub fn type_check(
     else { Some(group_analysis(group, checked, out.bodies, out.declared, unused)) },
     diagnostics: group.problems.concat(checked.diagnostics),
   }
-}
-
-fn sited_hashes(
-  hashes: HashOutput,
-  modules: List<ParsedModule>,
-  checked: CheckOutput,
-) -> HashOutput / {abort.raise} = {
-  let cached_sites = cached_member_sites(modules, checked);
-  checked_hashes(
-    hashes,
-    checked.facts.members.concat(cached_sites.sites),
-    cached_sites.unread,
-    checked.tests.fold(Set::empty(), |accumulator: Set<Bytes>, t: TestInfo|
-      if cached_sites.unread.contains(test_owner(t.module, t.name)) { accumulator.insert(t.key) }
-      else { accumulator }),
-  )
 }
 
 pub fn group_analysis(
@@ -693,112 +638,6 @@ pub fn group_analysis(
     bodies: bodies,
     declared: declared,
   }
-
-fn cached_member_sites(
-  modules: List<ParsedModule>,
-  checked: CheckOutput,
-) -> { sites: List<MemberSite>, unread: Set<Bytes> } / {abort.raise} = {
-  let cached_facts = checked.cached.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, RecordedFacts>, k: CachedFacts|
-      match k.facts { Some(r) -> accumulator.insert(k.name, r), None -> accumulator },
-  );
-  let read = range(0, modules.len()).fold(
-    { sites: [], placed: Set::empty() },
-    |accumulator: { sites: List<MemberSite>, placed: Set<Bytes> }, i: Int| {
-      let m = modules.get(i);
-      m.module.items.fold(
-        accumulator,
-        |a: { sites: List<MemberSite>, placed: Set<Bytes> }, item: Item| {
-          let at = match item {
-            FunctionItem(d) -> Some({ owner: qualify(m.name, d.name.name) }),
-            TestItem(d) -> Some({ owner: test_owner(m.name, d.name) }),
-            _ -> None,
-          };
-          match at {
-            None -> a,
-            Some(x) -> match cached_facts.get(x.owner) {
-              None -> a,
-              Some(recorded) ->
-                {
-                  sites: a.sites.concat(decode_facts(recorded, i, x.owner).members),
-                  placed: a.placed.insert(x.owner),
-                },
-            },
-          }
-        },
-      )
-    },
-  );
-  {
-    sites: read.sites,
-    unread: checked.seeded.fold(Set::empty(), |accumulator: Set<Bytes>, n: Bytes|
-      if read.placed.contains(n) { accumulator } else { accumulator.insert(n) }),
-  }
-}
-
-fn analyse_closure(
-  parsed: List<ParsedSource>,
-  clo: Closure,
-  root_count: Int,
-  tree: ToolchainTree,
-  unimported: Map<Bytes, List<Bytes>>,
-) -> AnalysisOutcome / {abort.raise} =
-  match hashed_closure(parsed, clo, root_count, tree, unimported) {
-    Err(diagnostics) -> Rejected(diagnostics),
-    Ok(h) -> match if parsed.take(root_count).any(|p: ParsedSource| p.name == prelude_module) {
-        None
-      } else { prune_prelude(parsed, h) } {
-      None -> checked_closure(h, CheckEvery),
-      Some(cut) -> match hashed_closure(cut, clo, root_count, tree, unimported) {
-        Err(diagnostics) -> Rejected(diagnostics),
-        Ok(pruned) -> checked_closure(pruned, CheckEvery),
-      },
-    },
-  }
-
-fn prune_prelude(
-  parsed: List<ParsedSource>,
-  h: HashedProgram,
-) -> Option<List<ParsedSource>> / {abort.raise} = {
-  let own = |name: Bytes| module_of_name(name) == prelude_module;
-  let resolved = h.resolved;
-  let roots = h.hashes.definitions.fold(
-    [],
-    |accumulator: List<Subject>, d: { name: Bytes, hash: Bytes }|
-      if own(d.name) { accumulator } else { accumulator.push(FunctionNamed(d.name)) },
-  ).concat(
-    resolved.index.nodes.fold([], |accumulator: List<Subject>, n: Node|
-      match n.body { NodeFn(_) -> accumulator, _ -> accumulator.push(DeclarationNamed(n.name)) }),
-  ).concat(
-    resolved.index.tests.map(|t: TestNode| ItemKeyed(t.key)),
-  ).concat(
-    resolved.index.laws.map(|l: LawNode| ItemKeyed(l.key)),
-  );
-  let reach = reachable_functions(h.hashes, roots);
-  let is_reachable = |p: ParsedSource, item: Item|
-    match item { FunctionItem(d) -> reach.contains(qualify(p.name, d.name.name)), _ -> true };
-  if !parsed.any(|p: ParsedSource|
-      p.name == prelude_module && p.module.module.items.any(|item: Item| !is_reachable(p, item))) {
-    None
-  } else {
-    Some(
-      parsed.map(|p: ParsedSource|
-        if p.name != prelude_module { p } else {
-          {
-            ..p,
-            module: {
-              ..p.module,
-              module: {
-                ..p.module.module,
-                items: p.module.module.items.filter(|item: Item| is_reachable(p, item)),
-              },
-            },
-          }
-        }),
-    )
-  }
-}
 
 pub fn runtime_dump(d: Dump) -> Dump =
   {
@@ -1390,7 +1229,10 @@ pub fn checked_bodies(analysis: Analysis) -> LoweringTargets / {abort.raise} = {
   let functions = rows.definitions.fold(
     Set::empty(),
     |accumulator: Set<Bytes>, row: KnownDefinitionRow|
-      if row.facts == None { accumulator } else { accumulator.insert(row.name) },
+      match row.facts {
+        RecordedHere(_) -> accumulator.insert(row.name),
+        CheckedElsewhere -> accumulator,
+      },
   );
   let tests = rows.tests.fold(functions, |accumulator: Set<Bytes>, row: KnownTestRow|
     accumulator.insert(row.owner));
@@ -1457,186 +1299,6 @@ pub fn untested(p: ParsedSource) -> ParsedSource =
     },
   }
 
-fn size_over(home: Bytes, declared: Bytes) -> Bytes / {abort.raise} = {
-  let source = Bytes::concat_all([
-    b"import ",
-    home,
-    b"\npub fn size(s: ",
-    home,
-    b"::Shape) -> Int / {",
-    home,
-    b"::log.write} = { ",
-    home,
-    b"::log.put(1); 1 }\n",
-  ]);
-  match analyse(
-      parse_all([{ name: b"m", source_text: source }, { name: home, source_text: declared }]),
-    ) {
-    Rejected(_) -> panic("the test program fails to check"),
-    Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
-        d.name == b"m.size") {
-      Some(d) -> d.interface,
-      None -> panic("the checked program does not export a definition named `m.size`"),
-    },
-  }
-}
-
-test "an interface identifies each type and effect by the hash of its declaration, not by its name" {
-  let declared = |shape: Bytes, operations: Bytes|
-    Bytes::concat_all([b"pub type Shape = ", shape, b"\npub effect log {\n", operations, b"}\n"]);
-  let put = b"  write put(n: Int) -> Unit\n";
-  let first = size_over(b"shapes", declared(b"| Dot | Line(Int)", put));
-  assert_eq(size_over(b"forms", declared(b"| Dot | Line(Int)", put)), first);
-  assert(size_over(b"shapes", declared(b"| Dot | Circle(Float)", put)) != first, None);
-  assert(
-    size_over(
-        b"shapes",
-        declared(b"| Dot | Line(Int)", Bytes::concat_all([put, b"  write flush() -> Unit\n"])),
-      )
-      != first,
-    None,
-  )
-}
-
-test "an interface distinguishes a type from an effect that has the same name" {
-  let opened = |boxed: Bytes|
-    match analyse(
-        parse_all([
-          {
-            name: b"m",
-            source_text: Bytes::concat_all([
-              b"pub type Box = ",
-              boxed,
-              b"\neffect Box { read held() -> Int }\npub fn open(b: Box) -> Int / {Box.read} = Box.held()\n",
-            ]),
-          },
-        ]),
-      ) {
-      Rejected(_) -> panic("the test program fails to check"),
-      Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
-          d.name == b"m.open") {
-        Some(d) -> d.interface,
-        None -> panic("the checked program does not export a definition named `m.size`"),
-      },
-    };
-  assert(opened(b"| Box(Int)") != opened(b"| Box(Int, Int)"), None)
-}
-
-test "an interface differs when a function parameter or type variable is marked `keep` and when it is not" {
-  let recorded = |source: Bytes|
-    match analyse(parse_all([{ name: b"m", source_text: source }])) {
-      Rejected(_) -> panic("the test program fails to check"),
-      Analysed(w) -> match interfaces_of(w.checked, w.hashes).find(|d: PublishedInterface|
-          d.name == b"m.f") {
-        Some(d) -> d.interface,
-        None -> panic("the checked program does not export a definition named `m.size`"),
-      },
-    };
-  assert(
-    recorded(b"pub fn f(g: keep (Int) -> Int) -> Int = g(1)\n")
-      != recorded(b"pub fn f(g: (Int) -> Int) -> Int = g(1)\n"),
-    None,
-  );
-  assert(
-    recorded(b"pub fn f<keep a>(x: keep a) -> a = x\n")
-      != recorded(b"pub fn f<a>(x: a) -> a = x\n"),
-    None,
-  )
-}
-
-test "the types used in a function body are recorded as keys into one shared table of types, and read back from that table" {
-  let source = b"fn first<a>(xs: List<a>, d: a) -> a = match xs { [x, ..] -> x, _ -> d }\nfn go(ys: List<Int>) -> Int = first(ys, 0)\n";
-  match analyse(parse_all([{ name: b"m", source_text: source }])) {
-    Rejected(_) -> panic("the test program fails to check"),
-    Analysed(w) -> {
-      let rows = rows_of(w);
-      let sites = |name: Bytes|
-        match rows.definitions.find(|r: KnownDefinitionRow| r.name == name) {
-          Some(r) -> match r.facts { Some(f) -> decode_facts(f, 0, b""), None -> no_body_facts },
-          None -> no_body_facts,
-        };
-      assert_eq(sites(b"m.go").types.len(), 0);
-      let bodies = |name: Bytes| bodies_read(sites(name).bodies, rows.types);
-      assert_eq(
-        bodies(b"m.go").flat_map(|b: TypedBody<Type>| typed_expression_nodes(b.body)).fold(
-          [],
-          |accumulator: List<List<Type>>, e: TypedExpression<Type>|
-            match e.node {
-              TypedRead(ReadDefinition(d)) -> accumulator.push(d.args),
-              _ -> accumulator,
-            },
-        ),
-        [[int_type]],
-      );
-      assert_eq(
-        bodies(b"m.first").flat_map(|b: TypedBody<Type>| b.params).filter(
-          |p: TypedParam<Type>| p.name == b"d",
-        ).map(|p: TypedParam<Type>| p.ty),
-        [VariableType(0)],
-      )
-    },
-  }
-}
-
-test "each test is identified by its module and label, and tests are listed in the program's test order" {
-  let d = dump_of(
-    analyse(
-      parse_all([
-        {
-          name: b"a",
-          source_text: b"fn one() -> Int = 1\ntest \"first\" { assert_eq(one(), 1) }\ntest \"second\" { assert_eq(one(), 1) }",
-        },
-        {
-          name: b"b",
-          source_text: b"fn test_like(x: Int) -> Int requires x > 0 = x\ntest \"third\" { assert_eq(test_like(2), 2) }",
-        },
-      ]),
-    ),
-  );
-  let tested = d.tests.map(|t: TestRow| test_owner(t.module, t.name));
-  assert_eq(
-    d.emitter_roots.map(|r: EmitterRoot| printed(r.key)).filter(|r: Bytes| tested.contains(r)),
-    [test_owner(b"a", b"first"), test_owner(b"a", b"second"), test_owner(b"b", b"third")],
-  );
-  assert_eq(range(0, 4).map(|i: Int| test_root_at(d, i)), [
-    Some(test_key(b"a", b"first")),
-    Some(test_key(b"a", b"second")),
-    Some(test_key(b"b", b"third")),
-    None,
-  ]);
-  assert_eq(d.tests.map(|t: TestRow| Bytes::concat_all([t.module, b".", t.name])), [
-    b"a.first",
-    b"a.second",
-    b"b.third",
-  ])
-}
-
-test "a test's key depends on the effect operations its code uses, and not on the order an effect set lists them in" {
-  let key = |set: Bytes| {
-    let source = Bytes::concat_all([
-      b"effect store {\n  read all[r]() -> List<Int>\n  write save[r](rows: List<Int>) -> Unit\n}\n",
-      set,
-      b"\nfn listed() -> Int / {Web} = store.all[orders]().len()\n",
-      b"test \"listed\" { handle { assert_eq(listed(), 0) } with { store.all[orders]() -> [] } }\n",
-    ]);
-    match analyse(parse_all([{ name: b"m", source_text: source }])) {
-      Rejected(_) -> panic("the test program fails to check"),
-      Analysed(w) ->
-        dump_of(Analysed(w)).keys.filter(|k: KeyRow| k.root == test_owner(b"m", b"listed")).map(
-          |k: KeyRow| k.key,
-        ),
-    }
-  };
-  let narrow = key(b"effect set Web = {store.read[orders], store.write[audit]}");
-  assert_eq(narrow.len(), 1);
-  assert_eq(key(b"effect set Web = {store.write[audit], store.read[orders]}"), narrow);
-  assert(
-    key(b"effect set Web = {store.read[orders], store.write[audit], store.read[inventory]}")
-      != narrow,
-    Some("a widened set left the key of a test that reaches it"),
-  )
-}
-
 test "a published builtin lists its type signature and its parameter names" {
   let rows = builtin_rows.filter(|r: BuiltinRow| r.name == b"Array::get");
   assert_eq(rows.len(), 1);
@@ -1644,84 +1306,5 @@ test "a published builtin lists its type signature and its parameter names" {
   match rows.get(0).scheme.ty {
     FunctionType(f) -> assert_eq(f.params.len(), 2),
     _ -> assert(false),
-  }
-}
-
-test "prelude function bodies can call extern functions and functions on a type, by method syntax or by qualified name" {
-  let source = Bytes::concat_all([
-    b"extern fn List::at<a>(xs: List<a>, i: Int) -> Option<a>\n",
-    b"extern fn List::len<a>(xs: List<a>) -> Int\n",
-    b"fn walked<a>(xs: List<a>, i: Int) -> Int = match xs.at(i) { Some(_) -> walked(xs, i + 1), None -> i }\n",
-    b"pub fn List::count<a>(xs: List<a>) -> Int = walked(xs, 0) + xs.len() + List::len(xs)\n",
-    b"pub fn List::twice<a>(xs: List<a>) -> Int = xs.count() + List::count(xs)\n",
-  ]);
-  match analyse(parse_all([{ name: prelude_module, source_text: source }])) {
-    Rejected(ds) ->
-      panic(String::of_bytes_lossy(Bytes::join(ds.map(|d: Diagnostic| d.message), b"; "))),
-    Analysed(w) ->
-      assert_eq(
-        w.checked.definitions.map(|d: DefinitionInfo| d.name).filter(|n: Bytes|
-          n.index_of(b"::") != None),
-        [b"std.prelude.List::count", b"std.prelude.List::twice"],
-      ),
-  }
-}
-
-test "a function that `std.prelude` defines in Ply is checked against the type signature that its callers see" {
-  let source = Bytes::concat_all([
-    b"pub fn g(xs: List<Int>) -> Int = xs.map(|x: Int| x + 1).filter(|x: Int| x > 2).fold(0, |a: Int, x: Int| a + x)\n",
-    b"pub fn k(xs: List<Int>) -> Option<Int> / {abort.raise} = xs.set(0, 1).push(2).at(0)\n",
-    b"pub fn l(a: Array<Int>, c: Columns<{ x: Int }>) -> Int = a.to_list().len() + c.to_list().len()\n",
-    b"fn e(o: Option<{ key: Int, value: Int }>) -> Int = match o { Some(x) -> x.key, None -> 0 }\n",
-    b"fn p(o: Option<{ key: Int, value: Int, rest: Map<Int, Int> }>) -> Int = match o { Some(x) -> x.rest.len(), None -> 0 }\n",
-    b"fn some<a>(o: Option<a>) -> Int = match o { Some(_) -> 1, None -> 0 }\n",
-    b"pub fn t(n: Int, u: U128, i: I128, s: String, f: Float) -> Int = n.to_string().len() + u.to_string().len() + i.to_string().len() + f.to_string().len() + s.trim().len() + (if Bytes::of_string(s).is_utf8() { 1 } else { 0 }) + some(U128::of_string(s)) + some(I128::of_string(s)) + some(Float::of_string(s))\n",
-    b"pub fn u(b: Bytes) -> Int / {abort.raise} = String::of_bytes(b).len() + String::of_bytes_lossy(b).len()\n",
-    b"pub fn d(a: Decimal, b: Decimal, f: Float, s: String) -> Int / {abort.raise} = a.div(b, 2, HalfEven).round(1, Down).to_string().len() + some(Decimal::of_string(s)) + some(Decimal::of_float(f)) + some(Int::of_decimal(a, Up)) + some(Int::of_float(f.round(Floor), Ceiling)) + (if Float::of_decimal(a) > 0.0 { 1 } else { 0 })\n",
-    b"pub fn n(m: Map<Int, Int>) -> Int = m.remove(1).insert(2, 3).update(2, |v: Int| v + 1).fold(0, |s: Int, k: Int, v: Int| s + k + v) + m.keys().len() + m.values().len() + m.entries().len() + Map::of_entries(m.entries()).merge(m).len() + e(m.first()) + e(m.last()) + e(m.floor(1)) + e(m.ceiling(1)) + e(m.below(1)) + e(m.above(1)) + p(m.pop_first()) + p(m.pop_last()) + m.range(None, true, None, true, 3).len() + (if m.contains(1) { 1 } else { 0 }) + m.split(1).below.len() + match m.get(1) { Some(v) -> v, None -> 0 }\n",
-  ]);
-  match analyse(parse_all([{ name: b"m", source_text: source }])) {
-    Rejected(_) -> panic("the test program fails to check"),
-    Analysed(w) -> {
-      let checked = w.checked.definitions.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Scheme>, d: DefinitionInfo| accumulator.insert(d.name, d.scheme),
-      );
-      let bodied = builtins.filter(|b: Builtin| b.body);
-      assert(bodied.len() > 0, None);
-      bodied.fold((), |u: Unit, b: Builtin|
-        assert_eq(checked.get(qualify(prelude_module, b.name)), Some(b.scheme)));
-      assert_eq(
-        w.checked.definitions.filter(|d: DefinitionInfo|
-          module_of_name(d.name) == prelude_module && d.ending != Terminates
-            && d.ending != TerminatesByDecreases).map(|d: DefinitionInfo| d.name),
-        [],
-      )
-    },
-  }
-}
-
-test "printing a definition's source text writes the parameter name on a method-call argument, as in `c.scaled(plus: 3)`" {
-  let source = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)\n";
-  match analyse(parse_all([{ name: b"m", source_text: source }])) {
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> {
-      let more = match print_bodies(
-          w.hashes.bodies.map(|b: { name: Bytes, body: Bytes }|
-            {
-              name: b.name,
-              body: b.body,
-              role: if module_of_name(b.name) == prelude_module { FromShippedModule }
-              else { WrittenWith(Public) },
-            }),
-          [],
-        ) {
-        Printed(ms) ->
-          ms.get(0).text.split(b"\n\n").fold(b"", |accumulator: Bytes, it: Bytes|
-            if it.contains(b"fn more(") { it } else { accumulator }),
-        Unprintable(reason) -> panic(String::of_bytes(reason.message)),
-      };
-      assert(more.contains(b".scaled(_l2: 3)"), Some(String::of_bytes_lossy(more)))
-    },
   }
 }

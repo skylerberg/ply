@@ -38,11 +38,9 @@ import compiler.store.hash.template (emitted_code)
 import compiler.front.rows (Dump, EmitterRoot, ModuleRow, KnownDefinitionRow, LawRow, BinderRow,
                             EffectRow)
 import compiler.emit.generated (MarshalledSums, marshalled_sums)
-import compiler.front.published (analyse, dump_of)
+import compiler.front.published (dump_of)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, LawBinders)
 import compiler.front.facts (Analysis)
-import compiler.emit.reads (over_analysis)
-import compiler.front (analyse_pulling_std_with)
 import compiler.emit.typing (unknown_type)
 import compiler.front.diagnostics (parse_all)
 import compiler.check.infer (dump_flag)
@@ -325,7 +323,7 @@ pub const unit_roots: List<Bytes> =
     b"compiler.front.emitter_input.view_dump",
   ]
 
-pub const compiler_roots: List<Bytes> = unit_roots.push(b"compiler.front.analyse_pulling_std_with")
+pub const compiler_roots: List<Bytes> = unit_roots.push(b"compiler.front.checking.every_query")
 
 pub fn program_key(entry: Bytes, runtime: Runtime, definitions: Bytes) -> Bytes / {abort.raise} =
   hex(
@@ -3147,51 +3145,6 @@ pub fn rejection_codes<a>(r: Result<a, List<Diagnostic>>) -> List<Bytes> =
         accumulator.push(d.code).concat(d.notes_text)),
   }
 
-test "each root a program requests has a key built from its kind, and the key's printed text equals the matching emitter root's name" {
-  let user = [
-    {
-      name: b"m",
-      source_text: Bytes::concat_all([
-        b"fn f(x: Int) -> Int requires x > 0 ensures result > 0 = x\n",
-        b"fn none<a>() -> List<a> ensures result.len() == 0 = []\n",
-        b"test \"t\" for n: Int in [1] { assert(n > 0) }\n",
-        b"law \"l\" forall (x: Int) where x > 0 { x + 1 > x }\n",
-        b"law \"s\" forall (x: a) { x == x }\n",
-      ]),
-    },
-  ];
-  let cases = {
-    name: b"std.cases",
-    source_text: Bytes::concat_all([
-      b"pub type Table<a> = List<a>\n",
-      b"pub type Listed = { label: String, identity: Bytes }\n",
-      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / {abort.raise | e} = table.map(|c: a| { label: label(c), identity: b\"\" })\n",
-      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise} = match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
-    ]),
-  };
-  let analysed = analyse_pulling_std_with(user, [cases]).out;
-  let dump = dump_of(analysed);
-  let offers = requested_roots(dump);
-  assert_eq(offers.filter(|k: RootKey| module_of(k) == b"m"), [
-    Named(b"m.f"),
-    Named(b"m.none"),
-    test_key(b"m", b"t"),
-    Clause({ definition: Named(b"m.f"), kind: Requires, n: 0 }),
-    Clause({ definition: Named(b"m.f"), kind: Ensures, n: 0 }),
-    Clause({ definition: Named(b"m.none"), kind: Ensures, n: 0 }),
-    TestCases(test_key(b"m", b"t")),
-    law_key(b"m", b"l", LawGuard),
-    law_key(b"m", b"l", LawBody),
-    law_key(b"m", b"s", LawBody),
-  ]);
-  let mine = offers.filter(|k: RootKey| module_of(k) == b"m");
-  assert_eq(
-    mine.filter(|k: RootKey|
-      over_outcome(analysed, |_: Analysis| enters(lowering_input_of(dump), k))),
-    mine.filter(|k: RootKey| k != law_key(b"m", b"s", LawBody)),
-  )
-}
-
 pub fn defined_in(text: Bytes, symbol: Bytes) -> Bytes / {abort.raise} =
   match text.index_of(symbol.concat(b"(PlyCtx *ctx")) {
     Some(i) -> {
@@ -3205,54 +3158,6 @@ pub fn bridged_in(text: Bytes, key: RootKey) -> Bytes / {abort.raise} = {
   let own = defined_in(text, symbol_of(root_text(root_name(key))));
   if own.index_of(b"ply_perform(") != None && own.index_of(b"ctx->bridge") == None { b"" }
   else { own.concat(b"\n") }
-}
-
-test "a host handler waits for the result of each operation whose clause performs a wait, including when the wait is inside a helper function" {
-  let user = [
-    {
-      name: b"m",
-      source_text: b"import std.fact (fact)\npub fn asked() -> Int / {fact.slow, fact.fast, fact.behind} = fact.slow() + fact.fast() + fact.behind()\n",
-    },
-  ];
-  let fact = {
-    name: b"std.fact",
-    source_text: Bytes::concat_all([
-      b"import std.internal.native (native, wait, job_wait)\n",
-      b"pub effect fact {\n  read slow() -> Int\n  read fast() -> Int\n  read behind() -> Int\n}\n",
-      b"host for fact by served\n",
-      b"fn waited() -> Int / {native.read, wait.read} = job_wait(1).len()\n",
-      b"fn served<a | e>(go: () -> a / {fact.slow, fact.fast, fact.behind | e}) -> a / {native.read, wait.read | e} =\n",
-      b"  handle { go() } with { fact.slow() -> job_wait(0).len(), fact.fast() -> 1, fact.behind() -> waited() }\n",
-    ]),
-  };
-  let native = {
-    name: b"std.internal.native",
-    source_text: b"pub nondet effect native {}\npub nondet effect wait {}\npub extern fn job_wait(ticket: Int) -> Bytes / {native.read, wait.read}\n",
-  };
-  let dump = dump_of(analyse_pulling_std_with(user, [fact, native]).out);
-  assert_eq(
-    dump.diagnostics.filter(|d: Diagnostic| d.severity == Error).map(|d: Diagnostic| d.message),
-    [],
-  );
-  assert_eq(
-    dump.effects.filter(|r: EffectRow| r.name == b"std.fact.fact").map(|r: EffectRow| r.waits),
-    [[b"slow", b"behind"]],
-  )
-}
-
-test "an `ensures` clause about a function that a definition returns gets no entry function, because the runtime can return a function but cannot call one" {
-  let user = [
-    {
-      name: b"m",
-      source_text: b"pub fn adder(n: Int) -> (Int) -> Int ensures result(1) == n + 1 = |x: Int| x + n\n",
-    },
-  ];
-  let analysed = analyse(parse_all(user));
-  let dump = dump_of(analysed);
-  let entered = |k: RootKey|
-    over_outcome(analysed, |_: Analysis| enters(lowering_input_of(dump), k));
-  assert(entered(Named(b"m.adder")), None);
-  assert(!entered(Clause({ definition: Named(b"m.adder"), kind: Ensures, n: 0 })), None)
 }
 
 const identifier_bytes: Bytes =
@@ -3275,53 +3180,6 @@ pub fn pointers_named(text: Bytes, prefix: Bytes, into: Set<Bytes>) -> Set<Bytes
         })
       },
     })
-
-fn over_outcome<a>(
-  analysed: AnalysisOutcome,
-  body: (Analysis) -> a / {EmitReads},
-) -> a / {abort.raise} =
-  match analysed {
-    Analysed(a) -> over_analysis(a, || body(a)),
-    Rejected(_) -> panic("the program does not check"),
-  }
-
-fn outputs_of(analysed: AnalysisOutcome, root: RootKey) -> List<Bytes> / {abort.raise} =
-  over_outcome(analysed, |a: Analysis|
-    emit::root_outputs(emit::scope_of(a, true, [root]), [root], Map::new()).map(|r: RootOutput|
-      root_text(r.name)))
-
-test "a module's analysis record lists the standard library modules it uses without importing, such as the list module and the scheduler" {
-  let user = [
-    {
-      name: b"m",
-      source_text: b"pub fn first(xs: List<Int>) -> Int / {abort.raise, task.write} = {\n  task.yield();\n  xs.get(0)\n}\n",
-    },
-    { name: b"n", source_text: b"import m\npub fn one() -> Int = 1\n" },
-  ];
-  let shipped = [
-    {
-      name: b"std.list",
-      source_text: b"pub fn List::get<a>(xs: List<a>, i: Int) -> a / {abort.raise} = match xs.at(i) { Some(x) -> x, None -> panic(\"no element there\") }\n",
-    },
-    { name: b"std.internal.schedule", source_text: b"pub fn idle() -> Int = 0\n" },
-  ];
-  let dump = dump_of(analyse_pulling_std_with(user, shipped).out);
-  let unimported = |module: Bytes|
-    dump.modules.filter(|row: ModuleRow| row.name == module).map(|row: ModuleRow| row.unimported);
-  assert_eq(unimported(b"m"), [[b"std.list", b"std.internal.schedule"]]);
-  assert_eq(unimported(b"n"), [[]])
-}
-
-test "a `law` whose body uses a type variable that the checker treats as unknown is compiled as a generic function, without a copy for each type" {
-  let user = [
-    {
-      name: b"m",
-      source_text: b"fn pair<a>(x: a) -> a = x\n\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n",
-    },
-  ];
-  let root = law_key(b"m", b"identity is identity", LawBody);
-  assert_eq(outputs_of(analyse(parse_all(user)), root), [printed(root)])
-}
 
 test "a build compiles the definitions requested from it, finds their compiled functions, and lists the definitions it contains" {
   let results = by_definition([{ key: b"m.f", value: one_body(b"m.f", []) }]);
