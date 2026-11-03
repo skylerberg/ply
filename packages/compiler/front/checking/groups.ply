@@ -46,7 +46,8 @@ import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, ShippedModu
 import compiler.front.owner_checks
 import compiler.front.emitter_input (KnownConstructors, module_contents, GroupLowering,
                                      group_lowering, group_lowering_bin, no_group_lowering,
-                                     ModuleCode, ModuleSites, module_code_bin, module_sites_bin)
+                                     ModuleCode, ModuleSites, module_code_bin, module_sites_bin,
+                                     BodyCalls, body_calls_bin, group_calls)
 import compiler.front (embed_read_of, may_call_embed, published, shipped_wants_bin)
 import compiler.front.pkg (Package)
 import compiler.front.published (GroupCheck, ResolvedGroup, encode_rows, decode_rows, no_rows)
@@ -577,14 +578,6 @@ fn signing_with(read: OwnersResult, owner: Bytes) -> List<Bytes> =
   read.signing.fold([], |accumulator: List<Bytes>, g: List<Bytes>|
     if g.contains(owner) { g } else { accumulator })
 
-fn declared_in(read: FoundOwners, name: Bytes) -> DeclaredOwners =
-  if name == b"" { { owners: read.owners, values: [] } } else {
-    {
-      owners: match read.result.declared.get(name) { Some(os) -> os, None -> [] },
-      values: match read.values.get(name) { Some(os) -> os, None -> [] },
-    }
-  }
-
 fn owners_written(
   read: FoundOwners,
   owners: List<OwnerRecord>,
@@ -627,8 +620,11 @@ fn owners_written(
       o.owner,
       signing_with(read.result, o.owner),
     ));
-  read.result.declared.keys().push(b"").fold(with_shapes, |w: Written, name: Bytes|
-    with_keyed_part(w, declared_part(), name, declared_in(read, name)))
+  read.result.declared.fold(with_shapes, |w: Written, name: Bytes, owners: List<Bytes>|
+    with_keyed_part(w, declared_part(), name, {
+      owners: owners,
+      values: match read.values.get(name) { Some(os) -> os, None -> [] },
+    }))
 }
 
 fn owner_key_at(named: ModuleKey, owner: Bytes) -> OwnerKey =
@@ -665,8 +661,13 @@ pub fn owner_facts(named: ModuleKey, owner: Bytes) -> OwnerFacts / {memo.read, a
   }
 
 pub fn check_group(key: GroupKey) -> Written / {QueryEffects, abort.raise} =
-  if !current(key) { group_written(owner_checks::no_group, owner_checks::no_group, None, []) }
-  else {
+  if !current(key) {
+    group_written(
+      owner_checks::no_group,
+      { result: owner_checks::no_group, lowering: None, calls: [] },
+      [],
+    )
+  } else {
     let named = { module: key.module, shipped: key.shipped, tested: key.tested };
     let alone = unit_key_of({
         module: key.module,
@@ -679,14 +680,17 @@ pub fn check_group(key: GroupKey) -> Written / {QueryEffects, abort.raise} =
     let members = key.owners.map(|o: Bytes| owner_facts(named, o));
     let checked = if alone {
       let c = group_checked(named, members, imports_of(key), from_groups, no_bodies);
-      { result: checked_group_result(key.module, c), lowering: lowering_of(c) }
+      {
+        result: checked_group_result(key.module, c),
+        lowering: lowering_of(c),
+        calls: calls_of(c),
+      }
     } else { finalize_group(named, key, members) };
     let result = checked.result;
     range(0, key.owners.len()).fold(
       group_written(
         owner_checks::facts_of_group(result),
-        result,
-        checked.lowering,
+        checked,
         members.map(|f: OwnerFacts| f.text),
       ),
       |w: Written, i: Int| {
@@ -706,31 +710,37 @@ pub fn check_group(key: GroupKey) -> Written / {QueryEffects, abort.raise} =
 
 fn group_written(
   facts: owner_checks::GroupResult,
-  result: owner_checks::GroupResult,
-  lowering: Option<GroupLowering>,
+  checked: CheckedGroup,
   texts: List<OwnerText>,
-) -> Written / {abort.raise} =
+) -> Written / {abort.raise} = {
+  let result = checked.result;
   with_part(
     with_part(
       with_part(
         with_part(
           with_part(
-            written(group_query(), owner_checks::encoded_group(facts)),
-            lowering_part(),
-            lowering,
+            with_part(
+              written(group_query(), owner_checks::encoded_group(facts)),
+              lowering_part(),
+              checked.lowering,
+            ),
+            listing_part(),
+            owner_checks::encoded_group(owner_checks::listed_group(result)),
           ),
-          listing_part(),
-          owner_checks::encoded_group(owner_checks::listed_group(result)),
+          summary_part(),
+          owner_checks::group_flags(result),
         ),
-        summary_part(),
-        owner_checks::group_flags(result),
+        rows_part(),
+        result.members.map(|m: owner_checks::MemberResult|
+          encode_rows(owner_checks::member_rows(m))),
       ),
-      rows_part(),
-      result.members.map(|m: owner_checks::MemberResult| encode_rows(owner_checks::member_rows(m))),
+      forms_part(),
+      formed(texts, result.forms),
     ),
-    forms_part(),
-    formed(texts, result.forms),
+    calls_part(),
+    checked.calls,
   )
+}
 
 pub fn lowering_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, Option<GroupLowering>> =
   { query: group_query(), name: b"lowering", output: bin::option_bin(group_lowering_bin()) }
@@ -744,8 +754,11 @@ pub fn summary_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, owner_chec
 pub fn rows_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, List<Bytes>> =
   { query: group_query(), name: b"rows", output: bin::list_bin(bin::bytes_bin()) }
 
-pub fn forms_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, GroupForms> =
+fn forms_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, GroupForms> =
   { query: group_query(), name: b"forms", output: group_forms_bin() }
+
+pub fn calls_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, List<BodyCalls>> =
+  { query: group_query(), name: b"calls", output: bin::list_bin(body_calls_bin()) }
 
 pub fn declarations_part() -> KeyedPartOf<GroupKey, owner_checks::EncodedGroup, Bytes, StoredDeclarations> =
   {
@@ -1338,10 +1351,17 @@ fn called_in(
 fn source_for_called(called: List<Bytes>) -> (Bytes) -> DeclarationSource =
   |o: Bytes| if called.contains(o) { GroupDeclarations } else { SignatureDeclarations }
 
-type CheckedGroup = { result: owner_checks::GroupResult, lowering: Option<GroupLowering> }
+type CheckedGroup = {
+  result: owner_checks::GroupResult,
+  lowering: Option<GroupLowering>,
+  calls: List<BodyCalls>,
+}
 
 fn lowering_of(c: UnitCheck) -> Option<GroupLowering> / {abort.raise} =
   match c.out.checked { Some(w) -> Some(group_lowering(w)), None -> None }
+
+fn calls_of(c: UnitCheck) -> List<BodyCalls> / {abort.raise} =
+  match c.out.checked { Some(w) -> group_calls(w), None -> [] }
 
 fn finalize_group(
   named: ModuleKey,
@@ -1370,7 +1390,7 @@ fn finalize_group(
         }
       },
     );
-    { result: checked_group_result(key.module, c), lowering: None }
+    { result: checked_group_result(key.module, c), lowering: None, calls: [] }
   } else {
     let c = group_checked(named, members, imports_of(key), declared_from, |source: OwnerSource|
       Some(owner_checks::supplied_bodies(walked, source.items, source.offset)));
@@ -1381,6 +1401,7 @@ fn finalize_group(
         c.source.items,
       ),
       lowering: lowering_of(c),
+      calls: calls_of(c),
     }
   }
 }
