@@ -1755,7 +1755,7 @@ unchanged.
 
 | flag | meaning |
 | --- | --- |
-| `--explain` | why each test was selected, which input changed, and where the time went |
+| `--explain` | why each test was selected, and where the time went |
 | `--filter TEXT` | run tests whose `<module>.<label>` contains `TEXT`; repeatable. Tests whose `<module>.<label>` does not contain `TEXT` do not run. The trailing dot in `std.json.` is part of the text, so the filter matches every test in the module `std.json` and no test in a module such as `std.jsonl`. |
 | `--shard K/N` | run part `K` of `N`; each test is always in the same part |
 | `--watch` | run again whenever a source file, or a file the last run embedded, changes |
