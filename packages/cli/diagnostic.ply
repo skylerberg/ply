@@ -1,6 +1,7 @@
 import compiler.syntax.parsing (Error, Warning, Note, Severity, severity_word)
-import compiler.check.resolve.tables (Diagnostic, Label, Fix, Edit, InSource, Place, WholeFile,
-                                      Unplaced)
+import compiler.check.resolve.tables (Diagnostic, Label, Fix, NoFix, Apply, Edit,
+                                      InSource, Place, WholeFile, Unplaced, fix_edits,
+                                      offered_fixes)
 import std.json (Json, Member, Object, Null, Str, Bool, Number, Array, object)
 import compiler.syntax.lexer
 import std.bytes
@@ -37,7 +38,7 @@ pub fn diagnostic_of(
     message: Bytes::of_string(message),
     notes_text: notes.map(Bytes::of_string),
     severity: severity,
-    fixes: [],
+    fixes: NoFix,
   }
 
 pub fn with_notes(diagnostic: Diagnostic, notes: List<String>) -> Diagnostic =
@@ -125,7 +126,7 @@ fn edit_json(places: List<SourceText>, e: Edit) -> Option<Json> / {abort.raise} 
 fn fix_json(places: List<SourceText>, f: Fix) -> Json / {abort.raise} =
   object([
     { key: "title", value: Str(String::of_bytes_lossy(f.title)) },
-    { key: "edits", value: Array(somes(f.edits.map(|e: Edit| edit_json(places, e)))) },
+    { key: "edits", value: Array(somes(fix_edits(f).map(|e: Edit| edit_json(places, e)))) },
   ])
 
 pub fn to_json(diagnostic: Diagnostic, places: List<SourceText>) -> Json / {abort.raise} =
@@ -152,7 +153,10 @@ fn members(diagnostic: Diagnostic, places: List<SourceText>) -> List<Member> / {
       key: "notes",
       value: Array(diagnostic.notes_text.map(|n: Bytes| Str(String::of_bytes_lossy(n)))),
     },
-    { key: "fixes", value: Array(diagnostic.fixes.map(|f: Fix| fix_json(places, f))) },
+    {
+      key: "fixes",
+      value: Array(offered_fixes(diagnostic.fixes).map(|f: Fix| fix_json(places, f))),
+    },
   ]
 
 pub fn all_to_json(
@@ -292,7 +296,7 @@ pub fn to_text(
     accumulator.concat(label_lines(style, diagnostic.severity, places, label)));
   let with_notes = diagnostic.notes_text.fold(labelled, |accumulator: List<String>, n: Bytes|
     accumulator.push("  = " ++ String::of_bytes_lossy(n)));
-  diagnostic.fixes.fold(with_notes, |accumulator: List<String>, f: Fix|
+  offered_fixes(diagnostic.fixes).fold(with_notes, |accumulator: List<String>, f: Fix|
     accumulator.push("  = fix: " ++ String::of_bytes_lossy(f.title)))
 }
 
@@ -336,7 +340,6 @@ fn a_diagnostic_of(
   message: Bytes,
   labels: List<Label>,
   notes: List<Bytes>,
-  fixes: List<Fix>,
 ) -> Diagnostic =
   {
     code: code,
@@ -345,7 +348,7 @@ fn a_diagnostic_of(
     message: message,
     notes_text: notes,
     severity: severity,
-    fixes: fixes,
+    fixes: NoFix,
   }
 
 const mismatch: Diagnostic =
@@ -361,7 +364,6 @@ const mismatch: Diagnostic =
       },
     ],
     [b"the body must return the written type"],
-    [],
   )
 
 test "`position_of` numbers lines and columns from 1, and counts a column in characters rather than bytes" {
@@ -405,7 +407,6 @@ test "`to_json` omits a label whose module does not exist or whose range is past
     b"type mismatch: function body type",
     [{ place: Unplaced, primary: true, text: b"nowhere" }],
     [],
-    [],
   );
   match to_json(outside, one_place) {
     Object(m) -> assert_eq(m.get("labels"), Some(Array([]))),
@@ -423,7 +424,6 @@ test "`to_json` omits a label whose module does not exist or whose range is past
       },
     ],
     [b"the body must return the written type"],
-    [],
   );
   assert_eq(to_text(plain, past, one_place), [
     "Error[E0201]: type mismatch: function body type",
@@ -437,7 +437,6 @@ test "a span that cuts a character in half is still shown, on the line where the
     b"E0201",
     b"type mismatch",
     [{ place: InSource({ module: 1, start: 4, end: 6 }), primary: true, text: b"here" }],
-    [],
     [],
   );
   assert_eq(as_bytes(to_text(plain, split, two_places)), [
@@ -469,20 +468,20 @@ test "ANSI colour only adds escape codes around the text and leaves the layout o
 }
 
 test "an empty span still gets one caret, and a suggested fix prints as its own `fix:` line" {
-  let insertion = a_diagnostic_of(
-    Warning,
-    b"E0126",
-    b"this needs a type",
-    [{ place: InSource({ module: 0, start: 5, end: 5 }), primary: true, text: b"" }],
-    [],
-    [
-      {
-        title: b"add the type",
-        edits: [{ module: 0, start: 5, end: 5, text: b": Int" }],
-        adds: None,
-      },
-    ],
-  );
+  let insertion = {
+    ..a_diagnostic_of(
+      Warning,
+      b"E0126",
+      b"this needs a type",
+      [{ place: InSource({ module: 0, start: 5, end: 5 }), primary: true, text: b"" }],
+      [],
+    ),
+    fixes: Apply({
+      title: b"add the type",
+      first: { module: 0, start: 5, end: 5, text: b": Int" },
+      rest: [],
+    }),
+  };
   assert_eq(to_text(plain, insertion, one_place), [
     "Warning[E0126]: this needs a type",
     "  --> m.ply:1:6",
@@ -500,14 +499,14 @@ test "an empty span still gets one caret, and a suggested fix prints as its own 
 }
 
 test "`errors_of` returns only the error diagnostics and leaves out warnings" {
-  let warning = a_diagnostic_of(Warning, b"W0611", b"never used", [], [], []);
+  let warning = a_diagnostic_of(Warning, b"W0611", b"never used", [], []);
   assert_eq(errors_of([mismatch, warning]).len(), 1)
 }
 
 test "`shown` substitutes a runtime error's values into its message text" {
   let slot = String::of_bytes(b"\x010\x02");
   let d = shown({
-    diagnostic: a_diagnostic_of(Error, b"E0501", Bytes::of_string("found " ++ slot), [], [], []),
+    diagnostic: a_diagnostic_of(Error, b"E0501", Bytes::of_string("found " ++ slot), [], []),
     values: [VInt(7)],
   });
   assert_eq(d.message, b"found 7")
@@ -517,7 +516,7 @@ test "a runtime error's JSON lists each value in full under `values`, while its 
   let slot = String::of_bytes(b"\x010\x02");
   let long = VList(range(0, shown_characters).map(|i: Int| VInt(i)));
   let raised = {
-    diagnostic: a_diagnostic_of(Error, b"E0501", Bytes::of_string("found " ++ slot), [], [], []),
+    diagnostic: a_diagnostic_of(Error, b"E0501", Bytes::of_string("found " ++ slot), [], []),
     values: [long],
   };
   match runtime_diagnostic_json(raised, one_place) {

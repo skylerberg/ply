@@ -57,9 +57,9 @@ import compiler.check.termination (Callee, GroupMember, BuiltinCallee, Construct
                                    DefinedCallee, OtherCallee, Termination, Terminates, Diverges,
                                    Summary, Verdict, verdict, unknown_summary)
 import compiler.check.resolve.tables (ParsedModule, Binding, ModuleBinding, Declaration, Diagnostic,
-                                      Label, Edit, with_fix, with_added_effects, insertion,
-                                      AddedEffects, TypeSpace, qualify, error_with_labels, error_at,
-                                      label_at, backticked, Parameters, ParamInfo)
+                                      Label, Edit, NoFix, with_fix, insertion, TypeSpace, qualify,
+                                      error_with_labels, error_at, label_at, backticked, Parameters,
+                                      ParamInfo)
 import compiler.check.resolve.scopes (find, method_binder_module)
 import compiler.expand.rewrite.shared (expressions_matching)
 import compiler.check.resolve.bindings (item_binders)
@@ -651,7 +651,9 @@ type Walk = { checker: Checker, bodies: Map<Int, ClosedBody>, signed: Map<Int, B
 
 type MemberChecked = { walk: Walk, undeclared: List<Effect>, callees: List<Bytes> }
 
-type CheckedBodies = { walk: Walk, members: List<{ undeclared: List<Effect>, callees: List<Int> }> }
+type MemberEffects = { undeclared: List<Effect>, callees: List<Int> }
+
+type CheckedBodies = { walk: Walk, members: List<MemberEffects> }
 
 fn checked_bodies(
   start: Walk,
@@ -678,32 +680,38 @@ fn checked_component(
   check_member: (Walk, Int) -> MemberChecked / {abort.raise, program.read, mode_facts.read, module_names.read},
 ) -> Walk / {abort.raise, program.read, mode_facts.read, module_names.read} = {
   let first = checked_bodies(start, component, signed, check_member);
-  if component.len() < 2
-      || first.members.all(|m: { undeclared: List<Effect>, callees: List<Int> }|
-        m.undeclared.len() == 0) { first.walk } else {
-    let reached = effects_reached_in_group(start.checker, signed, component, first.members);
+  let found = first.members.map(|m: MemberEffects| m.undeclared);
+  let reached = effects_reached_in_group(
+    component.map(|i: Int|
+      resolve_effects_in(start.checker, signed.sigs.get(i).published_effects).listed),
+    first.members.map(|m: MemberEffects| m.callees),
+    found,
+    found.fold([], |pool: List<Effect>, effects: List<Effect>| effects_union(pool, effects)).len()
+      * found.len(),
+  );
+  if all_covered(found, reached) { first.walk } else {
     let bound = range(0, component.len()).fold(start.checker, |c: Checker, k: Int|
       with_assumed_effects(c, signed, component.get(k), reached.get(k)));
     checked_bodies({ ..start, checker: bound }, component, signed, check_member).walk
   }
 }
 
+fn all_covered(known: List<List<Effect>>, reached: List<List<Effect>>) -> Bool =
+  range(0, known.len()).all(|k: Int| uncovered(known.get(k), reached.get(k)).len() == 0)
+
 fn effects_reached_in_group(
-  checker: Checker,
-  signed: ModuleSignatures,
-  component: List<Int>,
-  members: List<{ undeclared: List<Effect>, callees: List<Int> }>,
-) -> List<List<Effect>> / {abort.raise} = {
-  let published = component.map(|i: Int|
-    resolve_effects_in(checker, signed.sigs.get(i).published_effects).listed);
-  range(0, component.len()).fold(
-    members.map(|m: { undeclared: List<Effect>, callees: List<Int> }| m.undeclared),
-    |reached: List<List<Effect>>, _: Int|
-      range(0, component.len()).map(|k: Int|
-        members.get(k).callees.fold(reached.get(k), |found: List<Effect>, j: Int|
-          effects_union(found, uncovered(published.get(k), reached.get(j))))),
-  )
-}
+  published: List<List<Effect>>,
+  callees: List<List<Int>>,
+  reached: List<List<Effect>>,
+  addable: Int,
+) -> List<List<Effect>> / {abort.raise} =
+  if addable <= 0 { reached } else {
+    let next = range(0, reached.len()).map(|k: Int|
+      callees.get(k).fold(reached.get(k), |found: List<Effect>, j: Int|
+        effects_union(found, uncovered(published.get(k), reached.get(j)))));
+    if all_covered(reached, next) { reached }
+    else { effects_reached_in_group(published, callees, next, addable - 1) }
+  }
 
 fn with_assumed_effects(
   checker: Checker,
@@ -715,10 +723,7 @@ fn with_assumed_effects(
     let sig = signed.sigs.get(i);
     let widened = with_function_effects(
       sig.fn_type,
-      widened_effects(resolve_effects_in(checker, sig.published_effects), {
-        listed: effects,
-        variable: None,
-      }),
+      widened_effects(checker, sig, { listed: effects, variable: None }),
     );
     {
       ..checker,
@@ -1730,7 +1735,7 @@ fn record_function(
   let c: Checker = { ..checker, env: env_remove_global(checker.env, name) };
   let body_effects = resolve_effects_in(c, effects);
   let undeclared = undeclared_effects(c, definition, sig, body_effects);
-  let effects = widened_effects(resolve_effects_in(c, sig.published_effects), undeclared);
+  let effects = widened_effects(c, sig, undeclared);
   let fn_type = with_function_effects(sig.fn_type, effects);
   let g: Generalization = generalize(c.substitution, c.env, fn_type);
   let scheme: Scheme = split_labels(g.scheme, definition, sig);
@@ -2072,7 +2077,7 @@ fn noted_unperformed(
           ]),
           notes_text: [],
           severity: Warning,
-          fixes: [],
+          fixes: NoFix,
         };
         {
           ..checker,
@@ -2656,7 +2661,7 @@ fn undeclared_effects(
           {
             listed: uncovered(
               resolve_effects_in(checker, written).listed,
-              held_to_signature(checker, definition, body).listed,
+              effects_checked_against_signature(checker, definition, body).listed,
             ),
             variable: None,
           },
@@ -2665,7 +2670,7 @@ fn undeclared_effects(
     }
   }
 
-fn held_to_signature(
+fn effects_checked_against_signature(
   checker: Checker,
   definition: FnDefinition,
   body: Effects,
@@ -2675,11 +2680,17 @@ fn held_to_signature(
     Some(_) -> { listed: [], variable: body.variable },
   }
 
-fn widened_effects(published: Effects, undeclared: Effects) -> Effects / {abort.raise} =
+fn widened_effects(
+  checker: Checker,
+  sig: Signature,
+  undeclared: Effects,
+) -> Effects / {abort.raise} = {
+  let published = resolve_effects_in(checker, sig.published_effects);
   {
     listed: effects_union(published.listed, undeclared.listed),
     variable: match undeclared.variable { Some(v) -> Some(v), None -> published.variable },
   }
+}
 
 fn with_function_effects(ty: Type, effects: Effects) -> Type =
   match ty { FunctionType(f) -> FunctionType({ ..f, effects: effects }), other -> other }
@@ -2720,27 +2731,6 @@ fn site_label(declared_effects: List<Effect>, site: PerformSite) -> Bytes / {abo
 fn narrowed_by_effects(declared_effects: List<Effect>, o: Offence) -> Bool =
   match o.site { Some(s) -> narrowed_site(declared_effects, s), None -> false }
 
-fn added_effects(
-  definition: FnDefinition,
-  effects: List<Bytes>,
-  reached: List<Offence>,
-) -> AddedEffects / {abort.raise} =
-  {
-    function: definition.name.name,
-    effects: effects,
-    calls: reached.fold([], |found: List<Bytes>, o: Offence|
-      match o.site {
-        Some(s) -> match s.source {
-          PerformViaCall(name) -> {
-            let callee = simple_name_of(name);
-            if found.contains(callee) { found } else { found.push(callee) }
-          },
-          _ -> found,
-        },
-        None -> found,
-      }),
-  }
-
 fn effects_edit(checker: Checker, effects: EffectsExpression, text: Bytes) -> Edit =
   match effects.variable {
     None ->
@@ -2778,7 +2768,11 @@ fn check_upper_bound(
       None -> require_written_effects(checker, definition, inferred),
     },
     Some(_) -> {
-      let held = held_to_signature(checker, definition, resolve_effects_in(checker, inferred));
+      let held = effects_checked_against_signature(
+        checker,
+        definition,
+        resolve_effects_in(checker, inferred),
+      );
       match schema_of(checker.modules.get(checker.module).module, definition) {
         None -> check_written(checker, definition, declared, held),
         Some(schema) ->
@@ -3083,15 +3077,10 @@ fn require_written_effects(
     let fixable = nameable && (!forwarded || variable != None);
     let fixed: Diagnostic = match definition.return_type {
       Some(t) -> if fixable {
-        with_added_effects(
+        with_fix(
           d,
           Bytes::concat_all([b"write the effects `/ ", suggested, b"`"]),
           [insertion(checker.module, type_span(t).end, b" / ".concat(suggested))],
-          added_effects(
-            definition,
-            match variable { Some(name) -> effects.push(name), None -> effects },
-            offences(checker, [], inferred_effects.listed),
-          ),
         )
       } else { d },
       None -> d,
@@ -3309,11 +3298,10 @@ fn check_written(
       });
     let fixed: Diagnostic = match definition.effects {
       Some(r) -> if named.len() == 0 { d } else {
-        with_added_effects(
+        with_fix(
           d,
           Bytes::concat_all([b"add ", backticked(named, b", "), b" to the effects"]),
           [effects_edit(checker, r, Bytes::join(named, b", "))],
-          added_effects(definition, named, extra),
         )
       },
       None -> d,
