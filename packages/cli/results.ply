@@ -68,27 +68,22 @@ fn decoded_reads(stored: Option<Bytes>) -> Option<List<RecordedRead>> / {abort.r
     },
   }
 
-fn read_pass_traces(
+fn stored_reads(
   c0: tables::Cache,
   keys: List<Bytes>,
-) -> StoreRead<List<Option<List<RecordedRead>>>> / {abort.raise} =
+  stored_trace: (tables::Cache, Bytes) -> tables::ReadResult<Bytes> / {abort.raise},
+) -> StoreRead<Map<Bytes, List<RecordedRead>>> / {abort.raise} =
   keys.fold(
-    { value: [], cache: c0 },
-    |accumulator: StoreRead<List<Option<List<RecordedRead>>>>, key: Bytes| {
-      let got = tables::pass_trace(accumulator.cache, key);
-      { value: accumulator.value.push(decoded_reads(got.value)), cache: got.cache }
-    },
-  )
-
-fn code_passes_over(
-  c0: tables::Cache,
-  keys: List<Bytes>,
-) -> StoreRead<List<Option<List<RecordedRead>>>> / {abort.raise} =
-  keys.fold(
-    { value: [], cache: c0 },
-    |accumulator: StoreRead<List<Option<List<RecordedRead>>>>, key: Bytes| {
-      let got = tables::code_pass_trace(accumulator.cache, key);
-      { value: accumulator.value.push(decoded_reads(got.value)), cache: got.cache }
+    { value: Map::new(), cache: c0 },
+    |accumulator: StoreRead<Map<Bytes, List<RecordedRead>>>, key: Bytes| {
+      let got = stored_trace(accumulator.cache, key);
+      {
+        value: match decoded_reads(got.value) {
+          Some(reads) -> accumulator.value.insert(key, reads),
+          None -> accumulator.value,
+        },
+        cache: got.cache,
+      }
     },
   )
 
@@ -367,12 +362,12 @@ fn journaled<a | e>(
       warnings
     },
     result_cache.passes(keys) -> {
-      let o = read_pass_traces(store_state.cache, keys);
+      let o = stored_reads(store_state.cache, keys, tables::pass_trace);
       store_state = { ..store_state, cache: o.cache };
       o.value
     },
     result_cache.code_passes(keys) -> {
-      let o = code_passes_over(store_state.cache, keys);
+      let o = stored_reads(store_state.cache, keys, tables::code_pass_trace);
       store_state = { ..store_state, cache: o.cache };
       o.value
     },
@@ -651,7 +646,7 @@ const original_definition: { hash: Bytes, text: Bytes } =
 fn read_back(
   f: StoreUpdate,
   seen: List<Bytes>,
-) -> { passes: List<Option<List<RecordedRead>>>, codes: List<Option<List<RecordedRead>>>, moved: List<Option<List<RecordedRead>>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
+) -> { passes: Map<Bytes, List<RecordedRead>>, codes: Map<Bytes, List<RecordedRead>>, moved: List<Map<Bytes, List<RecordedRead>>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
   run_in_memory(mem_empty(), || {
     let c0 = store_pass(
       tables::open_cache[mem](cache_database(), some_stamps),
@@ -666,13 +661,12 @@ fn read_back(
       runtime_digest: "another",
     });
     {
-      passes: read_pass_traces(r, [hashed("t key"), hashed("other")]).value,
-      codes: code_passes_over(r, [hashed("t code"), hashed("t key")]).value,
-      moved: code_passes_over(moved, [hashed("t code")]).value.fold(
-        read_pass_traces(moved, [hashed("t key")]).value,
-        |accumulator: List<Option<List<RecordedRead>>>, o: Option<List<RecordedRead>>|
-          accumulator.push(o),
-      ),
+      passes: stored_reads(r, [hashed("t key"), hashed("other")], tables::pass_trace).value,
+      codes: stored_reads(r, [hashed("t code"), hashed("t key")], tables::code_pass_trace).value,
+      moved: [
+        stored_reads(moved, [hashed("t key")], tables::pass_trace).value,
+        stored_reads(moved, [hashed("t code")], tables::code_pass_trace).value,
+      ],
       seen: [blake3(b"m.f"), hashed("g")].map(|h: Bytes| tables::knows_definition(r, h)),
       baselines: last_passes_over(r, [b"m.t", b"m.u"]).value,
       texts: read_texts(r, [original_definition.hash, hashed("missing")]).value,
@@ -681,9 +675,9 @@ fn read_back(
 
 test "a stored run reads back its passing results, baselines and whether each test ran, and each baseline reads back with its definition text" {
   let back = read_back(an_update, [blake3(b"m.f")]);
-  assert_eq(back.passes, [Some(a_file_read), None]);
-  assert_eq(back.codes, [Some([]), None]);
-  assert_eq(back.moved, [None, Some([])]);
+  assert_eq(back.passes, Map::new().insert(hashed("t key"), a_file_read));
+  assert_eq(back.codes, Map::new().insert(hashed("t code"), []));
+  assert_eq(back.moved, [Map::new(), Map::new().insert(hashed("t code"), [])]);
   assert_eq(back.seen, [true, false]);
   assert_eq(back.baselines, [
     Some({
@@ -767,20 +761,22 @@ test "a run after a crash stores the passes its journal finished, returns the te
     let begun = begun_journal[mem](opened, j);
     {
       interrupted: begun.interrupted,
-      passes: read_pass_traces(tables::open_cache[mem](cache_database(), some_stamps), [
-        hashed("t key"),
-      ]).value,
+      passes: stored_reads(
+        tables::open_cache[mem](cache_database(), some_stamps),
+        [hashed("t key")],
+        tables::pass_trace,
+      ).value,
       left: recovery_of(read_journal[mem](j), some_stamps),
     }
   }).value;
   assert_eq(back.interrupted, [{ key: b"m.crashes", hash: b"c" }]);
-  assert_eq(back.passes, [Some(a_file_read)]);
+  assert_eq(back.passes, Map::new().insert(hashed("t key"), a_file_read));
   assert_eq(back.left, { rows: [], interrupted: [] })
 }
 
 test "storing a run with no results reads back no passing results, no ran-test flags and no baselines" {
   let back = read_back({ passes: [], code_passes: [], records: [] }, []);
-  assert_eq(back.passes, [None, None]);
+  assert_eq(back.passes, Map::new());
   assert_eq(back.seen, [false, false]);
   assert_eq(back.baselines, [None, None])
 }

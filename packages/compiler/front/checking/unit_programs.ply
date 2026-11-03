@@ -8,7 +8,10 @@ import compiler.emit.layout (intrinsics)
 import std.bytes (ascii_of_int)
 import compiler.emit.keys (RootKey, RootName)
 import compiler.front.checking (FileAt, in_memory, session_over, query_load, listed_module,
-                                analysed_over)
+                                analysed_over, prelude_pack, shipped_pack, check_with_pack,
+                                check_sources)
+import compiler.store.packs
+import std.fs
 import compiler.front.checking.units (RootLink, entries_of, program_code, reached_codes,
                                       roots_of_modules)
 import compiler.unit (UnitCode, UnitOutput, program_output)
@@ -66,8 +69,9 @@ pub fn compiled_program(
   shipped: List<Source>,
   wanted: Option<List<RootKey>> = None,
   files: List<FileAt> = [],
+  pack: packs::PackFiles = prelude_pack,
 ) -> Compiled / {abort.raise} =
-  match program_reached(user, shipped, wanted, files) {
+  match program_reached(user, shipped, wanted, files, pack) {
     Ok(c) -> c,
     Err(failed) ->
       panic(String::of_bytes_lossy(Bytes::join(failed.map(|d: Diagnostic| d.message), b"\n"))),
@@ -78,24 +82,29 @@ fn program_reached(
   shipped: List<Source>,
   wanted: Option<List<RootKey>>,
   files: List<FileAt>,
+  pack: packs::PackFiles,
 ) -> Result<Compiled, List<Diagnostic>> / {abort.raise} =
-  session_over(in_memory(user, shipped, files), |own: List<Bytes>| {
-    query_load(own, [], false, listed_module);
-    let roots = match wanted { Some(rs) -> rs, None -> roots_of_modules(own) };
-    let code = program_code(entries_of(roots));
-    match reached_codes(code) {
-      Err(failed) -> Err(failed),
-      Ok(codes) -> {
-        let output = program_output(codes, constructors_named(codes), 1, Map::new());
-        Ok({
-          output: output,
-          codes: codes,
-          roots: code.links.map(|l: RootLink| l.key).filter(|k: RootKey|
-            output.taken.contains(root_name(k))),
-        })
-      },
-    }
-  }).value
+  session_over(
+    in_memory(user, shipped, files),
+    |own: List<Bytes>| {
+      query_load(own, [], false, listed_module);
+      let roots = match wanted { Some(rs) -> rs, None -> roots_of_modules(own) };
+      let code = program_code(entries_of(roots));
+      match reached_codes(code) {
+        Err(failed) -> Err(failed),
+        Ok(codes) -> {
+          let output = program_output(codes, constructors_named(codes), 1, Map::new());
+          Ok({
+            output: output,
+            codes: codes,
+            roots: code.links.map(|l: RootLink| l.key).filter(|k: RootKey|
+              output.taken.contains(root_name(k))),
+          })
+        },
+      }
+    },
+    pack: pack,
+  ).value
 
 pub fn built(modules: List<Source>) -> Result<Compiled, Bytes> =
   handle {
@@ -122,7 +131,7 @@ fn unit_against_runtime(
   shipped: List<Source>,
   natives: List<Native>,
 ) -> Result<Bytes, List<Diagnostic>> / {abort.raise} = {
-  match program_reached(user, shipped, None, []) {
+  match program_reached(user, shipped, None, [], prelude_pack) {
     Err(failed) -> Err(failed),
     Ok(program) -> match code_rejections({ ..a_runtime(b"r"), natives: natives }, program.codes) {
       [] -> Ok(unit_text(program.output.parts)),
@@ -181,6 +190,34 @@ const sample_unit: Compiled =
       Named,
     ),
   )
+
+test "a program that imports shipped modules checks and lowers over a pack of their results as it does over their sources" {
+  let shipped = [
+    {
+      name: b"std.parity",
+      source_text: b"pub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\n\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\n",
+    },
+    {
+      name: b"std.pair",
+      source_text: b"import std.parity (even, odd)\n\npub type Pair = { left: Int, right: Int }\n\npub const origin: Pair = { left: 0, right: 1 }\n\npub fn balanced(p: Pair) -> Bool = even(p.left) && odd(p.right)\n",
+    },
+  ];
+  let user = [
+    {
+      name: b"app",
+      source_text: b"import std.pair (balanced, origin)\n\npub fn go(n: Int) -> Bool = balanced({ left: n, right: n + 1 }) && balanced(origin)\n",
+    },
+  ];
+  let pack = shipped_pack(shipped);
+  assert_eq(
+    check_with_pack(fs::mem_empty(), Some(pack), user, shipped).results,
+    check_sources(fs::mem_empty(), user, shipped).results,
+  );
+  assert_eq(
+    compiled_program(user, shipped, None, [], pack).output,
+    compiled_program(user, shipped).output,
+  )
+}
 
 test "a call to mutually recursive generic functions at a type compiles to their specialisations for that type, whichever one is called" {
   let source = Bytes::concat_all([

@@ -29,11 +29,11 @@ import std.bin
 import std.hash (blake3)
 import std.bytes
 import std.list
-import compiler.store.memo (memo)
+import compiler.store.memo (memo, main_part)
 import compiler.store.handles (QueryOf, PartOf, KeyedPartOf, Written, written, with_part,
                                with_keyed_part, fetch, fetch_part, fetch_keyed_part,
                                fetch_part_once, fetch_keyed_part_once, main_part_of,
-                               query_definition, product_definition)
+                               query_definition, product_definition, with_interface)
 import compiler.store.hash (UseLink, any_unreached, link_of, use_link_bin)
 import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, ShippedModule, CheckInputs,
                                Mention, OwnerText, OwnerSource, ItemAt, Imported, imported_bin,
@@ -45,9 +45,9 @@ import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, ShippedModu
                                call_cycles)
 import compiler.front.owner_checks
 import compiler.front.emitter_input (KnownConstructors, module_contents, GroupLowering,
-                                     group_lowering, group_lowering_bin, no_group_lowering,
-                                     ModuleCode, ModuleSites, module_code_bin, module_sites_bin,
-                                     BodyCalls, body_calls_bin, group_calls)
+                                     group_lowering, group_lowering_bin, ModuleCode, ModuleSites,
+                                     module_code_bin, module_sites_bin, BodyCalls, body_calls_bin,
+                                     group_calls)
 import compiler.front (embed_read_of, may_call_embed, published, shipped_wants_bin)
 import compiler.front.pkg (Package)
 import compiler.front.published (GroupCheck, ResolvedGroup, encode_rows, decode_rows, no_rows)
@@ -77,8 +77,8 @@ import compiler.check.infer.definitions (checked_functions, check_order)
 import compiler.check.infer.checker (BodyPlan, Checked, CheckOnly, ExternFunction, UncheckedBuiltin)
 import compiler.check.types (Effect, FunctionType)
 import compiler.store.hash.forms (NodeRef, HashInput, OwnHashes, DefinitionHash, TestHash, LawHash,
-                                  own_hashes, own_hashes_bin, no_own_hashes, joined_own_hashes,
-                                  hash_input_bin, joined_forms, module_record, record_digest)
+                                  own_hashes, own_hashes_bin, joined_own_hashes, hash_input_bin,
+                                  joined_forms, module_record, record_digest)
 import compiler.front.pages (Page, module_pages, pages_bin)
 import compiler.front.checking.world (build_packages, shipped_module_exists, ModuleKey,
                                       ModuleResult, module_key_bin, interface_key_bin,
@@ -93,7 +93,23 @@ import compiler.front.checking.world (build_packages, shipped_module_exists, Mod
 
 pub type OwnerKey = { module: Bytes, shipped: Bool, tested: Bool, owner: Bytes }
 
-pub type GroupKey = { module: Bytes, shipped: Bool, tested: Bool, owners: List<Bytes> }
+pub opaque type UnitKey = new { module: Bytes, shipped: Bool, tested: Bool, owners: List<Bytes> }
+
+pub opaque type CheckGroupKey = new {
+  module: Bytes,
+  shipped: Bool,
+  tested: Bool,
+  owners: List<Bytes>,
+}
+
+pub opaque type SignatureGroupKey = new {
+  module: Bytes,
+  shipped: Bool,
+  tested: Bool,
+  owners: List<Bytes>,
+}
+
+pub type GroupOutput<a> = | CurrentGroup(a) | ObsoleteGroup
 
 pub type OwnerFacts = { text: OwnerText, mentions: List<Mention> }
 
@@ -127,7 +143,13 @@ type OwnerRecord = { owner: Bytes, facts: OwnerFacts }
 
 derive bin for OwnerKey
 
-derive bin for GroupKey
+derive bin for UnitKey
+
+derive bin for CheckGroupKey
+
+derive bin for SignatureGroupKey
+
+derive bin for GroupOutput
 
 derive bin for OwnerFacts
 
@@ -197,24 +219,32 @@ pub fn name_declaration_query() -> QueryOf<InterfaceKey, NameDeclarations> =
 pub fn calls_query() -> QueryOf<OwnerKey, List<Bytes>> =
   { name: b"calls", input: owner_key_bin(), output: bin::list_bin(bin::bytes_bin()) }
 
-pub fn cycles_query() -> QueryOf<GroupKey, List<List<Bytes>>> =
+pub fn cycles_query() -> QueryOf<UnitKey, GroupOutput<List<List<Bytes>>>> =
   {
     name: b"cycles",
-    input: group_key_bin(),
-    output: bin::list_bin(bin::list_bin(bin::bytes_bin())),
+    input: unit_key_bin(),
+    output: group_output_bin(bin::list_bin(bin::list_bin(bin::bytes_bin()))),
   }
 
 pub fn group_of_query() -> QueryOf<OwnerKey, List<Bytes>> =
   { name: b"group of", input: owner_key_bin(), output: bin::list_bin(bin::bytes_bin()) }
 
-pub fn group_imports_query() -> QueryOf<GroupKey, List<Imported>> =
-  { name: b"group imports", input: group_key_bin(), output: bin::list_bin(imported_bin()) }
+pub fn group_imports_query() -> QueryOf<CheckGroupKey, GroupOutput<List<Imported>>> =
+  {
+    name: b"group imports",
+    input: check_group_key_bin(),
+    output: group_output_bin(bin::list_bin(imported_bin())),
+  }
 
 pub fn owner_imports_query() -> QueryOf<OwnerKey, List<Imported>> =
   { name: b"owner imports", input: owner_key_bin(), output: bin::list_bin(imported_bin()) }
 
-pub fn signature_imports_query() -> QueryOf<GroupKey, List<Imported>> =
-  { name: b"signature imports", input: group_key_bin(), output: bin::list_bin(imported_bin()) }
+pub fn signature_imports_query() -> QueryOf<SignatureGroupKey, GroupOutput<List<Imported>>> =
+  {
+    name: b"signature imports",
+    input: signature_group_key_bin(),
+    output: group_output_bin(bin::list_bin(imported_bin())),
+  }
 
 pub fn visible_modules_query() -> QueryOf<ModuleKey, List<Bytes>> =
   { name: b"sees", input: module_key_bin(), output: bin::list_bin(bin::bytes_bin()) }
@@ -222,17 +252,25 @@ pub fn visible_modules_query() -> QueryOf<ModuleKey, List<Bytes>> =
 pub fn wanted_files_query() -> QueryOf<ModuleKey, ShippedWants> =
   { name: b"wants", input: module_key_bin(), output: shipped_wants_bin() }
 
-pub fn group_query() -> QueryOf<GroupKey, owner_checks::EncodedGroup> =
-  { name: b"group", input: group_key_bin(), output: owner_checks::encoded_group_bin() }
+pub fn group_query() -> QueryOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>> =
+  {
+    name: b"group",
+    input: check_group_key_bin(),
+    output: group_output_bin(owner_checks::encoded_group_bin()),
+  }
 
-pub fn signatures_query() -> QueryOf<GroupKey, owner_checks::SignatureCheck> =
-  { name: b"signatures", input: group_key_bin(), output: owner_checks::signature_check_bin() }
+pub fn signatures_query() -> QueryOf<SignatureGroupKey, GroupOutput<owner_checks::SignatureCheck>> =
+  {
+    name: b"signatures",
+    input: signature_group_key_bin(),
+    output: group_output_bin(owner_checks::signature_check_bin()),
+  }
 
 pub fn typed_query() -> QueryOf<OwnerKey, owner_checks::InferenceResult> =
   { name: b"typed", input: owner_key_bin(), output: owner_checks::inference_result_bin() }
 
-pub fn group_hash_query() -> QueryOf<GroupKey, OwnHashes> =
-  { name: b"group hash", input: group_key_bin(), output: own_hashes_bin() }
+pub fn group_hash_query() -> QueryOf<UnitKey, GroupOutput<OwnHashes>> =
+  { name: b"group hash", input: unit_key_bin(), output: group_output_bin(own_hashes_bin()) }
 
 pub fn owner_hash_query() -> QueryOf<OwnerKey, OwnHashes> =
   { name: b"owner hash", input: owner_key_bin(), output: own_hashes_bin() }
@@ -494,21 +532,27 @@ fn called_owners<| e>(
 fn calls_of(named: ModuleKey, owner: Bytes) -> List<Bytes> / {memo.read, abort.raise} =
   fetch(calls_query(), owner_key_at(named, owner))
 
-pub fn find_cycles(key: GroupKey) -> Written / {memo.read, abort.raise} = {
+pub fn find_cycles(key: UnitKey) -> Written / {memo.read, abort.raise} = {
   let named = { module: key.module, shipped: key.shipped, tested: key.tested };
-  written(cycles_query(), if !current_unit(key) { [] }
-  else if key.owners.len() < 2 { [key.owners] }
-  else { call_cycles(key.owners, key.owners.map(|o: Bytes| calls_of(named, o))) })
+  written(cycles_query(), if !is_current_unit(key) { ObsoleteGroup }
+  else if key.owners.len() < 2 { CurrentGroup([key.owners]) }
+  else { CurrentGroup(call_cycles(key.owners, key.owners.map(|o: Bytes| calls_of(named, o)))) })
 }
 
-fn cycles_of(unit: GroupKey) -> List<List<Bytes>> / {memo.read, abort.raise} =
-  fetch(cycles_query(), unit)
+fn cycles_of(unit: UnitKey) -> List<List<Bytes>> / {memo.read, abort.raise} =
+  current_output(cycles_query(), unit)
 
 pub fn find_group_of(key: OwnerKey) -> Written / {memo.read, abort.raise} =
   written(
     group_of_query(),
-    cycles_of(unit_key_of(key)).fold([], |accumulator: List<Bytes>, g: List<Bytes>|
-      if g.contains(key.owner) { g } else { accumulator }),
+    match cycles_of(unit_key_of(key)).find(|g: List<Bytes>| g.contains(key.owner)) {
+      Some(g) -> g,
+      None ->
+        panic(
+          "the call cycles of the unit holding `" ++ String::of_bytes_lossy(key.owner)
+            ++ "` leave it out",
+        ),
+    },
   )
 
 pub fn list_wanted_files(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
@@ -519,10 +563,10 @@ pub fn list_wanted_files(named: ModuleKey) -> Written / {memo.read, abort.raise}
   })
 }
 
-pub fn resolve_group_imports(key: GroupKey) -> Written / {QueryEffects, abort.raise} =
-  written(group_imports_query(), if !current(key) { [] } else {
+pub fn resolve_group_imports(key: CheckGroupKey) -> Written / {QueryEffects, abort.raise} =
+  written(group_imports_query(), if !is_current_check_group(key) { ObsoleteGroup } else {
     let named = { module: key.module, shipped: key.shipped, tested: key.tested };
-    imports_of_members(named, key.owners.map(|o: Bytes| owner_facts(named, o)))
+    CurrentGroup(imports_of_members(named, key.owners.map(|o: Bytes| owner_facts(named, o))))
   })
 
 pub fn resolve_owner_imports(key: OwnerKey) -> Written / {QueryEffects, abort.raise} = {
@@ -535,21 +579,22 @@ pub fn resolve_owner_imports(key: OwnerKey) -> Written / {QueryEffects, abort.ra
   )
 }
 
-pub fn resolve_signature_imports(key: GroupKey) -> Written / {QueryEffects, abort.raise} = {
-  let named = { module: key.module, shipped: key.shipped, tested: key.tested };
-  let context = context_once(named);
-  let members = key.owners.map(|o: Bytes| shape_of(named, o));
-  written(
-    signature_imports_query(),
-    group_imports(
-      key.module,
-      members.map(|f: OwnerFacts| f.text),
-      members.fold([], |accumulator: List<Mention>, f: OwnerFacts| accumulator.concat(f.mentions)),
-      context.imports,
-      context.targets,
-    ),
-  )
-}
+pub fn resolve_signature_imports(key: SignatureGroupKey) -> Written / {QueryEffects, abort.raise} =
+  written(signature_imports_query(), if !is_current_signature_group(key) { ObsoleteGroup } else {
+    let named = { module: key.module, shipped: key.shipped, tested: key.tested };
+    let context = context_once(named);
+    let members = key.owners.map(|o: Bytes| shape_of(named, o));
+    CurrentGroup(
+      group_imports(
+        key.module,
+        members.map(|f: OwnerFacts| f.text),
+        members.fold([], |accumulator: List<Mention>, f: OwnerFacts|
+          accumulator.concat(f.mentions)),
+        context.imports,
+        context.targets,
+      ),
+    )
+  })
 
 pub fn context_once(named: ModuleKey) -> Context / {SessionReads, abort.raise} =
   fetch_part_once(
@@ -660,23 +705,10 @@ pub fn owner_facts(named: ModuleKey, owner: Bytes) -> OwnerFacts / {memo.read, a
       ),
   }
 
-pub fn check_group(key: GroupKey) -> Written / {QueryEffects, abort.raise} =
-  if !current(key) {
-    group_written(
-      owner_checks::no_group,
-      { result: owner_checks::no_group, lowering: None, calls: [] },
-      [],
-    )
-  } else {
+pub fn check_group(key: CheckGroupKey) -> Written / {QueryEffects, abort.raise} =
+  if !is_current_check_group(key) { written(group_query(), ObsoleteGroup) } else {
     let named = { module: key.module, shipped: key.shipped, tested: key.tested };
-    let alone = unit_key_of({
-        module: key.module,
-        shipped: key.shipped,
-        tested: key.tested,
-        owner: key.owners.at_or(0, b""),
-      }).owners.len(
-      )
-      < 2;
+    let alone = unit_of_group(key).owners.len() < 2;
     let members = key.owners.map(|o: Bytes| owner_facts(named, o));
     let checked = if alone {
       let c = group_checked(named, members, imports_of(key), from_groups, no_bodies);
@@ -720,7 +752,7 @@ fn group_written(
         with_part(
           with_part(
             with_part(
-              written(group_query(), owner_checks::encoded_group(facts)),
+              written(group_query(), CurrentGroup(owner_checks::encoded_group(facts))),
               lowering_part(),
               checked.lowering,
             ),
@@ -742,25 +774,25 @@ fn group_written(
   )
 }
 
-pub fn lowering_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, Option<GroupLowering>> =
+pub fn lowering_part() -> PartOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>, Option<GroupLowering>> =
   { query: group_query(), name: b"lowering", output: bin::option_bin(group_lowering_bin()) }
 
-pub fn listing_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, owner_checks::EncodedGroup> =
+pub fn listing_part() -> PartOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>, owner_checks::EncodedGroup> =
   { query: group_query(), name: b"listing", output: owner_checks::encoded_group_bin() }
 
-pub fn summary_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, owner_checks::GroupFlags> =
+pub fn summary_part() -> PartOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>, owner_checks::GroupFlags> =
   { query: group_query(), name: b"summary", output: owner_checks::group_flags_bin() }
 
-pub fn rows_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, List<Bytes>> =
+pub fn rows_part() -> PartOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>, List<Bytes>> =
   { query: group_query(), name: b"rows", output: bin::list_bin(bin::bytes_bin()) }
 
-fn forms_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, GroupForms> =
+fn forms_part() -> PartOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>, GroupForms> =
   { query: group_query(), name: b"forms", output: group_forms_bin() }
 
-pub fn calls_part() -> PartOf<GroupKey, owner_checks::EncodedGroup, List<BodyCalls>> =
+pub fn calls_part() -> PartOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>, List<BodyCalls>> =
   { query: group_query(), name: b"calls", output: bin::list_bin(body_calls_bin()) }
 
-pub fn declarations_part() -> KeyedPartOf<GroupKey, owner_checks::EncodedGroup, Bytes, StoredDeclarations> =
+pub fn declarations_part() -> KeyedPartOf<CheckGroupKey, GroupOutput<owner_checks::EncodedGroup>, Bytes, StoredDeclarations> =
   {
     query: group_query(),
     name: b"declarations",
@@ -1322,8 +1354,8 @@ fn checked_group_result(module: Bytes, c: UnitCheck) -> owner_checks::GroupResul
   owner_checks::group_result(c.out, module, c.texts, c.source.items, |x: ItemAt|
     c.source.offset + x.from)
 
-pub fn imports_of(key: GroupKey) -> List<Imported> / {memo.read, abort.raise} =
-  fetch(group_imports_query(), key)
+pub fn imports_of(key: CheckGroupKey) -> List<Imported> / {memo.read, abort.raise} =
+  current_output(group_imports_query(), key)
 
 fn inferences_of(
   named: ModuleKey,
@@ -1337,7 +1369,7 @@ fn inferences_of(
     })
 
 fn called_in(
-  key: GroupKey,
+  key: CheckGroupKey,
   walked: List<owner_checks::OwnerInference>,
 ) -> List<Bytes> / {memo.read, abort.raise} =
   walked.fold([], |accumulator: List<Bytes>, w: owner_checks::OwnerInference|
@@ -1365,7 +1397,7 @@ fn body_calls_of(c: UnitCheck) -> List<BodyCalls> / {abort.raise} =
 
 fn finalize_group(
   named: ModuleKey,
-  key: GroupKey,
+  key: CheckGroupKey,
   members: List<OwnerFacts>,
 ) -> CheckedGroup / {QueryEffects, abort.raise} = {
   let walked = inferences_of(named, members);
@@ -1406,7 +1438,7 @@ fn finalize_group(
   }
 }
 
-fn signature_declarations(key: GroupKey) -> StoredDeclarations / {memo.read, abort.raise} =
+fn signature_declarations(key: CheckGroupKey) -> StoredDeclarations / {memo.read, abort.raise} =
   key.owners.fold(no_stored_declarations, |found: StoredDeclarations, o: Bytes|
     declarations_joined(
       found,
@@ -1421,28 +1453,28 @@ fn signature_declarations(key: GroupKey) -> StoredDeclarations / {memo.read, abo
 type GroupProgram = { source: GroupSource, declared_from: (Bytes) -> DeclarationSource }
 
 pub fn resolved_group_of(
-  key: GroupKey,
-) -> Result<ResolvedGroup, List<Diagnostic>> / {QueryEffects, abort.raise} = {
-  let g = group_program_of(key);
+  key: CheckGroupKey,
+) -> Result<ResolvedGroup, List<Diagnostic>> / {QueryEffects, abort.raise} =
+  resolved_program(group_program_of(key))
+
+pub fn resolved_empty_program(
+  named: ModuleKey,
+) -> Result<ResolvedGroup, List<Diagnostic>> / {QueryEffects, abort.raise} =
+  resolved_program({
+    source: { named: named, members: [], imported: [] },
+    declared_from: from_groups,
+  })
+
+fn resolved_program(
+  g: GroupProgram,
+) -> Result<ResolvedGroup, List<Diagnostic>> / {QueryEffects, abort.raise} =
   with_group_read([g.source], g.declared_from, no_bodies, [], |read: GroupRead|
     resolved_group(read.inputs))
-}
 
-fn group_program_of(key: GroupKey) -> GroupProgram / {QueryEffects, abort.raise} = {
+fn group_program_of(key: CheckGroupKey) -> GroupProgram / {QueryEffects, abort.raise} = {
   let named = { module: key.module, shipped: key.shipped, tested: key.tested };
   let members = key.owners.map(|o: Bytes| owner_facts(named, o));
-  let cycle = match key.owners {
-    [] -> false,
-    [o, ..] ->
-      unit_key_of({
-          module: key.module,
-          shipped: key.shipped,
-          tested: key.tested,
-          owner: o,
-        }).owners.len(
-        )
-        >= 2,
-  };
+  let cycle = unit_of_group(key).owners.len() >= 2;
   {
     source: { named: named, members: members, imported: imports_of(key) },
     declared_from: if !cycle { from_groups }
@@ -1456,33 +1488,39 @@ fn inference_of(
 ) -> owner_checks::InferenceResult / {memo.read, abort.raise} =
   fetch(typed_query(), owner_key_at(named, owner))
 
-pub fn check_signatures(key: GroupKey) -> Written / {QueryEffects, abort.raise} =
-  written(signatures_query(), if !is_signature_unit(key) { owner_checks::no_signature_check } else {
+pub fn check_signatures(key: SignatureGroupKey) -> Written / {QueryEffects, abort.raise} =
+  written(signatures_query(), if !is_current_signature_group(key) { ObsoleteGroup } else {
     let named = { module: key.module, shipped: key.shipped, tested: key.tested };
     let members = key.owners.map(|o: Bytes| shape_of(named, o));
-    let imported = fetch(signature_imports_query(), key);
-    owner_checks::signature_check_of(
-      checked_group_result(
-        key.module,
-        group_checked(named, members, imported, from_signatures, inferring_only([])),
+    let imported = current_output(signature_imports_query(), key);
+    CurrentGroup(
+      owner_checks::signature_check_of(
+        checked_group_result(
+          key.module,
+          group_checked(named, members, imported, from_signatures, inferring_only([])),
+        ),
       ),
     )
   })
 
-fn is_signature_unit(g: GroupKey) -> Bool / {memo.read, abort.raise} =
+fn signature_group_in(named: ModuleKey, owners: List<Bytes>) -> SignatureGroupKey =
+  { module: named.module, shipped: named.shipped, tested: named.tested, owners: owners }
+
+fn signature_owners_of(o: OwnerKey) -> Option<List<Bytes>> / {memo.read, abort.raise} =
+  fetch_keyed_part(signature_unit_part(), module_key_of(o), o.owner)
+
+fn is_current_signature_group(g: SignatureGroupKey) -> Bool / {memo.read, abort.raise} =
   match g.owners {
     [] -> false,
     [o, ..] ->
-      signature_unit_of({ module: g.module, shipped: g.shipped, tested: g.tested, owner: o }).owners
-        == g.owners,
+      signature_owners_of({ module: g.module, shipped: g.shipped, tested: g.tested, owner: o })
+        == Some(g.owners),
   }
 
-fn signature_unit_of(o: OwnerKey) -> GroupKey / {memo.read, abort.raise} =
-  {
-    module: o.module,
-    shipped: o.shipped,
-    tested: o.tested,
-    owners: fetch_keyed_part(signature_unit_part(), module_key_of(o), o.owner).unwrap_or([]),
+fn signature_unit_of(o: OwnerKey) -> SignatureGroupKey / {memo.read, abort.raise} =
+  match signature_owners_of(o) {
+    Some(owners) -> signature_group_in(module_key_of(o), owners),
+    None -> panic(no_entry_for(o, "signature group")),
   }
 
 fn shape_of(named: ModuleKey, owner: Bytes) -> OwnerFacts / {memo.read, abort.raise} =
@@ -1514,34 +1552,75 @@ pub fn infer_owner_types(key: OwnerKey) -> Written / {QueryEffects, abort.raise}
   })
 }
 
-pub fn current(g: GroupKey) -> Bool / {memo.read, abort.raise} =
-  match g.owners {
+pub fn current_output<i, o>(
+  query: QueryOf<i, GroupOutput<o>>,
+  key: i,
+) -> o / {memo.read, abort.raise} =
+  match fetch(query, key) {
+    CurrentGroup(output) -> output,
+    ObsoleteGroup ->
+      panic(
+        "the query `" ++ String::of_bytes_lossy(query.name)
+          ++ "` was read with a key that no longer names a group",
+      ),
+  }
+
+fn no_entry_for(o: OwnerKey, kind: String) -> String =
+  "the module `" ++ String::of_bytes_lossy(o.module) ++ "` holds no declaration `"
+    ++ String::of_bytes_lossy(o.owner)
+    ++ "`, so it has no "
+    ++ kind
+
+fn unit_in(named: ModuleKey, owners: List<Bytes>) -> UnitKey =
+  { module: named.module, shipped: named.shipped, tested: named.tested, owners: owners }
+
+fn unit_owners_of(o: OwnerKey) -> Option<List<Bytes>> / {memo.read, abort.raise} =
+  fetch_keyed_part(unit_part(), module_key_of(o), o.owner)
+
+pub fn is_current_unit(u: UnitKey) -> Bool / {memo.read, abort.raise} =
+  match u.owners {
     [] -> false,
     [o, ..] ->
-      group_key_of({ module: g.module, shipped: g.shipped, tested: g.tested, owner: o }).owners
-        == g.owners,
+      unit_owners_of({ module: u.module, shipped: u.shipped, tested: u.tested, owner: o })
+        == Some(u.owners),
   }
 
-pub fn group_key_of(o: OwnerKey) -> GroupKey / {memo.read, abort.raise} = {
-  let unit = unit_key_of(o);
-  if unit.owners.len() < 2 { unit } else { { ..unit, owners: fetch(group_of_query(), o) } }
-}
+pub fn unit_key_of(o: OwnerKey) -> UnitKey / {memo.read, abort.raise} =
+  match unit_owners_of(o) {
+    Some(owners) -> unit_in(module_key_of(o), owners),
+    None -> panic(no_entry_for(o, "unit")),
+  }
 
-pub fn current_unit(g: GroupKey) -> Bool / {memo.read, abort.raise} =
+fn unit_of_group(g: CheckGroupKey) -> UnitKey / {memo.read, abort.raise} =
+  match g.owners {
+    [o, ..] -> unit_key_of({ module: g.module, shipped: g.shipped, tested: g.tested, owner: o }),
+    [] -> panic("a check group of `" ++ String::of_bytes_lossy(g.module) ++ "` has no owners"),
+  }
+
+fn check_group_in(named: ModuleKey, owners: List<Bytes>) -> CheckGroupKey =
+  { module: named.module, shipped: named.shipped, tested: named.tested, owners: owners }
+
+fn check_groups_in(unit: UnitKey) -> List<CheckGroupKey> / {memo.read, abort.raise} =
+  (if unit.owners.len() < 2 { [unit.owners] } else { cycles_of(unit) }).map(|owners: List<Bytes>|
+    check_group_in({ module: unit.module, shipped: unit.shipped, tested: unit.tested }, owners))
+
+fn group_owners_in(o: OwnerKey, unit: List<Bytes>) -> List<Bytes> / {memo.read, abort.raise} =
+  if unit.len() < 2 { unit } else { fetch(group_of_query(), o) }
+
+pub fn is_current_check_group(g: CheckGroupKey) -> Bool / {memo.read, abort.raise} =
   match g.owners {
     [] -> false,
-    [o, ..] ->
-      unit_key_of({ module: g.module, shipped: g.shipped, tested: g.tested, owner: o }).owners
-        == g.owners,
+    [o, ..] -> {
+      let at = { module: g.module, shipped: g.shipped, tested: g.tested, owner: o };
+      match unit_owners_of(at) {
+        Some(unit) -> group_owners_in(at, unit) == g.owners,
+        None -> false,
+      }
+    },
   }
 
-pub fn unit_key_of(o: OwnerKey) -> GroupKey / {memo.read, abort.raise} =
-  {
-    module: o.module,
-    shipped: o.shipped,
-    tested: o.tested,
-    owners: fetch_keyed_part(unit_part(), module_key_of(o), o.owner).unwrap_or([]),
-  }
+pub fn group_key_of(o: OwnerKey) -> CheckGroupKey / {memo.read, abort.raise} =
+  check_group_in(module_key_of(o), group_owners_in(o, unit_key_of(o).owners))
 
 fn types_named_in(f: TypeFacts) -> List<Bytes> =
   f.constructors.flat_map(|c: ConstructorInfo| c.fields.flat_map(type_names)).concat(
@@ -1577,24 +1656,22 @@ pub fn known_of_types(names: List<Bytes>) -> KnownConstructors / {CheckReads, ab
   }).fold(no_known, |known: KnownConstructors, v: Visit<Bytes, Option<TypeFacts>>|
     match v.value { Some(f) -> with_type(known, v.key, f), None -> known })
 
-pub fn stored_rows(g: GroupKey) -> Rows / {memo.read, abort.raise} =
-  if g.owners.len() == 0 { no_rows } else {
-    member_rows(g).fold(no_rows, |rows: Rows, r: Rows|
-      {
-        definitions: rows.definitions.concat(r.definitions),
-        tests: rows.tests.concat(r.tests),
-        laws: rows.laws.concat(r.laws),
-        types: types_joined(rows.types, r.types),
-      })
-  }
+pub fn stored_rows(g: CheckGroupKey) -> Rows / {memo.read, abort.raise} =
+  member_rows(g).fold(no_rows, |rows: Rows, r: Rows|
+    {
+      definitions: rows.definitions.concat(r.definitions),
+      tests: rows.tests.concat(r.tests),
+      laws: rows.laws.concat(r.laws),
+      types: types_joined(rows.types, r.types),
+    })
 
-pub fn stored_lowering(g: GroupKey) -> Option<GroupLowering> / {memo.read, abort.raise} =
-  if g.owners.len() == 0 { Some(no_group_lowering) } else { fetch_part(lowering_part(), g) }
+pub fn stored_lowering(g: CheckGroupKey) -> Option<GroupLowering> / {memo.read, abort.raise} =
+  fetch_part(lowering_part(), g)
 
-fn member_rows(g: GroupKey) -> List<Rows> / {memo.read, abort.raise} =
+fn member_rows(g: CheckGroupKey) -> List<Rows> / {memo.read, abort.raise} =
   fetch_part(rows_part(), g).map(decode_rows)
 
-pub fn group_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
+pub fn group_of(g: CheckGroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
   owner_checks::joined_group(
     group_listing_of(g),
     group_facts_of(g),
@@ -1602,8 +1679,8 @@ pub fn group_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.ra
     member_rows(g),
   )
 
-pub fn group_facts_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
-  owner_checks::decode_group(fetch(group_query(), g))
+pub fn group_facts_of(g: CheckGroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
+  owner_checks::decode_group(current_output(group_query(), g))
 
 fn entries_named<a>(entries: Map<Bytes, a>, names: Map<Bytes, Bool>) -> Map<Bytes, a> =
   entries.fold(Map::new(), |found: Map<Bytes, a>, name: Bytes, value: a|
@@ -1693,17 +1770,11 @@ fn names_declared_in(d: Declarations, name: Bytes) -> NameDeclarations =
     of_set: lookup_declared(d, SetSpace, name),
   }
 
-pub fn group_keys(named: ModuleKey) -> List<GroupKey> / {memo.read, abort.raise} =
-  fetch_part(groups_part(), named).map(|g: List<Bytes>|
-    { module: named.module, shipped: named.shipped, tested: named.tested, owners: g })
+pub fn group_keys(named: ModuleKey) -> List<UnitKey> / {memo.read, abort.raise} =
+  fetch_part(groups_part(), named).map(|g: List<Bytes>| unit_in(named, g))
 
-pub fn module_groups(named: ModuleKey) -> List<GroupKey> / {memo.read, abort.raise} =
-  group_keys(named).fold([], |accumulator: List<GroupKey>, unit: GroupKey|
-    accumulator.concat(
-      (if unit.owners.len() < 2 { [unit.owners] } else { cycles_of(unit) }).map(
-        |owners: List<Bytes>| { ..unit, owners: owners },
-      ),
-    ))
+pub fn module_groups(named: ModuleKey) -> List<CheckGroupKey> / {memo.read, abort.raise} =
+  group_keys(named).flat_map(check_groups_in)
 
 pub fn layout_of(named: ModuleKey) -> ModuleLayout / {memo.read, abort.raise} =
   fetch_part(layout_part(), named)
@@ -1721,7 +1792,7 @@ fn assembled_groups<| e>(
   named: ModuleKey,
   read: OwnersResult,
   layout: ModuleLayout,
-  result_of: (GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise | e},
+  result_of: (CheckGroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise | e},
 ) -> owner_checks::AssembledModule / {memo.read, abort.raise | e} = {
   let facts = placed_facts(named, layout);
   owner_checks::assembled(
@@ -1729,7 +1800,7 @@ fn assembled_groups<| e>(
     { ..read.shape, outline: layout.outline },
     read.order,
     read.recorded,
-    module_groups(named).map(|g: GroupKey|
+    module_groups(named).map(|g: CheckGroupKey|
       {
         items: item_layout(
           g.owners.map(|o: Bytes|
@@ -1755,12 +1826,7 @@ fn assembled_groups<| e>(
           ),
           result: {
             ..owner_checks::no_group,
-            rejected: signature_check_of({
-              module: named.module,
-              shipped: named.shipped,
-              tested: named.tested,
-              owners: u,
-            }).rejected,
+            rejected: signature_check_of(signature_group_in(named, u)).rejected,
           },
         }),
     ),
@@ -1768,8 +1834,10 @@ fn assembled_groups<| e>(
   )
 }
 
-fn signature_check_of(unit: GroupKey) -> owner_checks::SignatureCheck / {memo.read, abort.raise} =
-  fetch(signatures_query(), unit)
+fn signature_check_of(
+  group: SignatureGroupKey,
+) -> owner_checks::SignatureCheck / {memo.read, abort.raise} =
+  current_output(signatures_query(), group)
 
 fn reports_unused(setting: Setting) -> Bool =
   setting.origin == InRoot || (setting.origin == ShippedModule && setting.tested)
@@ -1800,7 +1868,7 @@ pub fn checked_module(named: ModuleKey) -> ModuleResult / {memo.read, abort.rais
   }
 }
 
-fn group_summary_of(g: GroupKey) -> owner_checks::GroupFlags / {memo.read, abort.raise} =
+fn group_summary_of(g: CheckGroupKey) -> owner_checks::GroupFlags / {memo.read, abort.raise} =
   fetch_part(summary_part(), g)
 
 pub fn checked_law_outline(
@@ -1820,7 +1888,7 @@ pub fn checked_law_outline(
   )
 }
 
-fn group_listing_of(g: GroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
+fn group_listing_of(g: CheckGroupKey) -> owner_checks::GroupResult / {memo.read, abort.raise} =
   owner_checks::decode_group(fetch_part(listing_part(), g))
 
 pub type ModuleListing = {
@@ -1952,15 +2020,14 @@ pub fn check_imports_header(key: ModuleKey) -> Written / {QueryEffects, abort.ra
 fn module_header(named: ModuleKey) -> ModuleHeader / {memo.read, abort.raise} =
   fetch(header_query(), named)
 
-pub fn hash_group(key: GroupKey) -> Written / {memo.read, abort.raise} =
-  written(group_hash_query(), if !current_unit(key) { no_own_hashes }
-  else { own_hashes(group_hash_inputs(key)) })
+pub fn hash_group(key: UnitKey) -> Written / {memo.read, abort.raise} =
+  written(group_hash_query(), if !is_current_unit(key) { ObsoleteGroup }
+  else { CurrentGroup(own_hashes(group_hash_inputs(key))) })
 
-fn unit_forms(key: GroupKey) -> List<GroupForms> / {memo.read, abort.raise} =
-  (if key.owners.len() < 2 { [key.owners] } else { cycles_of(key) }).map(|g: List<Bytes>|
-    group_forms_of({ ..key, owners: g }))
+fn unit_forms(key: UnitKey) -> List<GroupForms> / {memo.read, abort.raise} =
+  check_groups_in(key).map(group_forms_of)
 
-pub fn group_hash_inputs(key: GroupKey) -> HashInput / {memo.read, abort.raise} =
+pub fn group_hash_inputs(key: UnitKey) -> HashInput / {memo.read, abort.raise} =
   match unit_forms(key) {
     [one] -> one.forms,
     parts -> joined_forms(parts.map(|p: GroupForms| p.forms)),
@@ -1970,7 +2037,7 @@ pub type GroupForms = { forms: HashInput, functions: Map<Bytes, Bytes> }
 
 derive bin for GroupForms
 
-fn group_forms_of(g: GroupKey) -> GroupForms / {memo.read, abort.raise} =
+fn group_forms_of(g: CheckGroupKey) -> GroupForms / {memo.read, abort.raise} =
   fetch_part(forms_part(), g)
 
 fn formed(reads: List<OwnerText>, forms: HashInput) -> GroupForms =
@@ -1980,8 +2047,8 @@ fn formed(reads: List<OwnerText>, forms: HashInput) -> GroupForms =
       r.names.fold(accumulator, |m: Map<Bytes, Bytes>, n: Bytes| m.insert(n, r.owner))),
   }
 
-pub fn group_hashes_of(g: GroupKey) -> OwnHashes / {memo.read, abort.raise} =
-  fetch(group_hash_query(), g)
+pub fn group_hashes_of(u: UnitKey) -> OwnHashes / {memo.read, abort.raise} =
+  current_output(group_hash_query(), u)
 
 fn owned_by(
   module: Bytes,
@@ -2027,17 +2094,18 @@ pub fn record_module_hashes(named: ModuleKey) -> Written / {memo.read, abort.rai
 pub fn documented_query() -> QueryOf<ModuleKey, Pages> =
   { name: b"documented", input: module_key_bin(), output: pages_bin() }
 
+fn unit_among(units: List<UnitKey>, owner: Bytes) -> UnitKey / {abort.raise} =
+  match units.find(|u: UnitKey| u.owners.contains(owner)) {
+    Some(u) -> u,
+    None -> panic("the units of a module leave out `" ++ String::of_bytes_lossy(owner) ++ "`"),
+  }
+
 fn laws_referencing(lawful: ModuleKey) -> Map<Bytes, List<Bytes>> / {memo.read, abort.raise} = {
-  let groups = fetch_part(groups_part(), lawful);
+  let units = group_keys(lawful);
   module_owners(lawful).fold(Map::new(), |accumulator: Map<Bytes, List<Bytes>>, o: Bytes|
     if !o.starts_with(b"law ") { accumulator } else {
       let law = o.slice(4, o.len());
-      let hashed = group_hashes_of({
-        module: lawful.module,
-        shipped: lawful.shipped,
-        tested: lawful.tested,
-        owners: group_containing(groups, o),
-      });
+      let hashed = group_hashes_of(unit_among(units, o));
       hashed.laws.fold(accumulator, |by: Map<Bytes, List<Bytes>>, l: LawHash|
         l.uses.fold(by, |a: Map<Bytes, List<Bytes>>, r: NodeRef| {
           let recorded_laws = match a.get(r.name) { Some(laws) -> laws, None -> [] };
@@ -2278,40 +2346,71 @@ pub fn queries() -> List<CheckDefinition> =
       find_name_declaration,
     ),
     query_definition(symbols_query(), b"compiler.front.checking.groups.list_symbols", list_symbols),
-    query_definition(
-      module_summary_query(),
-      b"compiler.front.checking.groups.summarize_module",
-      summarize_module,
+    with_interface(
+      query_definition(
+        module_summary_query(),
+        b"compiler.front.checking.groups.summarize_module",
+        summarize_module,
+      ),
+      [main_part],
     ),
     query_definition(
       program_summary_query(),
       b"compiler.front.checking.groups.summarize_program",
       summarize_program,
     ),
-    product_definition(
-      module_contents_query(),
-      b"compiler.front.checking.groups.collect_module_contents",
-      collect_module_contents,
-      listing_products,
+    with_interface(
+      product_definition(
+        module_contents_query(),
+        b"compiler.front.checking.groups.collect_module_contents",
+        collect_module_contents,
+        listing_products,
+      ),
+      [code_part().name, declared_effects_part().name, imports_part().name],
     ),
-    product_definition(
-      module_listing_query(),
-      b"compiler.front.checking.groups.list_module",
-      list_module,
-      listing_products,
+    with_interface(
+      product_definition(
+        module_listing_query(),
+        b"compiler.front.checking.groups.list_module",
+        list_module,
+        listing_products,
+      ),
+      [main_part],
     ),
-    query_definition(owners_query(), b"compiler.front.checking.groups.find_owners", find_owners),
+    with_interface(
+      query_definition(owners_query(), b"compiler.front.checking.groups.find_owners", find_owners),
+      [
+        main_part,
+        owners_part().name,
+        groups_part().name,
+        layout_part().name,
+        context_part().name,
+        setting_part().name,
+        names_part().name,
+        module_declarations_part().name,
+        owner_part().name,
+        unit_part().name,
+        signature_unit_part().name,
+        declared_part().name,
+      ],
+    ),
     query_definition(calls_query(), b"compiler.front.checking.groups.find_calls", find_calls),
-    query_definition(cycles_query(), b"compiler.front.checking.groups.find_cycles", find_cycles),
+    with_interface(
+      query_definition(cycles_query(), b"compiler.front.checking.groups.find_cycles", find_cycles),
+      [main_part],
+    ),
     query_definition(
       group_of_query(),
       b"compiler.front.checking.groups.find_group_of",
       find_group_of,
     ),
-    query_definition(
-      wanted_files_query(),
-      b"compiler.front.checking.groups.list_wanted_files",
-      list_wanted_files,
+    with_interface(
+      query_definition(
+        wanted_files_query(),
+        b"compiler.front.checking.groups.list_wanted_files",
+        list_wanted_files,
+      ),
+      [main_part],
     ),
     query_definition(
       visible_modules_query(),
@@ -2338,16 +2437,34 @@ pub fn queries() -> List<CheckDefinition> =
       b"compiler.front.checking.groups.resolve_signature_imports",
       resolve_signature_imports,
     ),
-    query_definition(group_query(), b"compiler.front.checking.groups.check_group", check_group),
-    query_definition(
-      signatures_query(),
-      b"compiler.front.checking.groups.check_signatures",
-      check_signatures,
+    with_interface(
+      query_definition(group_query(), b"compiler.front.checking.groups.check_group", check_group),
+      [
+        main_part,
+        declarations_part().name,
+        lowering_part().name,
+        listing_part().name,
+        summary_part().name,
+        rows_part().name,
+        forms_part().name,
+        calls_part().name,
+      ],
     ),
-    query_definition(
-      typed_query(),
-      b"compiler.front.checking.groups.infer_owner_types",
-      infer_owner_types,
+    with_interface(
+      query_definition(
+        signatures_query(),
+        b"compiler.front.checking.groups.check_signatures",
+        check_signatures,
+      ),
+      [main_part],
+    ),
+    with_interface(
+      query_definition(
+        typed_query(),
+        b"compiler.front.checking.groups.infer_owner_types",
+        infer_owner_types,
+      ),
+      [main_part],
     ),
     query_definition(imports_query(), b"compiler.front.checking.world.list_imports", list_imports),
     query_definition(
@@ -2360,16 +2477,22 @@ pub fn queries() -> List<CheckDefinition> =
       b"compiler.front.checking.groups.cut_header_text",
       cut_header_text,
     ),
-    query_definition(
-      header_query(),
-      b"compiler.front.checking.groups.check_imports_header",
-      check_imports_header,
+    with_interface(
+      query_definition(
+        header_query(),
+        b"compiler.front.checking.groups.check_imports_header",
+        check_imports_header,
+      ),
+      [main_part],
     ),
-    product_definition(
-      group_hash_query(),
-      b"compiler.front.checking.groups.hash_group",
-      hash_group,
-      hash_products,
+    with_interface(
+      product_definition(
+        group_hash_query(),
+        b"compiler.front.checking.groups.hash_group",
+        hash_group,
+        hash_products,
+      ),
+      [main_part],
     ),
     product_definition(
       owner_hash_query(),
@@ -2377,23 +2500,32 @@ pub fn queries() -> List<CheckDefinition> =
       hash_owner,
       hash_products,
     ),
-    product_definition(
-      module_record_query(),
-      b"compiler.front.checking.groups.record_module_hashes",
-      record_module_hashes,
-      hash_products,
+    with_interface(
+      product_definition(
+        module_record_query(),
+        b"compiler.front.checking.groups.record_module_hashes",
+        record_module_hashes,
+        hash_products,
+      ),
+      [main_part],
     ),
-    product_definition(
-      documented_query(),
-      b"compiler.front.checking.groups.document_module",
-      document_module,
-      doc_products,
+    with_interface(
+      product_definition(
+        documented_query(),
+        b"compiler.front.checking.groups.document_module",
+        document_module,
+        doc_products,
+      ),
+      [main_part],
     ),
-    product_definition(
-      declaring_query(),
-      b"compiler.front.checking.groups.list_documenting_modules",
-      list_documenting_modules,
-      doc_products,
+    with_interface(
+      product_definition(
+        declaring_query(),
+        b"compiler.front.checking.groups.list_documenting_modules",
+        list_documenting_modules,
+        doc_products,
+      ),
+      [main_part],
     ),
   ]
 
