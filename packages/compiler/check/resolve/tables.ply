@@ -1,5 +1,5 @@
 import compiler.syntax.parsing (Error)
-import compiler.syntax.parsing (span_bin, dummy_span)
+import compiler.syntax.parsing (span_bin, span_between, is_generated, generated_span)
 import compiler.syntax.expressions (expression_bin)
 import compiler.syntax.parsing (Span, Identifier, QName, Severity, severity_bin, span_to)
 import compiler.syntax.items (Module, Item, FunctionItem, ExternItem, TypeItem, EffectItem,
@@ -10,6 +10,7 @@ import compiler.syntax.items (Module, Item, FunctionItem, ExternItem, TypeItem, 
 import compiler.syntax.expressions (Expression)
 import std.list
 import std.bin
+import std.bytes (ascii_of_int)
 import compiler.check.types (last_dot)
 
 pub type Source = { name: Bytes, source_text: Bytes }
@@ -69,7 +70,9 @@ pub fn bound_by_failed_import(scope: Scope, name: QName) -> Bool =
     Some(binder) -> scope.failed.contains(binder.name),
   }
 
-pub type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+pub type Place = | InSource({ module: Int, start: Int, end: Int }) | WholeFile(Int) | Unplaced
+
+pub type Label = { place: Place, primary: Bool, text: Bytes }
 
 pub type Edit = { module: Int, start: Int, end: Int, text: Bytes }
 
@@ -90,11 +93,13 @@ pub type Diagnostic = {
 pub fn placed_in(d: Diagnostic, module: Int) -> Diagnostic =
   {
     ..d,
-    labels: d.labels.map(|l: Label| { ..l, module: module }),
+    labels: d.labels.map(|l: Label| { ..l, place: in_module(l.place, module) }),
     fixes: d.fixes.map(|f: Fix| { ..f, edits: f.edits.map(|e: Edit| { ..e, module: module }) }),
   }
 
 derive bin for Source
+
+derive bin for Place
 
 derive bin for Label
 
@@ -227,7 +232,7 @@ pub fn module_binding_in(scope: Scope, binder: Bytes) -> Option<ModuleBinding> /
   match find_module_binding(scope.modules, binder) {
     Some(m) -> Some(m),
     None -> match implicit_target(binder) {
-      Some(target) -> Some({ binder: binder, target: target, span: dummy_span }),
+      Some(target) -> Some({ binder: binder, target: target, span: generated_span }),
       None -> None,
     },
   }
@@ -494,8 +499,55 @@ pub fn binder_span(declaration: ImportDeclaration) -> Span / {abort.raise} =
     SelectedNames(_) -> declaration.span,
   }
 
+pub fn place_of(m: Int, span: Span) -> Place =
+  if m == module_elsewhere || is_generated(span) { Unplaced }
+  else { InSource({ module: m, start: span.start, end: span.end }) }
+
+pub fn source_span(label: Label) -> Option<{ module: Int, start: Int, end: Int }> =
+  match label.place { InSource(s) -> Some(s), _ -> None }
+
+pub fn labelled_text(source: Bytes, label: Label) -> Bytes =
+  match source_span(label) { Some(s) -> source.slice(s.start, s.end), None -> b"" }
+
+pub fn place_module(place: Place) -> Option<Int> =
+  match place { InSource(s) -> Some(s.module), WholeFile(m) -> Some(m), Unplaced -> None }
+
+pub fn place_text(place: Place) -> Bytes =
+  match place {
+    InSource(s) ->
+      Bytes::concat_all([ascii_of_int(s.module), b":", ascii_of_int(s.start), b":", ascii_of_int(s.end)]),
+    WholeFile(m) -> ascii_of_int(m).concat(b":file"),
+    Unplaced -> b"unplaced",
+  }
+
+pub fn mapped_place(place: Place, module: Int, by: (Int) -> Int) -> Place =
+  match place {
+    InSource(s) -> InSource({ module: module, start: by(s.start), end: by(s.end) }),
+    WholeFile(_) -> WholeFile(module),
+    Unplaced -> Unplaced,
+  }
+
+pub fn in_module(place: Place, module: Int) -> Place =
+  match place {
+    InSource(s) -> InSource({ ..s, module: module }),
+    WholeFile(_) -> WholeFile(module),
+    Unplaced -> Unplaced,
+  }
+
 pub fn label_at(m: Int, span: Span, primary: Bool, text: Bytes) -> Label =
-  { module: m, start: span.start, end: span.end, primary: primary, text: text }
+  { place: place_of(m, span), primary: primary, text: text }
+
+pub fn error_unplaced(code: Bytes, message: Bytes, label: Bytes, notes: List<Bytes>) -> Diagnostic =
+  error_with_labels(code, message, [{ place: Unplaced, primary: true, text: label }], notes)
+
+pub fn error_in_file(
+  code: Bytes,
+  m: Int,
+  message: Bytes,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> Diagnostic =
+  error_with_labels(code, message, [{ place: WholeFile(m), primary: true, text: label }], notes)
 
 pub fn error_with_labels(
   code: Bytes,
@@ -644,9 +696,9 @@ pub fn unplaced_declarations(declarations: Declarations) -> Declarations = {
   let unplaced = |d: Declaration|
     {
       ..d,
-      span: dummy_span,
+      span: generated_span,
       closed_by: match d.closed_by {
-        Some(c) -> Some({ ..c, opaque: { ..c.opaque, span: dummy_span } }),
+        Some(c) -> Some({ ..c, opaque: { ..c.opaque, span: generated_span } }),
         None -> None,
       },
     };
@@ -705,10 +757,10 @@ test "a module name prefixes the names of its declarations, and its last segment
 }
 
 test "a diagnostic placed in a module moves its labels and the edits of its fixes there" {
-  let d = with_fix(error_at(b"E0101", 0, dummy_span, b"unknown", b"here", []), b"rename", [
+  let d = with_fix(error_at(b"E0101", 0, span_between(4, 9), b"unknown", b"here", []), b"rename", [
     { module: 0, start: 1, end: 2, text: b"x" },
   ]);
   let placed = placed_in(d, 3);
-  assert_eq(placed.labels.map(|l: Label| l.module), [3]);
+  assert_eq(placed.labels.map(|l: Label| l.place), [InSource({ module: 3, start: 4, end: 9 })]);
   assert_eq(placed.fixes.flat_map(|f: Fix| f.edits.map(|e: Edit| e.module)), [3])
 }

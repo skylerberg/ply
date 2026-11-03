@@ -2,14 +2,15 @@ import compiler.syntax.items (InstanceItem, HostInstance, KeyInstance, ReturnsFr
                               ShowInstance)
 import compiler.syntax.items (effect_set_definition_bin, schema_definition_bin, SchemaDefinition,
                               SchemaItem)
-import compiler.check.resolve.tables (parameters_bin)
+import compiler.check.resolve.tables (parameters_bin, mapped_place)
 import compiler.check.guards (contract_bin)
 import compiler.check.borrowing (parameter_modes_bin)
 import compiler.syntax.type_syntax (type_expression_bin)
 import compiler.syntax.items (opaque_bin)
 import compiler.check.resolve.tables (module_names, module_elsewhere, module_of_name,
                                       with_no_other_modules)
-import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, span_bin, is_bare)
+import compiler.syntax.parsing (Span, Identifier, QName, generated_span, span_bin, is_bare, is_generated,
+                                mapped_span)
 import std.bin
 import compiler.check.member (MemberTarget, member_target_bin)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
@@ -437,6 +438,7 @@ pub type SpecEnv = {
 pub type GroupDefinition = { name: Bytes, labels: List<Int>, types: List<RigidParam> }
 
 pub type CachedDefinition = {
+  labels: List<Int>,
   effects: List<Effect>,
   performed: List<Effect>,
   unbounded_effects: List<Effect>,
@@ -463,16 +465,16 @@ pub const listing_type: Type =
 pub type CheckCache = {
   definitions: Map<Bytes, CachedDefinition>,
   tests: Map<Bytes, CachedTest>,
-  root: Int,
+  own_modules: Int,
   types: TypeTable,
   body_plan: BodyPlan,
 }
 
-pub const empty_cache: CheckCache =
+pub fn empty_cache(own_modules: Int) -> CheckCache =
   {
     definitions: Map::new(),
     tests: Map::new(),
-    root: 1 << 62,
+    own_modules: own_modules,
     types: Map::new(),
     body_plan: CheckEvery,
   }
@@ -591,16 +593,16 @@ pub const no_stored_declarations: StoredDeclarations =
     hosts: Map::new(),
   }
 
-fn located_elsewhere(at: Location) -> Location = { module: module_elsewhere, span: dummy_span }
+fn located_elsewhere(at: Location) -> Location = { module: module_elsewhere, span: generated_span }
 
-fn site_elsewhere(site: Site) -> Site = { ..site, span: dummy_span }
+fn site_elsewhere(site: Site) -> Site = { ..site, span: generated_span }
 
 fn definition_elsewhere(d: DefinitionInfo) -> DefinitionInfo =
   {
     ..d,
     at: located_elsewhere(d.at),
-    raises: d.raises.map(|r: Raise| { ..r, span: dummy_span }),
-    spec: d.spec.map(|s: SpecInfo| { ..s, span: dummy_span }),
+    raises: d.raises.map(|r: Raise| { ..r, span: generated_span }),
+    spec: d.spec.map(|s: SpecInfo| { ..s, span: generated_span }),
     ending: match d.ending {
       Diverges(x) -> Diverges({ ..x, at: site_elsewhere(x.at), loop: x.loop.map(site_elsewhere) }),
       other -> other,
@@ -611,8 +613,8 @@ fn type_elsewhere(d: TypeDeclaration) -> TypeDeclaration =
   {
     ..d,
     owner: module_elsewhere,
-    span: dummy_span,
-    opaque: match d.opaque { Some(o) -> Some({ ..o, span: dummy_span }), None -> None },
+    span: generated_span,
+    opaque: match d.opaque { Some(o) -> Some({ ..o, span: generated_span }), None -> None },
   }
 
 fn constructor_elsewhere(c: ConstructorInfo) -> ConstructorInfo =
@@ -1014,6 +1016,7 @@ pub type NamedCallee = { site: Int, callee: Callee }
 
 pub type CheckedBody = {
   name: Bytes,
+  labels: List<Int>,
   listed: List<Effect>,
   has_effect_variable: Bool,
   performs: List<PerformSite>,
@@ -1050,7 +1053,7 @@ derive bin for NamedCallee
 derive bin for CheckedBody
 
 pub fn relocated_body(b: CheckedBody, module: Int, by: (Int) -> Int) -> CheckedBody = {
-  let at = |s: Span| { ..s, start: by(s.start), end: by(s.end) };
+  let at = |s: Span| mapped_span(s, by);
   let over = |o: Option<Span>| match o { Some(s) -> Some(at(s)), None -> None };
   let waits = |ms: List<PendingIteration>| ms.map(|m: PendingIteration| { ..m, span: at(m.span) });
   let call = |c: OwnCall| { ..c, span: at(c.span) };
@@ -1078,8 +1081,7 @@ pub fn relocated_body(b: CheckedBody, module: Int, by: (Int) -> Int) -> CheckedB
         ..t,
         rejection: {
           ..t.rejection,
-          labels: t.rejection.labels.map(|l: Label|
-            { ..l, module: module, start: by(l.start), end: by(l.end) }),
+          labels: t.rejection.labels.map(|l: Label| { ..l, place: mapped_place(l.place, module, by) }),
         },
       }),
     instantiations: b.instantiations.map(|f: Instantiation|
@@ -1279,7 +1281,7 @@ fn builtin_sum_constructors(adt: BuiltinSum) -> List<ConstructorInfo> / {abort.r
         label_variables: [],
         ty: if fields.len() == 0 { result } else { function_type(fields, result, no_effects) },
       },
-      at: { module: 0, span: dummy_span },
+      at: { module: 0, span: generated_span },
     }
   })
 }
@@ -1514,7 +1516,7 @@ fn prelude_operation(
     params: params,
     keep_indices: [],
     return_type: return_type,
-    at: { module: 0, span: dummy_span },
+    at: { module: 0, span: generated_span },
     scheme: Some({
       type_variables: type_variables,
       effect_variables: effect_variables,
@@ -1534,7 +1536,7 @@ pub const prelude_effects: List<EffectInfo> = {
   let body = function_type([], ta, open_effects(0));
   let task = task_type(ta);
   let chan = chan_type(ta);
-  let none = { module: 0, span: dummy_span };
+  let none = { module: 0, span: generated_span };
   [
     {
       name: b"task",
@@ -2109,7 +2111,7 @@ pub fn record_perform_under(
   over: Option<Span>,
   maybe: List<PendingIteration>,
 ) -> Checker =
-  if span.start == 0 && span.end == 0 { checker } else {
+  if is_generated(span) { checker } else {
     {
       ..checker,
       performs: checker.performs.push({

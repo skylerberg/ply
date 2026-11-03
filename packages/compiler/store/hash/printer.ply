@@ -1,4 +1,5 @@
-import compiler.syntax.parsing (qualified_name_text, Identifier, QName, Span, dummy_span)
+import std.set (Set)
+import compiler.syntax.parsing (qualified_name_text, Identifier, QName, Span, generated_span)
 import compiler.syntax.lexer (widths)
 import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, PatternLiteral,
                                  PatternRange, PatternConstructor, PatternRecord, PatternList,
@@ -36,7 +37,7 @@ import std.option
 import std.bytes
 import std.string
 import compiler.store.hash.encoding (hex, Choice, Slot)
-import compiler.store.hash.forms (member_hash)
+import compiler.store.hash.forms (member_hash, FramedBody, framed_body, SingleBody, MemberBody)
 import compiler.store.hash.stored
 import compiler.store.hash.stored (Reference, Hashed, Member, Itself, ByName, FreeName, Literal,
                                    IntLiteral, FixedLiteral, WideLiteral, BoolLiteral,
@@ -56,22 +57,10 @@ import compiler.store.hash.stored (Reference, Hashed, Member, Itself, ByName, Fr
                                    Sum, Nominal, Extern, FunctionOf, TypeOf, EffectOf, TestOf,
                                    LawOf, SpecOf, Stored, stored_bin)
 
-type Envelope = { kind: Int, class: Int, picks: Int, at: Int }
+pub fn envelope(body: Bytes) -> Option<FramedBody> =
+  match framed_body(body) { Some(f) -> if f.pending { None } else { Some(f) }, None -> None }
 
-pub fn envelope(body: Bytes) -> Option<Envelope> = {
-  let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
-  let framed = |class: Int, from: Int|
-    match body.u32_at(from) {
-      Some(n) -> if from + 4 + n > body.len() { None }
-      else { Some({ kind: kind, class: class, picks: from + 4, at: from + 4 + n }) },
-      None -> None,
-    };
-  if kind == 0 { framed(0, 1) }
-  else if kind == 1 { match body.u32_at(1) { Some(class) -> framed(class, 5), None -> None } }
-  else { None }
-}
-
-pub fn picks_of(body: Bytes, e: Envelope) -> List<List<Choice>> / {abort.raise} = {
+pub fn picks_of(body: Bytes, e: FramedBody) -> List<List<Choice>> / {abort.raise} = {
   let read = |at: Int| match body.u32_at(at) { Some(n) -> n, None -> panic("a malformed body") };
   iterate(
     { at: e.picks, lists: [] },
@@ -152,8 +141,8 @@ type Part = {
 type Layout = {
   parts: List<Part>,
   by_hash: Map<Bytes, List<Slot>>,
-  source_names: Map<Bytes, Map<Bytes, Bool>>,
-  constants: Map<Bytes, Bool>,
+  source_names: Map<Bytes, Set<Bytes>>,
+  constants: Set<Bytes>,
 }
 
 type BodyPrinter = {
@@ -161,14 +150,14 @@ type BodyPrinter = {
   part: Int,
   module: Bytes,
   graph: Map<Bytes, List<Bytes>>,
-  source_names: Map<Bytes, Bool>,
+  source_names: Set<Bytes>,
 }
 
 fn source_names_key(name: Bytes, hash: Bytes) -> Bytes = hash.concat(name)
 
 type NameState = {
   imports: Map<Bytes, Bytes>,
-  missing: Map<Bytes, Bool>,
+  missing: Set<Bytes>,
   slots: Map<Bytes, Int>,
   picks: List<Choice>,
   call_index: Int,
@@ -196,21 +185,21 @@ fn space_name(at: Int) -> Bytes = b"_s".concat(ascii_of_int(at))
 
 fn short_hex(h: Bytes) -> Bytes / {abort.raise} = hex(h).slice(0, 12)
 
-fn identifier(name: Bytes) -> Identifier = { name: name, span: dummy_span }
+fn identifier(name: Bytes) -> Identifier = { name: name, span: generated_span }
 
-fn unqualified(name: Bytes) -> QName = { module: None, name: identifier(name), span: dummy_span }
+fn unqualified(name: Bytes) -> QName = { module: None, name: identifier(name), span: generated_span }
 
 fn free_name(free: FreeName) -> QName =
   match free.module {
     Some(module) ->
-      { module: Some(identifier(module)), name: identifier(free.name), span: dummy_span },
+      { module: Some(identifier(module)), name: identifier(free.name), span: generated_span },
     None -> unqualified(free.name),
   }
 
 fn as_block(expression: Expression) -> Expression =
   match expression {
     BlockExpression(_) -> expression,
-    _ -> BlockExpression({ span: dummy_span, tail: Some(expression), statements: [] }),
+    _ -> BlockExpression({ span: generated_span, tail: Some(expression), statements: [] }),
   }
 
 fn named_in_turn<a, b>(
@@ -300,7 +289,7 @@ fn target_of(
     Hashed(hash) ->
       {
         naming: if printer.layout.by_hash.contains(hash) { naming }
-        else { { ..naming, missing: naming.missing.insert(hash, true) } },
+        else { { ..naming, missing: naming.missing.insert(hash) } },
         node: { hash: hash, member_index: 0 - 1 },
       },
     Member(class) -> {
@@ -337,7 +326,7 @@ fn named(
   match found {
     None ->
       {
-        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
+        naming: { ..naming, missing: naming.missing.insert(target.hash) },
         node: unqualified(match constructor {
           Some(given) -> given,
           None -> short_hex(target.hash),
@@ -349,7 +338,7 @@ fn named(
       if part.module == printer.module { { naming: naming, node: unqualified(name) } } else {
         {
           naming: { ..naming, imports: naming.imports.insert(part.module, part.binder) },
-          node: { module: Some(identifier(part.binder)), name: identifier(name), span: dummy_span },
+          node: { module: Some(identifier(part.binder)), name: identifier(name), span: generated_span },
         }
       }
     },
@@ -433,7 +422,7 @@ fn tag_binder(
   match found {
     None ->
       {
-        naming: { ..naming, missing: naming.missing.insert(target.hash, true) },
+        naming: { ..naming, missing: naming.missing.insert(target.hash) },
         node: identifier(short_hex(target.hash)),
       },
     Some(slot) -> {
@@ -546,7 +535,7 @@ fn type_of(
       {
         naming: spelled.naming,
         node: NamedTypeExpression({
-          span: dummy_span,
+          span: generated_span,
           name: head.node,
           args: spelled.node,
           labels: [],
@@ -566,7 +555,7 @@ fn type_of(
       {
         naming: spelled_effect_lists.naming,
         node: NamedTypeExpression({
-          span: dummy_span,
+          span: generated_span,
           name: head.node,
           args: spelled.node,
           labels: labels.map(|label: Label| label_of(depth, label)),
@@ -581,7 +570,7 @@ fn type_of(
       {
         naming: spelled_effects.naming,
         node: FunctionTypeExpression({
-          span: dummy_span,
+          span: generated_span,
           params: spelled_parameters.node,
           keep_indices: retained_parameters,
           once: once,
@@ -601,10 +590,10 @@ fn type_of(
       );
       {
         naming: spelled.naming,
-        node: RecordTypeExpression({ span: dummy_span, fields: spelled.node }),
+        node: RecordTypeExpression({ span: generated_span, fields: spelled.node }),
       }
     },
-    UnitType -> { naming: naming, node: UnitTypeExpression({ span: dummy_span }) },
+    UnitType -> { naming: naming, node: UnitTypeExpression({ span: generated_span }) },
   }
 
 fn optional_effects_of(
@@ -649,7 +638,7 @@ fn effect_expression_named(
       resource: labelled_by.resource,
       resource_wildcard: labelled_by.every,
       bounded: bounded,
-      span: dummy_span,
+      span: generated_span,
     },
   }
 }
@@ -693,7 +682,7 @@ fn effects_of(
         Some(EffectVariableName(name)) -> Some(identifier(name)),
       },
       variable_bounded: effects.bounded,
-      span: dummy_span,
+      span: generated_span,
     },
   }
 }
@@ -739,7 +728,7 @@ fn pattern_of(
   depth: Depth,
   original: stored::Pattern<Reference, Int>,
 ) -> BoundPattern / {abort.raise} = {
-  let span = dummy_span;
+  let span = generated_span;
   match original {
     Wild -> { naming: naming, depth: depth, node: PatternWildcard({ span: span }) },
     Bind ->
@@ -881,7 +870,7 @@ fn on_value_of(
   depth: Depth,
   call: stored::OnValueCall<Reference, Int, Int, Unit>,
 ) -> NamedNode<Expression> / {abort.raise} = {
-  let span = dummy_span;
+  let span = generated_span;
   let base = expression_of(printer, naming, depth, call.base);
   let arguments = expressions_of(printer, base.naming, depth, call.arguments);
   let given = fields_of(printer, arguments.naming, depth, call.named);
@@ -953,7 +942,7 @@ fn expression_of(
   depth: Depth,
   original: StoredExpression,
 ) -> NamedNode<Expression> / {abort.raise} = {
-  let span = dummy_span;
+  let span = generated_span;
   match original {
     Constant(EmbeddedLiteral(digest, _)) ->
       {
@@ -1276,7 +1265,7 @@ fn handle_of(
   depth: Depth,
   handled: stored::StoredHandle<Reference, Int, Int, Unit>,
 ) -> NamedNode<Expression> / {abort.raise} = {
-  let span = dummy_span;
+  let span = generated_span;
   let level = depth.values;
   let variables = range(0, handled.variables.len()).fold(
     { naming: naming, node: [] },
@@ -1364,7 +1353,7 @@ fn statement_of(
   depth: Depth,
   original: StoredStatement,
 ) -> NamedStatement / {abort.raise} = {
-  let span = dummy_span;
+  let span = generated_span;
   match original {
     Let(annotation, value, pattern) -> {
       let spelled_annotation = optional_type_of(printer, naming, depth, annotation);
@@ -1434,9 +1423,9 @@ fn constraints_of(constraints: List<stored::ParameterConstraint>) -> List<Constr
   constraints.map(|constrained: stored::ParameterConstraint|
     {
       deriver: constrained.deriver,
-      deriver_span: dummy_span,
+      deriver_span: generated_span,
       param: identifier(type_variable_name(constrained.level)),
-      span: dummy_span,
+      span: generated_span,
     })
 
 fn items_of(
@@ -1445,7 +1434,7 @@ fn items_of(
   form: Stored,
   name: Bytes,
 ) -> NamedNode<List<Item>> / {abort.raise} = {
-  let span = dummy_span;
+  let span = generated_span;
   match form {
     FunctionOf(function) -> {
       let depth = depth_of(function.generics);
@@ -1696,7 +1685,7 @@ type Component = {
 type Copied = { module: Bytes, names: List<Bytes>, public: List<Bool> }
 
 type PartitionState = {
-  seen: Map<Bytes, Bool>,
+  seen: Set<Bytes>,
   hash_by_name: Map<Bytes, Bytes>,
   parts: List<Part>,
   error: Option<PrintError>,
@@ -1713,17 +1702,17 @@ fn component_of(body: Bytes) -> Component / {abort.raise} =
     Some(e) -> {
       let payload = body.slice(e.at, body.len());
       let id = blake3(payload);
-      if e.kind == 0 {
-        { members: [payload], picks: picks_of(body, e), hashes: [id], id: id, key: id }
-      } else {
-        match members_of(payload) {
-          Some(ms) -> if e.class >= ms.len() { panic("a malformed component body") } else {
+      match e.frame {
+        SingleBody ->
+          { members: [payload], picks: picks_of(body, e), hashes: [id], id: id, key: id },
+        MemberBody(class) -> match members_of(payload) {
+          Some(ms) -> if class >= ms.len() { panic("a malformed component body") } else {
             {
               members: ms,
               picks: picks_of(body, e),
               hashes: range(0, ms.len()).map(|i: Int| member_hash(id, i)),
               id: id,
-              key: member_hash(id, e.class),
+              key: member_hash(id, class),
             }
           },
           None -> panic("a malformed component body"),
@@ -1752,7 +1741,7 @@ fn listed(ns: List<Holder>) -> Bytes / {abort.raise} =
 
 fn named_of(
   names: List<{ name: Bytes, hash: Bytes, public: Bool }>,
-  keys: Map<Bytes, Bool>,
+  keys: Set<Bytes>,
 ) -> { named: Map<Bytes, Map<Bytes, Holder>>, bad: Option<PrintError> } / {abort.raise} =
   names.fold(
     { named: Map::new(), bad: None },
@@ -1934,13 +1923,13 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
       1 + (match accumulator.get(default_binder(m)) { Some(k) -> k, None -> 0 }),
     ));
   let start = {
-    taken: sharing.fold(Map::new(), |accumulator: Map<Bytes, Bool>, b: Bytes, k: Int|
-      accumulator.insert(b, true)),
+    taken: sharing.fold(Set::empty(), |accumulator: Set<Bytes>, b: Bytes, k: Int|
+      accumulator.insert(b)),
     out: Map::new(),
   };
   let done = modules.fold(
     start,
-    |s: { taken: Map<Bytes, Bool>, out: Map<Bytes, Bytes> }, m: Bytes| {
+    |s: { taken: Set<Bytes>, out: Map<Bytes, Bytes> }, m: Bytes| {
       let own = default_binder(m);
       if match sharing.get(own) { Some(k) -> k == 1, None -> true } {
         { ..s, out: s.out.insert(m, own) }
@@ -1957,17 +1946,17 @@ fn binders(modules: List<Bytes>) -> Map<Bytes, Bytes> / {abort.raise} = {
               })
             } else { Stop(t) },
         );
-        { taken: s.taken.insert(found.binder, true), out: s.out.insert(m, found.binder) }
+        { taken: s.taken.insert(found.binder), out: s.out.insert(m, found.binder) }
       }
     },
   );
   done.out
 }
 
-fn layout_of(parts: List<Part>, meant: Map<Bytes, Map<Bytes, Bool>>) -> Layout / {abort.raise} = {
+fn layout_of(parts: List<Part>, meant: Map<Bytes, Set<Bytes>>) -> Layout / {abort.raise} = {
   let bound = binders(
-    parts.fold(Map::new(), |accumulator: Map<Bytes, Bool>, part: Part|
-      accumulator.insert(part.module, true)).keys(
+    parts.fold(Set::empty(), |accumulator: Set<Bytes>, part: Part|
+      accumulator.insert(part.module)).keys(
     ),
   );
   let placed = parts.map(|part: Part|
@@ -1989,10 +1978,10 @@ fn layout_of(parts: List<Part>, meant: Map<Bytes, Map<Bytes, Bool>>) -> Layout /
       },
     ),
     source_names: meant,
-    constants: placed.fold(Map::new(), |acc: Map<Bytes, Bool>, part: Part|
-      range(0, part.members.len()).fold(acc, |found: Map<Bytes, Bool>, c: Int|
+    constants: placed.fold(Set::empty(), |acc: Set<Bytes>, part: Part|
+      range(0, part.members.len()).fold(acc, |found: Set<Bytes>, c: Int|
         match stored_of(part.members.get(c), part.module) {
-          FunctionOf(function) -> if function.constant { found.insert(part.hashes.get(c), true) }
+          FunctionOf(function) -> if function.constant { found.insert(part.hashes.get(c)) }
           else { found },
           _ -> found,
         })),
@@ -2001,17 +1990,17 @@ fn layout_of(parts: List<Part>, meant: Map<Bytes, Map<Bytes, Bool>>) -> Layout /
 
 fn fresh_naming(
   imports: Map<Bytes, Bytes>,
-  missing: Map<Bytes, Bool>,
+  missing: Set<Bytes>,
   picks: List<Choice>,
 ) -> NameState =
   { imports: imports, missing: missing, slots: Map::new(), picks: picks, call_index: 0 }
 
 fn print_parts(
   layout: Layout,
-) -> { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> } / {abort.raise} =
+) -> { modules: Map<Bytes, Sheet>, missing: Set<Bytes>, graph: Map<Bytes, List<Bytes>> } / {abort.raise} =
   range(0, layout.parts.len()).fold(
-    { modules: Map::new(), missing: Map::new(), graph: Map::new() },
-    |accumulator: { modules: Map<Bytes, Sheet>, missing: Map<Bytes, Bool>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
+    { modules: Map::new(), missing: Set::empty(), graph: Map::new() },
+    |accumulator: { modules: Map<Bytes, Sheet>, missing: Set<Bytes>, graph: Map<Bytes, List<Bytes>> }, u: Int| {
       let p = layout.parts.get(u);
       if !p.printed { accumulator } else {
         let x = {
@@ -2023,7 +2012,7 @@ fn print_parts(
         };
         let walked = range(0, p.members.len()).fold(
           { imports: Map::new(), missing: accumulator.missing, texts: [] },
-          |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, c: Int| {
+          |w: { imports: Map<Bytes, Bytes>, missing: Set<Bytes>, texts: List<Bytes> }, c: Int| {
             let name = p.names.get(c);
             let printer = {
               ..x,
@@ -2068,16 +2057,16 @@ fn print_tests(
   layout: Layout,
   g: Map<Bytes, List<Bytes>>,
   tests: List<Bytes>,
-  missing: Map<Bytes, Bool>,
-) -> { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> } / {abort.raise} = {
+  missing: Set<Bytes>,
+) -> { imports: Map<Bytes, Bytes>, missing: Set<Bytes>, texts: List<Bytes> } / {abort.raise} = {
   let x = { layout: layout, part: 0 - 1, module: b"", graph: g, source_names: Map::new() };
   range(0, tests.len()).fold(
     { imports: Map::new(), missing: missing, texts: [] },
-    |w: { imports: Map<Bytes, Bytes>, missing: Map<Bytes, Bool>, texts: List<Bytes> }, i: Int| {
+    |w: { imports: Map<Bytes, Bytes>, missing: Set<Bytes>, texts: List<Bytes> }, i: Int| {
       let body = tests.get(i);
       let label = b"t".concat(ascii_of_int(i));
       match envelope(body) {
-        Some(e) -> if e.kind != 0 { panic("a stored test is not a single definition") } else {
+        Some(e) -> if e.frame != SingleBody { panic("a stored test is not a single definition") } else {
           let t = items_of(
             x,
             fresh_naming(w.imports, w.missing, match picks_of(body, e).at(0) {
@@ -2124,19 +2113,19 @@ pub fn print_bodies(
   let comps = bodies.map(component_of);
   let n = named_of(
     names,
-    comps.fold(Map::new(), |accumulator: Map<Bytes, Bool>, component: Component|
-      accumulator.insert(component.key, true)),
+    comps.fold(Set::empty(), |accumulator: Set<Bytes>, component: Component|
+      accumulator.insert(component.key)),
   );
   let parted: PartitionState = match n.bad {
-    Some(_) -> { seen: Map::new(), hash_by_name: Map::new(), parts: [], error: n.bad },
+    Some(_) -> { seen: Set::empty(), hash_by_name: Map::new(), parts: [], error: n.bad },
     None ->
       comps.fold(
-        { seen: Map::new(), hash_by_name: Map::new(), parts: [], error: None },
+        { seen: Set::empty(), hash_by_name: Map::new(), parts: [], error: None },
         |accumulator: PartitionState, component: Component|
           if is_some(accumulator.error) || accumulator.seen.contains(component.id) { accumulator }
           else {
             add_component(
-              { ..accumulator, seen: accumulator.seen.insert(component.id, true) },
+              { ..accumulator, seen: accumulator.seen.insert(component.id) },
               component,
               n.named,
               shipped,
@@ -2151,11 +2140,11 @@ pub fn print_bodies(
         parted.parts,
         meant.fold(
           Map::new(),
-          |accumulator: Map<Bytes, Map<Bytes, Bool>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|
+          |accumulator: Map<Bytes, Set<Bytes>>, n: { name: Bytes, hash: Bytes, names: List<Bytes> }|
             accumulator.insert(
               source_names_key(n.name, n.hash),
-              n.names.fold(Map::new(), |names_so_far: Map<Bytes, Bool>, name: Bytes|
-                names_so_far.insert(name, true)),
+              n.names.fold(Set::empty(), |names_so_far: Set<Bytes>, name: Bytes|
+                names_so_far.insert(name)),
             ),
         ),
       );

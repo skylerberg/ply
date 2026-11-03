@@ -1,3 +1,6 @@
+import std.set (Set)
+import compiler.codes (hole_code)
+import compiler.check.resolve.tables (labelled_text, source_span, InSource)
 import compiler.syntax.parsing (Error, Warning)
 import compiler.check.infer.checker (StoredDeclarations, declarations_checked,
                                      no_stored_declarations, declarations_joined)
@@ -6,7 +9,7 @@ import compiler.check.borrowing (mode_facts)
 import compiler.check.termination (summary_facts)
 import compiler.check.infer.checker (program)
 import compiler.check.infer.checker (CheckReads, with_no_other_definitions, constraints_of)
-import compiler.syntax.parsing (Span, span_between, node_id_base, dummy_span, moved_by)
+import compiler.syntax.parsing (Span, span_between, node_id_base, generated_span, moved_by)
 import std.bin
 import compiler.syntax.type_syntax (mode_text)
 import compiler.syntax.items (Module, Item, FunctionItem, TestItem, LawItem, ExternItem,
@@ -60,7 +63,7 @@ import compiler.check.infer.checker (OperationInfo, EffectInfo, ConstructorInfo,
                                      UnguardedBuiltin, RequirementNotShown, ZeroDivisor, Raise,
                                      TestInfo, LawBinder, LawInfo, MemberSite, WitnessOrder,
                                      LabelApplication, CachedDefinition, CachedTest, CachedFacts,
-                                     CheckCache, empty_cache, Checker, CheckedBody, report,
+                                     CheckCache, empty_cache, CheckEvery, Checker, CheckedBody, report,
                                      report_error_at, resolve, resolve_effects_in, abort_effect,
                                      definition_of, Builtin, builtin_of_extern, builtins,
                                      builtin_named, member_site_bin, witness_order_bin, ReleaseSite)
@@ -86,7 +89,8 @@ type CheckResult = { checker: Checker, ok: Bool }
 pub fn check_program(
   resolved: Resolution,
   modules: List<ParsedModule>,
-) -> CheckResult / {abort.raise} = check_program_with(resolved, modules, empty_cache)
+) -> CheckResult / {abort.raise} =
+  check_program_with(resolved, modules, empty_cache(modules.len()))
 
 pub fn check_diagnostics(
   resolved: Resolution,
@@ -328,10 +332,10 @@ fn in_body_order(sites: List<MemberSite>, bodies: List<TypedBody<Bytes>>) -> Lis
     }));
   let listed = bodies.fold(
     { out: [], named: Map::new() },
-    |accumulator: { out: List<MemberSite>, named: Map<Bytes, Bool> }, b: TypedBody<Bytes>|
+    |accumulator: { out: List<MemberSite>, named: Set<Bytes> }, b: TypedBody<Bytes>|
       match by.get(b.owner) {
         Some(ys) -> if accumulator.named.contains(b.owner) { accumulator } else {
-          { out: accumulator.out.concat(ys), named: accumulator.named.insert(b.owner, true) }
+          { out: accumulator.out.concat(ys), named: accumulator.named.insert(b.owner) }
         },
         None -> accumulator,
       },
@@ -391,7 +395,7 @@ fn resolved_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise, pr
               accumulator.push({
                 name: witness_param_name(w.param),
                 ty: int_type,
-                span: dummy_span,
+                span: generated_span,
               }),
             None -> accumulator,
           }),
@@ -639,8 +643,8 @@ fn needs_renumbering(ty: Type) -> Bool =
   }
 
 pub type ElaborationResult = {
-  ends: Map<Bytes, Bool>,
-  stated: Map<Bytes, Bool>,
+  ends: Set<Bytes>,
+  stated: Set<Bytes>,
   bodies: List<TypedBody<Type>>,
 }
 
@@ -658,17 +662,17 @@ pub fn elaborate(
   }
 }
 
-pub fn terminating_definitions(definitions: List<DefinitionInfo>) -> Map<Bytes, Bool> =
-  definitions.fold(Map::new(), |accumulator: Map<Bytes, Bool>, definition_info: DefinitionInfo|
+pub fn terminating_definitions(definitions: List<DefinitionInfo>) -> Set<Bytes> =
+  definitions.fold(Set::empty(), |accumulator: Set<Bytes>, definition_info: DefinitionInfo|
     match definition_info.ending {
-      Terminates -> accumulator.insert(definition_info.name, true),
+      Terminates -> accumulator.insert(definition_info.name),
       _ -> accumulator,
     })
 
-pub fn measured_definitions(definitions: List<DefinitionInfo>) -> Map<Bytes, Bool> =
-  definitions.fold(Map::new(), |accumulator: Map<Bytes, Bool>, definition_info: DefinitionInfo|
+pub fn measured_definitions(definitions: List<DefinitionInfo>) -> Set<Bytes> =
+  definitions.fold(Set::empty(), |accumulator: Set<Bytes>, definition_info: DefinitionInfo|
     match definition_info.ending {
-      TerminatesByDecreases -> accumulator.insert(definition_info.name, true),
+      TerminatesByDecreases -> accumulator.insert(definition_info.name),
       _ -> accumulator,
     })
 
@@ -946,11 +950,11 @@ fn dump_checked(checker: Checker) -> Bytes / {abort.raise} =
 
 fn dedup_diagnostics(diagnostics: List<Diagnostic>) -> List<Diagnostic> =
   diagnostics.fold(
-    { seen: Map::new(), unique: [] },
-    |accumulator: { seen: Map<Diagnostic, Bool>, unique: List<Diagnostic> }, diagnostic: Diagnostic|
+    { seen: Set::empty(), unique: [] },
+    |accumulator: { seen: Set<Diagnostic>, unique: List<Diagnostic> }, diagnostic: Diagnostic|
       if accumulator.seen.contains(diagnostic) { accumulator } else {
         {
-          seen: accumulator.seen.insert(diagnostic, true),
+          seen: accumulator.seen.insert(diagnostic),
           unique: accumulator.unique.push(diagnostic),
         }
       },
@@ -1011,6 +1015,7 @@ fn cache_of(checker: Checker) -> CheckCache = {
     Map::new(),
     |accumulator: Map<Bytes, CachedDefinition>, definition_info: DefinitionInfo|
       accumulator.insert(definition_info.name, {
+        labels: definition_info.scheme.label_variables,
         effects: definition_info.effects,
         performed: definition_info.performed,
         unbounded_effects: definition_info.scaling,
@@ -1024,11 +1029,10 @@ fn cache_of(checker: Checker) -> CheckCache = {
   let tests = checker.tests.fold(Map::new(), |accumulator: Map<Bytes, CachedTest>, t: TestInfo|
     accumulator.insert(t.key, { effects: t.effects, facts: b"" }));
   {
-    ..empty_cache,
+    ..checker.known,
     definitions: definitions,
     tests: tests,
-    root: checker.known.root,
-    types: checker.known.types,
+    body_plan: CheckEvery,
   }
 }
 
@@ -1101,7 +1105,7 @@ fn scheme_of(source: Bytes, name: Bytes) -> Bytes / {abort.raise} =
 fn labelled_diagnostics(source: Bytes) -> List<List<Bytes>> / {abort.raise} =
   dedup_diagnostics(checked_m(source).checker.diagnostics).map(|diagnostic: Diagnostic|
     [diagnostic.code].concat(
-      diagnostic.labels.map(|label: Label| source.slice(label.start, label.end)),
+      diagnostic.labels.map(|label: Label| labelled_text(source, label)),
     ))
 
 fn resolved_source_bodies(checker: Checker) -> List<TypedBody<Type>> / {abort.raise} = {
@@ -1541,7 +1545,7 @@ test "an unknown name's error suggests an in-scope name when the unknown name is
       {
         code: diagnostic.code,
         at: diagnostic.labels.fold(b"", |at: Bytes, label: Label|
-          if label.primary { source.slice(label.start, label.end) } else { at }),
+          if label.primary { labelled_text(source, label) } else { at }),
         offered: diagnostic.notes_text.any(|note: Bytes| note.index_of(b"count") != None),
       })
   };
@@ -1733,7 +1737,7 @@ test "recorded facts hold a body's data ahead of the body, and decode as they we
       module: 0,
       part: WholeBody,
       params: [],
-      body: { node: TypedLiteral(l), span: dummy_span, ty: b"", releases: [] },
+      body: { node: TypedLiteral(l), span: generated_span, ty: b"", releases: [] },
     };
     encode_facts({ ..no_body_facts, bodies: [body] })
   };
@@ -2455,7 +2459,7 @@ test "a `Map` whose key type is an alias with no ordering is rejected at every s
   let source = b"type Keyed = Map<(Int) -> Int, Int>\nfn first(m: Keyed) -> Int = m.len()\nfn second(m: Keyed) -> Int = m.len()";
   let primary = |diagnostic: Diagnostic|
     diagnostic.labels.fold(b"", |accumulator: Bytes, label: Label|
-      if label.primary { source.slice(label.start, label.end) } else { accumulator });
+      if label.primary { labelled_text(source, label) } else { accumulator });
   assert_eq(source_diagnostics(source).map(primary), [b"Keyed", b"Keyed"])
 }
 
@@ -2498,8 +2502,8 @@ fn rejects_a_value(form: Bytes) -> Unit / {abort.raise} = {
   let compared = source_diagnostics(source(b"let x = 1; x == 2"));
   assert_eq(
     compared.map(|diagnostic: Diagnostic|
-      diagnostic.labels.map(|label: Label| (label.start, label.end, label.text))),
-    [[(start + 11, start + 17, b"expected `Unit`, found `Bool`")]],
+      diagnostic.labels.map(|label: Label| (label.place, label.text))),
+    [[(InSource({ module: 0, start: start + 11, end: start + 17 }), b"expected `Unit`, found `Bool`")]],
   );
   assert_eq(fixes_of(compared).map(|fix: Fix| fix.title), [b"wrap it in `assert`"]);
   assert_eq(fixes_of(compared).map(|fix: Fix| fixed_by(source(b"let x = 1; x == 2"), fix)), [
@@ -2531,7 +2535,10 @@ fn rejected_at(
     {
       code: diagnostic.code,
       message: diagnostic.message,
-      on_name: l.start == start && l.end == start + name.len(),
+      on_name: match source_span(l) {
+        Some(s) -> s.start == start && s.end == start + name.len(),
+        None -> false,
+      },
     }
   })
 }
@@ -4107,7 +4114,7 @@ fn rejections(source: Bytes) -> List<List<Bytes>> / {abort.raise} =
       diagnostic.code,
       diagnostic.message,
       diagnostic.labels.fold(b"", |accumulator: Bytes, label: Label|
-        if label.primary { source.slice(label.start, label.end) } else { accumulator }),
+        if label.primary { labelled_text(source, label) } else { accumulator }),
     ])
 
 fn label_rejections(source: Bytes) -> List<Bytes> / {abort.raise} =
@@ -7426,7 +7433,7 @@ test "a named argument is checked against the `keep` of the parameter it names, 
 }
 
 fn hole_diagnostics(source: Bytes) -> List<Diagnostic> / {abort.raise} =
-  source_diagnostics(source).filter(|d: Diagnostic| d.code == b"W0613")
+  source_diagnostics(source).filter(|d: Diagnostic| d.code == hole_code)
 
 test "a hole checks as the expected type and performs no effects, so a function with no effects still checks" {
   assert_eq(check_codes(b"pub fn f(x: Int) -> Int = ???"), [b"W0613"]);
@@ -7504,7 +7511,7 @@ fn with_effects(row_and_body: Bytes) -> Bytes =
 
 fn unperformed_in(src: Bytes) -> List<Bytes> / {abort.raise} =
   valid_module_checker(src).unperformed.flat_map(|d: Diagnostic| d.labels).map(|l: Label|
-    src.slice(l.start, l.end))
+    labelled_text(src, l))
 
 fn narrowed(src: Bytes) -> Bytes / {abort.raise} =
   match fixes_of(valid_module_checker(src).unperformed) {
@@ -7557,7 +7564,7 @@ fn unperformed_beside_a_module(src: Bytes) -> List<Bytes> / {abort.raise} =
     Err(rejected) -> panic(String::of_bytes_lossy(rejected)),
     Ok(x) ->
       check_program(x.resolution, x.modules).checker.unperformed.flat_map(|d: Diagnostic|
-        d.labels).map(|l: Label| src.slice(l.start, l.end)),
+        d.labels).map(|l: Label| labelled_text(src, l)),
   }
 
 test "a set from another module is treated the same way" {

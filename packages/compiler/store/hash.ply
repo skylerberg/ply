@@ -1,6 +1,9 @@
+import std.set (Set)
+import compiler.codes (never_used_code)
+import compiler.store.hash.forms (framed_body, framed_head, SingleBody, MemberBody)
 import compiler.syntax.parsing (Warning)
 import compiler.store.hash.graph (NodeElsewhere)
-import compiler.syntax.parsing (Span, span_bin, dummy_span)
+import compiler.syntax.parsing (Span, span_bin, generated_span)
 import std.bin
 import compiler.syntax.type_syntax (TypeExpression)
 import compiler.syntax.expressions (Expression, LambdaExpression, Param, expression_span,
@@ -42,7 +45,7 @@ pub fn body_key(body: Bytes) -> Option<Bytes> / {abort.raise} =
   match envelope(body) {
     Some(e) -> {
       let payload = blake3(body.slice(e.at, body.len()));
-      Some(if e.kind == 0 { payload } else { member_hash(payload, e.class) })
+      Some(match e.frame { SingleBody -> payload, MemberBody(class) -> member_hash(payload, class) })
     },
     None -> None,
   }
@@ -53,44 +56,43 @@ pub fn body_component(body: Bytes) -> Option<{ id: Bytes, members: List<Bytes> }
     Some(e) -> {
       let payload = body.slice(e.at, body.len());
       let id = blake3(payload);
-      if e.kind == 0 { Some({ id: id, members: [id] }) } else {
-        match payload.u32_at(0) {
+      match e.frame {
+        SingleBody -> Some({ id: id, members: [id] }),
+        MemberBody(_) -> match payload.u32_at(0) {
           Some(count) -> if count > payload.len() / 4 { None } else {
             Some({ id: id, members: range(0, count).map(|class: Int| member_hash(id, class)) })
           },
           None -> None,
-        }
+        },
       }
     },
   }
 
-pub fn checked_body(body: Bytes, resolved_calls: Map<CallSite, Choice>) -> Bytes / {abort.raise} = {
-  let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
-  if kind != 2 && kind != 3 { body } else {
-    let from = if kind == 2 { 1 } else { 5 };
-    let n = match body.u32_at(from) { Some(x) -> x, None -> panic("a malformed body") };
-    let picks = match bin::decode(body.slice(from + 4, from + 4 + n), pending_resolutions_bin()) {
-      Ok(p) -> p,
-      Err(_) -> panic("a malformed body"),
-    };
-    Bytes::concat_all([
-      byte_of_int(kind - 2),
-      body.slice(1, from),
-      encoded_resolutions(
-        picks.map(|member: List<CallResolution>|
-          member.map(|p: CallResolution|
-            match p { Known(c) -> c, Pending(site) -> choice_at(resolved_calls, site) })),
-      ),
-      body.slice(from + 4 + n, body.len()),
-    ])
+pub fn checked_body(body: Bytes, resolved_calls: Map<CallSite, Choice>) -> Bytes / {abort.raise} =
+  match framed_body(body) {
+    None -> body,
+    Some(f) -> if !f.pending { body } else {
+      let picks = match bin::decode(body.slice(f.picks, f.at), pending_resolutions_bin()) {
+        Ok(p) -> p,
+        Err(_) -> panic("a malformed body"),
+      };
+      Bytes::concat_all([
+        framed_head(f, false),
+        encoded_resolutions(
+          picks.map(|member: List<CallResolution>|
+            member.map(|p: CallResolution|
+              match p { Known(c) -> c, Pending(site) -> choice_at(resolved_calls, site) })),
+        ),
+        body.slice(f.at, body.len()),
+      ])
+    },
   }
-}
 
 pub fn checked_hashes(
   hashes: HashOutput,
   sites: List<MemberSite>,
-  unread: Map<Bytes, Bool>,
-  unread_tests: Map<Bytes, Bool>,
+  unread: Set<Bytes>,
+  unread_tests: Set<Bytes>,
 ) -> HashOutput / {abort.raise} = {
   let resolved_calls = called_at(sites);
   {
@@ -246,14 +248,14 @@ fn uses_over(
   fixed: CachedHashes,
   first: () -> List<FirstPass> / {abort.raise},
 ) -> IndexUses / {abort.raise} = {
-  let named = fixed.nodes.fold(Map::new(), |accumulator: Map<Bytes, Bool>, f: CachedNode|
-    accumulator.insert(definition_key(f.name, f.declaration), true));
+  let named = fixed.nodes.fold(Set::empty(), |accumulator: Set<Bytes>, f: CachedNode|
+    accumulator.insert(definition_key(f.name, f.declaration)));
   if index.nodes.fold(true, |all: Bool, node: Node|
       all && named.contains(definition_key(node.name, is_declaration(node)))) {
-    let tested = fixed.tests.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: CachedTest|
-      accumulator.insert(t.key, true));
-    let lawed = fixed.laws.fold(Map::new(), |accumulator: Map<Bytes, Bool>, l: CachedLaw|
-      accumulator.insert(l.key, true));
+    let tested = fixed.tests.fold(Set::empty(), |accumulator: Set<Bytes>, t: CachedTest|
+      accumulator.insert(t.key));
+    let lawed = fixed.laws.fold(Set::empty(), |accumulator: Set<Bytes>, l: CachedLaw|
+      accumulator.insert(l.key));
     let tests = index.tests.filter(|t: TestNode| !tested.contains(t.key));
     let laws = index.laws.filter(|l: LawNode| !lawed.contains(l.key));
     {
@@ -332,11 +334,11 @@ fn node_edges_of(index: Index, first: List<FirstPass>) -> List<List<Int>> / {abo
   range(0, index.nodes.len()).map(|v: Int|
     node_edges(index, index.nodes.get(v), first.get(v).references))
 
-fn cached_node_indexes(index: Index, fixed: List<CachedNode>) -> Map<Int, Bool> / {abort.raise} = {
+fn cached_node_indexes(index: Index, fixed: List<CachedNode>) -> Set<Int> / {abort.raise} = {
   let keys = node_keys(index);
-  fixed.fold(Map::new(), |accumulator: Map<Int, Bool>, f: CachedNode|
+  fixed.fold(Set::empty(), |accumulator: Set<Int>, f: CachedNode|
     match keys.get(definition_key(f.name, f.declaration)) {
-      Some(v) -> accumulator.insert(v, true),
+      Some(v) -> accumulator.insert(v),
       None -> accumulator,
     })
 }
@@ -373,13 +375,13 @@ fn node_span(node: Node) -> Span =
     NodeFn(d) -> d.span,
     NodeType(d) -> d.span,
     NodeEffect(d) -> d.span,
-    NodeElsewhere(_) -> dummy_span,
+    NodeElsewhere(_) -> generated_span,
   }
 
 fn use_nodes(
   index: Index,
   edges: List<List<Int>>,
-  cached_indexes: Map<Int, Bool>,
+  cached_indexes: Set<Int>,
   tests: List<List<Int>>,
   laws: List<List<Int>>,
 ) -> List<UseNode> / {abort.raise} = {
@@ -432,24 +434,24 @@ derive bin for UseLink
 pub fn link_of(r: UseNode) -> UseLink =
   { key: r.key, root: r.root, leads: r.leads, reported: r.unused != None }
 
-fn reached_keys(links: List<UseLink>) -> Map<Bytes, Bool> / {abort.raise} = {
+fn reached_keys(links: List<UseLink>) -> Set<Bytes> / {abort.raise} = {
   let by_key = links.fold(Map::new(), |accumulator: Map<Bytes, UseLink>, r: UseLink|
     if r.key.len() == 0 { accumulator } else { accumulator.insert(r.key, r) });
   iterate(
     {
-      seen: Map::new(),
+      seen: Set::empty(),
       work: links.fold([], |accumulator: List<Bytes>, r: UseLink|
         if !r.root { accumulator }
         else if r.key.len() == 0 { accumulator.concat(r.leads) }
         else { accumulator.push(r.key) }),
     },
     1000000000,
-    |x: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
+    |x: { seen: Set<Bytes>, work: List<Bytes> }|
       match x.work {
         [] -> Stop(x.seen),
         [k, ..rest] -> if x.seen.contains(k) { Continue({ ..x, work: rest }) } else {
           Continue({
-            seen: x.seen.insert(k, true),
+            seen: x.seen.insert(k),
             work: match by_key.get(k) { Some(r) -> r.leads.concat(rest), None -> rest },
           })
         },
@@ -569,10 +571,10 @@ fn unused_diagnostic(index: Index, node: Node) -> Diagnostic / {abort.raise} = {
       },
     NodeType(d) -> { kind: b"type", span: d.name.span },
     NodeEffect(d) -> { kind: b"effect", span: d.name.span },
-    NodeElsewhere(_) -> { kind: b"name", span: dummy_span },
+    NodeElsewhere(_) -> { kind: b"name", span: generated_span },
   };
   {
-    code: b"W0611",
+    code: never_used_code,
     labels: [label_at(node.module, named.span, true, b"never used")],
     text: b"",
     message: Bytes::concat_all([named.kind, b" `", node.name, b"` is never used"]),
@@ -692,7 +694,7 @@ const itemized: List<Source> =
 test "hashing from cached definition nodes gives the same hashes and unused report as hashing from scratch" {
   let index = index_sources(itemized);
   let fresh = hashed_and_unused(index, no_cached_hashes, []);
-  let fixed = cached_nodes(index, fresh.hashes, Map::new().insert(b"base", true));
+  let fixed = cached_nodes(index, fresh.hashes, Map::new().insert(b"base"));
   assert(
     fixed.filter(|f: CachedNode| !f.declaration).len() > 0,
     Some("the fixture's base defines functions"),
@@ -738,8 +740,8 @@ test "hashing a program from a complete cache of nodes, tests and laws gives the
   ]);
   let index = index_sources(sources);
   let fresh = hashed_and_unused(index, no_cached_hashes, []);
-  let all = sources.fold(Map::new(), |accumulator: Map<Bytes, Bool>, s: Source|
-    accumulator.insert(s.name, true));
+  let all = sources.fold(Set::empty(), |accumulator: Set<Bytes>, s: Source|
+    accumulator.insert(s.name));
   let from_cache = hashed_and_unused(index, cached_hashes_of(index, fresh.hashes, all), []);
   assert_eq(from_cache.hashes, fresh.hashes);
   assert_eq(from_cache.unused, [])
@@ -1029,7 +1031,7 @@ test "a module with a test that uses `simulate` depends on the scheduler's funct
     source_text: b"fn three() -> Int = 3\ntest \"x\" {\n  let r = simulate { three() };\n  assert_eq(r, 3)\n}\n",
   };
   let scheduled = [b"std.internal.schedule.nested", b"std.internal.schedule.simulated"];
-  let scheduled_present = |functions: Map<Bytes, Bool>|
+  let scheduled_present = |functions: Set<Bytes>|
     scheduled.filter(|n: Bytes| functions.contains(n));
   let h = hash_index(index_sources([program, scheduler]));
   assert_eq(scheduled_present(reachable_functions(h, [ItemKeyed(b"m.x")])), scheduled);
@@ -1456,7 +1458,7 @@ test "printing a method call keeps it as written, with named arguments naming th
   let source = b"pub type Bag = | Bag(Int)\npub fn Bag::size(b: Bag) -> Int = match b { Bag(n) -> n + 1 }\npub type Cart = | Cart(Int)\npub fn Cart::size(c: Cart) -> Int = match c { Cart(n) -> n }\npub fn Cart::scaled(c: Cart, by: Int = 2, plus: Int = 0) -> Int = c.size() * by + plus\npub fn total(c: Cart) -> Int = c.size()\npub fn more(c: Cart) -> Int = c.scaled(plus: 3)";
   let index = index_sources([{ name: b"m", source_text: source }]);
   let body_of = |name: Bytes|
-    index.nodes.fold(dummy_span, |accumulator: Span, n: Node|
+    index.nodes.fold(generated_span, |accumulator: Span, n: Node|
       match n.body {
         NodeFn(d) -> if n.name == name { expression_span(d.body) } else { accumulator },
         _ -> accumulator,
@@ -2261,7 +2263,7 @@ test "reading each module's saved hash record finds the same functions, with the
   ]);
   let h = hash_index(index);
   let records = [b"std.show", b"std.cases", b"low", b"app"].map(|m: Bytes|
-    module_record(cached_hashes_of(index, h, Map::new().insert(m, true))));
+    module_record(cached_hashes_of(index, h, Map::new().insert(m))));
   let g = recorded_graph(
     records.map(|r: Bytes|
       match bin::decode(r, module_record_bin()) {
@@ -2273,7 +2275,7 @@ test "reading each module's saved hash record finds the same functions, with the
     {
       functions: r.functions.fold(
         Map::new(),
-        |accumulator: Map<Bytes, Bytes>, n: Bytes, _: Bool|
+        |accumulator: Map<Bytes, Bytes>, n: Bytes|
           match by_name(h.definitions).get(n) {
             Some(x) -> accumulator.insert(n, x),
             None -> accumulator,
@@ -2281,7 +2283,7 @@ test "reading each module's saved hash record finds the same functions, with the
       ),
       declarations: r.declarations.fold(
         Map::new(),
-        |accumulator: Map<Bytes, Bytes>, n: Bytes, _: Bool|
+        |accumulator: Map<Bytes, Bytes>, n: Bytes|
           match by_name(h.declarations).get(n) {
             Some(x) -> accumulator.insert(n, x),
             None -> accumulator,
@@ -2306,9 +2308,8 @@ test "reading each module's saved hash record finds the same functions, with the
     match r { Some(x) -> x.functions.values().concat(x.declarations.values()), None -> [] };
   assert_eq(
     recorded_hashes(g, [{ key: plain, case: false }, { key: ranged, case: true }]).sort(),
-    alone(recorded_reachable_hashes(g, plain, false)).concat(alone(case)).fold(
-      Map::new(),
-      |m: Map<Bytes, Bool>, h: Bytes| m.insert(h, true),
+    alone(recorded_reachable_hashes(g, plain, false)).concat(alone(case)).fold(Set::empty(),
+      |m: Set<Bytes>, h: Bytes| m.insert(h),
     ).keys(
     ),
   );

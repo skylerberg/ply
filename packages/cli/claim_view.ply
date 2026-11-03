@@ -1,4 +1,6 @@
 import progress
+import std.set (Set)
+import compiler.check.resolve.tables (Place, InSource, WholeFile, Unplaced, place_module, source_span)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (Analysis)
 import compiler.front.exports (ItemAt)
@@ -37,6 +39,7 @@ import sources (File)
 import std.bin
 import std.hash (blake3)
 import std.list
+import std.list (somes)
 import std.string
 
 pub type ClaimReading = { later: LaterReading, summaries: List<HashSummary> }
@@ -90,13 +93,17 @@ fn placed_at(placing: Map<Int, Placement>, at: ModuleSpan) -> ModuleSpan =
     None -> at,
   }
 
+fn placed_place(placing: Map<Int, Placement>, place: Place) -> Place =
+  match place {
+    InSource(s) -> InSource(placed_at(placing, s)),
+    WholeFile(m) -> WholeFile(placed_at(placing, { module: m, start: 0, end: 0 }).module),
+    Unplaced -> Unplaced,
+  }
+
 fn placed_diagnostic(placing: Map<Int, Placement>, d: Diagnostic) -> Diagnostic =
   {
     ..d,
-    labels: d.labels.map(|l: Label| {
-      let at = placed_at(placing, { module: l.module, start: l.start, end: l.end });
-      { ..l, module: at.module, start: at.start, end: at.end }
-    }),
+    labels: d.labels.map(|l: Label| { ..l, place: placed_place(placing, l.place) }),
     fixes: d.fixes.map(|f: Fix|
       {
         ..f,
@@ -187,7 +194,7 @@ type FreshModules = {
   definitions: Map<Bytes, List<Definition>>,
 }
 
-fn law_module(names: Map<Bytes, Bool>, key: String) -> Bytes = {
+fn law_module(names: Set<Bytes>, key: String) -> Bytes = {
   let parts = Bytes::of_string(key).split(b".");
   parts.take(parts.len() - 1).fold(
     { prefix: b"", found: b"" },
@@ -201,7 +208,8 @@ fn law_module(names: Map<Bytes, Bool>, key: String) -> Bytes = {
 
 fn warnings_by_module(warnings: List<Diagnostic>) -> Map<Int, List<Diagnostic>> =
   warnings.fold(Map::new(), |found: Map<Int, List<Diagnostic>>, d: Diagnostic|
-    d.labels.fold(Map::new(), |at: Map<Int, Bool>, l: Label| at.insert(l.module, true)).keys().fold(
+    d.labels.fold(Set::empty(), |at: Set<Int>, l: Label|
+      match place_module(l.place) { Some(m) -> at.insert(m), None -> at }).keys().fold(
       found,
       |all: Map<Int, List<Diagnostic>>, module: Int|
         all.insert(module, all.get(module).unwrap_or([]).push(d)),
@@ -213,7 +221,7 @@ fn fresh_by_module(
   names: List<Bytes>,
   opened: Map<Bytes, Int>,
 ) -> FreshModules = {
-  let known = names.fold(Map::new(), |found: Map<Bytes, Bool>, m: Bytes| found.insert(m, true));
+  let known = names.fold(Set::empty(), |found: Set<Bytes>, m: Bytes| found.insert(m));
   let module_of = w.checked.definitions.fold(
     Map::new(),
     |found: Map<String, Bytes>, d: DefinitionInfo|
@@ -463,8 +471,7 @@ test "a claim checked by group keeps its place in its file" {
 
 fn primary_places(ds: List<Diagnostic>) -> List<ModuleSpan> =
   ds.flat_map(|d: Diagnostic|
-    d.labels.filter(|l: Label| l.primary).map(|l: Label|
-      { module: l.module, start: l.start, end: l.end })).sort_by(|a: ModuleSpan, b: ModuleSpan|
+    somes(d.labels.filter(|l: Label| l.primary).map(source_span))).sort_by(|a: ModuleSpan, b: ModuleSpan|
     a.start <= b.start)
 
 const cycle_text: Bytes =

@@ -1,3 +1,4 @@
+import std.set (Set)
 import std.bytes (ascii_of_int)
 import compiler.check.known (none_constructor, some_constructor)
 import compiler.check.types (Type, NamedType, RecordType, bool_type, float_type, int_type,
@@ -9,7 +10,7 @@ import compiler.emit.lower.representation (leaf_type)
 import compiler.emit.lower.base (drop_unread_conversions)
 import compiler.emit.release (boxed_case_of)
 import compiler.emit.typing (unknown_type)
-import compiler.syntax.parsing (dummy_span)
+import compiler.syntax.parsing (generated_span)
 import compiler.emit.keys (Named, Root)
 import compiler.emit.typed_ir.containers (Retain)
 import compiler.emit.typed_ir.handling (empty_instance)
@@ -48,13 +49,13 @@ type Facts = {
   variables: Map<Int, Variable>,
   field_sources: Map<Int, { of: Int, path: Path }>,
   direct: Map<Int, List<Int>>,
-  made: Map<Int, Bool>,
+  made: Set<Int>,
   next: Int,
   opened: Map<Int, List<Variable>>,
   alias: Map<Int, Variable>,
   stacks: Map<Int, List<Variable>>,
-  promoted: Map<Int, Bool>,
-  immortal: Map<Int, Bool>,
+  promoted: Set<Int>,
+  immortal: Set<Int>,
 }
 
 type Live = Map<Int, Variable>
@@ -220,12 +221,12 @@ fn counted_block(
 
 type FieldReadScan = {
   gets: List<{ var: Variable, of: Variable, path: Path, pass: Int }>,
-  used_whole: Map<Int, Bool>,
-  taken: Map<Int, Bool>,
+  used_whole: Set<Int>,
+  taken: Set<Int>,
   bound: Map<Int, Int>,
   reads: Map<Int, Map<Path, Int>>,
   passed: Map<Int, List<{ id: Int, path: Path }>>,
-  unwritten: Map<Int, Bool>,
+  unwritten: Set<Int>,
 }
 
 fn built_in_place(f: Function) -> Function = {
@@ -279,7 +280,7 @@ type BuildState = {
   pending: Map<Int, Pending>,
   spots: Map<Int, InPlaceRead>,
   nested: Map<Int, NestedUpdate>,
-  gone: Map<Int, Bool>,
+  gone: Set<Int>,
 }
 
 fn built_into(b: Block, uses: Map<Int, Int>) -> Block = {
@@ -317,7 +318,7 @@ fn built_into(b: Block, uses: Map<Int, Int>) -> Block = {
                 } else { s.nested },
                 None -> s.nested,
               },
-              gone: folded.gone.fold(s.gone, |g: Map<Int, Bool>, id: Int| g.insert(id, true)),
+              gone: folded.gone.fold(s.gone, |g: Set<Int>, id: Int| g.insert(id)),
             }
           },
           Allocate(m) -> match m.made {
@@ -333,7 +334,7 @@ fn built_into(b: Block, uses: Map<Int, Int>) -> Block = {
                 pending: if uses.get(l.var.id) == Some(1) {
                   s.pending.insert(l.var.id, { shape: spliced.shape, args: spliced.args })
                 } else { s.pending },
-                gone: spliced.used.fold(s.gone, |g: Map<Int, Bool>, id: Int| g.insert(id, true)),
+                gone: spliced.used.fold(s.gone, |g: Set<Int>, id: Int| g.insert(id)),
               }
             },
             _ -> { ..s, out: s.out.push(i) },
@@ -445,7 +446,7 @@ fn take_fields(f: Function) -> Function = {
   let s = scan_field_reads(
     {
       gets: [],
-      used_whole: Map::new(),
+      used_whole: Set::empty(),
       taken: Map::new(),
       bound: start,
       reads: Map::new(),
@@ -471,10 +472,9 @@ fn take_fields(f: Function) -> Function = {
   );
   if with_reuse_candidate.len() == 0 { f } else {
     let facts = facts_of(f);
-    let takeable_ids = with_reuse_candidate.fold(
-      Map::new(),
-      |m: Map<Int, Bool>, id: Int, of: Variable|
-        if owns(facts, of) { m.insert(id, true) } else { m },
+    let takeable_ids = with_reuse_candidate.fold(Set::empty(),
+      |m: Set<Int>, id: Int, of: Variable|
+        if owns(facts, of) { m.insert(id) } else { m },
     );
     if takeable_ids.len() == 0 { f } else { { ..f, body: with_takes(f.body, takeable_ids) } }
   }
@@ -486,13 +486,13 @@ fn updated_past(s: FieldReadScan, u: { of: Variable, sets: List<FieldWrite> }) -
     Some(rs) ->
       {
         ..s,
-        unwritten: rs.fold(s.unwritten, |m: Map<Int, Bool>, r: { id: Int, path: Path }|
+        unwritten: rs.fold(s.unwritten, |m: Set<Int>, r: { id: Int, path: Path }|
           match r.path {
             FieldPath(p) -> if u.sets.any(|x: FieldWrite| x.at == p.at) { m }
-            else { m.insert(r.id, true) },
+            else { m.insert(r.id) },
             InlineRecordPath(at) -> if u.sets.any(|x: FieldWrite| x.at == at) { m }
-            else { m.insert(r.id, true) },
-            _ -> m.insert(r.id, true),
+            else { m.insert(r.id) },
+            _ -> m.insert(r.id),
           }),
       },
   }
@@ -573,7 +573,7 @@ fn scan_field_reads(s: FieldReadScan, b: Block, pass: Int) -> FieldReadScan =
               accumulator,
               takes_except_records(u.sets.map(|x: FieldWrite| x.arg)),
             );
-            updated_past({ ..sets, taken: sets.taken.insert(u.of.id, true) }, u)
+            updated_past({ ..sets, taken: sets.taken.insert(u.of.id) }, u)
           },
           _ -> used_in(accumulator, operands(l.value)),
         };
@@ -643,8 +643,8 @@ fn used_in(s: FieldReadScan, operands: List<Operand>) -> FieldReadScan =
       Some(v) ->
         {
           ..accumulator,
-          used_whole: accumulator.used_whole.insert(v.id, true),
-          taken: if o.takes { accumulator.taken.insert(v.id, true) } else { accumulator.taken },
+          used_whole: accumulator.used_whole.insert(v.id),
+          taken: if o.takes { accumulator.taken.insert(v.id) } else { accumulator.taken },
         },
       None -> accumulator,
     })
@@ -652,7 +652,7 @@ fn used_in(s: FieldReadScan, operands: List<Operand>) -> FieldReadScan =
 fn received_in(s: FieldReadScan, args: List<Arg>) -> FieldReadScan =
   used_in(s, args.map(|a: Arg| { arg: a, takes: true }))
 
-fn with_takes(b: Block, with_reuse_candidate: Map<Int, Bool>) -> Block =
+fn with_takes(b: Block, with_reuse_candidate: Set<Int>) -> Block =
   b.map(|i: Instruction|
     match i {
       Let(l) -> match l.value {
@@ -690,12 +690,12 @@ fn facts_of(f: Function) -> Facts = {
     variables: Map::new(),
     field_sources: Map::new(),
     direct: Map::new(),
-    made: Map::new(),
+    made: Set::empty(),
     next: 0,
     opened: Map::new(),
     alias: Map::new(),
     stacks: Map::new(),
-    promoted: Map::new(),
+    promoted: Set::empty(),
     immortal: uncounted_variables(f),
   };
   let first = collect_definitions(params_defined(f, empty), f.body);
@@ -710,7 +710,7 @@ fn facts_of(f: Function) -> Facts = {
   );
   let words = first.made.fold(
     { opened: Map::new(), next: first.next },
-    |accumulator: { opened: Map<Int, List<Variable>>, next: Int }, id: Int, _: Bool|
+    |accumulator: { opened: Map<Int, List<Variable>>, next: Int }, id: Int|
       match first.variables.get(id) {
         Some(s) -> if !openable(first, got, borrowed, s) { accumulator } else {
           let parts = parts_of(s.representation);
@@ -768,7 +768,7 @@ fn facts_of(f: Function) -> Facts = {
   let scan_promotions = find_made_owned(joined, f.body);
   {
     ..joined,
-    ownership: scan_promotions.fold(joined.ownership, |h: Map<Int, Ownership>, id: Int, _: Bool|
+    ownership: scan_promotions.fold(joined.ownership, |h: Map<Int, Ownership>, id: Int|
       h.insert(id, OwnsCount)),
     promoted: scan_promotions,
   }
@@ -781,7 +781,7 @@ fn join_assigned_ownership(facts: Facts, b: Block) -> Facts = {
     join_ownership(s, sets, bound, j, sets.len())).fx
 }
 
-type JoinState = { fx: Facts, done: Map<Int, Bool> }
+type JoinState = { fx: Facts, done: Set<Int> }
 
 fn levels(m: Map<Int, Int>, b: Block, level: Int) -> Map<Int, Int> =
   b.fold(m, |accumulator: Map<Int, Int>, i: Instruction|
@@ -865,7 +865,7 @@ fn join_ownership(
               None -> OwnsCount,
             }),
           },
-          done: first.done.insert(j, true),
+          done: first.done.insert(j),
         }
       },
     }
@@ -892,11 +892,11 @@ fn assigned(m: Map<Int, List<Arg>>, b: Block) -> Map<Int, List<Arg>> =
       _ -> accumulator,
     })
 
-fn find_made_owned(facts: Facts, b: Block) -> Map<Int, Bool> =
+fn find_made_owned(facts: Facts, b: Block) -> Set<Int> =
   scan_promotions(
     facts,
     scan_last_uses(facts, { at: 0, last: Map::new(), taken: Map::new() }, b),
-    { at: 0, gone: Map::new(), last_used: Map::new(), up: Map::new() },
+    { at: 0, gone: Map::new(), last_used: Set::empty(), up: Set::empty() },
     b,
   ).up
 
@@ -958,9 +958,9 @@ fn used_at(facts: Facts, s: LastUses, k: Int, operands: List<Operand>) -> LastUs
 
 type MadeOwnedScan = {
   at: Int,
-  gone: Map<Int, Bool>,
-  last_used: Map<Int, Bool>,
-  up: Map<Int, Bool>,
+  gone: Set<Int>,
+  last_used: Set<Int>,
+  up: Set<Int>,
 }
 
 fn scan_promotions(facts: Facts, s: LastUses, r: MadeOwnedScan, b: Block) -> MadeOwnedScan =
@@ -974,9 +974,9 @@ fn scan_promotions(facts: Facts, s: LastUses, r: MadeOwnedScan, b: Block) -> Mad
           Allocate(m) -> if is_reuse_candidate(l.var, m.made, m.reuse) {
             {
               ..past,
-              gone: past.last_used.fold(past.gone, |g: Map<Int, Bool>, id: Int, _: Bool|
+              gone: past.last_used.fold(past.gone, |g: Set<Int>, id: Int|
                 match facts.variables.get(id) {
-                  Some(v) -> if v.ty == l.var.ty && owns(facts, v) { g.insert(id, true) }
+                  Some(v) -> if v.ty == l.var.ty && owns(facts, v) { g.insert(id) }
                   else { g },
                   None -> g,
                 }),
@@ -1035,28 +1035,28 @@ fn passed_at(
   let used = expanded(facts, operands);
   {
     ..r,
-    up: used.fold(r.up, |u: Map<Int, Bool>, o: Operand|
+    up: used.fold(r.up, |u: Set<Int>, o: Operand|
       match operand_variable(o.arg) {
         Some(v) -> if points_into(v.representation) { u } else {
           match facts.ownership.get(v.id) {
             Some(BorrowsFrom(bs)) -> if flattened(facts, bs).any(|x: Int| r.gone.contains(x)) {
-              u.insert(v.id, true)
+              u.insert(v.id)
             } else { u },
             _ -> u,
           }
         },
         None -> u,
       }),
-    gone: used.fold(r.gone, |g: Map<Int, Bool>, o: Operand|
+    gone: used.fold(r.gone, |g: Set<Int>, o: Operand|
       match operand_variable(o.arg) {
         Some(v) -> if o.takes && s.last.get(v.id) == Some(k) && s.taken.get(v.id) == Some(k) {
-          g.insert(v.id, true)
+          g.insert(v.id)
         } else { g },
         None -> g,
       }),
-    last_used: used.fold(r.last_used, |d: Map<Int, Bool>, o: Operand|
+    last_used: used.fold(r.last_used, |d: Set<Int>, o: Operand|
       match operand_variable(o.arg) {
-        Some(v) -> if s.last.get(v.id) == Some(k) { d.insert(v.id, true) } else { d },
+        Some(v) -> if s.last.get(v.id) == Some(k) { d.insert(v.id) } else { d },
         None -> d,
       }),
   }
@@ -1071,7 +1071,7 @@ fn given_defined(params: List<Variable>, conv: Convention, facts: Facts) -> Fact
     match params.at(i) {
       None -> accumulator,
       Some(p) -> if param_borrowed(conv, i) { defined(accumulator, p, BorrowsFrom([])) }
-      else { { ..defined(accumulator, p, OwnsCount), made: accumulator.made.insert(p.id, true) } },
+      else { { ..defined(accumulator, p, OwnsCount), made: accumulator.made.insert(p.id) } },
     })
 
 fn read_by(by: Map<Int, List<Int>>, of: Int, id: Int) -> Map<Int, List<Int>> =
@@ -1187,7 +1187,7 @@ fn collect_definitions(facts: Facts, b: Block) -> Facts =
             })
           };
           let traced = match a {
-            Owns -> { ..d, made: d.made.insert(l.var.id, true) },
+            Owns -> { ..d, made: d.made.insert(l.var.id) },
             BorrowSources(xs) -> if xs.len() == 0 { d }
             else { { ..d, direct: d.direct.insert(l.var.id, xs.map(|x: Variable| x.id)) } },
             Immortal -> d,
@@ -1217,7 +1217,7 @@ fn collect_definitions(facts: Facts, b: Block) -> Facts =
         collect_definitions(
           defined(
             carried_variables(l.state).fold(accumulator, |a: Facts, s: Variable|
-              { ..defined(a, s, OwnsCount), made: a.made.insert(s.id, true) }),
+              { ..defined(a, s, OwnsCount), made: a.made.insert(s.id) }),
             l.result,
             OwnsCount,
           ),
@@ -1607,7 +1607,7 @@ fn outer_reads(facts: Facts, b: Block, bound: List<Variable>) -> Live = {
     else { alive(facts, l, v) })
 }
 
-type Mentions = { used: Map<Int, Variable>, bound: Map<Int, Bool> }
+type Mentions = { used: Map<Int, Variable>, bound: Set<Int> }
 
 fn mentioned(facts: Facts, m: Mentions, b: Block) -> Mentions =
   b.fold(m, |accumulator: Mentions, i: Instruction|
@@ -1669,11 +1669,11 @@ fn args_in(m: Mentions, args: List<Arg>) -> Mentions =
       None -> accumulator,
     })
 
-fn bound_in(m: Mentions, v: Variable) -> Mentions = { ..m, bound: m.bound.insert(v.id, true) }
+fn bound_in(m: Mentions, v: Variable) -> Mentions = { ..m, bound: m.bound.insert(v.id) }
 
 fn planned(facts: Facts, uses: List<Operand>, after: Live) -> Plan = {
   let t = expanded(facts, uses).fold(
-    { order: [], listed: Map::new(), taken: Map::new(), read: Map::new() },
+    { order: [], listed: Set::empty(), taken: Map::new(), read: Map::new() },
     |accumulator: OperandUses, o: Operand|
       match operand_variable(o.arg) {
         Some(v) -> {
@@ -1686,8 +1686,8 @@ fn planned(facts: Facts, uses: List<Operand>, after: Live) -> Plan = {
             {
               ..accumulator,
               read: base_of(facts, v).fold(
-                accumulator.read.insert(v.id, true),
-                |r: Map<Int, Bool>, b: Int| r.insert(b, true),
+                accumulator.read.insert(v.id),
+                |r: Set<Int>, b: Int| r.insert(b),
               ),
             }
           };
@@ -1725,16 +1725,16 @@ fn planned(facts: Facts, uses: List<Operand>, after: Live) -> Plan = {
 
 type OperandUses = {
   order: List<Variable>,
-  listed: Map<Int, Bool>,
+  listed: Set<Int>,
   taken: Map<Int, Int>,
-  read: Map<Int, Bool>,
+  read: Set<Int>,
 }
 
 fn consumed(t: OperandUses, id: Int) -> Int = match t.taken.get(id) { Some(n) -> n, None -> 0 }
 
 fn listed(t: OperandUses, v: Variable) -> OperandUses =
   if t.listed.contains(v.id) { t }
-  else { { ..t, order: t.order.push(v), listed: t.listed.insert(v.id, true) } }
+  else { { ..t, order: t.order.push(v), listed: t.listed.insert(v.id) } }
 
 fn with_increment(p: Plan, v: Variable, n: Int) -> Plan =
   if n > 0 { { ..p, incs: p.incs.push(Increment({ var: v, n: n })) } } else { p }
@@ -1761,7 +1761,7 @@ fn with_counts(
     |k: { incs: List<Instruction>, renames: Map<Int, Variable>, next: Int }, x: { of: Variable, n: Int }| {
       let v = { ..x.of, id: k.next };
       {
-        incs: k.incs.push(Let({ var: v, value: retain(x.of), at: dummy_span, unwind: [] })).concat(
+        incs: k.incs.push(Let({ var: v, value: retain(x.of), at: generated_span, unwind: [] })).concat(
           increments(v, x.n - 1),
         ),
         renames: k.renames.insert(x.of.id, v),
@@ -2288,7 +2288,7 @@ test "`insert_reference_counts` adds count instructions to the body of each clos
     key: Named(b"m.f#0"),
   };
   let closure = |body: Function|
-    Closure({ body: body, captures: 0, at: dummy_span, words: no_closure_evidence });
+    Closure({ body: body, captures: 0, at: generated_span, words: no_closure_evidence });
   let f = { ..root_of([], [], AsInt, [Return(IntOperand(0))]), lambdas: [closure(lambda)] };
   let o = insert_reference_counts(f);
   assert_eq(o.lambdas, [closure({ ..lambda, body: [Decrement(p), Return(VariableOperand(q))] })]);
@@ -3234,7 +3234,7 @@ test "an arm releases the values only it reads before it falls through to the ne
           [If({ cond: BoolOperand(true), then: then, otherwise: miss })],
           [Return(VariableOperand(q))],
         ],
-        rest: [Fail({ reason: NoMatchingArm, at: dummy_span, resource: [], unwind: [] })],
+        rest: [Fail({ reason: NoMatchingArm, at: generated_span, resource: [], unwind: [] })],
       }),
     ];
   let f = root_of([p, q], [], AsWord, matched([Return(VariableOperand(p))], [Miss]));
@@ -3265,7 +3265,7 @@ test "a match arm releases the values it read before it falls through to the nex
     [
       Match({
         arms: [first, [Return(VariableOperand(xs))]],
-        rest: [Fail({ reason: NoMatchingArm, at: dummy_span, resource: [], unwind: [] })],
+        rest: [Fail({ reason: NoMatchingArm, at: generated_span, resource: [], unwind: [] })],
       }),
     ];
   let f = root_of(
@@ -3519,7 +3519,7 @@ test "a `Handle` records the values its body reads, and the code that runs after
   let inside = [
     If({
       cond: VariableOperand(c),
-      then: [Fail({ reason: NoMatchingArm, at: dummy_span, resource: [], unwind: [] })],
+      then: [Fail({ reason: NoMatchingArm, at: generated_span, resource: [], unwind: [] })],
       otherwise: [],
     }),
     bind(r, call_of([VariableOperand(p)], [0]), []),

@@ -1,3 +1,4 @@
+import std.set (Set)
 import compiler.emit.typed_ir (is_integral, param_rep, param_borrowed, reps_of, param_ownerships,
                                borrowed_where, FieldWrite, Representation, AsWord, AsInt, AsBool,
                                AsFixed, AsFlattened, AsListView, AsReuseToken, Leaf, Variable, Arg,
@@ -35,7 +36,7 @@ import compiler.emit.representations (ints_joined, FieldShape, RecordShape, kind
 import compiler.check.known (none_constructor, some_constructor)
 import compiler.check.types (Type, NamedType, RecordType, record_fields, bool_type, int_type,
                              list_type, option_type, string_type)
-import compiler.syntax.parsing (dummy_span)
+import compiler.syntax.parsing (generated_span)
 import std.bytes (ascii_of_int)
 
 type PathState = {
@@ -43,14 +44,14 @@ type PathState = {
   borrowed_from: Map<Int, List<Int>>,
   borrowed: Map<Int, Int>,
   joins: Map<Int, Bool>,
-  unset: Map<Int, Bool>,
+  unset: Set<Int>,
   opened: Map<Int, List<Variable>>,
   alias: Map<Int, Variable>,
   stacks: Map<Int, List<Variable>>,
   taken: Map<Int, List<Path>>,
-  unique_checks: Map<Int, Bool>,
-  uncounted: Map<Int, Bool>,
-  pending: Map<Int, Bool>,
+  unique_checks: Set<Int>,
+  uncounted: Set<Int>,
+  pending: Set<Int>,
 }
 
 type CheckState = {
@@ -256,7 +257,7 @@ fn body_verified(f: Function) -> Option<Bytes> = {
 fn parameter_state(
   params: List<Variable>,
   conv: Convention,
-  immortal: Map<Int, Bool>,
+  immortal: Set<Int>,
 ) -> PathState =
   range(0, params.len()).fold(
     {
@@ -264,12 +265,12 @@ fn parameter_state(
       borrowed_from: Map::new(),
       borrowed: Map::new(),
       joins: Map::new(),
-      unset: Map::new(),
+      unset: Set::empty(),
       opened: Map::new(),
       alias: Map::new(),
       stacks: Map::new(),
       taken: Map::new(),
-      unique_checks: Map::new(),
+      unique_checks: Set::empty(),
       uncounted: immortal,
       pending: Map::new(),
     },
@@ -431,7 +432,7 @@ fn check_block(f: Function, context: Enclosing, w: CheckState, b: Block) -> Chec
                   ..x,
                   path_state: {
                     ..x.path_state,
-                    pending: x.path_state.pending.insert(s.var.id, true),
+                    pending: x.path_state.pending.insert(s.var.id),
                   },
                 }
               } else if borrowed_here(accumulator.path_state, v) {
@@ -1303,7 +1304,7 @@ fn note_take(w: CheckState, y: Variable, value: Rvalue) -> CheckState =
           ..w,
           path_state: {
             ..w.path_state,
-            unique_checks: w.path_state.unique_checks.insert(y.id, true),
+            unique_checks: w.path_state.unique_checks.insert(y.id),
           },
         },
       _ -> w,
@@ -1401,7 +1402,7 @@ fn borrowed_after(before: PathState, out: List<PathState>) -> Map<Int, List<Int>
       } else { n }))
 
 fn joined_paths(before: PathState, x: PathState, y: PathState) -> PathState =
-  x.pending.fold(x, |h: PathState, id: Int, _: Bool|
+  x.pending.fold(x, |h: PathState, id: Int|
     if !before.joins.contains(id) || before.pending.contains(id) || y.pending.contains(id) { h }
     else {
       {
@@ -1415,7 +1416,7 @@ fn joined_paths(before: PathState, x: PathState, y: PathState) -> PathState =
     })
 
 fn counts_with_pending(h: PathState, expected: Map<Int, Int>) -> Map<Int, Int> =
-  h.pending.fold(h.owned_counts, |m: Map<Int, Int>, id: Int, _: Bool|
+  h.pending.fold(h.owned_counts, |m: Map<Int, Int>, id: Int|
     match expected.get(id) {
       Some(n) -> if m.contains(id) { m } else { m.insert(id, n) },
       None -> m,
@@ -1500,13 +1501,13 @@ fn joined(before: CheckState, a: CheckState, b: CheckState) -> CheckState =
 fn scoped(h: PathState, outer: PathState) -> PathState =
   outer.unset.fold(
     { ..h, joins: outer.joins, unset: outer.unset },
-    |s: PathState, id: Int, _: Bool|
+    |s: PathState, id: Int|
       if h.unset.contains(id) { s }
       else { { ..s, joins: s.joins.insert(id, true), unset: s.unset.remove(id) } },
   )
 
 fn declared(h: PathState, id: Int) -> PathState =
-  { ..h, joins: h.joins.insert(id, false), unset: h.unset.insert(id, true) }
+  { ..h, joins: h.joins.insert(id, false), unset: h.unset.insert(id) }
 
 fn used(w: CheckState, operands: List<{ arg: Arg, takes: Bool }>) -> CheckState =
   operands.fold(w, |accumulator: CheckState, o: { arg: Arg, takes: Bool }|
@@ -1712,7 +1713,7 @@ fn escaping(h: PathState, value: Rvalue) -> Option<Variable> =
 
 pub fn points_into(r: Representation) -> Bool = r == AsAddress
 
-pub fn is_uncounted(y: Variable, value: Rvalue, immortal: Map<Int, Bool>) -> Bool =
+pub fn is_uncounted(y: Variable, value: Rvalue, immortal: Set<Int>) -> Bool =
   match value {
     Static(_) -> true,
     Aggregate(g) ->
@@ -1725,37 +1726,37 @@ pub fn is_uncounted(y: Variable, value: Rvalue, immortal: Map<Int, Bool>) -> Boo
     _ -> match count_shared_with(y, value) { Some(x) -> immortal.contains(x.id), None -> false },
   }
 
-pub fn uncounted_variables(f: Function) -> Map<Int, Bool> = {
+pub fn uncounted_variables(f: Function) -> Set<Int> = {
   let sets = joins_set(Map::new(), f.body);
   range(0, binders(f.body) + 1).fold(
     { found: Map::new(), done: false },
-    |accumulator: { found: Map<Int, Bool>, done: Bool }, _: Int|
+    |accumulator: { found: Set<Int>, done: Bool }, _: Int|
       if accumulator.done { accumulator } else {
         let lets = uncounted_lets(accumulator.found, f.body);
-        let next = sets.fold(lets, |m: Map<Int, Bool>, j: Int, args: List<Arg>|
+        let next = sets.fold(lets, |m: Set<Int>, j: Int, args: List<Arg>|
           if args.all(|a: Arg|
               match a {
                 VariableOperand(v) -> !is_refcounted(v.representation) || m.contains(v.id),
                 _ -> true,
-              }) { m.insert(j, true) }
+              }) { m.insert(j) }
           else { m });
         { found: next, done: next.len() == accumulator.found.len() }
       },
   ).found
 }
 
-fn uncounted_lets(found: Map<Int, Bool>, b: Block) -> Map<Int, Bool> =
-  b.fold(found, |m: Map<Int, Bool>, i: Instruction|
+fn uncounted_lets(found: Set<Int>, b: Block) -> Set<Int> =
+  b.fold(found, |m: Set<Int>, i: Instruction|
     match i {
-      Let(l) -> if is_uncounted(l.var, l.value, m) { m.insert(l.var.id, true) } else { m },
+      Let(l) -> if is_uncounted(l.var, l.value, m) { m.insert(l.var.id) } else { m },
       If(x) -> uncounted_lets(uncounted_lets(m, x.then), x.otherwise),
       Case(c) ->
         c.arms.fold(
           uncounted_lets(m, c.rest),
-          |n: Map<Int, Bool>, a: { when: Int, body: Block }| uncounted_lets(n, a.body),
+          |n: Set<Int>, a: { when: Int, body: Block }| uncounted_lets(n, a.body),
         ),
       Match(x) ->
-        x.arms.fold(uncounted_lets(m, x.rest), |n: Map<Int, Bool>, a: Block| uncounted_lets(n, a)),
+        x.arms.fold(uncounted_lets(m, x.rest), |n: Set<Int>, a: Block| uncounted_lets(n, a)),
       Loop(l) -> uncounted_lets(m, l.body),
       Handle(h) -> uncounted_lets(m, h.body),
       _ -> m,
@@ -2123,7 +2124,7 @@ pub fn call_of(args: List<Arg>, borrowed: List<Int>) -> Rvalue =
   })
 
 pub fn bind(v: Variable, value: Rvalue, unwind: List<Variable>) -> Instruction =
-  Let({ var: v, value: value, at: dummy_span, unwind: unwind })
+  Let({ var: v, value: value, at: generated_span, unwind: unwind })
 
 test "a record update may reuse the memory of another record only if that record has the same fields" {
   let text = string_type;
@@ -2421,7 +2422,7 @@ test "in a `Match`, the next arm starts with the ownership state the previous ar
         ],
         rest: [
           Decrement(q),
-          Fail({ reason: NoMatchingArm, at: dummy_span, resource: [], unwind: [] }),
+          Fail({ reason: NoMatchingArm, at: generated_span, resource: [], unwind: [] }),
         ],
       }),
     ]);
@@ -2538,7 +2539,7 @@ test "the failure path out of a `Handle` body must release exactly the variables
         [
           If({
             cond: VariableOperand(c),
-            then: [Fail({ reason: NoMatchingArm, at: dummy_span, resource: [], unwind: [] })],
+            then: [Fail({ reason: NoMatchingArm, at: generated_span, resource: [], unwind: [] })],
             otherwise: [],
           }),
         ],
@@ -2555,7 +2556,7 @@ test "the failure path out of a `Handle` body must release exactly the variables
             cond: VariableOperand(c),
             then: [
               Decrement(p),
-              Fail({ reason: NoMatchingArm, at: dummy_span, resource: [], unwind: [] }),
+              Fail({ reason: NoMatchingArm, at: generated_span, resource: [], unwind: [] }),
             ],
             otherwise: [],
           }),
@@ -2855,7 +2856,7 @@ test "a field taken out of its block is never read again, nor the block used who
       root_of([p], [], AsWord, [
         Do({
           value: Take({ of: p, path: FieldPath({ name: b"f", at: 0 }) }),
-          at: dummy_span,
+          at: generated_span,
           unwind: [],
         }),
         Return(VariableOperand(p)),
@@ -3017,7 +3018,7 @@ test "when a `Handle` has a `return` clause, the body's returned value is passed
                 args: [ZeroOperand(AsImmediate), VariableOperand(r)],
                 uses: { takes: [false, true], owned: false, fails: false, suspends: false },
               }),
-              at: dummy_span,
+              at: generated_span,
               unwind: [],
             }),
           ],
@@ -3154,7 +3155,7 @@ test "an operand must have the representation its operation expects, and a refer
   assert_eq(
     ownership_fault(
       root_of([p], [], AsInt, [
-        Do({ value: call_of([VariableOperand(p)], []), at: dummy_span, unwind: [] }),
+        Do({ value: call_of([VariableOperand(p)], []), at: generated_span, unwind: [] }),
         Return(IntOperand(0)),
       ]),
     ),
@@ -3346,7 +3347,7 @@ test "a bytes operation takes and returns values as its signature says, and writ
       IntOperand(0),
       IntOperand(4),
     ]),
-    at: dummy_span,
+    at: generated_span,
     unwind: [],
   });
   let checked = |params: List<Variable>, borrowed: List<Int>, result: Representation, body: Block|

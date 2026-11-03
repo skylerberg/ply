@@ -1,3 +1,4 @@
+import std.set (Set)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, InvalidMode, RaiseMode, is_raise,
                                     mode_text, angled, mode_bin)
 import compiler.syntax.lexer (is_identifier_continue)
@@ -320,18 +321,18 @@ pub fn fresh_effects(fresh: Fresh) -> { fresh: Fresh, effects: Effects } = {
 pub type Substitution = {
   ty: Map<Int, Type>,
   effects: Map<Int, Effects>,
-  rigid_type: Map<Int, Bool>,
-  rigid_effects: Map<Int, Bool>,
+  rigid_type: Set<Int>,
+  rigid_effects: Set<Int>,
 }
 
 pub const substitution_new: Substitution =
-  { ty: Map::new(), effects: Map::new(), rigid_type: Map::new(), rigid_effects: Map::new() }
+  { ty: Map::new(), effects: Map::new(), rigid_type: Set::empty(), rigid_effects: Set::empty() }
 
 pub fn mark_rigid_type(substitution: Substitution, v: Int) -> Substitution =
   {
     ty: substitution.ty,
     effects: substitution.effects,
-    rigid_type: substitution.rigid_type.insert(v, true),
+    rigid_type: substitution.rigid_type.insert(v),
     rigid_effects: substitution.rigid_effects,
   }
 pub fn mark_rigid_effects(substitution: Substitution, v: Int) -> Substitution =
@@ -339,7 +340,7 @@ pub fn mark_rigid_effects(substitution: Substitution, v: Int) -> Substitution =
     ty: substitution.ty,
     effects: substitution.effects,
     rigid_type: substitution.rigid_type,
-    rigid_effects: substitution.rigid_effects.insert(v, true),
+    rigid_effects: substitution.rigid_effects.insert(v),
   }
 pub fn is_rigid_type(substitution: Substitution, v: Int) -> Bool =
   substitution.rigid_type.contains(v)
@@ -1761,7 +1762,7 @@ pub type Printer = {
   type_names: Map<Int, Bytes>,
   effect_variable_names: Map<Int, Bytes>,
   label_names: Map<Int, Bytes>,
-  taken: Map<Bytes, Bool>,
+  taken: Set<Bytes>,
 }
 
 pub const printer_new: Printer =
@@ -1836,7 +1837,7 @@ fn label_in_use(names: Map<Int, Bytes>, name: Bytes) -> Bool =
 
 fn reserve_resource(printer: Printer, resource: Resource) -> Printer =
   match resource {
-    NamedResource(n) -> { ..printer, taken: printer.taken.insert(n, true) },
+    NamedResource(n) -> { ..printer, taken: printer.taken.insert(n) },
     _ -> printer,
   }
 
@@ -2147,66 +2148,19 @@ pub fn last_dot(b: Bytes) -> Int =
   range(0, b.len()).fold(0 - 1, |accumulator: Int, i: Int|
     if b.at(i) == 46 { i } else { accumulator })
 
-type Split = { name: Bytes, resource: Resource }
-
-fn read_effect(text: Bytes) -> Option<Effect> / {abort.raise} =
-  if text == b"diverges" { Some(diverges_effect) } else {
-    let n = text.len();
-    let split: Option<Split> = match text.index_of(b"[") {
-      None -> Some({ name: text, resource: SingletonResource }),
-      Some(i) -> if n == 0 || text.at(n - 1) != 93 || i == 0 { None }
-      else { Some({ name: text.slice(0, i), resource: NamedResource(text.slice(i + 1, n - 1)) }) },
-    };
-    match split {
-      None -> None,
-      Some(s) -> {
-        let d = last_dot(s.name);
-        if d <= 0 || d >= s.name.len() - 1 { None } else {
-          let eff = s.name.slice(0, d);
-          let access = s.name.slice(d + 1, s.name.len());
-          if access == b"read" {
-            Some({ effect: eff, resource: s.resource, mode: ReadMode, operation: None })
-          } else if access == b"write" {
-            Some({ effect: eff, resource: s.resource, mode: WriteMode, operation: None })
-          } else {
-            Some({ effect: eff, resource: s.resource, mode: WriteMode, operation: Some(access) })
-          }
-        }
-      },
-    }
-  }
-
-pub fn read_effects(text: Bytes) -> Option<List<Effect>> / {abort.raise} =
-  if text.len() == 0 { Some([]) }
-  else if text.at(0) == 60 { None }
-  else { Option::traverse(text.split(b","), read_effect) }
-
-fn label_position_name(i: Int) -> Bytes = b"#".concat(ascii_of_int(i))
-
-pub fn positional_effects_text(effects: List<Effect>, labels: List<Int>) -> Bytes / {abort.raise} =
-  effect_list_text(positional_effects(effects, labels), b",")
-
-pub fn positional_effects(effects: List<Effect>, labels: List<Int>) -> List<Effect> =
-  effects.map(|entry: Effect|
-    match entry.resource {
-      ResourceVariable(v) -> match labels.index_of(v) {
-        Some(i) -> { ..entry, resource: NamedResource(label_position_name(i)) },
-        None -> entry,
-      },
-      _ -> entry,
-    })
-
-pub fn effects_with_label_variables(
+pub fn relabelled(
   effects: List<Effect>,
-  labels: List<Int>,
+  from: List<Int>,
+  to: List<Int>,
 ) -> Option<List<Effect>> / {abort.raise} =
   Option::traverse(effects, |entry: Effect|
     match entry.resource {
-      NamedResource(n) -> if !n.starts_with(b"#") { Some(entry) } else {
-        match range(0, labels.len()).find(|i: Int| label_position_name(i) == n) {
-          Some(i) -> Some({ ..entry, resource: ResourceVariable(labels.get(i)) }),
+      ResourceVariable(v) -> match from.index_of(v) {
+        Some(i) -> match to.at(i) {
+          Some(label) -> Some({ ..entry, resource: ResourceVariable(label) }),
           None -> None,
-        }
+        },
+        None -> None,
       },
       _ -> Some(entry),
     })
@@ -2373,61 +2327,16 @@ test "`net.send[conn]` is ordered after `net.write[conn]` in an effect list, and
   )
 }
 
-test "effects read back as the effects they were printed from" {
-  let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, operation: None };
-  let wr = { effect: b"m.net", resource: SingletonResource, mode: WriteMode, operation: None };
-  let send = {
-    effect: b"m.net",
-    resource: NamedResource(b"conn"),
-    mode: WriteMode,
-    operation: Some(b"send"),
-  };
-  assert_eq(read_effects(b""), Some([]));
-  assert_eq(read_effects(effect_list_text([rd], b",")), Some([rd]));
-  assert_eq(read_effects(effect_list_text([rd, wr], b",")), Some([rd, wr]));
-  assert_eq(read_effects(effect_list_text([send], b",")), Some([send]));
-  assert_eq(
-    read_effects(
-      effect_list_text(
-        [
-          {
-            effect: b"m.net",
-            resource: ResourceVariable(4),
-            mode: WriteMode,
-            operation: Some(b"send"),
-          },
-        ],
-        b",",
-      ),
-    ),
-    None,
-  );
-  assert_eq(read_effects(b"db"), None);
-  assert_eq(read_effects(b".read"), None);
-  assert_eq(read_effects(b"m.db."), None);
-  assert_eq(read_effects(b"m.db.read[users"), None)
-}
-
-test "effects can be written as text with each label parameter named by its position, and read back with each position replaced by a given label variable" {
+test "relabelled effects swap each label variable for the label at its position, and fail on a variable that is not a label" {
   let send = |r: Resource|
     { effect: b"m.net", resource: r, mode: WriteMode, operation: Some(b"send") };
   let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, operation: None };
-  let recorded = positional_effects_text(
-    [send(ResourceVariable(7)), rd, send(ResourceVariable(4))],
-    [4, 7],
+  assert_eq(
+    relabelled([send(ResourceVariable(7)), rd, send(ResourceVariable(4))], [4, 7], [12, 30]),
+    Some([send(ResourceVariable(30)), rd, send(ResourceVariable(12))]),
   );
-  assert_eq(recorded, b"m.net.send[#1],m.db.read[users],m.net.send[#0]");
-  match read_effects(recorded) {
-    None -> panic("a recorded row reads as nothing"),
-    Some(effects) -> {
-      assert_eq(
-        effects_with_label_variables(effects, [12, 30]),
-        Some([send(ResourceVariable(30)), rd, send(ResourceVariable(12))]),
-      );
-      assert_eq(effects_with_label_variables(effects, [12]), None)
-    },
-  };
-  assert_eq(read_effects(positional_effects_text([send(ResourceVariable(9))], [4])), None)
+  assert_eq(relabelled([send(ResourceVariable(7))], [4, 7], [12]), None);
+  assert_eq(relabelled([send(ResourceVariable(9))], [4], [12]), None)
 }
 
 test "the printer names type variables in order of first appearance, and names effect variables separately" {
@@ -2520,8 +2429,8 @@ test "in an effect list a label variable is ordered after a named label and befo
   let s = {
     ty: Map::new().insert(4, label_type(b"conn")),
     effects: Map::new(),
-    rigid_type: Map::new(),
-    rigid_effects: Map::new(),
+    rigid_type: Set::empty(),
+    rigid_effects: Set::empty(),
   };
   assert_eq(effect_text(resolve_effect(s, var_)), b"net.send[conn]");
   assert_eq(effects_text(resolve_effects(s, closed_effects([var_, named]))), b"{net.send[conn]}")
@@ -2684,8 +2593,8 @@ test "instantiating a scheme gives its label parameters fresh variables and retu
   let s = {
     ty: Map::new().insert(bound, label_type(b"conn")),
     effects: Map::new(),
-    rigid_type: Map::new(),
-    rigid_effects: Map::new(),
+    rigid_type: Set::empty(),
+    rigid_effects: Set::empty(),
   };
   assert_eq(type_text(resolve_type(s, instance.ty)), b"() -> Unit / {net.send[conn]}")
 }

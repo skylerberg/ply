@@ -1,7 +1,10 @@
+import std.set (Set)
+import compiler.codes (never_used_code)
 import compiler.check.infer.checker (StoredDeclarations, stored_declarations_bin,
                                      no_stored_declarations)
 import std.bin
 import std.list
+import std.list (somes)
 import std.bytes
 import compiler.front.published (GroupCheck, no_rows)
 import compiler.front.facts (GroupAnalysis, ModuleFacts, group_part, read_outline,
@@ -30,8 +33,9 @@ import compiler.check.infer.definitions (checked_functions, check_order)
 import compiler.check.infer (EmitFacts, types_named, types_joined, emit_facts_bin,
                              remap_fact_modules)
 import compiler.check.typed (TypedBody, part_key)
-import compiler.check.resolve.tables (Diagnostic, Label, Edit, Fix, Source, diagnostic_bin)
-import compiler.syntax.parsing (Span, span_between, start)
+import compiler.check.resolve.tables (Diagnostic, Label, Edit, Fix, Source, diagnostic_bin, Place,
+                                      InSource, place_module, mapped_place, source_span)
+import compiler.syntax.parsing (Span, span_between, start, mapped_span)
 import compiler.check.types (InternedType, TypeInterner, Type, TypeTable, type_table_bin,
                              interned_subset, interned_type_bin, empty_interner, intern_types,
                              intern_more_types, types_of, unit_type)
@@ -57,7 +61,10 @@ pub type OwnerResult = {
 
 pub type Relocation = { from: Int, to: Int, by: (Int) -> Int }
 
-fn moved_at(s: Span, m: Relocation) -> Span = { ..s, start: (m.by)(s.start), end: (m.by)(s.end) }
+fn moved_at(s: Span, m: Relocation) -> Span = mapped_span(s, m.by)
+
+fn moved_place(place: Place, m: Relocation) -> Place =
+  if place_module(place) == Some(m.from) { mapped_place(place, m.to, m.by) } else { place }
 
 fn moved_location(l: Location, m: Relocation) -> Location =
   if l.module == m.from { { module: m.to, span: moved_at(l.span, m) } } else { l }
@@ -101,9 +108,7 @@ fn moved_tables(t: ModuleTables, m: Relocation) -> ModuleTables =
 fn moved_diagnostic(d: Diagnostic, m: Relocation) -> Diagnostic =
   {
     ..d,
-    labels: d.labels.map(|l: Label|
-      if l.module == m.from { { ..l, module: m.to, start: (m.by)(l.start), end: (m.by)(l.end) } }
-      else { l }),
+    labels: d.labels.map(|l: Label| { ..l, place: moved_place(l.place, m) }),
     fixes: d.fixes.map(|f: Fix|
       {
         ..f,
@@ -128,8 +133,13 @@ fn in_own_slot(d: Diagnostic, slot: Int, spots: List<ItemRange>) -> Diagnostic =
     within(module, span_between(start, end), slot, spots);
   {
     ..d,
-    labels: d.labels.filter(|l: Label| placed(l.module, l.start, l.end)).map(|l: Label|
-      { ..l, module: 0 }),
+    labels: somes(d.labels.map(|l: Label|
+      match l.place {
+        InSource(s) -> if placed(s.module, s.start, s.end) {
+          Some({ ..l, place: InSource({ ..s, module: 0 }) })
+        } else { None },
+        _ -> None,
+      })),
     fixes: d.fixes.filter(|f: Fix| f.edits.all(|e: Edit| placed(e.module, e.start, e.end))).map(
       |f: Fix| { ..f, edits: f.edits.map(|e: Edit| { ..e, module: 0 }) },
     ),
@@ -508,9 +518,8 @@ fn embeds_wanted(
     b"\n\n",
   );
   let wanted = if !may_call_embed(text) { Map::new() } else {
-    embed_requests(parse(text).node).fold(
-      Map::new(),
-      |accumulator: Map<Bytes, Bool>, want: EmbedRequest| accumulator.insert(embed_key(want), true),
+    embed_requests(parse(text).node).fold(Set::empty(),
+      |accumulator: Set<Bytes>, want: EmbedRequest| accumulator.insert(embed_key(want)),
     )
   };
   embeds.filter(|x: ModuleEmbed| x.module == module && wanted.contains(x.key))
@@ -821,13 +830,16 @@ fn checked_members(
   let cached = List::group_by(t.cached, |k: CachedFacts| owner_of_cached(k.name));
   let rows = List::group_by(module_check.rows.definitions, |r: KnownDefinitionRow|
     definition_named(r.name));
-  let warnings = w.warnings.filter(|d: Diagnostic| d.code != b"W0611").fold(
+  let warnings = w.warnings.filter(|d: Diagnostic| d.code != never_used_code).fold(
     Map::new(),
     |accumulator: Map<Bytes, List<Diagnostic>>, d: Diagnostic|
       d.labels.fold([], |os: List<Bytes>, l: Label|
-        if !l.primary { os } else {
-          let o = at(l.module, span_between(l.start, l.end));
-          if o.len() == 0 || os.contains(o) { os } else { os.push(o) }
+        match if l.primary { source_span(l) } else { None } {
+          None -> os,
+          Some(s) -> {
+            let o = at(s.module, span_between(s.start, s.end));
+            if o.len() == 0 || os.contains(o) { os } else { os.push(o) }
+          },
         }).fold(accumulator, |a: Map<Bytes, List<Diagnostic>>, o: Bytes|
         a.insert(o, List::push(match a.get(o) { Some(ds) -> ds, None -> [] }, d))),
   );
@@ -893,11 +905,11 @@ fn checked_forms(
   let prefix = module.concat(b".");
   let chosen = { ..module_selection(w.index, 0), called: Some(called_at(w.checked.facts.members)) };
   let set = |pick: (OwnerText) -> List<Bytes> / {abort.raise}|
-    members.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: OwnerText|
-      pick(o).fold(accumulator, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)));
+    members.fold(Set::empty(), |accumulator: Set<Bytes>, o: OwnerText|
+      pick(o).fold(accumulator, |a: Set<Bytes>, n: Bytes| a.insert(n)));
   let labelled = |kind: Bytes, o: OwnerText|
     if o.owner.starts_with(kind) { [o.owner.slice(kind.len(), o.owner.len())] } else { [] };
-  let among = |m: Map<Bytes, Bool>|
+  let among = |m: Set<Bytes>|
     |name: Bytes| name.starts_with(prefix) && m.contains(name.slice(prefix.len(), name.len()));
   let node_wanted = among(set(|o: OwnerText| o.names));
   let test_wanted = among(set(|o: OwnerText| labelled(b"test ", o)));
@@ -950,7 +962,10 @@ fn gathered<a>(owners: List<OwnerResult>, pick: (OwnerResult) -> List<a>) -> Lis
 
 fn diagnostic_start(d: Diagnostic) -> Int =
   d.labels.fold(0 - 1, |accumulator: Int, l: Label|
-    if accumulator < 0 && l.primary { l.start } else { accumulator })
+    match if accumulator < 0 && l.primary { source_span(l) } else { None } {
+      Some(s) -> s.start,
+      None -> accumulator,
+    })
 
 pub fn assembled(
   module: Bytes,

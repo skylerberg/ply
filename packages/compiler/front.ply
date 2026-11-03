@@ -1,5 +1,9 @@
+import std.set (Set)
+import compiler.codes (internal_error_code)
+import compiler.check.resolve.tables (labelled_text)
+import compiler.check.resolve.tables (error_unplaced)
 import compiler.syntax.parsing (Error, Warning)
-import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, dummy_span, no_module, start)
+import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, generated_span, no_module, start)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, EffectSetItem, RequiresClause, ImportDeclaration,
                               SelectedNames, dump_item, target_type, item_span, ModuleAlias,
@@ -15,6 +19,7 @@ import compiler.check.types (Effect, SingletonResource, Scheme, Type, FunctionTy
                              bytes_type, unit_type)
 import compiler.check.known (some_constructor)
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Label, Fix, Edit, qualify,
+                                      place_module, in_module,
                                       error_at, backticked, import_module_name, path_span,
                                       module_of_name)
 import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_modules)
@@ -76,12 +81,12 @@ fn import_at(imports: List<ImportDeclaration>, name: Bytes) -> Span / {abort.rai
       None -> if import_module_name(declaration) == name { Some(path_span(declaration)) }
       else { None },
     });
-  match found { Some(s) -> s, None -> dummy_span }
+  match found { Some(s) -> s, None -> generated_span }
 }
 
 fn foreign_import(m: Int, span: Span, importer: Bytes, name: Bytes) -> Diagnostic =
   error_at(
-    b"E0505",
+    internal_error_code,
     m,
     span,
     Bytes::concat_all([
@@ -100,7 +105,7 @@ fn foreign_import(m: Int, span: Span, importer: Bytes, name: Bytes) -> Diagnosti
 
 type ImportedModules = { wanted: Map<Bytes, Bytes>, diagnostics: List<Diagnostic> }
 
-type Wanted = { names: Map<Bytes, Bool>, diagnostics: List<Diagnostic> }
+type Wanted = { names: Set<Bytes>, diagnostics: List<Diagnostic> }
 
 type Importer = { name: Bytes, imports: List<ImportDeclaration> }
 
@@ -112,13 +117,13 @@ fn wanted(
   parsed: List<Importer>,
   required: List<Bytes>,
 ) -> Wanted / {abort.raise} = {
-  let has = listed.fold(Map::new(), |accumulator: Map<Bytes, Bool>, name: Bytes|
-    accumulator.insert(name, true));
-  let present = parsed.fold(Map::new(), |accumulator: Map<Bytes, Bool>, p: Importer|
-    accumulator.insert(p.name, true));
+  let has = listed.fold(Set::empty(), |accumulator: Set<Bytes>, name: Bytes|
+    accumulator.insert(name));
+  let present = parsed.fold(Set::empty(), |accumulator: Set<Bytes>, p: Importer|
+    accumulator.insert(p.name));
   let named: Wanted = {
-    names: required.fold(Map::new(), |accumulator: Map<Bytes, Bool>, name: Bytes|
-      if has.contains(name) && !present.contains(name) { accumulator.insert(name, true) }
+    names: required.fold(Set::empty(), |accumulator: Set<Bytes>, name: Bytes|
+      if has.contains(name) && !present.contains(name) { accumulator.insert(name) }
       else { accumulator }),
     diagnostics: [],
   };
@@ -129,7 +134,7 @@ fn wanted(
     imports.fold(accumulator, |w: Wanted, declaration: ImportDeclaration| {
       let name = import_module_name(declaration);
       if is_shipped(name) && !present.contains(name) {
-        if has.contains(name) { { ..w, names: w.names.insert(name, true) } } else {
+        if has.contains(name) { { ..w, names: w.names.insert(name) } } else {
           {
             ..w,
             diagnostics: w.diagnostics.push(if ships {
@@ -159,7 +164,7 @@ fn pull_round(
   let w = wanted(users, listed, parsed.map(importer), required);
   w.names.fold(
     { wanted: Map::new(), diagnostics: w.diagnostics },
-    |r: ImportedModules, name: Bytes, _: Bool|
+    |r: ImportedModules, name: Bytes|
       match shipped.get(name) {
         Some(source) -> { ..r, wanted: r.wanted.insert(name, source) },
         None -> { ..r, diagnostics: r.diagnostics.push(missing_shipped_source(name)) },
@@ -169,9 +174,9 @@ fn pull_round(
 
 fn missing_shipped_source(name: Bytes) -> Diagnostic =
   error_at(
-    b"E0505",
+    internal_error_code,
     0,
-    dummy_span,
+    generated_span,
     Bytes::concat_all([b"the shipped module `", name, b"` is pulled and was never read"]),
     b"the load read its shipped modules before it knew what it pulls",
     [b"this is Ply's fault, not the program's"],
@@ -206,9 +211,9 @@ pub fn dependencies_of(source: Source) -> Dependencies / {abort.raise} =
 fn home_imports(homes: List<Bytes>) -> List<ImportDeclaration> =
   homes.map(|h: Bytes|
     {
-      path: h.split(b".").map(|part: Bytes| { name: part, span: dummy_span }),
+      path: h.split(b".").map(|part: Bytes| { name: part, span: generated_span }),
       kind: WholeModule,
-      span: dummy_span,
+      span: generated_span,
     })
 
 pub fn shipped_inputs_of_pulled<| e>(
@@ -236,8 +241,8 @@ pub fn shipped_inputs_of_pulled<| e>(
     match wants.get(source.name) { Some(w) -> w, None -> wanted(source) };
   let found = pulled_read.fold(pulled_read, |accumulator: List<Source>, source: Source|
     wants_of(source).texts.fold(accumulator, reading));
-  let lookup_or_empty = found.fold(Map::new(), |accumulator: Map<Bytes, Bool>, s: Source|
-    accumulator.insert(s.name, true));
+  let lookup_or_empty = found.fold(Set::empty(), |accumulator: Set<Bytes>, s: Source|
+    accumulator.insert(s.name));
   {
     sources: found,
     unread: listed.filter(|n: Bytes| !lookup_or_empty.contains(n)),
@@ -281,15 +286,15 @@ pub fn shipped_inputs_of<| e>(
       importers: own.map(|m: ModuleDependencies| { name: m.name, imports: m.pulls.imports }),
       found: [],
       data: [],
-      tried: Map::new(),
+      tried: Set::empty(),
       pulls: [],
       declared: read_own.declared,
     },
     listed.len() + 1,
     required,
   );
-  let lookup_or_empty = needed.found.fold(Map::new(), |accumulator: Map<Bytes, Bool>, s: Source|
-    accumulator.insert(s.name, true));
+  let lookup_or_empty = needed.found.fold(Set::empty(), |accumulator: Set<Bytes>, s: Source|
+    accumulator.insert(s.name));
   {
     sources: needed.found,
     unread: listed.filter(|name: Bytes| !lookup_or_empty.contains(name)),
@@ -303,7 +308,7 @@ type ReadProgress = {
   importers: List<Importer>,
   found: List<Source>,
   data: List<ShippedData>,
-  tried: Map<Bytes, Bool>,
+  tried: Set<Bytes>,
   pulls: List<ModuleDependencies>,
   declared: Option<List<HomeNames>>,
 }
@@ -351,7 +356,7 @@ fn read_needed<| e>(
       read_data,
       pulled,
       names.fold(x, |accumulator: ReadProgress, name: Bytes| {
-        let tried = accumulator.tried.insert(name, true);
+        let tried = accumulator.tried.insert(name);
         match read(name) {
           None -> { ..accumulator, tried: tried },
           Some(text) -> {
@@ -395,7 +400,7 @@ fn read_embedded_files<| e>(
       match shipped_name(module, want.path) {
         Some(name) -> if accumulator.tried.contains(name) || !listed.contains(name) { accumulator }
         else {
-          let tried = accumulator.tried.insert(name, true);
+          let tried = accumulator.tried.insert(name);
           match read(name) {
             None -> { ..accumulator, tried: tried },
             Some(text) ->
@@ -409,7 +414,7 @@ fn read_embedded_files<| e>(
         None -> match shipped_data_name(module, want.path) {
           None -> accumulator,
           Some(name) -> if accumulator.tried.contains(name) { accumulator } else {
-            let tried = accumulator.tried.insert(name, true);
+            let tried = accumulator.tried.insert(name);
             match read_data(name) {
               None -> { ..accumulator, tried: tried },
               Some(bytes) ->
@@ -545,10 +550,9 @@ fn with_hidden_imports(p: ParsedSource, dependencies: Option<Dependencies>) -> P
   match dependencies {
     None -> p,
     Some(t) -> {
-      let have = p.module.module.imports.fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Bool>, d: ImportDeclaration|
-          match d.kind { ModuleAlias(a) -> accumulator.insert(a.name, true), _ -> accumulator },
+      let have = p.module.module.imports.fold(Set::empty(),
+        |accumulator: Set<Bytes>, d: ImportDeclaration|
+          match d.kind { ModuleAlias(a) -> accumulator.insert(a.name), _ -> accumulator },
       );
       let more = t.imports.filter(|d: ImportDeclaration|
         match d.kind {
@@ -668,7 +672,8 @@ fn parsed_at(
 fn moved_to(d: Diagnostic, index: Int) -> Diagnostic =
   {
     ..d,
-    labels: d.labels.map(|l: Label| if l.module == 0 { { ..l, module: index } } else { l }),
+    labels: d.labels.map(|l: Label|
+      if place_module(l.place) == Some(0) { { ..l, place: in_module(l.place, index) } } else { l }),
     fixes: d.fixes.map(|f: Fix|
       {
         ..f,
@@ -1076,17 +1081,16 @@ pub fn resolved_with_shipped(
 
 fn first_shipped_slot(h: HashedProgram) -> Int = h.resolved.root_count + h.closure.modules.len()
 
-fn shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} =
-  range(first_shipped_slot(h), h.resolved.modules.len()).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, i: Int| {
+fn shipped_functions(h: HashedProgram) -> Set<Bytes> / {abort.raise} =
+  range(first_shipped_slot(h), h.resolved.modules.len()).fold(Set::empty(),
+    |accumulator: Set<Bytes>, i: Int| {
       let m = h.resolved.modules.get(i);
-      m.module.items.fold(accumulator, |a: Map<Bytes, Bool>, item: Item|
-        match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name), true), _ -> a })
+      m.module.items.fold(accumulator, |a: Set<Bytes>, item: Item|
+        match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name)), _ -> a })
     },
   )
 
-fn used_shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} = {
+fn used_shipped_functions(h: HashedProgram) -> Set<Bytes> / {abort.raise} = {
   let first = first_shipped_slot(h);
   let candidates = shipped_functions(h);
   let imported = range(0, first).fold([], |accumulator: List<Subject>, i: Int|
@@ -1149,15 +1153,14 @@ fn used_shipped_functions(h: HashedProgram) -> Map<Bytes, Bool> / {abort.raise} 
 fn cut_to_reach(
   parsed: List<ParsedSource>,
   h: HashedProgram,
-  reach: Map<Bytes, Bool>,
+  reach: Set<Bytes>,
 ) -> Option<List<ParsedSource>> / {abort.raise} = {
   let first = first_shipped_slot(h);
   let candidates = shipped_functions(h);
   let wanted = |name: Bytes| !candidates.contains(name) || reach.contains(name);
-  let declared = h.resolved.index.nodes.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, n: Node|
-      match n.body { NodeFn(_) -> accumulator, _ -> accumulator.insert(n.name, true) },
+  let declared = h.resolved.index.nodes.fold(Set::empty(),
+    |accumulator: Set<Bytes>, n: Node|
+      match n.body { NodeFn(_) -> accumulator, _ -> accumulator.insert(n.name) },
   );
   let is_retained = |p: ParsedSource, item: Item|
     match item {
@@ -1482,10 +1485,8 @@ pub fn embed_inputs_of<| e>(
 }
 
 fn changed_embed_error(embed: ModuleEmbed) -> Diagnostic / {abort.raise} =
-  error_at(
+  error_unplaced(
     b"E0146",
-    no_module,
-    dummy_span,
     Bytes::concat_all([
       b"`",
       request_of_key(embed.key).path,
@@ -1596,8 +1597,8 @@ test "building a program's tables from each module's own check results gives the
         cached_hashes_of(
           w.index,
           w.hashes,
-          w.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
-            accumulator.insert(m.name, true)),
+          w.modules.fold(Set::empty(), |accumulator: Set<Bytes>, m: ParsedModule|
+            accumulator.insert(m.name)),
         ),
         Map::new(),
         true,
@@ -1664,8 +1665,8 @@ test "building a program's tables from its modules' check results gives the same
   let fixing = cached_hashes_of(
     whole.index,
     whole.hashes,
-    whole.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: ParsedModule|
-      accumulator.insert(m.name, true)),
+    whole.modules.fold(Set::empty(), |accumulator: Set<Bytes>, m: ParsedModule|
+      accumulator.insert(m.name)),
   );
   let returned = assembled_program(
     facts,
@@ -1991,7 +1992,7 @@ test "a program's analysis result lists its warnings, its module order, its pack
   assert_eq(d.diagnostics, [
     {
       code: b"W0611",
-      labels: [{ module: 0, start: 46, end: 51, primary: true, text: b"never used" }],
+      labels: [{ place: InSource({ module: 0, start: 46, end: 51 }), primary: true, text: b"never used" }],
       text: b"",
       message: b"type `m.Shape` is never used",
       notes_text: [],
@@ -2065,7 +2066,7 @@ test "only a definition that no emitter root uses gets an unused-definition warn
   let program = dead_code_sources.get(0).source_text;
   let named = d.diagnostics.map(|diagnostic: Diagnostic|
     match diagnostic.labels.filter(|l: Label| l.primary) {
-      [l, ..] -> program.slice(l.start, l.end),
+      [l, ..] -> labelled_text(program, l),
       [] -> b"",
     });
   assert_eq(named.sort_by(|a: Bytes, b: Bytes| compare(a, b) == Less), [
@@ -2906,7 +2907,7 @@ test "importing a module that is not bundled reports an error at the import and 
   assert_eq(a.dump.diagnostics, [
     {
       code: b"E0106",
-      labels: [{ module: 0, start: 7, end: 12, primary: true, text: b"not found" }],
+      labels: [{ place: InSource({ module: 0, start: 7, end: 12 }), primary: true, text: b"not found" }],
       text: b"",
       message: b"no module named `std.e` ships with this compiler",
       notes_text: [
@@ -3346,7 +3347,7 @@ test "a rejected program returns only diagnostics located at the error, and no d
     {
       code: b"E0201",
       labels: [
-        { module: 0, start: 16, end: 19, primary: true, text: b"expected `Int`, found `String`" },
+        { place: InSource({ module: 0, start: 16, end: 19 }), primary: true, text: b"expected `Int`, found `String`" },
       ],
       text: b"",
       message: b"type mismatch: function body type",
@@ -3540,7 +3541,7 @@ test "a function generic over effects takes its result from cached data, includi
 test "cached data that names effects the program does not have is ignored and the bodies are checked again" {
   let rows = rows_of(analysis_of(effect_sources));
   let stale = rows.definitions.map(|row: KnownDefinitionRow|
-    { ..row, effects: b"nowhere.read", performed_effects: b"nowhere.read" });
+    { ..row, effects: [written_effect(b"nowhere")], performed: [written_effect(b"nowhere")] });
   let walked = analyse_with(parse_all(effect_sources), { ..rows, definitions: stale, tests: [] });
   assert_eq(seeded_of(walked), []);
   assert_eq(published(walked), published(analyse(parse_all(effect_sources))))
@@ -3611,6 +3612,9 @@ const two_effects: List<Source> =
     },
   ]
 
+fn written_effect(name: Bytes) -> Effect =
+  { effect: name, resource: SingletonResource, mode: WriteMode, operation: None }
+
 fn wrong_effect_rows(sources: List<Source>) -> List<KnownDefinitionRow> / {abort.raise} =
   match analyse(parse_all(sources)) {
     Rejected(_) -> panic("the program failed checking"),
@@ -3623,9 +3627,9 @@ fn wrong_effect_rows(sources: List<Source>) -> List<KnownDefinitionRow> / {abort
       [b"m.say", b"m.quiet"].map(|n: Bytes|
         {
           name: n,
-          effects: b"m.other.write",
-          performed_effects: b"m.other.write",
-          repeated_effects: b"",
+          effects: [written_effect(b"m.other")],
+          performed: [written_effect(b"m.other")],
+          repeated: [],
           repeats: [],
           ending: Terminates,
           summary: unknown_summary,
@@ -4336,23 +4340,23 @@ test "embedding a data file missing from the shipped modules, or a path outside 
     match p.out {
       Analysed(_) -> [],
       Rejected(ds) ->
-        ds.map(|d: Diagnostic| { code: d.code, modules: d.labels.map(|l: Label| l.module) }),
+        ds.map(|d: Diagnostic| { code: d.code, modules: d.labels.map(|l: Label| place_module(l.place)) }),
     };
-  assert_eq(placed_at(over_words(source_text, [])), [{ code: b"E0146", modules: [2] }]);
+  assert_eq(placed_at(over_words(source_text, [])), [{ code: b"E0146", modules: [Some(2)] }]);
   let leaving = analyse_pulling_std_with(
     user,
     [words_module(b"../list.txt")],
     no_rows,
     data: [{ name: b"list.txt", bytes: b"x" }, { name: b"std/list.txt", bytes: b"x" }],
   );
-  assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [2] }]);
+  assert_eq(placed_at(leaving), [{ code: b"E0146", modules: [Some(2)] }]);
   let directory = analyse_pulling_std_with(
     user,
     [{ name: b"std.words", source_text: b"pub fn count() -> Int = embed_dir(\"words\").len()\n" }],
     no_rows,
     data: words_data(b"one\n"),
   );
-  assert_eq(placed_at(directory), [{ code: b"E0146", modules: [2] }])
+  assert_eq(placed_at(directory), [{ code: b"E0146", modules: [Some(2)] }])
 }
 
 test "`shipped_embedded` returns a shipped module's data file even when the module is given only as a stub without its full source" {

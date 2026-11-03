@@ -1,4 +1,5 @@
-import compiler.syntax.parsing (Span, dummy_span, span_bin, span_between)
+import std.set (Set)
+import compiler.syntax.parsing (Span, generated_span, span_bin, span_between)
 import compiler.emit.code (Code, CodeLiteral, CodeVariable, NDefinition, NConstructor, NBuiltin,
                            CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeLambda, CodeSimulate,
@@ -80,8 +81,15 @@ pub type Demand = { callee: Bytes, param: Int, owner: Owner }
 
 pub type Escape = { callee: Bytes, arity: Int }
 
+pub type CostedKind = | CostedFunction | CostedTest | CostedLaw
+
+pub type Verdict = | Reuses | Copies | Undecided
+
+pub fn verdict_word(verdict: Verdict) -> Bytes =
+  match verdict { Reuses -> b"reuses", Copies -> b"copies", Undecided -> b"unknown" }
+
 pub type WalkedBody = {
-  item_kind: Bytes,
+  item_kind: CostedKind,
   module_name: Bytes,
   name: Bytes,
   label: Bytes,
@@ -116,6 +124,7 @@ pub type ParamTable = Map<Bytes, Map<Int, ParamSharing>>
 
 pub type Parameters = { table: Map<Bytes, Map<Int, ParamSharing>>, rounds: Int }
 
+derive bin for CostedKind
 derive bin for Cause
 derive bin for Reason
 derive bin for Owner
@@ -149,12 +158,12 @@ type Definition = {
 }
 
 type Body = {
-  item_kind: Bytes,
+  item_kind: CostedKind,
   module: Int,
   module_name: Bytes,
   name: Bytes,
   label: Bytes,
-  definition_index: Int,
+  definition_index: Option<Int>,
   arity: Int,
   code: Code,
   moves: Moves,
@@ -171,7 +180,7 @@ type WalkResult = {
 
 type Program = {
   index: Map<Bytes, Int>,
-  builtins: Map<Bytes, Bool>,
+  builtins: Set<Bytes>,
   definitions: List<Definition>,
   bodies: List<Body>,
 }
@@ -814,7 +823,7 @@ fn start_returns(definitions: List<Definition>) -> Tables =
 
 fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} = {
   let chain = range(0, b.arity).map(|k: Int|
-    { slot: k, owner: if b.definition_index < 0 { FreshOwner } else { ParamOwner(k) } });
+    { slot: k, owner: match b.definition_index { Some(_) -> ParamOwner(k), None -> FreshOwner } });
   let w = walk({ ..env, moves: b.moves }, b.code, {
     chain: chain,
     sites: [],
@@ -838,8 +847,9 @@ fn walks(prog: Program, tables: Tables) -> List<WalkResult> / {abort.raise} =
 fn with_returns(prog: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
   range(0, prog.bodies.len()).fold(tables, |accumulator: Tables, i: Int| {
     let b: Body = prog.bodies.get(i);
-    if b.definition_index < 0 { accumulator } else {
-      { rets: accumulator.rets.set(b.definition_index, return_of(found.get(i).return_owner)) }
+    match b.definition_index {
+      None -> accumulator,
+      Some(d) -> { rets: accumulator.rets.set(d, return_of(found.get(i).return_owner)) },
     }
   })
 
@@ -853,11 +863,11 @@ fn settled_walks(prog: Program, tables: Tables, rounds: Int) -> Settled / {abort
 }
 
 fn called_outside(prog: Program, found: List<WalkResult>) -> List<Int> = {
-  let inside = prog.bodies.fold(Map::new(), |accumulator: Map<Int, Bool>, b: Body|
-    accumulator.insert(b.definition_index, true));
-  found.fold(Map::new(), |accumulator: Map<Int, Bool>, f: WalkResult|
-    f.reads.fold(accumulator, |m: Map<Int, Bool>, r: ReturnRead|
-      if inside.contains(r.callee) { m } else { m.insert(r.callee, true) })).keys(
+  let inside = prog.bodies.fold(Set::empty(), |accumulator: Set<Int>, b: Body|
+    match b.definition_index { Some(d) -> accumulator.insert(d), None -> accumulator });
+  found.fold(Set::empty(), |accumulator: Set<Int>, f: WalkResult|
+    f.reads.fold(accumulator, |m: Set<Int>, r: ReturnRead|
+      if inside.contains(r.callee) { m } else { m.insert(r.callee) })).keys(
   )
 }
 
@@ -872,7 +882,7 @@ fn walked_body(p: CostInput, prog: Program, b: Body, f: WalkResult) -> WalkedBod
     module_name: b.module_name,
     name: b.name,
     label: b.label,
-    definition: if b.definition_index < 0 { None } else { Some(name(b.definition_index)) },
+    definition: b.definition_index.map(name),
     reuse: match b.reuse { Some(s) -> Some(relative(p, s)), None -> None },
     sites: f.sites.map(|s: RawSite| { ..s, span: relative(p, s.span) }),
     demands: f.demands.filter(|d: PassedArgument| own(d.callee)).map(|d: PassedArgument|
@@ -885,8 +895,8 @@ fn walked_body(p: CostInput, prog: Program, b: Body, f: WalkResult) -> WalkedBod
 
 fn declared_in(p: CostInput, prog: Program) -> List<DeclaredReturn> / {abort.raise} =
   prog.bodies.fold([], |accumulator: List<DeclaredReturn>, b: Body|
-    if b.definition_index < 0 { accumulator } else {
-      let d: Definition = prog.definitions.get(b.definition_index);
+    match b.definition_index { None -> accumulator, Some(index) -> {
+      let d: Definition = prog.definitions.get(index);
       match d.declared_return {
         None -> accumulator,
         Some(x) ->
@@ -898,7 +908,7 @@ fn declared_in(p: CostInput, prog: Program) -> List<DeclaredReturn> / {abort.rai
             span: relative(p, x.span),
           }),
       }
-    })
+    } })
 
 pub fn walked_group<| e>(
   p: CostInput,
@@ -982,14 +992,14 @@ pub type Site = {
   start: Int,
   end: Int,
   operation: Bytes,
-  verdict: Bytes,
+  verdict: Verdict,
   reason: Bytes,
   suggestion: Bytes,
-  param: Int,
+  param: Option<Int>,
 }
 
 pub type Costed = {
-  item_kind: Bytes,
+  item_kind: CostedKind,
   module: Int,
   module_name: Bytes,
   name: Bytes,
@@ -1024,7 +1034,7 @@ pub fn placed_span(items: List<ItemAt>, span: Span) -> Span =
   { ..span, start: placed_position(items, span.start), end: placed_position(items, span.end) }
 
 fn finish(raw: RawSite, definition: Option<Bytes>, table: ParamTable) -> Site = {
-  let sited = |verdict: Bytes, reason: Bytes, cause: Option<Cause>, param: Int|
+  let sited = |verdict: Verdict, reason: Bytes, cause: Option<Cause>, param: Option<Int>|
     {
       start: raw.span.start,
       end: raw.span.end,
@@ -1037,7 +1047,7 @@ fn finish(raw: RawSite, definition: Option<Bytes>, table: ParamTable) -> Site = 
   match raw.owner {
     FreshOwner ->
       sited(
-        b"reuses",
+        Reuses,
         Bytes::concat_all([
           b"the ",
           container_name(raw.builtin_name),
@@ -1046,10 +1056,10 @@ fn finish(raw: RawSite, definition: Option<Bytes>, table: ParamTable) -> Site = 
           b"` with a single reference",
         ]),
         None,
-        0 - 1,
+        None,
       ),
-    SharedOwner(reason) -> sited(b"copies", reason.text, Some(reason.cause), 0 - 1),
-    UnknownOwner(reason) -> sited(b"unknown", reason.text, Some(reason.cause), 0 - 1),
+    SharedOwner(reason) -> sited(Copies, reason.text, Some(reason.cause), None),
+    UnknownOwner(reason) -> sited(Undecided, reason.text, Some(reason.cause), None),
     ParamOwner(k) -> {
       let head = Bytes::concat_all([
         b"the ",
@@ -1060,39 +1070,39 @@ fn finish(raw: RawSite, definition: Option<Bytes>, table: ParamTable) -> Site = 
       match param_at(table, definition, k) {
         Some(SoleParam) ->
           sited(
-            b"reuses",
+            Reuses,
             head.concat(b", and every call site passes it and never uses it again"),
             None,
-            k,
+            Some(k),
           ),
         Some(SharedParam(reason)) ->
           sited(
-            b"copies",
+            Copies,
             Bytes::concat_all([
               head,
               b", and a caller uses it again after the call: ",
               reason.text,
             ]),
             Some(CallerRetains),
-            k,
+            Some(k),
           ),
         Some(UnsureParam(reason)) ->
           sited(
-            b"unknown",
+            Undecided,
             Bytes::concat_all([
               head,
               b", and it is unclear whether a call site uses it again: ",
               reason.text,
             ]),
             Some(reason.cause),
-            k,
+            Some(k),
           ),
         None ->
           sited(
-            b"unknown",
+            Undecided,
             head.concat(b" of a definition the compiler cannot find"),
             Some(CallerRetains),
-            k,
+            Some(k),
           ),
       }
     },
@@ -1126,7 +1136,7 @@ fn module_bodies(
   let m = setting.module;
   roots.fold([], |a: List<Body>, ir: ItemRoot| {
     let moves = root_moves(s, ir.root);
-    let body = |kind: Bytes, name: Bytes, label: Bytes, definition: Int, reuse: Option<Span>|
+    let body = |kind: CostedKind, name: Bytes, label: Bytes, definition: Option<Int>, reuse: Option<Span>|
       {
         item_kind: kind,
         module: i,
@@ -1143,20 +1153,20 @@ fn module_bodies(
       FunctionItem(d) ->
         a.push(
           body(
-            b"fn",
+            CostedFunction,
             d.name.name,
             Bytes::concat_all([m, b".", d.name.name]),
-            match index.get(qualify(m, d.name.name)) { Some(k) -> k, None -> 0 - 1 },
+            index.get(qualify(m, d.name.name)),
             d.reuse,
           ),
         ),
       TestItem(t) ->
         a.push(
-          body(b"test", t.name, Bytes::concat_all([m, b": test ", quoted(t.name)]), 0 - 1, None),
+          body(CostedTest, t.name, Bytes::concat_all([m, b": test ", quoted(t.name)]), None, None),
         ),
       LawItem(l) ->
         a.push(
-          body(b"law", l.name, Bytes::concat_all([m, b": law ", quoted(l.name)]), 0 - 1, None),
+          body(CostedLaw, l.name, Bytes::concat_all([m, b": law ", quoted(l.name)]), None, None),
         ),
       _ -> a,
     }
@@ -1179,7 +1189,7 @@ fn definition_of_function(
     declared_return: declared_at(call_shape(definition).returned, match definition.returns {
       Some(ReturnsFresh(return_span)) -> return_span,
       Some(ReturnsParam(x)) -> x.span,
-      None -> dummy_span,
+      None -> generated_span,
     }),
   }
 }
@@ -1202,7 +1212,7 @@ fn definition_elsewhere(
     params: [],
     arity: d.arity,
     own: own,
-    declared_return: declared_at(returned_called(qualify(module, d.name)), dummy_span),
+    declared_return: declared_at(returned_called(qualify(module, d.name)), generated_span),
   }
 
 fn violates(declared: ReturnOwnership, got: ReturnOwnership) -> Bool =
@@ -1236,7 +1246,7 @@ pub type CostInput = {
   rows: Rows,
   facts: InferredFacts,
   walked: List<Int>,
-  roots: Option<Map<Bytes, Bool>>,
+  roots: Option<Set<Bytes>>,
   origin: Int,
 }
 
@@ -1334,7 +1344,7 @@ fn with_definitions_elsewhere(
 
 fn lowered_bodies(p: CostInput, index: Map<Bytes, Int>) -> Option<List<Body>> / {EmitReads} = {
   let tables = embed_tables(p.embeds);
-  let wants = p.walked.fold(Map::new(), |m: Map<Int, Bool>, i: Int| m.insert(i, true));
+  let wants = p.walked.fold(Set::empty(), |m: Set<Int>, i: Int| m.insert(i));
   let read = range(0, p.modules.len()).fold(
     { modules: [], bad: false },
     |accumulator: { modules: List<ParsedModule>, bad: Bool }, i: Int| {
@@ -1361,8 +1371,8 @@ fn lowered_bodies(p: CostInput, index: Map<Bytes, Int>) -> Option<List<Body>> / 
           Some(roots) ->
             Some({
               roots: roots,
-              modules: p.walked.fold(Map::new(), |m: Map<Bytes, Bool>, i: Int|
-                m.insert(p.modules.get(i).name, true)),
+              modules: p.walked.fold(Set::empty(), |m: Set<Bytes>, i: Int|
+                m.insert(p.modules.get(i).name)),
             }),
         },
       ) {
@@ -1384,8 +1394,8 @@ fn program_of(p: CostInput) -> Option<Program> / {EmitReads} = {
       let definitions = with_definitions_elsewhere(p, written, bodies);
       Some({
         index: indexed(definitions),
-        builtins: builtin_names.fold(Map::new(), |accumulator: Map<Bytes, Bool>, b: Bytes|
-          accumulator.insert(b, true)),
+        builtins: builtin_names.fold(Set::empty(), |accumulator: Set<Bytes>, b: Bytes|
+          accumulator.insert(b)),
         definitions: definitions,
         bodies: bodies,
       })
@@ -1495,16 +1505,17 @@ test "a cost report gives each update's source location, whether it copies or re
   assert(r.ok);
   assert_eq(r.definitions.len(), 1);
   let d = r.definitions.get(0);
-  assert_eq([d.item_kind, d.module_name, d.name], [b"fn", b"m", b"grow"]);
+  assert_eq(d.item_kind, CostedFunction);
+  assert_eq([d.module_name, d.name], [b"m", b"grow"]);
   assert_eq(d.reuse_keyword, Some(span_between(0, 5)));
   assert_eq(d.sites.len(), 1);
   let s = d.sites.get(0);
   assert_eq(source.slice(s.start, s.end), b"xs.push(n)");
   assert_eq(s.operation, b"List::push");
-  assert_eq(s.verdict, b"copies");
+  assert_eq(verdict_word(s.verdict), b"copies");
   assert_eq(s.reason, b"`Map::get` returns a clone the map still contains");
   assert_eq(s.suggestion, b"`Map::update`");
-  assert_eq(s.param, 0 - 1)
+  assert_eq(s.param, None)
 }
 
 test "updating a map entry read with `first` or `floor` copies it, but an entry removed with `pop_first` or `split` is reused" {
@@ -1513,7 +1524,7 @@ test "updating a map entry read with `first` or `floor` copies it, but an entry 
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let peeked = site_of(b"peek");
-  assert_eq([peeked.verdict, peeked.reason, peeked.suggestion], [
+  assert_eq([verdict_word(peeked.verdict), peeked.reason, peeked.suggestion], [
     b"copies",
     b"`.value` was read from a record that another value still owns: `Map::first` returns a clone the map still contains",
     b"`Map::update`",
@@ -1523,11 +1534,11 @@ test "updating a map entry read with `first` or `floor` copies it, but an entry 
     b"`.value` was read from a record that another value still owns: `Map::floor` returns a clone the map still contains",
   );
   let taken = site_of(b"take");
-  assert_eq([taken.verdict, taken.reason], [
+  assert_eq([verdict_word(taken.verdict), taken.reason], [
     b"reuses",
     b"the list is parameter 0, and every call site passes it and never uses it again",
   ]);
-  assert_eq(site_of(b"cut").verdict, b"reuses")
+  assert_eq(verdict_word(site_of(b"cut").verdict), b"reuses")
 }
 
 test "an array or list element replaced in place is an update, and one read out first is a copy" {
@@ -1536,28 +1547,28 @@ test "an array or list element replaced in place is an update, and one read out 
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let filled = site_of(b"fill");
-  assert_eq([filled.operation, filled.verdict, filled.reason], [
+  assert_eq([filled.operation, verdict_word(filled.verdict), filled.reason], [
     b"Array::set",
     b"reuses",
     b"the array is parameter 0, and every call site passes it and never uses it again",
   ]);
   let twiced = site_of(b"twice");
-  assert_eq([twiced.operation, twiced.verdict], [b"Array::set", b"reuses"]);
+  assert_eq([twiced.operation, verdict_word(twiced.verdict)], [b"Array::set", b"reuses"]);
   let again = site_of(b"again");
-  assert_eq([again.verdict, again.reason, again.suggestion], [
+  assert_eq([verdict_word(again.verdict), again.reason, again.suggestion], [
     b"copies",
     b"`xs` is read again after this point, so this use clones it",
     b"make the update the last use of the variable: first bind anything else you need from the variable to new names",
   ]);
-  assert_eq(site_of(b"sized").verdict, b"reuses");
+  assert_eq(verdict_word(site_of(b"sized").verdict), b"reuses");
   let read = site_of(b"first");
-  assert_eq([read.operation, read.verdict, read.reason], [
+  assert_eq([read.operation, verdict_word(read.verdict), read.reason], [
     b"Array::set",
     b"copies",
     b"`List::at` returns a clone of an element the list still owns",
   ]);
   let bumped = site_of(b"bump");
-  assert_eq([bumped.operation, bumped.verdict], [b"List::set", b"reuses"])
+  assert_eq([bumped.operation, verdict_word(bumped.verdict)], [b"List::set", b"reuses"])
 }
 
 test "updating a value read from a scope reports a copy, and updating one the scope's callback returns or ends up using reports an unknown cost" {
@@ -1566,19 +1577,19 @@ test "updating a value read from a scope reports a copy, and updating one the sc
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let read = site_of(b"read");
-  assert_eq([read.verdict, read.reason, read.suggestion], [
+  assert_eq([verdict_word(read.verdict), read.reason, read.suggestion], [
     b"copies",
     b"`Scoped::get` returns a copy of a value the scope still owns",
     b"",
   ]);
-  assert_eq(site_of(b"answered").verdict, b"unknown");
-  assert_eq(site_of(b"released").verdict, b"unknown")
+  assert_eq(verdict_word(site_of(b"answered").verdict), b"unknown");
+  assert_eq(verdict_word(site_of(b"released").verdict), b"unknown")
 }
 
 fn verdicts(r: Report) -> List<Bytes> =
   r.definitions.fold([], |accumulator: List<Bytes>, d: Costed|
     d.sites.fold(accumulator, |a: List<Bytes>, s: Site|
-      a.push(Bytes::concat_all([d.name, b" ", s.verdict]))))
+      a.push(Bytes::concat_all([d.name, b" ", verdict_word(s.verdict)]))))
 
 test "a `returns` clause is checked against the function body, and a mismatch reports the declared and actual return origin" {
   let source = Bytes::concat_all([
@@ -1605,9 +1616,9 @@ test "an update inside a callback passed to a builtin reports a copy or reuse by
   let r = reported([b"m"], [source]);
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
-  assert_eq(site_of(b"grown").verdict, b"reuses");
+  assert_eq(verdict_word(site_of(b"grown").verdict), b"reuses");
   let each = site_of(b"each");
-  assert_eq([each.verdict, each.reason], [
+  assert_eq([verdict_word(each.verdict), each.reason], [
     b"copies",
     b"an element of the list being iterated over, which the list still owns",
   ]);
@@ -1655,7 +1666,7 @@ test "`fold` is treated as returning whatever its callback returns" {
 test "a callee in another body is read through the given return, and a demand names the callee" {
   let source = b"pub fn kept(xs: List<Int>) -> List<Int> = xs\nfn grow(xs: List<Int>, n: Int) -> List<Int> = kept(xs).push(n)\n";
   let c = checked_cost_input([b"m"], [source]);
-  let only_grow = { ..c.input, roots: Some(Map::new().insert(b"m.grow", true)) };
+  let only_grow = { ..c.input, roots: Some(Map::new().insert(b"m.grow")) };
   let walked = over_analysis(c.analysis, ||
     walked_group(only_grow, |name: Bytes|
       if name == b"m.kept" { ReturnOfParam(0) } else { FreshReturn }));

@@ -1,3 +1,5 @@
+import std.set (Set)
+import compiler.emit.keys (root_key_bin)
 import compiler.syntax.parsing (Span, no_module, span_bin)
 import compiler.syntax.items (HostInstance, InvariantInstance, SpecKind, RequiresClause,
                               EnsuresClause, CostClause, SpaceClause, spec_kind_text, InstanceKind,
@@ -5,8 +7,8 @@ import compiler.syntax.items (HostInstance, InvariantInstance, SpecKind, Require
 import compiler.syntax.type_syntax (mode_text)
 import compiler.emit.code (dump)
 import compiler.check.types (Scheme, scheme_bin, Effect, Type, effect_bin, NamedType, FunctionType,
-                             RecordType, VariableType, effect_list_text, positional_effects_text,
-                             read_effects, Printer, printer_new, print_type, Field,
+                             RecordType, VariableType, effect_list_text, canonical_beside,
+                             relabelled, Printer, printer_new, print_type, Field,
                              canonical_effects, canonical_scheme, canonical_type, bool_type,
                              int_type, bytes_type, unit_type, NominalType, TypeTable, variables_in,
                              type_bin, type_table_bin)
@@ -89,7 +91,7 @@ fn definition_row(
       { name: param.name, at: span_at(definition_info.at.module, param.span) }),
     spec: definition_info.spec.map(|spec: SpecInfo|
       {
-        kind: spec_kind_text(spec.kind),
+        kind: spec.kind,
         index: spec.index,
         effects: canonical_effects(spec.effects),
         at: span_at(definition_info.at.module, spec.span),
@@ -131,7 +133,7 @@ fn operation_row(
 ) -> OperationRow / {abort.raise} =
   {
     name: op_info.name,
-    mode: mode_text(op_info.mode),
+    mode: op_info.mode,
     resource_param: op_info.resource_param,
     retained_parameters: op_info.keep_indices,
     params: op_info.params.map(canonical_type),
@@ -257,22 +259,22 @@ fn definition_hash_row(tables: HashTables, name: Bytes) -> HashRow / {abort.rais
 
 fn hash_rows(outlines: List<Outline>, hashes: HashOutput) -> List<HashTableRow> / {abort.raise} = {
   let t = hash_tables(hashes);
-  let definition = |accumulator: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, name: Bytes|
+  let definition = |accumulator: { seen: Set<Bytes>, frames: List<HashTableRow> }, name: Bytes|
     match accumulator.seen.get(name) {
       Some(_) -> accumulator,
       None ->
         {
           ..accumulator,
-          seen: accumulator.seen.insert(name, true),
+          seen: accumulator.seen.insert(name),
           frames: accumulator.frames.push(DefinitionHashRow(definition_hash_row(t, name))),
         },
     };
   outlines.fold(
-    { seen: Map::new(), frames: [] },
-    |accumulator: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, o: Outline|
+    { seen: Set::empty(), frames: [] },
+    |accumulator: { seen: Set<Bytes>, frames: List<HashTableRow> }, o: Outline|
       o.items.fold(
         accumulator,
-        |a: { seen: Map<Bytes, Bool>, frames: List<HashTableRow> }, item: OutlineItem|
+        |a: { seen: Set<Bytes>, frames: List<HashTableRow> }, item: OutlineItem|
           match item {
             OutlinedFunction(f) -> definition(a, qualify(o.name, f.name)),
             OutlinedType(x) -> definition(a, qualify(o.name, x.name)),
@@ -435,7 +437,7 @@ pub fn root_keys(
     checked.definitions.map(|d: DefinitionInfo|
       { key: d.name, value: emitted_signature_text(d, values) }),
   );
-  let guarded = checked.laws.fold(Map::new(), |accumulator: Map<Bytes, Bool>, l: LawInfo|
+  let guarded = checked.laws.fold(Set::empty(), |accumulator: Set<Bytes>, l: LawInfo|
     accumulator.insert(l.key, l.has_guard));
   outlines.fold([], |accumulator: List<KeyRow>, o: Outline|
     o.items.fold(accumulator, |a: List<KeyRow>, item: OutlineItem|
@@ -554,8 +556,8 @@ pub fn stated_by_constructor(known: KnownConstructors) -> Map<Bytes, List<Bytes>
   })
 
 pub fn with_known_constructors(dump: Dump, known: KnownConstructors) -> Dump / {abort.raise} = {
-  let held = dump.constructors.fold(Map::new(), |found: Map<Bytes, Bool>, c: ConstructorRow|
-    found.insert(c.name, true));
+  let held = dump.constructors.fold(Set::empty(), |found: Set<Bytes>, c: ConstructorRow|
+    found.insert(c.name));
   let added = known.constructors.filter(|c: ConstructorInfo| !held.contains(c.name));
   let width_sums = width_sums_of(known.constructors);
   {
@@ -586,7 +588,7 @@ pub fn constructors_read(
 fn width_number(name: Bytes) -> Option<Int> =
   List::find_index(fixed_widths, |w: { name: Bytes, bits: Int, signed: Bool }| w.name == name)
 
-type WidthSums = { sums: Map<Bytes, Bool> }
+type WidthSums = { sums: Set<Bytes> }
 
 fn width_sums_of(constructors: List<ConstructorInfo>) -> WidthSums = {
   let fixed_width_types = types_with_fixed_width(constructors, []);
@@ -1007,7 +1009,7 @@ pub fn checked_program_of(w: Analysis) -> CheckedProgram / {abort.raise} =
     checked: w.checked,
   }
 
-pub type RootPlace = { root: Bytes, at: ModuleSpan }
+pub type RootPlace = { root: Bytes, key: RootKey, at: ModuleSpan }
 
 pub type MainPlace = { root: Bytes, at: ModuleSpan, effects: List<Effect> }
 
@@ -1047,8 +1049,8 @@ pub fn module_rollup(shape: ModuleShape, tables: ModuleTables) -> ModuleRollup /
   {
     mains: own.filter(|d: DefinitionInfo| d.simple_name == b"main").map(|d: DefinitionInfo|
       { root: d.name, at: location_span(d.at), effects: d.effects }),
-    roots: emitter_roots(one.outlines, checked, width_sums).map(|r: EmitterRoot|
-      { root: r.root, at: r.at }),
+    roots: keyed_roots(one.outlines, checked, width_sums).map(|k: KeyedRoot|
+      { root: k.root.root, key: k.key, at: k.root.at }),
     declared: declared_effects(
       checked.effects.filter(|e: EffectInfo| e.module == module).map(|e: EffectInfo|
         effect_row(e, effect_public_of(effs, e), hosts, read, width_sums)),
@@ -1104,42 +1106,32 @@ fn const_sites(shape: ModuleShape) -> List<ConstSite> = {
     })
 }
 
-fn known_definitions(
-  rows: List<KnownDefinitionRow>,
-) -> Map<Bytes, CachedDefinition> / {abort.raise} =
+fn known_definitions(rows: List<KnownDefinitionRow>) -> Map<Bytes, CachedDefinition> =
   rows.fold(Map::new(), |accumulator: Map<Bytes, CachedDefinition>, row: KnownDefinitionRow|
-    match ((
-        read_effects(row.effects),
-        read_effects(row.performed_effects),
-        read_effects(row.repeated_effects),
-      )) {
-      (Some(effects), Some(performed), Some(scaling)) ->
-        accumulator.insert(row.name, {
-          effects: effects,
-          performed: performed,
-          unbounded_effects: scaling,
-          repeated_parameters: row.repeats,
-          ending: row.ending,
-          summary: row.summary,
-          raises: row.raises,
-          ownership_facts: row.facts,
-        }),
-      _ -> accumulator,
-    })
+    accumulator.insert(row.name, {
+      labels: row.scheme.label_variables,
+      effects: row.effects,
+      performed: row.performed,
+      unbounded_effects: row.repeated,
+      repeated_parameters: row.repeats,
+      ending: row.ending,
+      summary: row.summary,
+      raises: row.raises,
+      ownership_facts: row.facts,
+    }))
 
 fn known_tests(rows: List<KnownTestRow>) -> Map<Bytes, CachedTest> / {abort.raise} =
   rows.fold(Map::new(), |accumulator: Map<Bytes, CachedTest>, r: KnownTestRow|
-    match read_effects(r.effects) {
-      None -> accumulator,
+    match relabelled(r.effects, [], []) {
       Some(effects) -> accumulator.insert(r.key, { effects: effects, facts: r.body_facts }),
+      None -> accumulator,
     })
 
-pub fn cache_from_rows(rows: Rows, root: Int) -> CheckCache / {abort.raise} =
+pub fn cache_from_rows(rows: Rows, own_modules: Int) -> CheckCache / {abort.raise} =
   {
-    ..empty_cache,
+    ..empty_cache(own_modules),
     definitions: known_definitions(rows.definitions),
     tests: known_tests(rows.tests),
-    root: root,
     types: rows.types,
   }
 
@@ -1157,29 +1149,26 @@ pub fn effect_hashes_of(
 pub fn definition_known_row(
   definition_info: DefinitionInfo,
   read: AllBodyFacts,
-) -> KnownDefinitionRow / {abort.raise} =
+) -> KnownDefinitionRow / {abort.raise} = {
+  let canonical = canonical_beside(definition_info.scheme, [], [
+    definition_info.effects,
+    definition_info.performed,
+    definition_info.scaling,
+  ]);
   {
     name: definition_info.name,
-    effects: positional_effects_text(
-      definition_info.effects,
-      definition_info.scheme.label_variables,
-    ),
-    performed_effects: positional_effects_text(
-      definition_info.performed,
-      definition_info.scheme.label_variables,
-    ),
-    repeated_effects: positional_effects_text(
-      definition_info.scaling,
-      definition_info.scheme.label_variables,
-    ),
+    effects: canonical.effect_lists.get(0),
+    performed: canonical.effect_lists.get(1),
+    repeated: canonical.effect_lists.get(2),
     repeats: definition_info.repeats,
     ending: definition_info.ending,
     summary: definition_info.summary,
     raises: definition_info.raises,
     facts: encoded_facts(read, definition_info.name),
-    scheme: canonical_scheme(definition_info.scheme),
+    scheme: canonical.scheme,
     value: constant_value(read, definition_info),
   }
+}
 
 fn constant_value(
   read: AllBodyFacts,
@@ -1207,7 +1196,7 @@ fn test_known_row(
   {
     key: test_info.key,
     hash: hash,
-    effects: effect_list_text(test_info.effects, b","),
+    effects: test_info.effects,
     owner: owner,
     body_facts: encoded_facts(read, owner),
   }
@@ -1342,4 +1331,4 @@ fn test_rows(
   checked.tests.map(|t: TestInfo|
     test_known_row(t, test_hash(t.key), test_owner(t.module, t.name), read))
 
-pub type TestRunScope = { owners: Map<Bytes, Bool>, tests: Map<Bytes, Bool> }
+pub type TestRunScope = { owners: Set<Bytes>, tests: Set<Bytes> }

@@ -1,3 +1,4 @@
+import std.set (Set)
 import compiler.store.hash.graph (NodeElsewhere, is_declared_kind)
 import compiler.syntax.parsing (Span, Identifier, QName, is_bare, bare, starts_upper,
                                 prelude_binder)
@@ -343,21 +344,52 @@ pub fn encoded_resolutions(picks: List<List<Choice>>) -> Bytes = {
 pub fn pending_resolutions_bin() -> bin::BinCodec<List<List<CallResolution>>> =
   bin::list_bin(bin::list_bin(call_resolution_bin()))
 
+pub type BodyFrame = | SingleBody | MemberBody(Int)
+
+pub type FramedBody = { frame: BodyFrame, pending: Bool, picks: Int, at: Int }
+
+fn frame_head(frame: BodyFrame, pending: Bool) -> Bytes = {
+  let base = if pending { 2 } else { 0 };
+  match frame {
+    SingleBody -> byte_of_int(base),
+    MemberBody(class) -> byte_of_int(base + 1).concat(u32_le(class)),
+  }
+}
+
+pub fn framed_head(body: FramedBody, pending: Bool) -> Bytes = frame_head(body.frame, pending)
+
+pub fn framed_body(body: Bytes) -> Option<FramedBody> = {
+  let framed = |frame: BodyFrame, pending: Bool, from: Int|
+    match body.u32_at(from) {
+      Some(n) -> if from + 4 + n > body.len() { None }
+      else { Some({ frame: frame, pending: pending, picks: from + 4, at: from + 4 + n }) },
+      None -> None,
+    };
+  let member = |pending: Bool|
+    match body.u32_at(1) { Some(class) -> framed(MemberBody(class), pending, 5), None -> None };
+  let kind = if body.len() == 0 { 0 - 1 } else { body.at(0) };
+  if kind == 0 { framed(SingleBody, false, 1) }
+  else if kind == 1 { member(false) }
+  else if kind == 2 { framed(SingleBody, true, 1) }
+  else if kind == 3 { member(true) }
+  else { None }
+}
+
 fn stored_body(
   class: Option<Int>,
   picks: List<List<CallResolution>>,
   payload: Bytes,
 ) -> Bytes / {abort.raise} = {
-  let head = |kind: Int|
-    match class { None -> byte_of_int(kind), Some(c) -> byte_of_int(kind + 1).concat(u32_le(c)) };
+  let frame = match class { None -> SingleBody, Some(c) -> MemberBody(c) };
+  let head = |pending: Bool| frame_head(frame, pending);
   let found = Option::traverse(picks, |member: List<CallResolution>|
     Option::traverse(member, |p: CallResolution|
       match p { Known(c) -> Some(c), Pending(_) -> None }));
   match found {
-    Some(choices) -> Bytes::concat_all([head(0), encoded_resolutions(choices), payload]),
+    Some(choices) -> Bytes::concat_all([head(false), encoded_resolutions(choices), payload]),
     None -> {
       let open = bin::encode(picks, pending_resolutions_bin());
-      Bytes::concat_all([head(2), u32_le(open.len()), open, payload])
+      Bytes::concat_all([head(true), u32_le(open.len()), open, payload])
     },
   }
 }
@@ -738,10 +770,10 @@ pub fn hash_input(
   fixed: Map<Int, List<Int>>,
   fixing: CachedHashes,
 ) -> Shaped / {abort.raise} = {
-  let held_tests = fixing.tests.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: CachedTest|
-    accumulator.insert(t.key, true));
-  let held_laws = fixing.laws.fold(Map::new(), |accumulator: Map<Bytes, Bool>, l: CachedLaw|
-    accumulator.insert(l.key, true));
+  let held_tests = fixing.tests.fold(Set::empty(), |accumulator: Set<Bytes>, t: CachedTest|
+    accumulator.insert(t.key));
+  let held_laws = fixing.laws.fold(Set::empty(), |accumulator: Set<Bytes>, l: CachedLaw|
+    accumulator.insert(l.key));
   let shape = |v: Int, formed: Bool| {
     let node = index.nodes.get(v);
     {
@@ -769,13 +801,12 @@ pub fn hash_input(
   };
   let first = first_pass_of(plain, fixed);
   let cyclic = if fixed.len() == 0 { Map::new() } else {
-    graph::components({ out: first.map(|f: FirstPass| f.references) }).fold(
-      Map::new(),
-      |accumulator: Map<Int, Bool>, c: List<Int>|
+    graph::components({ out: first.map(|f: FirstPass| f.references) }).fold(Set::empty(),
+      |accumulator: Set<Int>, c: List<Int>|
         if c.len() < 2 || c.fold(true, |all: Bool, v: Int| all && fixed.contains(v)) { accumulator }
         else {
-          c.fold(accumulator, |a: Map<Int, Bool>, v: Int|
-            if fixed.contains(v) { a.insert(v, true) } else { a })
+          c.fold(accumulator, |a: Set<Int>, v: Int|
+            if fixed.contains(v) { a.insert(v) } else { a })
         },
     )
   };
@@ -1718,7 +1749,7 @@ pub fn hash_forms(forms: HashInput, fixed: List<CachedNode>) -> CachedHashes / {
 pub fn cached_nodes(
   index: Index,
   hashes: HashOutput,
-  keep: Map<Bytes, Bool>,
+  keep: Set<Bytes>,
 ) -> List<CachedNode> / {abort.raise} = {
   let node_refs = |refs: List<Int>|
     refs.map(|r: Int|
@@ -1810,7 +1841,7 @@ pub fn cached_nodes(
 pub fn cached_hashes_of(
   index: Index,
   hashes: HashOutput,
-  keep: Map<Bytes, Bool>,
+  keep: Set<Bytes>,
 ) -> CachedHashes / {abort.raise} = {
   let refs = |rs: List<Int>|
     rs.map(|r: Int|
@@ -2142,7 +2173,7 @@ pub fn walked(
 
 pub type Subject = | FunctionNamed(Bytes) | DeclarationNamed(Bytes) | ItemKeyed(Bytes)
 
-pub type ReachableNames = { functions: Map<Bytes, Bool>, declarations: Map<Bytes, Bool> }
+pub type ReachableNames = { functions: Set<Bytes>, declarations: Set<Bytes> }
 
 fn nodes_of(r: Refs, which: Subject) -> List<Int> =
   match which {
@@ -2162,14 +2193,14 @@ fn reachable_names(r: Refs, nodes: List<Int>) -> ReachableNames / {abort.raise} 
     { functions: Map::new(), declarations: Map::new() },
     |accumulator: ReachableNames, v: Int|
       if r.is_declaration.get(v) {
-        { ..accumulator, declarations: accumulator.declarations.insert(r.names.get(v), true) }
-      } else { { ..accumulator, functions: accumulator.functions.insert(r.names.get(v), true) } },
+        { ..accumulator, declarations: accumulator.declarations.insert(r.names.get(v)) }
+      } else { { ..accumulator, functions: accumulator.functions.insert(r.names.get(v)) } },
   )
 
 pub fn reach(hashes: HashOutput, roots: List<Subject>) -> ReachableNames / {abort.raise} =
   reachable_names(hashes.refs, walked(hashes.refs.edges, start_nodes(hashes.refs, roots)).all)
 
-pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {abort.raise} = {
+pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Set<Bytes> / {abort.raise} = {
   let r = hashes.refs;
   let known = keys.filter(|k: Bytes|
     r.items.contains(k) || r.functions.contains(k) || r.declared.contains(k));
@@ -2177,8 +2208,8 @@ pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {
     hashes,
     known.fold([], |accumulator: List<Subject>, k: Bytes| accumulator.concat(meanings(k))),
   );
-  known.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: Bytes|
-    accumulator.insert(k, true)).merge(
+  known.fold(Set::empty(), |accumulator: Set<Bytes>, k: Bytes|
+    accumulator.insert(k)).merge(
     reachable.functions,
   ).merge(
     reachable.declarations,
@@ -2188,12 +2219,12 @@ pub fn closure_of(hashes: HashOutput, keys: List<Bytes>) -> Map<Bytes, Bool> / {
 pub fn reachable_functions(
   hashes: HashOutput,
   roots: List<Subject>,
-) -> Map<Bytes, Bool> / {abort.raise} = {
+) -> Set<Bytes> / {abort.raise} = {
   let r = hashes.refs;
   unit_reach(r, start_nodes(r, roots))
 }
 
-fn unit_reach(r: Refs, starts: List<Int>) -> Map<Bytes, Bool> / {abort.raise} = {
+fn unit_reach(r: Refs, starts: List<Int>) -> Set<Bytes> / {abort.raise} = {
   let scheduled = scheduler_module.concat(b".");
   let written = range(0, r.names.len()).filter(|v: Int|
     !r.is_declaration.get(v) && r.names.get(v).starts_with(scheduled));
@@ -2221,7 +2252,7 @@ pub fn used_from(hashes: HashOutput, roots: List<Subject>) -> ReachableNames / {
 pub fn reachable_by_tests(
   hashes: HashOutput,
   keys: List<Bytes>,
-) -> Map<Bytes, Bool> / {abort.raise} = {
+) -> Set<Bytes> / {abort.raise} = {
   let r = hashes.refs;
   unit_reach(
     r,
