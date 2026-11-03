@@ -15,9 +15,9 @@ import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, EffectItem, 
                               schema_guard_name, InstanceItem, NumericItem, SumBody,
                               ImportDeclaration, WholeModule, ModuleAlias, SelectedNames,
                               VariantDefinition, OperationDefinition, DeriveOrigin, Derivation,
-                              parse, parse_started, header, header_of, is_explicit_import,
-                              item_span, import_declaration_bin, owner_of, item_owner,
-                              test_of_owner, member_of, member_name, is_builtin, derivation_bin)
+                              parse, header, header_of, is_explicit_import, item_span,
+                              import_declaration_bin, owner_of, item_owner, test_of_owner,
+                              member_of, member_name, is_builtin, derivation_bin)
 import compiler.syntax.fmt (print_standalone)
 import compiler.syntax.expressions (BlockExpression, expression_span, hidden_callees,
                                     implicitly_imported_by, prelude_module, map_literal_call,
@@ -31,20 +31,18 @@ import compiler.expand.embed (EmbedFile)
 import compiler.syntax.lexer (lex, Token, Identifier, Punctuation, Keyword, StringLiteral,
                               InterpolatedHead, LineString, EndOfInput, is_identifier_start,
                               bound_names)
-import compiler.syntax.parsing (Identifier, Span, starts_upper, generated_span, start,
-                                start_from_tokens)
+import compiler.syntax.parsing (Identifier, Span, starts_upper, generated_span, start_from_tokens)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, Raise, BodyPlan, CheckEvery,
                                      CheckedElsewhere)
 import compiler.check.types (canonical_scheme, Scheme)
 
-pub type Mention = { module: Bytes, name: Bytes }
+pub type NameInModule = { module: Bytes, name: Bytes }
 
-pub fn any_module_name(name: Bytes) -> Bytes = b"::".concat(name)
-
-pub fn called_of(modules: List<Bytes>, names: List<Bytes>) -> List<Mention> =
-  modules.fold([], |accumulator: List<Mention>, m: Bytes|
-    names.fold(accumulator, |a: List<Mention>, n: Bytes|
-      a.push({ module: m, name: any_module_name(n) })))
+pub type Mention =
+  | MemberMention(NameInModule)
+  | ModuleMention(Bytes)
+  | NameMention(NameInModule)
+  | VisibleMemberMention(Bytes)
 
 pub type OwnerInterface = {
   owner: Bytes,
@@ -58,9 +56,11 @@ pub type OwnerInterface = {
 pub type Exports = {
   module: Bytes,
   owners: Map<Bytes, List<Bytes>>,
+  members: Map<Bytes, List<Bytes>>,
   entries: Map<Bytes, OwnerInterface>,
 }
 
+derive bin for NameInModule
 derive bin for Mention
 derive bin for OwnerInterface
 derive bin for Exports
@@ -109,6 +109,7 @@ pub type Scope = {
   binders: Map<Bytes, Bytes>,
   selected: Map<Bytes, List<Bytes>>,
   owners: Map<Bytes, List<Bytes>>,
+  members: Map<Bytes, List<Bytes>>,
 }
 
 fn scope_of(
@@ -116,9 +117,10 @@ fn scope_of(
   imports: List<ImportDeclaration>,
   targets: List<Bytes>,
   owners: Map<Bytes, List<Bytes>>,
+  members: Map<Bytes, List<Bytes>>,
 ) -> Scope / {abort.raise} =
   range(0, min(imports.len(), targets.len())).fold(
-    { module: module, binders: Map::new(), selected: Map::new(), owners: owners },
+    { module: module, binders: Map::new(), selected: Map::new(), owners: owners, members: members },
     |s: Scope, i: Int| {
       let d = imports.get(i);
       let target = targets.get(i);
@@ -147,14 +149,23 @@ fn scope_of(
     },
   )
 
-pub fn mention_key(m: Mention) -> Bytes = Bytes::concat_all([m.module, b"\x00", m.name])
+fn distinct(ms: List<Mention>) -> List<Mention> = Set::of_list(ms).elements()
 
-fn distinct(ms: List<Mention>) -> List<Mention> =
-  ms.fold(Map::new(), |accumulator: Map<Bytes, Mention>, m: Mention|
-    accumulator.insert(mention_key(m), m)).fold(
-    [],
-    |accumulator: List<Mention>, _: Bytes, m: Mention| accumulator.push(m),
-  )
+fn module_of_mention(m: Mention) -> Option<Bytes> =
+  match m {
+    VisibleMemberMention(_) -> None,
+    MemberMention(n) -> Some(n.module),
+    NameMention(n) -> Some(n.module),
+    ModuleMention(module) -> Some(module),
+  }
+
+fn mentions_owner(m: Mention, module: Bytes, owners: List<Bytes>) -> Bool =
+  match m {
+    VisibleMemberMention(_) -> false,
+    MemberMention(_) -> false,
+    NameMention(n) -> n.module == module && owners.contains(n.name),
+    ModuleMention(_) -> false,
+  }
 
 fn identifier_at(tokens: List<Token>, i: Int) -> Option<Bytes> =
   if i < 0 { None } else {
@@ -202,22 +213,24 @@ fn called_on_value(
 }
 
 fn on_value(scope: Scope, name: Bytes) -> List<Mention> =
-  [{ module: b"", name: name }].concat(if scope.owners.contains(any_module_name(name)) {
-    [{ module: scope.module, name: any_module_name(name) }]
+  [VisibleMemberMention(name)].concat(if scope.members.contains(name) {
+    [MemberMention({ module: scope.module, name: name })]
   } else { [] })
 
 fn of_type(scope: Scope, of: Bytes, name: Bytes) -> List<Mention> = {
   let selected = match scope.selected.get(of) { Some(ms) -> ms, None -> [] };
   let homes = List::concat(if scope.owners.contains(of) { [scope.module] } else { [] }, selected);
   let declared = homes.fold([], |accumulator: List<Mention>, m: Bytes|
-    accumulator.push({ module: m, name: of }).push({ module: m, name: member_name(of, name) }));
+    accumulator.push(NameMention({ module: m, name: of })).push(
+      NameMention({ module: m, name: member_name(of, name) }),
+    ));
   if selected.len() == 0 && starts_upper(of) { declared.concat(on_value(scope, name)) }
   else { declared }
 }
 
 fn binder_mentions(scope: Scope, binder: Bytes, name: Bytes) -> List<Mention> =
   match scope.binders.get(binder) {
-    Some(m) -> [{ module: m, name: name }],
+    Some(m) -> [NameMention({ module: m, name: name })],
     None -> of_type(scope, binder, name),
   }
 
@@ -260,16 +273,17 @@ fn mentioned_in(scope: Scope, tokens: List<Token>) -> List<Mention> / {abort.rai
         match scope.binders.get(n) {
           Some(m) ->
             accumulator.concat(
-              [b"literal", b"compile", b"fill"].map(|f: Bytes| { module: m, name: f }),
+              [b"literal", b"compile", b"fill"].map(|f: Bytes| NameMention({ module: m, name: f })),
             ),
           None -> accumulator,
         }
       } else {
         schema_parts(tokens, i, n).fold(accumulator, |found: List<Mention>, p: Bytes| {
-          let own = if scope.owners.contains(p) { found.push({ module: scope.module, name: p }) }
-          else { found };
+          let own = if scope.owners.contains(p) {
+            found.push(NameMention({ module: scope.module, name: p }))
+          } else { found };
           match scope.selected.get(n) {
-            Some(ms) -> own.concat(ms.map(|m: Bytes| { module: m, name: p })),
+            Some(ms) -> own.concat(ms.map(|m: Bytes| NameMention({ module: m, name: p }))),
             None -> own,
           }
         })
@@ -291,14 +305,15 @@ fn written_mentions(module: Bytes, tokens: List<Token>, i: Int) -> List<Mention>
     None -> [],
   };
   let scheduled = match identifier_at(tokens, i) {
-    Some(n) -> if n == b"simulate" { [{ module: scheduler_module, name: b"simulated" }] }
-    else if marshalling_operations.contains(n) && punct_at(tokens, i - 1, b"dot")
+    Some(n) -> if n == b"simulate" {
+      [NameMention({ module: scheduler_module, name: b"simulated" })]
+    } else if marshalling_operations.contains(n) && punct_at(tokens, i - 1, b"dot")
         && identifier_at(tokens, i - 2) == Some(b"task") {
-      [{ module: scheduler_module, name: crossing_function(n) }]
+      [NameMention({ module: scheduler_module, name: crossing_function(n) })]
     } else { [] },
     None -> [],
   };
-  called.map(|n: Bytes| { module: prelude_module, name: n }).concat(scheduled)
+  called.map(|n: Bytes| NameMention({ module: prelude_module, name: n })).concat(scheduled)
 }
 
 fn opens_own_types(tokens: List<Token>, i: Int) -> Bool = {
@@ -332,8 +347,8 @@ fn hidden_of(raw: Module) -> List<Mention> =
     if is_explicit_import(d) || imports_implicit_names(d) { accumulator } else {
       let module = import_path(d);
       hidden_callees(binder_of(d).unwrap_or(b"")).fold(
-        accumulator.push({ module: module, name: b"" }),
-        |found: List<Mention>, name: Bytes| found.push({ module: module, name: name }),
+        accumulator.push(ModuleMention(module)),
+        |found: List<Mention>, name: Bytes| found.push(NameMention({ module: module, name: name })),
       )
     })
 
@@ -410,10 +425,15 @@ pub fn imports_read(
   mentions: List<Mention>,
   runtimes: List<Bytes>,
 ) -> List<Imported> / {abort.raise} = {
-  let named = mentions.fold(Set::empty(), |accumulator: Set<Bytes>, m: Mention|
-    accumulator.insert(mention_key(m)));
+  let named = mentions.fold(Set::empty(), |accumulator: Set<NameInModule>, m: Mention|
+    match m {
+      VisibleMemberMention(_) -> accumulator,
+      MemberMention(_) -> accumulator,
+      NameMention(n) -> accumulator.insert(n),
+      ModuleMention(_) -> accumulator,
+    });
   let modules = mentions.fold(Set::empty(), |accumulator: Set<Bytes>, m: Mention|
-    accumulator.insert(m.module));
+    match module_of_mention(m) { Some(module) -> accumulator.insert(module), None -> accumulator });
   range(0, min(imports.len(), targets.len())).fold([], |accumulator: List<Imported>, i: Int| {
     let d = imports.get(i);
     let target = targets.get(i);
@@ -423,7 +443,7 @@ pub fn imports_read(
       match d.kind {
         SelectedNames(ns) -> {
           let mentioned_names = ns.filter(|n: Identifier|
-            named.contains(mention_key({ module: target, name: n.name })));
+            named.contains({ module: target, name: n.name }));
           if mentioned_names.len() == 0 { accumulator } else {
             accumulator.push({
               declaration: { ..d, kind: SelectedNames(mentioned_names) },
@@ -449,7 +469,7 @@ pub fn group_imports(
   imports_read(
     imports,
     targets,
-    mentions.filter(|m: Mention| !(m.module == module && names.contains(m.name))),
+    mentions.filter(|m: Mention| !mentions_owner(m, module, names)),
     members.fold([], |accumulator: List<Bytes>, o: OwnerText| accumulator.concat(o.runtimes)),
   )
 }
@@ -521,14 +541,11 @@ fn owners_listed(
   )
 }
 
-fn named_in(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+fn member_owners(raw: Module, parsed: ParsedModule) -> Map<Bytes, List<Bytes>> / {abort.raise} =
   function_owners(raw, parsed).fold(
-    owners_in(raw, parsed),
+    Map::new(),
     |accumulator: Map<Bytes, List<Bytes>>, f: Bytes, o: Bytes|
-      match member_of(f) {
-        Some(m) -> listed_under(accumulator, any_module_name(m.member), o),
-        None -> accumulator,
-      },
+      match member_of(f) { Some(m) -> listed_under(accumulator, m.member, o), None -> accumulator },
   )
 
 fn generated_by_owner(
@@ -554,7 +571,7 @@ fn generated_by_owner(
     })
 }
 
-pub fn named_node(name: Bytes) -> Mention / {abort.raise} = {
+pub fn named_node(name: Bytes) -> NameInModule / {abort.raise} = {
   let k = range(0, name.len()).fold(0 - 1, |accumulator: Int, i: Int|
     if name.at(i) == 46 { i } else { accumulator });
   if k < 0 { { module: b"", name: name } }
@@ -593,11 +610,12 @@ fn scopes(
   raw: Module,
   targets: List<Bytes>,
 ) -> { written: Scope, expanded: Scope } / {abort.raise} = {
-  let owners = named_in(raw, parsed);
+  let owners = owners_in(raw, parsed);
+  let members = member_owners(raw, parsed);
   let added = parsed.module.imports.drop(raw.imports.len()).map(import_path);
   {
-    written: scope_of(parsed.name, raw.imports, targets, owners),
-    expanded: scope_of(parsed.name, parsed.module.imports, targets.concat(added), owners),
+    written: scope_of(parsed.name, raw.imports, targets, owners, members),
+    expanded: scope_of(parsed.name, parsed.module.imports, targets.concat(added), owners, members),
   }
 }
 
@@ -622,7 +640,6 @@ pub fn exports_from(
   definition_rows: List<KnownDefinitionRow>,
 ) -> Exports / {abort.raise} = {
   let module = parsed.name;
-  let owners = named_in(raw, parsed);
   let functions = function_owners(raw, parsed);
   let mention_scopes = scopes(parsed, raw, targets);
   let fn_owner = |name: Bytes|
@@ -639,7 +656,8 @@ pub fn exports_from(
   let generated = generated_by_owner(raw, parsed, functions);
   {
     module: module,
-    owners: owners,
+    owners: owners_in(raw, parsed),
+    members: member_owners(raw, parsed),
     entries: items.fold(
       Map::new(),
       |accumulator: Map<Bytes, OwnerInterface>, o: Bytes, its: List<Item>| {
@@ -663,7 +681,7 @@ pub fn exports_from(
           mentioned(mention_scopes.written, stated).concat(expansion).concat(
             hidden_import_mentions(printed),
           ),
-        ).filter(|m: Mention| !(m.module == module && m.name == o));
+        ).filter(|m: Mention| !mentions_owner(m, module, [o]));
         let runtimes = deriver_modules_of(raw, its);
         accumulator.insert(o, {
           owner: o,
@@ -678,47 +696,6 @@ pub fn exports_from(
       },
     ),
   }
-}
-
-pub fn imported_mentions_in(
-  parsed: ParsedModule,
-  raw: Module,
-  text: Bytes,
-  tokens: List<Token>,
-  targets: List<Bytes>,
-) -> List<Mention> / {abort.raise} = {
-  let mention_scopes = scopes(parsed, raw, targets);
-  let expansion = generated_by_owner(raw, parsed, function_owners(raw, parsed)).fold(
-    [],
-    |accumulator: List<Mention>, _: Bytes, fs: List<Item>|
-      accumulator.concat(mentioned(mention_scopes.expanded, alone(text, fs))),
-  );
-  let selected = mention_scopes.written.selected.fold(
-    [],
-    |accumulator: List<Mention>, n: Bytes, ms: List<Bytes>|
-      accumulator.concat(ms.map(|m: Bytes| { module: m, name: n })),
-  );
-  let runtimes = deriver_modules_of(raw, raw.items).map(|m: Bytes| { module: m, name: b"" });
-  distinct(
-    mentioned_in(mention_scopes.written, tokens).concat(expansion).concat(selected).concat(
-      runtimes.concat(hidden_of(raw)),
-    ),
-  ).filter(|m: Mention| m.module != parsed.name)
-}
-
-pub fn imported_mentions_of(
-  analysis: Analysis,
-  i: Int,
-  text: Bytes,
-) -> List<Mention> / {abort.raise} = {
-  let s = start(text);
-  imported_mentions_in(
-    analysis.modules.get(i),
-    parse_started(s).node,
-    text,
-    s.input.tokens,
-    import_targets(analysis, i),
-  )
 }
 
 fn nowhere(i: Identifier) -> Identifier = { ..i, span: generated_span }
@@ -927,7 +904,7 @@ pub fn owner_mentions(
   let expansion = if o.generated.len() == 0 { [] } else { mentioned(scope.expanded, o.generated) };
   let hidden = implicit_mentions(source, tokens, || Bytes::join(o.texts, b"\n\n"));
   distinct(mentioned_in(scope.written, tokens).concat(expansion).concat(hidden)).filter(
-    |m: Mention| !(m.module == module && m.name == o.owner),
+    |m: Mention| !mentions_owner(m, module, [o.owner]),
   )
 }
 
@@ -944,18 +921,23 @@ pub fn owner_groups(
       match mentions.get(o) { Some(ms) -> ms, None -> [] },
       [],
       |accumulator: List<Int>, m: Mention|
-        if m.module != module { accumulator } else {
-          List::fold(
-            match scope.written.owners.get(m.name) { Some(os) -> os, None -> [] },
-            accumulator,
-            |a: List<Int>, p: Bytes|
-              match slot.get(p) { Some(k) -> if a.contains(k) { a } else { a.push(k) }, None -> a },
-          )
-        },
+        owners_mentioned(module, scope.written, m).fold(accumulator, |a: List<Int>, p: Bytes|
+          match slot.get(p) { Some(k) -> if a.contains(k) { a } else { a.push(k) }, None -> a }),
     ));
   graph::components({ out: out }).map(|comp: List<Int>|
     comp.map(|i: Int| owners.get(i)).sort_by(|a: Bytes, b: Bytes|
       match compare_values(a, b) { Greater -> false, _ -> true }))
+}
+
+fn owners_mentioned(module: Bytes, scope: Scope, m: Mention) -> List<Bytes> = {
+  let listed = |declared: Map<Bytes, List<Bytes>>, n: NameInModule|
+    if n.module != module { [] } else { match declared.get(n.name) { Some(os) -> os, None -> [] } };
+  match m {
+    VisibleMemberMention(_) -> [],
+    MemberMention(n) -> listed(scope.members, n),
+    NameMention(n) -> listed(scope.owners, n),
+    ModuleMention(_) -> [],
+  }
 }
 
 pub fn call_cycles(
@@ -1074,26 +1056,41 @@ pub fn named_as_owned(m: Module, o: OwnerSource) -> Module / {abort.raise} =
 fn for_all<a>(xs: List<a>, f: (a) -> Unit / {abort.raise}) -> Unit / {abort.raise} =
   xs.fold((), |_: Unit, x: a| f(x))
 
-fn mentions_in(text: Bytes) -> List<Bytes> / {abort.raise} =
+fn mentions_in(text: Bytes) -> List<Mention> / {abort.raise} =
   distinct(
     mentioned(
       {
         module: b"here",
         binders: Map::new().insert(b"lib", b"deep.lib"),
         selected: Map::new().insert(b"Shape", [b"shapes"]),
-        owners: [b"Stack", b"::push", b"depth"].fold(
+        owners: [b"Stack", b"depth"].fold(
           Map::new(),
           |accumulator: Map<Bytes, List<Bytes>>, n: Bytes| accumulator.insert(n, [n]),
         ),
+        members: Map::new().insert(b"push", [b"Stack"]),
       },
       text,
     ),
-  ).map(|m: Mention| Bytes::concat_all([m.module, b" ", m.name]))
+  )
+
+fn name_in(module: Bytes, name: Bytes) -> Mention = NameMention({ module: module, name: name })
+
+fn in_prelude(names: List<Bytes>) -> List<Mention> =
+  names.map(|n: Bytes| name_in(prelude_module, n))
 
 test "a method called on a constant is mentioned as one called on a local is" {
-  assert_eq(mentions_in(b"fn f() -> Int = depth.area()"), [b" area", b"here depth"]);
-  assert_eq(mentions_in(b"fn f() -> Int = Shape.area()"), [b" area", b"shapes Shape"]);
-  assert_eq(mentions_in(b"fn f() -> Int = lib::table.area()"), [b" area", b"deep.lib table"])
+  assert_eq(mentions_in(b"fn f() -> Int = depth.area()"), [
+    name_in(b"here", b"depth"),
+    VisibleMemberMention(b"area"),
+  ]);
+  assert_eq(mentions_in(b"fn f() -> Int = Shape.area()"), [
+    name_in(b"shapes", b"Shape"),
+    VisibleMemberMention(b"area"),
+  ]);
+  assert_eq(mentions_in(b"fn f() -> Int = lib::table.area()"), [
+    name_in(b"deep.lib", b"table"),
+    VisibleMemberMention(b"area"),
+  ])
 }
 
 test "a method call records only the method name, a call to a type's function records the type too, and an effect operation call records nothing" {
@@ -1101,27 +1098,34 @@ test "a method call records only the method name, a call to a type's function re
     mentions_in(
       b"fn f(xs: Stack) -> Int / {abort.raise} = { abort.raise(1); xs.push(2).depth() + lib::made().area() }",
     ),
-    [b" area", b" depth", b" push", b"deep.lib made", b"here ::push", b"here Stack"],
+    [
+      MemberMention({ module: b"here", name: b"push" }),
+      name_in(b"deep.lib", b"made"),
+      name_in(b"here", b"Stack"),
+      VisibleMemberMention(b"area"),
+      VisibleMemberMention(b"depth"),
+      VisibleMemberMention(b"push"),
+    ],
   );
   assert_eq(mentions_in(b"fn g() -> Int = Shape::unit().area() + Stack::depth(Stack::new())"), [
-    b" area",
-    b" depth",
-    b" new",
-    b"here Stack",
-    b"here Stack::depth",
-    b"here Stack::new",
-    b"shapes Shape",
-    b"shapes Shape::unit",
+    name_in(b"here", b"Stack"),
+    name_in(b"here", b"Stack::depth"),
+    name_in(b"here", b"Stack::new"),
+    name_in(b"shapes", b"Shape"),
+    name_in(b"shapes", b"Shape::unit"),
+    VisibleMemberMention(b"area"),
+    VisibleMemberMention(b"depth"),
+    VisibleMemberMention(b"new"),
   ]);
   assert_eq(mentions_in(b"fn h(b: Bytes) -> Bytes = Bytes::push(Bytes::trimmed(b), 0)"), [
-    b" push",
-    b" trimmed",
-    b"here ::push",
+    MemberMention({ module: b"here", name: b"push" }),
+    VisibleMemberMention(b"push"),
+    VisibleMemberMention(b"trimmed"),
   ])
 }
 
 test "`==`, `digest` and `assert_eq` depend on the functions generated for containers, but `<` and `observe` do not" {
-  let written = emitted_code.calls.map(|n: Bytes| Bytes::concat_all([prelude_module, b" ", n]));
+  let written = in_prelude(emitted_code.calls);
   assert_eq(mentions_in(b"fn f(a: Int, b: Int) -> Bool = a == b"), written);
   assert_eq(mentions_in(b"fn f(a: Int, b: Int) -> Bool = a != b"), written);
   assert_eq(mentions_in(b"fn f(a: Int) -> Bytes = digest(a)"), written);
@@ -1136,23 +1140,24 @@ test "a map literal depends on the same functions as a call to `Map::of_entries`
     mentions_in(b"fn f() -> Map<Int, Int> = #{1: 2}"),
     mentions_in(b"fn f() -> Map<Int, Int> = Map::of_entries([{ key: 1, value: 2 }])"),
   );
-  let marshalling = emitted_code.calls.concat(emitted_code.insert_calls).map(|n: Bytes|
-    Bytes::concat_all([prelude_module, b" ", n]));
-  assert_eq(mentions_in(b"fn f() -> Map<Int, Int> = #{}"), [b" of_entries"].concat(marshalling));
-  assert(mentions_in(b"fn f() -> String = f\"{#{1: 2}}\"").contains(b" of_entries"), None)
+  let marshalling = in_prelude(emitted_code.calls.concat(emitted_code.insert_calls));
+  assert_eq(
+    mentions_in(b"fn f() -> Map<Int, Int> = #{}"),
+    marshalling.concat([VisibleMemberMention(b"of_entries")]),
+  );
+  let interpolated = mentions_in(b"fn f() -> String = f\"{#{1: 2}}\"");
+  assert(interpolated.contains(VisibleMemberMention(b"of_entries")), None)
 }
 
 test "a container type name depends on the container conversion functions, except inside the prelude" {
-  let marshalling = emitted_code.calls.concat(emitted_code.insert_calls).map(|n: Bytes|
-    Bytes::concat_all([prelude_module, b" ", n]));
+  let marshalling = in_prelude(emitted_code.calls.concat(emitted_code.insert_calls));
   assert_eq(mentions_in(b"fn f(xs: List<Int>) -> Int = 0"), marshalling);
   assert_eq(mentions_in(b"fn f(n: Int) -> Int = n"), []);
   assert_eq(written_mentions(prelude_module, lex(b"List<Int>").tokens, 0), [])
 }
 
 test "an effect operation's type parameters depend on the container conversion functions, since they may be instantiated with a container" {
-  let marshalling = emitted_code.calls.concat(emitted_code.insert_calls).map(|n: Bytes|
-    Bytes::concat_all([prelude_module, b" ", n]));
+  let marshalling = in_prelude(emitted_code.calls.concat(emitted_code.insert_calls));
   assert_eq(mentions_in(b"effect box {\n  write put<a>(x: a) -> Unit\n}\n"), marshalling);
   assert_eq(mentions_in(b"effect box {\n  read take[k]<a>() -> a\n}\n"), marshalling);
   assert_eq(
@@ -1161,6 +1166,24 @@ test "an effect operation's type parameters depend on the container conversion f
   );
   assert_eq(mentions_in(b"effect box {\n  write put(x: Int) -> Unit\n}\n"), []);
   assert_eq(mentions_in(b"fn f(read: Int, x: Int) -> Bool = read < x"), [])
+}
+
+test "a whole-module import is kept when a mention names its module, the whole module or a name or member in it" {
+  let whole = |module: Bytes|
+    {
+      path: module.split(b".").map(|n: Bytes| { name: n, span: generated_span }),
+      kind: WholeModule,
+      span: generated_span,
+    };
+  let modules = [b"std.whole", b"std.named", b"std.members", b"std.unmentioned"];
+  let mentions = [
+    ModuleMention(b"std.whole"),
+    name_in(b"std.named", b"f"),
+    MemberMention({ module: b"std.members", name: b"g" }),
+    VisibleMemberMention(b"h"),
+  ];
+  let kept = imports_read(modules.map(whole), modules, mentions, []);
+  assert_eq(kept.map(|x: Imported| x.target), [b"std.whole", b"std.named", b"std.members"])
 }
 
 test "a call on a locally bound name depends only on the called function's name, however the name is bound" {
@@ -1174,10 +1197,18 @@ test "a call on a locally bound name depends only on the called function's name,
       b"fn f(l: List<T>) -> Int = match l { [x, ..rest] -> x.go[r](), [] -> 0 }",
     ],
     |text: Bytes|
-      assert_eq(mentions_in(text).filter(|m: Bytes| !m.starts_with(prelude_module)), [b" go"]),
+      assert_eq(
+        mentions_in(text).filter(|m: Mention| module_of_mention(m) != Some(prelude_module)),
+        [VisibleMemberMention(b"go")],
+      ),
   );
-  assert_eq(mentions_in(b"fn f() -> Int / {x.go} = x.go() + lib::x.go()"), [b" go", b"deep.lib x"]);
-  assert_eq(mentions_in(b"fn f() -> Int = (limits.go)() + size(limits.most)"), [b" go"])
+  assert_eq(mentions_in(b"fn f() -> Int / {x.go} = x.go() + lib::x.go()"), [
+    name_in(b"deep.lib", b"x"),
+    VisibleMemberMention(b"go"),
+  ]);
+  assert_eq(mentions_in(b"fn f() -> Int = (limits.go)() + size(limits.most)"), [
+    VisibleMemberMention(b"go"),
+  ])
 }
 
 test "a definition's tokens, with or without its signature, equal the tokens from lexing its source texts joined, and give the same mentions" {
