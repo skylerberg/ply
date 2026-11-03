@@ -49,7 +49,13 @@ pub type Cause =
 
 pub type Reason = { cause: Cause, text: Bytes }
 
-pub type Owner = | FreshOwner | ParamOwner(Int) | SharedOwner(Reason) | UnknownOwner(Reason)
+pub type DefinitionParameter = { definition: Bytes, index: Int }
+
+pub type Owner =
+  | FreshOwner
+  | ParamOwner(DefinitionParameter)
+  | SharedOwner(Reason)
+  | UnknownOwner(Reason)
 
 pub type ParamSharing = | SoleParam | UnsureParam(Reason) | SharedParam(Reason)
 
@@ -81,19 +87,30 @@ pub type Demand = { callee: Bytes, param: Int, owner: Owner }
 
 pub type Escape = { callee: Bytes, arity: Int }
 
-pub type CostedKind = | CostedFunction | CostedTest | CostedLaw
+pub type CostedKind<a> = | CostedFunction(a) | CostedTest | CostedLaw
 
-pub type Verdict = | Reuses | Copies | Undecided
+pub type Origin = | Local | Parameter(Int)
 
-pub fn verdict_word(verdict: Verdict) -> Bytes =
-  match verdict { Reuses -> b"reuses", Copies -> b"copies", Undecided -> b"unknown" }
+pub type Verdict = | Reuses(Bytes) | Copies(Reason, Origin) | Undecided(Reason, Origin)
+
+pub fn site_reason(verdict: Verdict) -> Bytes =
+  match verdict { Reuses(text) -> text, Copies(reason, _) -> reason.text, Undecided(reason, _) -> reason.text }
+
+pub fn suggestion(verdict: Verdict) -> Option<Bytes> =
+  match verdict {
+    Reuses(_) -> None,
+    Copies(reason, _) -> suggestion_for(reason.cause),
+    Undecided(reason, _) -> suggestion_for(reason.cause),
+  }
+
+pub fn breaks_reuse(verdict: Verdict) -> Bool =
+  match verdict { Copies(_, Local) -> true, Undecided(_, Local) -> true, _ -> false }
 
 pub type WalkedBody = {
-  item_kind: CostedKind,
+  item_kind: CostedKind<Bytes>,
   module_name: Bytes,
   name: Bytes,
   label: Bytes,
-  definition: Option<Bytes>,
   reuse: Option<Span>,
   sites: List<RawSite>,
   demands: List<Demand>,
@@ -112,7 +129,6 @@ pub type DeclaredReturn = {
 pub type GroupWalk = { ok: Bool, bodies: List<WalkedBody>, declared: List<DeclaredReturn> }
 
 pub type BodyDemands = {
-  caller: Option<Bytes>,
   label: Bytes,
   escaped: List<Escape>,
   demands: List<Demand>,
@@ -122,12 +138,14 @@ pub type ModuleDemands = { ok: Bool, bodies: List<BodyDemands> }
 
 pub type ParamTable = Map<Bytes, Map<Int, ParamSharing>>
 
-pub type Parameters = { table: Map<Bytes, Map<Int, ParamSharing>>, rounds: Int }
+pub type Parameters = { table: Map<Bytes, Map<Int, ParamSharing>> }
 
 derive bin for CostedKind
 derive bin for Verdict
+derive bin for Origin
 derive bin for Cause
 derive bin for Reason
+derive bin for DefinitionParameter
 derive bin for Owner
 derive bin for ParamSharing
 derive bin for ReturnOwnership
@@ -159,12 +177,11 @@ type Definition = {
 }
 
 type Body = {
-  item_kind: CostedKind,
+  item_kind: CostedKind<Int>,
   module: Int,
   module_name: Bytes,
   name: Bytes,
   label: Bytes,
-  definition_index: Option<Int>,
   arity: Int,
   code: Code,
   moves: Moves,
@@ -729,36 +746,48 @@ fn callback(
     _ -> walk(env, arg, state),
   }
 
-fn sharing_rank(p: ParamSharing) -> Int =
-  match p { SoleParam -> 2, UnsureParam(_) -> 1, SharedParam(_) -> 0 }
+fn later_reason(a: Reason, b: Reason) -> Reason =
+  match compare(a.cause, b.cause) {
+    Less -> b,
+    Greater -> a,
+    Equal -> match compare(a.text, b.text) { Less -> b, _ -> a },
+  }
 
-fn meet(a: ParamSharing, b: ParamSharing) -> ParamSharing =
-  if sharing_rank(b) < sharing_rank(a) { b } else { a }
+fn worse(a: ParamSharing, b: ParamSharing) -> ParamSharing =
+  match ((a, b)) {
+    (SharedParam(x), SharedParam(y)) -> SharedParam(later_reason(x, y)),
+    (SharedParam(_), _) -> a,
+    (_, SharedParam(_)) -> b,
+    (UnsureParam(x), UnsureParam(y)) -> UnsureParam(later_reason(x, y)),
+    (UnsureParam(_), _) -> a,
+    (_, UnsureParam(_)) -> b,
+    _ -> a,
+  }
 
-fn param_at(table: ParamTable, name: Option<Bytes>, k: Int) -> Option<ParamSharing> =
-  match name {
-    None -> None,
-    Some(n) -> match table.get(n) {
-      None -> Some(SoleParam),
-      Some(slots) -> match slots.get(k) { Some(p) -> Some(p), None -> Some(SoleParam) },
-    },
+fn slot_sharing(slots: Map<Int, ParamSharing>, index: Int) -> ParamSharing =
+  match slots.get(index) { Some(p) -> p, None -> SoleParam }
+
+fn sharing_of(table: ParamTable, parameter: DefinitionParameter) -> ParamSharing =
+  match table.get(parameter.definition) {
+    None -> SoleParam,
+    Some(slots) -> slot_sharing(slots, parameter.index),
   }
 
 fn combine_param(table: ParamTable, callee: Bytes, param: Int, p: ParamSharing) -> ParamTable = {
   let slots = match table.get(callee) { Some(s) -> s, None -> Map::new() };
-  let met = meet(match slots.get(param) { Some(s) -> s, None -> SoleParam }, p);
+  let met = worse(slot_sharing(slots, param), p);
   match met { SoleParam -> table, _ -> table.insert(callee, slots.insert(param, met)) }
 }
 
 fn return_of(owner: Owner) -> ReturnOwnership =
   match owner {
     FreshOwner -> FreshReturn,
-    ParamOwner(k) -> ReturnOfParam(k),
+    ParamOwner(p) -> ReturnOfParam(p.index),
     SharedOwner(reason) -> SharedReturn(reason),
     UnknownOwner(reason) -> UnsureReturn(reason),
   }
 
-fn interpret(owner: Owner, caller: Option<Bytes>, table: ParamTable, label: Bytes) -> ParamSharing =
+fn interpret(owner: Owner, table: ParamTable, label: Bytes) -> ParamSharing =
   match owner {
     FreshOwner -> SoleParam,
     SharedOwner(reason) ->
@@ -769,37 +798,32 @@ fn interpret(owner: Owner, caller: Option<Bytes>, table: ParamTable, label: Byte
       UnsureParam(
         reworded(reason, Bytes::concat_all([label, b" passes a value; reason: ", reason.text])),
       ),
-    ParamOwner(k) -> match param_at(table, caller, k) {
-      Some(SoleParam) -> SoleParam,
-      Some(UnsureParam(reason)) ->
+    ParamOwner(p) -> match sharing_of(table, p) {
+      SoleParam -> SoleParam,
+      UnsureParam(reason) ->
         UnsureParam(
           reworded(
             reason,
             Bytes::concat_all([
               label,
               b" passes its own parameter ",
-              ascii_of_int(k),
+              ascii_of_int(p.index),
               b", whose ownership is not yet known",
             ]),
           ),
         ),
-      Some(SharedParam(reason)) ->
+      SharedParam(reason) ->
         SharedParam(
           reworded(
             reason,
             Bytes::concat_all([
               label,
               b" passes its own parameter ",
-              ascii_of_int(k),
+              ascii_of_int(p.index),
               b", which the function's callers may still use after the call",
             ]),
           ),
         ),
-      None ->
-        UnsureParam({
-          cause: CallerRetains,
-          text: Bytes::concat_all([label, b" passes a parameter this analysis cannot identify"]),
-        }),
     },
   }
 
@@ -823,8 +847,12 @@ fn start_returns(definitions: List<Definition>) -> Tables =
   }
 
 fn walk_body(env: Env, b: Body) -> WalkResult / {abort.raise} = {
-  let chain = range(0, b.arity).map(|k: Int|
-    { slot: k, owner: match b.definition_index { Some(_) -> ParamOwner(k), None -> FreshOwner } });
+  let owner_of_parameter = |k: Int|
+    match b.item_kind {
+      CostedFunction(d) -> ParamOwner({ definition: env.prog.definitions.get(d).name, index: k }),
+      _ -> FreshOwner,
+    };
+  let chain = range(0, b.arity).map(|k: Int| { slot: k, owner: owner_of_parameter(k) });
   let w = walk({ ..env, moves: b.moves }, b.code, {
     chain: chain,
     sites: [],
@@ -845,27 +873,42 @@ fn walks(prog: Program, tables: Tables) -> List<WalkResult> / {abort.raise} =
   prog.bodies.map(|b: Body|
     walk_body({ prog: prog, module: b.module, tables: tables, moves: no_moves }, b))
 
+fn return_rank(r: ReturnOwnership) -> Int =
+  match r { FreshReturn -> 0, ReturnOfParam(_) -> 1, UnsureReturn(_) -> 2, SharedReturn(_) -> 3 }
+
+fn raised(held: ReturnOwnership, found: ReturnOwnership) -> ReturnOwnership =
+  if return_rank(found) > return_rank(held) { found } else { held }
+
 fn with_returns(prog: Program, found: List<WalkResult>, tables: Tables) -> Tables / {abort.raise} =
   range(0, prog.bodies.len()).fold(tables, |accumulator: Tables, i: Int| {
     let b: Body = prog.bodies.get(i);
-    match b.definition_index {
-      None -> accumulator,
-      Some(d) -> { rets: accumulator.rets.set(d, return_of(found.get(i).return_owner)) },
+    match b.item_kind {
+      CostedFunction(d) ->
+        {
+          rets: accumulator.rets.set(
+            d,
+            raised(accumulator.rets.get(d), return_of(found.get(i).return_owner)),
+          ),
+        },
+      _ -> accumulator,
     }
   })
 
 type Settled = { found: List<WalkResult>, tables: Tables }
 
-fn settled_walks(prog: Program, tables: Tables, rounds: Int) -> Settled / {abort.raise} = {
-  let found = walks(prog, tables);
-  let next = with_returns(prog, found, tables);
-  if next == tables || rounds + 1 >= 24 { { found: found, tables: next } }
-  else { settled_walks(prog, next, rounds + 1) }
-}
+fn defined_bodies(prog: Program) -> Int =
+  prog.bodies.filter(|b: Body| match b.item_kind { CostedFunction(_) -> true, _ -> false }).len()
+
+fn settled_walks(prog: Program, tables: Tables) -> Settled / {abort.raise} =
+  iterate(tables, 3 * defined_bodies(prog) + 1, |held: Tables| {
+    let found = walks(prog, held);
+    let next = with_returns(prog, found, held);
+    if next == held { Stop({ found: found, tables: held }) } else { Continue(next) }
+  })
 
 fn called_outside(prog: Program, found: List<WalkResult>) -> List<Int> = {
   let inside = prog.bodies.fold(Set::empty(), |accumulator: Set<Int>, b: Body|
-    match b.definition_index { Some(d) -> accumulator.insert(d), None -> accumulator });
+    match b.item_kind { CostedFunction(d) -> accumulator.insert(d), _ -> accumulator });
   found.fold(Set::empty(), |accumulator: Set<Int>, f: WalkResult|
     f.reads.fold(accumulator, |m: Set<Int>, r: ReturnRead|
       if inside.contains(r.callee) { m } else { m.insert(r.callee) })).elements(
@@ -875,30 +918,41 @@ fn called_outside(prog: Program, found: List<WalkResult>) -> List<Int> = {
 fn relative(p: CostInput, span: Span) -> Span =
   { ..span, start: span.start - p.origin, end: span.end - p.origin }
 
-fn walked_body(p: CostInput, prog: Program, b: Body, f: WalkResult) -> WalkedBody / {abort.raise} = {
+fn walked_body(
+  p: CostInput,
+  prog: Program,
+  settled: Settled,
+  b: Body,
+  f: WalkResult,
+) -> WalkedBody / {abort.raise} = {
   let own = |d: Int| prog.definitions.get(d).own;
   let name = |d: Int| prog.definitions.get(d).name;
   {
-    item_kind: b.item_kind,
+    item_kind: match b.item_kind {
+      CostedFunction(d) -> CostedFunction(name(d)),
+      CostedTest -> CostedTest,
+      CostedLaw -> CostedLaw,
+    },
     module_name: b.module_name,
     name: b.name,
     label: b.label,
-    definition: b.definition_index.map(name),
     reuse: match b.reuse { Some(s) -> Some(relative(p, s)), None -> None },
     sites: f.sites.map(|s: RawSite| { ..s, span: relative(p, s.span) }),
     demands: f.demands.filter(|d: PassedArgument| own(d.callee)).map(|d: PassedArgument|
       { callee: name(d.callee), param: d.param, owner: d.owner }),
     escaped: f.used_as_values.filter(own).map(|d: Int|
       { callee: name(d), arity: prog.definitions.get(d).arity }),
-    returned: return_of(f.return_owner),
+    returned: match b.item_kind {
+      CostedFunction(d) -> settled.tables.rets.get(d),
+      _ -> return_of(f.return_owner),
+    },
   }
 }
 
 fn declared_in(p: CostInput, prog: Program) -> List<DeclaredReturn> / {abort.raise} =
   prog.bodies.fold([], |accumulator: List<DeclaredReturn>, b: Body|
-    match b.definition_index {
-      None -> accumulator,
-      Some(index) -> {
+    match b.item_kind {
+      CostedFunction(index) -> {
         let d: Definition = prog.definitions.get(index);
         match d.declared_return {
           None -> accumulator,
@@ -912,6 +966,7 @@ fn declared_in(p: CostInput, prog: Program) -> List<DeclaredReturn> / {abort.rai
             }),
         }
       },
+      _ -> accumulator,
     })
 
 pub fn walked_group<| e>(
@@ -926,11 +981,11 @@ pub fn walked_group<| e>(
         prog.definitions.get(d).own);
       let tables = outside.fold(start, |accumulator: Tables, d: Int|
         { rets: accumulator.rets.set(d, returned(prog.definitions.get(d).name)) });
-      let settled = settled_walks(prog, tables, 0);
+      let settled = settled_walks(prog, tables);
       {
         ok: true,
         bodies: range(0, prog.bodies.len()).map(|i: Int|
-          walked_body(p, prog, prog.bodies.get(i), settled.found.get(i))),
+          walked_body(p, prog, settled, prog.bodies.get(i), settled.found.get(i))),
         declared: declared_in(p, prog),
       }
     },
@@ -942,7 +997,7 @@ pub fn demands_of(walked: List<GroupWalk>) -> ModuleDemands =
     bodies: walked.fold([], |accumulator: List<BodyDemands>, w: GroupWalk|
       w.bodies.fold(accumulator, |a: List<BodyDemands>, b: WalkedBody|
         if b.demands.len() == 0 && b.escaped.len() == 0 { a } else {
-          a.push({ caller: b.definition, label: b.label, escaped: b.escaped, demands: b.demands })
+          a.push({ label: b.label, escaped: b.escaped, demands: b.demands })
         })),
   }
 
@@ -969,41 +1024,44 @@ fn parameters_round(rollups: List<ModuleDemands>, table: ParamTable) -> ParamTab
     m.bodies.fold(accumulator, |round: ParamTable, b: BodyDemands| {
       let escaped = b.escaped.fold(round, |s: ParamTable, e: Escape| escaped_from(s, b.label, e));
       b.demands.fold(escaped, |s: ParamTable, d: Demand|
-        combine_param(s, d.callee, d.param, interpret(d.owner, b.caller, table, b.label)))
+        combine_param(s, d.callee, d.param, interpret(d.owner, table, b.label)))
     }))
 
-fn settled_parameters(rollups: List<ModuleDemands>, table: ParamTable, rounds: Int) -> Parameters = {
-  let next = parameters_round(rollups, table);
-  if next == table || rounds + 1 >= 24 { { table: next, rounds: rounds + 1 } }
-  else { settled_parameters(rollups, next, rounds + 1) }
-}
+fn demanded_parameters(rollups: List<ModuleDemands>) -> Int =
+  rollups.fold(Set::empty(), |found: Set<DefinitionParameter>, m: ModuleDemands|
+    m.bodies.fold(found, |in_module: Set<DefinitionParameter>, b: BodyDemands| {
+      let escaped = b.escaped.fold(in_module, |s: Set<DefinitionParameter>, e: Escape|
+        range(0, e.arity).fold(s, |t: Set<DefinitionParameter>, k: Int|
+          t.insert({ definition: e.callee, index: k })));
+      b.demands.fold(escaped, |s: Set<DefinitionParameter>, d: Demand|
+        s.insert({ definition: d.callee, index: d.param }))
+    })).size()
 
-pub fn parameters_of(rollups: List<ModuleDemands>) -> Parameters =
-  settled_parameters(rollups, Map::new(), 0)
-
-fn suggestion_for(cause: Option<Cause>) -> Bytes =
-  match cause {
-    Some(ReadAgain) ->
-      b"make the update the last use of the variable: first bind anything else you need from the variable to new names",
-    Some(MapEntry) -> b"`Map::update`",
-    Some(CapturedValue) -> b"bind the value before the closure captures it, or capture less",
-    Some(CallerRetains) ->
-      b"change the call site: the caller uses the value it passes again after the call",
-    _ -> b"",
+pub fn parameters_of(rollups: List<ModuleDemands>) -> Parameters / {abort.raise} =
+  {
+    table: iterate(Map::new(), demanded_parameters(rollups) + 2, |table: ParamTable| {
+      let next = parameters_round(rollups, table);
+      if next == table { Stop(table) } else { Continue(next) }
+    }),
   }
 
-pub type Site = {
-  start: Int,
-  end: Int,
-  operation: Bytes,
-  verdict: Verdict,
-  reason: Bytes,
-  suggestion: Bytes,
-  param: Option<Int>,
-}
+fn suggestion_for(cause: Cause) -> Option<Bytes> =
+  match cause {
+    ReadAgain ->
+      Some(
+        b"make the update the last use of the variable: first bind anything else you need from the variable to new names",
+      ),
+    MapEntry -> Some(b"`Map::update`"),
+    CapturedValue -> Some(b"bind the value before the closure captures it, or capture less"),
+    CallerRetains ->
+      Some(b"change the call site: the caller uses the value it passes again after the call"),
+    _ -> None,
+  }
+
+pub type Site = { start: Int, end: Int, operation: Bytes, verdict: Verdict }
 
 pub type Costed = {
-  item_kind: CostedKind,
+  item_kind: CostedKind<Bytes>,
   module: Int,
   module_name: Bytes,
   name: Bytes,
@@ -1024,7 +1082,6 @@ pub type ReturnMismatch = {
 
 pub type Report = {
   ok: Bool,
-  rounds: Int,
   definitions: List<Costed>,
   return_mismatches: List<ReturnMismatch>,
 }
@@ -1037,76 +1094,62 @@ derive bin for Report
 pub fn placed_span(items: List<ItemAt>, span: Span) -> Span =
   { ..span, start: placed_position(items, span.start), end: placed_position(items, span.end) }
 
-fn finish(raw: RawSite, definition: Option<Bytes>, table: ParamTable) -> Site = {
-  let sited = |verdict: Verdict, reason: Bytes, cause: Option<Cause>, param: Option<Int>|
-    {
-      start: raw.span.start,
-      end: raw.span.end,
-      operation: raw.builtin_name,
-      verdict: verdict,
-      reason: reason,
-      suggestion: suggestion_for(cause),
-      param: param,
-    };
+fn finish(raw: RawSite, table: ParamTable) -> Site = {
+  let sited = |verdict: Verdict|
+    { start: raw.span.start, end: raw.span.end, operation: raw.builtin_name, verdict: verdict };
   match raw.owner {
     FreshOwner ->
       sited(
-        Reuses,
-        Bytes::concat_all([
-          b"the ",
-          container_name(raw.builtin_name),
-          b" reaches `",
-          raw.builtin_name,
-          b"` with a single reference",
-        ]),
-        None,
-        None,
+        Reuses(
+          Bytes::concat_all([
+            b"the ",
+            container_name(raw.builtin_name),
+            b" reaches `",
+            raw.builtin_name,
+            b"` with a single reference",
+          ]),
+        ),
       ),
-    SharedOwner(reason) -> sited(Copies, reason.text, Some(reason.cause), None),
-    UnknownOwner(reason) -> sited(Undecided, reason.text, Some(reason.cause), None),
-    ParamOwner(k) -> {
+    SharedOwner(reason) -> sited(Copies(reason, Local)),
+    UnknownOwner(reason) -> sited(Undecided(reason, Local)),
+    ParamOwner(p) -> {
       let head = Bytes::concat_all([
         b"the ",
         container_name(raw.builtin_name),
         b" is parameter ",
-        ascii_of_int(k),
+        ascii_of_int(p.index),
       ]);
-      match param_at(table, definition, k) {
-        Some(SoleParam) ->
+      let origin = Parameter(p.index);
+      match sharing_of(table, p) {
+        SoleParam ->
+          sited(Reuses(head.concat(b", and every call site passes it and never uses it again"))),
+        SharedParam(reason) ->
           sited(
-            Reuses,
-            head.concat(b", and every call site passes it and never uses it again"),
-            None,
-            Some(k),
+            Copies(
+              {
+                cause: CallerRetains,
+                text: Bytes::concat_all([
+                  head,
+                  b", and a caller uses it again after the call: ",
+                  reason.text,
+                ]),
+              },
+              origin,
+            ),
           ),
-        Some(SharedParam(reason)) ->
+        UnsureParam(reason) ->
           sited(
-            Copies,
-            Bytes::concat_all([
-              head,
-              b", and a caller uses it again after the call: ",
-              reason.text,
-            ]),
-            Some(CallerRetains),
-            Some(k),
-          ),
-        Some(UnsureParam(reason)) ->
-          sited(
-            Undecided,
-            Bytes::concat_all([
-              head,
-              b", and it is unclear whether a call site uses it again: ",
-              reason.text,
-            ]),
-            Some(reason.cause),
-            Some(k),
-          ),
-        None ->
-          sited(
-            Undecided,
-            head.concat(b" of a definition the compiler cannot find"),
-            Some(CallerRetains),
-            Some(k),
+            Undecided(
+              {
+                cause: reason.cause,
+                text: Bytes::concat_all([
+                  head,
+                  b", and it is unclear whether a call site uses it again: ",
+                  reason.text,
+                ]),
+              },
+              origin,
+            ),
           ),
       }
     },
@@ -1140,14 +1183,13 @@ fn module_bodies(
   let m = setting.module;
   roots.fold([], |a: List<Body>, ir: ItemRoot| {
     let moves = root_moves(s, ir.root);
-    let body = |kind: CostedKind, name: Bytes, label: Bytes, definition: Option<Int>, reuse: Option<Span>|
+    let body = |kind: CostedKind<Int>, name: Bytes, label: Bytes, reuse: Option<Span>|
       {
         item_kind: kind,
         module: i,
         module_name: m,
         name: name,
         label: label,
-        definition_index: definition,
         arity: ir.root.params.len(),
         code: ir.root.code,
         moves: moves,
@@ -1157,20 +1199,22 @@ fn module_bodies(
       FunctionItem(d) ->
         a.push(
           body(
-            CostedFunction,
+            CostedFunction(match index.get(qualify(m, d.name.name)) {
+              Some(definition) -> definition,
+              None -> panic("a function body has no definition among the program's definitions"),
+            }),
             d.name.name,
             Bytes::concat_all([m, b".", d.name.name]),
-            index.get(qualify(m, d.name.name)),
             d.reuse,
           ),
         ),
       TestItem(t) ->
         a.push(
-          body(CostedTest, t.name, Bytes::concat_all([m, b": test ", quoted(t.name)]), None, None),
+          body(CostedTest, t.name, Bytes::concat_all([m, b": test ", quoted(t.name)]), None),
         ),
       LawItem(l) ->
         a.push(
-          body(CostedLaw, l.name, Bytes::concat_all([m, b": law ", quoted(l.name)]), None, None),
+          body(CostedLaw, l.name, Bytes::concat_all([m, b": law ", quoted(l.name)]), None),
         ),
       _ -> a,
     }
@@ -1423,13 +1467,13 @@ fn costed_in(table: ParamTable, placed: PlacedWalk) -> List<Costed> =
           None -> None,
         },
         sites: b.sites.map(|raw: RawSite|
-          finish({ ..raw, span: placed_span(placed.items, raw.span) }, b.definition, table)),
+          finish({ ..raw, span: placed_span(placed.items, raw.span) }, table)),
       })
     })
 
 fn mismatches_in(placed: PlacedWalk) -> List<ReturnMismatch> =
   placed.walk.declared.fold([], |accumulator: List<ReturnMismatch>, d: DeclaredReturn|
-    match placed.walk.bodies.find(|b: WalkedBody| b.definition == Some(d.definition)) {
+    match placed.walk.bodies.find(|b: WalkedBody| b.item_kind == CostedFunction(d.definition)) {
       None -> accumulator,
       Some(b) -> if !violates(d.declared, b.returned) { accumulator } else {
         let at = placed_span(placed.items, d.span);
@@ -1450,7 +1494,6 @@ fn first_site(c: Costed) -> Int = match c.sites.at(0) { Some(s) -> s.start, None
 pub fn module_costs(walks: List<PlacedWalk>, parameters: Parameters) -> Report =
   {
     ok: walks.all(|w: PlacedWalk| w.walk.ok),
-    rounds: parameters.rounds,
     definitions: walks.fold([], |accumulator: List<Costed>, w: PlacedWalk|
       accumulator.concat(costed_in(parameters.table, w))).sort_by(|a: Costed, b: Costed|
       first_site(a) <= first_site(b)),
@@ -1462,7 +1505,6 @@ pub fn module_costs(walks: List<PlacedWalk>, parameters: Parameters) -> Report =
 pub fn report_of(modules: List<Report>) -> Report =
   {
     ok: modules.all(|m: Report| m.ok),
-    rounds: match modules.at(0) { Some(m) -> m.rounds, None -> 0 },
     definitions: modules.fold([], |accumulator: List<Costed>, m: Report|
       accumulator.concat(m.definitions)),
     return_mismatches: modules.fold([], |accumulator: List<ReturnMismatch>, m: Report|
@@ -1509,17 +1551,18 @@ test "a cost report gives each update's source location, whether it copies or re
   assert(r.ok);
   assert_eq(r.definitions.len(), 1);
   let d = r.definitions.get(0);
-  assert_eq(d.item_kind, CostedFunction);
+  assert_eq(d.item_kind, CostedFunction(b"m.grow"));
   assert_eq([d.module_name, d.name], [b"m", b"grow"]);
   assert_eq(d.reuse_keyword, Some(span_between(0, 5)));
   assert_eq(d.sites.len(), 1);
   let s = d.sites.get(0);
   assert_eq(source.slice(s.start, s.end), b"xs.push(n)");
   assert_eq(s.operation, b"List::push");
-  assert_eq(verdict_word(s.verdict), b"copies");
-  assert_eq(s.reason, b"`Map::get` returns a clone the map still contains");
-  assert_eq(s.suggestion, b"`Map::update`");
-  assert_eq(s.param, None)
+  assert_eq(
+    s.verdict,
+    Copies({ cause: MapEntry, text: b"`Map::get` returns a clone the map still contains" }, Local),
+  );
+  assert_eq(suggestion(s.verdict), Some(b"`Map::update`"))
 }
 
 test "updating a map entry read with `first` or `floor` copies it, but an entry removed with `pop_first` or `split` is reused" {
@@ -1528,21 +1571,26 @@ test "updating a map entry read with `first` or `floor` copies it, but an entry 
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let peeked = site_of(b"peek");
-  assert_eq([verdict_word(peeked.verdict), peeked.reason, peeked.suggestion], [
-    b"copies",
-    b"`.value` was read from a record that another value still owns: `Map::first` returns a clone the map still contains",
-    b"`Map::update`",
-  ]);
   assert_eq(
-    site_of(b"near").reason,
+    peeked.verdict,
+    Copies(
+      {
+        cause: MapEntry,
+        text: b"`.value` was read from a record that another value still owns: `Map::first` returns a clone the map still contains",
+      },
+      Local,
+    ),
+  );
+  assert_eq(suggestion(peeked.verdict), Some(b"`Map::update`"));
+  assert_eq(
+    site_reason(site_of(b"near").verdict),
     b"`.value` was read from a record that another value still owns: `Map::floor` returns a clone the map still contains",
   );
-  let taken = site_of(b"take");
-  assert_eq([verdict_word(taken.verdict), taken.reason], [
-    b"reuses",
-    b"the list is parameter 0, and every call site passes it and never uses it again",
-  ]);
-  assert_eq(verdict_word(site_of(b"cut").verdict), b"reuses")
+  assert_eq(
+    site_of(b"take").verdict,
+    Reuses(b"the list is parameter 0, and every call site passes it and never uses it again"),
+  );
+  assert(reuses(site_of(b"cut")))
 }
 
 test "an array or list element replaced in place is an update, and one read out first is a copy" {
@@ -1551,44 +1599,62 @@ test "an array or list element replaced in place is an update, and one read out 
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let filled = site_of(b"fill");
-  assert_eq([filled.operation, verdict_word(filled.verdict), filled.reason], [
-    b"Array::set",
-    b"reuses",
-    b"the array is parameter 0, and every call site passes it and never uses it again",
-  ]);
+  assert_eq(filled.operation, b"Array::set");
+  assert_eq(
+    filled.verdict,
+    Reuses(b"the array is parameter 0, and every call site passes it and never uses it again"),
+  );
   let twiced = site_of(b"twice");
-  assert_eq([twiced.operation, verdict_word(twiced.verdict)], [b"Array::set", b"reuses"]);
+  assert(twiced.operation == b"Array::set" && reuses(twiced));
   let again = site_of(b"again");
-  assert_eq([verdict_word(again.verdict), again.reason, again.suggestion], [
-    b"copies",
-    b"`xs` is read again after this point, so this use clones it",
-    b"make the update the last use of the variable: first bind anything else you need from the variable to new names",
-  ]);
-  assert_eq(verdict_word(site_of(b"sized").verdict), b"reuses");
+  assert_eq(
+    again.verdict,
+    Copies({ cause: ReadAgain, text: b"`xs` is read again after this point, so this use clones it" }, Local),
+  );
+  assert_eq(
+    suggestion(again.verdict),
+    Some(
+      b"make the update the last use of the variable: first bind anything else you need from the variable to new names",
+    ),
+  );
+  assert(reuses(site_of(b"sized")));
   let read = site_of(b"first");
-  assert_eq([read.operation, verdict_word(read.verdict), read.reason], [
-    b"Array::set",
-    b"copies",
-    b"`List::at` returns a clone of an element the list still owns",
-  ]);
+  assert_eq(read.operation, b"Array::set");
+  assert_eq(
+    read.verdict,
+    Copies(
+      { cause: ContainerElement, text: b"`List::at` returns a clone of an element the list still owns" },
+      Local,
+    ),
+  );
   let bumped = site_of(b"bump");
-  assert_eq([bumped.operation, verdict_word(bumped.verdict)], [b"List::set", b"reuses"])
+  assert(bumped.operation == b"List::set" && reuses(bumped))
 }
 
-test "updating a value read from a scope reports a copy, and updating one the scope's callback returns or ends up using reports an unknown cost" {
+test "updating a value read from a scope reports a copy, and updating one the scope's callback returns or ends up using reports an undecided cost" {
   let source = b"fn read(xs: List<Int>, n: Int) -> List<Int> = with_scope[r](xs, |l: List<Int>| ()) { h -> h.get().push(n) }\nfn answered(xs: List<Int>, n: Int) -> List<Int> = List::push(with_scope[r](n, |k: Int| ()) { h -> xs }, n)\nfn released(xs: List<Int>, n: Int) -> Int = with_scope[r](xs, |l: List<Int>| { let grown = l.push(n); () }) { h -> n }\n";
   let r = reported([b"m"], [source]);
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
   let read = site_of(b"read");
-  assert_eq([verdict_word(read.verdict), read.reason, read.suggestion], [
-    b"copies",
-    b"`Scoped::get` returns a copy of a value the scope still owns",
-    b"",
-  ]);
-  assert_eq(verdict_word(site_of(b"answered").verdict), b"unknown");
-  assert_eq(verdict_word(site_of(b"released").verdict), b"unknown")
+  assert_eq(
+    read.verdict,
+    Copies(
+      { cause: ContainerElement, text: b"`Scoped::get` returns a copy of a value the scope still owns" },
+      Local,
+    ),
+  );
+  assert_eq(suggestion(read.verdict), None);
+  assert(undecided(site_of(b"answered")));
+  assert(undecided(site_of(b"released")))
 }
+
+fn reuses(s: Site) -> Bool = match s.verdict { Reuses(_) -> true, _ -> false }
+
+fn undecided(s: Site) -> Bool = match s.verdict { Undecided(_, _) -> true, _ -> false }
+
+fn verdict_word(verdict: Verdict) -> Bytes =
+  match verdict { Reuses(_) -> b"reuses", Copies(_, _) -> b"copies", Undecided(_, _) -> b"undecided" }
 
 fn verdicts(r: Report) -> List<Bytes> =
   r.definitions.fold([], |accumulator: List<Bytes>, d: Costed|
@@ -1620,12 +1686,17 @@ test "an update inside a callback passed to a builtin reports a copy or reuse by
   let r = reported([b"m"], [source]);
   assert(r.ok);
   let site_of = |name: Bytes| r.definitions.filter(|d: Costed| d.name == name).get(0).sites.get(0);
-  assert_eq(verdict_word(site_of(b"grown").verdict), b"reuses");
-  let each = site_of(b"each");
-  assert_eq([verdict_word(each.verdict), each.reason], [
-    b"copies",
-    b"an element of the list being iterated over, which the list still owns",
-  ]);
+  assert(reuses(site_of(b"grown")));
+  assert_eq(
+    site_of(b"each").verdict,
+    Copies(
+      {
+        cause: ContainerElement,
+        text: b"an element of the list being iterated over, which the list still owns",
+      },
+      Local,
+    ),
+  );
   assert_eq(r.return_mismatches.map(|u: ReturnMismatch| (u.name, u.actual)), [
     (b"m.values", b"`Map::fold` returns whatever its callback returned"),
   ])
@@ -1663,19 +1734,21 @@ test "`fold` is treated as returning whatever its callback returns" {
   let app = b"import lib.more\nreuse fn grow(n: Int) -> List<Int> = more::made(n).push(n)\nreuse fn other(n: Int) -> List<Int> = more::plain(n).push(n)\n";
   let r = reported([b"app", b"lib.more"], [app, lib], [0, 1]);
   assert(r.ok);
-  assert_eq(verdicts(r), [b"grow reuses", b"other unknown"]);
+  assert_eq(verdicts(r), [b"grow reuses", b"other undecided"]);
   assert_eq(r.return_mismatches, [])
 }
 
 test "a callee in another body is read through the given return, and a demand names the callee" {
   let source = b"pub fn kept(xs: List<Int>) -> List<Int> = xs\nfn grow(xs: List<Int>, n: Int) -> List<Int> = kept(xs).push(n)\n";
   let c = checked_cost_input([b"m"], [source]);
-  let only_grow = { ..c.input, roots: Some(Map::new().insert(b"m.grow")) };
+  let only_grow = { ..c.input, roots: Some(Set::of_list([b"m.grow"])) };
   let walked = over_analysis(c.analysis, ||
     walked_group(only_grow, |name: Bytes|
       if name == b"m.kept" { ReturnOfParam(0) } else { FreshReturn }));
-  assert_eq(walked.bodies.map(|b: WalkedBody| b.definition), [Some(b"m.grow")]);
-  assert_eq(walked.bodies.get(0).demands, [{ callee: b"m.kept", param: 0, owner: ParamOwner(0) }])
+  assert_eq(walked.bodies.map(|b: WalkedBody| b.item_kind), [CostedFunction(b"m.grow")]);
+  assert_eq(walked.bodies.get(0).demands, [
+    { callee: b"m.kept", param: 0, owner: ParamOwner({ definition: b"m.grow", index: 0 }) },
+  ])
 }
 
 test "parameters stay sole until a caller's demand reaches them through its own parameter" {
@@ -1683,13 +1756,17 @@ test "parameters stay sole until a caller's demand reaches them through its own 
     ok: true,
     bodies: [
       {
-        caller: Some(b"m.outer"),
         label: b"m.outer",
         escaped: [],
-        demands: [{ callee: b"m.inner", param: 0, owner: ParamOwner(0) }],
+        demands: [
+          {
+            callee: b"m.inner",
+            param: 0,
+            owner: ParamOwner({ definition: b"m.outer", index: 0 }),
+          },
+        ],
       },
       {
-        caller: None,
         label: b"m: test",
         escaped: [],
         demands: [
@@ -1703,10 +1780,28 @@ test "parameters stay sole until a caller's demand reaches them through its own 
     ],
   };
   let settled = parameters_of([rollup]);
-  assert(settled.rounds > 1);
-  assert(match param_at(settled.table, Some(b"m.inner"), 0) {
-    Some(SharedParam(_)) -> true,
+  assert(match sharing_of(settled.table, { definition: b"m.inner", index: 0 }) {
+    SharedParam(_) -> true,
     _ -> false,
   });
-  assert_eq(param_at(settled.table, Some(b"m.other"), 0), Some(SoleParam))
+  assert_eq(sharing_of(settled.table, { definition: b"m.other", index: 0 }), SoleParam)
+}
+
+fn passes_on(caller: Bytes, callee: Bytes, cause: Cause) -> BodyDemands =
+  {
+    label: caller,
+    escaped: [],
+    demands: [
+      { callee: callee, param: 0, owner: ParamOwner({ definition: caller, index: 0 }) },
+      { callee: callee, param: 0, owner: UnknownOwner({ cause: cause, text: caller }) },
+    ],
+  }
+
+test "parameters that pass each other's values settle to one table, whatever order the demands come in" {
+  let f = passes_on(b"m.f", b"m.g", ReadAgain);
+  let g = passes_on(b"m.g", b"m.f", MapEntry);
+  let reversed = |b: BodyDemands| { ..b, demands: b.demands.reverse() };
+  let settled = parameters_of([{ ok: true, bodies: [f, g] }]);
+  assert_eq(parameters_of([{ ok: true, bodies: [g, f] }]), settled);
+  assert_eq(parameters_of([{ ok: true, bodies: [reversed(f), reversed(g)] }]), settled)
 }
