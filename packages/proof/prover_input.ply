@@ -1,10 +1,11 @@
 import compiler.syntax.parsing (Warning)
 import compiler.check.infer.checker (TypeFacts)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.facts (Analysis, analysis_identities, claim_literals, literals_of,
-                             schema_definitions, Bounded, bounds_of, guard_bounds)
+import compiler.front.facts (Analysis, claim_literals, literals_of, schema_definitions, Bounded,
+                             bounds_of, guard_bounds)
 import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.checking (read_over, analysed_over)
+import compiler.front.checking (read_over, analysed_over, session_over, claimed_in_memory,
+                                in_memory, InMemory, FileAt)
 import compiler.front.checking.promises (ClaimsAnalysed, ClaimsRejected, claims_analysed)
 import compiler.front.rows (module_imports)
 import compiler.check.infer.checker (Builtin, ConstructorInfo, DefinitionInfo, LawBinder, LawInfo,
@@ -21,7 +22,7 @@ import compiler.store.hash.forms (HashOutput, NodeRef, ItemKeyed, references_in,
 import compiler.store.hash.encoding (hex)
 import std.hash (blake3)
 import compiler.check.resolve.tables (Diagnostic, InSource, ParsedModule, Place, Unplaced,
-                                      WholeFile, error_at, place_of, qualify)
+                                      WholeFile, Source, error_at, place_of, qualify)
 import compiler.syntax.parsing (Span)
 import compiler.check.types (Effect, Field, Printer, Type, NamedType, FunctionType, RecordType,
                              VariableType, print_resource, print_effects, print_type,
@@ -1039,11 +1040,26 @@ fn measures_of(modules: List<ParsedModule>) -> Map<Bytes, Expression> =
         _ -> a,
       }))
 
-pub fn whole_program_input(
-  analysis: Analysis,
+pub type Claimed = { program: InMemory, analysis: Analysis, identities: Identities }
+
+pub fn claimed_session(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+) -> Claimed / {abort.raise} = {
+  let claimed = claimed_in_memory(in_memory(sources, shipped, files));
+  match claimed.outcome {
+    ClaimsRejected(_) -> panic("the fixture program was rejected by the checker"),
+    ClaimsAnalysed(w, identities) ->
+      { program: claimed.program, analysis: w, identities: identities },
+  }
+}
+
+pub fn claimed_input(
+  claimed: Claimed,
   owned: (Bytes) -> Bool,
 ) -> ProverInputResult / {abort.raise} =
-  prover_input_of(analysis, analysis_identities(analysis), owned)
+  prover_input_of(claimed.analysis, claimed.identities, owned)
 
 pub fn whole_of(source: Bytes) -> Analysis / {abort.raise} =
   match analysed_over([{ name: b"m", source_text: source }]) {
@@ -1054,7 +1070,7 @@ pub fn whole_of(source: Bytes) -> Analysis / {abort.raise} =
 pub fn every(m: Bytes) -> Bool = true
 
 fn prover_input(source: Bytes) -> ProverInputResult / {abort.raise} =
-  whole_program_input(whole_of(source), every)
+  claimed_input(claimed_session([{ name: b"m", source_text: source }]), every)
 
 fn declaration_named(ds: List<Declaration>, name: String) -> Declaration / {abort.raise} =
   match ds.fold(None, |found: Option<Declaration>, d: Declaration|
@@ -1189,28 +1205,43 @@ test "an `ensures` clause's frame comes from the effects its definition declares
 fn hex_len(o: Option<String>) -> Int = match o { Some(t) -> t.len(), None -> 0 }
 
 test "`prover_input_of` includes the definitions and `law`s of the modules being proved, with hashes and texts matching what review stores" {
-  let w = whole_of(
-    b"fn f(x: Int) -> Int ensures result == x = x\nfn g() -> Int = 1\nlaw \"f is g\" forall (x: Int) { f(x) == x + g() - 1 }\n",
-  );
-  let built = whole_program_input(w, |m: Bytes| m == b"m");
+  let w = claimed_session([
+    {
+      name: b"m",
+      source_text: b"fn f(x: Int) -> Int ensures result == x = x\nfn g() -> Int = 1\nlaw \"f is g\" forall (x: Int) { f(x) == x + g() - 1 }\n",
+    },
+  ]);
+  let built = claimed_input(w, |m: Bytes| m == b"m");
   assert_eq(built.definitions.map(|d: Definition| d.name), ["m.f", "m.g"]);
   assert_eq(built.definitions.map(|d: Definition| hex_len(d.hash)), [64, 64]);
   assert_eq(built.definitions.map(|d: Definition| d.specs.map(String::len)), [[64], []]);
   assert_eq(built.laws.map(|l: WrittenLaw| (l.key, l.text.len())), [("m.f is g", 64)]);
   let mentions = built.laws.get(0).mentions;
   assert(mentions.contains("m.f") && mentions.contains("m.g"));
-  let other = whole_program_input(w, |m: Bytes| m != b"m");
+  let other = claimed_input(w, |m: Bytes| m != b"m");
   assert_eq(other.definitions.filter(|d: Definition| d.name.starts_with("m.")), []);
   assert_eq(other.laws, [])
 }
 
 test "`prover_input_of` omits the claims of modules outside the proof run, but still includes their types" {
-  let built = whole_program_input(
-    whole_of(b"type Coin = | Heads | Tails\nlaw \"heads\" forall (c: Coin) { c == c || true }\n"),
+  let built = claimed_input(
+    claimed_session([
+      {
+        name: b"m",
+        source_text: b"type Coin = | Heads | Tails\nlaw \"heads\" forall (c: Coin) { c == c || true }\n",
+      },
+    ]),
     |m: Bytes| m != b"m",
   );
   assert_eq(built.world.obligations, []);
   assert_eq(declaration_named(built.world.declarations, "m.Coin").variants.len(), 2)
+}
+
+test "a claim about a function whose body calls a prelude function is keyed by the stored identities" {
+  let built = prover_input(
+    b"fn made(n: Int) -> List<Int> requires n >= 0 ensures result.len() == n = range(0, n)\n",
+  );
+  assert(owned_by(built.world.obligations, "m.made").len() > 0)
 }
 
 const coin_type_shape: Shape =
@@ -1315,9 +1346,13 @@ test "outside the module that defines an opaque type, the prover never builds va
       source_text: b"import std.vault (Token, Stamp, Coin)\ntype Held = | Held(Token, Int)\nfn kept(t: Token) -> Int ensures result != 7 = 1\nfn stamps(ss: List<Stamp>) -> Int ensures result != 7 = ss.len()\nfn wrapped(h: Held) -> Int ensures result != 7 = 1\nfn flipped(c: Coin, n: Int) -> Int ensures result != 7 = n\n",
     },
   ];
-  let built = match analysed_over(user, shipped) {
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> whole_program_input(w, every),
+  let built = match session_over(in_memory(user, shipped), |_: List<Bytes>|
+      claims_analysed([
+        { module: b"m", shipped: false, tested: true },
+        { module: b"std.vault", shipped: true, tested: false },
+      ]).outcome).value {
+    ClaimsRejected(_) -> panic("the fixture program was rejected by the checker"),
+    ClaimsAnalysed(w, identities) -> prover_input_of(w, identities, every),
   };
   let made = |owner: String|
     owned_by(built.world.obligations, owner).get(0).binders.map(|b: Binder| b.constructible);
@@ -1405,7 +1440,7 @@ fn placeless(built: ProverInputResult) -> List<PlacelessObligation> =
 fn by_key(a: PlacelessObligation, b: PlacelessObligation) -> Bool =
   match compare_values(a.key, b.key) { Greater -> false, _ -> true }
 
-test "a claim's prover input built from stored group results equals the one a whole check gives" {
+test "a claim's prover input read from stored group results equals the one a whole check of the program gives" {
   let sources = [
     {
       name: b"lib",
@@ -1417,10 +1452,7 @@ test "a claim's prover input built from stored group results equals the one a wh
     },
   ];
   let owned = |m: Bytes| m == b"lib" || m == b"app";
-  let whole = match analysed_over(sources) {
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> whole_program_input(w, owned),
-  };
+  let whole = claimed_input(claimed_session(sources), owned);
   match read_over(sources, ||
       claims_analysed([
         { module: b"app", shipped: false, tested: true },
@@ -1438,24 +1470,23 @@ test "a claim's prover input built from stored group results equals the one a wh
   }
 }
 
-fn app_law_key(source: Bytes) -> String / {abort.raise} =
-  match analysed_over([
-      { name: b"base", source_text: b"pub fn f(x: Int) -> Int = x\n".concat(source) },
-      {
-        name: b"app",
-        source_text: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n",
-      },
-    ]) {
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> match whole_program_input(w, |m: Bytes| m == b"app").world.obligations.fold(
-        None,
-        |found: Option<String>, o: Obligation|
-          if o.owner == "app.uses" { Some(o.key) } else { found },
-      ) {
-      Some(k) -> k,
-      None -> panic("the fixture has no claim named `app.uses`"),
+fn app_law_key(source: Bytes) -> String / {abort.raise} = {
+  let claimed = claimed_session([
+    { name: b"base", source_text: b"pub fn f(x: Int) -> Int = x\n".concat(source) },
+    {
+      name: b"app",
+      source_text: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n",
     },
+  ]);
+  match claimed_input(claimed, |m: Bytes| m == b"app").world.obligations.fold(
+      None,
+      |found: Option<String>, o: Obligation|
+        if o.owner == "app.uses" { Some(o.key) } else { found },
+    ) {
+    Some(k) -> k,
+    None -> panic("the fixture has no claim named `app.uses`"),
   }
+}
 
 test "a claim's cache key changes when the `law`s of an imported package change, and when the definitions a `law` mentions change" {
   let none = app_law_key(b"");
