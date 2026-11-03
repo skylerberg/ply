@@ -6,6 +6,7 @@ import std.graph
 import std.graph (Visit, traverse)
 import std.hash (blake3)
 import std.list
+import std.math (unlimited_steps)
 import compiler.check.infer.definitions (Extern, extern_bin, module_externs)
 import compiler.check.resolve.tables (module_of_name, qualify)
 import compiler.check.infer.definitions (declared_natives)
@@ -28,7 +29,7 @@ import compiler.front.checking.groups (GroupKey, OwnerKey, group_key_bin, module
                                        resolved_group_of, stored_lowering, declared_of,
                                        owners_result_of, stored_rows, OwnersResult, owner_key_bin,
                                        group_key_of, owner_facts, checked_law_outline,
-                                       over_full_names, module_key_in)
+                                       over_full_names, module_key_in, forms_part)
 import compiler.front.owner_checks (MemberResult)
 import compiler.front.checking.world (module_read, ModuleKey, module_key_bin, decoded, QueryEffects,
                                       RunEffects, CheckQuery, decode_cache, package_location_of,
@@ -39,10 +40,12 @@ import compiler.front.exports (Mention, mention_bin, OwnerInterface)
 import compiler.front.rows (OutlineItem, OutlinedFunction, OutlinedTest, OutlinedLaw, Rows,
                             KnownDefinitionRow)
 import compiler.store.hash.template (emitted_code)
+import compiler.store.hash.forms (NodeRef)
+import compiler.store.hash.graph (HeldValue)
 import compiler.store.memo (memo)
 import compiler.store.handles (QueryOf, PartOf, KeyedPartOf, Written, written, with_part,
-                               with_keyed_part, fetch, fetch_digest, fetch_part, fetch_keyed_part,
-                               query_definition)
+                               with_keyed_part, fetch, fetch_all, fetch_all_part, fetch_digest,
+                               fetch_part, fetch_keyed_part, query_definition)
 import compiler.syntax.expressions (prelude_module, prelude_hosts)
 import compiler.syntax.items (SpecKind, RequiresClause, EnsuresClause)
 import compiler.unit (lowering_rejected, always_enters, CalleeFacts, LoweredBatch, LoweredUnit,
@@ -119,6 +122,9 @@ pub fn module_units_query() -> QueryOf<ModuleKey, ModuleUnits> =
 
 pub fn root_unit_part() -> KeyedPartOf<ModuleKey, ModuleUnits, RootKey, CodeUnit> =
   { query: module_units_query(), name: b"root unit", key: root_key_bin(), output: code_unit_bin() }
+
+pub fn unit_calls_query() -> QueryOf<CodeUnit, List<CodeUnit>> =
+  { name: b"unit calls", input: code_unit_bin(), output: bin::list_bin(code_unit_bin()) }
 
 pub fn reachable_query() -> QueryOf<Entries, Reached> =
   { name: b"reachable", input: entries_bin(), output: reached_bin() }
@@ -648,13 +654,134 @@ fn with_unit_part(
 
 type ReachedRoot = { unit: CodeUnit, summary: Option<UnitSummary>, calls: List<RootKey> }
 
-pub fn find_reachable_units(entries: Entries) -> Written / {memo.read, abort.raise} = {
-  let reached = traverse(entries.roots, |k: RootKey| {
-    let unit = unit_of_root(k, entries.tested);
-    let summary = if unit == NoCode { None } else { Some(summary_of(unit)) };
-    let calls = match summary { Some(s) -> roots_called(s, k), None -> [] };
-    { value: { unit: unit, summary: summary, calls: calls }, next: calls }
+fn unit_tested(unit: CodeUnit) -> Bool =
+  match unit { OfGroup(g) -> tested_of(g), OfRoot(r) -> r.tested, NoCode -> false }
+
+fn roots_called_before_lowering(unit: CodeUnit) -> List<RootKey> / {memo.read, abort.raise} =
+  match unit {
+    OfGroup(g) ->
+      fetch_part(forms_part(), g).forms.names.fold([], |found: List<RootKey>, named: NodeRef|
+        if named.kind == HeldValue { found.push(Named(named.name)) } else { found }),
+    OfRoot(r) -> match r.key { EntryPoint(entered) -> [entered], other -> [unspecialised(other)] },
+    NoCode -> [],
+  }
+
+pub fn list_unit_calls(unit: CodeUnit) -> Written / {memo.read, abort.raise} = {
+  let tested = unit_tested(unit);
+  written(
+    unit_calls_query(),
+    roots_called_before_lowering(unit).fold([], |found: List<CodeUnit>, k: RootKey| {
+      let callee = unit_of_root(k, tested);
+      if callee == unit || callee == NoCode { found } else { found.push_unique(callee) }
+    }),
+  )
+}
+
+type CalledUnit = Visit<CodeUnit, List<CodeUnit>>
+
+fn call_levels(reached: List<CalledUnit>) -> List<List<CodeUnit>> / {abort.raise} = {
+  let index = reached.fold(Map::new(), |m: Map<CodeUnit, Int>, v: CalledUnit|
+    m.insert(v.key, m.len()));
+  let condensed = graph::condensation({
+    out: reached.map(|v: CalledUnit|
+      v.value.fold([], |out: List<Int>, callee: CodeUnit|
+        match index.get(callee) { Some(i) -> out.push(i), None -> out })),
   });
+  let heights = condensed.graph.out.fold([], |found: List<Int>, lower: List<Int>|
+    found.push(lower.fold(0, |height: Int, below: Int| max(height, found.get(below) + 1))));
+  range(0, condensed.members.len()).fold(
+    Map::new(),
+    |levels: Map<Int, List<CodeUnit>>, component: Int| {
+      let height = heights.get(component);
+      levels.insert(
+        height,
+        List::concat(
+          match levels.get(height) { Some(us) -> us, None -> [] },
+          condensed.members.get(component).map(|n: Int| reached.get(n).key),
+        ),
+      )
+    },
+  ).values(
+  )
+}
+
+fn lowered_by_level(
+  lowered: Set<CodeUnit>,
+  needed: List<CodeUnit>,
+) -> Set<CodeUnit> / {memo.read, abort.raise} = {
+  let reached = traverse(needed, |unit: CodeUnit| {
+    let callees = fetch(unit_calls_query(), unit).filter(|c: CodeUnit| !lowered.contains(c));
+    { value: callees, next: callees }
+  });
+  call_levels(reached).fold((), |_: Unit, level: List<CodeUnit>| {
+    fetch_all_part(code_summary_part(), level);
+  });
+  reached.fold(lowered, |done: Set<CodeUnit>, v: CalledUnit| done.insert(v.key))
+}
+
+type Frontier = { met: Set<RootKey>, roots: List<RootKey> }
+
+fn with_met(frontier: Frontier, root: RootKey) -> Frontier =
+  if frontier.met.contains(root) { frontier }
+  else { { met: frontier.met.insert(root), roots: frontier.roots.push(root) } }
+
+type ReachRound = {
+  visits: List<Visit<RootKey, ReachedRoot>>,
+  frontier: Frontier,
+  lowered: Set<CodeUnit>,
+}
+
+type PlacedRoot = { key: RootKey, unit: CodeUnit }
+
+type Expanded = { visits: List<Visit<RootKey, ReachedRoot>>, next: Frontier }
+
+fn expanded_root(sofar: Expanded, root: PlacedRoot) -> Expanded / {memo.read, abort.raise} = {
+  let summary = if root.unit == NoCode { None } else { Some(summary_of(root.unit)) };
+  let calls = match summary { Some(s) -> roots_called(s, root.key), None -> [] };
+  {
+    visits: sofar.visits.push({
+      key: root.key,
+      value: { unit: root.unit, summary: summary, calls: calls },
+    }),
+    next: calls.fold(sofar.next, with_met),
+  }
+}
+
+fn next_round(round: ReachRound, tested: Bool) -> ReachRound / {memo.read, abort.raise} = {
+  let placed = round.frontier.roots.map(|k: RootKey| { key: k, unit: unit_of_root(k, tested) });
+  let lowered = lowered_by_level(
+    round.lowered,
+    placed.fold([], |found: List<CodeUnit>, p: PlacedRoot|
+      if p.unit == NoCode || round.lowered.contains(p.unit) { found }
+      else { found.push_unique(p.unit) }),
+  );
+  let expanded = placed.fold(
+    { visits: round.visits, next: { met: round.frontier.met, roots: [] } },
+    expanded_root,
+  );
+  { visits: expanded.visits, frontier: expanded.next, lowered: lowered }
+}
+
+type ReachedWalk = { visits: List<Visit<RootKey, ReachedRoot>>, lowered: Set<CodeUnit> }
+
+fn reached_roots(entries: Entries) -> ReachedWalk / {memo.read, abort.raise} =
+  iterate(
+    {
+      visits: [],
+      frontier: entries.roots.fold({ met: Set::empty(), roots: [] }, with_met),
+      lowered: Set::empty(),
+    },
+    unlimited_steps,
+    |r: ReachRound|
+      match r.frontier.roots {
+        [] -> Stop({ visits: r.visits, lowered: r.lowered }),
+        _ -> Continue(next_round(r, entries.tested)),
+      },
+  )
+
+pub fn find_reachable_units(entries: Entries) -> Written / {memo.read, abort.raise} = {
+  let walk = reached_roots(entries);
+  let reached = walk.visits;
   let walked = reached.fold(
     { units: Map::new(), modules: Map::new(), links: [], failures: [] },
     |w: ReachWalk, v: Visit<RootKey, ReachedRoot>| {
@@ -675,8 +802,13 @@ pub fn find_reachable_units(entries: Entries) -> Written / {memo.read, abort.rai
     { walk: walked, parts: Map::new() },
     |b: PartsBuilt, at: Bytes, unit: CodeUnit| with_unit_part(b, at, unit),
   );
+  let parts = built.parts.values();
+  lowered_by_level(
+    walk.lowered,
+    parts.flat_map(|p: PartMembers| p.units).filter(|u: CodeUnit| !walk.lowered.contains(u)),
+  );
   written(reachable_query(), {
-    parts: built.parts.values(),
+    parts: parts,
     roots: reached.map(|v: Visit<RootKey, ReachedRoot>| v.key),
     links: walked.links,
     failures: walked.failures,
@@ -713,13 +845,11 @@ fn foreign_head(
   }
 }
 
-fn part_tested(part: PartMembers) -> Bool =
-  part.units.fold(false, |any: Bool, u: CodeUnit|
-    any || (match u { OfGroup(g) -> tested_of(g), OfRoot(r) -> r.tested, NoCode -> false }))
+fn part_tested(part: PartMembers) -> Bool = part.units.any(unit_tested)
 
 pub fn build_part(part: PartMembers) -> Written / {memo.read, abort.raise} = {
   let tested = part_tested(part);
-  let codes = part.units.map(unit_code_of);
+  let codes = codes_of_part(part);
   let own = codes.fold(Set::empty(), |m: Set<RootName>, c: UnitCode|
     c.results.fold(m, |into: Set<RootName>, r: RootOutput|
       r.result.tables.members.map(root_name).fold(
@@ -757,6 +887,11 @@ pub fn code_queries() -> List<CheckDefinition> =
       list_module_units,
     ),
     query_definition(
+      unit_calls_query(),
+      b"compiler.front.checking.units.list_unit_calls",
+      list_unit_calls,
+    ),
+    query_definition(
       reachable_query(),
       b"compiler.front.checking.units.find_reachable_units",
       find_reachable_units,
@@ -778,6 +913,7 @@ pub const code_product_queries: List<Bytes> =
   [
     code_query().name,
     module_units_query().name,
+    unit_calls_query().name,
     reachable_query().name,
     part_query().name,
     constant_values_query().name,
@@ -815,7 +951,9 @@ pub fn entries_of(roots: List<RootKey>) -> Entries / {memo.read, abort.raise} =
 pub fn program_code(entries: Entries) -> ProgramCode / {memo.read, abort.raise} = {
   let reached = fetch(reachable_query(), entries);
   {
-    parts: reached.parts.map(|part: PartMembers| { part: part, made: fetch(part_query(), part) }),
+    parts: list::zip(reached.parts, fetch_all(part_query(), reached.parts)).map(
+      |p: { first: PartMembers, second: MadePart }| { part: p.first, made: p.second },
+    ),
     roots: reached.roots,
     links: reached.links,
     failures: reached.failures,
@@ -891,7 +1029,7 @@ pub fn closure_codes(code: ProgramCode) -> Map<RootName, Bytes> / {abort.raise} 
 }
 
 pub fn codes_of_part(part: PartMembers) -> List<UnitCode> / {memo.read, abort.raise} =
-  part.units.map(unit_code_of)
+  fetch_all(code_query(), part.units)
 
 pub fn decoded_code(bytes: Bytes) -> UnitCode / {abort.raise} =
   decoded(bytes, unit_code_bin(), "a unit's code")
@@ -939,4 +1077,22 @@ test "a root's code digest changes when anything it can call changes, and not ot
   let after = closure_codes(linked_program(digests(b"4"), calls));
   assert(before.get(root_name(Named(b"f"))) != after.get(root_name(Named(b"f"))), None);
   assert_eq(before.get(root_name(Named(b"h"))), after.get(root_name(Named(b"h"))))
+}
+
+test "units are lowered in levels where each unit comes after every unit it calls, and the units of a cycle share a level" {
+  let unit = |name: Bytes| OfRoot({ key: Named(name), tested: false });
+  let called = |name: Bytes, callees: List<Bytes>| { key: unit(name), value: callees.map(unit) };
+  let units = [
+    called(b"main", [b"f", b"leaf"]),
+    called(b"f", [b"g"]),
+    called(b"g", [b"f", b"leaf"]),
+    called(b"leaf", []),
+  ];
+  let levels = call_levels(units);
+  let level_of = |name: Bytes|
+    range(0, levels.len()).filter(|i: Int| levels.get(i).contains(unit(name)));
+  assert_eq(levels.flatten().sort(), units.map(|v: CalledUnit| v.key).sort());
+  assert_eq(level_of(b"f"), level_of(b"g"));
+  assert(level_of(b"leaf").get(0) < level_of(b"f").get(0), None);
+  assert(level_of(b"f").get(0) < level_of(b"main").get(0), None)
 }
