@@ -6,12 +6,13 @@ import compiler.check.infer.checker (CheckReads, DefinitionInfo, EffectInfo, Typ
                                      no_stored_declarations)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
 import compiler.emit.representations (type_names, lowering)
-import compiler.front.facts (Analysis, PlacedTables, checked_of_parts)
+import compiler.front.facts (Analysis, PlacedTables, checked_of_parts, hashed_analysis)
 import compiler.front.published (group_analysis)
-import compiler.front.owner_checks (MemberResult, relocated_diagnostics, relocated_tables)
+import compiler.front.owner_checks (MemberResult, rejected_in, tables_in)
 import compiler.front.rows (OutlineItem, OutlinedFunction)
 import compiler.front.exports (item_at_bin, Imported, ItemAt, Mention, OwnerSource, OwnerText,
-                               group_imports, hash_entry_bin, item_layout, mention_key, named_node)
+                               group_imports, hash_entry_bin, item_layout, laid_out, mention_key,
+                               named_node)
 import compiler.emit.costs (cost_input_of, GroupWalk, ParamSharing, ReturnOwnership, FreshReturn,
                             WalkedBody, demands_of, group_walk_bin, module_costs,
                             module_demands_bin, parameters_bin, parameters_of, report_bin,
@@ -19,10 +20,11 @@ import compiler.emit.costs (cost_input_of, GroupWalk, ParamSharing, ReturnOwners
 import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, item_span)
 import compiler.check.resolve.tables (Diagnostic, ParsedModule, placed_in, qualify)
 import compiler.check.infer (item_owner)
-import compiler.store.hash.forms (CachedHashes, CachedNode, NodeRef, hash_layout, hashes_from_cache,
-                                  no_cached_hashes)
+import compiler.store.hash (unreached)
+import compiler.store.hash.forms (CachedHashes, CachedLaw, CachedNode, CachedTest, NodeRef,
+                                  hash_layout, hashes_from_cache, no_cached_hashes)
 import compiler.front.checking.units (with_code_reads)
-import compiler.program.group_check (LoadedSource, checked_group, resolved_group)
+import compiler.program.group_check (LoadedSource, resolved_group)
 import compiler.front.checking.world (ModuleKey, QueryEffects, SessionReads, context_once, decoded,
                                       interface_key_bin, module_key_bin, own_modules_kind,
                                       package_location_of, shipped_for)
@@ -143,30 +145,20 @@ fn returned_by(name: Bytes) -> ReturnOwnership / {memo.read, abort.raise} = {
 
 pub fn cost_walk_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
   let u = decoded(input, group_key_bin(), "a unit's names");
-  let members = unit_members(u);
-  let read = with_group_read(
-    [{ named: module_of_unit(u), members: members, imported: imports_for_unit(u, members) }],
-    always_entire,
-    no_bodies,
-    [],
-    |group: GroupRead|
-      {
-        out: checked_group(group.inputs, group.body_plan),
-        source: group.inputs.loaded.get(0).source,
-      },
-  );
+  let read = stored_analysis([u]);
+  let source = read.loaded.get(0);
   let unwalked = { ok: false, bodies: [], declared: [] };
   bin::encode(
-    match read.out.checked {
-      None -> unwalked,
-      Some(w) -> handle {
+    match read.outcome {
+      Rejected(_) -> unwalked,
+      Analysed(w) -> handle {
         with_code_reads(u.tested, ||
           walked_group(
             {
               ..cost_input_of(w),
               walked: [0],
-              roots: Some(unit_roots(w.modules.get(0), read.source)),
-              origin: read.source.offset,
+              roots: Some(unit_roots(w.modules.get(0), source)),
+              origin: source.offset,
             },
             returned_by,
           ))
@@ -293,10 +285,17 @@ pub fn hash_of_definition(name: Bytes) -> Option<Bytes> / {memo.read, abort.rais
 fn states_clauses(o: OwnerKey) -> Bool / {memo.read, abort.raise} =
   hashed_nodes(o).any(|n: CachedNode| n.specs.len() > 0)
 
+fn references_of(o: OwnerKey) -> List<NodeRef> / {memo.read, abort.raise} =
+  if is_test_or_law(o.owner) {
+    let fixing = group_hashes_of(unit_key_of(o)).fixing;
+    fixing.tests.flat_map(|t: CachedTest| t.refs.concat(t.runs)).concat(
+      fixing.laws.flat_map(|l: CachedLaw| l.refs),
+    )
+  } else { hashed_nodes(o).flat_map(|n: CachedNode| n.edges.concat(n.clauses)) }
+
 fn functions_used_by(o: OwnerKey) -> List<OwnerKey> / {memo.read, abort.raise} =
-  hashed_nodes(o).fold([], |accumulator: List<OwnerKey>, n: CachedNode|
-    n.edges.concat(n.clauses).fold(accumulator, |a: List<OwnerKey>, r: NodeRef|
-      if r.declaration { a } else { a.concat(owners_of_function(r.name)) }))
+  references_of(o).fold([], |accumulator: List<OwnerKey>, r: NodeRef|
+    if r.declaration { accumulator } else { accumulator.concat(owners_of_function(r.name)) })
 
 fn body_key(o: OwnerKey) -> Bytes = mention_key({ module: o.module, name: o.owner })
 
@@ -402,20 +401,6 @@ type StoredTables = {
   seen: Map<Bytes, Bool>,
 }
 
-fn member_items(
-  checked_in: List<ItemAt>,
-  loaded: OwnerSource,
-  owner: Bytes,
-) -> List<ItemAt> / {abort.raise} = {
-  let own = |items: List<ItemAt>| items.filter(|x: ItemAt| x.owner == owner);
-  let read = own(loaded.items);
-  let checked = own(checked_in);
-  range(0, min(read.len(), checked.len())).map(|k: Int| {
-    let c = checked.get(k);
-    { owner: owner, from: c.from, to: loaded.offset + read.get(k).from, len: c.len }
-  })
-}
-
 fn with_stored_owner(
   found: StoredTables,
   module: Int,
@@ -426,11 +411,10 @@ fn with_stored_owner(
   let at = owner_at(u, owner);
   let checked_in = group_key_of(at);
   let result = group_of(checked_in);
-  let items = member_items(
-    item_layout(checked_in.owners.map(|o: Bytes| owner_facts(module_of_unit(u), o).text)),
-    loaded,
-    owner,
+  let stored = item_layout(
+    checked_in.owners.map(|o: Bytes| owner_facts(module_of_unit(u), o).text),
   );
+  let placed = laid_out(loaded.items, loaded.offset);
   let seen = bin::encode(checked_in, group_key_bin());
   let first = !found.seen.contains(seen);
   let fixing = if first { group_hashes_of(checked_in).fixing } else { no_cached_hashes };
@@ -439,12 +423,12 @@ fn with_stored_owner(
       module,
       found.parts.get(module).unwrap_or([]).concat(
         result.members.filter(|m: MemberResult| m.owner == owner).map(|m: MemberResult|
-          { module: module, tables: relocated_tables(m.result.tables, items) }),
+          { module: module, tables: tables_in(m, stored, placed) }),
       ),
     ),
     rejected: if !first { found.rejected } else {
       found.rejected.concat(
-        relocated_diagnostics(result.rejected, items).map(|d: Diagnostic| placed_in(d, module)),
+        rejected_in(result.rejected, stored, placed).map(|d: Diagnostic| placed_in(d, module)),
       )
     },
     declared: declarations_joined(found.declared, stored_declarations_of(at, Entire)),
@@ -485,14 +469,17 @@ fn stored_analysis(groups: List<GroupKey>) -> GroupsAnalysed / {SessionReads, ab
           if read.rejected.len() > 0 { Rejected(read.rejected) } else {
             Analysed(
               with_stored_tables(
-                group_analysis(
-                  resolved,
-                  checked_of_parts(
-                    resolved.resolution.order.flat_map(|i: Int| read.parts.get(i).unwrap_or([])),
+                hashed_analysis(
+                  group_analysis(
+                    resolved,
+                    checked_of_parts(
+                      resolved.resolution.order.flat_map(|i: Int| read.parts.get(i).unwrap_or([])),
+                    ),
+                    [],
+                    read.declared,
+                    unreached(resolved.uses),
                   ),
                   hashes_from_cache(hash_layout(resolved.index), read.fixing),
-                  [],
-                  read.declared,
                 ),
                 with_performed_effects(group.mentioned),
               ),

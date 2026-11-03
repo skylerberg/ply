@@ -60,8 +60,9 @@ import compiler.front.rows (span_at, Cut, KeyRow, EmitterRoot, KnownDefinitionRo
                             KnownLawRow, Rows, known_definition_row_bin, rows_bin, ModuleSpan,
                             DefinitionRow, TestRow, DefinitionHashRow, HashTableRow, Dump,
                             normalized_diagnostic)
-import compiler.front.facts (Analysis, PackageTables, package_tables, toolchain_tree, tree_named,
-                             home_of, ToolchainTree, NoTree)
+import compiler.front.facts (Analysis, GroupAnalysis, PackageTables, hashed_analysis,
+                             package_tables, toolchain_tree, tree_named, home_of, ToolchainTree,
+                             NoTree)
 import compiler.front.emitter_input (test_root_at, checked_program_of, view_dump, Analysed,
                                      AnalysisOutcome, Rejected, cache_from_rows, InferredFacts,
                                      inferred_facts_of, rows_from)
@@ -506,8 +507,6 @@ pub type ResolvedGroup = {
   modules: List<ParsedModule>,
   resolution: Resolution,
   index: Index,
-  hashes: HashOutput,
-  unused: List<Diagnostic>,
   uses: List<UseNode>,
   module_packages: List<Int>,
   root_count: Int,
@@ -518,6 +517,8 @@ pub type ResolvedGroup = {
 
 pub type HashedProgram = {
   resolved: ResolvedGroup,
+  hashes: HashOutput,
+  unused: List<Diagnostic>,
   unimported: List<List<Bytes>>,
   closure: Closure,
   packages: List<PackageDependencies>,
@@ -535,7 +536,7 @@ pub fn resolved_facts(group: ResolvedGroup) -> ResolvedFacts =
 pub type GroupCheck = {
   resolved: ResolvedFacts,
   declared: StoredDeclarations,
-  checked: Option<Analysis>,
+  checked: Option<GroupAnalysis>,
   diagnostics: List<Diagnostic>,
 }
 
@@ -564,16 +565,16 @@ pub fn hashed_closure(
       let x = resolved.program;
       let hashed = hashed_and_unused(resolved.index, fixed, resolved.tables.module_packages);
       Ok({
+        hashes: hashed.hashes,
+        unused: hashed.unused.filter(|diagnostic: Diagnostic|
+          diagnostic.labels.any(
+            |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
+              l.primary && l.module < root_count,
+          )),
         resolved: {
           modules: x.modules,
           resolution: x.resolution,
           index: resolved.index,
-          hashes: hashed.hashes,
-          unused: hashed.unused.filter(|diagnostic: Diagnostic|
-            diagnostic.labels.any(
-              |l: { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }|
-                l.primary && l.module < root_count,
-            )),
           uses: hashed.uses,
           module_packages: resolved.tables.module_packages,
           root_count: root_count,
@@ -643,12 +644,12 @@ pub fn checked_closure(
   known: Rows,
   body_plan: BodyPlan,
 ) -> AnalysisOutcome / {abort.raise} = {
-  let check = with_no_other_definitions(|| type_check(h.resolved, known, body_plan));
+  let check = with_no_other_definitions(|| type_check(h.resolved, known, body_plan, h.unused));
   match check.checked {
     None -> Rejected(check.diagnostics),
     Some(a) ->
       Analysed({
-        ..a,
+        ..hashed_analysis(a, sited_hashes(h.hashes, a.modules, a.checked)),
         unimported: h.unimported,
         manifest: match h.closure.packages.at(0) { Some(p) -> p.manifest, None -> None },
         packages: h.packages,
@@ -663,6 +664,7 @@ pub fn type_check(
   group: ResolvedGroup,
   known: Rows,
   body_plan: BodyPlan,
+  unused: List<Diagnostic>,
 ) -> GroupCheck / {abort.raise, CheckReads} = {
   let out = check_output_with(group.resolution, group.modules, {
     ..cache_from_rows(known, group.root_count),
@@ -672,47 +674,43 @@ pub fn type_check(
   {
     resolved: resolved_facts(group),
     declared: out.declared,
-    checked: if !checked.ok || group.problems.len() > 0 { None } else {
-      Some(
-        group_analysis(
-          group,
-          checked,
-          {
-            let cached_sites = cached_member_sites(group.modules, checked);
-            checked_hashes(
-              group.hashes,
-              checked.facts.members.concat(cached_sites.sites),
-              cached_sites.unread,
-              checked.tests.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: TestInfo|
-                if cached_sites.unread.contains(test_owner(t.module, t.name)) {
-                  accumulator.insert(t.key, true)
-                } else { accumulator }),
-            )
-          },
-          out.bodies,
-          out.declared,
-        ),
-      )
-    },
+    checked: if !checked.ok || group.problems.len() > 0 { None }
+    else { Some(group_analysis(group, checked, out.bodies, out.declared, unused)) },
     diagnostics: group.problems.concat(checked.diagnostics.map(outside_every_module)),
   }
+}
+
+fn sited_hashes(
+  hashes: HashOutput,
+  modules: List<ParsedModule>,
+  checked: CheckOutput,
+) -> HashOutput / {abort.raise} = {
+  let cached_sites = cached_member_sites(modules, checked);
+  checked_hashes(
+    hashes,
+    checked.facts.members.concat(cached_sites.sites),
+    cached_sites.unread,
+    checked.tests.fold(Map::new(), |accumulator: Map<Bytes, Bool>, t: TestInfo|
+      if cached_sites.unread.contains(test_owner(t.module, t.name)) {
+        accumulator.insert(t.key, true)
+      } else { accumulator }),
+  )
 }
 
 pub fn group_analysis(
   group: ResolvedGroup,
   checked: CheckOutput,
-  hashes: HashOutput,
   bodies: List<CheckedBody>,
   declared: StoredDeclarations,
-) -> Analysis =
+  unused: List<Diagnostic>,
+) -> GroupAnalysis =
   {
     modules: group.modules,
     r: group.resolution,
     unimported: group.modules.map(|_: ParsedModule| []),
     checked: checked,
     index: group.index,
-    hashes: hashes,
-    warnings: group.unused.map(outside_every_module).concat(checked.warnings),
+    warnings: unused.map(outside_every_module).concat(checked.warnings),
     uses: group.uses,
     manifest: None,
     packages: [],
@@ -798,7 +796,7 @@ fn prune_prelude(
 ) -> Option<List<ParsedSource>> / {abort.raise} = {
   let own = |name: Bytes| module_of_name(name) == prelude_module;
   let resolved = h.resolved;
-  let roots = resolved.hashes.definitions.fold(
+  let roots = h.hashes.definitions.fold(
     [],
     |accumulator: List<Subject>, d: { name: Bytes, hash: Bytes }|
       if own(d.name) { accumulator } else { accumulator.push(FunctionNamed(d.name)) },
@@ -810,7 +808,7 @@ fn prune_prelude(
   ).concat(
     resolved.index.laws.map(|l: LawNode| ItemKeyed(l.key)),
   );
-  let reach = reachable_functions(resolved.hashes, roots);
+  let reach = reachable_functions(h.hashes, roots);
   let is_reachable = |p: ParsedSource, item: Item|
     match item { FunctionItem(d) -> reach.contains(qualify(p.name, d.name.name)), _ -> true };
   if !parsed.any(|p: ParsedSource|
