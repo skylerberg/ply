@@ -9,7 +9,7 @@ import std.list
 import std.show (show)
 import compiler.store.segments
 import compiler.store.segments (CommitResult, Committed, LockHeld, Manifest, Segment, SegmentWriter,
-                                StoreChanged, WriteFailed, RowFound, RowAbsent, RowUnreadable)
+                                StoreChanged, WriteFailed)
 import compiler.store.fact_tree
 import compiler.store.fact_tree (TreeEntry, TreeNode, TreeRoot, tree_node_bin)
 
@@ -22,7 +22,6 @@ pub effect recent_reads {
   write keep_node(hash: Bytes, node: TreeNode) -> Unit
   read table(name: Bytes) -> Option<Bytes>
   write keep_table(name: Bytes, rows: Bytes) -> Unit
-  write lookups_in(name: Bytes) -> Int
 }
 
 pub type Tree = | Facts | Dependents | Inputs | Codes | Records | Cursors | PackUsed
@@ -83,8 +82,6 @@ fn tree_number(tree: Tree) -> Int =
 
 fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
-const whole_table_after: Int = 256
-
 fn table_name(seg: Segment, table: Table) -> Bytes / {abort.raise} =
   seg.token.concat(byte_of_int(table_number(table)))
 
@@ -111,21 +108,8 @@ fn row_in_segment<[r]>(
   seg: Segment,
   table: Table,
   key: Bytes,
-) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
-  let name = table_name(seg, table);
-  match recent_reads.table(name) {
-    Some(rows) -> segments::row_of(rows, row_width(table), key),
-    None -> if recent_reads.lookups_in(name) >= whole_table_after {
-      segments::row_of(loaded_rows[r](db, seg, table), row_width(table), key)
-    } else {
-      match segments::row_on_disk[r](db.dir, seg, table_number(table), key) {
-        RowFound(row) -> Some(row),
-        RowAbsent -> None,
-        RowUnreadable -> fact_damage.damaged("a segment that the manifest lists does not read"),
-      }
-    },
-  }
-}
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  segments::row_of(loaded_rows[r](db, seg, table), row_width(table), key)
 
 type StoredRow = { token: Bytes, row: Bytes }
 
@@ -181,8 +165,6 @@ fn node_at<[r]>(
     },
   }
 
-const node_limit: Int = 1048576
-
 pub fn with_recent_reads<a | e>(
   work: () -> a / {recent_reads.read, recent_reads.write | e},
 ) -> a / e =
@@ -191,20 +173,13 @@ pub fn with_recent_reads<a | e>(
   } with {
     var nodes: Map<Bytes, TreeNode> = Map::new(),
     var tables: Map<Bytes, Bytes> = Map::new(),
-    var lookups: Map<Bytes, Int> = Map::new(),
     recent_reads.node(hash) -> nodes.get(hash),
     recent_reads.keep_node(hash, node) -> {
-      nodes = if nodes.len() >= node_limit { Map::new().insert(hash, node) }
-      else { nodes.insert(hash, node) };
+      nodes = nodes.insert(hash, node);
     },
     recent_reads.table(name) -> tables.get(name),
     recent_reads.keep_table(name, rows) -> {
       tables = tables.insert(name, rows);
-    },
-    recent_reads.lookups_in(name) -> {
-      let count = match lookups.get(name) { Some(n) -> n, None -> 0 };
-      lookups = lookups.insert(name, count + 1);
-      count
     },
   }
 
