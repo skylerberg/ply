@@ -4,7 +4,7 @@ import std.hash (checksum)
 import std.bytes (u32_le, u64_le)
 import std.list
 
-const format_version: Int = 3
+const format_version: Int = 4
 
 const segment_magic: Bytes = b"PLYSEGM1"
 
@@ -26,7 +26,7 @@ fn read_u32(b: Bytes, at: Int) -> Int = match b.u32_at(at) { Some(n) -> n, None 
 
 fn read_u64(b: Bytes, at: Int) -> Int = match b.u64_at(at) { Some(n) -> n, None -> 0 }
 
-pub type TableEntry = { table: Int, width: Int, count: Int, offset: Int, sum: Bytes }
+pub type TableEntry = { table: Int, offset: Int, size: Int, sum: Bytes }
 
 pub type Segment = { token: Bytes, at: Int, size: Int, parts: List<TableEntry> }
 
@@ -45,7 +45,7 @@ pub fn segment_path(dir: String, token: Bytes) -> String / {abort.raise} =
 fn lock_path(dir: String) -> String = dir ++ "/lock"
 
 fn table_entry_bytes(p: TableEntry) -> Bytes =
-  Bytes::concat_all([u32_le(p.table), u32_le(p.width), u64_le(p.count), u64_le(p.offset), p.sum])
+  Bytes::concat_all([u32_le(p.table), u64_le(p.offset), u64_le(p.size), p.sum])
 
 fn segment_bytes(s: Segment) -> Bytes =
   Bytes::concat_all([
@@ -78,14 +78,13 @@ fn table_entries_from(
   if end_run <= 0 { { value: accumulator, at: at } } else {
     table_entries_from(
       b,
-      at + 32,
+      at + 28,
       end_run - 1,
       accumulator.push({
         table: read_u32(b, at),
-        width: read_u32(b, at + 4),
-        count: read_u64(b, at + 8),
-        offset: read_u64(b, at + 16),
-        sum: b.slice(at + 24, at + 32),
+        offset: read_u64(b, at + 4),
+        size: read_u64(b, at + 12),
+        sum: b.slice(at + 20, at + 28),
       }),
     )
   }
@@ -207,38 +206,100 @@ pub fn table_rows<[r]>(
   dir: String,
   token: Bytes,
   entry: TableEntry,
-) -> Option<Bytes> / {fs.read[r], abort.raise} =
-  if entry.count == 0 { Some(b"") } else {
-    match read_range[r](segment_path(dir, token), entry.offset, entry.count * entry.width) {
-      Some(b) -> if checksum(b) == entry.sum { Some(b) } else { None },
-      None -> None,
-    }
+) -> Option<SortedTable> / {fs.read[r], abort.raise} =
+  match read_range[r](segment_path(dir, token), entry.offset, entry.size) {
+    Some(b) -> if checksum(b) == entry.sum { decoded_table(b) } else { None },
+    None -> None,
   }
 
-fn key_prefix(b: Bytes, at: Int) -> Int = {
-  let le = read_u32(b, at);
-  (le & 255) << 24 | (le >> 8 & 255) << 16 | (le >> 16 & 255) << 8 | le >> 24 & 255
+pub type Row = { key: Bytes, value: Bytes }
+
+pub opaque type SortedTable = new { count: Int, bytes: Bytes }
+
+const row_bounds_width: Int = 8
+
+fn bounds_at(row: Int) -> Int = 4 + row_bounds_width * row
+
+fn key_end(table: SortedTable, row: Int) -> Int = read_u32(table.bytes, bounds_at(row))
+
+fn value_end(table: SortedTable, row: Int) -> Int = read_u32(table.bytes, bounds_at(row) + 4)
+
+fn row_start(table: SortedTable, row: Int) -> Int =
+  if row == 0 { 0 } else { value_end(table, row - 1) }
+
+pub fn sorted_table(table_rows: Map<Bytes, Bytes>) -> SortedTable / {abort.raise} = {
+  let built = table_rows.fold(
+    { end: 0, bounds: [], body: [] },
+    |accumulator: { end: Int, bounds: List<Bytes>, body: List<Bytes> }, key: Bytes, value: Bytes| {
+      let after_key = accumulator.end + key.len();
+      let after_value = after_key + value.len();
+      let bounds = accumulator.bounds;
+      let body = accumulator.body;
+      {
+        end: after_value,
+        bounds: bounds.push(u32_le(after_key).concat(u32_le(after_value))),
+        body: body.push(key).push(value),
+      }
+    },
+  );
+  {
+    count: table_rows.len(),
+    bytes: Bytes::concat_all([
+      u32_le(table_rows.len()),
+      Bytes::concat_all(built.bounds),
+      Bytes::concat_all(built.body),
+    ]),
+  }
 }
 
-pub fn lower_bound(table_rows: Bytes, width: Int, key: Bytes) -> Int / {abort.raise} = {
-  let n = key.len();
-  let head = key_prefix(key, 0);
-  iterate({ lo: 0, hi: table_rows.len() / width }, 65, |x: { lo: Int, hi: Int }|
-    if x.lo >= x.hi { Stop(x.lo) } else {
-      let mid = x.lo + (x.hi - x.lo) / 2;
-      let at = mid * width;
-      let h = key_prefix(table_rows, at);
-      let under = if h != head { h < head }
-      else { compare_values(table_rows.slice(at, at + n), key) == Less };
-      if under { Continue({ lo: mid + 1, hi: x.hi }) } else { Continue({ lo: x.lo, hi: mid }) }
+pub const empty_table: SortedTable = { count: 0, bytes: u32_le(0) }
+
+pub fn decoded_table(bytes: Bytes) -> Option<SortedTable> =
+  match bytes.u32_at(0) {
+    None -> None,
+    Some(count) -> {
+      let body_end = if count == 0 { Some(0) } else { bytes.u32_at(bounds_at(count - 1) + 4) };
+      match body_end {
+        Some(end) -> if bounds_at(count) + end == bytes.len() {
+          Some({ count: count, bytes: bytes })
+        } else { None },
+        None -> None,
+      }
+    },
+  }
+
+pub fn table_bytes(table: SortedTable) -> Bytes = table.bytes
+
+pub fn row_count(table: SortedTable) -> Int = table.count
+
+fn key_at(table: SortedTable, row: Int) -> Bytes / {abort.raise} = {
+  let body = bounds_at(table.count);
+  table.bytes.slice(body + row_start(table, row), body + key_end(table, row))
+}
+
+pub fn row_at(table: SortedTable, row: Int) -> Row / {abort.raise} = {
+  let body = bounds_at(table.count);
+  {
+    key: key_at(table, row),
+    value: table.bytes.slice(body + key_end(table, row), body + value_end(table, row)),
+  }
+}
+
+pub fn lower_bound(table: SortedTable, key: Bytes) -> Int / {abort.raise} =
+  iterate({ low: 0, high: table.count }, table.count + 2, |x: { low: Int, high: Int }|
+    if x.low >= x.high { Stop(x.low) } else {
+      let middle = x.low + (x.high - x.low) / 2;
+      if compare_values(key_at(table, middle), key) == Less {
+        Continue({ low: middle + 1, high: x.high })
+      } else { Continue({ low: x.low, high: middle }) }
     })
-}
 
-pub fn row_of(table_rows: Bytes, width: Int, key: Bytes) -> Option<Bytes> / {abort.raise} = {
-  let at = lower_bound(table_rows, width, key) * width;
-  if at + width <= table_rows.len() && table_rows.slice(at, at + key.len()) == key {
-    Some(table_rows.slice(at, at + width))
-  } else { None }
+pub fn value_in(table: SortedTable, key: Bytes) -> Option<Bytes> / {abort.raise} = {
+  let at = lower_bound(table, key);
+  if at >= table.count { None } else {
+    let row = row_at(table, at);
+    if row.key == key { Some(row.value) } else { None }
+  }
 }
 
 pub fn framed(payload: Bytes) -> Bytes / {abort.raise} = {
@@ -343,30 +404,10 @@ pub fn flush_when_full<[r]>(
 ) -> SegmentWriter / {fs.write[r], abort.raise} =
   if w.buffered > flush_threshold { flush[r](dir, schema, token, w, b"") } else { w }
 
-pub opaque type Table = new { table: Int, width: Int, rows: Bytes }
+pub opaque type Table = new { table: Int, rows: SortedTable }
 
-pub fn table<v>(
-  table: Int,
-  table_rows: Map<Bytes, v>,
-  row: (Bytes, v) -> Option<Bytes> / {abort.raise},
-) -> Table / {abort.raise} = {
-  let built = table_rows.fold(
-    { width: 0, rows: [] },
-    |accumulator: { width: Int, rows: List<Bytes> }, key: Bytes, value: v|
-      match row(key, value) {
-        None -> accumulator,
-        Some(rest) -> {
-          let width = key.len() + rest.len();
-          if accumulator.width != 0 && accumulator.width != width {
-            panic("the rows of a table are one width")
-          };
-          let rows = accumulator.rows;
-          { width: width, rows: rows.push(key).push(rest) }
-        },
-      },
-  );
-  { table: table, width: built.width, rows: Bytes::concat_all(built.rows) }
-}
+pub fn table(table: Int, table_rows: Map<Bytes, Bytes>) -> Table / {abort.raise} =
+  { table: table, rows: sorted_table(table_rows) }
 
 pub fn finish<[r]>(
   dir: String,
@@ -378,20 +419,20 @@ pub fn finish<[r]>(
   let built = tables.fold(
     { at: w.end, parts: [], bytes: [] },
     |accumulator: { at: Int, parts: List<TableEntry>, bytes: List<Bytes> }, t: Table|
-      if t.rows.len() == 0 { accumulator } else {
+      if t.rows.count == 0 { accumulator } else {
         let at = accumulator.at;
         let parts = accumulator.parts;
         let bytes = accumulator.bytes;
+        let encoded = t.rows.bytes;
         {
-          at: at + t.rows.len(),
+          at: at + encoded.len(),
           parts: parts.push({
             table: t.table,
-            width: t.width,
-            count: t.rows.len() / t.width,
             offset: at,
-            sum: checksum(t.rows),
+            size: encoded.len(),
+            sum: checksum(encoded),
           }),
-          bytes: bytes.push(t.rows),
+          bytes: bytes.push(encoded),
         }
       },
   );
@@ -538,9 +579,7 @@ fn write_test_segment<[r]>(
       }
     },
   );
-  match finish[r](dir, schema, token, placed.writing, [
-      table(1, placed.rows, |_: Bytes, at: Bytes| Some(at)),
-    ]) {
+  match finish[r](dir, schema, token, placed.writing, [table(1, placed.rows)]) {
     Some(seg) -> seg,
     None -> panic("the test's file system could not write the stored file segment"),
   }
@@ -563,9 +602,9 @@ fn lookup<[r]>(dir: String, key: Bytes) -> Option<Bytes> / {fs.read[r], abort.ra
           None -> None,
           Some(entry) -> match table_rows[r](dir, seg.token, entry) {
             None -> None,
-            Some(section) -> match row_of(section, 44, key) {
+            Some(section) -> match value_in(section, key) {
               None -> None,
-              Some(row) -> payload[r](dir, seg.token, read_u64(row, 32), read_u32(row, 40)),
+              Some(place) -> payload[r](dir, seg.token, read_u64(place, 0), read_u32(place, 8)),
             },
           },
         }
@@ -742,6 +781,32 @@ test "a sweep keeps the segments of another store in the same directory when tha
 pub fn rows_folded<a | e>(count: Int, init: a, f: (a, Int) -> a / e) -> a / {abort.raise | e} =
   iterate({ at: 0, value: init }, count + 1, |s: { at: Int, value: a }|
     if s.at >= count { Stop(s.value) } else { Continue({ at: s.at + 1, value: f(s.value, s.at) }) })
+
+test "a sorted table returns each key's value, nothing for other keys, and its rows in key order" {
+  let rows = Map::new().insert(b"b", b"2").insert(b"ab", b"").insert(b"a", b"one").insert(
+    b"abc",
+    b"three",
+  );
+  let encoded = table_bytes(sorted_table(rows));
+  let read = match decoded_table(encoded) {
+    Some(table) -> table,
+    None -> panic("a table that was just encoded does not decode"),
+  };
+  assert_eq(
+    rows.keys().map(|key: Bytes| value_in(read, key)),
+    rows.values().map(|value: Bytes| Some(value)),
+  );
+  assert_eq([b"", b"aa", b"abcd", b"c"].map(|key: Bytes| value_in(read, key)), [
+    None,
+    None,
+    None,
+    None,
+  ]);
+  assert_eq(range(0, row_count(read)).map(|row: Int| row_at(read, row)), rows.entries());
+  assert_eq(row_at(read, lower_bound(read, b"aa")).key, b"ab");
+  assert_eq(value_in(empty_table, b"a"), None);
+  assert_eq(decoded_table(encoded.slice(0, 9)), None)
+}
 
 test "`rows_folded` visits each row index exactly once, in order" {
   assert_eq(rows_folded(3, [], |seen: List<Int>, i: Int| seen.push(i)), [0, 1, 2]);
