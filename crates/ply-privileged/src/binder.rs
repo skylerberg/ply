@@ -75,7 +75,8 @@ impl ply_compiled::entry::Binder for Binder {
         w.list(listening.signals().iter(), |w, s| {
             w.str(s.name());
         });
-        w.str(&binding_digest(grants)).str(&crate::shipped::program_digest());
+        w.str(&binding_digest(grants))
+            .str(&crate::shipped::program_digest());
     }
 }
 
