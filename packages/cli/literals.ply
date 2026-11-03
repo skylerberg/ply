@@ -1,7 +1,8 @@
 import compiler.check.resolve.tables (source_span)
 import compiler.syntax.parsing (Error)
 import compiler.syntax.expressions (TaggedPart)
-import compiler.front.checking.view (LaterReading, ProgramSites)
+import compiler.front.checking.view (LaterReading)
+import compiler.front.checking.program_facts (ProgramSites)
 import compiler.front.facts (TaggedSite)
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (length_prefixed)
@@ -48,10 +49,15 @@ derive bin for Verdict
 
 pub type EvaluationRequest = { callee: Bytes, hash: Bytes, parts: List<Bytes> }
 
+pub type StoredJudgements = { verdicts: List<Verdict>, statements: List<CheckResult> }
+
 pub effect evaluation {
   read verdicts(program: CodeProgram, requests: List<EvaluationRequest>) -> Result<List<Verdict>, List<Diagnostic>>
   read statements(program: CodeProgram, requests: List<statements::StatementCheck>) -> Result<List<CheckResult>, List<Diagnostic>>
+  read stored(place: ProgramPlace, requests: List<EvaluationRequest>, checks: List<statements::StatementCheck>) -> Option<StoredJudgements>
 }
+
+pub type SiteCheck = | Settled(List<Diagnostic>) | Unsettled
 
 fn request_of(site: TaggedSite) -> EvaluationRequest =
   { callee: site.callee, hash: site.hash, parts: site.parts.map(|part: TaggedPart| part.text) }
@@ -202,7 +208,7 @@ pub fn site_errors<a>(
   places: List<SourceText>,
 ) -> List<Diagnostic> / {evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} =
   if later.sites.tagged.len() + later.sites.statements.len() == 0 { [] } else {
-    match units::code_program_of(s, later.rollups) {
+    match units::code_program_of(s, later.rollup) {
       Err(diagnostics) -> diagnostics,
       Ok(program) -> evaluation_errors(program, later.sites, places),
     }
@@ -217,6 +223,26 @@ pub fn later_errors<a>(
     [] -> site_errors(s, later.reading, places),
     broken -> broken,
   }
+
+pub fn stored_site_check(
+  place: ProgramPlace,
+  sites: ProgramSites,
+  places: List<SourceText>,
+) -> SiteCheck / {evaluation.stored, abort.raise} = {
+  let parsers = distinct_requests(sites.tagged);
+  let checks = check_sites(sites);
+  if parsers.len() + checks.len() == 0 { Settled(schemas_rejected(checks)) } else {
+    match evaluation.stored(place, parsers, checks.map(|a: CheckSite| a.check)) {
+      None -> Unsettled,
+      Some(found) ->
+        Settled(
+          verdict_errors(sites.tagged, places, parsers, found.verdicts).concat(
+            judged_errors(checks, found.statements),
+          ),
+        ),
+    }
+  }
+}
 
 pub fn evaluation_errors(
   program: CodeProgram,
@@ -234,15 +260,17 @@ fn statement_errors(
   if checks.len() == 0 { rejected } else {
     match evaluation.statements(program, checks.map(|a: CheckSite| a.check)) {
       Err(diagnostics) -> rejected.concat(diagnostics),
-      Ok(judgements) ->
-        range(0, checks.len()).fold(rejected, |accumulator: List<Diagnostic>, i: Int|
-          match judgements.at(i) {
-            Some(j) -> accumulator.concat(check_diagnostics(checks.get(i), j)),
-            None -> accumulator,
-          }),
+      Ok(judgements) -> judged_errors(checks, judgements),
     }
   }
 }
+
+fn judged_errors(checks: List<CheckSite>, judgements: List<CheckResult>) -> List<Diagnostic> / {abort.raise} =
+  range(0, checks.len()).fold(schemas_rejected(checks), |accumulator: List<Diagnostic>, i: Int|
+    match judgements.at(i) {
+      Some(j) -> accumulator.concat(check_diagnostics(checks.get(i), j)),
+      None -> accumulator,
+    })
 
 fn literal_errors(
   program: CodeProgram,
@@ -253,26 +281,30 @@ fn literal_errors(
     let parsers = distinct_requests(sites);
     match evaluation.verdicts(program, parsers) {
       Err(diagnostics) -> diagnostics,
-      Ok(verdicts) -> {
-        let by_identity = range(0, parsers.len()).fold(
-          Map::new(),
-          |found: Map<Bytes, Verdict>, i: Int|
-            match verdicts.at(i) {
-              Some(v) -> found.insert(request_identity(parsers.get(i)), v),
-              None -> found,
-            },
-        );
-        sites.fold([], |accumulator: List<Diagnostic>, site: TaggedSite|
-          match by_identity.get(request_identity(request_of(site))) {
-            None -> accumulator,
-            Some(verdict) -> match literal_error(places, site, verdict) {
-              Some(diagnostic) -> accumulator.push(diagnostic),
-              None -> accumulator,
-            },
-          })
-      },
+      Ok(verdicts) -> verdict_errors(sites, places, parsers, verdicts),
     }
   }
+
+fn verdict_errors(
+  sites: List<TaggedSite>,
+  places: List<SourceText>,
+  parsers: List<EvaluationRequest>,
+  verdicts: List<Verdict>,
+) -> List<Diagnostic> / {abort.raise} = {
+  let by_identity = range(0, parsers.len()).fold(Map::new(), |found: Map<Bytes, Verdict>, i: Int|
+    match verdicts.at(i) {
+      Some(v) -> found.insert(request_identity(parsers.get(i)), v),
+      None -> found,
+    });
+  sites.fold([], |accumulator: List<Diagnostic>, site: TaggedSite|
+    match by_identity.get(request_identity(request_of(site))) {
+      None -> accumulator,
+      Some(verdict) -> match literal_error(places, site, verdict) {
+        Some(diagnostic) -> accumulator.push(diagnostic),
+        None -> accumulator,
+      },
+    })
+}
 
 fn verdict_of(called: CallResult) -> Verdict / {abort.raise} =
   match called.result {
@@ -390,6 +422,22 @@ fn judging_store(
 fn judgement_of(j: Judging, kind: tables::Judged, key: Bytes) -> Option<Bytes> / {abort.raise} =
   match j.cache { Some(c) -> tables::judgement(c, kind, key), None -> None }
 
+fn stored_verdict(j: Judging, key: Bytes) -> Option<Verdict> / {abort.raise} =
+  match judgement_of(j, tables::Verdicts, key) {
+    None -> None,
+    Some(bytes) -> match bin::decode(bytes, verdict_bin()) { Ok(v) -> Some(v), Err(_) -> None },
+  }
+
+fn stored_statement(j: Judging, key: Bytes) -> Option<CheckResult> / {abort.raise} =
+  match judgement_of(j, tables::StatementChecks, key) {
+    None -> None,
+    Some(bytes) -> match bin::decode(bytes, check_result_bin()) { Ok(r) -> Some(r), Err(_) -> None },
+  }
+
+fn all_stored<a>(found: List<Option<a>>) -> Option<List<a>> =
+  found.fold(Some([]), |all: Option<List<a>>, one: Option<a>|
+    match ((all, one)) { (Some(xs), Some(x)) -> Some(xs.push(x)), _ -> None })
+
 fn judgements_stored(
   j: Judging,
   kind: tables::Judged,
@@ -409,13 +457,25 @@ fn toolchain_now() -> Bytes / {shipped.definitions, shipped.runtime, shipped.ver
   toolchain_key(shipped.definitions(), shipped_runtime().identity, shipped.version())
 
 pub fn with_evaluation_cache<a | e>(
-  body: () -> a / {evaluation.verdicts, evaluation.statements | e},
+  body: () -> a / {evaluation.verdicts, evaluation.statements, evaluation.stored | e},
 ) -> a / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, shipped.version, semantics.cached, fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise | e} =
   handle {
     body()
   } with {
     evaluation.statements(program, checks) ->
       judgements(toolchain_now(), judging_store(program.place), program, checks),
+    evaluation.stored(place, requests, checks) -> {
+      let toolchain = toolchain_now();
+      let j = judging_store(place);
+      match ((
+          all_stored(requests.map(|a: EvaluationRequest| stored_verdict(j, verdict_key(toolchain, a)))),
+          all_stored(checks.map(|a: statements::StatementCheck|
+            stored_statement(j, check_result_key(toolchain, a)))),
+        )) {
+        (Some(verdicts), Some(statements)) -> Some({ verdicts: verdicts, statements: statements }),
+        _ -> None,
+      }
+    },
     evaluation.verdicts(program, requests) -> {
       let toolchain = toolchain_now();
       let j = judging_store(program.place);
@@ -424,13 +484,7 @@ pub fn with_evaluation_cache<a | e>(
         {
           request: a,
           key: key,
-          cached: match judgement_of(j, tables::Verdicts, key) {
-            None -> None,
-            Some(bytes) -> match bin::decode(bytes, verdict_bin()) {
-              Ok(v) -> Some(v),
-              Err(_) -> None,
-            },
-          },
+          cached: stored_verdict(j, key),
         }
       });
       let open = sought.filter(|s: KeyedRequest| s.cached == None);
@@ -479,13 +533,7 @@ fn judgements(
     {
       request: a,
       key: key,
-      cached: match judgement_of(j, tables::StatementChecks, key) {
-        None -> None,
-        Some(bytes) -> match bin::decode(bytes, check_result_bin()) {
-          Ok(r) -> Some(r),
-          Err(_) -> None,
-        },
-      },
+      cached: stored_statement(j, key),
     }
   });
   let open = keyed.filter(|k: KeyedStatement| k.cached == None);

@@ -54,8 +54,8 @@ import std.term (Style)
 import tests.report (Entry, RunDecision, cached_count, Program, Cost, SearchSummary, Outcome, Site,
                      finished_line, display_name_at, Failed, Fault, RunReport, no_time_spent,
                      case_of, canonical)
-import tests.listing (TestListing, hash_at, listing_of_program, sources_named, test_at,
-                      test_hash_at)
+import tests.listing (hash_at, listing_of_program, sources_named, test_at)
+import tests.listing (TestListing, TestRecord, run_hash)
 import tests.history (IndexedVersion, store_versions)
 
 pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
@@ -67,7 +67,7 @@ pub fn entry_of(index: Int, key: Bytes) -> Entry =
 pub type Reporting = { style: Style, width: Int, to_stderr: Bool }
 
 pub type Journaling = {
-  started: (Int) -> StartedTest,
+  started: (Int) -> StartedTest / {abort.raise},
   stored: (JobResult) -> StoreUpdate / {abort.raise},
 }
 
@@ -132,11 +132,14 @@ pub fn journaling_of(
     |found: Map<Int, conclude::Test>, t: conclude::Test| found.insert(t.index, t),
   );
   {
-    started: |i: Int|
-      {
-        key: match test_at(analysis, i) { Some(t) -> t.key, None -> b"" },
-        hash: test_hash_at(analysis, i).unwrap_or(b""),
-      },
+    started: |i: Int| {
+      let t = analysis.tests.get(i);
+      match run_hash(t) {
+        Some(hash) -> { key: t.info.key, hash: hash },
+        None ->
+          panic("the run started the test `" ++ String::of_bytes_lossy(t.info.key) ++ "`, which it did not select"),
+      }
+    },
     stored: |done: JobResult|
       match declared.get(done.test) {
         Some(t) -> conclude::stored_by(conclusion_of(done), t, era, chosen),
@@ -145,14 +148,17 @@ pub fn journaling_of(
   }
 }
 
-pub fn crashes_of(analysis: TestListing, interrupted: List<StartedTest>) -> Map<Int, KnownFailure> =
+pub fn crashes_of(
+  analysis: TestListing,
+  interrupted: List<StartedTest>,
+) -> Map<Int, KnownFailure> / {abort.raise} =
   if interrupted.len() == 0 { Map::new() } else {
     range(0, analysis.tests.len()).fold(Map::new(), |found: Map<Int, KnownFailure>, i: Int|
-      match test_at(analysis, i) {
+      match test_at(analysis, i).map(|x: TestRecord| x.info) {
         None -> found,
         Some(t) -> {
-          let hash = test_hash_at(analysis, i).unwrap_or(b"");
-          if interrupted.any(|s: StartedTest| s.key == t.key && s.hash == hash) {
+          let hash = run_hash(analysis.tests.get(i));
+          if interrupted.any(|s: StartedTest| s.key == t.key && Some(s.hash) == hash) {
             found.insert(
               i,
               tester::crashed(
@@ -394,13 +400,14 @@ pub fn changes_of_test(
 pub fn conclude_tests(analysis: TestListing, program: Program) -> List<conclude::Test> =
   range(0, analysis.tests.len()).fold([], |accumulator: List<conclude::Test>, i: Int|
     match test_at(analysis, i) {
-      Some(t) -> {
+      Some(listed) -> {
+        let t = listed.info;
         let entry = match case_of(program, i) { Some(c) -> Some(c.entry), None -> None };
         accumulator.push({
           index: i,
           key: t.key,
           seeded: uses_simulation(t.effects),
-          hash: test_hash_at(analysis, i),
+          hash: run_hash(listed),
           start: match entry { Some(e) -> e.key, None -> t.key },
           case: match entry { Some(e) -> e.case != None, None -> false },
         })
@@ -494,7 +501,7 @@ pub fn job_outcome(analysis: TestListing, done: JobResult) -> Outcome / {abort.r
   {
     index: done.test,
     name: match test_at(analysis, done.test) {
-      Some(t) -> String::of_bytes_lossy(t.name),
+      Some(t) -> String::of_bytes_lossy(t.info.name),
       None -> "",
     },
     hash: hash_at(analysis, done.test),
@@ -515,7 +522,7 @@ fn outcome_of(
   {
     index: outcome.index,
     name: match test_at(analysis, outcome.index) {
-      Some(t) -> String::of_bytes_lossy(t.name),
+      Some(t) -> String::of_bytes_lossy(t.info.name),
       None -> "",
     },
     hash: hash_at(analysis, outcome.index),
@@ -537,7 +544,7 @@ fn failed_of(
   done: Map<Int, JobResult>,
   failed: conclude::TestFailure<RuntimeDiagnostic>,
 ) -> Failed / {abort.raise} = {
-  let t = test_at(analysis, failed.index);
+  let t = test_at(analysis, failed.index).map(|x: TestRecord| x.info);
   let e = exploration_of(done, failed.index);
   let key = String::of_bytes_lossy(failed.key);
   {
@@ -604,7 +611,7 @@ fn escapes_of(
             internal_error_code,
             "`"
               ++ (match test_at(analysis, outcome.index) {
-                Some(t) -> String::of_bytes_lossy(t.name),
+                Some(t) -> String::of_bytes_lossy(t.info.name),
                 None -> "",
               })
               ++ "` performed real system operations, but its passing result was cached without the list of operations the run used",
@@ -682,7 +689,6 @@ pub fn run_report_of(
       name: b.name,
       fragment: b.fragment,
       entered: done.fold(0, |n: Int, i: Int, d: JobResult| n + d.usage.entries),
-      units: b.units,
       load_nanos: b.load_nanos,
     }),
     results: c.outcomes.map(|outcome: conclude::Outcome<RuntimeDiagnostic>|

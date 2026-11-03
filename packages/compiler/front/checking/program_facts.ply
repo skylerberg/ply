@@ -1,0 +1,268 @@
+import std.bin
+import std.list
+import compiler.store.memo (memo)
+import compiler.store.handles (QueryOf, Written, written, fetched, part_fetched, query_definition)
+import compiler.check.infer.checker (EffectInfo, Location, TestInfo, location_bin, prelude_effects,
+                                     test_info_bin)
+import compiler.expand.embed (ModuleEmbed, module_embed_bin)
+import compiler.front.emitter_input (ConstSite, LawPlace, MainPlace, ModuleTests, RootPlace,
+                                     const_site_bin, law_place_bin, main_place_bin, root_place_bin)
+import compiler.front.exports (named_node)
+import compiler.front.facts (Argument, StatementSite, TaggedSite, callees_of, statement_site_bin,
+                             tagged_site_bin, with_hashes)
+import compiler.front.rows (DeclaredEffect, DeclaredOperation, declared_effect_bin)
+import compiler.front.checking.world (CheckDefinition, ModuleKey)
+import compiler.front.checking.groups (TestHash, code_part, declared_effects_part,
+                                       hash_summary_query, imports_part, sites_part, tests_part)
+import compiler.front.checking.promises (hash_of_definition)
+
+pub type Modules = { root: Int, own: List<Bytes>, pulled: List<Bytes> }
+
+derive bin for Modules
+
+fn own_key(module: Bytes) -> ModuleKey = { module: module, shipped: false, tested: false }
+
+fn pulled_key(module: Bytes) -> ModuleKey = { module: module, shipped: true, tested: false }
+
+pub fn keys_of(modules: Modules) -> List<ModuleKey> =
+  modules.own.map(own_key).concat(modules.pulled.map(pulled_key))
+
+pub fn names_of(modules: Modules) -> List<Bytes> = modules.own.concat(modules.pulled)
+
+pub type ListedTest = { info: TestInfo, label: Location }
+
+pub type TestList = {
+  root: Int,
+  names: List<Bytes>,
+  tests: List<ListedTest>,
+  effects: Map<Bytes, Bool>,
+  records: List<Bytes>,
+}
+
+derive bin for ListedTest
+
+derive bin for TestList
+
+pub fn test_list(
+  root: Int,
+  names: List<Bytes>,
+  tests: List<TestInfo>,
+  labels: Map<Bytes, Location>,
+  effects: Map<Bytes, Bool>,
+  records: List<Bytes>,
+) -> TestList / {abort.raise} =
+  {
+    root: root,
+    names: names,
+    tests: tests.map(|t: TestInfo|
+      {
+        info: t,
+        label: match labels.get(t.key) {
+          Some(at) -> at,
+          None ->
+            panic("the program holds no label of the test `" ++ String::of_bytes_lossy(t.key) ++ "`"),
+        },
+      }),
+    effects: effects.fold(
+      prelude_effects.fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
+        found.insert(e.name, e.nondet)),
+      |found: Map<Bytes, Bool>, name: Bytes, varies: Bool| found.insert(name, varies),
+    ),
+    records: records,
+  }
+
+pub fn test_list_query() -> QueryOf<Modules, TestList> =
+  { name: b"test list", input: modules_bin(), output: test_list_bin() }
+
+type PlacedTests = { tests: List<TestInfo>, labels: Map<Bytes, Location> }
+
+pub fn test_list_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
+  let keys = keys_of(modules);
+  let placed = range(0, modules.own.len()).fold(
+    { tests: [], labels: Map::new() },
+    |found: PlacedTests, i: Int| {
+      let read: ModuleTests = part_fetched(tests_part(), keys.get(i));
+      {
+        tests: read.tests.fold(found.tests, |tests: List<TestInfo>, t: TestInfo|
+          tests.push({ ..t, index: tests.len(), at: { ..t.at, module: i } })),
+        labels: read.labels.fold(found.labels, |labels: Map<Bytes, Location>, key: Bytes, at: Location|
+          labels.insert(key, { ..at, module: i })),
+      }
+    },
+  );
+  written(
+    test_list_query(),
+    test_list(
+      modules.root,
+      names_of(modules),
+      placed.tests,
+      placed.labels,
+      keys.fold(Map::new(), |found: Map<Bytes, Bool>, k: ModuleKey|
+        part_fetched(declared_effects_part(), k).fold(found, |m: Map<Bytes, Bool>, d: DeclaredEffect|
+          m.insert(d.name, d.nondet))),
+      keys.map(|k: ModuleKey| fetched(hash_summary_query(), k).record),
+    ),
+  )
+}
+
+pub type TestIdentity = { run: Bytes, listing: Option<Bytes> }
+
+pub fn test_identities(
+  modules: Modules,
+  keys: List<Bytes>,
+) -> Map<Bytes, TestIdentity> / {memo.read, abort.raise} = {
+  let wanted = keys.fold(Map::new(), |found: Map<Bytes, Bool>, key: Bytes| found.insert(key, true));
+  keys_of(modules).fold(Map::new(), |found: Map<Bytes, TestIdentity>, k: ModuleKey|
+    fetched(hash_summary_query(), k).tests.fold(found, |m: Map<Bytes, TestIdentity>, t: TestHash|
+      if wanted.contains(t.key) { m.insert(t.key, { run: t.hash, listing: t.listing }) } else { m }))
+}
+
+pub type ProgramRollup = {
+  embeds: List<ModuleEmbed>,
+  roots: List<RootPlace>,
+  mains: List<MainPlace>,
+  declared: List<DeclaredEffect>,
+  laws: List<LawPlace>,
+}
+
+derive bin for ProgramRollup
+
+pub fn program_rollup_query() -> QueryOf<Modules, ProgramRollup> =
+  { name: b"program rollup", input: modules_bin(), output: program_rollup_bin() }
+
+fn declared_at(d: DeclaredEffect, i: Int) -> DeclaredEffect =
+  {
+    ..d,
+    at: { ..d.at, module: i },
+    operations: d.operations.map(|o: DeclaredOperation| { ..o, at: { ..o.at, module: i } }),
+  }
+
+pub fn program_rollup_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
+  let keys = keys_of(modules);
+  let at = range(0, keys.len());
+  let code = keys.map(|k: ModuleKey| part_fetched(code_part(), k));
+  written(program_rollup_query(), {
+    embeds: at.fold([], |found: List<ModuleEmbed>, i: Int| found.concat(code.get(i).embeds)),
+    roots: at.fold([], |found: List<RootPlace>, i: Int|
+      found.concat(code.get(i).roots.map(|r: RootPlace| { ..r, at: { ..r.at, module: i } }))),
+    mains: at.fold([], |found: List<MainPlace>, i: Int|
+      found.concat(code.get(i).mains.map(|m: MainPlace| { ..m, at: { ..m.at, module: i } }))),
+    declared: at.fold([], |found: List<DeclaredEffect>, i: Int|
+      found.concat(
+        part_fetched(declared_effects_part(), keys.get(i)).map(|d: DeclaredEffect|
+          declared_at(d, i)),
+      )),
+    laws: at.fold([], |found: List<LawPlace>, i: Int| found.concat(code.get(i).laws)),
+  })
+}
+
+pub type ProgramSites = {
+  imports: List<List<Int>>,
+  tagged: List<TaggedSite>,
+  statements: List<StatementSite>,
+  constants: List<ConstSite>,
+}
+
+derive bin for ProgramSites
+
+pub fn program_sites_query() -> QueryOf<Modules, ProgramSites> =
+  { name: b"program sites", input: modules_bin(), output: program_sites_bin() }
+
+pub fn module_imports(modules: Modules) -> List<List<Int>> / {memo.read, abort.raise} = {
+  let names = names_of(modules);
+  let slots = range(0, names.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
+    found.insert(names.get(i), i));
+  keys_of(modules).map(|k: ModuleKey|
+    part_fetched(imports_part(), k).fold([], |found: List<Int>, name: Bytes|
+      match slots.get(name) { Some(i) -> found.push(i), None -> found }))
+}
+
+pub fn reached_modules(imports: List<List<Int>>, start: List<Int>) -> Map<Int, Bool> / {abort.raise} =
+  iterate(
+    { seen: Map::new(), work: start },
+    imports.fold(start.len() + 1, |n: Int, edges: List<Int>| n + edges.len()),
+    |s: { seen: Map<Int, Bool>, work: List<Int> }|
+      match s.work {
+        [] -> Stop(s.seen),
+        [m, ..rest] -> if s.seen.contains(m) { Continue({ ..s, work: rest }) } else {
+          Continue({ seen: s.seen.insert(m, true), work: rest.concat(imports.at_or(m, [])) })
+        },
+      },
+  )
+
+pub fn names_reached(
+  names: List<Bytes>,
+  imports: List<List<Int>>,
+  start: List<Bytes>,
+) -> Map<Bytes, Bool> / {abort.raise} = {
+  let wanted = start.fold(Map::new(), |found: Map<Bytes, Bool>, name: Bytes| found.insert(name, true));
+  reached_modules(imports, range(0, names.len()).filter(|i: Int| wanted.contains(names.get(i)))).fold(
+    Map::new(),
+    |found: Map<Bytes, Bool>, i: Int, _: Bool| found.insert(names.get(i), true),
+  )
+}
+
+fn hashes_of_callees(
+  modules: Modules,
+  callees: List<Bytes>,
+) -> Map<Bytes, Bytes> / {memo.read, abort.raise} = {
+  let known = names_of(modules).fold(Map::new(), |found: Map<Bytes, Bool>, m: Bytes|
+    found.insert(m, true));
+  callees.fold(Map::new(), |found: Map<Bytes, Bytes>, name: Bytes|
+    if found.contains(name) || !known.contains(named_node(name).module) { found }
+    else { match hash_of_definition(name) { Some(h) -> found.insert(name, h), None -> found } })
+}
+
+pub fn program_sites_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
+  let keys = keys_of(modules);
+  let root = range(0, modules.root);
+  let read = root.map(|i: Int| part_fetched(sites_part(), keys.get(i)));
+  let tagged = root.fold([], |found: List<TaggedSite>, i: Int|
+    found.concat(read.get(i).tagged.map(|t: TaggedSite| { ..t, module: i })));
+  let statements = root.fold([], |found: List<StatementSite>, i: Int|
+    found.concat(read.get(i).statements.map(|x: StatementSite| { ..x, module: i })));
+  let constants = root.fold([], |found: List<ConstSite>, i: Int|
+    found.concat(read.get(i).constants.map(|c: ConstSite| { ..c, module: i })));
+  let hashed = hashes_of_callees(
+    modules,
+    tagged.map(|t: TaggedSite| t.callee).concat(constants.map(|c: ConstSite| c.name)).concat(
+      statements.fold([], |found: List<Bytes>, x: StatementSite|
+        x.args.fold(found, |names: List<Bytes>, a: Argument| names.concat(callees_of(a)))),
+    ),
+  );
+  let hash_of = |name: Bytes| hashed.get(name).unwrap_or(b"");
+  written(program_sites_query(), {
+    imports: module_imports(modules),
+    tagged: tagged.map(|t: TaggedSite| { ..t, hash: hash_of(t.callee) }),
+    statements: statements.map(|x: StatementSite| with_hashes(hashed, x)),
+    constants: constants.map(|c: ConstSite| { ..c, hash: hash_of(c.name) }),
+  })
+}
+
+pub fn program_queries() -> List<CheckDefinition> =
+  [
+    query_definition(
+      test_list_query(),
+      b"compiler.front.checking.program_facts.test_list_result",
+      test_list_result,
+    ),
+    query_definition(
+      program_rollup_query(),
+      b"compiler.front.checking.program_facts.program_rollup_result",
+      program_rollup_result,
+    ),
+    query_definition(
+      program_sites_query(),
+      b"compiler.front.checking.program_facts.program_sites_result",
+      program_sites_result,
+    ),
+  ]
+
+test "a module reaches the modules it imports, directly or indirectly" {
+  let imports = [[1], [2], [], [0], []];
+  let reached = |m: Int| reached_modules(imports, [m]).keys().sort_by(|a: Int, b: Int| a <= b);
+  assert_eq(reached(0), [0, 1, 2]);
+  assert_eq(reached(3), [0, 1, 2, 3]);
+  assert_eq(reached(4), [4]);
+  assert_eq(reached_modules([[1], [0]], [1]).keys().sort_by(|a: Int, b: Int| a <= b), [0, 1])
+}
