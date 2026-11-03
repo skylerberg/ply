@@ -11,7 +11,7 @@ import compiler.store.handles (fetch, fetch_all)
 import compiler.store.database
 import compiler.store.database (WriteLimit, Finished, Stopped, Stored, NotKept)
 import compiler.store.memo.store (QueriesId, queries_id)
-import compiler.store.memo.engine (Run, reading, in_session, reachable_keys)
+import compiler.store.memo.engine (Run, ShippedFact, reading, in_session, shipped_facts)
 import compiler.store.packs
 import compiler.unit (definition_hash)
 import compiler.front.owner_checks
@@ -46,16 +46,13 @@ import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, Mod
                                       absent, shipped_names_listed, CheckDefinition)
 import compiler.front.checking.promises (promise_queries, program_analysed, claims_analysed,
                                          ClaimsOutcome, ClaimsRejected, ClaimsAnalysed)
-import compiler.front.checking.groups (module_contents_query, group_key_bin, module_rejected,
-                                       listed_result, owners_result_bin, owners_query, calls_query,
-                                       cycles_query, group_imports_query, visible_modules_query,
-                                       wanted_files_query, group_query, signatures_query,
-                                       typed_query, group_hash_query, header_text_query,
-                                       header_query, owner_imports_query, signature_imports_query,
+import compiler.front.checking.groups (group_key_bin, module_rejected, listed_result,
+                                       owners_result_bin, owners_query, group_imports_query,
+                                       visible_modules_query, wanted_files_query, group_hash_query,
+                                       owner_imports_query, signature_imports_query,
                                        module_record_query, documented_query, declaring_query,
-                                       queries, tables_of_result, module_summary_query,
-                                       module_listing_query, module_listing_bin, checked_module,
-                                       module_own_hashes)
+                                       queries, tables_of_result, module_listing_query,
+                                       module_listing_bin, checked_module, module_own_hashes)
 
 import compiler.front.checking.units (code_queries, with_code_reads)
 import compiler.front.checking.interfaces (interface_queries, published_module)
@@ -220,6 +217,7 @@ pub fn registry(
           body: q.body,
           persistent: !digest_only_queries.contains(q.name),
           product: q.product,
+          interface: q.interface,
         }),
     ),
   )
@@ -235,6 +233,7 @@ pub fn fresh_registry(more: List<CheckDefinition> = []) -> CheckQueries =
           body: q.body,
           persistent: true,
           product: q.product,
+          interface: q.interface,
         }),
     ),
   )
@@ -323,26 +322,6 @@ pub fn query_load(
     { results: pulled.results, pulled: pulled.pulled }
   }
 }
-
-pub const shipped_queries: List<Bytes> =
-  [
-    owners_query().name,
-    module_summary_query().name,
-    module_listing_query().name,
-    module_contents_query().name,
-    signatures_query().name,
-    typed_query().name,
-    calls_query().name,
-    cycles_query().name,
-    group_query().name,
-    group_hash_query().name,
-    header_query().name,
-    header_text_query().name,
-    module_record_query().name,
-    wanted_files_query().name,
-    documented_query().name,
-    declaring_query().name,
-  ]
 
 pub const digest_only_queries: List<Bytes> =
   [
@@ -676,6 +655,7 @@ fn embedded_in_memory(
 pub fn session_over<a>(
   program: InMemory,
   work: (List<Bytes>) -> a / {SessionReads, abort.raise},
+  pack: packs::PackFiles = prelude_pack,
 ) -> { program: InMemory, value: a } / {abort.raise} = {
   let w = inputs_in_memory(program);
   let qs = fresh_registry();
@@ -686,7 +666,7 @@ pub fn session_over<a>(
     embedded_in_memory(program.files, module, want);
   let done = over_decoding(
     program.store,
-    prelude_frames,
+    |part: packs::PackPart| packs::frame_in(Some(pack), part),
     prelude_files,
     |kind: Bytes, at: Bytes|
       lookup_input(
@@ -871,6 +851,7 @@ fn queried_in(
         body: main_only,
         persistent: true,
         product: None,
+        interface: Set::empty(),
       }),
     }
   };
@@ -953,7 +934,12 @@ pub fn files_differing(steps: List<Step>, company: StoreSharing) -> List<Bytes> 
 pub type Step = { what: Bytes, sources: List<Source> }
 
 test "every query whose results the toolchain ships caches its results" {
-  assert_eq(shipped_queries.filter(|n: Bytes| digest_only_queries.contains(n)), [])
+  assert_eq(
+    every_query().filter(|q: CheckDefinition|
+      !q.interface.is_empty() && digest_only_queries.contains(q.name)).map(|q: CheckDefinition|
+      q.name),
+    [],
+  )
 }
 
 fn kept_outputs(store: fs::MemFs, digests: List<Bytes>) -> List<Bytes> / {abort.raise} =
@@ -1454,13 +1440,12 @@ test "a group that calls a group with a type error is checked against its writte
 type ShippedStore = {
   store: fs::MemFs,
   queries: QueriesId,
-  keys: List<Bytes>,
+  facts: List<ShippedFact>,
   rejected: List<CheckedModule>,
 }
 
 fn shipped_store(shipped: List<Source>) -> ShippedStore / {abort.raise} = {
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  let wanted = Set::of_list(shipped_queries);
   let qs = fresh_registry();
   let done = over_decoding(
     fs::mem_empty(),
@@ -1471,13 +1456,13 @@ fn shipped_store(shipped: List<Source>) -> ShippedStore / {abort.raise} = {
       in_session(qs, |run: Run| {
         let all = reading(qs, run, ||
           check_shipped_modules(with_prelude_source(shipped).map(|s: Source| s.name)));
-        { run: all.run, value: { keys: reachable_keys(qs, wanted, all.run), rejected: all.value } }
+        { run: all.run, value: { facts: shipped_facts(qs, all.run), rejected: all.value } }
       }),
   );
   {
     store: done.store,
     queries: queries_id(qs),
-    keys: done.value.keys,
+    facts: done.value.facts,
     rejected: done.value.rejected,
   }
 }
@@ -1519,7 +1504,7 @@ test "a compiler module imports another below the compiler's root by its full na
 
 pub fn shipped_pack(shipped: List<Source>) -> packs::PackFiles / {abort.raise} = {
   let built = shipped_store(shipped);
-  database::pack_in_memory(built.store, built.keys, built.queries, prelude_files)
+  database::pack_in_memory(built.store, built.facts, built.queries, prelude_files)
 }
 
 test "a module whose text fails to parse outside its items is rejected with the parse error" {

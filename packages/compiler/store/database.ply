@@ -17,7 +17,8 @@ import compiler.store.memo.store (Dependency, ExternalInput, FactDetails, Querie
                                   parts_digest, queries_id, session_input, session_inputs,
                                   stored_fact_bin, stored_input_bin, trusted_pack_id, with_mark,
                                   with_mark_moved, with_session_inputs, without_mark)
-import compiler.store.memo.engine (in_session_of)
+import compiler.store.memo.engine (ShippedFact, in_session_of)
+import compiler.store.handles (part_label)
 import compiler.store.packs
 import compiler.store.segments
 import compiler.store.segments (CommitResult, Committed, LockHeld, StoreChanged, WriteFailed)
@@ -56,12 +57,14 @@ const empty_pack_build: PackBuild =
 
 fn with_packed_fact<| e>(
   built: PackBuild,
-  key: Bytes,
+  shipped: ShippedFact,
   fact: StoredFact,
   output_of: (Bytes) -> Option<Bytes> / {abort.raise | e},
 ) -> PackBuild / {abort.raise | e} = {
-  let outputs = fact.parts.fold(Map::new(), |found: Map<Bytes, Bytes>, _: Bytes, digest: Bytes|
-    match output_of(digest) { Some(o) -> found.insert(digest, o), None -> found });
+  let parts = fact.parts.fold(Map::new(), |held: Map<Bytes, Bytes>, name: Bytes, digest: Bytes|
+    if shipped.parts.contains(part_label(name)) { held.insert(name, digest) } else { held });
+  let outputs = parts.fold(Map::new(), |found: Map<Bytes, Bytes>, name: Bytes, digest: Bytes|
+    match output_of(digest) { Some(o) -> found.insert(digest, o), None -> unpackable_part(name) });
   let inline = outputs.fold(Map::new(), |found: Map<Bytes, Bytes>, digest: Bytes, o: Bytes|
     if is_inline(o) { found.insert(digest, o) } else { found });
   let with_results = outputs.fold(built, |b: PackBuild, digest: Bytes, o: Bytes|
@@ -74,15 +77,21 @@ fn with_packed_fact<| e>(
     });
   let framed = packs::append_frame(
     with_results.writing,
-    bin::encode({ parts: fact.parts, inline: inline }, sealed_record_bin()),
+    bin::encode({ parts: parts, inline: inline }, sealed_record_bin()),
   );
   {
     ..with_results,
     writing: framed.writing,
-    records: with_results.records.insert(pack_key(key), framed.at),
-    returned: with_results.returned.insert(pack_key(key), parts_digest(fact.parts)),
+    records: with_results.records.insert(pack_key(shipped.key), framed.at),
+    returned: with_results.returned.insert(pack_key(shipped.key), parts_digest(parts)),
   }
 }
+
+fn unpackable_part<a>(part: Bytes) -> a / {abort.raise} =
+  panic(
+    "the part `" ++ String::of_bytes_lossy(part_label(part))
+      ++ "` of a fact the pack ships has no stored output, so the pack cannot hold it",
+  )
 
 type StoreRun = {
   db: Database,
@@ -668,16 +677,16 @@ pub fn outputs_by_digest<[r]>(
 
 pub fn write_pack<[r]>(
   opening: fact_store::Opening,
-  keys: List<Bytes>,
+  facts: List<ShippedFact>,
   queries: QueriesId,
   files: Bytes,
 ) -> { written: packs::PackFiles, records: Int } / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
   undamaged_opened[r](opening, |db: Database| {
-    let laid = keys.fold(empty_pack_build, |built: PackBuild, key: Bytes|
-      match fact_store::value_of[r](db, Facts, key) {
+    let laid = facts.fold(empty_pack_build, |built: PackBuild, shipped: ShippedFact|
+      match fact_store::value_of[r](db, Facts, shipped.key) {
         None -> built,
         Some(b) ->
-          with_packed_fact(built, key, undecoded(b, stored_fact_bin()), |digest: Bytes|
+          with_packed_fact(built, shipped, undecoded(b, stored_fact_bin()), |digest: Bytes|
             fact_store::result_of[r](db, result_key(digest))),
       });
     {
@@ -812,12 +821,12 @@ pub fn outputs_in_memory(
 
 pub fn pack_in_memory(
   tree: fs::MemFs,
-  keys: List<Bytes>,
+  facts: List<ShippedFact>,
   queries: QueriesId,
   files: Bytes,
 ) -> packs::PackFiles / {abort.raise} =
   read_in_memory(tree, |opening: fact_store::Opening|
-    write_pack[memory](opening, keys, queries, files).written)
+    write_pack[memory](opening, facts, queries, files).written)
 
 fn quoted(input: Bytes) -> Bytes / {memo.read, abort.raise} =
   match memo.fetch(b"text", input, main_part) {
@@ -1014,7 +1023,7 @@ test "a pack holds the facts of the keys it is built from, and a trusted run use
   let pack = fs::on_mem[abs](fs::mem_of([]), || {
     quoted_over[abs](long);
     with_opening[abs]("s", |opening: fact_store::Opening|
-      write_pack[abs](opening, keys, queries_id(queries), b"files"))
+      write_pack[abs](opening, main_parts_of(keys), queries_id(queries), b"files"))
   }).value;
   let used = fs::on_mem[abs](fs::mem_of([]), ||
     with_database[abs](
@@ -1039,7 +1048,11 @@ fn query(
     body: |input: Bytes| main_only(body(input)),
     persistent: true,
     product: None,
+    interface: Set::of_list([main_part]),
   }
+
+fn main_parts_of(keys: List<Bytes>) -> List<ShippedFact> =
+  keys.map(|key: Bytes| { key: key, parts: Set::of_list([main_part]) })
 
 fn read_file(input: Bytes) -> Bytes / {memo.read} =
   match memo.external(b"file", input) { Some(text) -> text, None -> b"" }
@@ -1595,7 +1608,7 @@ test "a fact in a trusted pack is used as it is, and a project records what it u
   let qs = plain_queries(q);
   let pack = pack_in_memory(
     source.store,
-    facts_in_memory(source.store).keys(),
+    main_parts_of(facts_in_memory(source.store).keys()),
     queries_id(qs),
     b"files",
   );
@@ -1615,7 +1628,7 @@ test "a fact that used a sealed fact is recomputed when a new pack changes that 
     let built = fetched_in(q, w, b"length", b"a").world;
     let written = pack_in_memory(
       built.store,
-      facts_in_memory(built.store).keys(),
+      main_parts_of(facts_in_memory(built.store).keys()),
       queries_id(plain_queries(q)),
       files,
     );
@@ -1629,6 +1642,60 @@ test "a fact that used a sealed fact is recomputed when a new pack changes that 
   let first = run_with(fs::mem_empty(), older, b"old");
   assert_eq(first.value, b"long 4");
   assert_eq(run_with(first.tree, newer, b"new").value, b"long 5")
+}
+
+fn measured(input: Bytes) -> Parts / {memo.read} = {
+  let length = length_of(input);
+  Map::new().insert(main_part, length).insert(b"doubled", length.concat(length))
+}
+
+fn doubled_of(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  match memo.fetch(b"measured", input, b"doubled") {
+    Some(o) -> o,
+    None -> panic("the query `measured` wrote no part `doubled`"),
+  }
+
+fn measured_main(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  fetched_main(b"measured", input)
+
+fn measures() -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"measured", { ..query(b"measured", b"m1", length_of), body: measured }).insert(
+    b"twice",
+    query(b"twice", b"w1", doubled_of),
+  ).insert(
+    b"plain",
+    query(b"plain", b"p1", measured_main),
+  )
+
+fn measured_over(pack: packs::PackFiles, name: Bytes) -> Result<Bytes, Bytes> = {
+  let read = |part: packs::PackPart| packs::frame_in(Some(pack), part);
+  handle {
+    Ok(
+      with_store_in_memory(fs::mem_empty(), read, b"files", |_: Bytes, _: Bytes| None, ||
+        in_session_of(plain_queries(measures()), name, b"a")).value,
+    )
+  } with {
+    abort.raise(message) -> Err(Bytes::of_string(message)),
+  }
+}
+
+test "a read of a part that a sealed fact's query does not ship is an internal error naming the reader and the part" {
+  let source = fetched_in(measures(), four(), b"twice", b"a").world;
+  let pack = pack_in_memory(
+    source.store,
+    main_parts_of([fact_key(b"measured", b"a")]),
+    queries_id(plain_queries(measures())),
+    b"files",
+  );
+  assert_eq(measured_over(pack, b"plain"), Ok(b"4"));
+  match measured_over(pack, b"twice") {
+    Ok(_) -> panic("a read of a part the pack does not hold returned a result"),
+    Err(message) ->
+      assert(
+        [b"internal error", b"`twice`", b"`doubled`"].all(|text: Bytes|
+          message.index_of(text) != None),
+      ),
+  }
 }
 
 fn together(name: Bytes, input: Bytes) -> Bytes / {memo.read, abort.raise} =
