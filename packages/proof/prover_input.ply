@@ -101,6 +101,8 @@ pub type TrustedLaw = {
   module: Int,
 }
 
+type TrustedIdentity = { law: LawInfo, identity: Bytes }
+
 pub type ProverInputResult = {
   world: ProverInput,
   definitions: List<Definition>,
@@ -121,12 +123,6 @@ pub fn prover_input_of(
   let written = written_params(analysis.modules);
   let wheres = law_guards(analysis.modules);
   let requires = clauses_written(analysis.modules);
-  let by_name = |xs: List<{ name: Bytes, hashes: List<Bytes> }>|
-    xs.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }|
-        accumulator.insert(s.name, s.hashes),
-    );
   let keys = clause_keys(analysis.hashes);
   let definitions = analysis.checked.definitions.filter(|d: DefinitionInfo| owned(d.module));
   let schemas = schema_definitions(analysis.modules);
@@ -140,24 +136,25 @@ pub fn prover_input_of(
   let values = if stating.len() == 0 { Map::new() } else { values_named(analysis.modules) };
   let built = definitions.fold(clauses, |accumulator: CollectedObligations, d: DefinitionInfo|
     builds_of(accumulator, d, written, stating, values, analysis.hashes, closing));
+  let law_identities = law_keys(analysis.hashes);
   let collected = laws.fold(built, |accumulator: CollectedObligations, l: LawInfo|
-    law_of(accumulator, l, law_keys(analysis.hashes), wheres, closing));
+    law_of(accumulator, l, law_identities, wheres, closing));
   let imports = imports_of(analysis.modules);
-  let trusted = analysis.checked.laws.filter(|l: LawInfo|
-    !owned(l.module) && !l.has_guard && analysis.hashes.laws.contains(l.key));
-  let imported_law_hashes = |o: Obligation|
+  let trusted = analysis.checked.laws.fold([], |found: List<TrustedIdentity>, l: LawInfo|
+    if owned(l.module) || l.has_guard { found } else {
+      match law_identities.get(l.key) {
+        Some(identity) -> found.push({ law: l, identity: identity }),
+        None -> found,
+      }
+    });
+  let imported_law_identities = |o: Obligation|
     match o.kind {
       Cost(_) -> [],
       Space(_) -> [],
       _ -> match imports.at(o.at.module) {
         Some(reach) ->
-          trusted.filter(|l: LawInfo| reach.contains(l.at.module)).fold(
-            [],
-            |accumulator: List<Bytes>, l: LawInfo|
-              match analysis.hashes.laws.get(l.key) {
-                Some(h) -> accumulator.push(h),
-                None -> accumulator,
-              },
+          trusted.filter(|t: TrustedIdentity| reach.contains(t.law.at.module)).map(
+            |t: TrustedIdentity| t.identity,
           ),
         None -> [],
       },
@@ -168,14 +165,14 @@ pub fn prover_input_of(
       signatures: analysis.checked.definitions.map(signature_of),
       builtins: builtin_signatures,
       obligations: collected.obligations.map(|o: Obligation|
-        with_imported_laws(o, imported_law_hashes(o))),
+        with_imported_laws(o, imported_law_identities(o))),
       measures: measures_in(analysis, owned),
       keys: keys_of(analysis.checked.instances),
       numerics: numerics_of(analysis.checked.numeric_types),
       invariants: stating.map(|i: { type_name: Bytes, by: Bytes }|
         { type_name: String::of_bytes_lossy(i.type_name), by: String::of_bytes_lossy(i.by) }),
       imports: imports,
-      trusted_laws: trusted.map(|l: LawInfo| trusted_law_from(l, closing)),
+      trusted_laws: trusted.map(|t: TrustedIdentity| trusted_law_from(t.law, closing)),
       operations: operations_of(analysis.checked.effects),
     },
     definitions: defined(
@@ -760,12 +757,12 @@ pub fn measures_input(analysis: Analysis, measures: List<Measure>) -> ProverInpu
     operations: operations_of(analysis.checked.effects),
   }
 
-fn with_imported_laws(o: Obligation, hashes: List<Bytes>) -> Obligation / {abort.raise} =
-  if hashes.len() == 0 { o } else {
+fn with_imported_laws(o: Obligation, identities: List<Bytes>) -> Obligation / {abort.raise} =
+  if identities.len() == 0 { o } else {
     {
       ..o,
       key: String::of_bytes_lossy(
-        hex(blake3(Bytes::concat_all([Bytes::of_string(o.key)].concat(hashes)))),
+        hex(blake3(Bytes::concat_all([Bytes::of_string(o.key)].concat(identities)))),
       ),
     }
   }
@@ -912,32 +909,37 @@ fn builds_of(
           warnings: accumulator.warnings.push(unhashed(d.name, d.at.module, d.at.span)),
         },
       Some(check) ->
-        owed_for.fold(accumulator, |a: CollectedObligations, i: { type_name: Bytes, by: Bytes }| {
-          let typed = h.declarations.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
-            if x.name == i.type_name { x.hash } else { found });
-          let key = String::of_bytes_lossy(
-            hex(blake3(Bytes::concat_all([b"builds\x00", check, typed]))),
-          );
-          {
-            ..a,
-            obligations: a.obligations.push({
-              key: key,
-              run_key: key,
-              owner: String::of_bytes_lossy(d.name),
-              kind: Builds(String::of_bytes_lossy(i.type_name)),
-              at: span_at(d.at.module, d.at.span),
-              binders: range(0, params.len()).map(|k: Int| printed.binders.get(k)),
-              result: printed.binders.at(params.len()),
-              variables: printed.variables,
-              guards: [],
-              literals: [],
-              effects: None,
-              frame: NoWrites,
-              strategy: Bounded,
-              identities: [],
-            }),
-          }
-        }),
+        owed_for.fold(accumulator, |a: CollectedObligations, i: { type_name: Bytes, by: Bytes }|
+          match h.declarations.filter(|x: { name: Bytes, hash: Bytes }| x.name == i.type_name).at(
+              0,
+            ) {
+            None ->
+              { ..a, warnings: a.warnings.push(unhashed(i.type_name, d.at.module, d.at.span)) },
+            Some(declared) -> {
+              let key = String::of_bytes_lossy(
+                hex(blake3(Bytes::concat_all([b"builds\x00", check, declared.hash]))),
+              );
+              {
+                ..a,
+                obligations: a.obligations.push({
+                  key: key,
+                  run_key: key,
+                  owner: String::of_bytes_lossy(d.name),
+                  kind: Builds(String::of_bytes_lossy(i.type_name)),
+                  at: span_at(d.at.module, d.at.span),
+                  binders: range(0, params.len()).map(|k: Int| printed.binders.get(k)),
+                  result: printed.binders.at(params.len()),
+                  variables: printed.variables,
+                  guards: [],
+                  literals: [],
+                  effects: None,
+                  frame: NoWrites,
+                  strategy: Bounded,
+                  identities: [],
+                }),
+              }
+            },
+          }),
     }
   }
 }
