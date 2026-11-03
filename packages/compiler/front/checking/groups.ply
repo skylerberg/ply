@@ -42,7 +42,8 @@ import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, ShippedModu
                                owner_interface_bin, module_origin_bin, mention_bin, owner_text_bin,
                                module_scope, owner_texts, owner_mentions, owner_groups,
                                group_source_from, value_owners, unplaced_imports, item_layout,
-                               signature_text, owner_tokens, signature_tokens, call_cycles)
+                               signature_text, owner_tokens, signature_tokens, call_cycles,
+                               placed_in_group)
 import compiler.front.owner_checks
 import compiler.front.emitter_input (KnownConstructors, module_contents, GroupLowering,
                                      group_lowering, group_lowering_bin, ModuleCode, ModuleSites,
@@ -1200,13 +1201,38 @@ fn setting_of(named: ModuleKey) -> Setting / {memo.read, abort.raise} =
 
 pub type GroupRead = { inputs: GroupInputs, body_plan: BodyPlan, mentioned: List<NameInModule> }
 
-pub type GroupSource = { named: ModuleKey, members: List<OwnerFacts>, imported: List<Imported> }
+pub type TextPositions = | GroupPositions | FilePositions(ModuleLayout)
+
+pub type GroupSource = {
+  named: ModuleKey,
+  members: List<OwnerFacts>,
+  imported: List<Imported>,
+  positions: TextPositions,
+}
+
+fn placed_by(positions: TextPositions, texts: List<OwnerText>) -> List<OwnerText> / {abort.raise} =
+  match positions {
+    GroupPositions -> placed_in_group(texts),
+    FilePositions(layout) -> {
+      let starts = layout.owners.fold(Map::new(), |found: Map<Bytes, List<Int>>, o: OwnerPlace|
+        found.insert(o.owner, o.starts));
+      texts.map(|t: OwnerText|
+        match starts.get(t.owner) {
+          Some(at) -> { ..t, starts: at },
+          None -> panic("a group names a declaration that its module's layout does not place"),
+        })
+    },
+  }
 
 fn loaded_source(
   g: GroupSource,
   tables: ImportPackages,
 ) -> LoadedSource / {SessionReads, abort.raise} = {
-  let source = source_of_group(g.named.module, g.members.map(|f: OwnerFacts| f.text), g.imported);
+  let source = source_of_group(
+    g.named.module,
+    placed_by(g.positions, g.members.map(|f: OwnerFacts| f.text)),
+    g.imported,
+  );
   {
     source: source,
     role: if g.named.shipped { Dependency } else { Own },
@@ -1340,7 +1366,7 @@ pub fn group_checked(
   body_supplier: BodySupplier,
 ) -> UnitCheck / {QueryEffects, abort.raise} =
   with_group_read(
-    [{ named: named, members: members, imported: imported }],
+    [{ named: named, members: members, imported: imported, positions: GroupPositions }],
     declared_from,
     body_supplier,
     |read: GroupRead|
@@ -1352,8 +1378,7 @@ pub fn group_checked(
   )
 
 fn checked_group_result(module: Bytes, c: UnitCheck) -> owner_checks::GroupResult / {abort.raise} =
-  owner_checks::group_result(c.out, module, c.texts, c.source.items, |x: ItemAt|
-    c.source.offset + x.from)
+  owner_checks::group_result(c.out, module, c.texts, c.source.items, |x: ItemAt| x.to)
 
 pub fn imports_of(key: CheckGroupKey) -> List<Imported> / {memo.read, abort.raise} =
   current_output(group_imports_query(), key)
@@ -1406,7 +1431,7 @@ fn finalize_group(
   if walked.fold(false, |found: Bool, w: owner_checks::OwnerInference|
       found || owner_checks::inference_rejected(w.typed)) {
     let c = with_group_read(
-      [{ named: named, members: members, imported: imports_of(key) }],
+      [{ named: named, members: members, imported: imports_of(key), positions: GroupPositions }],
       declared_from,
       no_bodies,
       |read: GroupRead| {
@@ -1416,7 +1441,7 @@ fn finalize_group(
           source: source,
           out: rejected_group(
             read.inputs,
-            owner_checks::inference_errors(walked, source.items, source.offset),
+            owner_checks::inference_errors(walked, source.items),
             signature_declarations(key),
           ),
         }
@@ -1425,7 +1450,7 @@ fn finalize_group(
     { result: checked_group_result(key.module, c), lowering: None, calls: [] }
   } else {
     let c = group_checked(named, members, imports_of(key), declared_from, |source: OwnerSource|
-      Some(owner_checks::supplied_bodies(walked, source.items, source.offset)));
+      Some(owner_checks::supplied_bodies(walked, source.items)));
     {
       result: owner_checks::finalized_result(
         checked_group_result(key.module, c),
@@ -1461,7 +1486,7 @@ pub fn resolved_empty_program(
   named: ModuleKey,
 ) -> Result<ResolvedGroup, List<Diagnostic>> / {QueryEffects, abort.raise} =
   resolved_program({
-    source: { named: named, members: [], imported: [] },
+    source: { named: named, members: [], imported: [], positions: GroupPositions },
     declared_from: from_groups,
   })
 
@@ -1476,7 +1501,12 @@ fn group_program_of(key: CheckGroupKey) -> GroupProgram / {QueryEffects, abort.r
   let members = key.owners.map(|o: Bytes| owner_facts(named, o));
   let cycle = unit_of_group(key).owners.len() >= 2;
   {
-    source: { named: named, members: members, imported: imports_of(key) },
+    source: {
+      named: named,
+      members: members,
+      imported: imports_of(key),
+      positions: GroupPositions,
+    },
     declared_from: if !cycle { from_groups }
     else { source_for_called(called_in(key, inferences_of(named, members))) },
   }
@@ -1547,8 +1577,7 @@ pub fn infer_owner_types(key: OwnerKey) -> Written / {QueryEffects, abort.raise}
       from_signatures,
       inferring_only(facts.text.names.map(|n: Bytes| qualify(key.module, n))),
     );
-    owner_checks::inference_result(c.out, key.module, facts.text, c.source.items, |x: ItemAt|
-      c.source.offset + x.from)
+    owner_checks::inference_result(c.out, key.module, facts.text, c.source.items, |x: ItemAt| x.to)
   })
 }
 

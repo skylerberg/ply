@@ -3,17 +3,14 @@ import std.set (Set)
 import compiler.check.resolve.tables (Place, InSource, WholeFile, Unplaced, in_module, place_module,
                                       source_span)
 import compiler.front.facts (Analysis)
-import compiler.front.exports (ItemAt)
 import compiler.front.checking (LoadInputs, InMemory, in_memory, read_over, lowered_over)
 import compiler.front.checking.units (with_code_reads)
 import compiler.emit.representations (code_facts)
 import compiler.front.checking.promises (ClaimsProgram, ClaimIdentities, ClaimsAnalysed,
-                                         ClaimsRejected, PlacedModule, claims_analysed)
+                                         ClaimsRejected, claims_analysed)
 import compiler.check.resolve.tables (placed_in)
 import compiler.check.resolve.tables (Source, Diagnostic, Edit, Label, ParsedModule, diagnostic_bin,
                                       fixes_moved)
-import compiler.emit.costs (placed_span)
-import compiler.syntax.parsing (span_between)
 import compiler.check.infer.checker (DefinitionInfo, elsewhere)
 import claims (Claim, ClaimPlace, ClaimsEntry, Collection, DischargeResult, NotCompiled, OwnClaims,
                PendingClaim, Rejection, StaticProver, WantedClaim, claim_bin, discharge_library,
@@ -70,52 +67,28 @@ pub type ModuleClaims = {
 
 derive bin for ModuleClaims
 
-type Placement = { slot: Int, offset: Int, items: List<ItemAt> }
+fn placements(modules: List<Bytes>, names: List<Bytes>) -> Map<Int, Int> / {abort.raise} =
+  range(0, modules.len()).fold(Map::new(), |found: Map<Int, Int>, i: Int|
+    match names.index_of(modules.get(i)) { Some(slot) -> found.insert(i, slot), None -> found })
 
-fn placements(
-  placed: List<PlacedModule>,
-  names: List<Bytes>,
-) -> Map<Int, Placement> / {abort.raise} =
-  range(0, placed.len()).fold(Map::new(), |found: Map<Int, Placement>, i: Int| {
-    let p = placed.get(i);
-    match names.index_of(p.module) {
-      Some(slot) -> found.insert(i, { slot: slot, offset: p.offset, items: p.items }),
-      None -> found,
-    }
-  })
+fn placed_module(placing: Map<Int, Int>, module: Int) -> Int =
+  match placing.get(module) { Some(slot) -> slot, None -> module }
 
-fn in_file(p: Placement, position: Int) -> Int =
-  placed_span(p.items, span_between(position - p.offset, position - p.offset)).start
-
-type SourceSpan = { module: Int, start: Int, end: Int }
-
-fn placed_module(placing: Map<Int, Placement>, module: Int) -> Int =
-  match placing.get(module) { Some(p) -> p.slot, None -> module }
-
-fn placed_at(placing: Map<Int, Placement>, at: SourceSpan) -> SourceSpan =
-  match placing.get(at.module) {
-    Some(p) -> { module: p.slot, start: in_file(p, at.start), end: in_file(p, at.end) },
-    None -> at,
-  }
-
-fn placed_place(placing: Map<Int, Placement>, place: Place) -> Place =
+fn placed_place(placing: Map<Int, Int>, place: Place) -> Place =
   match place {
-    InSource(s) -> InSource(placed_at(placing, s)),
+    InSource(s) -> InSource({ ..s, module: placed_module(placing, s.module) }),
     WholeFile(m) -> WholeFile(placed_module(placing, m)),
     Unplaced -> Unplaced,
   }
 
-fn placed_diagnostic(placing: Map<Int, Placement>, d: Diagnostic) -> Diagnostic =
+fn placed_diagnostic(placing: Map<Int, Int>, d: Diagnostic) -> Diagnostic =
   {
     ..d,
     labels: d.labels.map(|l: Label| { ..l, place: placed_place(placing, l.place) }),
-    fixes: fixes_moved(d.fixes, |e: Edit| {
-      let at = placed_at(placing, { module: e.module, start: e.start, end: e.end });
-      { ..e, module: at.module, start: at.start, end: at.end }
-    }),
+    fixes: fixes_moved(d.fixes, |e: Edit| { ..e, module: placed_module(placing, e.module) }),
   }
 
-fn claim_place(placing: Map<Int, Placement>, o: Obligation) -> ClaimPlace =
+fn claim_place(placing: Map<Int, Int>, o: Obligation) -> ClaimPlace =
   {
     module: placed_module(placing, o.module),
     at: placed_place(placing, o.at),
@@ -125,7 +98,7 @@ fn claim_place(placing: Map<Int, Placement>, o: Obligation) -> ClaimPlace =
 fn placed_own(
   w: Analysis,
   built: ProverInputResult,
-  placing: Map<Int, Placement>,
+  placing: Map<Int, Int>,
 ) -> OwnClaims / {abort.raise} = {
   let fresh = own_claims(w, built, |o: Obligation| claim_place(placing, o));
   { ..fresh, warnings: fresh.warnings.map(|d: Diagnostic| placed_diagnostic(placing, d)) }
@@ -277,7 +250,7 @@ fn claimed_with_view<| e>(
   let w = c.analysis;
   let owned = |m: Bytes| names.contains(m);
   let built = prover_input_of(w, c.identities, owned);
-  let fresh = placed_own(w, built, placements(c.placed, names));
+  let fresh = placed_own(w, built, placements(c.modules, names));
   let opened = open.fold(Map::new(), |found: Map<Bytes, Int>, k: KnownModule|
     found.insert(k.name, k.index));
   let by_module = fresh_by_module(fresh, w, names, opened);
@@ -311,11 +284,7 @@ fn claimed_with_view<| e>(
   })
 }
 
-pub type ClaimClosure = {
-  analysis: Analysis,
-  identities: ClaimIdentities,
-  placed: List<PlacedModule>,
-}
+pub type ClaimClosure = { analysis: Analysis, identities: ClaimIdentities, modules: List<Bytes> }
 
 pub fn claimed_modules<| e>(
   inputs: ClaimInputs,
@@ -358,11 +327,11 @@ fn closure_of(
 ) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise} =
   match analysed.outcome {
     ClaimsRejected(ds) -> {
-      let placing = placements(analysed.placed, names);
+      let placing = placements(analysed.modules, names);
       Err(ds.map(|d: Diagnostic| placed_diagnostic(placing, d)))
     },
     ClaimsAnalysed(w, identities) ->
-      Ok({ analysis: w, identities: identities, placed: analysed.placed }),
+      Ok({ analysis: w, identities: identities, modules: analysed.modules }),
   }
 
 pub fn claims_closure(
@@ -456,7 +425,7 @@ test "a claim checked by group keeps its place and its guard's place in its file
       let fresh = placed_own(
         c.analysis,
         prover_input_of(c.analysis, c.identities, |m: Bytes| names.contains(m)),
-        placements(c.placed, names),
+        placements(c.modules, names),
       );
       let text = claimed_sources.get(0).source_text;
       let four = fresh.claims.filter(|claim: Claim| claim.owner == "app.four");
@@ -475,6 +444,8 @@ test "a claim checked by group keeps its place and its guard's place in its file
     },
   }
 }
+
+type SourceSpan = { module: Int, start: Int, end: Int }
 
 fn primary_places(ds: List<Diagnostic>) -> List<SourceSpan> =
   ds.flat_map(|d: Diagnostic|

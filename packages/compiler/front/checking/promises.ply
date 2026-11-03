@@ -14,7 +14,7 @@ import compiler.front.published (group_analysis)
 import compiler.front.owner_checks (MemberResult, rejected_in, tables_in)
 import compiler.front.rows (OutlineItem, OutlinedFunction)
 import compiler.front.exports (item_at_bin, Imported, ItemAt, Mention, NameInModule, OwnerSource,
-                               OwnerText, group_imports, item_layout, laid_out, named_node)
+                               OwnerText, group_imports, item_layout, named_node)
 import compiler.emit.costs (cost_input_of, CostedFunction, GroupWalk, ParamSharing, ReturnOwnership,
                             FreshReturn, WalkedBody, demands_of, group_walk_bin, module_costs,
                             module_demands_bin, parameters_bin, parameters_of, report_bin,
@@ -44,7 +44,8 @@ import compiler.front.checking.groups (UnitKey, GroupSource, OwnerFacts, OwnerKe
                                        group_key_of, group_of, group_hashes_of, GroupDeclarations,
                                        stored_declarations_of, context_once, GroupOutput,
                                        CurrentGroup, ObsoleteGroup, group_output_bin,
-                                       current_output, is_current_unit, module_key_of)
+                                       current_output, is_current_unit, module_key_of,
+                                       TextPositions, GroupPositions, FilePositions)
 
 pub fn cost_walk_query() -> QueryOf<UnitKey, GroupOutput<GroupWalk>> =
   { name: b"cost walk", input: unit_key_bin(), output: group_output_bin(group_walk_bin()) }
@@ -137,8 +138,8 @@ fn imports_for_unit(
 
 fn unit_roots(m: ParsedModule, source: OwnerSource) -> Set<Bytes> / {abort.raise} =
   m.module.items.fold(Set::empty(), |roots: Set<Bytes>, item: Item| {
-    let start = item_span(item).start - source.offset;
-    let inside = source.items.any(|x: ItemAt| x.from <= start && start < x.from + x.len);
+    let start = item_span(item).start;
+    let inside = source.items.any(|x: ItemAt| x.to <= start && start < x.to + x.len);
     if !inside { roots } else {
       match item {
         FunctionItem(_) -> roots.insert(item_owner(m.name, item)),
@@ -159,7 +160,7 @@ pub fn cost_walk_result(u: UnitKey) -> Written / {QueryEffects, abort.raise} =
   else { CurrentGroup(walked_unit(u)) })
 
 fn walked_unit(u: UnitKey) -> GroupWalk / {QueryEffects, abort.raise} = {
-  let read = stored_analysis([loaded_unit(u)]);
+  let read = stored_analysis([loaded_unit(u)], in_group);
   let source = read.loaded.get(0);
   let unwalked = |reason: Bytes| { unfinished: [reason], bodies: [], declared: [] };
   match read.outcome {
@@ -168,12 +169,7 @@ fn walked_unit(u: UnitKey) -> GroupWalk / {QueryEffects, abort.raise} = {
     Analysed(w) -> handle {
       with_code_reads(u.tested, ||
         walked_group(
-          {
-            ..cost_input_of(w),
-            walked: [0],
-            roots: Some(unit_roots(w.modules.get(0), source)),
-            origin: source.offset,
-          },
+          { ..cost_input_of(w), walked: [0], roots: Some(unit_roots(w.modules.get(0), source)) },
           returned_by,
         ))
     } with {
@@ -326,15 +322,32 @@ fn groups_reached(u: UnitKey) -> List<LoadedOwners> / {memo.read, abort.raise} =
   let named = module_of_unit(u);
   let reached = bodies_reached(u.owners.map(|o: Bytes| owner_at(named, o)));
   let by_module = reached.values().fold(Map::new(), with_loaded_owner);
-  [match by_module.get(u.module) { Some(g) -> g, None -> loaded_unit(u) }].concat(
+  let beside = match by_module.get(u.module) {
+    Some(g) -> g.owners.filter(|o: Bytes| !u.owners.contains(o)),
+    None -> [],
+  };
+  [{ ..loaded_unit(u), owners: u.owners.concat(beside) }].concat(
     by_module.values().filter(|g: LoadedOwners| g.named.module != u.module),
   )
 }
 
-fn source_of_unit(u: LoadedOwners) -> GroupSource / {SessionReads, abort.raise} = {
+fn source_of_unit(
+  u: LoadedOwners,
+  positions: (ModuleKey) -> TextPositions / {memo.read, abort.raise},
+) -> GroupSource / {SessionReads, abort.raise} = {
   let members = unit_members(u);
-  { named: u.named, members: members, imported: imports_for_unit(u, members) }
+  {
+    named: u.named,
+    members: members,
+    imported: imports_for_unit(u, members),
+    positions: positions(u.named),
+  }
 }
+
+fn in_group(_: ModuleKey) -> TextPositions = GroupPositions
+
+fn in_file(named: ModuleKey) -> TextPositions / {memo.read, abort.raise} =
+  FilePositions(layout_of(named))
 
 fn with_stored_tables(
   a: Analysis,
@@ -388,14 +401,9 @@ fn with_stored_tables(
   }
 }
 
-pub type MeasureProgram = {
-  outcome: AnalysisOutcome,
-  measured: List<Bytes>,
-  offset: Int,
-  owned: List<Bytes>,
-}
+pub type MeasureProgram = { outcome: AnalysisOutcome, measured: List<Bytes>, owned: List<Bytes> }
 
-type GroupsAnalysed = { outcome: AnalysisOutcome, offset: Int, loaded: List<OwnerSource> }
+type GroupsAnalysed = { outcome: AnalysisOutcome, loaded: List<OwnerSource> }
 
 type StoredTables = {
   parts: Map<Int, List<PlacedTables>>,
@@ -418,7 +426,6 @@ fn with_stored_owner(
   let unit = unit_key_of(at);
   let result = group_of(checked_in);
   let stored = item_layout(checked_in.owners.map(|o: Bytes| owner_facts(u.named, o).text));
-  let placed = laid_out(loaded.items, loaded.offset);
   let seen = bin::encode(checked_in, check_group_key_bin());
   let first = !found.seen.contains(seen);
   let hashed = bin::encode(unit, unit_key_bin());
@@ -427,12 +434,13 @@ fn with_stored_owner(
       module,
       found.parts.get(module).unwrap_or([]).concat(
         result.members.filter(|m: MemberResult| m.owner == owner).map(|m: MemberResult|
-          { module: module, tables: tables_in(m, stored, placed) }),
+          { module: module, tables: tables_in(m, stored, loaded.items) }),
       ),
     ),
     rejected: if !first { found.rejected } else {
       found.rejected.concat(
-        rejected_in(result.rejected, stored, placed).map(|d: Diagnostic| placed_in(d, module)),
+        rejected_in(result.rejected, stored, loaded.items).map(|d: Diagnostic|
+          placed_in(d, module)),
       )
     },
     declared: declarations_joined(found.declared, stored_declarations_of(at, GroupDeclarations)),
@@ -461,8 +469,12 @@ fn stored_tables(
         with_stored_owner(f, i, groups.get(i), loaded.get(i), o)),
   )
 
-fn stored_analysis(groups: List<LoadedOwners>) -> GroupsAnalysed / {SessionReads, abort.raise} =
-  with_group_read(groups.map(source_of_unit), from_groups, no_bodies, |group: GroupRead| {
+fn stored_analysis(
+  groups: List<LoadedOwners>,
+  positions: (ModuleKey) -> TextPositions / {memo.read, abort.raise},
+) -> GroupsAnalysed / {SessionReads, abort.raise} = {
+  let sources = groups.map(|u: LoadedOwners| source_of_unit(u, positions));
+  with_group_read(sources, from_groups, no_bodies, |group: GroupRead| {
     let loaded = group.inputs.loaded.map(|l: LoadedSource| l.source);
     {
       outcome: match resolved_group(group.inputs) {
@@ -470,23 +482,24 @@ fn stored_analysis(groups: List<LoadedOwners>) -> GroupsAnalysed / {SessionReads
         Ok(resolved) -> if resolved.problems.len() > 0 { Rejected(resolved.problems) } else {
           let read = stored_tables(groups, loaded);
           if read.rejected.len() > 0 { Rejected(read.rejected) } else {
+            let analysed = group_analysis(
+              resolved,
+              checked_of_parts(
+                resolved.resolution.order.flat_map(|i: Int| read.parts.get(i).unwrap_or([])),
+              ),
+              [],
+              read.declared,
+              unreached(resolved.uses),
+              range(0, resolved.modules.len()).map(|i: Int|
+                match groups.at(i) {
+                  Some(g) -> owners_result_of(g.named).shape.unimported,
+                  None -> [],
+                }),
+            );
             Analysed(
               with_stored_tables(
                 hashed_analysis(
-                  group_analysis(
-                    resolved,
-                    checked_of_parts(
-                      resolved.resolution.order.flat_map(|i: Int| read.parts.get(i).unwrap_or([])),
-                    ),
-                    [],
-                    read.declared,
-                    unreached(resolved.uses),
-                    range(0, resolved.modules.len()).map(|i: Int|
-                      match groups.at(i) {
-                        Some(g) -> owners_result_of(g.named).shape.unimported,
-                        None -> [],
-                      }),
-                  ),
+                  { ..analysed, packages: group.inputs.loaded.get(0).tables.packages },
                   hash_output(hash_layout(resolved.index), read.own),
                 ),
                 with_performed_effects(group.mentioned),
@@ -495,12 +508,10 @@ fn stored_analysis(groups: List<LoadedOwners>) -> GroupsAnalysed / {SessionReads
           }
         },
       },
-      offset: loaded.get(0).offset,
       loaded: loaded,
     }
   })
-
-pub type PlacedModule = { module: Bytes, offset: Int, items: List<ItemAt> }
+}
 
 pub type ClaimIdentities = { opened: Set<Bytes>, identities: Identities }
 
@@ -508,22 +519,7 @@ pub type ClaimsOutcome =
   | ClaimsRejected(List<Diagnostic>)
   | ClaimsAnalysed(Analysis, ClaimIdentities)
 
-pub type ClaimsProgram = { outcome: ClaimsOutcome, placed: List<PlacedModule> }
-
-fn placed_module(g: LoadedOwners, offset: Int) -> PlacedModule / {memo.read, abort.raise} = {
-  let facts = placed_facts(g.named, layout_of(g.named));
-  {
-    module: g.named.module,
-    offset: offset,
-    items: item_layout(
-      g.owners.map(|o: Bytes|
-        match facts.get(o) {
-          Some(f) -> f.text,
-          None -> panic("a group names a declaration that its module's layout does not place"),
-        }),
-    ),
-  }
-}
+pub type ClaimsProgram = { outcome: ClaimsOutcome, modules: List<Bytes> }
 
 type OpenedGroups = { groups: List<LoadedOwners>, others: List<LoadedOwners>, modules: Set<Bytes> }
 
@@ -542,12 +538,12 @@ fn opened_groups(open: List<ModuleKey>) -> OpenedGroups / {SessionReads, abort.r
 }
 
 pub fn program_analysed(open: List<ModuleKey>) -> AnalysisOutcome / {SessionReads, abort.raise} =
-  stored_analysis(opened_groups(open).groups).outcome
+  stored_analysis(opened_groups(open).groups, in_file).outcome
 
 pub fn claims_analysed(open: List<ModuleKey>) -> ClaimsProgram / {SessionReads, abort.raise} = {
   let opened = opened_groups(open);
   let groups = opened.groups;
-  let analysed = stored_analysis(groups);
+  let analysed = stored_analysis(groups, in_file);
   {
     outcome: match analysed.outcome {
       Rejected(diagnostics) -> ClaimsRejected(diagnostics),
@@ -561,8 +557,7 @@ pub fn claims_analysed(open: List<ModuleKey>) -> ClaimsProgram / {SessionReads, 
           ),
         }),
     },
-    placed: range(0, groups.len()).map(|i: Int|
-      placed_module(groups.get(i), analysed.loaded.get(i).offset)),
+    modules: groups.map(|g: LoadedOwners| g.named.module),
   }
 }
 
@@ -571,11 +566,9 @@ fn is_law(subject: Identified) -> Bool =
 
 pub fn measure_program(u: UnitKey) -> MeasureProgram / {QueryEffects, abort.raise} = {
   let groups = groups_reached(u);
-  let analysed = stored_analysis(groups);
   {
-    outcome: analysed.outcome,
+    outcome: stored_analysis(groups, in_group).outcome,
     measured: measured_in(u, owners_result_of(module_of_unit(u))),
-    offset: analysed.offset,
     owned: groups.map(|g: LoadedOwners| g.named.module).filter(|m: Bytes|
       m == u.module || in_root(m)),
   }
