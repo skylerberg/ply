@@ -1,0 +1,313 @@
+import std.bin
+import std.bytes
+import std.list
+import std.hash (blake3)
+import std.fs
+import std.fs (fs, Kind, File, Dir, Symlink, Missing, Listed, Entry, MemFs, MemResult, mem_of,
+               mem_empty)
+import compiler.store.hash.encoding (hex)
+import compiler.store.memo (memo)
+import compiler.store.memo.engine (Run, in_session, reading)
+import compiler.store.database
+import compiler.store.packs
+import compiler.store.handles (QueryOf, Written, written, query_definition, fetch)
+import compiler.front.checking (fresh_registry)
+import compiler.front.checking.world (QueryEffects, CheckDefinition, traced_file_kind, shipped_kind,
+                                      data_kind, with_decode_cache)
+import testing.reads (RecordedRead, TracedRead, ReadPath, ReadConfiguration, UsedBinding,
+                      ReadShippedModule,
+                      ReadShippedData, ReadProgram, PathRead, WholeFile, DirectoryEntries, PathKind,
+                      DirectoryTree, UnderRoot, OutsideRoots, PathReadAt, recorded_read_bin,
+                      path_read_bin)
+
+pub type NamedRoot = { name: Bytes, directory: Bytes }
+
+pub type ConfiguredKey = { key: Bytes, digest: Bytes }
+
+pub type PassContext = {
+  roots: List<NamedRoot>,
+  configuration: List<ConfiguredKey>,
+  binding: Bytes,
+  program: Bytes,
+}
+
+pub type PassCheck = { key: Bytes, reads: List<RecordedRead>, context: PassContext }
+
+pub type TracedFile = { how: PathRead, path: Bytes, own: List<Bytes> }
+
+derive bin for NamedRoot
+
+derive bin for ConfiguredKey
+
+derive bin for PassContext
+
+derive bin for PassCheck
+
+derive bin for TracedFile
+
+pub const test_pass_name: Bytes = b"test pass"
+
+pub fn test_pass_query() -> QueryOf<PassCheck, Bool> =
+  { name: test_pass_name, input: pass_check_bin(), output: bin::bool_bin() }
+
+pub fn test_pass_result(check: PassCheck) -> Written / {QueryEffects, abort.raise} =
+  written(
+    test_pass_query(),
+    check.reads.fold(true, |holds: Bool, recorded: RecordedRead|
+      holds && read_unchanged(check.context, recorded)),
+  )
+
+pub fn pass_queries() -> List<CheckDefinition> =
+  [query_definition(test_pass_query(), b"passes.test_pass_result", test_pass_result)]
+
+fn read_unchanged(
+  context: PassContext,
+  recorded: RecordedRead,
+) -> Bool / {memo.read, abort.raise} =
+  match recorded.read {
+    ReadPath(at) -> match traced_file_of(context, at) {
+      Some(file) ->
+        memo.external(traced_file_kind, bin::encode(file, traced_file_bin()))
+          == Some(recorded.digest),
+      None -> false,
+    },
+    ReadConfiguration(key) -> configured_now(context, key) == recorded.digest,
+    UsedBinding -> context.binding == recorded.digest,
+    ReadShippedModule(name) -> shipped_digest(memo.external(shipped_kind, name)) == recorded.digest,
+    ReadShippedData(name) -> shipped_digest(memo.external(data_kind, name)) == recorded.digest,
+    ReadProgram -> context.program == recorded.digest,
+  }
+
+fn traced_file_of(context: PassContext, at: PathReadAt) -> Option<TracedFile> / {abort.raise} =
+  match at.place {
+    OutsideRoots(path) -> Some({ how: at.how, path: path, own: at.own }),
+    UnderRoot(rooted) -> match context.roots.find(|r: NamedRoot| r.name == rooted.root) {
+      Some(root) -> Some({ how: at.how, path: joined(root.directory, rooted.path), own: at.own }),
+      None -> None,
+    },
+  }
+
+fn joined(directory: Bytes, path: Bytes) -> Bytes =
+  if path.len() == 0 { directory } else { Bytes::concat_all([directory, b"/", path]) }
+
+fn configured_now(context: PassContext, key: Bytes) -> Bytes / {abort.raise} =
+  match context.configuration.find(|c: ConfiguredKey| c.key == key) {
+    Some(c) -> c.digest,
+    None -> configured_digest(None),
+  }
+
+pub fn configured_digest(value: Option<Bytes>) -> Bytes / {abort.raise} =
+  hex(
+    blake3(match value { Some(v) -> Bytes::concat_all([b"value\x00", v]), None -> b"none" }),
+  )
+
+fn shipped_digest(text: Option<Bytes>) -> Bytes / {abort.raise} =
+  match text { Some(t) -> hex(blake3(t)), None -> b"none" }
+
+pub fn traced_file_digest(at: Bytes) -> Option<Bytes> / {fs.read[abs], abort.raise} =
+  match bin::decode(at, traced_file_bin()) {
+    Err(_) -> None,
+    Ok(file) -> if !file.path.starts_with(b"/") { None } else {
+      let place = String::of_bytes_lossy(file.path.slice(1, file.path.len()));
+      Some(hex(blake3(Bytes::concat_all([how_word(file.how), b"\x00", read_now(file, place)]))))
+    },
+  }
+
+fn how_word(how: PathRead) -> Bytes =
+  match how {
+    WholeFile -> b"file",
+    DirectoryEntries -> b"dir",
+    PathKind -> b"kind",
+    DirectoryTree -> b"tree",
+  }
+
+fn read_now(file: TracedFile, place: String) -> Bytes / {fs.read[abs], abort.raise} =
+  match file.how {
+    WholeFile -> match fs.read_file[abs](place) {
+      Some(bytes) -> Bytes::concat_all([b"bytes\x00", bytes]),
+      None -> b"none",
+    },
+    DirectoryEntries -> match fs.list_dir[abs](place) {
+      Some(entries) ->
+        Bytes::concat_all(
+          [b"entries\x00"].concat(
+            entries.filter(|e: Listed| !excluded_entry(e.name, file.own)).map(|e: Listed|
+              Bytes::concat_all([Bytes::of_string(e.name), b"\x00", kind_number(e.kind)])),
+          ),
+        ),
+      None -> b"none",
+    },
+    PathKind -> kind_word(fs.kind[abs](place)),
+    DirectoryTree -> match fs.walk[abs](place) {
+      Some(entries) ->
+        Bytes::concat_all(
+          entries.fold([], |found: List<Bytes>, e: Entry| {
+            let relative = below(place, e.path);
+            if excluded_below(relative, file.own) { found }
+            else { found.push(tree_entry(place, relative, e.kind)) }
+          }),
+        ),
+      None -> b"none",
+    },
+  }
+
+const cache_dir_name: Bytes = b".ply-cache"
+
+fn excluded_entry(name: String, own: List<Bytes>) -> Bool = {
+  let named = Bytes::of_string(name);
+  named == cache_dir_name || own.any(|o: Bytes| o == named)
+}
+
+fn excluded_below(relative: Bytes, own: List<Bytes>) -> Bool =
+  relative.split(b"/").any(|part: Bytes| part == cache_dir_name)
+    || own.any(|o: Bytes| relative == o || relative.starts_with(o.concat(b"/")))
+
+fn below(place: String, path: String) -> Bytes / {abort.raise} = {
+  let whole = Bytes::of_string(path);
+  let prefix = Bytes::of_string(place).concat(b"/");
+  if whole.starts_with(prefix) { whole.slice(prefix.len(), whole.len()) } else { whole }
+}
+
+fn tree_entry(
+  place: String,
+  relative: Bytes,
+  kind: Kind,
+) -> Bytes / {fs.read[abs], abort.raise} =
+  Bytes::concat_all([
+    relative,
+    b"\x00",
+    match kind {
+      Symlink -> b"link\x00",
+      Dir -> b"dir\x00",
+      File ->
+        Bytes::concat_all([
+          b"file\x00",
+          blake3(
+            match fs.read_file[abs](place ++ "/" ++ String::of_bytes_lossy(relative)) {
+              Some(bytes) -> bytes,
+              None -> b"",
+            },
+          ),
+        ]),
+      Missing -> b"none\x00",
+    },
+  ])
+
+fn kind_number(kind: Kind) -> Bytes =
+  match kind { File -> b"\x00", Dir -> b"\x01", Symlink -> b"\x02", Missing -> b"\x03" }
+
+fn kind_word(kind: Kind) -> Bytes =
+  match kind { Symlink -> b"link", Dir -> b"dir", File -> b"file", Missing -> b"none" }
+
+fn context_with(configuration: List<ConfiguredKey>) -> PassContext =
+  {
+    roots: [{ name: b"cwd", directory: b"/project" }],
+    configuration: configuration,
+    binding: b"granted",
+    program: b"this ply",
+  }
+
+fn holds_over(
+  database: MemFs,
+  files: MemFs,
+  shipped: Map<Bytes, Bytes>,
+  check: PassCheck,
+) -> MemResult<Bool> / {abort.raise} = {
+  let qs = fresh_registry(pass_queries());
+  database::with_store_in_memory(
+    database,
+    packs::no_pack,
+    b"",
+    |kind: Bytes, at: Bytes|
+      if kind == traced_file_kind { fs::on_mem[abs](files, || traced_file_digest(at)).value }
+      else if kind == shipped_kind { shipped.get(at) }
+      else { None },
+    ||
+      with_decode_cache(||
+        in_session(qs, |run: Run| reading(qs, run, || fetch(test_pass_query(), check)))),
+  )
+}
+
+test "a stored pass that read a file holds while the file is unchanged, and not after it changes" {
+  let check = {
+    key: b"t",
+    reads: [
+      {
+        read: ReadPath({
+          how: WholeFile,
+          place: UnderRoot({ root: b"cwd", path: b"a.txt" }),
+          own: [],
+        }),
+        digest: hex(blake3(b"file\x00bytes\x00one")),
+      },
+    ],
+    context: context_with([]),
+  };
+  let file_of = |body: Bytes| mem_of([{ path: "project/a.txt", body: body }]);
+  let first = holds_over(mem_empty(), file_of(b"one"), Map::new(), check);
+  let unchanged = holds_over(first.tree, file_of(b"one"), Map::new(), check);
+  let changed = holds_over(unchanged.tree, file_of(b"two"), Map::new(), check);
+  let restored = holds_over(changed.tree, file_of(b"one"), Map::new(), check);
+  assert_eq([first.value, unchanged.value, changed.value, restored.value], [true, true, false, true])
+}
+
+test "a stored pass that read a standard library module's text holds only while that text is unchanged" {
+  let check = {
+    key: b"t",
+    reads: [{ read: ReadShippedModule(b"std.list"), digest: hex(blake3(b"one")) }],
+    context: context_with([]),
+  };
+  let text_of = |text: Bytes| Map::new().insert(b"std.list", text);
+  let first = holds_over(mem_empty(), mem_empty(), text_of(b"one"), check);
+  let changed = holds_over(first.tree, mem_empty(), text_of(b"two"), check);
+  let gone = holds_over(changed.tree, mem_empty(), Map::new(), check);
+  assert_eq([first.value, changed.value, gone.value], [true, false, false])
+}
+
+test "a stored pass does not hold once a configuration value, the grants, the program or a root it read differs" {
+  let holds = |read: TracedRead, digest: Bytes, context: PassContext|
+    holds_over(
+      mem_empty(),
+      mem_of([{ path: "project/a.txt", body: b"one" }]),
+      Map::new(),
+      { key: b"t", reads: [{ read: read, digest: digest }], context: context },
+    ).value;
+  let region = |value: Bytes| [{ key: b"SERVICE_REGION", digest: configured_digest(Some(value)) }];
+  let eu = configured_digest(Some(b"eu"));
+  assert(holds(ReadConfiguration(b"SERVICE_REGION"), eu, context_with(region(b"eu"))), None);
+  assert(!holds(ReadConfiguration(b"SERVICE_REGION"), eu, context_with(region(b"us"))), None);
+  assert(!holds(ReadConfiguration(b"SERVICE_REGION"), eu, context_with([])), None);
+  assert(holds(UsedBinding, b"granted", context_with([])), None);
+  assert(!holds(UsedBinding, b"granted", { ..context_with([]), binding: b"more granted" }), None);
+  assert(!holds(ReadProgram, b"this ply", { ..context_with([]), program: b"another ply" }), None);
+  let under_root = ReadPath({
+    how: WholeFile,
+    place: UnderRoot({ root: b"cwd", path: b"a.txt" }),
+    own: [],
+  });
+  let one = hex(blake3(b"file\x00bytes\x00one"));
+  assert(holds(under_root, one, context_with([])), None);
+  assert(!holds(under_root, one, { ..context_with([]), roots: [] }), None)
+}
+
+test "a tree's digest ignores `.ply-cache` and the paths the run wrote, and changes with any other file below it" {
+  let digest_of_tree = |files: List<{ path: String, body: Bytes }>|
+    fs::on_mem[abs](mem_of(files), ||
+      traced_file_digest(
+        bin::encode({ how: DirectoryTree, path: b"/project", own: [b"out"] }, traced_file_bin()),
+      )).value;
+  let base = [{ path: "project/a.ply", body: b"a" }, { path: "project/b/c.ply", body: b"c" }];
+  let original = digest_of_tree(base);
+  assert(original != None, None);
+  assert_eq(
+    digest_of_tree(
+      base.concat([
+        { path: "project/.ply-cache/entry", body: b"cached" },
+        { path: "project/out/written", body: b"written" },
+      ]),
+    ),
+    original,
+  );
+  assert(digest_of_tree([{ path: "project/a.ply", body: b"a" }, { path: "project/b/c.ply", body: b"d" }]) != original, None);
+  assert(digest_of_tree(base.concat([{ path: "project/b/new.ply", body: b"n" }])) != original, None)
+}

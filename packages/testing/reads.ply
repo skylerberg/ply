@@ -1,0 +1,123 @@
+import std.bin
+import std.bytes
+import std.list
+
+pub type PathRead = | WholeFile | DirectoryEntries | PathKind | DirectoryTree
+
+pub type RootPath = { root: Bytes, path: Bytes }
+
+pub type FilePlace = | UnderRoot(RootPath) | OutsideRoots(Bytes)
+
+pub type PathReadAt = { how: PathRead, place: FilePlace, own: List<Bytes> }
+
+pub type TracedRead =
+  | ReadPath(PathReadAt)
+  | ReadConfiguration(Bytes)
+  | UsedBinding
+  | ReadShippedModule(Bytes)
+  | ReadShippedData(Bytes)
+  | ReadProgram
+
+pub type RecordedRead = { read: TracedRead, digest: Bytes }
+
+pub type Trace = | Checkable(List<RecordedRead>) | Unchecked(Bytes)
+
+derive bin for PathRead
+
+derive bin for RootPath
+
+derive bin for FilePlace
+
+derive bin for PathReadAt
+
+derive bin for TracedRead
+
+derive bin for RecordedRead
+
+pub fn trace_of(text: Bytes) -> Trace =
+  text.split(b"\n").fold(Checkable([]), |found: Trace, line: Bytes|
+    match found {
+      Unchecked(_) -> found,
+      Checkable(reads) -> if line.len() == 0 { found } else {
+        match recorded_read_of(line) {
+          Some(read) -> Checkable(reads.push(read)),
+          None -> Unchecked(line),
+        }
+      },
+    })
+
+fn recorded_read_of(line: Bytes) -> Option<RecordedRead> =
+  match line.split(b"\t") {
+    [b"binding", digest] -> Some({ read: UsedBinding, digest: digest }),
+    [b"program", digest] -> Some({ read: ReadProgram, digest: digest }),
+    [b"config", key, digest] -> Some({ read: ReadConfiguration(key), digest: digest }),
+    [b"shipped", name, digest] -> match shipped_read_of(name) {
+      Some(read) -> Some({ read: read, digest: digest }),
+      None -> None,
+    },
+    [how, root, path, own, digest] -> match path_read_of(how) {
+      Some(read) ->
+        Some({
+          read: ReadPath({ how: read, place: place_of(root, path), own: owned_paths(own) }),
+          digest: digest,
+        }),
+      None -> None,
+    },
+    _ -> None,
+  }
+
+fn shipped_read_of(name: Bytes) -> Option<TracedRead> =
+  if name.len() == 0 { None }
+  else if name.index_of(b"/") != None { Some(ReadShippedData(name)) }
+  else { Some(ReadShippedModule(name)) }
+
+fn path_read_of(how: Bytes) -> Option<PathRead> =
+  match how {
+    b"file" -> Some(WholeFile),
+    b"dir" -> Some(DirectoryEntries),
+    b"kind" -> Some(PathKind),
+    b"tree" -> Some(DirectoryTree),
+    _ -> None,
+  }
+
+fn place_of(root: Bytes, path: Bytes) -> FilePlace =
+  if root.len() == 0 { OutsideRoots(path) } else { UnderRoot({ root: root, path: path }) }
+
+fn owned_paths(own: Bytes) -> List<Bytes> = if own.len() == 0 { [] } else { own.split(b"\x1f") }
+
+test "`trace_of` reads each line of a run's trace as a read with the digest the run recorded" {
+  assert_eq(
+    trace_of(
+      b"binding\tb1\nconfig\tSERVICE_REGION\tc1\nfile\tcwd\tsrc/a.ply\t\tf1\ntree\t\t/tmp/out\tbuild\x1flogs\tt1\nshipped\tstd.list\ts1\nshipped\tstd/oid/names.txt\td1\nprogram\tp1\n",
+    ),
+    Checkable([
+      { read: UsedBinding, digest: b"b1" },
+      { read: ReadConfiguration(b"SERVICE_REGION"), digest: b"c1" },
+      {
+        read: ReadPath({
+          how: WholeFile,
+          place: UnderRoot({ root: b"cwd", path: b"src/a.ply" }),
+          own: [],
+        }),
+        digest: b"f1",
+      },
+      {
+        read: ReadPath({
+          how: DirectoryTree,
+          place: OutsideRoots(b"/tmp/out"),
+          own: [b"build", b"logs"],
+        }),
+        digest: b"t1",
+      },
+      { read: ReadShippedModule(b"std.list"), digest: b"s1" },
+      { read: ReadShippedData(b"std/oid/names.txt"), digest: b"d1" },
+      { read: ReadProgram, digest: b"p1" },
+    ]),
+  );
+  assert_eq(trace_of(b""), Checkable([]))
+}
+
+test "a trace with a line that names no read Ply can check again is unchecked" {
+  assert_eq(trace_of(b"binding\tb1\nshipped\t\tn1\n"), Unchecked(b"shipped\t\tn1"));
+  assert_eq(trace_of(b"file\tcwd\ta.txt\tb3\n"), Unchecked(b"file\tcwd\ta.txt\tb3"))
+}

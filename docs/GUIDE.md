@@ -1756,9 +1756,11 @@ hash changes but the code does not, so the recorded pass still applies and `ply 
 the test.
 
 The test's hash covers each standard library function, type and effect the test uses, so a change
-to one of them reruns the test. A test that reads the text of a standard library module, for example
-by running `ply`, records that module, and its pass stays valid only while the module's text is
-unchanged.
+to one of them reruns the test. A test that uses the host also records what it read: files and
+directories under the roots `--fs` grants, configuration keys, standard library module texts, the
+`ply` program, and which roots, programs and effects were granted. `ply test` reuses the recorded
+pass only while each of these still has the value the test read. If any has changed, the test runs
+again.
 
 | flag | meaning |
 | --- | --- |

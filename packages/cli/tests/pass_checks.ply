@@ -1,0 +1,61 @@
+import std.set (Set)
+import std.env (env)
+import std.fs (fs)
+import std.machine as entering
+import progress
+import configuration
+import compiler.front.checking (LoadInputs)
+import compiler.store.handles (fetch)
+import program (ProgramPlace, ProgramStore, in_program_store)
+import passes (PassContext, PassCheck, test_pass_query, configured_digest)
+import tester (Options, grants_of)
+import testing.select (Pass)
+
+pub fn passes_holding(
+  place: ProgramPlace,
+  options: Options,
+  stored: List<Pass>,
+) -> Set<Bytes> / {ProgramStore, entering::machine.hosting, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], abort.raise} = {
+  let traced = stored.filter(|p: Pass| p.reads.len() > 0);
+  let untraced = stored.filter(|p: Pass| p.reads.len() == 0).map(|p: Pass| p.key);
+  Set::of_list(
+    if traced.len() == 0 { untraced } else { untraced.concat(traced_holding(place, options, traced)) },
+  )
+}
+
+fn traced_holding(
+  place: ProgramPlace,
+  options: Options,
+  traced: List<Pass>,
+) -> List<Bytes> / {ProgramStore, entering::machine.hosting, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], abort.raise} =
+  match context_of(options) {
+    None -> [],
+    Some(context) -> {
+      let checks = traced.map(|p: Pass| { key: p.key, reads: p.reads, context: context });
+      progress::silently(||
+        in_program_store(place, |_: LoadInputs|
+          checks.fold([], |held: List<Bytes>, c: PassCheck|
+            if fetch(test_pass_query(), c) { held.push(c.key) } else { held }))).value
+    },
+  }
+
+fn context_of(
+  options: Options,
+) -> Option<PassContext> / {entering::machine.hosting, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs], abort.raise} =
+  match configuration::resolve_configuration({ ..options.machine.config, schema: None }, |name: String|
+      Err([])) {
+    Err(_) -> None,
+    Ok(resolution) -> {
+      let supplied = configuration::run_configuration(resolution.configuration);
+      let hosting = entering::machine.hosting(grants_of(options.machine, supplied));
+      Some({
+        roots: hosting.roots.map(|r: entering::NamedPath|
+          { name: Bytes::of_string(r.name), directory: Bytes::of_string(r.path) }),
+        configuration: supplied.values.filter(|v: { key: String, value: String, secret: Bool }|
+          !v.secret).map(|v: { key: String, value: String, secret: Bool }|
+          { key: Bytes::of_string(v.key), digest: configured_digest(Some(Bytes::of_string(v.value))) }),
+        binding: Bytes::of_string(hosting.binding),
+        program: Bytes::of_string(hosting.program),
+      })
+    },
+  }
