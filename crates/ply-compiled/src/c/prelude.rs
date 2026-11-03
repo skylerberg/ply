@@ -142,6 +142,7 @@ helpers! {
     rt_inc_shared(w);
     rt_note_update(in_place, copied);
     rt_failed(raises: I64, texts: *const Word, notes: I64, shown: I64);
+    rt_failed_call(root: I64, start: I64, end: I64);
 
     rt_alloc_bytes(bytes) -> Block;
     rt_alloc_kept(bytes) -> Block;

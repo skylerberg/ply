@@ -1426,6 +1426,13 @@ handles it only when named: `try[abort.raise] { .. }`. Unhandled, a failed asser
 (`E0501`) and any other is an error (`E0502`). Overflow and running out of stack end the program and
 cannot be handled.
 
+**Where a failure is reported.** The error that ends the program points at the expression that
+failed, labelled `raised here`. It also labels each call the failure returned through, `called
+here`, from the innermost call outwards. Each label names the function it is in. So a failing
+`xs.get(9)` names the line inside `List::get` and the line of your code that called it. When the
+run has no source for a label's function, the label becomes a note that names the function.
+Recording these calls costs nothing while the program runs without failing.
+
 **Calls that cannot fail.** A call adds no `abort.raise` when the checker can see that it cannot
 fail where it is written:
 
