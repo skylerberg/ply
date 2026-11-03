@@ -9,19 +9,21 @@ import compiler.syntax.expressions (prelude_module)
 import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone,
                                 lookup_input_shipping, over_decoding, prelude_frames, prelude_files,
                                 query_load, listed_module, analysed_over)
-import compiler.front.checking.units (Entries, PartCode, code_unit_bin, codes_of_part, part_text,
-                                      program_code, entries_of, roots_of_modules)
+import compiler.front.checking.units (Entries, PartCode, RootLink, CodeUnit, NoCode, code_query,
+                                      code_unit_bin, codes_of_part, part_text, program_code,
+                                      entries_of, roots_of_modules)
 import compiler.cc (WrittenPart)
 import compiler.front.published (dump_of)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.emit (diagnostics_text)
 import compiler.store.memo (memo)
+import compiler.store.handles (fetch)
 import compiler.store.memo.engine (Run, in_session, reading)
 import compiler.unit (unit_code_bin, requested_roots)
 
 type Built = { codes: Map<Bytes, Bytes>, text: Bytes }
 
-type Finished = { store: fs::MemFs, run: Run, built: Built }
+type Finished = { store: fs::MemFs, built: Built }
 
 const main_entry: Entries =
   {
@@ -47,28 +49,34 @@ fn built_program(entries: Entries) -> Built / {memo.read, abort.raise} = {
   })
 }
 
-fn built_from(
+fn read_in_session<a>(
   store: fs::MemFs,
   sources: List<Source>,
-  wanted: () -> Entries / {memo.read, abort.raise},
-) -> Finished / {abort.raise} = {
+  body: () -> a / {memo.read, abort.raise},
+) -> { store: fs::MemFs, value: a } / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry();
-  let done = over_decoding(
+  over_decoding(
     store,
     prelude_frames,
     prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
-      in_session(qs, |run: Run| {
-        let done = reading(qs, run, || {
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
           query_load(w.own, [], false, listed_module);
-          built_program(wanted())
-        });
-        { run: done.run, value: done }
-      }),
-  );
-  { store: done.store, run: done.value.run, built: done.value.value }
+          body()
+        })),
+  )
+}
+
+fn built_from(
+  store: fs::MemFs,
+  sources: List<Source>,
+  wanted: () -> Entries / {memo.read, abort.raise},
+) -> Finished / {abort.raise} = {
+  let done = read_in_session(store, sources, || built_program(wanted()));
+  { store: done.store, built: done.value }
 }
 
 fn library(limit: Bytes) -> Source =
@@ -105,6 +113,27 @@ test "after a series of edits each unit's code equals a build from nothing" {
     warm.store
   });
   ()
+}
+
+test "a program lowers every unit it reaches, each to the code the unit has when it is lowered alone" {
+  let sources = [library(b"3"), program(b"n * 2")];
+  let whole = read_in_session(fs::mem_empty(), sources, || {
+    let code = program_code(main_entry);
+    {
+      built: built_program(main_entry),
+      units: code.parts.flat_map(|p: PartCode| p.part.units),
+      reached: code.links.map(|l: RootLink| l.unit).filter(|at: Bytes|
+        at != bin::encode(NoCode, code_unit_bin())),
+    }
+  }).value;
+  assert(whole.reached.all(|at: Bytes| whole.built.codes.contains(at)), None);
+  let alone = read_in_session(fs::mem_empty(), sources, ||
+    whole.units.reverse().fold(Map::new(), |m: Map<Bytes, Bytes>, unit: CodeUnit|
+      m.insert(
+        bin::encode(unit, code_unit_bin()),
+        bin::encode(fetch(code_query(), unit), unit_code_bin()),
+      ))).value;
+  assert_eq(whole.built.codes, alone)
 }
 
 fn every_root_kind(body: Bytes) -> Source =
