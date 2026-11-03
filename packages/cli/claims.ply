@@ -2,12 +2,10 @@ import compiler.syntax.parsing (Error, Warning)
 import compiler.load (LoadedAnalysis)
 import std.bin
 import std.cli (Parsed, has, parse_nat, value, values_of, nat_value)
-import proof.discharge (RuntimeRequest, JudgePoints, RunInterleaving, ClaimToDischarge, Batch,
-                        Judgements, Interleaved, LawRun, JudgeMode, WholeClaim, WitnessSearch,
-                        GuardFilter, discharged)
+import proof.discharge (Runtime, InterleavingRun, ClaimToDischarge, Batch, JudgedBatch, LawRun,
+                        JudgeMode, WholeClaim, WitnessSearch, GuardFilter, discharged)
 import proof.evidence (evidence_of, evidence_bytes)
 import sim.plan
-import sim.plan (Seed)
 import proof.prover_input (ProverInputResult, Obligation, ProverInput, empty_prover_input)
 import proof.decide (Diagnosis, StaticResult, decision_word, steps_of, not_attempted)
 import proof.lower (Blocker, blocker_parts)
@@ -203,8 +201,7 @@ pub type StaticProverResult = {
 
 pub type StaticAnswer = { resolved: StaticResult, diagnosis: Option<StaticProverResult> }
 
-pub type StaticProver<| e> =
-  (List<LookedUp>, Bool, Int) -> List<WantedClaim> / {abort.raise | e}
+pub type StaticProver<| e> = (List<LookedUp>, Bool, Int) -> List<WantedClaim> / {abort.raise | e}
 
 const unattempted: StaticAnswer = { resolved: not_attempted, diagnosis: None }
 
@@ -682,19 +679,7 @@ pub fn discharge_runs(
       claims,
       collection.world,
       collection.plan.sim,
-      |q: RuntimeRequest|
-        match q {
-          JudgePoints(batches) -> {
-            let j = judge_parallel(p, batches, collection.lanes);
-            entry_warnings.ended(j.warnings);
-            Judgements(j.each)
-          },
-          RunInterleaving(claim, point, seed, steps) -> {
-            let r = run_interleaving(p, claim, point, seed, steps);
-            entry_warnings.ended(r.warnings);
-            Interleaved(r.run)
-          },
-        },
+      proof_runtime(p, collection.lanes),
       |claim: PendingClaim, outcome: Outcome| discharging.decided(claim, outcome),
     )
   } with {
@@ -711,33 +696,50 @@ effect entry_warnings {
   write ended(warnings: List<Diagnostic>) -> Unit
 }
 
-fn judge_parallel(
+fn proof_runtime<t | e>(
   p: ProofContext,
-  batches: List<Batch>,
   lanes: Option<Int>,
-) -> { each: List<List<Judgement>>, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} = {
+) -> Runtime<t | {entering::machine.enter, entry_warnings.ended, abort.raise | e}> =
+  {
+    judge: |batches: List<Batch<t>>| {
+      let j = judge_parallel(p, batches, lanes);
+      entry_warnings.ended(j.warnings);
+      j.each
+    },
+    interleave: |run: InterleavingRun| {
+      let r = run_interleaving(p, run);
+      entry_warnings.ended(r.warnings);
+      r.run
+    },
+  }
+
+fn judge_parallel<t>(
+  p: ProofContext,
+  batches: List<Batch<t>>,
+  lanes: Option<Int>,
+) -> { each: List<JudgedBatch<t>>, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} = {
   let dealt = machine::split_into_lanes(batches, lanes);
   let judge_batch = judge_lanes(p, dealt, 0, dealt.len(), 64);
   {
     each: machine::merge_lanes(
-      judge_batch.map(|lane: List<BatchResult>| lane.map(|j: BatchResult| j.each)),
+      judge_batch.map(|lane: List<BatchResult<t>>| lane.map(|j: BatchResult<t>| j.judged)),
     ),
-    warnings: judge_batch.fold([], |accumulator: List<Diagnostic>, lane: List<BatchResult>|
-      lane.fold(accumulator, |into: List<Diagnostic>, j: BatchResult| into.concat(j.warnings))),
+    warnings: judge_batch.fold([], |accumulator: List<Diagnostic>, lane: List<BatchResult<t>>|
+      lane.fold(accumulator, |into: List<Diagnostic>, j: BatchResult<t>| into.concat(j.warnings))),
   }
 }
 
-fn judge_lanes(
+fn judge_lanes<t>(
   p: ProofContext,
-  lanes: List<List<Batch>>,
+  lanes: List<List<Batch<t>>>,
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<List<BatchResult>> / {entering::machine.enter, abort.raise} =
+) -> List<List<BatchResult<t>>> / {entering::machine.enter, abort.raise} =
   if hi - lo <= 0 { [] } else if hi - lo == 1 || depth_left <= 0 {
-    range(lo, hi).fold([], |out: List<List<BatchResult>>, i: Int|
+    range(lo, hi).fold([], |out: List<List<BatchResult<t>>>, i: Int|
       match lanes.at(i) {
-        Some(lane) -> out.push(lane.map(|b: Batch| judge_batch(p, b))),
+        Some(lane) -> out.push(lane.map(|b: Batch<t>| judge_batch(p, b))),
         None -> out,
       })
   } else {
@@ -761,18 +763,18 @@ pub fn laws_by_key(laws: List<LawPlace>) -> Map<String, LawPlace> =
   laws.fold(Map::new(), |found: Map<String, LawPlace>, l: LawPlace|
     found.insert(String::of_bytes_lossy(l.key), l))
 
-pub type BatchResult = { each: List<Judgement>, warnings: List<Diagnostic> }
+pub type BatchResult<t> = { judged: JudgedBatch<t>, warnings: List<Diagnostic> }
 
 type ClaimRoots = { guards: List<String>, body: String, call: Option<String> }
 
 type EntryResult = { result: Result<Value, Judgement>, warnings: List<Diagnostic> }
 
-pub fn judge_batch(
+pub fn judge_batch<t>(
   p: ProofContext,
-  batch: Batch,
-) -> BatchResult / {entering::machine.enter, abort.raise} =
+  batch: Batch<t>,
+) -> BatchResult<t> / {entering::machine.enter, abort.raise} =
   match roots_of(p, batch.claim_index) {
-    Err(fault) -> { each: [fault], warnings: [] },
+    Err(fault) -> { judged: { batch: batch, judgements: [fault] }, warnings: [] },
     Ok(r) -> {
       let done = batch.points.fold(
         { each: [], warnings: [], over: false },
@@ -799,7 +801,7 @@ pub fn judge_batch(
             }
           },
       );
-      { each: done.each, warnings: done.warnings }
+      { judged: { batch: batch, judgements: done.each }, warnings: done.warnings }
     },
   }
 
@@ -999,12 +1001,9 @@ fn missing_claim(o: Obligation) -> Judgement =
 
 pub fn run_interleaving(
   p: ProofContext,
-  claim: Int,
-  point: List<Value>,
-  seed: Seed,
-  steps: Int,
+  run: InterleavingRun,
 ) -> { run: LawRun, warnings: List<Diagnostic> } / {entering::machine.enter, abort.raise} =
-  match roots_of(p, claim) {
+  match roots_of(p, run.claim_index) {
     Err(fault) ->
       {
         run: {
@@ -1014,10 +1013,10 @@ pub fn run_interleaving(
         warnings: [],
       },
     Ok(r) -> {
-      let o = entering::machine.enter(p.unit_id, r.body, machine::arguments_of(point), {
+      let o = entering::machine.enter(p.unit_id, r.body, machine::arguments_of(run.point), {
         ..entering::unbounded,
         timeout_ms: p.timeout_ms,
-        seed: Some({ root: seed.root, path: seed.path, steps: max(steps, 1) }),
+        seed: Some({ root: run.seed.root, path: run.seed.path, steps: max(run.steps, 1) }),
       });
       let verdict = match as_boolean(root_value(o.ended, r.body)) {
         Ok(true) -> Passed,
