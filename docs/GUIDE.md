@@ -1748,8 +1748,10 @@ is the compiled code the test ran. If an edit or a new `ply` compiles the test t
 hash changes but the code does not, so the recorded pass still applies and `ply test` does not run
 the test.
 
-A pass also records each standard library function, type and effect the test used, and stays valid
-only while those are unchanged.
+The test's hash covers each standard library function, type and effect the test uses, so a change
+to one of them reruns the test. A test that reads the text of a standard library module, for example
+by running `ply`, records that module, and its pass stays valid only while the module's text is
+unchanged.
 
 | flag | meaning |
 | --- | --- |
@@ -2593,15 +2595,16 @@ moves. `ply rename` never changes any other text in a string. It reports a warni
 string unchanged, for a string whose whole text is a renamed name but not a full dotted name, and
 for a string that contains a word `--words` renames.
 
-`ply rename` changes nothing and exits with code 2 in either of two cases. In the first case, the
-program does not check before the rename. In the second case, the rename would change what a name
-refers to. Examples are two definitions that would get the same name, a local variable that would be
-hidden by another local variable, a call on a value that could then call a different function, and
-code that a `derive` line generates for a type that uses a name the rename removes. These checks
-ensure that the renamed program has the same types, so `ply rename` does not check the program again
-afterwards. `ply rename` changes only the files under the paths you give it. It stops if another
-file of the package uses a renamed name. `--check` reports what would change without writing any
-file.
+`ply rename` changes nothing and exits with code 2 in any of three cases. In the first case, the
+program does not check before the rename. In the second case, the renamed program does not check:
+`ply rename` checks the files it would change, and the files that use their names, against the
+package's stored results. In the third case, the rename would change what a name refers to.
+Examples are two definitions that would get the same name, a local variable that would be hidden by
+another local variable, a call on a value that could then call a different function, and code that
+a `derive` line generates for a type that uses a name the rename removes. A map of only parameter
+and local lines skips both checks and compares only what each name refers to. `ply rename` changes
+only the files under the paths you give it. It stops if another file of the package uses a renamed
+name. `--check` reports what would change without writing any file.
 
 ### 17.7 Editing one definition
 

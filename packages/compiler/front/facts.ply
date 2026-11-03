@@ -28,7 +28,7 @@ import compiler.check.resolve.scopes (post_order)
 import compiler.store.hash.graph (Index, Node, TestNode, LawNode, HeldValue, tagged_target,
                                   denotation, DenotesFunction, DenotesConstructor, DenotesNothing,
                                   qualified_effect_name, qualified_type_name)
-import compiler.store.hash.forms (HashOutput, OwnHashes, by_name, reachable_functions, Subject,
+import compiler.store.hash.forms (HashOutput, OwnHashes, reachable_functions, Subject,
                                   FunctionNamed, DeclarationNamed, ItemKeyed, hash_output,
                                   ModuleHashes, joined_module_hashes, Identities, Identified,
                                   TestRun, TestListing, LawRun, LawProof, DefinitionRun,
@@ -53,7 +53,6 @@ import compiler.front.pkg (PackageSources, Closure, Package, LockedPackage, clos
 import compiler.checkout (PartRole, StandardLibraryPart, CompilerPart)
 import compiler.check.resolve.scopes (PackageDependencies)
 import std.bin
-import std.hash (blake3)
 import std.pkg (Manifest)
 import std.list
 import compiler.expand.rewrite.shared (tagged_in, expressions_matching)
@@ -791,59 +790,6 @@ fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} 
   }
 }
 
-fn views_read(
-  shapes: List<ModuleShape>,
-  hashes: HashOutput,
-  read: Set<Bytes>,
-  texts: Map<Bytes, Bytes>,
-) -> List<ShippedModuleSummary> / {abort.raise} = {
-  let definitions = by_name(hashes.definitions);
-  let declarations = by_name(hashes.declarations);
-  let hash_of = |table: Map<Bytes, Bytes>, name: Bytes|
-    match table.get(name) { Some(hash) -> hash, None -> b"" };
-  shapes.fold([], |accumulator: List<ShippedModuleSummary>, s: ModuleShape| {
-    let o = s.outline;
-    match texts.get(o.name) {
-      None -> accumulator,
-      Some(text) -> {
-        let declared = o.items.fold([], |a: List<Bytes>, item: OutlineItem| {
-          let line = |name: Bytes|
-            a.push(
-              Bytes::concat_all([
-                b"declared ",
-                qualify(o.name, name),
-                b" ",
-                hash_of(declarations, qualify(o.name, name)),
-              ]),
-            );
-          match item { OutlinedType(x) -> line(x.name), OutlinedEffect(x) -> line(x.name), _ -> a }
-        });
-        let shape = declared.concat(s.imports.map(|m: Bytes| b"imports ".concat(m))).concat(
-          o.set_texts.map(|t: Bytes| b"set ".concat(t)),
-        );
-        accumulator.push({
-          module: o.name,
-          text: hex(blake3(text)),
-          form: hex(blake3(Bytes::join(shape, b"\n"))),
-          definitions: o.items.fold(
-            [],
-            |a: List<{ name: Bytes, hash: Bytes }>, item: OutlineItem|
-              match item {
-                OutlinedFunction(x) -> {
-                  let name = qualify(o.name, x.name);
-                  if read.contains(name) {
-                    a.push({ name: name, hash: hex(hash_of(definitions, name)) })
-                  } else { a }
-                },
-                _ -> a,
-              },
-          ),
-        })
-      },
-    }
-  })
-}
-
 pub type Frame = {
   outlines: List<Outline>,
   order: List<Bytes>,
@@ -891,7 +837,7 @@ pub fn framed_program(
   pins: List<LockedPackage>,
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
-) -> { frame: Frame, reads: TableReads, views: List<ShippedModuleSummary> } / {abort.raise} = {
+) -> { frame: Frame, reads: TableReads } / {abort.raise} = {
   let untested = |s: ModuleShape| !tested && !shipped.contains(s.outline.name);
   let read = shapes.map(|s: ModuleShape| if untested(s) { untested_shape(s) } else { s });
   let cut = shapes_cut(read, hashed, shipped_names(shipped), prune_unreachable);
@@ -922,7 +868,6 @@ pub fn framed_program(
         { outline: s.outline, untested: untested(s), trimmed: (cut.is_cut)(s) }),
       reachable: cut.reachable,
     },
-    views: if cut.cutting { views_read(read, cut.whole, cut.reachable, shipped) } else { [] },
   }
 }
 
@@ -930,8 +875,6 @@ fn shipped_names(shipped: Map<Bytes, Bytes>) -> Set<Bytes> =
   shipped.fold(Set::empty(), |m: Set<Bytes>, n: Bytes, _: Bytes| m.insert(n))
 
 type CutShapes = {
-  cutting: Bool,
-  whole: HashOutput,
   reachable: Set<Bytes>,
   is_cut: (ModuleShape) -> Bool,
   merged: MergedShapes,
@@ -946,16 +889,18 @@ fn shapes_cut(
 ) -> CutShapes / {abort.raise} = {
   let cutting = prune_unreachable
     && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
-  let whole = hash_output(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), hashed);
-  let reach = if cutting { reachable_shipped_functions(read, whole, shipped) }
-  else { Set::empty() };
+  let reach = if cutting {
+    reachable_shipped_functions(
+      read,
+      hash_output(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), hashed),
+      shipped,
+    )
+  } else { Set::empty() };
   let is_cut = |s: ModuleShape| cutting && shipped.contains(s.outline.name);
   let merged = merged_shapes(
     read.map(|s: ModuleShape| if is_cut(s) { cut_shape(s, reach) } else { s }),
   );
   {
-    cutting: cutting,
-    whole: whole,
     reachable: reach,
     is_cut: is_cut,
     merged: merged,
@@ -1120,7 +1065,7 @@ pub fn assembled_program(
   pins: List<LockedPackage>,
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
-) -> { view: CheckedProgram, views: List<ShippedModuleSummary> } / {abort.raise} = {
+) -> CheckedProgram / {abort.raise} = {
   let f = framed_program(
     facts.map(|x: ModuleFacts| x.shape),
     hashed,
@@ -1134,10 +1079,7 @@ pub fn assembled_program(
     module_packages,
     embeds,
   );
-  {
-    view: checked_program_over(f.frame, f.reads, facts.map(|x: ModuleFacts| x.tables)),
-    views: f.views,
-  }
+  checked_program_over(f.frame, f.reads, facts.map(|x: ModuleFacts| x.tables))
 }
 
 pub fn pulled_next(
@@ -1158,12 +1100,7 @@ pub fn pulled_next(
   )
 }
 
-pub type AssembledLoad = {
-  frame: Frame,
-  reads: TableReads,
-  views: List<ShippedModuleSummary>,
-  pulled: List<Bytes>,
-}
+pub type AssembledLoad = { frame: Frame, reads: TableReads, pulled: List<Bytes> }
 
 pub fn assembled_load(
   own: List<Bytes>,
@@ -1198,7 +1135,7 @@ pub fn assembled_load(
     tables.module_packages,
     embeds,
   );
-  { frame: program.frame, reads: program.reads, views: program.views, pulled: pulled }
+  { frame: program.frame, reads: program.reads, pulled: pulled }
 }
 
 fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {abort.raise} = {
@@ -1768,9 +1705,3 @@ pub fn home_of(modules: List<ParsedModule>, of: SchemaInstance) -> Option<Int> =
         }),
   }
 
-pub type ShippedModuleSummary = {
-  module: Bytes,
-  text: Bytes,
-  form: Bytes,
-  definitions: List<{ name: Bytes, hash: Bytes }>,
-}

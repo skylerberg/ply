@@ -42,17 +42,10 @@ impl Read {
 }
 
 #[derive(Default)]
-struct Reads {
-    read: usize,
-    viewed: usize,
-}
-
-#[derive(Default)]
 struct Observations {
     reads: BTreeSet<(Read, PathBuf)>,
     writes: BTreeSet<PathBuf>,
-    shipped: BTreeMap<String, Reads>,
-    viewed: BTreeMap<String, String>,
+    shipped: BTreeSet<String>,
     program: bool,
     digested: BTreeMap<String, String>,
     children: Vec<PathBuf>,
@@ -193,44 +186,7 @@ impl Recorder {
     }
 
     pub fn shipped(&self, name: &str) {
-        self.observed()
-            .shipped
-            .entry(name.to_string())
-            .or_default()
-            .read += 1;
-    }
-
-    pub fn reached(&self, view: &str, pulled: bool) {
-        let mut modules: BTreeMap<&str, Vec<(String, String)>> = BTreeMap::new();
-        for line in view.lines() {
-            let fields: Vec<&str> = line.split('\t').collect();
-            if let [kind @ ("shipform" | "shipdef"), module, at, digest] = fields.as_slice() {
-                modules
-                    .entry(module)
-                    .or_default()
-                    .push((format!("{kind}\t{module}\t{at}"), digest.to_string()));
-            }
-        }
-        let mut o = self.observed();
-        for (module, lines) in modules {
-            let Some(reads) = o.shipped.get_mut(module) else {
-                continue;
-            };
-            let stands_for = if pulled {
-                reads.read > reads.viewed
-            } else {
-                reads.read > 0
-            };
-            if !stands_for {
-                continue;
-            }
-            if pulled {
-                reads.viewed += 1;
-            }
-            for (line, digest) in lines {
-                settle(&mut o.viewed, line, digest);
-            }
-        }
+        self.observed().shipped.insert(name.to_string());
     }
 
     pub fn ran_program(&self) {
@@ -261,14 +217,7 @@ impl Recorder {
 fn merge(into: &mut Observations, from: &Observations) {
     into.reads.extend(from.reads.iter().cloned());
     into.writes.extend(from.writes.iter().cloned());
-    for (name, reads) in &from.shipped {
-        let into = into.shipped.entry(name.clone()).or_default();
-        into.read += reads.read;
-        into.viewed += reads.viewed;
-    }
-    for (line, digest) in &from.viewed {
-        settle(&mut into.viewed, line.clone(), digest.clone());
-    }
+    into.shipped.extend(from.shipped.iter().cloned());
     into.program |= from.program;
     for (line, digest) in &from.digested {
         settle(&mut into.digested, line.clone(), digest.clone());
@@ -295,14 +244,9 @@ pub struct Binary<'a> {
 
 fn digested(o: &Observations, binary: &Binary<'_>) -> BTreeMap<String, String> {
     let mut lines = o.digested.clone();
-    for (name, reads) in &o.shipped {
-        if reads.read > reads.viewed {
-            let digest = (binary.shipped)(name).unwrap_or_else(|| "none".to_string());
-            settle(&mut lines, format!("shipped\t{name}"), digest);
-        }
-    }
-    for (line, digest) in &o.viewed {
-        settle(&mut lines, line.clone(), digest.clone());
+    for name in &o.shipped {
+        let digest = (binary.shipped)(name).unwrap_or_else(|| "none".to_string());
+        settle(&mut lines, format!("shipped\t{name}"), digest);
     }
     if o.program {
         settle(&mut lines, "program".to_string(), binary.program.clone());
@@ -361,11 +305,6 @@ fn merge_child_observations(o: &mut Observations) {
                 ["program", digest] => {
                     settle(&mut o.digested, "program".to_string(), digest.to_string())
                 }
-                [kind @ ("shipform" | "shipdef"), module, at, digest] => settle(
-                    &mut o.viewed,
-                    format!("{kind}\t{module}\t{at}"),
-                    digest.to_string(),
-                ),
                 ["opaque", reason] => o.opaque.push(reason.to_string()),
                 _ => {}
             }
@@ -571,11 +510,6 @@ pub fn moved(trace: &str, world: &World<'_>, into: Option<&Recorder>) -> Option<
                 noted(&|r| r.shipped(name));
                 (world.binary.shipped)(name).unwrap_or_else(|| "none".to_string()) == *digest
             }
-            ["shipform", name, text, _] => {
-                noted(&|r| r.shipped(name));
-                (world.binary.shipped)(name).as_deref() == Some(*text)
-            }
-            ["shipdef", ..] => true,
             ["program", digest] => {
                 noted(&|r| r.ran_program());
                 world.binary.program == *digest
@@ -610,8 +544,7 @@ pub fn moved(trace: &str, world: &World<'_>, into: Option<&Recorder>) -> Option<
 fn said(fields: &[&str]) -> String {
     match fields {
         ["shipped", "", _] => "the list of shipped modules".to_string(),
-        ["shipped", name, _] | ["shipform", name, ..] => format!("the shipped module `{name}`"),
-        ["shipdef", _, name, _] => format!("the shipped definition `{name}`"),
+        ["shipped", name, _] => format!("the shipped module `{name}`"),
         ["program", _] => "the `ply` program".to_string(),
         ["binding", _] => "the binding".to_string(),
         ["config", key, _] => format!("the configuration key `{key}`"),

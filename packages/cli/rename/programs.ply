@@ -10,8 +10,10 @@ import compiler.checkout (module_files, prefix_of)
 import std.path (normalize)
 import walk (Failure)
 import sources
-import program (ParsedSources, modules_within, narrowed_project, read_paths, renamed_resolution,
-                session_over)
+import program (session_over, in_program_store, packages_of)
+import compiler.front.pkg (Package, closure)
+import compiler.front.checking (LoadInputs)
+import rename.lines (ProgramNeeds, NeedsTypes, NeedsNames)
 import diagnostic (errors_text)
 import builder (builder)
 import std.random (entropy)
@@ -23,11 +25,11 @@ import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
 import compiler.front.checking.view (CheckedOwner)
 import compiler.front.checking.world (Modules)
-import compiler.front.checking.program_facts (names_of, names_reached)
-import compiler.store.memo (memo)
-import compiler.front (ShippedInputs)
-import compiler.check.resolve.defaults (ResolvedProgram)
-import compiler.check.resolve.tables (ParsedModule, Diagnostic, Declarations, Resolution, Scope,
+import compiler.front.checking.program_facts (own_key)
+import compiler.front.checking.references (ResolvedModule, resolved_module, modules_reading,
+                                           modules_importing)
+import compiler.store.memo (memo, fact_inspection)
+import compiler.check.resolve.tables (Source, Diagnostic, Declarations, Resolution, Scope,
                                       module_of_name)
 import compiler.check.resolve.bindings (written, Written, Reference, ModuleQualifier, Unbound)
 import compiler.check.infer (item_owner)
@@ -47,7 +49,6 @@ import compiler.syntax.parsing (Identifier)
 import compiler.check.resolve.tables (qualify)
 import compiler.syntax.node_ids (numbered_module)
 import compiler.emit.keys (name_in_module)
-import std.list (positions)
 import project_store
 
 pub type Library = { root: RootedPath, name: String }
@@ -96,11 +97,12 @@ pub type DeclaredRecord = { name: Bytes, record: Record, fields: List<Bytes> }
 
 pub type Read = {
   file: sources::File,
-  index: Int,
   name: Bytes,
   entries: List<Entry>,
   calls: Map<Bytes, Map<Int, MemberTarget>>,
-  imports: List<{ declaration: ImportDeclaration, target: Int }>,
+  imports: List<{ declaration: ImportDeclaration, target: Bytes }>,
+  declarations: Declarations,
+  scope: Scope,
   externs: Set<Bytes>,
   effects: List<{ name: Bytes, operations: List<Bytes> }>,
   sums: List<{ name: Bytes, variants: List<Bytes> }>,
@@ -133,29 +135,29 @@ pub type Loaded = {
   path: ResolvedPath,
   root: String,
   files: List<RootedPath>,
-  names: List<Bytes>,
-  indices: Map<Bytes, Int>,
-  module_files: List<Option<String>>,
-  declarations: List<Declarations>,
-  scopes: List<Scope>,
-  visible_modules: List<List<Int>>,
-  shipping: ShippedInputs,
+  module_files: Map<Bytes, String>,
+  library_files: Map<String, String>,
   reads: List<Read>,
   unrenamed: List<Read>,
 }
 
+pub type ChangedNames = { names: List<Bytes>, module: Bool }
+
 pub type DefinitionKey = { file: String, name: Bytes }
+
+pub fn file_of_module(l: Loaded, module: Bytes) -> Option<String> =
+  match l.module_files.get(module) {
+    Some(file) -> Some(file),
+    None -> l.library_files.get(String::of_bytes_lossy(module) ++ ".ply"),
+  }
 
 pub fn key_of(l: Loaded, qualified: Bytes) -> Option<DefinitionKey> / {abort.raise} = {
   let module = module_of_name(qualified);
-  match l.indices.get(module).and_then(|i: Int| l.module_files.at(i)) {
-    Some(Some(file)) -> Some({ file: file, name: name_in_module(module, qualified) }),
-    _ -> None,
+  match file_of_module(l, module) {
+    Some(file) -> Some({ file: file, name: name_in_module(module, qualified) }),
+    None -> None,
   }
 }
-
-fn file_of(pwd: String, files: Map<String, String>, at: RootedPath) -> Option<String> =
-  if at.label == "shipped" { files.get(at.path) } else { Some(absolute(pwd, at)) }
 
 fn shipped_files(
   path: ResolvedPath,
@@ -165,7 +167,7 @@ fn shipped_files(
     None -> Map::new(),
   }
 
-fn calls_of(owners: List<CheckedOwner>) -> Map<Bytes, Map<Int, MemberTarget>> =
+pub fn calls_of(owners: List<CheckedOwner>) -> Map<Bytes, Map<Int, MemberTarget>> =
   owners.fold(Map::new(), |found: Map<Bytes, Map<Int, MemberTarget>>, o: CheckedOwner|
     o.facts.members.fold(found, |into: Map<Bytes, Map<Int, MemberTarget>>, s: MemberSite|
       into.insert(s.owner, into.get(s.owner).unwrap_or(Map::new()).insert(s.site, s.callee))))
@@ -290,91 +292,77 @@ fn declared_records(module: Bytes, tree: Module) -> List<DeclaredRecord> =
       _ -> accumulator,
     })
 
-pub fn entries_of(
-  r: Resolution,
-  index: Int,
-  name: Bytes,
-  tree: Module,
-) -> List<Entry> / {abort.raise} = {
-  let names = with_no_other_modules(|| written(r, index, tree));
-  range(0, names.len()).map(|k: Int|
+pub fn entries_of(name: Bytes, resolved: ResolvedModule) -> List<Entry> / {abort.raise} =
+  range(0, resolved.written.len()).map(|k: Int|
     {
-      owner: if k == 0 { b"" } else { item_owner(name, tree.items.get(k - 1)) },
-      names: names.get(k),
+      owner: if k == 0 { b"" } else { item_owner(name, resolved.tree.items.get(k - 1)) },
+      names: resolved.written.get(k),
     })
-}
 
 fn read_of(
-  resolved: ResolvedProgram,
-  calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
-  owner_records: Map<Bytes, Map<Int, Record>>,
   file: sources::File,
-) -> Option<Read> / {abort.raise} = {
+  resolved: ResolvedModule,
+  owners: List<CheckedOwner>,
+) -> Read / {abort.raise} = {
   let name = Bytes::of_string(file.module);
-  match range(0, resolved.modules.len()).find(|i: Int| resolved.modules.get(i).name == name) {
-    None -> None,
-    Some(index) -> {
-      let parsed = resolved.modules.get(index);
-      let tree = numbered_module(parse(file.text).node);
-      let targets = resolved.resolution.imports.get(index);
-      let entries = entries_of(resolved.resolution, index, name, tree);
-      Some({
-        file: file,
-        index: index,
-        name: name,
-        entries: entries,
-        calls: calls.get(name).unwrap_or(Map::new()),
-        imports: range(0, tree.imports.len()).fold(
-          [],
-          |accumulator: List<{ declaration: ImportDeclaration, target: Int }>, k: Int|
-            match targets.at(k) {
-              Some(t) -> accumulator.push({ declaration: tree.imports.get(k), target: t }),
-              None -> accumulator,
-            },
-        ),
-        externs: tree.items.fold(Set::empty(), |accumulator: Set<Bytes>, item: Item|
-          match item { ExternItem(x) -> accumulator.insert(x.name.name), _ -> accumulator }),
-        effects: tree.items.fold(
-          [],
-          |accumulator: List<{ name: Bytes, operations: List<Bytes> }>, item: Item|
-            match item {
-              EffectItem(e) ->
-                accumulator.push({
-                  name: e.name.name,
-                  operations: e.operations.map(|operation: OperationDefinition|
-                    operation.name.name),
-                }),
-              _ -> accumulator,
-            },
-        ),
-        sums: tree.items.fold(
-          [],
-          |accumulator: List<{ name: Bytes, variants: List<Bytes> }>, item: Item|
-            match item {
-              TypeItem(t) -> match t.body {
-                SumBody(variants) ->
-                  accumulator.push({
-                    name: t.name.name,
-                    variants: variants.map(|v: VariantDefinition| v.name.name),
-                  }),
-                _ -> accumulator,
-              },
-              _ -> accumulator,
-            },
-        ),
-        records: declared_records(name, tree),
-        derived: parsed.derived,
-        derived_unbound: derived_unbound(resolved.resolution, index, parsed.derived),
-        typed_records: entries.fold(
-          Map::new(),
-          |accumulator: Map<Bytes, Map<Int, Record>>, e: Entry|
-            match owner_records.get(e.owner) {
-              Some(sites) -> accumulator.insert(e.owner, sites),
-              None -> accumulator,
-            },
-        ),
-      })
-    },
+  let tree = resolved.tree;
+  let entries = entries_of(name, resolved);
+  let owner_records = records_of(owners);
+  {
+    file: file,
+    name: name,
+    entries: entries,
+    calls: calls_of(owners),
+    imports: range(0, tree.imports.len()).fold(
+      [],
+      |accumulator: List<{ declaration: ImportDeclaration, target: Bytes }>, k: Int|
+        match resolved.import_targets.at(k) {
+          Some(t) -> accumulator.push({ declaration: tree.imports.get(k), target: t }),
+          None -> accumulator,
+        },
+    ),
+    declarations: resolved.resolution.declarations.get(0),
+    scope: resolved.resolution.scopes.get(0),
+    externs: tree.items.fold(Set::empty(), |accumulator: Set<Bytes>, item: Item|
+      match item { ExternItem(x) -> accumulator.insert(x.name.name), _ -> accumulator }),
+    effects: tree.items.fold(
+      [],
+      |accumulator: List<{ name: Bytes, operations: List<Bytes> }>, item: Item|
+        match item {
+          EffectItem(e) ->
+            accumulator.push({
+              name: e.name.name,
+              operations: e.operations.map(|operation: OperationDefinition| operation.name.name),
+            }),
+          _ -> accumulator,
+        },
+    ),
+    sums: tree.items.fold(
+      [],
+      |accumulator: List<{ name: Bytes, variants: List<Bytes> }>, item: Item|
+        match item {
+          TypeItem(t) -> match t.body {
+            SumBody(variants) ->
+              accumulator.push({
+                name: t.name.name,
+                variants: variants.map(|v: VariantDefinition| v.name.name),
+              }),
+            _ -> accumulator,
+          },
+          _ -> accumulator,
+        },
+    ),
+    records: declared_records(name, tree),
+    derived: resolved.parsed.derived,
+    derived_unbound: derived_unbound(resolved.resolution, 0, resolved.parsed.derived),
+    typed_records: entries.fold(
+      Map::new(),
+      |accumulator: Map<Bytes, Map<Int, Record>>, e: Entry|
+        match owner_records.get(e.owner) {
+          Some(sites) -> accumulator.insert(e.owner, sites),
+          None -> accumulator,
+        },
+    ),
   }
 }
 
@@ -383,137 +371,132 @@ fn under(at: RootedPath, root: RootedPath) -> Bool =
     && (root.path == "" || root.path == "." || at.path == root.path
     || at.path.starts_with(root.path ++ "/"))
 
-type ProgramLoad = {
-  files: List<sources::File>,
-  read_at: List<RootedPath>,
-  shipping: ShippedInputs,
-  resolved: Result<ResolvedProgram, List<Diagnostic>>,
-  parses: ParsedSources,
-  calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
-  owner_records: Map<Bytes, Map<Int, Record>>,
+type FileRead = | FileResolved(Read) | FileRejected(Failure)
+
+fn file_read(file: sources::File) -> FileRead / {memo.read, abort.raise} = {
+  let key = own_key(Bytes::of_string(file.module));
+  match resolved_module(key, file.text) {
+    Err(diagnostics) ->
+      FileRejected({ path: displayed(file.at), reason: "does not check: " ++ errors_text(diagnostics) }),
+    Ok(resolved) -> FileResolved(read_of(file, resolved, view::checked_owners(key))),
+  }
 }
 
-type RenameReading = {
-  included: Set<Bytes>,
-  calls: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>,
-  owner_records: Map<Bytes, Map<Int, Record>>,
-}
+type RenameReading = { reads: List<Read>, unrenamed: List<Read>, failures: List<Failure> }
+
+type FilePlace = | Renamed | ReadBefore | Outside
+
+fn with_read(reading: RenameReading, read: FileRead, kept: (Read) -> RenameReading) -> RenameReading =
+  match read {
+    FileRejected(f) -> { ..reading, failures: reading.failures.push(f) },
+    FileResolved(r) -> kept(r),
+  }
+
+fn with_file(
+  reading: RenameReading,
+  file: sources::File,
+  place: FilePlace,
+) -> RenameReading / {memo.read, abort.raise} =
+  match place {
+    Renamed ->
+      with_read(reading, file_read(file), |r: Read| { ..reading, reads: reading.reads.push(r) }),
+    ReadBefore -> reading,
+    Outside ->
+      with_read(reading, file_read(file), |r: Read|
+        { ..reading, unrenamed: reading.unrenamed.push(r) }),
+  }
 
 fn rename_reading(
   project: sources::Project,
-  modules: Modules,
+  place: (sources::File) -> FilePlace / {abort.raise},
   mentions: (sources::File) -> Bool / {abort.raise},
-) -> RenameReading / {memo.read, abort.raise} = {
-  let start = project.files.filter(mentions).map(|f: sources::File| Bytes::of_string(f.module));
-  let included = names_reached(
-    names_of(modules),
-    view::program_imports(modules),
-    if start.len() > 0 { start } else { modules.own.take(1) },
+  changed: (Read) -> ChangedNames / {abort.raise},
+) -> RenameReading / {memo.read, fact_inspection.read, abort.raise} = {
+  let mentioning = project.files.filter(|f: sources::File| place(f) == Renamed && mentions(f));
+  let first = mentioning.fold(
+    { reads: [], unrenamed: [], failures: [] },
+    |reading: RenameReading, f: sources::File| with_file(reading, f, Renamed),
   );
-  let checked = modules_within(modules, included).fold(
-    Map::new(),
-    |found: Map<Bytes, List<CheckedOwner>>, m: Bytes|
-      found.insert(m, view::checked_owners({ module: m, shipped: false, tested: false })),
-  );
-  {
-    included: included,
-    calls: checked.fold(
-      Map::new(),
-      |found: Map<Bytes, Map<Bytes, Map<Int, MemberTarget>>>, m: Bytes, owners: List<CheckedOwner>|
-        found.insert(m, calls_of(owners)),
-    ),
-    owner_records: checked.fold(
-      Map::new(),
-      |found: Map<Bytes, Map<Int, Record>>, _: Bytes, owners: List<CheckedOwner>|
-        records_of(owners).fold(
-          found,
-          |all: Map<Bytes, Map<Int, Record>>, owner: Bytes, sites: Map<Int, Record>|
-            all.insert(owner, sites),
-        ),
-    ),
-  }
+  let read_modules = mentioning.map(|f: sources::File| Bytes::of_string(f.module));
+  let readers = first.reads.fold([], |found: List<Bytes>, r: Read| {
+    let c = changed(r);
+    modules_reading(r.name, c.names).concat(if c.module { modules_importing(r.name) } else { [] }).fold(
+      found,
+      |all: List<Bytes>, m: Bytes| if read_modules.contains(m) { all } else { all.push_unique(m) },
+    )
+  });
+  project.files.filter(|f: sources::File| readers.contains(Bytes::of_string(f.module))).fold(
+    first,
+    |reading: RenameReading, f: sources::File| with_file(reading, f, place(f)),
+  )
 }
 
-fn resolved_load(
-  project: sources::Project,
-  pulled: List<Bytes>,
-  shipping: ShippedInputs,
-  parses: ParsedSources,
-  included: Option<Set<Bytes>>,
-) -> ProgramLoad / {ProjectFiles, Derives, abort.raise} = {
-  let narrowed = match included {
-    Some(names) -> narrowed_project(project, names),
-    None -> project,
-  };
-  let resolution = renamed_resolution(narrowed, shipping, parses);
-  {
-    files: narrowed.files,
-    read_at: read_paths(narrowed).concat(pulled.map(sources::shipped_path)),
-    shipping: shipping,
-    resolved: match resolution.resolved {
-      Ok(resolved) -> Ok(resolved),
-      Err(u) -> Err(u.diagnostics),
-    },
-    parses: resolution.parses,
-    calls: Map::new(),
-    owner_records: Map::new(),
-  }
-}
+type ProjectRead = { project: sources::Project, reading: RenameReading }
 
-fn checked_load(
+fn project_read(
   path: ResolvedPath,
-  parses: ParsedSources,
+  needs: ProgramNeeds,
+  place: (sources::File) -> FilePlace / {abort.raise},
   mentions: (sources::File) -> Bool / {abort.raise},
-) -> ProgramLoad / {project_store::databases.open, time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, abort.raise, diverges} = {
+  changed: (Read) -> ChangedNames / {abort.raise},
+) -> Result<ProjectRead, List<Diagnostic>> / {project_store::databases.open, time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, abort.raise, diverges} = {
   let project = sources::load_resolved([path]);
-  match progress::silently(||
-      session_over(
-        [path],
-        project,
-        time.elapsed_ms(),
-        false,
-        |modules: Modules, _: ProgramSummary| rename_reading(project, modules, mentions),
-      )) {
-    Err(r) ->
-      {
-        ..resolved_load(project, [], sources::shipping_of([]), parses, None),
-        resolved: Err(r.diagnostics),
-      },
-    Ok(s) ->
-      {
-        ..resolved_load(project, s.modules.pulled, sources::shipping_of(s.modules.pulled), parses, Some(s.value.included)),
-        calls: s.value.calls,
-        owner_records: s.value.owner_records,
-      },
+  let read = || rename_reading(project, place, mentions, changed);
+  match needs {
+    NeedsTypes -> match progress::silently(||
+        session_over([path], project, time.elapsed_ms(), false, |_: Modules, _: ProgramSummary|
+          read())) {
+      Err(r) -> Err(r.diagnostics),
+      Ok(s) -> Ok({ project: project, reading: s.value }),
+    },
+    NeedsNames -> if project.diagnostics.len() > 0 { Err(project.diagnostics) } else {
+      Ok({
+        project: project,
+        reading: progress::silently(||
+          in_program_store({ project: project, store: Some(path) }, |_: LoadInputs| read())).value,
+      })
+    },
   }
 }
 
-fn unchecked_load(
-  path: ResolvedPath,
-  shipping: ShippedInputs,
-  parses: ParsedSources,
-) -> ProgramLoad / {builder.git[vcs], ProjectFiles, Derives, abort.raise, diverges} =
-  resolved_load(sources::load_resolved([path]), [], shipping, parses, None)
+fn module_files_of(
+  pwd: String,
+  project: sources::Project,
+) -> Map<Bytes, String> / {abort.raise} = {
+  let own = project.files.fold(Map::new(), |m: Map<Bytes, String>, f: sources::File|
+    m.insert(Bytes::of_string(f.module), absolute(pwd, f.at)));
+  let packages = closure(packages_of(project), project.sources.map(|s: Source| s.name)).packages;
+  project.packages.fold(own, |found: Map<Bytes, String>, package: sources::DependencyPackage|
+    match packages.find(|p: Package| p.root == Bytes::of_string(package.root)) {
+      None -> found,
+      Some(p) ->
+        package.files.fold(found, |m: Map<Bytes, String>, f: sources::File|
+          m.insert(qualify(p.prefix, Bytes::of_string(f.module)), absolute(pwd, f.at))),
+    })
+}
 
 pub fn loads_of(
   given: List<ResolvedPath>,
   pwd: String,
-  checked: Bool,
+  needs: ProgramNeeds,
   mentions: (sources::File) -> Bool / {abort.raise},
+  changed: (Read) -> ChangedNames / {abort.raise},
 ) -> { loads: List<Loaded>, failures: List<Failure> } / {project_store::databases.open, time.elapsed_ms, fs.resolved_kind[abs], shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, abort.raise, diverges} = {
   let roots = given.map(rooted);
-  let shipping = sources::shipping_of(if checked { [] } else { sources::shipped_names() });
-  let done = given.fold(
-    { loads: [], failures: [], parses: Map::new() },
-    |accumulator: { loads: List<Loaded>, failures: List<Failure>, parses: ParsedSources }, path: ResolvedPath| {
+  given.fold(
+    { loads: [], failures: [] },
+    |accumulator: { loads: List<Loaded>, failures: List<Failure> }, path: ResolvedPath| {
       let root = rooted(path);
       if accumulator.loads.any(|l: Loaded| l.files.any(|f: RootedPath| under(f, root))) {
         accumulator
       } else {
-        let load = if checked { checked_load(path, accumulator.parses, mentions) }
-        else { unchecked_load(path, shipping, accumulator.parses) };
-        let library_files = shipped_files(path);
-        match load.resolved {
+        let read_before = accumulator.loads.fold(Set::empty(), |m: Set<String>, l: Loaded|
+          l.reads.fold(m, |into: Set<String>, r: Read| into.insert(absolute(pwd, r.file.at))));
+        let place = |f: sources::File|
+          if !roots.any(|r: RootedPath| under(f.at, r)) { Outside }
+          else if read_before.contains(absolute(pwd, f.at)) { ReadBefore }
+          else { Renamed };
+        match project_read(path, needs, place, mentions, changed) {
           Err(ds) ->
             {
               ..accumulator,
@@ -522,48 +505,21 @@ pub fn loads_of(
                 reason: "does not check: " ++ errors_text(ds),
               }),
             },
-          Ok(resolved) -> {
-            let read_before = accumulator.loads.fold(Set::empty(), |m: Set<String>, l: Loaded|
-              l.reads.fold(m, |into: Set<String>, r: Read| into.insert(absolute(pwd, r.file.at))));
+          Ok(read) ->
             {
               loads: accumulator.loads.push({
                 path: path,
                 root: displayed(root),
-                files: load.files.map(|f: sources::File| f.at),
-                names: resolved.modules.map(|m: ParsedModule| m.name),
-                indices: positions(resolved.modules.map(|m: ParsedModule| m.name)),
-                module_files: load.read_at.map(|at: RootedPath| file_of(pwd, library_files, at)),
-                declarations: resolved.resolution.declarations,
-                scopes: resolved.resolution.scopes,
-                visible_modules: resolved.resolution.visible_modules,
-                shipping: load.shipping,
-                reads: load.files.filter(|f: sources::File|
-                  roots.any(|r: RootedPath| under(f.at, r))
-                    && !read_before.contains(absolute(pwd, f.at))).fold(
-                  [],
-                  |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, load.calls, load.owner_records, f) {
-                      Some(r) -> reads.push(r),
-                      None -> reads,
-                    },
-                ),
-                unrenamed: load.files.filter(|f: sources::File|
-                  !roots.any(|r: RootedPath| under(f.at, r))).fold(
-                  [],
-                  |reads: List<Read>, f: sources::File|
-                    match read_of(resolved, load.calls, load.owner_records, f) {
-                      Some(r) -> reads.push(r),
-                      None -> reads,
-                    },
-                ),
+                files: read.project.files.map(|f: sources::File| f.at),
+                module_files: module_files_of(pwd, read.project),
+                library_files: shipped_files(path),
+                reads: read.reading.reads,
+                unrenamed: read.reading.unrenamed,
               }),
-              failures: accumulator.failures,
-              parses: load.parses,
-            }
-          },
+              failures: accumulator.failures.concat(read.reading.failures),
+            },
         }
       }
     },
-  );
-  { loads: done.loads, failures: done.failures }
+  )
 }
