@@ -36,10 +36,16 @@ pub type Callee =
   | DefinedCallee(Bytes)
   | OtherCallee
 
-pub type Termination =
-  | Terminates
-  | TerminatesByDecreases
-  | Diverges({ at: Site, through: Option<Bytes>, loop: List<Site> })
+pub type Termination = | Terminates | TerminatesByDecreases | Diverges(Divergence)
+
+pub type Divergence = { at: Site, reason: DivergenceReason }
+
+pub type DivergenceReason =
+  | NoDescent(List<Site>)
+  | CallsDiverging(Bytes)
+  | CheckStopped(StoppedBy)
+
+pub type StoppedBy = | TooManyCallPatterns(Int) | LambdasNestedTooDeep(Int)
 
 pub type Site = { caller: Bytes, span: Span }
 
@@ -89,6 +95,9 @@ pub effect termination_facts {
 
 derive bin for Callee
 derive bin for Site
+derive bin for StoppedBy
+derive bin for DivergenceReason
+derive bin for Divergence
 derive bin for Termination
 derive bin for Place
 derive bin for Base
@@ -146,13 +155,13 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise, termination_facts.read} = {
       None -> match seen.get(i).too_deep_at { Some(span) -> Some(site(g, i, span)), None -> None },
     });
   let own = match lost {
-    Some(s) -> Diverges({ at: s, through: None, loop: [] }),
+    Some(s) -> Diverges({ at: s, reason: CheckStopped(LambdasNestedTooDeep(max_inline_depth)) }),
     None -> match find_non_decreasing_loop(g, calls, false) {
       None -> Terminates,
-      Some(first) -> if !stating { diverges_from_loop(first) } else {
+      Some(first) -> if !stating { Diverges(first) } else {
         match find_non_decreasing_loop(g, calls, true) {
           None -> TerminatesByDecreases,
-          Some(again) -> diverges_from_loop(again),
+          Some(again) -> Diverges(again),
         }
       },
     },
@@ -160,7 +169,7 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise, termination_facts.read} = {
   let out = |member: Int|
     |e: Termination, o: ExternalCall|
       weaker(e, match (g.ending_of)(o.name) {
-        Diverges(_) -> Diverges({ at: site(g, member, o.span), through: Some(o.name), loop: [] }),
+        Diverges(_) -> Diverges({ at: site(g, member, o.span), reason: CallsDiverging(o.name) }),
         other -> other,
       });
   let resolved = match own { Diverges(_) -> Terminates, other -> other };
@@ -195,11 +204,6 @@ fn stable_results(g: Group) -> List<Option<Term>> / {abort.raise, termination_fa
 
 const max_result_rounds: Int = 6
 
-fn diverges_from_loop(u: NonDecreasingLoop) -> Termination =
-  Diverges({ at: u.at, through: None, loop: u.loop })
-
-type NonDecreasingLoop = { at: Site, loop: List<Site> }
-
 fn site(g: Group, member: Int, span: Span) -> Site / {abort.raise} = {
   let start = g.definitions.get(member).span.start;
   { caller: g.names.get(member), span: span_between(span.start - start, span.end - start) }
@@ -216,7 +220,7 @@ fn find_non_decreasing_loop(
   g: Group,
   calls: List<List<Call>>,
   stated: Bool,
-) -> Option<NonDecreasingLoop> / {abort.raise} = {
+) -> Option<Divergence> / {abort.raise} = {
   let measures = propagate_measures(
     calls,
     range(0, g.definitions.len()).map(|i: Int| measures_of(g, i, calls.get(i), stated)),
@@ -269,20 +273,25 @@ type GraphClosure = {
   buckets: Map<Int, List<Graph>>,
   queue: List<Graph>,
   next: Int,
-  bad: Option<NonDecreasingLoop>,
+  bad: Option<Divergence>,
 }
 
-fn search_loops(n: Int, calls: List<Graph>) -> Option<NonDecreasingLoop> / {abort.raise} = {
+fn search_loops(n: Int, calls: List<Graph>) -> Option<Divergence> / {abort.raise} = {
   let from = range(0, n).map(|i: Int| calls.filter(|x: Graph| x.from == i));
   let start = calls.fold(
     { buckets: Map::new(), queue: [], next: 0, bad: None },
     |c: GraphClosure, x: Graph| enqueue(c, n, x),
   );
-  iterate(start, max_closure_size + 2, |c: GraphClosure|
+  iterate(start, call_pattern_limit + 2, |c: GraphClosure|
     match c.bad {
       Some(_) -> Stop(c.bad),
-      None -> if c.next >= c.queue.len() { Stop(None) } else if c.queue.len() > max_closure_size {
-        Stop(Some({ at: c.queue.get(0).calls.get(0), loop: [] }))
+      None -> if c.next >= c.queue.len() { Stop(None) } else if c.queue.len() > call_pattern_limit {
+        Stop(
+          Some({
+            at: c.queue.get(0).calls.get(0),
+            reason: CheckStopped(TooManyCallPatterns(call_pattern_limit)),
+          }),
+        )
       } else {
         let x = c.queue.get(c.next);
         let grown = from.get(x.to).fold(c, |accumulator: GraphClosure, y: Graph|
@@ -303,14 +312,14 @@ fn enqueue(c: GraphClosure, n: Int, x: Graph) -> GraphClosure / {abort.raise} = 
       bad: match c.bad {
         Some(_) -> c.bad,
         None -> if x.from == x.to && idempotent(x) && !shrinks(x) {
-          Some({ at: x.calls.get(0), loop: x.calls })
+          Some({ at: x.calls.get(0), reason: NoDescent(x.calls) })
         } else { None },
       },
     }
   }
 }
 
-const max_closure_size: Int = 10000
+const call_pattern_limit: Int = 10000
 
 fn add_graph(gs: List<Graph>, x: Graph) -> List<Graph> =
   if gs.fold(false, |found: Bool, y: Graph|
