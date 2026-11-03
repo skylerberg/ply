@@ -34,7 +34,8 @@ import report (CommandOutput, indent, ok_code, count_of, reported, rejected)
 import std.json (Json, Null, Str, Bool, Number, Array, Object, Member, object, int, strings,
                  to_string)
 import std.term (Style, plain, dim, red, green, yellow)
-import proof.obligation (Binding, Builds, frame_bin, kind_bin, CacheRejected, Certificate, Change,
+import proof.obligation (Binding, Builds, frame_bin, kind_bin, CacheLookup, CacheRejected,
+                         Certificate, Change, needs_discharge,
                          Changed, ClaimRow, Cost, Counterexample, Coverage, Definition,
                          InternalError, Ensures, Fault, Frame, Fresh, FromProof, Reason, Judgement,
                          PointFailed, PointFaulted, PointPassed, PointRaised, PointRejected, Kind,
@@ -50,6 +51,7 @@ import std.value
 import std.machine as entering
 import sim.recording (Passed, Failed)
 import std.time (time)
+import std.list
 import std.list (somes)
 import proof.rules (Rule, CaseSplit, Congruence, ExhaustiveEnumeration, LinearArithmetic,
                     Propositional, Unfold, rules_json)
@@ -88,7 +90,8 @@ pub type Claim = {
   kind: Kind,
   guarded: Bool,
   frame: Frame,
-  at: { module: Int, start: Int, end: Int },
+  module: Int,
+  at: Place,
   unused_effects: List<String>,
   schema: Option<String>,
 }
@@ -162,6 +165,7 @@ pub fn own_claims(analysis: Analysis, built: ProverInputResult) -> OwnClaims / {
         kind: o.kind,
         guarded: o.guards.len() > 0,
         frame: o.frame,
+        module: o.module,
         at: o.at,
         unused_effects: match o.kind {
           Ensures(_) -> match definitions.get(o.owner) {
@@ -234,13 +238,12 @@ pub fn static_prover_of(
         } else {
           let found = wanted.map(|i: Int|
             match obligation(i) { Some(o) -> Some({ o: o, d: diagnosis_of(p, o) }), None -> None });
-          let by_index = range(0, wanted.len()).fold(
+          let by_index = list::zip(wanted, found).fold(
             Map::new(),
-            |accumulator: Map<Int, Option<Diagnosis>>, k: Int|
-              match found.at(k) {
-                Some(Some(f)) ->
-                  accumulator.insert(match wanted.at(k) { Some(i) -> i, None -> -1 }, f.d),
-                _ -> accumulator,
+            |accumulator: Map<Int, Option<Diagnosis>>, pair: { first: Int, second: Option<{ o: Obligation, d: Option<Diagnosis> }> }|
+              match pair.second {
+                Some(f) -> accumulator.insert(pair.first, f.d),
+                None -> accumulator,
               },
           );
           {
@@ -411,23 +414,28 @@ pub fn exit_code_of(rows: List<Row>) -> Int =
   if any_unproved(rows) { failure_code } else { ok_code }
 
 pub fn rows_of(claims: List<Claim>, wanted: List<Int>, verdicts: Verdicts) -> List<Row> =
-  range(0, wanted.len()).fold([], |accumulator: List<Row>, i: Int|
-    match claims.at(match wanted.at(i) { Some(k) -> k, None -> -1 }) {
-      None -> accumulator,
-      Some(c) -> match verdicts.outcomes.at(i) {
-        None -> accumulator,
-        Some(o) ->
-          accumulator.push({
-            claim: c,
-            outcome: o,
-            reason: match verdicts.reasons.at(i) { Some(r) -> r, None -> Fresh },
-            static_prover: match verdicts.static_prover_results {
-              Some(prover_results) -> match prover_results.at(i) { Some(r) -> r, None -> None },
-              None -> None,
-            },
-          }),
-      },
-    })
+  list::zip(wanted, verdicts.outcomes).fold(
+    { rows: [], at: 0 },
+    |accumulator: { rows: List<Row>, at: Int }, pair: { first: Int, second: Outcome }| {
+      let i = accumulator.at;
+      {
+        rows: match claims.at(pair.first) {
+          None -> accumulator.rows,
+          Some(c) ->
+            accumulator.rows.push({
+              claim: c,
+              outcome: pair.second,
+              reason: match verdicts.reasons.at(i) { Some(r) -> r, None -> Fresh },
+              static_prover: match verdicts.static_prover_results {
+                Some(prover_results) -> match prover_results.at(i) { Some(r) -> r, None -> None },
+                None -> None,
+              },
+            }),
+        },
+        at: i + 1,
+      }
+    },
+  ).rows
 
 pub fn laws_in(collection: Collection) -> Laws =
   laws_of(collection.definitions.map(|definition: Definition| definition.name), collection.laws)
@@ -453,13 +461,10 @@ pub fn claim_rows(
   wanted: List<Int>,
   outcomes: List<Outcome>,
 ) -> List<ClaimRow> =
-  range(0, wanted.len()).fold([], |accumulator: List<ClaimRow>, i: Int|
-    match collection.claims.at(match wanted.at(i) { Some(k) -> k, None -> -1 }) {
+  list::zip(wanted, outcomes).fold([], |accumulator: List<ClaimRow>, pair: { first: Int, second: Outcome }|
+    match collection.claims.at(pair.first) {
       None -> accumulator,
-      Some(claim) -> match outcomes.at(i) {
-        None -> accumulator,
-        Some(o) -> accumulator.push(claim_row(claim, o)),
-      },
+      Some(claim) -> accumulator.push(claim_row(claim, pair.second)),
     })
 
 pub fn count_specified(collection: Collection) -> Int =
@@ -496,7 +501,7 @@ pub fn decide_claims<| e>(
   static_prover: Bool,
   discharge: (List<Int>, List<StaticResult>) -> Result<DischargeResult, Rejection> / {discharging.decided | e},
 ) -> Result<Verdicts, Rejection> / {abort.raise, proof_store.cached, proof_store.record, decisions.known | e} = {
-  let selected_claims = wanted.map(|i: Int| claim_at(collection.claims, i));
+  let selected_claims = wanted.map(|i: Int| collection.claims.get(i));
   let keys = selected_claims.map(evidence_keys);
   let cached_texts = keys.map(|k: { bare: String, ran: String }|
     proof_store.cached([k.bare, k.ran]));
@@ -506,11 +511,12 @@ pub fn decide_claims<| e>(
     verdict_of(k.bare, k.ran, evidence_kind(cached_at(h, 0)), evidence_kind(cached_at(h, 1)))
   });
   let selection = select(results);
-  let runs = selection.to_discharge.map(|at: Int| match wanted.at(at) { Some(i) -> i, None -> -1 });
+  let runs = list::zip(wanted, results).filter(|pair: { first: Int, second: CacheLookup }|
+    needs_discharge(pair.second)).map(|pair: { first: Int, second: CacheLookup }| pair.first);
   let static_results = (statics.result)(wanted, runs, static_prover, collection.plan.prove_budget);
   let row_at = |at: Int, outcome: Outcome|
     {
-      claim: claim_at(selected_claims, at),
+      claim: selected_claims.get(at),
       outcome: outcome,
       reason: match selection.reasons.at(at) { Some(r) -> r, None -> Fresh },
       static_prover: match static_results.static_prover_results {
@@ -528,9 +534,9 @@ pub fn decide_claims<| e>(
           accumulator.insert(at, match text {
             Some(t) -> match evidence_of(t) {
               Ok(c) -> Proved(c),
-              Err(_) -> missing_outcome(claim_at(selected_claims, at)),
+              Err(_) -> missing_outcome(selected_claims.get(at)),
             },
-            None -> missing_outcome(claim_at(selected_claims, at)),
+            None -> missing_outcome(selected_claims.get(at)),
           })
         },
         _ -> accumulator,
@@ -538,13 +544,19 @@ pub fn decide_claims<| e>(
   );
   cached_outcomes.fold((), |_: Unit, at: Int, outcome: Outcome|
     decisions.known(row_at(at, outcome)));
-  let place_of = range(0, runs.len()).fold(Map::new(), |accumulator: Map<Int, Int>, k: Int|
-    accumulator.insert(runs.at_or(k, -1), selection.to_discharge.at_or(k, -1)));
+  let place_of = list::zip(runs, selection.to_discharge).fold(
+    Map::new(),
+    |accumulator: Map<Int, Int>, pair: { first: Int, second: Int }|
+      accumulator.insert(pair.first, pair.second),
+  );
   let ran = handle {
     discharge(runs, static_results.resolved)
   } with {
     discharging.decided(claim, outcome) ->
-      decisions.known(row_at(place_of.get_or(claim, -1), outcome)),
+      match place_of.get(claim) {
+        Some(at) -> decisions.known(row_at(at, outcome)),
+        None -> panic("the discharge decided a claim it was not given"),
+      },
   };
   match ran {
     Err(reason) -> Err(reason),
@@ -555,10 +567,8 @@ pub fn decide_claims<| e>(
         selection.to_discharge,
         d.outcomes,
       );
-      range(d.outcomes.len(), selection.to_discharge.len()).fold((), |_: Unit, k: Int| {
-        let at = selection.to_discharge.at_or(k, -1);
-        decisions.known(row_at(at, all.at_or(at, missing_outcome(claim_at(selected_claims, at)))))
-      });
+      selection.to_discharge.drop(d.outcomes.len()).fold((), |_: Unit, at: Int|
+        decisions.known(row_at(at, all.get(at))));
       let recorded = cache_writes(
         keys,
         all.map(|o: Outcome| match o { Proved(c) -> Some(c.ran), _ -> None }),
@@ -612,15 +622,21 @@ fn merge_outcomes(
   cached_outcomes: Map<Int, Outcome>,
   to_discharge: List<Int>,
   discharged: List<Outcome>,
-) -> List<Outcome> = {
-  let place = range(0, to_discharge.len()).fold(Map::new(), |accumulator: Map<Int, Int>, k: Int|
-    accumulator.insert(to_discharge.at_or(k, -1), k));
+) -> List<Outcome> / {abort.raise} = {
+  let place = list::zip(to_discharge, range(0, to_discharge.len())).fold(
+    Map::new(),
+    |accumulator: Map<Int, Int>, pair: { first: Int, second: Int }|
+      accumulator.insert(pair.first, pair.second),
+  );
   range(0, claims.len()).map(|at: Int|
     match cached_outcomes.get(at) {
       Some(o) -> o,
-      None -> match discharged.at(place.get_or(at, -1)) {
-        Some(o) -> o,
-        None -> missing_outcome(claim_at(claims, at)),
+      None -> match place.get(at) {
+        Some(k) -> match discharged.at(k) {
+          Some(o) -> o,
+          None -> missing_outcome(claims.get(at)),
+        },
+        None -> missing_outcome(claims.get(at)),
       },
     })
 }
@@ -973,7 +989,7 @@ fn claim_keys(laws: Map<String, LawPlace>, o: Obligation) -> Option<ClaimKeys> /
     Law(_) -> match laws.get(o.owner) {
       Some(at) ->
         Some({
-          guards: o.guards.map(|g: { module: Int, start: Int, end: Int }|
+          guards: o.guards.map(|g: Place|
             law_key(at.module, at.name, LawGuard)),
           body: law_key(at.module, at.name, LawBody),
           call: None,
@@ -1070,23 +1086,6 @@ pub fn run_interleaving(
 
 fn cached_at(texts: List<Option<Bytes>>, i: Int) -> Option<Bytes> =
   match texts.at(i) { Some(x) -> x, None -> None }
-
-pub fn claim_at(claims: List<Claim>, i: Int) -> Claim =
-  match claims.at(i) {
-    Some(c) -> c,
-    None ->
-      {
-        key: "",
-        run_key: "",
-        owner: "",
-        kind: Ensures(0),
-        guarded: false,
-        frame: NoWrites,
-        at: { module: 0, start: 0, end: 0 },
-        unused_effects: [],
-        schema: None,
-      },
-  }
 
 pub fn coverage_lines(
   style: Style,
@@ -1289,7 +1288,7 @@ fn claim_error(
   error_with_labels(
     code,
     message,
-    [{ place: InSource(row.claim.at), primary: true, text: label }],
+    [{ place: row.claim.at, primary: true, text: label }],
     notes,
   )
 
@@ -1307,11 +1306,11 @@ fn refutation(row: Row, context: Counterexample) -> Diagnostic = {
   )
 }
 
-fn vacuity(row: Row, guard: { module: Int, start: Int, end: Int }) -> Diagnostic =
+fn vacuity(row: Row, guard: Place) -> Diagnostic =
   error_with_labels(
     b"E0420",
     Bytes::of_string(label_of(row.claim) ++ " is vacuous: " ++ vacuity_summary),
-    [{ place: InSource(guard), primary: true, text: b"this guard admits nothing" }],
+    [{ place: guard, primary: true, text: b"this guard admits nothing" }],
     [
       b"an obligation over an empty domain is trivially valid and says nothing",
       b"widen the guard, or delete the claim",
@@ -1369,8 +1368,6 @@ pub fn failure_output(
     CacheUnavailable(r) -> reported(style, command, r.diagnostics, r.places),
   }
 
-pub const a_span: { module: Int, start: Int, end: Int } = { module: 0, start: 3, end: 7 }
-
 pub fn a_claim(owner: String, kind: Kind) -> Claim =
   {
     key: "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
@@ -1379,7 +1376,8 @@ pub fn a_claim(owner: String, kind: Kind) -> Claim =
     kind: kind,
     guarded: false,
     frame: NoWrites,
-    at: a_span,
+    module: 0,
+    at: InSource({ module: 0, start: 3, end: 7 }),
     unused_effects: [],
     schema: None,
   }

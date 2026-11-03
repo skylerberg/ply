@@ -1,6 +1,6 @@
 import progress
 import std.set (Set)
-import compiler.check.resolve.tables (Place, InSource, WholeFile, Unplaced, place_module,
+import compiler.check.resolve.tables (Place, InSource, WholeFile, Unplaced, in_module, place_module,
                                       source_span)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (Analysis, analysis_identities)
@@ -32,7 +32,7 @@ import compiler.unit (identity_of, shipped)
 import program (ProgramStore, Session, front_end, in_program_store)
 import proof.obligation (Builds, Definition, Kind, Law, WrittenLaw, definition_bin, written_law_bin)
 import proof.prover_input (Obligation, ProverInput, Static, Unhandled, empty_prover_input,
-                           prover_input_of)
+                           prover_input_of, written_before)
 import proof.static_prover (claims_for, diagnosis_of, modules_of, prover_of)
 import proof.decide (Proved)
 import proof.goal (default_prove_budget)
@@ -96,6 +96,9 @@ fn in_file(p: Placement, position: Int) -> Int =
 
 type SourceSpan = { module: Int, start: Int, end: Int }
 
+fn placed_module(placing: Map<Int, Placement>, module: Int) -> Int =
+  match placing.get(module) { Some(p) -> p.slot, None -> module }
+
 fn placed_at(placing: Map<Int, Placement>, at: SourceSpan) -> SourceSpan =
   match placing.get(at.module) {
     Some(p) -> { module: p.slot, start: in_file(p, at.start), end: in_file(p, at.end) },
@@ -105,7 +108,7 @@ fn placed_at(placing: Map<Int, Placement>, at: SourceSpan) -> SourceSpan =
 fn placed_place(placing: Map<Int, Placement>, place: Place) -> Place =
   match place {
     InSource(s) -> InSource(placed_at(placing, s)),
-    WholeFile(m) -> WholeFile(match placing.get(m) { Some(p) -> p.slot, None -> m }),
+    WholeFile(m) -> WholeFile(placed_module(placing, m)),
     Unplaced -> Unplaced,
   }
 
@@ -122,7 +125,8 @@ fn placed_diagnostic(placing: Map<Int, Placement>, d: Diagnostic) -> Diagnostic 
 fn placed_own(fresh: OwnClaims, placing: Map<Int, Placement>) -> OwnClaims =
   {
     ..fresh,
-    claims: fresh.claims.map(|c: Claim| { ..c, at: placed_at(placing, c.at) }),
+    claims: fresh.claims.map(|c: Claim|
+      { ..c, module: placed_module(placing, c.module), at: placed_place(placing, c.at) }),
     warnings: fresh.warnings.map(|d: Diagnostic| placed_diagnostic(placing, d)),
   }
 
@@ -156,7 +160,8 @@ fn known_module(
 fn placed_claims(c: ModuleClaims, index: Int) -> ModuleClaims =
   {
     ..c,
-    claims: c.claims.map(|claim: Claim| { ..claim, at: { ..claim.at, module: index } }),
+    claims: c.claims.map(|claim: Claim|
+      { ..claim, module: index, at: in_module(claim.at, index) }),
     warnings: c.warnings.map(|d: Diagnostic| placed_in(d, index)),
   }
 
@@ -171,6 +176,7 @@ fn placeholder_obligation(c: Claim) -> Obligation =
     run_key: c.run_key,
     owner: c.owner,
     kind: c.kind,
+    module: c.module,
     at: c.at,
     binders: [],
     result: None,
@@ -186,10 +192,11 @@ fn placeholder_obligation(c: Claim) -> Obligation =
 fn kind_rank(k: Kind) -> Int = match k { Law(_) -> 2, Builds(_) -> 1, _ -> 0 }
 
 fn comes_first(a: WorldClaim, b: WorldClaim) -> Bool = {
-  let x = { rank: kind_rank(a.claim.kind), module: a.claim.at.module, start: a.claim.at.start };
-  let y = { rank: kind_rank(b.claim.kind), module: b.claim.at.module, start: b.claim.at.start };
-  x.rank < y.rank
-    || (x.rank == y.rank && (x.module < y.module || (x.module == y.module && x.start <= y.start)))
+  let x = a.claim;
+  let y = b.claim;
+  kind_rank(x.kind) < kind_rank(y.kind)
+    || (kind_rank(x.kind) == kind_rank(y.kind)
+    && (x.module < y.module || (x.module == y.module && !written_before(y.at, x.at))))
 }
 
 type FreshModules = {
@@ -231,7 +238,7 @@ fn fresh_by_module(
       found.insert(String::of_bytes_lossy(d.name), d.module),
   );
   {
-    claims: fresh.claims.group_by(|c: Claim| c.at.module),
+    claims: fresh.claims.group_by(|c: Claim| c.module),
     laws: fresh.laws.group_by(|l: WrittenLaw| law_module(known, l.key)),
     warnings: warnings_by_module(fresh.warnings),
     definitions: fresh.definitions.fold(
@@ -309,7 +316,7 @@ fn claimed_with_view(
     else { match k.claims { Some(claimed) -> found.push(claimed), None -> found } });
   let pairs = range(0, fresh.claims.len()).fold([], |found: List<WorldClaim>, i: Int| {
     let claim = fresh.claims.get(i);
-    if !opened.contains(names.at_or(claim.at.module, b"")) { found }
+    if !opened.contains(names.at_or(claim.module, b"")) { found }
     else { found.push({ claim: claim, obligation: built.world.obligations.get(i) }) }
   });
   let mine = claims_of_program(names, built.world, current, pairs);
@@ -468,11 +475,13 @@ test "a claim checked by group keeps its place in its file" {
       let four = fresh.claims.filter(|claim: Claim| claim.owner == "app.four");
       assert(four.len() > 0);
       assert(
-        four.all(|claim: Claim| {
-          let at = claim.at;
-          at.module == 0 && text.slice(at.start, at.end).len() > 0
-            && text.slice(0, at.start).index_of(b"pub fn four") != None
-        }),
+        four.all(|claim: Claim|
+          match claim.at {
+            InSource(at) ->
+              claim.module == 0 && at.module == 0 && text.slice(at.start, at.end).len() > 0
+                && text.slice(0, at.start).index_of(b"pub fn four") != None,
+            _ -> false,
+          }),
       )
     },
   }
@@ -572,7 +581,7 @@ test "a module loaded without the others keeps its place among all modules" {
   match claimed_over(modules_with_claims(3, b"n + 2").reverse(), first).claimed {
     Ok(c) -> {
       let named = |claim: Claim|
-        claim.owner.starts_with(String::of_bytes_lossy(c.mine.modules.get(claim.at.module)) ++ ".");
+        claim.owner.starts_with(String::of_bytes_lossy(c.mine.modules.get(claim.module)) ++ ".");
       assert(c.mine.claims.len() > 0 && c.mine.claims.all(named))
     },
     Err(_) -> panic("the claims of a program with no errors do not load"),

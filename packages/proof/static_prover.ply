@@ -4,7 +4,7 @@ import compiler.front.published (ClaimClause, LoweringTargets, analyse)
 import compiler.front.facts (Analysis)
 import compiler.front.rows (module_imports)
 import compiler.syntax.items (CostClause, EnsuresClause, RequiresClause, SpaceClause)
-import compiler.check.resolve.tables (ParsedModule)
+import compiler.check.resolve.tables (ParsedModule, Place, WholeFile)
 import context (Context, Claims, claims_from_analysis, context, constructor, signature, group_of,
                 is_recursive, terminates)
 import decide (Certified, Diagnosis, StaticResult, Undecided, GuardRefuted, Unwitnessed, Proved,
@@ -21,11 +21,12 @@ import rules (CostBound, SpaceBound, Rule, Cited)
 import sort (canonical)
 import prover_input (Bounded, NotEnumerable, Measure, Obligation, TrustedLaw, ProverInput,
                      Interleave, Run, Every, measures_in, measures_input, fallback_of,
-                     whole_program_input)
+                     whole_program_input, written_before)
 import prover_input
 import std.list
+import std.set (Set)
 
-pub type LocatedLemma = { module: Int, start: Int, lemma: Lemma }
+pub type LocatedLemma = { module: Int, at: Place, lemma: Lemma }
 
 pub type Prover = {
   context: Context,
@@ -40,16 +41,14 @@ pub type Prover = {
 pub fn prover_of(claims: Claims, w: ProverInput, budget: Int) -> Prover / {abort.raise} = {
   let context = context(claims, w);
   let limits = { ..default_limits, steps: budget };
-  let shown = w.measures.fold(Map::new(), |m: Map<String, Bool>, x: Measure|
-    match check_measure(context, x, limits) { Ok([]) -> m.insert(x.owner, true), _ -> m });
+  let shown = w.measures.fold(Set::empty(), |m: Set<String>, x: Measure|
+    match check_measure(context, x, limits) { Ok([]) -> m.insert(x.owner), _ -> m });
   let measured = {
     context: {
       ..context,
-      measured: shown.keys().fold(Map::new(), |m: Map<String, Bool>, name: String|
-        if group_of(context, name).fold(true, |all: Bool, member: String|
-            all && (shown.contains(member) || !has_measure(context, member))) {
-          m.insert(name, true)
-        } else { m }),
+      measured: shown.filter(|name: String|
+        group_of(context, name).fold(true, |all: Bool, member: String|
+          all && (shown.contains(member) || !has_measure(context, member)))),
     },
     claims: claims,
     limits: limits,
@@ -107,7 +106,7 @@ pub fn prover_of(claims: Claims, w: ProverInput, budget: Int) -> Prover / {abort
           Some(l.body),
           |name: String| signature(p.context, name) != None && constructor(p.context, name) == None,
         ) {
-        Some(lemma) -> { ..p, proved: p.proved.push({ module: t.module, start: 0, lemma: lemma }) },
+        Some(lemma) -> { ..p, proved: p.proved.push({ module: t.module, at: WholeFile(t.module), lemma: lemma }) },
         None -> p,
       },
     });
@@ -125,7 +124,7 @@ pub fn prover_of(claims: Claims, w: ProverInput, budget: Int) -> Prover / {abort
               Proved(_) ->
                 {
                   ..decided,
-                  proved: p.proved.push({ module: o.at.module, start: o.at.start, lemma: l }),
+                  proved: p.proved.push({ module: o.module, at: o.at, lemma: l }),
                 },
               _ -> decided,
             }
@@ -199,9 +198,9 @@ fn lemma_at(p: Prover, o: Obligation) -> Option<Lemma> =
 fn import_order(os: List<Obligation>, imports: List<List<Int>>) -> List<Obligation> = {
   let depth = |m: Int| match imports.at(m) { Some(xs) -> xs.len(), None -> 0 };
   let ahead = |x: Obligation, o: Obligation|
-    depth(x.at.module) < depth(o.at.module)
-      || (depth(x.at.module) == depth(o.at.module)
-      && (x.at.module < o.at.module || (x.at.module == o.at.module && x.at.start <= o.at.start)));
+    depth(x.module) < depth(o.module)
+      || (depth(x.module) == depth(o.module)
+      && (x.module < o.module || (x.module == o.module && !written_before(o.at, x.at))));
   os.fold([], |accumulator: List<Obligation>, o: Obligation|
     accumulator.filter(|x: Obligation| ahead(x, o)).push(o).concat(
       accumulator.filter(|x: Obligation| !ahead(x, o)),
@@ -209,9 +208,9 @@ fn import_order(os: List<Obligation>, imports: List<List<Int>>) -> List<Obligati
 }
 
 fn lemmas_for(p: Prover, o: Obligation) -> List<Lemma> = {
-  let imported = match p.imports.at(o.at.module) { Some(xs) -> xs, None -> [] };
+  let imported = match p.imports.at(o.module) { Some(xs) -> xs, None -> [] };
   p.proved.filter(|x: LocatedLemma|
-    (x.module == o.at.module && x.start < o.at.start) || imported.contains(x.module)).map(
+    (x.module == o.module && written_before(x.at, o.at)) || imported.contains(x.module)).map(
     |x: LocatedLemma| x.lemma,
   )
 }
@@ -317,10 +316,10 @@ pub fn claims_for(
 
 pub fn modules_of(analysis: Analysis, os: List<Obligation>) -> List<Int> =
   os.fold([], |accumulator: List<Int>, obligation: Obligation|
-    if obligation.at.module >= analysis.modules.len() { range(0, analysis.modules.len()) }
-    else if accumulator.fold(false, |seen: Bool, m: Int| seen || m == obligation.at.module) {
+    if obligation.module >= analysis.modules.len() { range(0, analysis.modules.len()) }
+    else if accumulator.fold(false, |seen: Bool, m: Int| seen || m == obligation.module) {
       accumulator
-    } else { accumulator.push(obligation.at.module) })
+    } else { accumulator.push(obligation.module) })
 
 fn name_at(modules: List<ParsedModule>, i: Int) -> Bytes =
   match modules.at(i) { Some(m) -> m.name, None -> b"" }
@@ -330,12 +329,11 @@ fn import_closure(modules: List<ParsedModule>, from: List<Int>) -> List<Int> / {
     accumulator.insert(name_at(modules, i), i));
   let seen = iterate(
     {
-      seen: from.fold(Map::new(), |accumulator: Map<Int, Bool>, i: Int|
-        accumulator.insert(i, true)),
+      seen: Set::of_list(from),
       stack: from,
     },
     modules.len() + from.len() + 1,
-    |s: { seen: Map<Int, Bool>, stack: List<Int> }|
+    |s: { seen: Set<Int>, stack: List<Int> }|
       match s.stack.at(s.stack.len() - 1) {
         None -> Stop(s.seen),
         Some(i) -> {
@@ -345,10 +343,10 @@ fn import_closure(modules: List<ParsedModule>, from: List<Int>) -> List<Int> / {
           Continue(
             imported.fold(
               { seen: s.seen, stack: rest },
-              |accumulator: { seen: Map<Int, Bool>, stack: List<Int> }, name: Bytes|
+              |accumulator: { seen: Set<Int>, stack: List<Int> }, name: Bytes|
                 match index.get(name) {
                   Some(j) -> if accumulator.seen.contains(j) { accumulator } else {
-                    { seen: accumulator.seen.insert(j, true), stack: accumulator.stack.push(j) }
+                    { seen: accumulator.seen.insert(j), stack: accumulator.stack.push(j) }
                   },
                   None -> accumulator,
                 },

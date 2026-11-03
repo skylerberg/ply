@@ -22,7 +22,8 @@ import compiler.store.hash.forms (HashOutput, NodeRef, ItemKeyed, references_in,
                                   LawProof)
 import compiler.store.hash.encoding (hex)
 import std.hash (blake3)
-import compiler.check.resolve.tables (Diagnostic, ParsedModule, error_at, qualify)
+import compiler.check.resolve.tables (Diagnostic, InSource, ParsedModule, Place, Unplaced, WholeFile,
+                                       error_at, place_of, qualify)
 import compiler.syntax.parsing (Span)
 import compiler.check.types (Effect, Field, Printer, Type, NamedType, FunctionType, RecordType,
                              VariableType, print_resource, print_effects, print_type,
@@ -35,6 +36,7 @@ import domain (Cases, NamedSort, Declaration, Domain, Interval, FunctionSort, Re
 import obligation (Builds, Cost, Definition, Ensures, Frame, Kind, Law, NoWrites, Space, Writes,
                    WrittenLaw)
 import std.list
+import std.set (Set)
 
 pub type Signature = {
   name: String,
@@ -60,17 +62,27 @@ pub type Obligation = {
   run_key: String,
   owner: String,
   kind: Kind,
-  at: { module: Int, start: Int, end: Int },
+  module: Int,
+  at: Place,
   binders: List<Binder>,
   result: Option<Binder>,
   variables: List<String>,
-  guards: List<{ module: Int, start: Int, end: Int }>,
+  guards: List<Place>,
   literals: List<Bytes>,
   effects: Option<String>,
   frame: Frame,
   strategy: Strategy,
   identities: List<Int>,
 }
+
+pub fn written_before(earlier: Place, later: Place) -> Bool =
+  match ((earlier, later)) {
+    (InSource(a), InSource(b)) -> a.start < b.start,
+    (WholeFile(_), InSource(_)) -> true,
+    (WholeFile(_), Unplaced) -> true,
+    (InSource(_), Unplaced) -> true,
+    _ -> false,
+  }
 
 pub type Measure = {
   owner: String,
@@ -154,7 +166,7 @@ pub fn prover_input_of(
     match o.kind {
       Cost(_) -> [],
       Space(_) -> [],
-      _ -> match imports.at(o.at.module) {
+      _ -> match imports.at(o.module) {
         Some(reach) ->
           trusted.filter(|t: TrustedIdentity| reach.contains(t.law.at.module)).map(
             |t: TrustedIdentity| t.identity,
@@ -628,7 +640,7 @@ fn clauses_of(
     let result = printed.binders.at(params.len());
     let stated = match clauses.get(d.name) { Some(c) -> c, None -> { requires: [], ensures: [] } };
     let propositions = stated.requires;
-    let guards = propositions.map(|g: Expression| source_at(d.at.module, expression_span(g)));
+    let guards = propositions.map(|g: Expression| place_of(d.at.module, expression_span(g)));
     let frame = frame_of(d.effects);
     let strategy = clause_strategy(
       effects_text(run_needs(d.effects)),
@@ -669,7 +681,8 @@ fn clauses_of(
                     SpaceClause -> Space(st.spaces),
                     _ -> Ensures(st.ensures),
                   },
-                  at: source_at(d.at.module, clause.span),
+                  module: d.at.module,
+                  at: place_of(d.at.module, clause.span),
                   binders: binders,
                   result: if bound { None } else { result },
                   variables: printed.variables,
@@ -722,12 +735,13 @@ fn law_of(
           run_key: String::of_bytes_lossy(hex(law_key.run_key)),
           owner: String::of_bytes_lossy(l.key),
           kind: Law(Some(String::of_bytes_lossy(l.name))),
-          at: source_at(l.at.module, l.at.span),
+          module: l.at.module,
+          at: place_of(l.at.module, l.at.span),
           binders: printed.binders,
           result: None,
           variables: printed.variables,
           guards: match wheres.get(l.key) {
-            Some(s) -> match s.guard { Some(g) -> [source_at(l.at.module, g)], None -> [] },
+            Some(s) -> match s.guard { Some(g) -> [place_of(l.at.module, g)], None -> [] },
             None -> [],
           },
           literals: match wheres.get(l.key) { Some(s) -> s.literals, None -> [] },
@@ -826,9 +840,9 @@ pub fn imports_of(modules: List<ParsedModule>) -> List<List<Int>> / {abort.raise
 fn reachable_from(direct: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
   let start = match direct.at(from) { Some(xs) -> xs, None -> [] };
   let seen = iterate(
-    { seen: start.fold(Map::new(), |m: Map<Int, Bool>, x: Int| m.insert(x, true)), stack: start },
+    { seen: Set::of_list(start), stack: start },
     direct.len() * direct.len() + 2,
-    |s: { seen: Map<Int, Bool>, stack: List<Int> }|
+    |s: { seen: Set<Int>, stack: List<Int> }|
       match s.stack.at(s.stack.len() - 1) {
         None -> Stop(s.seen),
         Some(i) -> {
@@ -837,16 +851,16 @@ fn reachable_from(direct: List<List<Int>>, from: Int) -> List<Int> / {abort.rais
           Continue(
             next.fold(
               { seen: s.seen, stack: rest },
-              |accumulator: { seen: Map<Int, Bool>, stack: List<Int> }, j: Int|
+              |accumulator: { seen: Set<Int>, stack: List<Int> }, j: Int|
                 if accumulator.seen.contains(j) { accumulator } else {
-                  { seen: accumulator.seen.insert(j, true), stack: accumulator.stack.push(j) }
+                  { seen: accumulator.seen.insert(j), stack: accumulator.stack.push(j) }
                 },
             ),
           )
         },
       },
   );
-  seen.keys().filter(|j: Int| j != from)
+  seen.elements().filter(|j: Int| j != from)
 }
 
 pub fn invariants_of(instances: List<InstanceInfo>) -> List<{ type_name: Bytes, by: Bytes }> =
@@ -934,7 +948,8 @@ fn builds_of(
                   run_key: built(definition_keys.run_key),
                   owner: String::of_bytes_lossy(d.name),
                   kind: Builds(String::of_bytes_lossy(i.type_name)),
-                  at: source_at(d.at.module, d.at.span),
+                  module: d.at.module,
+                  at: place_of(d.at.module, d.at.span),
                   binders: range(0, params.len()).map(|k: Int| printed.binders.get(k)),
                   result: printed.binders.at(params.len()),
                   variables: printed.variables,
@@ -1146,7 +1161,7 @@ test "a clause's variables are its definition's parameters as written, and `resu
     Some({ name: "result", ty: SortVariable(0), text: "a", constructible: true }),
   );
   assert_eq(o.variables, ["a", "b"]);
-  assert_eq(o.guards.map(|g: { module: Int, start: Int, end: Int }| g.start), [49]);
+  assert(match o.guards { [InSource(g)] -> g.start == 49, _ -> false });
   assert_eq(o.frame, NoWrites);
   assert_eq(o.effects, None);
   assert_eq(o.key.len(), 64);
@@ -1298,8 +1313,8 @@ test "a `law`'s guard is its `where` condition, located at its position in the s
   );
   assert_eq(
     os.map(|obligation: Obligation|
-      obligation.guards.map(|g: { module: Int, start: Int, end: Int }| (g.start, g.end))),
-    [[(36, 41)]],
+      obligation.guards.map(|g: Place| match g { InSource(s) -> Some((s.start, s.end)), _ -> None })),
+    [[Some((36, 41))]],
   )
 }
 
