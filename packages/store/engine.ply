@@ -1,6 +1,8 @@
 import std.fs (fs, mem_empty)
 import std.set (Set)
 import compiler.store.database
+import compiler.store.database (StoreProblem, open_database)
+import compiler.store.fact_store (Opening)
 import fake (run_in_memory)
 
 pub const key_width: Int = 32
@@ -10,7 +12,7 @@ fn slot(table: Int, key: Bytes) -> Bytes / {abort.raise} = byte_of_int(table) ++
 const schema_slot: Bytes = b"\x00schema"
 
 pub type Store = {
-  dir: String,
+  database: Opening,
   schema: Bytes,
   rows: Map<Bytes, Bytes>,
   puts: Map<Bytes, Bytes>,
@@ -30,23 +32,37 @@ pub fn warn(store: Store, trouble: WarningKind, message: String) -> Store =
 fn add_warning(ws: List<Warning>, w: Warning) -> List<Warning> =
   if ws.fold(false, |seen: Bool, x: Warning| seen || x == w) { ws } else { ws.push(w) }
 
-pub fn damaged_store(reason: String) -> Warning =
-  { kind: Corrupt, message: "the store is unreadable (" ++ reason ++ "); this run starts empty" }
+pub fn problem_warning(problem: StoreProblem) -> Warning =
+  {
+    kind: match problem { database::Damaged(_) -> Corrupt, database::NotKept(_) -> Unreadable },
+    message: database::problem_message(problem),
+  }
 
 pub fn messages(ws: List<Warning>) -> List<String> = ws.map(|w: Warning| w.message)
 
-fn store_of(dir: String, schema: Bytes, rows: Map<Bytes, Bytes>) -> Store =
-  { dir: dir, schema: schema, rows: rows, puts: Map::new(), deleted: Set::empty(), warnings: [] }
+fn store_of(database: Opening, schema: Bytes, rows: Map<Bytes, Bytes>) -> Store =
+  {
+    database: database,
+    schema: schema,
+    rows: rows,
+    puts: Map::new(),
+    deleted: Set::empty(),
+    warnings: [],
+  }
 
-pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise} =
-  match database::read_records[r](dir) {
-    Err(reason) -> { ..store_of(dir, schema, Map::new()), warnings: [damaged_store(reason)] },
+pub fn open<[r]>(database: Opening, schema: Bytes) -> Store / {fs.read[r], abort.raise} =
+  match database::read_records[r](database) {
+    Err(reason) ->
+      {
+        ..store_of(database, schema, Map::new()),
+        warnings: [problem_warning(database::Damaged(reason))],
+      },
     Ok(rows) -> if rows.get(schema_slot) == Some(schema) || rows.remove(schema_slot).len() == 0 {
-      store_of(dir, schema, rows.remove(schema_slot))
+      store_of(database, schema, rows.remove(schema_slot))
     } else {
       warn(
         {
-          ..store_of(dir, schema, Map::new()),
+          ..store_of(database, schema, Map::new()),
           deleted: rows.fold(Set::empty(), |found: Set<Bytes>, sl: Bytes, _: Bytes|
             found.insert(sl)),
         },
@@ -123,21 +139,26 @@ pub fn with_rows(store: Store, rows: List<Row>) -> Store / {abort.raise} =
 pub fn flush<[r]>(store: Store) -> Store / {fs.read[r], fs.write[r], abort.raise} =
   if pending_count(store) == 0 { store } else {
     match database::write_records[r](
-        store.dir,
+        store.database,
         store.puts.insert(schema_slot, store.schema),
         store.deleted,
       ) {
-      Err(reason) -> warn(store, Unreadable, reason ++ "; this run's entries were not kept"),
-      Ok(_) -> {
-        let reopened = open[r](store.dir, store.schema);
+      [] -> {
+        let reopened = open[r](store.database, store.schema);
         { ..reopened, warnings: store.warnings.concat(reopened.warnings) }
       },
+      problems ->
+        problems.fold(store, |s: Store, problem: StoreProblem|
+          { ..s, warnings: add_warning(s.warnings, problem_warning(problem)) }),
     }
   }
 
 pub fn name_key(name: String) -> Bytes = Bytes::of_string(name).blake3()
 
 const schema_a: Bytes = b"schema a"
+
+fn database_in_memory(cache_dir: String) -> Opening / {fs.write[mem]} =
+  open_database[mem](database::database_in(cache_dir))
 
 fn lookup_payload(f: Lookup) -> Bytes =
   match f { Hit(b) -> b, Miss -> b"<miss>", Bad(reason) -> Bytes::of_string(reason) }
@@ -150,7 +171,7 @@ fn is_miss(f: Lookup) -> Bool = match f { Miss -> true, _ -> false }
 
 test "entries put in a store can be read immediately, and again after the store is flushed and reopened" {
   let run = run_in_memory(mem_empty(), || {
-    let s0 = open[mem]("cache", schema_a);
+    let s0 = open[mem](database_in_memory("cache"), schema_a);
     assert_eq(s0.warnings, []);
     let s1 = put(
       put(put(s0, 1, name_key("a"), b"alpha"), 2, name_key("a"), b"other table"),
@@ -163,7 +184,7 @@ test "entries put in a store can be read immediately, and again after the store 
     assert_eq(s2.warnings, []);
     assert_eq(pending_count(s2), 0);
     assert_eq(lookup_payload(get(s2, 1, name_key("b"))), b"beta");
-    let s3 = open[mem]("cache", schema_a);
+    let s3 = open[mem](database_in_memory("cache"), schema_a);
     assert_eq(lookup_payload(get(s3, 1, name_key("a"))), b"alpha");
     assert_eq(lookup_payload(get(s3, 1, name_key("b"))), b"beta");
     assert_eq(lookup_payload(get(s3, 2, name_key("a"))), b"other table");
@@ -177,13 +198,13 @@ test "entries put in a store can be read immediately, and again after the store 
 test "the rows a store has not flushed yet, put into another store, read back the same, and a row that names no slot is skipped" {
   let run = run_in_memory(mem_empty(), || {
     let written = put(
-      put(open[mem]("one", schema_a), 1, name_key("a"), b"alpha"),
+      put(open[mem](database_in_memory("one"), schema_a), 1, name_key("a"), b"alpha"),
       2,
       name_key("b"),
       b"beta",
     );
     let copied = with_rows(
-      open[mem]("two", schema_a),
+      open[mem](database_in_memory("two"), schema_a),
       pending_rows(written).push({ slot: b"\x01short", payload: b"x" }),
     );
     {
@@ -200,11 +221,11 @@ test "the rows a store has not flushed yet, put into another store, read back th
 test "a deleted entry stays deleted and a replaced entry keeps its new value after a flush and a reopen" {
   let run = run_in_memory(mem_empty(), || {
     let s1 = flush[mem](
-      put(put(open[mem]("cache", schema_a), 1, name_key("a"), b"one"), 1, name_key("b"), b"two"),
+      put(put(open[mem](database_in_memory("cache"), schema_a), 1, name_key("a"), b"one"), 1, name_key("b"), b"two"),
     );
     let s2 = flush[mem](put(drop(s1, 1, name_key("a")), 1, name_key("b"), b"three"));
     assert(is_miss(get(s2, 1, name_key("a"))));
-    let s3 = open[mem]("cache", schema_a);
+    let s3 = open[mem](database_in_memory("cache"), schema_a);
     assert(is_miss(get(s3, 1, name_key("a"))));
     assert_eq(lookup_payload(get(s3, 1, name_key("b"))), b"three");
     assert_eq(keys(s3, 1), [name_key("b")]);
@@ -216,13 +237,13 @@ test "a deleted entry stays deleted and a replaced entry keeps its new value aft
 test "two runs flushing one store keep each other's entries, and the later wins a shared key" {
   let run = run_in_memory(mem_empty(), || {
     let a = put(
-      put(open[mem]("cache", schema_a), 1, name_key("mine"), b"a"),
+      put(open[mem](database_in_memory("cache"), schema_a), 1, name_key("mine"), b"a"),
       1,
       name_key("both"),
       b"from a",
     );
     let b = put(
-      put(open[mem]("cache", schema_a), 1, name_key("theirs"), b"b"),
+      put(open[mem](database_in_memory("cache"), schema_a), 1, name_key("theirs"), b"b"),
       1,
       name_key("both"),
       b"from b",
@@ -230,7 +251,7 @@ test "two runs flushing one store keep each other's entries, and the later wins 
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
     assert_eq(lookup_payload(get(b1, 1, name_key("mine"))), b"a");
-    let c = open[mem]("cache", schema_a);
+    let c = open[mem](database_in_memory("cache"), schema_a);
     assert_eq(lookup_payload(get(c, 1, name_key("mine"))), b"a");
     assert_eq(lookup_payload(get(c, 1, name_key("theirs"))), b"b");
     assert_eq(lookup_payload(get(c, 1, name_key("both"))), b"from b");
@@ -241,12 +262,12 @@ test "two runs flushing one store keep each other's entries, and the later wins 
 
 test "an entry deleted by one run stays deleted when another run flushed its own entries first" {
   let run = run_in_memory(mem_empty(), || {
-    let s0 = flush[mem](put(open[mem]("cache", schema_a), 1, name_key("first"), b"0"));
-    let a = put(open[mem]("cache", schema_a), 1, name_key("mine"), b"a");
-    let b = drop(open[mem]("cache", schema_a), 1, name_key("first"));
+    let s0 = flush[mem](put(open[mem](database_in_memory("cache"), schema_a), 1, name_key("first"), b"0"));
+    let a = put(open[mem](database_in_memory("cache"), schema_a), 1, name_key("mine"), b"a");
+    let b = drop(open[mem](database_in_memory("cache"), schema_a), 1, name_key("first"));
     let a1 = flush[mem](a);
     let b1 = flush[mem](b);
-    let c = open[mem]("cache", schema_a);
+    let c = open[mem](database_in_memory("cache"), schema_a);
     assert(is_miss(get(c, 1, name_key("first"))));
     assert_eq(lookup_payload(get(c, 1, name_key("mine"))), b"a");
     all_messages([s0.warnings, a1.warnings, b1.warnings, c.warnings])
@@ -256,11 +277,11 @@ test "an entry deleted by one run stays deleted when another run flushed its own
 
 test "a store written under another schema opens empty with a warning, and the next flush replaces its entries" {
   let run = run_in_memory(mem_empty(), || {
-    let s1 = flush[mem](put(open[mem]("cache", schema_a), 1, name_key("a"), b"x"));
-    let other = open[mem]("cache", b"schema b");
+    let s1 = flush[mem](put(open[mem](database_in_memory("cache"), schema_a), 1, name_key("a"), b"x"));
+    let other = open[mem](database_in_memory("cache"), b"schema b");
     assert(is_miss(get(other, 1, name_key("a"))));
     assert_eq(pending_count(flush[mem](put(other, 1, name_key("b"), b"y"))), 0);
-    let again = open[mem]("cache", b"schema b");
+    let again = open[mem](database_in_memory("cache"), b"schema b");
     assert(is_miss(get(again, 1, name_key("a"))));
     assert_eq(lookup_payload(get(again, 1, name_key("b"))), b"y");
     all_messages([s1.warnings, other.warnings, again.warnings])

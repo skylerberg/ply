@@ -124,7 +124,9 @@ and flag.
 `ply` stores its work in `.ply-cache/` at the project root: a database of checked modules, saved
 baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is always safe, and `ply cache clear` empties it.
 A run that crashes, or that races another run, can make a later run redo work, but never gives a
-wrong result.
+wrong result. A run whose results cannot be saved, because another `ply` was writing the database or
+the directory cannot be written, still finishes and warns that they were not kept (`W0601`). A
+damaged database is reported (`W0602`), and the run starts from an empty one.
 
 Each project has its own database. `ply cache copy CHECKOUT` starts a new checkout with the database
 of another one. The project's compiled code is kept in `.ply-cache/c/`, one library per part of the
@@ -2636,10 +2638,14 @@ explain --all` lists them all.
 Under `--json`, a diagnostic with a known fix includes `fixes`. Each fix has a `title` and `edits`,
 and each edit replaces the text from `start` to `end` of `file` with `text`. On a terminal, a fix is
 shown as a `= fix:` line. A diagnostic offers either one fix or several alternatives, such as which
-`raise` a `try` handles. `ply check --fix` applies only a diagnostic's single fix, and leaves a
-choice between alternatives to you. When a body performs an effect its signature lacks, every caller that does
-not handle the effect gets its own error and fix in the same run, so `ply check --fix` fixes the
-whole chain at once. A runtime diagnostic, such as a failed assertion, cuts a long value short
+`raise` a `try` handles. Its `fix_choice` is `none`, `apply` (one fix) or `choose_one` (the `fixes`
+are alternatives). `ply check --fix` applies only a diagnostic's single fix, and leaves a choice
+between alternatives to you. It prints a `fixed` line for each fix it applied and a `not fixed` line,
+with the reason, for each fix it did not apply: a choice between alternatives, an edit outside the
+project's own files (in a dependency or a shipped module), or an edit that overlaps a fix applied in
+the same run. Under `--json` these are `fixed` and `not_fixed`. When a body performs an effect its
+signature lacks, every caller that does not handle the effect gets its own error and fix in the same
+run, so `ply check --fix` fixes the whole chain at once. A runtime diagnostic, such as a failed assertion, cuts a long value short
 with `… N more`; under `--json` the whole value is in `values`.
 
 ## 19. Limits and sharp edges

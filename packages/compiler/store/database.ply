@@ -415,20 +415,65 @@ fn over_database<a, [r] | e>(
   }
 }
 
-pub type StoreOutcome<a> = { value: a, damage: Option<String> }
+pub type StoreProblem = | Damaged(String) | NotKept(String)
 
-type Session<a> = { outcome: StoreOutcome<a>, commit: CommitResult }
+pub type StoreOutcome<a> = { value: a, problems: List<StoreProblem> }
 
-fn with_opened<a, [r] | e>(
-  dir: String,
-  go: (fact_store::Opening) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e},
-) -> a / {fs.read[r], fs.write[r], abort.raise | e} =
-  with_recent_reads(|| {
-    let opening = fact_store::open[r](dir);
-    let value = go(opening);
-    fact_store::close[r](opening);
-    value
-  })
+pub fn problem_message(problem: StoreProblem) -> String =
+  match problem {
+    Damaged(reason) -> "the store is unreadable (" ++ reason ++ "); this run starts empty",
+    NotKept(reason) -> reason ++ "; this run's entries were not kept",
+  }
+
+fn commit_problems(result: CommitResult) -> List<StoreProblem> =
+  match result {
+    Committed(_) -> [],
+    LockHeld -> [NotKept("another `ply` was writing the store")],
+    StoreChanged -> [NotKept("another `ply` changed the store at the same time")],
+    WriteFailed -> [NotKept("the store could not be written")],
+  }
+
+type Session<a> = { value: a, damage: Option<String>, commit: CommitResult }
+
+fn outcome_of<a>(session: Session<a>) -> StoreOutcome<a> =
+  {
+    value: session.value,
+    problems: match session.damage {
+      Some(reason) -> [Damaged(reason)].concat(commit_problems(session.commit)),
+      None -> commit_problems(session.commit),
+    },
+  }
+
+pub fn open_database<[r]>(dir: String) -> fact_store::Opening / {fs.write[r]} =
+  fact_store::open[r](dir)
+
+pub fn close_database<[r]>(opening: fact_store::Opening) -> Unit / {fs.write[r]} =
+  fact_store::close[r](opening)
+
+fn session_on<a, [r] | e>(
+  opening: fact_store::Opening,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  noted: (Bytes) -> Unit / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} =
+  with_recent_reads(||
+    with_session_inputs(|| {
+      let first = handle {
+        Ok(over_database[r](fact_store::loaded[r](opening), read, world, look, noted, work))
+      } with {
+        fact_damage.damaged(reason) -> Err(reason),
+      };
+      match first {
+        Ok(ran) -> { value: ran.value, damage: None, commit: ran.commit },
+        Err(reason) -> {
+          let ran = fact_store::undamaged(||
+            over_database[r](fact_store::emptied[r](opening), read, world, look, noted, work));
+          { value: ran.value, damage: Some(reason), commit: ran.commit }
+        },
+      }
+    }))
 
 fn session_in<a, [r] | e>(
   dir: String,
@@ -437,23 +482,22 @@ fn session_in<a, [r] | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} =
-  with_opened[r](dir, |opening: fact_store::Opening|
-    with_session_inputs(|| {
-      let first = handle {
-        Ok(over_database[r](fact_store::loaded[r](opening), read, world, look, noted, work))
-      } with {
-        fact_damage.damaged(reason) -> Err(reason),
-      };
-      match first {
-        Ok(ran) -> { outcome: { value: ran.value, damage: None }, commit: ran.commit },
-        Err(reason) -> {
-          let ran = fact_store::undamaged(||
-            over_database[r](fact_store::emptied(opening), read, world, look, noted, work));
-          { outcome: { value: ran.value, damage: Some(reason) }, commit: ran.commit }
-        },
-      }
-    }))
+) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} = {
+  let opening = open_database[r](dir);
+  let session = session_on[r](opening, read, world, look, noted, work);
+  close_database[r](opening);
+  session
+}
+
+pub fn with_opened_database<a, [r] | e>(
+  opening: fact_store::Opening,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  noted: (Bytes) -> Unit / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
+  outcome_of(session_on[r](opening, read, world, look, noted, work))
 
 pub fn with_database<a, [r] | e>(
   dir: String,
@@ -463,7 +507,7 @@ pub fn with_database<a, [r] | e>(
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
-  session_in[r](dir, read, world, look, noted, work).outcome
+  outcome_of(session_in[r](dir, read, world, look, noted, work))
 
 pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
 
@@ -487,31 +531,37 @@ fn undamaged_in<a, [r]>(
     Err(reason) -> panic("the fact database is damaged: " ++ reason),
   }
 
+fn read_opened<a, [r]>(
+  opening: fact_store::Opening,
+  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
+) -> Result<a, String> / {fs.read[r], abort.raise} =
+  with_recent_reads(||
+    handle {
+      Ok(read(fact_store::loaded[r](opening)))
+    } with {
+      fact_damage.damaged(reason) -> Err(reason),
+    })
+
 pub fn read_records<[r]>(
-  dir: String,
+  opening: fact_store::Opening,
 ) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], abort.raise} =
-  read_only_in[r](dir, |db: Database| fact_store::entries_under[r](db, Records, b""))
+  read_opened[r](opening, |db: Database| fact_store::entries_under[r](db, Records, b""))
 
 pub fn write_records<[r]>(
-  dir: String,
+  opening: fact_store::Opening,
   puts: Map<Bytes, Bytes>,
   deleted: Set<Bytes>,
-) -> Result<Unit, String> / {fs.read[r], fs.write[r], abort.raise} =
-  with_opened[r](dir, |opening: fact_store::Opening|
+) -> List<StoreProblem> / {fs.read[r], fs.write[r], abort.raise} =
+  with_recent_reads(||
     handle {
       let written = puts.fold(
         deleted.fold(fact_store::loaded[r](opening), |d: Database, key: Bytes|
           fact_store::without_value(d, Records, key)),
         |d: Database, key: Bytes, value: Bytes| fact_store::with_value(d, Records, key, value),
       );
-      match fact_store::commit[r](written, |current: Database| live_results[r](current)) {
-        Committed(_) -> Ok(()),
-        LockHeld -> Err("another `ply` was writing the store"),
-        StoreChanged -> Err("another `ply` changed the store at the same time"),
-        WriteFailed -> Err("the store could not be written"),
-      }
+      commit_problems(fact_store::commit[r](written, |current: Database| live_results[r](current)))
     } with {
-      fact_damage.damaged(reason) -> Err("the store is damaged (" ++ reason ++ ")"),
+      fact_damage.damaged(reason) -> [NotKept("the store is damaged (" ++ reason ++ ")")],
     })
 
 pub fn copy_database<[r]>(from: String, to: String) -> Unit / {fs.read[r], fs.write[r]} = {
@@ -581,15 +631,18 @@ pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} =
 pub type StoredOutput = | Stored(Bytes) | NotKept
 
 pub fn outputs_by_digest<[r]>(
-  dir: String,
+  opening: fact_store::Opening,
   digests: List<Bytes>,
 ) -> Map<Bytes, StoredOutput> / {fs.read[r], abort.raise} =
-  undamaged_in[r](dir, |db: Database|
-    digests.fold(Map::new(), |found: Map<Bytes, StoredOutput>, digest: Bytes|
-      found.insert(digest, match fact_store::result_of[r](db, result_key(digest)) {
-        Some(output) -> Stored(output),
-        None -> NotKept,
-      })))
+  match read_opened[r](opening, |db: Database|
+      digests.fold(Map::new(), |found: Map<Bytes, StoredOutput>, digest: Bytes|
+        found.insert(digest, match fact_store::result_of[r](db, result_key(digest)) {
+          Some(output) -> Stored(output),
+          None -> NotKept,
+        }))) {
+    Ok(outputs) -> outputs,
+    Err(reason) -> panic("the fact database is damaged: " ++ reason),
+  }
 
 pub fn write_pack<[r]>(
   from: String,
@@ -680,10 +733,10 @@ pub fn with_writes_limited<a | e>(
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> InMemoryOutcome<a> / {abort.raise | e} = {
   let ran = session_in_memory(tree, limit, read, world, look, work);
-  match ran.value.outcome.damage {
+  match ran.value.damage {
     Some(reason) -> Stopped({ tree: ran.tree, reason: "it was damaged: " ++ reason }),
     None -> match ran.value.commit {
-      Committed(_) -> Finished({ value: ran.value.outcome.value, tree: ran.tree }),
+      Committed(_) -> Finished({ value: ran.value.value, tree: ran.tree }),
       refused -> Stopped({ tree: ran.tree, reason: "its commit was refused: " ++ show(refused) }),
     },
   }
@@ -697,9 +750,9 @@ pub fn with_store_in_memory<a | e>(
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> fs::MemResult<a> / {abort.raise | e} = {
   let ran = session_in_memory(tree, AllWrites, read, world, look, work);
-  match ran.value.outcome.damage {
+  match ran.value.damage {
     Some(reason) -> panic("the fact database held in memory is damaged: " ++ reason),
-    None -> { value: ran.value.outcome.value, tree: ran.tree },
+    None -> { value: ran.value.value, tree: ran.tree },
   }
 }
 
@@ -728,7 +781,12 @@ pub fn outputs_in_memory(
   tree: fs::MemFs,
   digests: List<Bytes>,
 ) -> Map<Bytes, StoredOutput> / {abort.raise} =
-  read_in_memory(tree, |dir: String| outputs_by_digest[memory](dir, digests))
+  fs::on_mem[memory](tree, || {
+    let opening = open_database[memory](in_memory_database_dir);
+    let outputs = outputs_by_digest[memory](opening, digests);
+    close_database[memory](opening);
+    outputs
+  }).value
 
 pub fn pack_in_memory(
   tree: fs::MemFs,
@@ -832,7 +890,7 @@ test "a stored value that fails its checksum makes the run start over from nothi
     fs.write_file[abs]("s/" ++ segment, b"not a segment");
     session_over_files[abs](None, b"quoted")
   });
-  assert(torn.value.damage != None)
+  assert(was_damaged(torn.value))
 }
 
 test "a manifest that names a missing segment is damage, not an empty store" {
@@ -844,20 +902,79 @@ test "a manifest that names a missing segment is damage, not an empty store" {
     session_over_files[abs](None, b"quoted")
   });
   assert_eq(lost.value.value, b"\"four\"");
-  assert(lost.value.damage != None)
+  assert(was_damaged(lost.value))
+}
+
+fn was_damaged<a>(outcome: StoreOutcome<a>) -> Bool =
+  outcome.problems.any(|problem: StoreProblem|
+    match problem { Damaged(_) -> true, NotKept(_) -> false })
+
+fn records_written_in<[r]>(
+  dir: String,
+  puts: Map<Bytes, Bytes>,
+  deleted: Set<Bytes>,
+) -> List<StoreProblem> / {fs.read[r], fs.write[r], abort.raise} = {
+  let opening = open_database[r](dir);
+  let problems = write_records[r](opening, puts, deleted);
+  close_database[r](opening);
+  problems
+}
+
+fn records_read_in<[r]>(
+  dir: String,
+) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], fs.write[r], abort.raise} = {
+  let opening = open_database[r](dir);
+  let records = read_records[r](opening);
+  close_database[r](opening);
+  records
 }
 
 test "records survive a reopen beside the facts, and a dropped record is gone" {
   let facts = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
   let written = fs::on_mem[abs](facts.tree, ||
-    write_records[abs]("s", Map::new().insert(b"a", b"1").insert(b"b", b"2"), Set::empty()));
+    records_written_in[abs]("s", Map::new().insert(b"a", b"1").insert(b"b", b"2"), Set::empty()));
   let dropped = fs::on_mem[abs](written.tree, ||
-    write_records[abs]("s", Map::new(), Set::empty().insert(b"a")));
+    records_written_in[abs]("s", Map::new(), Set::empty().insert(b"a")));
+  assert_eq(written.value, []);
+  assert_eq(dropped.value, []);
   assert_eq(
-    fs::on_mem[abs](dropped.tree, || read_records[abs]("s")).value,
+    fs::on_mem[abs](dropped.tree, || records_read_in[abs]("s")).value,
     Ok(Map::new().insert(b"b", b"2")),
   );
   assert_eq(fs::on_mem[abs](dropped.tree, || quoted_over[abs](b"four")).value, b"\"four\"")
+}
+
+fn quoted_on<[r]>(
+  opening: fact_store::Opening,
+  text: Bytes,
+) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], abort.raise} =
+  with_opened_database[r](
+    opening,
+    packs::no_pack,
+    b"",
+    |_: Bytes, _: Bytes| Some(text),
+    |_: Bytes| (),
+    || in_session_of(test_queries(), b"quoted", b"a"),
+  )
+
+test "one opening serves sessions and records writes in turn, and each commit builds on the one before" {
+  let ran = fs::on_mem[abs](fs::mem_of([]), || {
+    let opening = open_database[abs]("s");
+    let first = quoted_on[abs](opening, b"four");
+    let records = write_records[abs](opening, Map::new().insert(b"a", b"1"), Set::empty());
+    let second = quoted_on[abs](opening, b"forty");
+    let read = read_records[abs](opening);
+    close_database[abs](opening);
+    {
+      problems: first.problems.concat(records).concat(second.problems),
+      values: [first.value, second.value],
+      read: read,
+    }
+  });
+  assert_eq(ran.value.problems, []);
+  assert_eq(ran.value.values, [b"\"four\"", b"\"forty\""]);
+  assert_eq(ran.value.read, Ok(Map::new().insert(b"a", b"1")));
+  assert_eq(fs::on_mem[abs](ran.tree, || quoted_over[abs](b"forty")).value, b"\"forty\"")
 }
 
 test "a copied database is correct for its new place, and an edit there changes what it reads" {

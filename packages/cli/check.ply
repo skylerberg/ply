@@ -18,7 +18,7 @@ import diagnostic (SourceText, all_to_json, to_text)
 import program (Phases, Refusal, Session, ModuleReport, module_reports, definitions_in_order,
                 own_tests, location_of, places_of, placed_fixes, session_over)
 import paths (write_file)
-import fixes (FixedFile, change_lines, changes_json)
+import fixes (FixedFile, change_lines, changes_json, unapplied_lines, unapplied_fixes_json)
 import fixes
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
@@ -51,6 +51,7 @@ import std.string
 import definitions (scheme_of, listed_effects_text)
 import proof.obligation (plural)
 import compiler.syntax.parsing (generated_span, span_between)
+import project_store
 
 const types_indent: Int = 5
 
@@ -459,14 +460,14 @@ fn definition_json(
   explain: Bool,
   schemas: Set<Bytes>,
   located: Map<Bytes, Location>,
-  hash: Bytes,
+  hash: Option<Bytes>,
   definition_info: DefinitionInfo,
 ) -> Json / {abort.raise} = {
   let named: List<Member> = [
     { key: "name", value: Str(String::of_bytes_lossy(definition_info.name)) },
     { key: "module", value: Str(String::of_bytes_lossy(definition_info.module)) },
     { key: "simple_name", value: Str(String::of_bytes_lossy(definition_info.simple_name)) },
-    { key: "hash", value: Str(String::of_bytes(hex(hash))) },
+    { key: "hash", value: hash_json(hash) },
     { key: "type", value: Str(scheme_of(definition_info)) },
     { key: "effects", value: Array(json_strings(effect_texts(definition_info.effects))) },
     { key: "scaling", value: Array(json_strings(effect_texts(definition_info.scaling))) },
@@ -514,13 +515,16 @@ fn ending_json(
       ]),
   }
 
-fn test_json(hash: Bytes, test_info: TestInfo) -> Json / {abort.raise} =
+fn hash_json(hash: Option<Bytes>) -> Json / {abort.raise} =
+  match hash { Some(h) -> Str(String::of_bytes(hex(h))), None -> Null }
+
+fn test_json(hash: Option<Bytes>, test_info: TestInfo) -> Json / {abort.raise} =
   object([
     { key: "index", value: int(test_info.index) },
     { key: "key", value: Str(String::of_bytes_lossy(test_info.key)) },
     { key: "name", value: Str(String::of_bytes_lossy(test_info.name)) },
     { key: "module", value: Str(String::of_bytes_lossy(test_info.module)) },
-    { key: "hash", value: Str(String::of_bytes(hex(hash))) },
+    { key: "hash", value: hash_json(hash) },
     { key: "nondet", value: Bool(test_info.nondet) },
     { key: "outside_effects", value: Array(json_strings(effect_texts(test_info.effects))) },
   ])
@@ -593,7 +597,7 @@ fn document(
             flags.explain,
             schemas,
             located,
-            match hashes.get(definition_info.name) { Some(h) -> h, None -> b"" },
+            hashes.get(definition_info.name),
             definition_info,
           )),
       ),
@@ -602,7 +606,7 @@ fn document(
       key: "tests",
       value: Array(
         own_tests(analysis).map(|t: TestInfo|
-          test_json(match analysis.hashes.tests.get(t.key) { Some(h) -> h, None -> b"" }, t)),
+          test_json(analysis.hashes.tests.get(t.key), t)),
       ),
     },
     { key: "effects", value: Array(analysis.checked.effects.map(effect_json)) },
@@ -680,7 +684,7 @@ fn check_output(
   }
 }
 
-type CheckRun = { output: CommandOutput, reported: List<Diagnostic> }
+type CheckRun = { output: CommandOutput, reported: List<Diagnostic>, places: List<SourceText> }
 
 fn with_later_checks(
   style: Style,
@@ -696,8 +700,18 @@ fn with_later_checks(
   let broken = if unkept.len() > 0 { unkept }
   else { site_errors(s, later.reading, reported.places) };
   if broken.len() > 0 {
-    { output: rejected(style, "check", broken, reported.places), reported: broken }
-  } else { { output: check_output(style, flags, reported, promises), reported: reported.warnings } }
+    {
+      output: rejected(style, "check", broken, reported.places),
+      reported: broken,
+      places: reported.places,
+    }
+  } else {
+    {
+      output: check_output(style, flags, reported, promises),
+      reported: reported.warnings,
+      places: reported.places,
+    }
+  }
 }
 
 fn refused_output(flags: Flags, r: Refusal) -> CommandOutput / {abort.raise} = {
@@ -746,7 +760,7 @@ fn reported_of(s: Session<CheckReading>) -> Reported / {fs.read_file[shipped]} =
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {project_store::databases.open, process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
   let project = load_resolved(flags.paths);
   if flags.fix { check_and_fix(flags, project) } else { checked(flags, project).output }
 }
@@ -754,18 +768,27 @@ pub fn run(
 fn check_and_fix(
   flags: Flags,
   project: Project,
-) -> CommandOutput / {process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let result = fixes::fixed(placed_fixes(project, checked(flags, project).reported));
+) -> CommandOutput / {project_store::databases.open, process.err[proc], shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let first = checked(flags, project);
+  let result = fixes::fixed(placed_fixes(project, first.places, first.reported));
   let unwritten = result.files.fold([], |errors: List<String>, f: FixedFile|
     if write_file(f.file.at, f.text) { errors }
     else { errors.push("error: " ++ f.file.path ++ ": could not write") });
   let output = checked(flags, load_resolved(flags.paths)).output;
   {
     json: match output.json {
-      Object(members) -> Object(members.insert("fixed", changes_json(result.applied))),
+      Object(members) ->
+        Object(
+          members.insert("fixed", changes_json(result.applied)).insert(
+            "not_fixed",
+            unapplied_fixes_json(result.unapplied),
+          ),
+        ),
       other -> other,
     },
-    lines: change_lines(result.applied).concat(output.lines),
+    lines: change_lines(result.applied).concat(unapplied_lines(result.unapplied)).concat(
+      output.lines,
+    ),
     errs: output.errs.concat(unwritten),
     code: if unwritten.len() == 0 { output.code } else { compile_error },
   }
@@ -774,7 +797,7 @@ fn check_and_fix(
 fn checked(
   flags: Flags,
   project: Project,
-) -> CheckRun / {process.err[proc], shipped.read_pack, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, shipped.report_view_used} =
+) -> CheckRun / {project_store::databases.open, process.err[proc], shipped.read_pack, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, shipped.report_view_used} =
   match progress::reporting("checking", ||
       session_over(
         flags.paths,
@@ -783,7 +806,7 @@ fn checked(
         flags.verify_dependencies,
         |modules: Modules, read: ProgramSummary| check_reading(flags, modules, read),
       )) {
-    Err(r) -> { output: refused_output(flags, r), reported: r.diagnostics },
+    Err(r) -> { output: refused_output(flags, r), reported: r.diagnostics, places: r.places },
     Ok(s) -> {
       let reported = reported_of(s);
       match s.value.later {
@@ -791,6 +814,7 @@ fn checked(
           {
             output: check_output(style_of(flags), flags, reported, no_promises),
             reported: s.warnings,
+            places: reported.places,
           },
         Some(later) -> with_later_checks(style_of(flags), flags, reported, s, later),
       }

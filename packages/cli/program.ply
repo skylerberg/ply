@@ -5,8 +5,8 @@ import compiler.codes (unknown_name_code)
 import compiler.check.resolve.tables (error_unplaced)
 import sources (ProjectFiles)
 import compiler.cc (toolchain)
+import compiler.checkout (prefix_of)
 import project_store
-import compiler.store.database
 import compiler.load (Derives, LoadedAnalysis, SourceFile, report_viewed, derivation_result)
 import compiler.expand.derive (DeriverRequest)
 import compiler.front.diagnostics (ParsedSource, parse_from)
@@ -38,7 +38,7 @@ import compiler.check.termination (Terminates, unknown_summary)
 import compiler.check.resolve.tables (placed_in)
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Edit, Fix, Label, NoFix,
                                       Apply, ChooseOne, module_elsewhere, qualify)
-import fixes (FileEdit, PlacedFix)
+import fixes (FileEdit, PlacedFix, FixPlacement, Applicable, Unapplicable)
 import compiler.check.types (NamedType, FunctionType, tables_joined)
 import diagnostic (SourceText, position_of)
 import paths
@@ -96,29 +96,62 @@ pub fn packages_of(project: Project) -> PackageSources =
 fn own_places(project: Project) -> List<SourceText> =
   project.files.map(|file: File| { path: file.path, text: file.text })
 
-fn file_edit(project: Project, edit: Edit) -> Option<FileEdit> =
-  project.files.at(edit.module).map(|file: File|
-    { file: file, start: edit.start, end: edit.end, text: edit.text })
-
-fn placed_fix(project: Project, fix: Fix) -> Option<PlacedFix> =
-  match file_edit(project, fix.first) {
-    None -> None,
-    Some(first) ->
-      fix.rest.fold(
-        Some({ title: fix.title, first: first, rest: [] }),
-        |placed: Option<PlacedFix>, edit: Edit|
-          match ((placed, file_edit(project, edit))) {
-            (Some(p), Some(e)) -> Some({ ..p, rest: p.rest.push(e) }),
-            _ -> None,
-          },
-      ),
+fn file_edit(
+  project: Project,
+  places: List<SourceText>,
+  edit: Edit,
+) -> Result<FileEdit, String> =
+  match project.files.at(edit.module) {
+    Some(file) -> Ok({ file: file, start: edit.start, end: edit.end, text: edit.text }),
+    None -> Err(match places.at(edit.module) {
+      Some(place) -> "it edits `" ++ place.path ++ "`, which is not a file of this project",
+      None -> "it edits a module that has no file",
+    }),
   }
 
-pub fn placed_fixes(project: Project, diagnostics: List<Diagnostic>) -> List<PlacedFix> =
-  diagnostics.fold([], |found: List<PlacedFix>, d: Diagnostic|
+type Placing = | Fits(PlacedFix) | Outside(List<String>)
+
+fn with_edit(placing: Placing, edit: Result<FileEdit, String>) -> Placing =
+  match ((placing, edit)) {
+    (Fits(placed), Ok(e)) -> Fits({ ..placed, rest: placed.rest.push(e) }),
+    (Fits(_), Err(reason)) -> Outside([reason]),
+    (Outside(reasons), Ok(_)) -> Outside(reasons),
+    (Outside(reasons), Err(reason)) -> Outside(reasons.push_unique(reason)),
+  }
+
+fn placed_fix(
+  project: Project,
+  places: List<SourceText>,
+  fix: Fix,
+) -> FixPlacement = {
+  let first = match file_edit(project, places, fix.first) {
+    Ok(e) -> Fits({ title: fix.title, first: e, rest: [] }),
+    Err(reason) -> Outside([reason]),
+  };
+  match fix.rest.fold(first, |placing: Placing, edit: Edit|
+      with_edit(placing, file_edit(project, places, edit))) {
+    Fits(placed) -> Applicable(placed),
+    Outside(reasons) -> Unapplicable({ title: fix.title, reason: String::join(reasons, "; ") }),
+  }
+}
+
+fn alternatives_left(diagnostic: Diagnostic, fixes: List<Fix>) -> FixPlacement =
+  Unapplicable({
+    title: diagnostic.message,
+    reason: "it offers " ++ fixes.len().to_string() ++ " fixes to choose from: "
+      ++ String::join(fixes.map(|f: Fix| String::of_bytes_lossy(f.title)), "; "),
+  })
+
+pub fn placed_fixes(
+  project: Project,
+  places: List<SourceText>,
+  diagnostics: List<Diagnostic>,
+) -> List<FixPlacement> =
+  diagnostics.fold([], |found: List<FixPlacement>, d: Diagnostic|
     match d.fixes {
-      Apply(fix) -> match placed_fix(project, fix) { Some(p) -> found.push(p), None -> found },
-      ChooseOne(_, _, _) -> found,
+      Apply(fix) -> found.push(placed_fix(project, places, fix)),
+      ChooseOne(first, second, rest) ->
+        found.push(alternatives_left(d, [first, second].concat(rest))),
       NoFix -> found,
     })
 
@@ -268,7 +301,7 @@ pub fn renamed_resolution(
   }
 }
 
-pub effect set ProgramStore = {shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], ProjectFiles, Derives}
+pub effect set ProgramStore = {project_store::databases.open, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], ProjectFiles, Derives}
 
 pub fn in_program_store<a>(
   place: ProgramPlace,
@@ -276,9 +309,7 @@ pub fn in_program_store<a>(
 ) -> Opened<a> / {ProgramStore, progress.write, abort.raise} =
   match place.store {
     None -> module_queries::temporary_session(place.project, work),
-    Some(r) -> if r.label == "cwd" {
-      module_queries::stored_session[cwd](store_of(r), place.project, work)
-    } else { module_queries::stored_session[abs](store_of(r), place.project, work) },
+    Some(r) -> module_queries::stored_session(project_store::database_place(r), place.project, work),
   }
 
 fn slots_of(project: Project) -> List<String> / {abort.raise} =
@@ -286,9 +317,6 @@ fn slots_of(project: Project) -> List<String> / {abort.raise} =
     project.root_key,
     project.packages.map(|package: DependencyPackage| package.root),
   )
-
-pub fn store_of(resolved: paths::ResolvedPath) -> String =
-  database::database_in(project_store::cache_dir_in(resolved))
 
 pub type Phases = { read_ms: Int, front_end_ms: Int, store_ms: Int }
 
@@ -391,7 +419,7 @@ pub fn session<a>(
   paths: List<paths::ResolvedPath>,
   verify: Bool,
   work: (Modules, ProgramSummary) -> a / {memo.read, fact_inspection.read, abort.raise},
-) -> Result<Session<a>, Refusal> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, progress.write, abort.raise, diverges} = {
+) -> Result<Session<a>, Refusal> / {project_store::databases.open, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, progress.write, abort.raise, diverges} = {
   let started = time.elapsed_ms();
   session_over(paths, load_resolved(paths), started, verify, work)
 }
@@ -402,71 +430,105 @@ pub fn session_over<a>(
   started: Int,
   verify: Bool,
   work: (Modules, ProgramSummary) -> a / {memo.read, fact_inspection.read, abort.raise},
-) -> Result<Session<a>, Refusal> / {shipped.read_pack, toolchain.reuse_dir, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, progress.write, abort.raise} = {
+) -> Result<Session<a>, Refusal> / {project_store::databases.open, shipped.read_pack, toolchain.reuse_dir, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, progress.write, abort.raise} = {
   let read_ms = time.elapsed_ms() - started;
-  if project.diagnostics.len() > 0 {
-    Err(refused_before(own_places(project), project.diagnostics, read_ms))
-  } else if project.sources.len() == 0 {
-    Err(
-      refused_before(
-        [],
-        [no_ply_files(match paths.at(0) { Some(r) -> r.display, None -> "." })],
-        read_ms,
-      ),
-    )
-  } else {
-    let published = if verify { interfaces::published_interfaces(slots_of(project)) } else { [] };
-    let place = { project: project, store: paths.at(0) };
-    let tree = match paths.at(0) { Some(root) -> toolchain_tree(root.part), None -> NoTree };
-    let opened = in_program_store(place, |w: LoadInputs|
-      reached(project, tree, w, published, work));
-    let own = project_sources(project);
-    let phases = {
-      read_ms: read_ms,
-      front_end_ms: time.elapsed_ms() - started - read_ms,
-      store_ms: 0,
-    };
-    let refused = |places: List<SourceText>, diagnostics: List<Diagnostic>|
-      Err({
-        diagnostics: diagnostics,
-        places: places,
+  match ((project.diagnostics, toolchain_tree_of(paths))) {
+    ([_, ..], _) -> Err(refused_before(own_places(project), project.diagnostics, read_ms)),
+    ([], Err(mixed)) -> Err(refused_before(own_places(project), [mixed], read_ms)),
+    ([], Ok(tree)) -> if project.sources.len() == 0 {
+      Err(
+        refused_before(
+          [],
+          [no_ply_files(match paths.at(0) { Some(r) -> r.display, None -> "." })],
+          read_ms,
+        ),
+      )
+    } else { opened_over(paths, project, started, read_ms, verify, tree, work) },
+  }
+}
+
+fn toolchain_tree_of(paths: List<paths::ResolvedPath>) -> Result<ToolchainTree, Diagnostic> =
+  match paths {
+    [] -> Ok(NoTree),
+    [first, ..rest] -> if rest.all(|r: paths::ResolvedPath| r.part == first.part) {
+      Ok(toolchain_tree(first.part))
+    } else { Err(parts_mixed(paths)) },
+  }
+
+fn parts_mixed(paths: List<paths::ResolvedPath>) -> Diagnostic =
+  error_unplaced(
+    b"E0502",
+    b"the paths lie in different parts of the toolchain",
+    b"name paths in one part at a time",
+    paths.map(|r: paths::ResolvedPath|
+      Bytes::of_string(
+        "`" ++ r.display ++ "` "
+          ++ match r.part {
+            None -> "is in no part of the toolchain",
+            Some(role) -> "is in the `" ++ prefix_of(role) ++ "` part",
+          },
+      )),
+  )
+
+fn opened_over<a>(
+  paths: List<paths::ResolvedPath>,
+  project: Project,
+  started: Int,
+  read_ms: Int,
+  verify: Bool,
+  tree: ToolchainTree,
+  work: (Modules, ProgramSummary) -> a / {memo.read, fact_inspection.read, abort.raise},
+) -> Result<Session<a>, Refusal> / {project_store::databases.open, shipped.read_pack, toolchain.reuse_dir, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Derives, progress.write, abort.raise} = {
+  let published = if verify { interfaces::published_interfaces(slots_of(project)) } else { [] };
+  let place = { project: project, store: paths.at(0) };
+  let opened = in_program_store(place, |w: LoadInputs|
+    reached(project, tree, w, published, work));
+  let own = project_sources(project);
+  let phases = {
+    read_ms: read_ms,
+    front_end_ms: time.elapsed_ms() - started - read_ms,
+    store_ms: 0,
+  };
+  let refused = |places: List<SourceText>, diagnostics: List<Diagnostic>|
+    Err({
+      diagnostics: diagnostics,
+      places: places,
+      tallies: opened.tallies,
+      missing_results: opened.missing_results,
+      phases: phases,
+    });
+  let reach = opened.value;
+  match reach.value {
+    None -> if reach.packaged.len() > 0 {
+      refused(own.modules.concat(own.manifests), reach.packaged)
+    } else {
+      refused(
+        own.modules.concat(reach.read.pulled.map(pulled_place)).concat(own.manifests),
+        reach.rejected,
+      )
+    },
+    Some(value) -> {
+      let opened_session = {
+        paths: paths,
+        project: project,
+        place: place,
+        inputs: opened.inputs,
+        modules: {
+          root: project.sources.len(),
+          own: opened.inputs.own,
+          pulled: reach.read.pulled,
+        },
+        summary: reach.read,
+        warnings: reach.warnings.concat(project_store::problem_diagnostics(opened.problems)),
+        value: value,
         tallies: opened.tallies,
         missing_results: opened.missing_results,
         phases: phases,
-      });
-    let reach = opened.value;
-    match reach.value {
-      None -> if reach.packaged.len() > 0 {
-        refused(own.modules.concat(own.manifests), reach.packaged)
-      } else {
-        refused(
-          own.modules.concat(reach.read.pulled.map(pulled_place)).concat(own.manifests),
-          reach.rejected,
-        )
-      },
-      Some(value) -> {
-        let opened_session = {
-          paths: paths,
-          project: project,
-          place: place,
-          inputs: opened.inputs,
-          modules: {
-            root: project.sources.len(),
-            own: opened.inputs.own,
-            pulled: reach.read.pulled,
-          },
-          summary: reach.read,
-          warnings: reach.warnings.concat(project_store::damage_diagnostics(opened.damage)),
-          value: value,
-          tallies: opened.tallies,
-          missing_results: opened.missing_results,
-          phases: phases,
-        };
-        if reach.mismatches.len() > 0 {
-          refused(own.modules.concat(own.manifests), reach.mismatches)
-        } else { Ok(opened_session) }
-      },
-    }
+      };
+      if reach.mismatches.len() > 0 {
+        refused(own.modules.concat(own.manifests), reach.mismatches)
+      } else { Ok(opened_session) }
+    },
   }
 }
 

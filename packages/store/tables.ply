@@ -9,7 +9,8 @@ import compiler.store.hash.graph (HeldValue)
 import engine (Store, Lookup, Hit, Miss, Bad, Warning, WarningKind, Corrupt, Unreadable,
                OtherVersion, Row, open, get, put, drop, keys, flush, stats, warn, messages,
                pending_count, pending_rows, without_pending, with_rows, name_key, contains_key)
-import compiler.store.database (database_in)
+import compiler.store.database (database_in, open_database)
+import compiler.store.fact_store (Opening)
 import fake (run_in_memory)
 import std.hash (blake3)
 
@@ -70,8 +71,8 @@ pub const schema: Bytes =
 
 pub type Cache = { store: Store, stamps: Stamps }
 
-pub fn open_cache<[r]>(dir: String, stamps: Stamps) -> Cache / {fs.read[r], abort.raise} =
-  { store: check_stamps(open[r](database_in(dir), schema), stamps), stamps: stamps }
+pub fn open_cache<[r]>(database: Opening, stamps: Stamps) -> Cache / {fs.read[r], abort.raise} =
+  { store: check_stamps(open[r](database, schema), stamps), stamps: stamps }
 
 const stamps_key: Bytes = named_key(b"stamps")
 
@@ -601,6 +602,8 @@ pub fn prune(cache: Cache) -> Cache / {abort.raise} = {
 
 const test_stamps: Stamps = { runtime_digest: "runtime", code: "code" }
 
+fn cache_database() -> Opening / {fs.write[mem]} = open_database[mem](database_in("cache"))
+
 fn module_record_with_names(names: List<String>) -> Bytes / {abort.raise} =
   bin::encode(
     {
@@ -634,7 +637,7 @@ fn record_in(modules: List<Bytes>) -> PassRecord =
 test "every table round-trips through a flush and a reopen" {
   let m = module_record_with_names(["m.f"]);
   let run = run_in_memory(mem_empty(), || {
-    let c1 = open_cache[mem]("cache", test_stamps);
+    let c1 = open_cache[mem](cache_database(), test_stamps);
     let c2 = put_text(c1, name_key("m.f"), b"fn f() -> Int = 1\n");
     let c3 = put_snapshot(put_module_record(c2, m), [record_digest(m)]);
     let c4 = put_pass_record(
@@ -652,7 +655,7 @@ test "every table round-trips through a flush and a reopen" {
       specs: [name_key("s")],
     });
     let c = flush_cache[mem](c5);
-    let r = open_cache[mem]("cache", test_stamps);
+    let r = open_cache[mem](cache_database(), test_stamps);
     assert_eq(text(r, name_key("m.f")).value, Some(b"fn f() -> Int = 1\n"));
     assert_eq(text(r, name_key("m.g")).value, None);
     assert(has_text(r, name_key("m.f")) && !has_text(r, name_key("m.g")));
@@ -679,7 +682,7 @@ test "every table round-trips through a flush and a reopen" {
 test "recording a snapshot or module record again writes nothing, and a module record filed under a name other than its digest is not read and warns" {
   let m = module_record_with_names(["m.f"]);
   let run = run_in_memory(mem_empty(), || {
-    let c = put_snapshot(put_module_record(open_cache[mem]("cache", test_stamps), m), [
+    let c = put_snapshot(put_module_record(open_cache[mem](cache_database(), test_stamps), m), [
       record_digest(m),
     ]);
     let passes_kept = put_snapshot(put_module_record(c, m), [record_digest(m)]);
@@ -698,7 +701,7 @@ test "`prune` deletes cached texts, snapshots and module records that no passing
   let live = module_record_with_names(["m.passed", "m.stale"]);
   let dead = module_record_with_names(["m.orphan"]);
   let run = run_in_memory(mem_empty(), || {
-    let c0 = open_cache[mem]("cache", test_stamps);
+    let c0 = open_cache[mem](cache_database(), test_stamps);
     let c1 = put_pass_record(
       put_snapshot(
         put_snapshot(put_module_record(put_module_record(c0, live), dead), [record_digest(dead)]),
@@ -710,7 +713,7 @@ test "`prune` deletes cached texts, snapshots and module records that no passing
     let c2 = ["m.passed", "m.stale", "m.orphan", "t"].fold(c1, |cache: Cache, n: String|
       put_text(cache, name_key(n), b"v"));
     let pruned_cache = flush_cache[mem](prune(c2));
-    let r = open_cache[mem]("cache", test_stamps);
+    let r = open_cache[mem](cache_database(), test_stamps);
     {
       texts: ["m.passed", "m.stale", "m.orphan", "t"].map(|n: String| has_text(r, name_key(n))),
       modules: [live, dead].map(|m: Bytes| has_module_record(r, record_digest(m))),
@@ -723,7 +726,7 @@ test "`prune` deletes cached texts, snapshots and module records that no passing
 test "`prune` deletes test passes that no pass record lists, and keeps the passes they list" {
   let run = run_in_memory(mem_empty(), || {
     let m = module_record_with_names(["m.f"]);
-    let c0 = put_snapshot(put_module_record(open_cache[mem]("cache", test_stamps), m), [
+    let c0 = put_snapshot(put_module_record(open_cache[mem](cache_database(), test_stamps), m), [
       record_digest(m),
     ]);
     let c1 = put_pass_record(c0, b"m.t", record_in([record_digest(m)]));
@@ -736,7 +739,7 @@ test "`prune` deletes test passes that no pass record lists, and keeps the passe
       b"",
     );
     let flushed = flush_cache[mem](c3);
-    let r = open_cache[mem]("cache", test_stamps);
+    let r = open_cache[mem](cache_database(), test_stamps);
     [
       passed(r, name_key("result")).value,
       passed(r, name_key("stale")).value,
@@ -749,14 +752,14 @@ test "`prune` deletes test passes that no pass record lists, and keeps the passe
 
 test "`prune` deletes proof evidence that no module's claims list, and keeps the evidence they list" {
   let run = run_in_memory(mem_empty(), || {
-    let c0 = put_module_claims(open_cache[mem]("cache", test_stamps), b"m", {
+    let c0 = put_module_claims(open_cache[mem](cache_database(), test_stamps), b"m", {
       identity: b"",
       claims: b"",
       evidence: [name_key("listed")],
     });
     let c1 = put_evidence(put_evidence(c0, name_key("listed"), b"a"), name_key("stale"), b"b");
     let c = flush_cache[mem](c1);
-    let r = open_cache[mem]("cache", test_stamps);
+    let r = open_cache[mem](cache_database(), test_stamps);
     [evidence(r, name_key("listed")).value, evidence(r, name_key("stale")).value]
   });
   assert_eq(run.value, [Some(b"a"), None])
@@ -765,11 +768,11 @@ test "`prune` deletes proof evidence that no module's claims list, and keeps the
 test "two runs update different entries both keep theirs" {
   let run = run_in_memory(mem_empty(), || {
     let claims = |text: Bytes| { identity: b"", claims: text, evidence: [] };
-    let a = put_module_claims(open_cache[mem]("cache", test_stamps), b"m.a", claims(b"A"));
-    let b = put_module_claims(open_cache[mem]("cache", test_stamps), b"m.b", claims(b"B"));
+    let a = put_module_claims(open_cache[mem](cache_database(), test_stamps), b"m.a", claims(b"A"));
+    let b = put_module_claims(open_cache[mem](cache_database(), test_stamps), b"m.b", claims(b"B"));
     let a1 = flush_cache[mem](a);
     let b1 = flush_cache[mem](b);
-    let r = open_cache[mem]("cache", test_stamps);
+    let r = open_cache[mem](cache_database(), test_stamps);
     [b"m.a", b"m.b"].map(|m: Bytes|
       match module_claims(r, m).value { Some(c) -> c.claims, None -> b"" })
   });
@@ -778,7 +781,7 @@ test "two runs update different entries both keep theirs" {
 
 test "recording a text under a hash that already has a text writes nothing and leaves the first text unchanged" {
   let run = run_in_memory(mem_empty(), || {
-    let first = put_text(open_cache[mem]("cache", test_stamps), name_key("m.f"), b"F");
+    let first = put_text(open_cache[mem](cache_database(), test_stamps), name_key("m.f"), b"F");
     let again = put_text(first, name_key("m.f"), b"F // a comment");
     { pending: pending_count(again.store), retained: text(again, name_key("m.f")).value }
   });
@@ -787,7 +790,7 @@ test "recording a text under a hash that already has a text writes nothing and l
 
 test "a passing result saved with its test's code is still found after the runtime digest changes, but is lost once the code stamp changes too" {
   let run = run_in_memory(mem_empty(), || {
-    let a = open_cache[mem]("cache", test_stamps);
+    let a = open_cache[mem](cache_database(), test_stamps);
     let _recorded = flush_cache[mem](
       put_code_record(
         put_passed_code(put_passed(a, name_key("result"), b""), name_key("code"), b""),
@@ -795,8 +798,8 @@ test "a passing result saved with its test's code is still found after the runti
         [name_key("code")],
       ),
     );
-    let moved = open_cache[mem]("cache", { ..test_stamps, runtime_digest: "another" });
-    let recoded = open_cache[mem]("cache", {
+    let moved = open_cache[mem](cache_database(), { ..test_stamps, runtime_digest: "another" });
+    let recoded = open_cache[mem](cache_database(), {
       ..test_stamps,
       runtime_digest: "another",
       code: "another",
@@ -814,7 +817,7 @@ test "cache entries written by a different build are discarded with a single war
   let run = run_in_memory(mem_empty(), || {
     let c0 = put_code_record(
       put_passed_code(
-        put_passed(open_cache[mem]("cache", test_stamps), name_key("t"), b""),
+        put_passed(open_cache[mem](cache_database(), test_stamps), name_key("t"), b""),
         name_key("code"),
         b"",
       ),
@@ -824,15 +827,15 @@ test "cache entries written by a different build are discarded with a single war
     let c1 = put_review(c0, b"m.f", { definition: name_key("m.f"), specs: [] });
     let written = flush_cache[mem](c1);
     let moved = { ..test_stamps, runtime_digest: "elsewhere" };
-    let r = open_cache[mem]("cache", moved);
+    let r = open_cache[mem](cache_database(), moved);
     let warned = messages(r.store.warnings);
-    let passes_kept = flush_cache[mem](open_cache[mem]("cache", moved));
+    let passes_kept = flush_cache[mem](open_cache[mem](cache_database(), moved));
     {
       warned: warned,
       passed: passed(r, name_key("t")).value,
       code: passed_code(r, name_key("code")).value,
       review: review(r, b"m.f").value != None,
-      later: messages(open_cache[mem]("cache", moved).store.warnings),
+      later: messages(open_cache[mem](cache_database(), moved).store.warnings),
     }
   });
   assert_eq(run.value.warned, [
@@ -847,12 +850,12 @@ test "cache entries written by a different build are discarded with a single war
 test "opening a cache written by a different runtime warns once and returns no stored test result or evidence" {
   let run = run_in_memory(mem_empty(), || {
     let c0 = put_evidence(
-      put_passed(open_cache[mem]("cache", test_stamps), name_key("t"), b""),
+      put_passed(open_cache[mem](cache_database(), test_stamps), name_key("t"), b""),
       name_key("claim"),
       b"evidence",
     );
     let written = flush_cache[mem](c0);
-    let r = open_cache[mem]("cache", { ..test_stamps, runtime_digest: "another runtime" });
+    let r = open_cache[mem](cache_database(), { ..test_stamps, runtime_digest: "another runtime" });
     {
       warned: messages(r.store.warnings).len(),
       passed: passed(r, name_key("t")).value,

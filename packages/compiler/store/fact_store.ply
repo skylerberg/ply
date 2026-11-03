@@ -224,12 +224,33 @@ fn fresh_database(dir: String, manifest: Manifest) -> Database =
     log_floor: 0,
   }
 
-pub opaque type Opening = | Opening({ blank: Database, file: segments::ManifestFile })
+pub opaque type Opening = | Opening({ dir: String, run: Option<String> })
+
+type Current = { blank: Database, file: segments::ManifestFile }
+
+fn current<[r]>(opening: Opening) -> Current / {fs.read[r], abort.raise} =
+  match opening {
+    Opening(o) -> {
+      let file = segments::manifest_file[r](o.dir, schema);
+      let manifest = segments::listed(file);
+      {
+        blank: {
+          ..fresh_database(o.dir, manifest),
+          run: o.run,
+          token: segments::segment_token(o.run, manifest.generation, 0),
+          writing: if o.run == None { segments::failed_writer } else { segments::new_writer },
+        },
+        file: file,
+      }
+    },
+  }
 
 pub const unreadable_manifest: String = "its manifest does not read"
 
-pub fn emptied(opening: Opening) -> Database =
-  match opening { Opening(o) -> { ..o.blank, starts_over: true } }
+pub fn emptied<[r]>(opening: Opening) -> Database / {fs.read[r], abort.raise} = {
+  let now = current[r](opening);
+  { ..now.blank, starts_over: true }
+}
 
 type StoredState = { roots: List<fact_tree::TreeChild>, log_end: Int }
 
@@ -258,8 +279,10 @@ fn with_stored_state<[r]>(
 
 pub fn loaded<[r]>(
   opening: Opening,
-) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match opening { Opening(o) -> with_stored_state[r](o.blank, o.file) }
+) -> Database / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let now = current[r](opening);
+  with_stored_state[r](now.blank, now.file)
+}
 
 pub fn read_only<[r]>(
   dir: String,
@@ -268,23 +291,11 @@ pub fn read_only<[r]>(
   with_stored_state[r](fresh_database(dir, segments::listed(file)), file)
 }
 
-pub fn open<[r]>(dir: String) -> Opening / {fs.read[r], fs.write[r], abort.raise} = {
-  let file = segments::manifest_file[r](dir, schema);
-  let manifest = segments::listed(file);
-  let run = segments::start_run[r](dir);
-  Opening({
-    blank: {
-      ..fresh_database(dir, manifest),
-      run: run,
-      token: segments::segment_token(run, manifest.generation, 0),
-      writing: if run == None { segments::failed_writer } else { segments::new_writer },
-    },
-    file: file,
-  })
-}
+pub fn open<[r]>(dir: String) -> Opening / {fs.write[r]} =
+  Opening({ dir: dir, run: segments::start_run[r](dir) })
 
 pub fn close<[r]>(opening: Opening) -> Unit / {fs.write[r]} =
-  match opening { Opening(o) -> segments::end_run[r](o.blank.run) }
+  match opening { Opening(o) -> segments::end_run[r](o.run) }
 
 fn pending_in(db: Database, tree: Int) -> Map<Bytes, Option<Bytes>> =
   match db.pending.get(tree) { Some(entries) -> entries, None -> Map::new() }
@@ -952,7 +963,7 @@ test "a tree node that fails its checksum raises `damaged`, and starting over re
         value_of[abs](db, Facts, key_of("first")) == None
       } with {
         fact_damage.damaged(_) -> {
-          committed_over[abs](emptied(opening));
+          committed_over[abs](emptied[abs](opening));
           true
         },
       }
