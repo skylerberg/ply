@@ -1,15 +1,15 @@
+import compiler.check.infer.checker (decode_facts, RecordedFacts)
 import compiler.emit.print.lists (item_function)
 import compiler.emit.print.probe (probed_fn, probed_helper)
 import compiler.check.resolve.tables (Source, qualify)
-import compiler.check.infer (decode_facts)
 import compiler.check.types (Type, NamedType, RecordType, SingletonResource, int_type, bytes_type,
                              string_type, decode_type, float_type, unit_type, bool_type, list_type,
                              option_type, map_type, iter_type)
 import compiler.check.known (ordering_type, result_type, array_type, columns_type)
 import compiler.emit.typing (unknown_type)
 import compiler.front
-import compiler.front.rows (Rows, KnownDefinitionRow, Dump, ConstructorRow, EmitterConstructor)
-import compiler.front.published (analyse, analyse_with, no_rows, dump_of)
+import compiler.front.rows (KnownDefinitionRow, Dump, ConstructorRow, EmitterConstructor)
+import compiler.front.published (analyse, dump_of)
 import compiler.front (analyse_pulling_std_with)
 import std.list
 import compiler.front.diagnostics (parse_all)
@@ -1756,7 +1756,6 @@ fn outputs_reachable_from(
   let analysed = analyse_pulling_std_with(
     zip_sources([b"m"], [module_source]),
     shipped,
-    no_rows,
   ).out;
   let a = accepted(analysed);
   let s = scope_of(a, true, start);
@@ -3167,7 +3166,6 @@ test "the emitter writes an embed out as the front end's result says it was read
     analyse_pulling_std_with(
       [{ name: b"m", source_text: source }],
       [],
-      no_rows,
       { root: b"", manifest: None, supplied: [] },
       [{ root: b"", module: b"m", want: want, read: Ok([embed_file(b"", b"one")]) }],
     ).out,
@@ -3186,7 +3184,6 @@ test "an extern in a standard library module is called with raw machine values w
     analyse_pulling_std_with(
       [{ name: b"m", source_text: sources.get(1) }],
       [{ name: b"std.native", source_text: sources.get(0) }],
-      no_rows,
     ).out,
   );
   let results_of = |key: RootKey| emit_root_results(a, [key]);
@@ -3444,7 +3441,7 @@ fn outputs_at(
   let given = zip_sources(names, sources);
   emit_root_results(
     accepted(if shipped.len() == 0 { analyse(parse_all(given)) }
-    else { analyse_pulling_std_with(given, shipped, no_rows).out }),
+    else { analyse_pulling_std_with(given, shipped).out }),
     wanted,
     published,
   )
@@ -3844,54 +3841,15 @@ fn site_fixture_with(above: Bytes, body: Bytes) -> List<Source> =
     { name: b"b", source_text: b"pub fn twice<a>(x: a) -> a\n  where numeric(a)\n= x + x\n" },
   ]
 
-fn site_fixture_outputs(
-  analysed: emitter_input::AnalysisOutcome,
-) -> List<RootOutput> / {abort.raise} =
-  emit_root_results(accepted(analysed), [
-    Named(b"a.moved"),
-    test_key(b"a", b"moves"),
-    Named(b"b.twice"),
-  ])
-
-test "a body is lowered from the facts recorded for it, whether they come from a fresh analysis or from stored results" {
-  let fresh = analyse(parse_all(site_fixture(b"")));
-  let walked = dump_of(fresh);
-  let recorded = walked.rows.definitions.fold(b"", |accumulator: Bytes, row: KnownDefinitionRow|
-    if row.name == b"a.moved" { row.facts } else { accumulator });
-  match decode_facts(recorded, 0, b"a.moved") {
-    None -> panic("the row records what the walk read"),
-    Some(f) -> assert(f.bodies.len() > 0),
-  };
-  let seeded = analyse_with(parse_all(site_fixture(b"")), walked.rows);
-  match seeded {
-    emitter_input::Rejected(_) -> panic("the test program fails to check"),
-    emitter_input::Analysed(w) ->
-      assert_eq(front::not_written(w.checked.seeded), [b"b.twice", b"a.moved"]),
-  };
-  assert_eq(site_fixture_outputs(seeded), site_fixture_outputs(fresh))
-}
-
-fn analysed_with_rows(
-  sources: List<Source>,
-  rows: Rows,
-) -> emitter_input::AnalysisOutcome / {abort.raise} =
-  analyse_pulling_std_with(sources, [], rows).out
-
-test "a body lowered from stored facts is still correct after its definition moves in the file" {
-  let before = dump_of(analysed_with_rows(site_fixture(b""), no_rows));
-  let after = site_fixture(b"// a comment, and a definition, above it\nfn aside() -> Int = 7\n");
-  let seeded = analysed_with_rows(after, before.rows);
-  match seeded {
-    emitter_input::Rejected(_) -> panic("the test program fails to check"),
-    emitter_input::Analysed(w) -> {
-      assert_eq(front::not_written(w.checked.seeded), [b"b.twice", b"a.moved"]);
-      assert_eq(
-        w.checked.seeded.filter(|n: Bytes| front::used_prelude_functions.contains(n)),
-        front::used_prelude_functions,
-      )
+test "a definition's row records the facts that lowering its body reads" {
+  let walked = dump_of(analyse(parse_all(site_fixture(b""))));
+  match walked.rows.definitions.find(|row: KnownDefinitionRow| row.name == b"a.moved") {
+    Some(row) -> match row.facts {
+      Some(recorded) -> assert(decode_facts(recorded, 0, b"a.moved").bodies.len() > 0),
+      None -> panic("the row records what the walk read"),
     },
-  };
-  assert_eq(site_fixture_outputs(seeded), site_fixture_outputs(analysed_with_rows(after, no_rows)))
+    None -> panic("the program has no definition `a.moved`"),
+  }
 }
 
 const connections: Bytes =
@@ -3899,23 +3857,14 @@ const connections: Bytes =
 
 const owning: Bytes = b"{ let c = open(); { ..p, x: send(c, 3) } }"
 
-test "a body lowered from stored facts still releases the values it owns after its definition moves in the file" {
-  let before = dump_of(analysed_with_rows(site_fixture_with(connections, owning), no_rows));
-  let after = site_fixture_with(b"// a comment above it\n".concat(connections), owning);
-  assert_eq(
-    site_fixture_outputs(analysed_with_rows(after, before.rows)),
-    site_fixture_outputs(analysed_with_rows(after, no_rows)),
-  )
-}
-
 test "the facts recorded for a body are the same wherever its definition appears in the file" {
   let facts_of = |sources: List<Source>| {
-    let d = dump_of(analysed_with_rows(sources, no_rows));
-    d.rows.definitions.fold(b"", |accumulator: Bytes, row: KnownDefinitionRow|
+    let d = dump_of(analyse_pulling_std_with(sources, []).out);
+    d.rows.definitions.fold(None, |accumulator: Option<RecordedFacts>, row: KnownDefinitionRow|
       if row.name == b"a.moved" { row.facts } else { accumulator })
   };
   let here = facts_of(site_fixture(b""));
-  assert(here.len() > 1);
+  assert(here != None);
   assert_eq(
     facts_of(site_fixture(b"// a comment, and a definition, above it\nfn aside() -> Int = 7\n")),
     here,

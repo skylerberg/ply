@@ -12,16 +12,15 @@ import compiler.front.owner_checks
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of, view_dump,
                                      inferred_facts_bin)
 import compiler.front.rows (known_definition_row_bin)
-import compiler.front.published (no_rows, analyse, dump_of)
-import compiler.front (published, load_with_shipped, analyse_pulling_std_with, faceted,
-                       checked_staged)
+import compiler.front.published (dump_of)
+import compiler.front (load_with_shipped, analyse_pulling_std_with, faceted)
 import compiler.front.facts (ModuleShape, ModuleTables, Analysis, AssembledLoad, CheckedProgram,
                              assembled_program, assembled_load, functions_of, tests_of, NoTree)
 import compiler.syntax.items (derivation_bin)
 import compiler.expand.derive (Generated, derivation_at_bin, deriver_response_bin)
 import std.value
 import std.value (VList, VRecord, VStr)
-import compiler.front.diagnostics (parse_all, with_prelude_source)
+import compiler.front.diagnostics (with_prelude_source)
 import compiler.syntax.expressions (prelude_module)
 import compiler.expand.embed (EmbedFile, embed_file)
 import compiler.check.resolve.tables (Source, Diagnostic, backticked)
@@ -46,23 +45,22 @@ import compiler.front.checking.groups (GroupKey, module_listing_query, module_co
 import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, CheckedModule,
                                 facts_of_result, checked_program_from_results, query_load,
                                 hashed_all, cycles_among, root_warnings, rejected_first,
-                                PublicationSummary, RejectionSummary, OutcomeSummary,
+                                OutcomeSummary,
                                 outcome_summary, reject_embed, nothing_derived, over_decoding,
                                 queried_over, prelude_frames, prelude_files, lookup_input_alone,
-                                inputs_alone, queried_results, outcome_of, Step, product_queries,
+                                inputs_alone, Step, product_queries,
                                 check_sources, layered, module_of, checked_with_write_limit,
                                 listed_module)
 import compiler.store.database (AllWrites, FailAfter, same_database_in_memory)
 
-type Reference = { whole: OutcomeSummary, own_hashes: OwnHashes, results: List<CheckedModule> }
+type Reference = { outcome: OutcomeSummary, own_hashes: OwnHashes }
+
+fn from_nothing(sources: List<Source>) -> OutcomeSummary / {abort.raise} =
+  outcome_summary(queried_over(fs::mem_empty(), sources).outcome)
 
 fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
-  let fresh = queried_results(fresh_registry(), fs::mem_empty(), sources);
-  {
-    whole: outcome_summary(analyse(parse_all(sources))),
-    own_hashes: fresh.own_hashes,
-    results: fresh.results,
-  }
+  let fresh = queried_over(fs::mem_empty(), sources);
+  { outcome: outcome_summary(fresh.outcome), own_hashes: fresh.own_hashes }
 }
 
 fn sources_key(sources: List<Source>) -> Bytes =
@@ -80,19 +78,9 @@ fn edit_session_over(store: fs::MemFs) -> EditSession =
 
 fn with_step(s: EditSession, step: Step) -> EditSession / {abort.raise} = {
   let warm = queried_over(s.store, step.sources);
-  let now = outcome_summary(warm.outcome);
   let key = sources_key(step.sources);
   let r = match s.references.get(key) { Some(known) -> known, None -> reference_of(step.sources) };
-  let same_outcome = r.results == warm.results
-    || now == outcome_summary(outcome_of(step.sources, r.results));
-  let agrees = same_outcome && warm.own_hashes == r.own_hashes
-    && (match r.whole {
-      PublicationSummary(_) -> now == r.whole,
-      RejectionSummary(_) -> match now {
-        RejectionSummary(_) -> true,
-        PublicationSummary(_) -> false,
-      },
-    });
+  let agrees = outcome_summary(warm.outcome) == r.outcome && warm.own_hashes == r.own_hashes;
   {
     store: warm.store,
     references: s.references.insert(key, r),
@@ -1291,7 +1279,7 @@ test "assembling a program from per-module check results gives the same definiti
     (),
     |u: Unit, sources: List<Source>| {
       let fixed = check_sources(fs::mem_empty(), sources, []);
-      match analyse_pulling_std_with(sources, [], no_rows).out {
+      match analyse_pulling_std_with(sources, []).out {
         Rejected(_) -> panic("the fixture program was rejected by the checker"),
         Analysed(w) -> {
           let returned = assembled_program(
@@ -1403,7 +1391,7 @@ fn load_with_analysis(
     used_only,
     root_warnings(done.results, f.user.len()),
   );
-  match analyse_pulling_std_with(f.user, f.shipped, no_rows, cut_unused: used_only).out {
+  match analyse_pulling_std_with(f.user, f.shipped, cut_unused: used_only).out {
     Rejected(_) -> panic("the test program fails to check"),
     Analysed(whole) ->
       {
@@ -1525,7 +1513,7 @@ test "a function body that calls a method on a value records the same check resu
       b"",
       |accumulator: Bytes, x: DefinitionHash| if x.name == b"m.f" { x.body } else { accumulator },
     );
-    match analyse_pulling_std_with(fixture.sources, [], no_rows).out {
+    match analyse_pulling_std_with(fixture.sources, []).out {
       Rejected(_) -> panic("the fixture program was rejected by the checker"),
       Analysed(w) -> assert_eq(body_named(w.hashes.bodies, b"m.f"), returned),
     };
@@ -1577,7 +1565,7 @@ test "reverting a failing edit gives the original result" {
   let broken = queried_over(cold.store, source(b"n + true"));
   assert_eq(
     outcome_summary(broken.outcome),
-    outcome_summary(analyse(parse_all(source(b"n + true")))),
+    from_nothing(source(b"n + true")),
   );
   let mended = queried_over(broken.store, source(b"n + 1"));
   assert_eq(outcome_summary(mended.outcome), outcome_summary(cold.outcome))
@@ -1624,17 +1612,16 @@ test "when a set of definitions fails to check, its hash is computed without the
 test "edits to mutually recursive functions give the result of a check from scratch" {
   let before = paired(b"true", b"n");
   let cold = queried_over(fs::mem_empty(), before);
-  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = paired(b"n == 0", b"n");
   let warm = queried_over(cold.store, after);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after));
   let renamed = paired(b"n == 0", b"left");
   let again = queried_over(warm.store, renamed);
-  assert_eq(outcome_summary(again.outcome), outcome_summary(analyse(parse_all(renamed))));
+  assert_eq(outcome_summary(again.outcome), from_nothing(renamed));
   let broken = paired(b"n", b"left");
   assert_eq(
     outcome_summary(queried_over(again.store, broken).outcome),
-    outcome_summary(analyse(parse_all(broken))),
+    from_nothing(broken),
   )
 }
 
@@ -1664,10 +1651,9 @@ fn recursive_types_sources(more: Bytes) -> List<Source> =
 test "mutually recursive functions give the result of a check from scratch after a type they reach through a sibling gains a variant" {
   let before = recursive_types_sources(b"");
   let cold = queried_over(fs::mem_empty(), before);
-  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = recursive_types_sources(b" | Rest");
   let warm = queried_over(cold.store, after);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))))
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after))
 }
 
 fn derive_sources(more: Bytes) -> List<Source> =
@@ -1744,16 +1730,15 @@ fn stack_queue_sources(stack: Bytes, queue: Bytes) -> List<Source> =
 test "edits to definitions that are not mutually recursive give the result of a check from scratch" {
   let before = stack_queue_sources(b"xs.len()", b"f.len()");
   let cold = queried_over(fs::mem_empty(), before);
-  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
   let after = stack_queue_sources(b"xs.len() + 0", b"f.len()");
   let warm = queried_over(cold.store, after);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after));
   let calling = stack_queue_sources(b"xs.len() + 0", b"Stack(f).len()");
   let called = queried_over(warm.store, calling);
-  assert_eq(outcome_summary(called.outcome), outcome_summary(analyse(parse_all(calling))));
+  assert_eq(outcome_summary(called.outcome), from_nothing(calling));
   let moved = stack_queue_sources(b"0", b"Stack(f).len()");
   let resolved = queried_over(called.store, moved);
-  assert_eq(outcome_summary(resolved.outcome), outcome_summary(analyse(parse_all(moved))))
+  assert_eq(outcome_summary(resolved.outcome), from_nothing(moved))
 }
 
 fn shaped(shapes: Bytes, app: Bytes) -> List<Source> =
@@ -1785,7 +1770,7 @@ test "adding a function to a type and changing its signature give the result of 
     b"area(of: Shape) -> Int = match of",
   );
   let warm = queried_over(added.store, resigned);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(resigned))));
+  assert_eq(outcome_summary(warm.outcome), from_nothing(resigned));
   assert(match warm.outcome { Analysed(_) -> true, Rejected(_) -> false })
 }
 
@@ -2038,7 +2023,7 @@ test "a definition whose cached result becomes outdated while other definitions 
     b"pub fn go(n: Int) -> Int = lib::step(1) + shown(n)",
   );
   let warm = queried_over(queried_over(fs::mem_empty(), before).store, after);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after));
   assert_eq(warm.results, queried_over(fs::mem_empty(), after).results)
 }
 
@@ -2067,7 +2052,7 @@ test "when an edit breaks several definitions, each reports the same error as a 
   );
   let narrowed = lib_app_sources(b"pub fn step(n: Int, by: Int) -> Int = n + by\n");
   let warm = queried_over(cold.store, narrowed);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(narrowed))))
+  assert_eq(outcome_summary(warm.outcome), from_nothing(narrowed))
 }
 
 test "adding a definition to a standard library module gives the hashes of a check from scratch" {

@@ -1,7 +1,8 @@
 import std.set (Set)
 import std.graph (Visit, traverse)
 import compiler.check.infer.checker (with_no_other_definitions, CheckReads, StoredDeclarations,
-                                     no_stored_declarations)
+                                     no_stored_declarations, BodyFacts, decode_facts, no_body_facts,
+                                     RecordedFacts)
 import compiler.syntax.parsing (Span, Identifier, ParseDiagnostic, generated_span, moved_by,
                                 parse_diagnostic, parse_label, start)
 import compiler.syntax.items (Module, Item, FunctionItem, TypeItem, TestItem, LawItem, SumBody,
@@ -35,12 +36,11 @@ import compiler.check.typed (TypedBody, TypedExpression, TypedCall, TypedRead, R
                              BodyPart, WholeBody, MeasureBody, ClauseBody, TypedParam, body_retyped,
                              without_witnesses, typed_expression_nodes,
                              typed_expression_nodes_mapped, ReadBuiltin, without_releases)
-import compiler.check.infer (CheckOutput, BodyFacts, types_joined, types_named, decode_facts,
-                             no_body_facts, elaborate, terminating_definitions,
-                             measured_definitions, bodies_with, bodies_read, check_output_with,
-                             EmitFacts)
+import compiler.check.infer (CheckOutput, types_joined, types_named, elaborate,
+                             terminating_definitions, measured_definitions, bodies_with,
+                             bodies_read, check_output_with, EmitFacts)
 import compiler.check.infer.checker (DefinitionInfo, TestInfo, CachedFacts, BodyPlan, CheckEvery,
-                                     WitnessOrder, MemberSite, witness_params, Builtin, builtins,
+                                     CheckOnly, empty_cache, WitnessOrder, MemberSite, witness_params, Builtin, builtins,
                                      CheckedBody)
 import compiler.check.infer.definitions (natives_of)
 import compiler.emit.keys (test_owner, test_key, law_owner, Named, printed)
@@ -66,7 +66,7 @@ import compiler.front.rows (Cut, KeyRow, EmitterRoot, KnownDefinitionRow, KnownT
 import compiler.front.facts (Analysis, GroupAnalysis, PackageTables, hashed_analysis,
                              package_tables, tree_named, home_of, ToolchainTree, NoTree)
 import compiler.front.emitter_input (test_root_at, checked_program_of, view_dump, Analysed,
-                                     AnalysisOutcome, Rejected, cache_from_rows, InferredFacts,
+                                     AnalysisOutcome, Rejected, InferredFacts,
                                      inferred_facts_of, rows_from)
 
 pub const no_rows: Rows = { definitions: [], tests: [], laws: [], types: Map::new() }
@@ -129,17 +129,14 @@ fn joined_facts(g: BodyFacts, f: BodyFacts) -> BodyFacts =
 fn gathered(
   g: GatheredFacts,
   owner: Bytes,
-  recorded: Option<Bytes>,
+  recorded: Option<RecordedFacts>,
   module: Int,
 ) -> GatheredFacts / {abort.raise} =
   match g.missing {
     Some(_) -> g,
     None -> match recorded {
       None -> { ..g, missing: Some(owner) },
-      Some(bytes) -> match decode_facts(bytes, module, owner) {
-        None -> { ..g, missing: Some(owner) },
-        Some(f) -> { ..g, facts: joined_facts(g.facts, f) },
-      },
+      Some(r) -> { ..g, facts: joined_facts(g.facts, decode_facts(r, module, owner)) },
     },
   }
 
@@ -155,19 +152,22 @@ pub fn facts_read(
     match here.get(w.modules.get(i)) { Some(j) -> accumulator.insert(i, j), None -> accumulator });
   let definitions = rows.definitions.fold(
     Map::new(),
-    |accumulator: Map<Bytes, Bytes>, row: KnownDefinitionRow|
-      accumulator.insert(row.name, row.facts),
+    |accumulator: Map<Bytes, RecordedFacts>, row: KnownDefinitionRow|
+      match row.facts { Some(r) -> accumulator.insert(row.name, r), None -> accumulator },
   );
-  let tests = rows.tests.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, row: KnownTestRow|
-    accumulator.insert(row.owner, row.body_facts));
+  let tests = rows.tests.fold(
+    Map::new(),
+    |accumulator: Map<Bytes, RecordedFacts>, row: KnownTestRow|
+      accumulator.insert(row.owner, row.body_facts),
+  );
   let loose = rows.laws.fold(
     { ..no_body_facts, types: rows.types },
     |accumulator: BodyFacts, row: KnownLawRow|
       match here.get(module_of_name(row.owner)) {
         None -> accumulator,
-        Some(i) -> match decode_facts(row.body_facts, i, row.owner) {
-          None -> accumulator,
-          Some(f) -> joined_facts(accumulator, { ..f, types: types_named(f.types, f.bodies) }),
+        Some(i) -> {
+          let f = decode_facts(row.body_facts, i, row.owner);
+          joined_facts(accumulator, { ..f, types: types_named(f.types, f.bodies) })
         },
       },
   );
@@ -373,11 +373,10 @@ pub fn stored_bodies(hashes: HashOutput) -> List<StoredBody> / {abort.raise} =
 pub type StubCuts = { name: Bytes, cuts: List<Cut> }
 
 pub fn analyse(parsed: List<ParsedSource>) -> AnalysisOutcome / {abort.raise} =
-  analyse_with(parsed, no_rows)
+  analyse_with(parsed)
 
 pub fn analyse_with(
   parsed: List<ParsedSource>,
-  rows: Rows,
   packages: PackageSources = { root: b"", manifest: None, supplied: [] },
 ) -> AnalysisOutcome / {abort.raise} = {
   let clo = closure(packages, parsed.map(|p: ParsedSource| p.name));
@@ -405,7 +404,6 @@ pub fn analyse_with(
   analyse_closure(
     all,
     clo,
-    rows,
     parsed.len(),
     tree_named(parsed.map(|p: ParsedSource| p.name)),
     unimported,
@@ -618,12 +616,8 @@ pub fn resolved_closure(
   }
 }
 
-pub fn checked_closure(
-  h: HashedProgram,
-  known: Rows,
-  body_plan: BodyPlan,
-) -> AnalysisOutcome / {abort.raise} = {
-  let check = with_no_other_definitions(|| type_check(h.resolved, known, body_plan, h.unused));
+pub fn checked_closure(h: HashedProgram, body_plan: BodyPlan) -> AnalysisOutcome / {abort.raise} = {
+  let check = with_no_other_definitions(|| type_check(h.resolved, body_plan, h.unused));
   match check.checked {
     None -> Rejected(check.diagnostics),
     Some(a) ->
@@ -641,12 +635,11 @@ pub fn checked_closure(
 
 pub fn type_check(
   group: ResolvedGroup,
-  known: Rows,
   body_plan: BodyPlan,
   unused: List<Diagnostic>,
 ) -> GroupCheck / {abort.raise, CheckReads} = {
   let out = check_output_with(group.resolution, group.modules, {
-    ..cache_from_rows(known, group.root_count),
+    ..empty_cache(group.root_count),
     body_plan: body_plan,
   });
   let checked: CheckOutput = out.checked;
@@ -707,7 +700,8 @@ fn cached_member_sites(
 ) -> { sites: List<MemberSite>, unread: Set<Bytes> } / {abort.raise} = {
   let cached_facts = checked.cached.fold(
     Map::new(),
-    |accumulator: Map<Bytes, Bytes>, k: CachedFacts| accumulator.insert(k.name, k.facts),
+    |accumulator: Map<Bytes, RecordedFacts>, k: CachedFacts|
+      match k.facts { Some(r) -> accumulator.insert(k.name, r), None -> accumulator },
   );
   let read = range(0, modules.len()).fold(
     { sites: [], placed: Set::empty() },
@@ -725,10 +719,11 @@ fn cached_member_sites(
             None -> a,
             Some(x) -> match cached_facts.get(x.owner) {
               None -> a,
-              Some(recorded) -> match decode_facts(recorded, i, x.owner) {
-                None -> a,
-                Some(f) -> { sites: a.sites.concat(f.members), placed: a.placed.insert(x.owner) },
-              },
+              Some(recorded) ->
+                {
+                  sites: a.sites.concat(decode_facts(recorded, i, x.owner).members),
+                  placed: a.placed.insert(x.owner),
+                },
             },
           }
         },
@@ -737,11 +732,7 @@ fn cached_member_sites(
   );
   {
     sites: read.sites,
-    unread: checked.seeded.concat(
-      checked.tests.fold([], |accumulator: List<Bytes>, t: TestInfo|
-        if checked.cached_tests.contains(t.key) { accumulator.push(test_owner(t.module, t.name)) }
-        else { accumulator }),
-    ).fold(Set::empty(), |accumulator: Set<Bytes>, n: Bytes|
+    unread: checked.seeded.fold(Set::empty(), |accumulator: Set<Bytes>, n: Bytes|
       if read.placed.contains(n) { accumulator } else { accumulator.insert(n) }),
   }
 }
@@ -749,7 +740,6 @@ fn cached_member_sites(
 fn analyse_closure(
   parsed: List<ParsedSource>,
   clo: Closure,
-  rows: Rows,
   root_count: Int,
   tree: ToolchainTree,
   unimported: Map<Bytes, List<Bytes>>,
@@ -759,10 +749,10 @@ fn analyse_closure(
     Ok(h) -> match if parsed.take(root_count).any(|p: ParsedSource| p.name == prelude_module) {
         None
       } else { prune_prelude(parsed, h) } {
-      None -> checked_closure(h, rows, CheckEvery),
+      None -> checked_closure(h, CheckEvery),
       Some(cut) -> match hashed_closure(cut, clo, root_count, tree, unimported) {
         Err(diagnostics) -> Rejected(diagnostics),
-        Ok(pruned) -> checked_closure(pruned, rows, CheckEvery),
+        Ok(pruned) -> checked_closure(pruned, CheckEvery),
       },
     },
   }
@@ -1400,13 +1390,13 @@ pub fn checked_bodies(analysis: Analysis) -> LoweringTargets / {abort.raise} = {
   let functions = rows.definitions.fold(
     Set::empty(),
     |accumulator: Set<Bytes>, row: KnownDefinitionRow|
-      if row.facts.len() == 0 { accumulator } else { accumulator.insert(row.name) },
+      if row.facts == None { accumulator } else { accumulator.insert(row.name) },
   );
   let tests = rows.tests.fold(functions, |accumulator: Set<Bytes>, row: KnownTestRow|
-    if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner) });
+    accumulator.insert(row.owner));
   {
     roots: rows.laws.fold(tests, |accumulator: Set<Bytes>, row: KnownLawRow|
-      if row.body_facts.len() == 0 { accumulator } else { accumulator.insert(row.owner) }),
+      accumulator.insert(row.owner)),
     modules: analysis.modules.fold(Set::empty(), |accumulator: Set<Bytes>, m: ParsedModule|
       accumulator.insert(m.name)),
   }
@@ -1439,22 +1429,13 @@ pub fn claims_in(
 }
 
 pub fn rechecked(analysis: Analysis, wanted: List<Int>) -> List<TypedBody<Type>> / {abort.raise} = {
-  let walked = wanted.fold(Set::empty(), |accumulator: Set<Bytes>, i: Int| {
+  let walked = wanted.fold([], |accumulator: List<Bytes>, i: Int| {
     let m = analysis.modules.get(i);
-    m.module.items.fold(accumulator, |a: Set<Bytes>, item: Item|
-      match item { FunctionItem(d) -> a.insert(qualify(m.name, d.name.name)), _ -> a })
+    m.module.items.fold(accumulator, |a: List<Bytes>, item: Item|
+      match item { FunctionItem(d) -> a.push(qualify(m.name, d.name.name)), _ -> a })
   });
-  let rows = rows_of(analysis);
-  let known = cache_from_rows(
-    {
-      definitions: rows.definitions.filter(|row: KnownDefinitionRow| !walked.contains(row.name)),
-      tests: rows.tests,
-      laws: rows.laws,
-      types: rows.types,
-    },
-    0,
-  );
-  match with_no_other_definitions(|| bodies_with(analysis.r, analysis.modules, known)) {
+  match with_no_other_definitions(||
+      bodies_with(analysis.r, analysis.modules, { ..empty_cache(0), body_plan: CheckOnly(walked) })) {
     None -> panic("a program the front end accepted fails type checking"),
     Some(bodies) -> bodies,
   }
@@ -1568,7 +1549,7 @@ test "the types used in a function body are recorded as keys into one shared tab
       let rows = rows_of(w);
       let sites = |name: Bytes|
         match rows.definitions.find(|r: KnownDefinitionRow| r.name == name) {
-          Some(r) -> match decode_facts(r.facts, 0, b"") { Some(f) -> f, None -> no_body_facts },
+          Some(r) -> match r.facts { Some(f) -> decode_facts(f, 0, b""), None -> no_body_facts },
           None -> no_body_facts,
         };
       assert_eq(sites(b"m.go").types.len(), 0);
