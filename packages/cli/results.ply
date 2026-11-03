@@ -21,6 +21,7 @@ import store.tables
 import store.fake (run_in_memory)
 import testing.conclude (StoreUpdate, PassRecord)
 import testing.select (Pass)
+import testing.reads (RecordedRead, ReadPath, UnderRoot, WholeFile, recorded_read_bin)
 import claims (proof_store, AcceptResult, ClaimsEntry)
 import std.env (env)
 import proof.obligation (ClaimSnapshot)
@@ -55,23 +56,41 @@ pub fn open_store(
 
 type StoreRead<a> = { value: a, cache: tables::Cache }
 
+fn encoded_reads(reads: List<RecordedRead>) -> Bytes / {abort.raise} =
+  bin::encode(reads, bin::list_bin(recorded_read_bin()))
+
+fn decoded_reads(stored: Option<Bytes>) -> Option<List<RecordedRead>> / {abort.raise} =
+  match stored {
+    None -> None,
+    Some(b) -> match bin::decode(b, bin::list_bin(recorded_read_bin())) {
+      Ok(reads) -> Some(reads),
+      Err(_) -> None,
+    },
+  }
+
 fn read_pass_traces(
   c0: tables::Cache,
   keys: List<Bytes>,
-) -> StoreRead<List<Option<Bytes>>> / {abort.raise} =
-  keys.fold({ value: [], cache: c0 }, |accumulator: StoreRead<List<Option<Bytes>>>, key: Bytes| {
-    let got = tables::pass_trace(accumulator.cache, key);
-    { value: accumulator.value.push(got.value), cache: got.cache }
-  })
+) -> StoreRead<List<Option<List<RecordedRead>>>> / {abort.raise} =
+  keys.fold(
+    { value: [], cache: c0 },
+    |accumulator: StoreRead<List<Option<List<RecordedRead>>>>, key: Bytes| {
+      let got = tables::pass_trace(accumulator.cache, key);
+      { value: accumulator.value.push(decoded_reads(got.value)), cache: got.cache }
+    },
+  )
 
 fn code_passes_over(
   c0: tables::Cache,
   keys: List<Bytes>,
-) -> StoreRead<List<Option<Bytes>>> / {abort.raise} =
-  keys.fold({ value: [], cache: c0 }, |accumulator: StoreRead<List<Option<Bytes>>>, key: Bytes| {
-    let got = tables::code_pass_trace(accumulator.cache, key);
-    { value: accumulator.value.push(got.value), cache: got.cache }
-  })
+) -> StoreRead<List<Option<List<RecordedRead>>>> / {abort.raise} =
+  keys.fold(
+    { value: [], cache: c0 },
+    |accumulator: StoreRead<List<Option<List<RecordedRead>>>>, key: Bytes| {
+      let got = tables::code_pass_trace(accumulator.cache, key);
+      { value: accumulator.value.push(decoded_reads(got.value)), cache: got.cache }
+    },
+  )
 
 fn snapshot_over(
   c0: tables::Cache,
@@ -177,14 +196,16 @@ pub fn put_update(
 ) -> tables::Cache / {abort.raise} = {
   let c1 = f.code_passes.fold(
     f.passes.fold(c0, |c: tables::Cache, p: Pass| {
+      let stored = encoded_reads(p.reads);
       let store_state = tables::pass_trace(c, p.key);
-      if store_state.value == Some(p.trace) { store_state.cache }
-      else { tables::put_passed(store_state.cache, p.key, p.trace) }
+      if store_state.value == Some(stored) { store_state.cache }
+      else { tables::put_passed(store_state.cache, p.key, stored) }
     }),
     |c: tables::Cache, p: Pass| {
+      let stored = encoded_reads(p.reads);
       let store_state = tables::code_pass_trace(c, p.key);
-      if store_state.value == Some(p.trace) { store_state.cache }
-      else { tables::put_passed_code(store_state.cache, p.key, p.trace) }
+      if store_state.value == Some(stored) { store_state.cache }
+      else { tables::put_passed_code(store_state.cache, p.key, stored) }
     },
   );
   let c2 = f.records.fold(c1, |c: tables::Cache, e: { key: Bytes, record: PassRecord }|
@@ -593,10 +614,18 @@ const a_module: ModuleHashes = {
   { record: record_digest(module_record(own)), own: own }
 }
 
+const a_file_read: List<RecordedRead> =
+  [
+    {
+      read: ReadPath({ how: WholeFile, place: UnderRoot({ root: b"cwd", path: b"a" }), own: [] }),
+      digest: b"d",
+    },
+  ]
+
 const an_update: StoreUpdate =
   {
-    passes: [{ key: hashed("t key"), trace: b"file\tcwd\ta\td\n" }],
-    code_passes: [{ key: hashed("t code"), trace: b"" }],
+    passes: [{ key: hashed("t key"), reads: a_file_read }],
+    code_passes: [{ key: hashed("t code"), reads: [] }],
     records: [
       {
         key: b"m.t",
@@ -622,7 +651,7 @@ const original_definition: { hash: Bytes, text: Bytes } =
 fn read_back(
   f: StoreUpdate,
   seen: List<Bytes>,
-) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
+) -> { passes: List<Option<List<RecordedRead>>>, codes: List<Option<List<RecordedRead>>>, moved: List<Option<List<RecordedRead>>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
   run_in_memory(mem_empty(), || {
     let c0 = store_pass(
       tables::open_cache[mem](cache_database(), some_stamps),
@@ -641,7 +670,8 @@ fn read_back(
       codes: code_passes_over(r, [hashed("t code"), hashed("t key")]).value,
       moved: code_passes_over(moved, [hashed("t code")]).value.fold(
         read_pass_traces(moved, [hashed("t key")]).value,
-        |accumulator: List<Option<Bytes>>, o: Option<Bytes>| accumulator.push(o),
+        |accumulator: List<Option<List<RecordedRead>>>, o: Option<List<RecordedRead>>|
+          accumulator.push(o),
       ),
       seen: [blake3(b"m.f"), hashed("g")].map(|h: Bytes| tables::knows_definition(r, h)),
       baselines: last_passes_over(r, [b"m.t", b"m.u"]).value,
@@ -651,9 +681,9 @@ fn read_back(
 
 test "a stored run reads back its passing results, baselines and whether each test ran, and each baseline reads back with its definition text" {
   let back = read_back(an_update, [blake3(b"m.f")]);
-  assert_eq(back.passes, [Some(b"file\tcwd\ta\td\n"), None]);
-  assert_eq(back.codes, [Some(b""), None]);
-  assert_eq(back.moved, [None, Some(b"")]);
+  assert_eq(back.passes, [Some(a_file_read), None]);
+  assert_eq(back.codes, [Some([]), None]);
+  assert_eq(back.moved, [None, Some([])]);
   assert_eq(back.seen, [true, false]);
   assert_eq(back.baselines, [
     Some({
@@ -744,7 +774,7 @@ test "a run after a crash stores the passes its journal finished, returns the te
     }
   }).value;
   assert_eq(back.interrupted, [{ key: b"m.crashes", hash: b"c" }]);
-  assert_eq(back.passes, [Some(b"file\tcwd\ta\td\n")]);
+  assert_eq(back.passes, [Some(a_file_read)]);
   assert_eq(back.left, { rows: [], interrupted: [] })
 }
 

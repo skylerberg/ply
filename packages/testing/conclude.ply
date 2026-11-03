@@ -1,6 +1,7 @@
 import std.list
 import std.set (Set)
 import select (Cached, Pass, Reason, passed_before)
+import reads (Checkable, Unchecked, RecordedRead, ReadPath, UnderRoot, WholeFile, trace_of)
 
 pub type SearchSummary = { explored: Int, exhaustive: Bool, exhausted: Bool, failed: Bool }
 
@@ -132,39 +133,53 @@ pub fn recorded_pass<d>(
   chosen: RunSelection,
 ) -> Recorded =
   match r.trace {
-    None -> { record: Some(Untraced), update: nothing_stored },
-    Some(trace) -> match chosen.recorded.get(r.index) {
-      None -> { record: None, update: nothing_stored },
-      Some(keys) -> {
-        let record = record_under(keys, declared.seeded, r.searched);
-        let written = match record { WrittenUnder(under) -> under, _ -> [] };
-        let coded = match chosen.codes.get(r.index) {
-          Some(cs) -> if is_written(record) { cs } else { [] },
-          None -> [],
-        };
-        {
-          record: Some(record),
-          update: {
-            passes: written.map(|k: Bytes| { key: k, trace: trace }),
-            code_passes: coded.map(|k: Bytes| { key: k, trace: trace }),
-            records: if is_written(record) {
-              [
-                {
-                  key: declared.key,
-                  record: {
-                    test: declared.hash,
-                    era: era,
-                    start: declared.start,
-                    case: declared.case,
-                    passes: written,
-                    codes: coded,
-                  },
+    None -> untraced,
+    Some(text) -> match trace_of(text) {
+      Unchecked(_) -> untraced,
+      Checkable(reads) -> recorded_with(reads, r, declared, era, chosen),
+    },
+  }
+
+const untraced: Recorded = { record: Some(Untraced), update: nothing_stored }
+
+fn recorded_with<d>(
+  reads: List<RecordedRead>,
+  r: TestResult<d>,
+  declared: Test,
+  era: Bytes,
+  chosen: RunSelection,
+) -> Recorded =
+  match chosen.recorded.get(r.index) {
+    None -> { record: None, update: nothing_stored },
+    Some(keys) -> {
+      let record = record_under(keys, declared.seeded, r.searched);
+      let written = match record { WrittenUnder(under) -> under, _ -> [] };
+      let coded = match chosen.codes.get(r.index) {
+        Some(cs) -> if is_written(record) { cs } else { [] },
+        None -> [],
+      };
+      {
+        record: Some(record),
+        update: {
+          passes: written.map(|k: Bytes| { key: k, reads: reads }),
+          code_passes: coded.map(|k: Bytes| { key: k, reads: reads }),
+          records: if is_written(record) {
+            [
+              {
+                key: declared.key,
+                record: {
+                  test: declared.hash,
+                  era: era,
+                  start: declared.start,
+                  case: declared.case,
+                  passes: written,
+                  codes: coded,
                 },
-              ]
-            } else { [] },
-          },
-        }
-      },
+              },
+            ]
+          } else { [] },
+        },
+      }
     },
   }
 
@@ -361,7 +376,7 @@ fn passing(index: Int) -> TestResult<String> =
     seeds: 0,
   }
 
-fn pass_of(key: Bytes) -> Pass = { key: key, trace: b"" }
+fn pass_of(key: Bytes) -> Pass = { key: key, reads: [] }
 
 fn failing(index: Int) -> TestResult<String> =
   { ..passing(index), status: "failed", failure: Some("assertion failed") }
@@ -522,10 +537,24 @@ test "a passing test with no recorded keys is counted as passed but stores no pa
   assert_eq(c.store_update.passes, [])
 }
 
-test "`conclude_run` stores a passing test that used the host with its trace of file reads, under both its test key and its code key" {
-  let hosted = { ..passing(0), host: true, trace: Some(b"file\tcwd\ta.txt\tb3\n") };
+test "`conclude_run` stores a passing test that used the host with the reads of its trace, under both its test key and its code key" {
+  let hosted = { ..passing(0), host: true, trace: Some(b"file\tcwd\ta.txt\t\tb3\n") };
   let c = conclude_run(two_tests, snapshot, select_all(two_tests), no_changes, [hosted]);
+  let reads = [
+    {
+      read: ReadPath({ how: WholeFile, place: UnderRoot({ root: b"cwd", path: b"a.txt" }), own: [] }),
+      digest: b"b3",
+    },
+  ];
   assert_eq(c.outcomes.map(|o: Outcome<String>| o.recorded), [Some(WrittenUnder([b"t0"]))]);
-  assert_eq(c.store_update.passes, [{ key: b"t0", trace: b"file\tcwd\ta.txt\tb3\n" }]);
-  assert_eq(c.store_update.code_passes, [{ key: b"c0", trace: b"file\tcwd\ta.txt\tb3\n" }])
+  assert_eq(c.store_update.passes, [{ key: b"t0", reads: reads }]);
+  assert_eq(c.store_update.code_passes, [{ key: b"c0", reads: reads }])
+}
+
+test "`conclude_run` stores no pass for a passing test whose trace names a read that cannot be checked again" {
+  let unchecked = { ..passing(0), host: true, trace: Some(b"shipped\t\tn1\n") };
+  let c = conclude_run(two_tests, snapshot, select_all(two_tests), no_changes, [unchecked]);
+  assert_eq(c.outcomes.map(|o: Outcome<String>| o.recorded), [Some(Untraced)]);
+  assert_eq(c.store_update.passes, []);
+  assert_eq(c.store_update.code_passes, [])
 }
