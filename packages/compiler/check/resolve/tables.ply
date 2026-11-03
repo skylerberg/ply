@@ -6,7 +6,8 @@ import compiler.syntax.items (Module, Item, FunctionItem, ExternItem, TypeItem, 
                               EffectSetItem, SumBody, AliasBody, VariantDefinition, Visibility,
                               Private, ImportDeclaration, WholeModule, ModuleAlias, SelectedNames,
                               DeriveOrigin, is_pub, NominalBody, ExternBody, is_builtin,
-                              EffectSetDefinition, Opaque, opaque_bin, SchemaDefinition, is_shipped)
+                              EffectSetDefinition, Opaque, opaque_bin, SchemaDefinition, is_shipped,
+                              item_span)
 import compiler.syntax.expressions (Expression)
 import std.list
 import std.bin
@@ -739,6 +740,152 @@ pub fn declarations_of(parsed: ParsedModule) -> Declarations =
       },
       _ -> declarations,
     })
+
+pub type DistinctModule = { module: Module, redefinitions: List<Diagnostic> }
+
+type DeclaredName = { namespace: Namespace, name: Identifier, kind: Bytes }
+
+type FirstDefinition = { span: Span, kind: Bytes, item: Span, in_type: Bool }
+
+type Clash = { declared: DeclaredName, first: FirstDefinition }
+
+type FirstDefinitions = {
+  values: Map<Bytes, FirstDefinition>,
+  types: Map<Bytes, FirstDefinition>,
+  effects: Map<Bytes, FirstDefinition>,
+  sets: Map<Bytes, FirstDefinition>,
+}
+
+type RedefinitionWalk = {
+  firsts: FirstDefinitions,
+  dropped: List<Span>,
+  redefinitions: List<Diagnostic>,
+}
+
+const no_first_definitions: FirstDefinitions =
+  { values: Map::new(), types: Map::new(), effects: Map::new(), sets: Map::new() }
+
+fn first_definitions_in(
+  firsts: FirstDefinitions,
+  namespace: Namespace,
+) -> Map<Bytes, FirstDefinition> =
+  match namespace {
+    ValueSpace -> firsts.values,
+    TypeSpace -> firsts.types,
+    EffectSpace -> firsts.effects,
+    SetSpace -> firsts.sets,
+  }
+
+fn with_first_definition(
+  firsts: FirstDefinitions,
+  declared: DeclaredName,
+  first: FirstDefinition,
+) -> FirstDefinitions =
+  match declared.namespace {
+    ValueSpace -> { ..firsts, values: firsts.values.insert(declared.name.name, first) },
+    TypeSpace -> { ..firsts, types: firsts.types.insert(declared.name.name, first) },
+    EffectSpace -> { ..firsts, effects: firsts.effects.insert(declared.name.name, first) },
+    SetSpace -> { ..firsts, sets: firsts.sets.insert(declared.name.name, first) },
+  }
+
+fn names_declared_by(module_name: Bytes, module: Module, item: Item) -> List<DeclaredName> =
+  match item {
+    FunctionItem(f) -> [{ namespace: ValueSpace, name: f.name, kind: b"a function" }],
+    ExternItem(f) -> if is_builtin(module_name, module, f) { [] }
+    else { [{ namespace: ValueSpace, name: f.name, kind: b"a function" }] },
+    EffectItem(e) -> [{ namespace: EffectSpace, name: e.name, kind: b"an effect" }],
+    EffectSetItem(e) -> [{ namespace: SetSpace, name: e.name, kind: b"an effect set" }],
+    TypeItem(t) -> {
+      let named = [{ namespace: TypeSpace, name: t.name, kind: b"a type" }];
+      match t.body {
+        SumBody(vs) ->
+          named.concat(
+            vs.map(|variant: VariantDefinition|
+              { namespace: ValueSpace, name: variant.name, kind: b"a constructor" }),
+          ),
+        AliasBody(_) -> named,
+        NominalBody(_) -> named,
+        ExternBody -> named,
+      }
+    },
+    _ -> [],
+  }
+
+fn is_type_item(item: Item) -> Bool = match item { TypeItem(_) -> true, _ -> false }
+
+fn with_first_definitions(
+  firsts: FirstDefinitions,
+  declared: List<DeclaredName>,
+  item: Item,
+) -> FirstDefinitions =
+  declared.fold(firsts, |found: FirstDefinitions, d: DeclaredName|
+    with_first_definition(found, d, {
+      span: d.name.span,
+      kind: d.kind,
+      item: item_span(item),
+      in_type: is_type_item(item),
+    }))
+
+fn redefinition(module_index: Int, module_name: Bytes, clash: Clash) -> Diagnostic =
+  error_at_and(
+    b"E0105",
+    module_index,
+    clash.declared.name.span,
+    Bytes::concat_all([
+      b"`",
+      clash.declared.name.name,
+      b"` is defined twice",
+      if module_name.len() == 0 { b"" }
+      else { Bytes::concat_all([b" in module `", module_name, b"`"]) },
+    ]),
+    Bytes::concat_all([b"redefined here as ", clash.declared.kind]),
+    module_index,
+    clash.first.span,
+    Bytes::concat_all([b"first defined here as ", clash.first.kind]),
+    [b"rename one of them"],
+  )
+
+pub fn without_redefinitions(
+  module_index: Int,
+  module_name: Bytes,
+  module: Module,
+) -> DistinctModule = {
+  let walked = module.items.fold(
+    { firsts: no_first_definitions, dropped: [], redefinitions: [] },
+    |accumulator: RedefinitionWalk, item: Item| {
+      let declared = names_declared_by(module_name, module, item);
+      let clashes = declared.fold([], |found: List<Clash>, d: DeclaredName|
+        match first_definitions_in(accumulator.firsts, d.namespace).get(d.name.name) {
+          Some(first) -> found.push({ declared: d, first: first }),
+          None -> found,
+        });
+      let reported = clashes.fold(accumulator.redefinitions, |ds: List<Diagnostic>, c: Clash|
+        ds.push(redefinition(module_index, module_name, c)));
+      if clashes.len() == 0 {
+        { ..accumulator, firsts: with_first_definitions(accumulator.firsts, declared, item) }
+      } else if is_type_item(item) && clashes.all(|c: Clash| !c.first.in_type) {
+        {
+          firsts: with_first_definitions(accumulator.firsts, declared, item),
+          dropped: accumulator.dropped.concat(clashes.map(|c: Clash| c.first.item)),
+          redefinitions: reported,
+        }
+      } else {
+        {
+          ..accumulator,
+          dropped: accumulator.dropped.push(item_span(item)),
+          redefinitions: reported,
+        }
+      }
+    },
+  );
+  {
+    module: {
+      ..module,
+      items: module.items.filter(|item: Item| !walked.dropped.contains(item_span(item))),
+    },
+    redefinitions: walked.redefinitions,
+  }
+}
 
 pub fn unplaced_declarations(declarations: Declarations) -> Declarations = {
   let unplaced = |d: Declaration|
