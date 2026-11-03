@@ -12,9 +12,10 @@ import compiler.store.hash.forms (DefinitionHash, ModuleHashes, ModuleRecord, No
 import compiler.check.resolve.tables (Diagnostic)
 import compiler.store.hash.graph (HeldValue)
 import project_store
-import project_store (InWorkingDirectory, AtAbsolutePath, databases)
+import project_store (InWorkingDirectory, AtAbsolutePath, WorkingDirectory, Absolute, PathLabel,
+                      Databases, databases)
 import compiler.store.database (database_in, open_database)
-import compiler.store.fact_store (Opening)
+import compiler.store.fact_store (Opening, recent_reads)
 import paths
 import store.tables
 import store.fake (run_in_memory)
@@ -33,13 +34,13 @@ pub type OpenStore = { place: project_store::StoreLocation, cache: tables::Cache
 
 pub fn store_for(
   paths: List<paths::ResolvedPath>,
-) -> OpenStore / {databases.open, semantics.cached, fs.read[cwd], fs.read[abs], fs.read_file[shipped], abort.raise} =
+) -> OpenStore / {Databases, semantics.cached, fs.read[cwd], fs.read[abs], fs.read_file[shipped], abort.raise} =
   open_store(paths, project_store::shipped_stamps())
 
 pub fn open_store(
   paths: List<paths::ResolvedPath>,
   stamps: tables::Stamps,
-) -> OpenStore / {databases.open, fs.read[cwd], fs.read[abs], abort.raise} = {
+) -> OpenStore / {Databases, fs.read[cwd], fs.read[abs], abort.raise} = {
   let place = project_store::store_location_of(paths, stamps);
   let database = project_store::database_place_of(place);
   let opening = databases.open(database);
@@ -206,10 +207,10 @@ fn flush_update<[r]>(
   cache: tables::Cache,
   f: StoreUpdate,
   seen: List<Bytes>,
-) -> tables::Cache / {fs.read[r], fs.write[r], abort.raise} =
+) -> tables::Cache / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} =
   tables::flush_cache[r](put_update(cache, f, seen))
 
-fn without_warnings(k: OpenStore) -> OpenStore =
+pub fn without_warnings(k: OpenStore) -> OpenStore =
   { ..k, cache: { ..k.cache, store: { ..k.cache.store, warnings: [] } } }
 
 fn cache_warnings(cache: tables::Cache) -> List<Diagnostic> =
@@ -231,7 +232,7 @@ derive bin for JournalMark
 derive bin for JournalRows
 derive bin for JournalEntry
 
-type Journal = { label: String, path: String, base: tables::Cache }
+type Journal = { label: PathLabel, path: String, base: tables::Cache }
 
 fn journal_of(k: OpenStore) -> Journal =
   { label: k.place.label, path: k.place.dir ++ "/test-journal", base: k.cache }
@@ -279,7 +280,7 @@ fn read_journal<[r]>(j: Journal) -> List<JournalEntry> / {fs.read[r], abort.rais
 fn begun_journal<[r]>(
   k: OpenStore,
   j: Journal,
-) -> { store: OpenStore, interrupted: List<StartedTest> } / {fs.read[r], fs.write[r], abort.raise} = {
+) -> { store: OpenStore, interrupted: List<StartedTest> } / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
   let found = recovery_of(read_journal[r](j), k.cache.stamps);
   let cache = if found.rows.len() == 0 { k.cache }
   else { tables::flush_cache[r](tables::with_written_rows(k.cache, found.rows)) };
@@ -292,14 +293,18 @@ fn appended(
   journal: Journal,
   entry: JournalEntry,
 ) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} = {
-  let _ = if journal.label == "cwd" { fs.append[cwd](journal.path, framed(entry)) }
-  else { fs.append[abs](journal.path, framed(entry)) };
+  let _ = match journal.label {
+    WorkingDirectory -> fs.append[cwd](journal.path, framed(entry)),
+    Absolute -> fs.append[abs](journal.path, framed(entry)),
+  };
   ()
 }
 
 fn ended_journal(journal: Journal) -> Unit / {fs.write[cwd], fs.write[abs]} = {
-  let _ = if journal.label == "cwd" { fs.remove[cwd](journal.path) }
-  else { fs.remove[abs](journal.path) };
+  let _ = match journal.label {
+    WorkingDirectory -> fs.remove[cwd](journal.path),
+    Absolute -> fs.remove[abs](journal.path),
+  };
   ()
 }
 
@@ -309,10 +314,11 @@ fn finished_rows(journal: Journal, update: StoreUpdate) -> List<JournalRow> / {a
 pub fn with_result_cache<a | e>(
   opened_store: OpenStore,
   go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} = {
-  let begun = if opened_store.place.label == "cwd" {
-    begun_journal[cwd](opened_store, journal_of(opened_store))
-  } else { begun_journal[abs](opened_store, journal_of(opened_store)) };
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} = {
+  let begun = match opened_store.place.label {
+    WorkingDirectory -> begun_journal[cwd](opened_store, journal_of(opened_store)),
+    Absolute -> begun_journal[abs](opened_store, journal_of(opened_store)),
+  };
   let journal = journal_of(begun.store);
   let result = journaled(begun.store, begun.interrupted, journal, go);
   ended_journal(journal);
@@ -324,7 +330,7 @@ fn journaled<a | e>(
   interrupted: List<StartedTest>,
   journal: Journal,
   go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.started, result_cache.finished | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} =
   handle {
     go()
   } with {
@@ -371,8 +377,10 @@ fn journaled<a | e>(
       };
     },
     result_cache.store_results(f, seen) -> {
-      let c = if store_state.place.label == "cwd" { flush_update[cwd](store_state.cache, f, seen) }
-      else { flush_update[abs](store_state.cache, f, seen) };
+      let c = match store_state.place.label {
+        WorkingDirectory -> flush_update[cwd](store_state.cache, f, seen),
+        Absolute -> flush_update[abs](store_state.cache, f, seen),
+      };
       store_state = without_warnings({ ..store_state, cache: c });
       cache_warnings(c)
     },
@@ -428,14 +436,16 @@ fn after_write(k: OpenStore, cache: tables::Cache) -> StoreWrite =
 fn flushed(
   k: OpenStore,
   cache: tables::Cache,
-) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
-  after_write(k, if k.place.label == "cwd" { tables::flush_cache[cwd](cache) }
-  else { tables::flush_cache[abs](cache) })
+) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} =
+  after_write(k, match k.place.label {
+    WorkingDirectory -> tables::flush_cache[cwd](cache),
+    Absolute -> tables::flush_cache[abs](cache),
+  })
 
 fn record_evidence(
   k: OpenStore,
   entries: List<{ key: String, evidence: Bytes }>,
-) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} =
   flushed(
     k,
     entries.fold(k.cache, |cache: tables::Cache, e: { key: String, evidence: Bytes }|
@@ -451,7 +461,7 @@ fn claims_of(k: OpenStore, module: Bytes, identity: Bytes) -> Option<Bytes> / {a
 fn record_claims(
   k: OpenStore,
   entries: List<ClaimsEntry>,
-) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} =
   flushed(
     k,
     entries.fold(k.cache, |cache: tables::Cache, e: ClaimsEntry|
@@ -479,7 +489,7 @@ fn baselines_of(
 fn accepted_of(
   k: OpenStore,
   records: List<{ name: String, record: ClaimSnapshot }>,
-) -> { store: OpenStore, accepted: AcceptResult } / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} = {
+) -> { store: OpenStore, accepted: AcceptResult } / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} = {
   let w = flushed(
     k,
     records.fold(k.cache, |cache: tables::Cache, r: { name: String, record: ClaimSnapshot }|
@@ -502,7 +512,7 @@ fn accepted_of(
 pub fn with_evidence<a | e>(
   opened_store: OpenStore,
   go: () -> a / {proof_store.cached, proof_store.record, proof_store.module_claims, proof_store.record_claims | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} =
   handle {
     go()
   } with {
@@ -524,7 +534,7 @@ pub fn with_evidence<a | e>(
 pub fn with_review<a | e>(
   opened_store: OpenStore,
   go: () -> a / {proof_store.cached, proof_store.record, proof_store.module_claims, proof_store.record_claims, proof_store.baselines, proof_store.accepted | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs] | e} =
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} =
   handle {
     go()
   } with {
@@ -709,7 +719,7 @@ test "a journal names the tests it saw start but not finish, returns the rows of
 test "a run after a crash stores the passes its journal finished, returns the tests it left running, and starts a new journal" {
   let back = run_in_memory(mem_empty(), || {
     let opened = {
-      place: { label: "mem", dir: "cache", root: "", stamps: some_stamps },
+      place: { label: WorkingDirectory, dir: "cache", root: "", stamps: some_stamps },
       cache: tables::open_cache[mem](cache_database(), some_stamps),
     };
     let j = journal_of(opened);

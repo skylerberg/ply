@@ -183,7 +183,7 @@ pub fn read_range<[r]>(
   } else {
     let read = iterate(
       { at: offset, left: len, got: [] },
-      1048576,
+      len / max_read_size + 2,
       |x: { at: Int, left: Int, got: List<Bytes> }|
         if x.left <= 0 { Stop(Some(x.got)) } else {
           let n = min(x.left, max_read_size);
@@ -200,26 +200,19 @@ pub fn read_range<[r]>(
     match read { Some(parts) -> Some(Bytes::concat_all(parts)), None -> None }
   }
 
-fn find_table(parts: List<TableEntry>, table: Int) -> Option<TableEntry> =
-  parts.fold(None, |accumulator: Option<TableEntry>, p: TableEntry|
-    match accumulator {
-      Some(_) -> accumulator,
-      None -> if p.table == table { Some(p) } else { None },
-    })
+pub fn table_entry(seg: Segment, table: Int) -> Option<TableEntry> =
+  seg.parts.find(|p: TableEntry| p.table == table)
 
 pub fn table_rows<[r]>(
   dir: String,
-  seg: Segment,
-  table: Int,
+  token: Bytes,
+  entry: TableEntry,
 ) -> Option<Bytes> / {fs.read[r], abort.raise} =
-  match find_table(seg.parts, table) {
-    None -> Some(b""),
-    Some(p) -> if p.count == 0 { Some(b"") } else {
-      match read_range[r](segment_path(dir, seg.token), p.offset, p.count * p.width) {
-        Some(b) -> if checksum(b) == p.sum { Some(b) } else { None },
-        None -> None,
-      }
-    },
+  if entry.count == 0 { Some(b"") } else {
+    match read_range[r](segment_path(dir, token), entry.offset, entry.count * entry.width) {
+      Some(b) -> if checksum(b) == entry.sum { Some(b) } else { None },
+      None -> None,
+    }
   }
 
 fn key_prefix(b: Bytes, at: Int) -> Int = {
@@ -246,21 +239,6 @@ pub fn row_of(table_rows: Bytes, width: Int, key: Bytes) -> Option<Bytes> / {abo
   if at + width <= table_rows.len() && table_rows.slice(at, at + key.len()) == key {
     Some(table_rows.slice(at, at + width))
   } else { None }
-}
-
-pub fn rows_of(table_rows: Bytes, width: Int, key: Bytes) -> List<Bytes> / {abort.raise} = {
-  let n = key.len();
-  iterate(
-    { i: lower_bound(table_rows, width, key), out: [] },
-    1000000000,
-    |x: { i: Int, out: List<Bytes> }| {
-      let at = x.i * width;
-      if at + width <= table_rows.len() && table_rows.slice(at, at + n) == key {
-        let i = x.i;
-        Continue({ i: i + 1, out: x.out.push(table_rows.slice(at, at + width)) })
-      } else { Stop(x.out) }
-    },
-  )
 }
 
 pub fn framed(payload: Bytes) -> Bytes / {abort.raise} = {
@@ -581,11 +559,14 @@ fn lookup<[r]>(dir: String, key: Bytes) -> Option<Bytes> / {fs.read[r], abort.ra
       Some(_) -> accumulator,
       None -> {
         let seg = m.segments.get(m.segments.len() - 1 - i);
-        match table_rows[r](dir, seg, 1) {
+        match table_entry(seg, 1) {
           None -> None,
-          Some(section) -> match row_of(section, 44, key) {
+          Some(entry) -> match table_rows[r](dir, seg.token, entry) {
             None -> None,
-            Some(row) -> payload[r](dir, seg.token, read_u64(row, 32), read_u32(row, 40)),
+            Some(section) -> match row_of(section, 44, key) {
+              None -> None,
+              Some(row) -> payload[r](dir, seg.token, read_u64(row, 32), read_u32(row, 40)),
+            },
           },
         }
       },
@@ -638,16 +619,9 @@ test "a manifest or table that fails verification is treated as missing, never p
   let run = fs::on_mem[abs](fs::mem_of([]), || {
     let seg = write_segment[abs]("s", b"token--1", [{ key: b"a".blake3(), value: b"one" }]);
     let m = committed_manifest(commit[abs]("s", test_shapes, seg));
-    let whole = table_rows[abs]("s", m.segments.get(0), 1) != None;
-    let torn = table_rows[abs](
-      "s",
-      {
-        ..m.segments.get(0),
-        size: 0,
-        parts: [{ ..List::get(m.segments.get(0).parts, 0), sum: b"12345678" }],
-      },
-      1,
-    );
+    let entry = List::get(m.segments.get(0).parts, 0);
+    let whole = table_rows[abs]("s", seg.token, entry) != None;
+    let torn = table_rows[abs]("s", seg.token, { ..entry, sum: b"12345678" });
     let path = "s/" ++ manifest_name(test_shapes);
     let bytes = match fs.read_file[abs](path) { Some(b) -> b, None -> b"" };
     fs.write_file[abs](path, bytes.slice(0, bytes.len() - 1));

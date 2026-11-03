@@ -450,6 +450,17 @@ pub fn open_database<[r]>(dir: String) -> fact_store::Opening / {fs.write[r]} =
 pub fn close_database<[r]>(opening: fact_store::Opening) -> Unit / {fs.write[r]} =
   fact_store::close[r](opening)
 
+pub fn with_opening<a, [r] | e>(
+  dir: String,
+  work: (fact_store::Opening) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write | e},
+) -> a / {fs.read[r], fs.write[r] | e} =
+  with_recent_reads(|| {
+    let opening = open_database[r](dir);
+    let value = work(opening);
+    close_database[r](opening);
+    value
+  })
+
 fn session_on<a, [r] | e>(
   opening: fact_store::Opening,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
@@ -457,23 +468,22 @@ fn session_on<a, [r] | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} =
-  with_recent_reads(||
-    with_session_inputs(|| {
-      let first = handle {
-        Ok(over_database[r](fact_store::loaded[r](opening), read, world, look, noted, work))
-      } with {
-        fact_damage.damaged(reason) -> Err(reason),
-      };
-      match first {
-        Ok(ran) -> { value: ran.value, damage: None, commit: ran.commit },
-        Err(reason) -> {
-          let ran = fact_store::undamaged(||
-            over_database[r](fact_store::emptied[r](opening), read, world, look, noted, work));
-          { value: ran.value, damage: Some(reason), commit: ran.commit }
-        },
-      }
-    }))
+) -> Session<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e} =
+  with_session_inputs(|| {
+    let first = handle {
+      Ok(over_database[r](fact_store::loaded[r](opening), read, world, look, noted, work))
+    } with {
+      fact_damage.damaged(reason) -> Err(reason),
+    };
+    match first {
+      Ok(ran) -> { value: ran.value, damage: None, commit: ran.commit },
+      Err(reason) -> {
+        let ran = fact_store::undamaged(||
+          over_database[r](fact_store::emptied[r](opening), read, world, look, noted, work));
+        { value: ran.value, damage: Some(reason), commit: ran.commit }
+      },
+    }
+  })
 
 fn session_in<a, [r] | e>(
   dir: String,
@@ -482,12 +492,9 @@ fn session_in<a, [r] | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} = {
-  let opening = open_database[r](dir);
-  let session = session_on[r](opening, read, world, look, noted, work);
-  close_database[r](opening);
-  session
-}
+) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} =
+  with_opening[r](dir, |opening: fact_store::Opening|
+    session_on[r](opening, read, world, look, noted, work))
 
 pub fn with_opened_database<a, [r] | e>(
   opening: fact_store::Opening,
@@ -496,7 +503,7 @@ pub fn with_opened_database<a, [r] | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
+) -> StoreOutcome<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e} =
   outcome_of(session_on[r](opening, read, world, look, noted, work))
 
 pub fn with_database<a, [r] | e>(
@@ -511,58 +518,45 @@ pub fn with_database<a, [r] | e>(
 
 pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
 
-fn read_only_in<a, [r]>(
-  dir: String,
+fn read_opened<a, [r]>(
+  opening: fact_store::Opening,
   read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
-) -> Result<a, String> / {fs.read[r], abort.raise} =
-  with_recent_reads(||
-    handle {
-      Ok(read(fact_store::read_only[r](dir)))
-    } with {
-      fact_damage.damaged(reason) -> Err(reason),
-    })
+) -> Result<a, String> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  handle {
+    Ok(read(fact_store::loaded[r](opening)))
+  } with {
+    fact_damage.damaged(reason) -> Err(reason),
+  }
 
-fn undamaged_in<a, [r]>(
-  dir: String,
+fn undamaged_opened<a, [r]>(
+  opening: fact_store::Opening,
   read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
-) -> a / {fs.read[r], abort.raise} =
-  match read_only_in[r](dir, read) {
+) -> a / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  match read_opened[r](opening, read) {
     Ok(value) -> value,
     Err(reason) -> panic("the fact database is damaged: " ++ reason),
   }
 
-fn read_opened<a, [r]>(
-  opening: fact_store::Opening,
-  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
-) -> Result<a, String> / {fs.read[r], abort.raise} =
-  with_recent_reads(||
-    handle {
-      Ok(read(fact_store::loaded[r](opening)))
-    } with {
-      fact_damage.damaged(reason) -> Err(reason),
-    })
-
 pub fn read_records<[r]>(
   opening: fact_store::Opening,
-) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], abort.raise} =
+) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
   read_opened[r](opening, |db: Database| fact_store::entries_under[r](db, Records, b""))
 
 pub fn write_records<[r]>(
   opening: fact_store::Opening,
   puts: Map<Bytes, Bytes>,
   deleted: Set<Bytes>,
-) -> List<StoreProblem> / {fs.read[r], fs.write[r], abort.raise} =
-  with_recent_reads(||
-    handle {
-      let written = puts.fold(
-        deleted.fold(fact_store::loaded[r](opening), |d: Database, key: Bytes|
-          fact_store::without_value(d, Records, key)),
-        |d: Database, key: Bytes, value: Bytes| fact_store::with_value(d, Records, key, value),
-      );
-      commit_problems(fact_store::commit[r](written, |current: Database| live_results[r](current)))
-    } with {
-      fact_damage.damaged(reason) -> [NotWritten("the store is damaged (" ++ reason ++ ")")],
-    })
+) -> List<StoreProblem> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} =
+  handle {
+    let written = puts.fold(
+      deleted.fold(fact_store::loaded[r](opening), |d: Database, key: Bytes|
+        fact_store::without_value(d, Records, key)),
+      |d: Database, key: Bytes, value: Bytes| fact_store::with_value(d, Records, key, value),
+    );
+    commit_problems(fact_store::commit[r](written, |current: Database| live_results[r](current)))
+  } with {
+    fact_damage.damaged(reason) -> [NotWritten("the store is damaged (" ++ reason ++ ")")],
+  }
 
 pub fn copy_database<[r]>(from: String, to: String) -> Unit / {fs.read[r], fs.write[r]} = {
   fs.create_dir[r](to);
@@ -611,8 +605,10 @@ fn with_fact_of_kind<[r]>(
     },
   }
 
-pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} =
-  undamaged_in[r](dir, |db: Database| {
+pub fn usage<[r]>(
+  opening: fact_store::Opening,
+) -> Usage / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  undamaged_opened[r](opening, |db: Database| {
     let size = fact_store::store_size(db);
     let facts = fact_store::entries_under[r](db, Facts, b"").values();
     let kinds = facts.fold(Map::new(), |found: Map<Bytes, KindUsage>, b: Bytes|
@@ -633,24 +629,21 @@ pub type StoredOutput = | Stored(Bytes) | NotKept
 pub fn outputs_by_digest<[r]>(
   opening: fact_store::Opening,
   digests: List<Bytes>,
-) -> Map<Bytes, StoredOutput> / {fs.read[r], abort.raise} =
-  match read_opened[r](opening, |db: Database|
-      digests.fold(Map::new(), |found: Map<Bytes, StoredOutput>, digest: Bytes|
-        found.insert(digest, match fact_store::result_of[r](db, result_key(digest)) {
-          Some(output) -> Stored(output),
-          None -> NotKept,
-        }))) {
-    Ok(outputs) -> outputs,
-    Err(reason) -> panic("the fact database is damaged: " ++ reason),
-  }
+) -> Map<Bytes, StoredOutput> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  undamaged_opened[r](opening, |db: Database|
+    digests.fold(Map::new(), |found: Map<Bytes, StoredOutput>, digest: Bytes|
+      found.insert(digest, match fact_store::result_of[r](db, result_key(digest)) {
+        Some(output) -> Stored(output),
+        None -> NotKept,
+      })))
 
 pub fn write_pack<[r]>(
-  from: String,
+  opening: fact_store::Opening,
   keys: List<Bytes>,
   queries: QueriesId,
   files: Bytes,
-) -> { written: packs::PackFiles, records: Int } / {fs.read[r], abort.raise} =
-  undamaged_in[r](from, |db: Database| {
+) -> { written: packs::PackFiles, records: Int } / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  undamaged_opened[r](opening, |db: Database| {
     let laid = keys.fold(empty_pack_build, |built: PackBuild, key: Bytes|
       match fact_store::value_of[r](db, Facts, key) {
         None -> built,
@@ -678,8 +671,10 @@ pub type FactRecord = {
   parts: Map<Bytes, Bytes>,
 }
 
-fn fact_records<[r]>(dir: String) -> Map<Bytes, FactRecord> / {fs.read[r], abort.raise} =
-  undamaged_in[r](dir, |db: Database|
+fn fact_records<[r]>(
+  opening: fact_store::Opening,
+) -> Map<Bytes, FactRecord> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  undamaged_opened[r](opening, |db: Database|
     fact_store::entries_under[r](db, Facts, b"").fold(
       Map::new(),
       |found: Map<Bytes, FactRecord>, key: Bytes, b: Bytes| {
@@ -697,8 +692,10 @@ fn fact_records<[r]>(dir: String) -> Map<Bytes, FactRecord> / {fs.read[r], abort
       },
     ))
 
-fn stored_inputs<[r]>(dir: String) -> List<StoredInput> / {fs.read[r], abort.raise} =
-  undamaged_in[r](dir, |db: Database| inputs_of[r](db))
+fn stored_inputs<[r]>(
+  opening: fact_store::Opening,
+) -> List<StoredInput> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  undamaged_opened[r](opening, |db: Database| inputs_of[r](db))
 
 pub const in_memory_database_dir: String = "store"
 
@@ -768,25 +765,21 @@ pub fn same_database_in_memory(a: fs::MemFs, b: fs::MemFs) -> Bool / {abort.rais
 
 fn read_in_memory<a>(
   tree: fs::MemFs,
-  read: (String) -> a / {fs.read[memory], abort.raise},
-) -> a / {abort.raise} = fs::on_mem[memory](tree, || read(in_memory_database_dir)).value
+  read: (fact_store::Opening) -> a / {fs.read[memory], recent_reads.read, recent_reads.write, abort.raise},
+) -> a / {abort.raise} =
+  fs::on_mem[memory](tree, || with_opening[memory](in_memory_database_dir, read)).value
 
 pub fn facts_in_memory(tree: fs::MemFs) -> Map<Bytes, FactRecord> / {abort.raise} =
-  read_in_memory(tree, |dir: String| fact_records[memory](dir))
+  read_in_memory(tree, |opening: fact_store::Opening| fact_records[memory](opening))
 
 pub fn inputs_in_memory(tree: fs::MemFs) -> List<StoredInput> / {abort.raise} =
-  read_in_memory(tree, |dir: String| stored_inputs[memory](dir))
+  read_in_memory(tree, |opening: fact_store::Opening| stored_inputs[memory](opening))
 
 pub fn outputs_in_memory(
   tree: fs::MemFs,
   digests: List<Bytes>,
 ) -> Map<Bytes, StoredOutput> / {abort.raise} =
-  fs::on_mem[memory](tree, || {
-    let opening = open_database[memory](in_memory_database_dir);
-    let outputs = outputs_by_digest[memory](opening, digests);
-    close_database[memory](opening);
-    outputs
-  }).value
+  read_in_memory(tree, |opening: fact_store::Opening| outputs_by_digest[memory](opening, digests))
 
 pub fn pack_in_memory(
   tree: fs::MemFs,
@@ -794,7 +787,8 @@ pub fn pack_in_memory(
   queries: QueriesId,
   files: Bytes,
 ) -> packs::PackFiles / {abort.raise} =
-  read_in_memory(tree, |dir: String| write_pack[memory](dir, keys, queries, files).written)
+  read_in_memory(tree, |opening: fact_store::Opening|
+    write_pack[memory](opening, keys, queries, files).written)
 
 fn quoted(input: Bytes) -> Bytes / {memo.read, abort.raise} =
   match memo.fetch(b"text", input, main_part) {
@@ -913,21 +907,13 @@ fn records_written_in<[r]>(
   dir: String,
   puts: Map<Bytes, Bytes>,
   deleted: Set<Bytes>,
-) -> List<StoreProblem> / {fs.read[r], fs.write[r], abort.raise} = {
-  let opening = open_database[r](dir);
-  let problems = write_records[r](opening, puts, deleted);
-  close_database[r](opening);
-  problems
-}
+) -> List<StoreProblem> / {fs.read[r], fs.write[r], abort.raise} =
+  with_opening[r](dir, |opening: fact_store::Opening| write_records[r](opening, puts, deleted))
 
 fn records_read_in<[r]>(
   dir: String,
-) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], fs.write[r], abort.raise} = {
-  let opening = open_database[r](dir);
-  let records = read_records[r](opening);
-  close_database[r](opening);
-  records
-}
+) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], fs.write[r], abort.raise} =
+  with_opening[r](dir, |opening: fact_store::Opening| read_records[r](opening))
 
 test "records survive a reopen beside the facts, and a dropped record is gone" {
   let facts = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
@@ -947,7 +933,7 @@ test "records survive a reopen beside the facts, and a dropped record is gone" {
 fn quoted_on<[r]>(
   opening: fact_store::Opening,
   text: Bytes,
-) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], abort.raise} =
+) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} =
   with_opened_database[r](
     opening,
     packs::no_pack,
@@ -958,19 +944,18 @@ fn quoted_on<[r]>(
   )
 
 test "one opening serves sessions and records writes in turn, and each commit builds on the one before" {
-  let ran = fs::on_mem[abs](fs::mem_of([]), || {
-    let opening = open_database[abs]("s");
-    let first = quoted_on[abs](opening, b"four");
-    let records = write_records[abs](opening, Map::new().insert(b"a", b"1"), Set::empty());
-    let second = quoted_on[abs](opening, b"forty");
-    let read = read_records[abs](opening);
-    close_database[abs](opening);
-    {
-      problems: first.problems.concat(records).concat(second.problems),
-      values: [first.value, second.value],
-      read: read,
-    }
-  });
+  let ran = fs::on_mem[abs](fs::mem_of([]), ||
+    with_opening[abs]("s", |opening: fact_store::Opening| {
+      let first = quoted_on[abs](opening, b"four");
+      let records = write_records[abs](opening, Map::new().insert(b"a", b"1"), Set::empty());
+      let second = quoted_on[abs](opening, b"forty");
+      let read = read_records[abs](opening);
+      {
+        problems: first.problems.concat(records).concat(second.problems),
+        values: [first.value, second.value],
+        read: read,
+      }
+    }));
   assert_eq(ran.value.problems, []);
   assert_eq(ran.value.values, [b"\"four\"", b"\"forty\""]);
   assert_eq(ran.value.read, Ok(Map::new().insert(b"a", b"1")));
@@ -999,7 +984,8 @@ test "a pack holds the facts of the keys it is built from, and a trusted run use
   let keys = [b"text", b"quoted"].map(|name: Bytes| fact_key(name, b"a"));
   let pack = fs::on_mem[abs](fs::mem_of([]), || {
     quoted_over[abs](long);
-    write_pack[abs]("s", keys, queries_id(queries), b"files")
+    with_opening[abs]("s", |opening: fact_store::Opening|
+      write_pack[abs](opening, keys, queries_id(queries), b"files"))
   }).value;
   let used = fs::on_mem[abs](fs::mem_of([]), ||
     with_database[abs](
