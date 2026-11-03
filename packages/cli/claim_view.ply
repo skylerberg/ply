@@ -3,15 +3,16 @@ import std.set (Set)
 import compiler.check.resolve.tables (Place, InSource, WholeFile, Unplaced, place_module,
                                       source_span)
 import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.facts (Analysis)
+import compiler.front.facts (Analysis, analysis_identities)
 import compiler.front.exports (ItemAt)
 import compiler.front.published (no_rows)
 import compiler.front.checking (LoadInputs, read_over)
-import compiler.front.checking.promises (ClaimsProgram, PlacedModule, claims_analysed)
+import compiler.front.checking.promises (ClaimsProgram, ClaimsAnalysed, ClaimsRejected,
+                                         PlacedModule, claims_analysed)
 import compiler.check.resolve.tables (placed_in)
 import compiler.check.resolve.tables (Source, Diagnostic, Edit, Fix, Label, ParsedModule,
                                       diagnostic_bin)
-import compiler.store.hash.forms (with_identities)
+import compiler.store.hash.forms (Identities)
 import compiler.emit.costs (placed_span)
 import compiler.syntax.parsing (span_between)
 import compiler.check.infer.checker (DefinitionInfo)
@@ -125,7 +126,7 @@ fn placed_diagnostic(placing: Map<Int, Placement>, d: Diagnostic) -> Diagnostic 
 fn placed_own(fresh: OwnClaims, placing: Map<Int, Placement>) -> OwnClaims =
   {
     ..fresh,
-    claims: fresh.claims.map(|c: Claim| { ..c, at: placed_place(placing, c.at) }),
+    claims: fresh.claims.map(|c: Claim| { ..c, at: placed_at(placing, c.at) }),
     warnings: fresh.warnings.map(|d: Diagnostic| placed_diagnostic(placing, d)),
   }
 
@@ -287,7 +288,7 @@ fn claimed_with_view(
 ) -> Result<ClaimedProgram, List<Diagnostic>> / {proof_store.record_claims, abort.raise} = {
   let w = c.analysis;
   let owned = |m: Bytes| names.contains(m);
-  let built = prover_input_of(w, owned);
+  let built = prover_input_of(w, c.identities, owned);
   let fresh = placed_own(own_claims(w, built), placements(c.placed, names));
   let opened = open.fold(Map::new(), |found: Map<Bytes, Int>, k: KnownModule|
     found.insert(k.name, k.index));
@@ -322,7 +323,7 @@ fn claimed_with_view(
   })
 }
 
-pub type ClaimClosure = { analysis: Analysis, placed: List<PlacedModule> }
+pub type ClaimClosure = { analysis: Analysis, identities: Identities, placed: List<PlacedModule> }
 
 pub fn claimed_modules<| e>(
   inputs: ClaimInputs,
@@ -363,11 +364,12 @@ fn closure_of(
   names: List<Bytes>,
 ) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise} =
   match analysed.outcome {
-    Rejected(ds) -> {
+    ClaimsRejected(ds) -> {
       let placing = placements(analysed.placed, names);
       Err(ds.map(|d: Diagnostic| placed_diagnostic(placing, d)))
     },
-    Analysed(w) -> Ok({ analysis: w, placed: analysed.placed }),
+    ClaimsAnalysed(w, identities) ->
+      Ok({ analysis: w, identities: identities, placed: analysed.placed }),
   }
 
 pub fn claims_closure(
@@ -401,7 +403,7 @@ fn whole_analysis(sources: List<Source>) -> Analysis / {abort.raise} =
       false,
       [],
     ).out {
-    Analysed(w) -> { ..w, hashes: with_identities(w.hashes) },
+    Analysed(w) -> w,
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
   }
 
@@ -418,12 +420,13 @@ const claimed_sources: List<Source> =
     { name: b"other", source_text: b"pub fn unrelated(n: Int) -> Int = n * 3\n" },
   ]
 
-fn claim_keys(w: Analysis) -> List<String> / {abort.raise} =
-  prover_input_of(w, |m: Bytes| true).world.obligations.map(|o: Obligation| o.key)
+fn claim_keys(w: Analysis, identities: Identities) -> List<String> / {abort.raise} =
+  prover_input_of(w, identities, |m: Bytes| true).world.obligations.map(|o: Obligation|
+    o.key)
 
-fn proved_claims(w: Analysis) -> List<String> / {abort.raise} = {
+fn proved_claims(w: Analysis, identities: Identities) -> List<String> / {abort.raise} = {
   let owned = |m: Bytes| [b"app", b"lib", b"other"].contains(m);
-  let world = prover_input_of(w, owned).world;
+  let world = prover_input_of(w, identities, owned).world;
   let p = prover_of(
     claims_for(w, modules_of(w, world.obligations), owned),
     world,
@@ -438,12 +441,13 @@ fn proved_claims(w: Analysis) -> List<String> / {abort.raise} = {
 
 test "the claims of the open modules, checked by group, are the claims of the whole program and prove the same" {
   let whole = whole_analysis(claimed_sources);
+  let identities = analysis_identities(whole);
   match closure_over(claimed_sources, [b"app", b"lib", b"other"]) {
     Err(_) -> panic("the claims of a checked program were rejected"),
     Ok(c) -> {
-      assert_eq(claim_keys(c.analysis), claim_keys(whole));
-      assert(proved_claims(whole).contains("app.four"));
-      assert_eq(proved_claims(c.analysis), proved_claims(whole));
+      assert_eq(claim_keys(c.analysis, c.identities), claim_keys(whole, identities));
+      assert(proved_claims(whole, identities).contains("app.four"));
+      assert_eq(proved_claims(c.analysis, c.identities), proved_claims(whole, identities));
       assert_eq(c.analysis.modules.map(|m: ParsedModule| m.name).take(3), [
         b"app",
         b"lib",
@@ -459,20 +463,21 @@ test "a claim checked by group keeps its place in its file" {
     Ok(c) -> {
       let names = [b"app", b"lib", b"other"];
       let fresh = placed_own(
-        own_claims(c.analysis, prover_input_of(c.analysis, |m: Bytes| names.contains(m))),
+        own_claims(
+          c.analysis,
+          prover_input_of(c.analysis, c.identities, |m: Bytes| names.contains(m)),
+        ),
         placements(c.placed, names),
       );
       let text = claimed_sources.get(0).source_text;
       let four = fresh.claims.filter(|claim: Claim| claim.owner == "app.four");
       assert(four.len() > 0);
       assert(
-        four.all(|claim: Claim|
-          match claim.at {
-            InSource(at) ->
-              at.module == 0 && text.slice(at.start, at.end).len() > 0
-                && text.slice(0, at.start).index_of(b"pub fn four") != None,
-            _ -> false,
-          }),
+        four.all(|claim: Claim| {
+          let at = claim.at;
+          at.module == 0 && text.slice(at.start, at.end).len() > 0
+            && text.slice(0, at.start).index_of(b"pub fn four") != None
+        }),
       )
     },
   }
