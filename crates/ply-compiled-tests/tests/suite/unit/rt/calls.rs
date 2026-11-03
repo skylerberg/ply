@@ -141,7 +141,7 @@ fn a_failure_that_is_no_raise_stands_as_it_is() {
 fn rooted_at(start: u32) -> Ctx {
     let mut ctx = Ctx::new(Arc::new(Tables {
         fields: Vec::new(),
-        memo: Vec::new(),
+        memo: Box::new([]),
         functions: Vec::new(),
         immortals: Mutex::new(Heap::persistent()),
         roots: vec![Root {

@@ -24,9 +24,9 @@ import compiler.emit.keys
 import compiler.emit.keys (printed, RootKey, Named, Specialisation, Test, TestCases, Clause, Law,
                            EntryPoint, Coded, Requires, Ensures, LawGuard, LawBody, LawPart,
                            InlinedLambda, KeyArg, KeyType, KeyLayout, RootName, root_name,
-                           root_text, definition_of, site_owner, inlined_lambdas, key_types,
-                           specialisation_key, module_of, root_key_bin, test_key, law_key,
-                           entry_name, root_name_bin, unspecialised)
+                           root_text, definition_of, site_owner, site_owners, inlined_lambdas,
+                           key_types, specialisation_key, module_of, root_key_bin, test_key,
+                           law_key, entry_name, root_name_bin, unspecialised)
 import compiler.emit
 import compiler.emit.borrow_inference (OwnershipSignature, signatures_from)
 import compiler.emit.representations (layout_variables, has_variables, is_scalar_type,
@@ -368,14 +368,7 @@ pub fn write_cached_file<[r]>(
   }
 }
 
-pub type RequestedRoot = {
-  key: RootKey,
-  name: RootName,
-  arity: Int,
-  constant: Bool,
-  site: RootName,
-  home: Bytes,
-}
+pub type RequestedRoot = { key: RootKey, name: RootName, arity: Int, constant: Bool, home: Bytes }
 
 derive bin for RequestedRoot
 
@@ -669,14 +662,13 @@ fn resolved(
   local: Map<Bytes, Int>,
 ) -> Bytes / {abort.raise} = {
   let text = body.text;
-  let member = |h: Hole, otherwise: RootName|
-    if h.digits.len() == 0 { otherwise }
-    else { root_name(body.tables.members.get(digits(h.digits))) };
+  let member = |h: Hole, otherwise: RootName, named: (RootKey) -> RootName|
+    if h.digits.len() == 0 { otherwise } else { named(body.tables.members.get(digits(h.digits))) };
   let walk_levels = holes(text).fold(
     { from: 0, out: [] },
     |s: { from: Int, out: List<Bytes> }, h: Hole| {
-      let value = if h.kind == 114 { ascii_of_int(root_id(root_text(member(h, site)))) }
-      else if h.kind == 115 { symbol_named(member(h, own_root(body))) } else {
+      let value = if h.kind == 114 { ascii_of_int(root_id(root_text(member(h, site, site_owner)))) }
+      else if h.kind == 115 { symbol_named(member(h, own_root(body), root_name)) } else {
         Bytes::concat_all([
           table,
           b"[",
@@ -713,6 +705,7 @@ fn exports_text(
   modules: Int,
   p: Pools,
   entered: List<RootName>,
+  sites: List<RootName>,
 ) -> Bytes =
   Bytes::concat_all([
     labelled_lines(
@@ -732,6 +725,7 @@ fn exports_text(
     Bytes::concat_all(
       entered.map(|r: RootName| Bytes::concat_all([b"entered ", root_text(r), b"\n"])),
     ),
+    Bytes::concat_all(sites.map(|r: RootName| Bytes::concat_all([b"site ", root_text(r), b"\n"]))),
   ])
 
 fn literal_lines(line: Bytes) -> Bytes / {abort.raise} =
@@ -1184,14 +1178,29 @@ pub fn produce(
       Bytes::concat_all([root_text(n), b" ", ascii_of_int(position_in(placed.lambdas, entry(n)))])),
     modules,
     pools,
-    offered.filter(|o: RequestedRoot| o.name == entry_name(o.site)).map(|o: RequestedRoot| o.site),
+    offered.filter(|o: RequestedRoot| o.name == entry_name(site_owner(o.key))).map(
+      |o: RequestedRoot| site_owner(o.key),
+    ),
+    sorted_unique_names(
+      s.bodies.fold([], |accumulator: List<RootName>, k: UnitBody|
+        accumulator.concat(site_owners(offer_of(k.name).key)).concat(
+          k.tables.members.flat_map(site_owners),
+        )),
+    ),
   );
   let by_name = taken.fold(
     Map::new(),
     |accumulator: Map<RootName, IncludedRoot>, t: IncludedRoot| accumulator.insert(t.name, t),
   );
   let written = plans.map(|p: Planned|
-    part_written(p, |n: RootName| offer_of(n).site, by_name, machine, constant_c, outside));
+    part_written(
+      p,
+      |n: RootName| site_owner(offer_of(n).key),
+      by_name,
+      machine,
+      constant_c,
+      outside,
+    ));
   let tail = [
     { label: "runtime", text: unit_tail(machine) },
     {
@@ -1320,7 +1329,7 @@ fn offered_as_shared(
   offered: List<RequestedRoot>,
   c: { key: RootKey, home: Bytes },
 ) -> RequestedRoot / {abort.raise} =
-  match offered.find(|o: RequestedRoot| o.site == site_owner(c.key)) {
+  match offered.find(|o: RequestedRoot| site_owner(o.key) == site_owner(c.key)) {
     Some(o) -> { ..o, key: c.key, name: root_name(c.key), home: c.home },
     None -> panic("a shared body has no root that requested it"),
   }
@@ -1724,8 +1733,7 @@ fn unit_finished<s>(w: UnitWalk<s>, natives_here: List<Extern>) -> LoweredUnit /
 
 fn requested_root(p: LoweringInput, k: RootKey, home: Bytes) -> RequestedRoot =
   match k {
-    EntryPoint(_) ->
-      { key: k, name: root_name(k), arity: 0, constant: false, site: site_owner(k), home: home },
+    EntryPoint(_) -> { key: k, name: root_name(k), arity: 0, constant: false, home: home },
     _ -> match p.roots.get(site_owner(k)) {
       Some(r) ->
         {
@@ -1734,11 +1742,9 @@ fn requested_root(p: LoweringInput, k: RootKey, home: Bytes) -> RequestedRoot =
           arity: r.arity,
           constant: r.pure && r.arity == 0
             && (match k { Specialisation(_, _) -> false, Coded(_) -> false, _ -> true }),
-          site: site_owner(k),
           home: home,
         },
-      None ->
-        { key: k, name: root_name(k), arity: 0, constant: false, site: site_owner(k), home: home },
+      None -> { key: k, name: root_name(k), arity: 0, constant: false, home: home },
     },
   }
 
@@ -2196,14 +2202,7 @@ fn by_definition<v>(entries: List<{ key: Bytes, value: v }>) -> Map<RootName, v>
     m.insert(definition_root(x.key), x.value))
 
 fn offer_root(k: RootKey, arity: Int) -> RequestedRoot =
-  {
-    key: k,
-    name: root_name(k),
-    arity: arity,
-    constant: false,
-    site: root_name(k),
-    home: home_of(k),
-  }
+  { key: k, name: root_name(k), arity: arity, constant: false, home: home_of(k) }
 
 fn request(n: Bytes, arity: Int) -> RequestedRoot = offer_root(Named(n), arity)
 
@@ -2804,7 +2803,7 @@ test "each unit section is labelled with 16 hex digits from its first body's roo
 test "a unit's text has an `entered` line for each root whose entry point the unit includes, even without a body for that root" {
   let entry = |n: Bytes| root_name(EntryPoint(Named(n)));
   let definition = |n: Bytes| request(n, 0);
-  let entered = |n: Bytes| { ..offer_root(EntryPoint(Named(n)), 0), site: definition_root(n) };
+  let entered = |n: Bytes| offer_root(EntryPoint(Named(n)), 0);
   let p = fresh(
     [],
     [definition(b"m.f"), definition(b"m.g"), entered(b"m.f"), entered(b"m.h")],
