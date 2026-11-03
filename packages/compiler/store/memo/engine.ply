@@ -5,8 +5,8 @@ import std.graph (Visit, traverse)
 import std.math (unlimited_steps)
 import std.hash (blake3)
 import compiler.store.memo (memo, Parts, Product, Query, Queries, main_part, RecordedRead,
-                            RecordedFact, ReadOfFact, ReadOfDeletedFact, ReadOfInput,
-                            FactReader, fact_inspection)
+                            RecordedFact, ReadOfFact, ReadOfDeletedFact, ReadOfInput, FactReader,
+                            fact_inspection)
 import compiler.store.memo.store (Dependency, ExternalDependency, QueryDependency, StoredFact,
                                   FactDetails, StoredInput, ExternalInput, SealedInput, InputRead,
                                   Waited, digest_of, encoded_details, fact_key, location_id,
@@ -162,27 +162,48 @@ fn released(id: Bytes) -> Bool / {memo_store.read, memo_store.write} =
     }
   }
 
-fn deleted_one(key: Bytes) -> List<Bytes> / {memo_store.read, memo_store.write, abort.raise} =
+fn deleted_one(
+  key: Bytes,
+  read_from: Set<Bytes>,
+) -> Set<Bytes> / {memo_store.read, memo_store.write, abort.raise} =
   match memo_store.fact(key) {
     None -> {
       memo_store.settle(key);
-      []
+      read_from
     },
     Some(f) -> {
       marked_dependents(key);
       let before = memo_store.details(f.details);
       memo_store.delete(key);
-      edges_of(key, before.reads).values().fold([], |next: List<Bytes>, e: Edge| {
+      edges_of(key, before.reads).values().fold(read_from, |ons: Set<Bytes>, e: Edge| {
         memo_store.remove_dependent(e.on, e.member);
-        if released(e.on) { next.push(e.on) } else { next }
+        ons.insert(e.on)
       })
     },
   }
 
-fn deleted_all(keys: List<Bytes>) -> Unit / {memo_store.read, memo_store.write, abort.raise} = {
-  traverse(keys, |key: Bytes| { value: (), next: deleted_one(key) });
-  ()
-}
+type Deleting = { level: List<Bytes>, deleted: Set<Bytes> }
+
+fn deleted_all(keys: List<Bytes>) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
+  iterate(
+    { level: Set::of_list(keys).elements(), deleted: Set::of_list(keys) },
+    unlimited_steps,
+    |d: Deleting|
+      if d.level.len() == 0 { Stop(()) } else {
+        let next = released_among(
+          d.level.fold(Set::empty(), |ons: Set<Bytes>, key: Bytes| deleted_one(key, ons)),
+          d.deleted,
+        );
+        Continue({ level: next, deleted: d.deleted.union(Set::of_list(next)) })
+      },
+  )
+
+fn released_among(
+  ons: Set<Bytes>,
+  deleted: Set<Bytes>,
+) -> List<Bytes> / {memo_store.read, memo_store.write} =
+  ons.difference(deleted).fold([], |next: List<Bytes>, on: Bytes|
+    if released(on) { next.push(on) } else { next })
 
 fn deleted(key: Bytes) -> Unit / {memo_store.read, memo_store.write, abort.raise} =
   deleted_all([key])
@@ -197,11 +218,14 @@ fn edges_updated(
   new.fold((), |_: Unit, id: Bytes, e: Edge|
     if !old.contains(id) { memo_store.add_dependent(e.on, e.member) });
   deleted_all(
-    old.fold([], |gone: List<Bytes>, id: Bytes, e: Edge|
-      if new.contains(id) { gone } else {
-        memo_store.remove_dependent(e.on, e.member);
-        if released(e.on) { gone.push(e.on) } else { gone }
-      }),
+    released_among(
+      old.fold(Set::empty(), |ons: Set<Bytes>, id: Bytes, e: Edge|
+        if new.contains(id) { ons } else {
+          memo_store.remove_dependent(e.on, e.member);
+          ons.insert(e.on)
+        }),
+      Set::empty(),
+    ),
   )
 }
 
