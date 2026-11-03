@@ -111,3 +111,37 @@ fn a_set_of_libraries_fills_the_slots_of_calls_between_them_in_both_directions()
     let result = units::entered(&native, "m.one", &[]).expect("it returns");
     assert_eq!(imm_value(result), 7);
 }
+
+#[test]
+fn two_programs_that_load_the_same_library_each_call_their_own_other_libraries_through_it() {
+    if std::process::Command::new("cc")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        return;
+    }
+    let dir = tempfile::tempdir().expect("a scratch directory");
+    let two = units::symbol("m.two");
+    let caller = [def(
+        "m.one",
+        0,
+        &format!("  extern Word (*{two}_slot)(PlyCtx *);\n  return {two}_slot(ctx);"),
+    )];
+    let returning = |value: i64| [def("m.two", 0, &format!("  return ply_imm({value});"))];
+    let shared = linked_library(
+        dir.path(),
+        &caller,
+        &[two.as_str()],
+        &units::symbol("m.one"),
+    );
+    let seven = linked_library(&dir.path().join("seven"), &returning(7), &[], &two);
+    let nine = linked_library(&dir.path().join("nine"), &returning(9), &[], &two);
+    let first = ply_compiled::c::load_libraries(&[shared.clone(), seven]).expect("they load");
+    let second = ply_compiled::c::load_libraries(&[shared, nine]).expect("they load");
+    let called = |native: &ply_compiled::c::Native| {
+        imm_value(units::entered(native, "m.one", &[]).expect("it returns"))
+    };
+    assert_eq!(called(&first), 7);
+    assert_eq!(called(&second), 9);
+}
