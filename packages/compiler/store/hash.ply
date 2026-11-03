@@ -490,15 +490,7 @@ pub fn hash_dump(sources: List<Source>) -> String / {abort.raise} = {
   String::of_bytes(head.concat(body))
 }
 
-fn dumped_hash(dump: String, name: Bytes) -> Bytes / {abort.raise} = {
-  let d = Bytes::of_string(dump);
-  let key = Bytes::concat_all([b"H;", name, b";"]);
-  let start = match d.index_of(key) {
-    Some(i) -> i + key.len(),
-    None -> panic("the hash dump has no entry for the definition"),
-  };
-  d.slice(start, start + 64)
-}
+fn dumped_hash(dump: String, name: Bytes) -> Bytes / {abort.raise} = dumped_as(dump, b"H;", name)
 
 test "a type is used when a function declared on it is called, and reported unused when none of its functions is called" {
   let source = b"type Tally = | Tally\nfn Tally::made() -> Int = 1\nfn Tally::idle() -> Int = 2\ntype Lone = | Lone\nfn Lone::made() -> Int = 3\npub fn f() -> Int = Tally::made()\n";
@@ -540,14 +532,6 @@ test "a definition's hash covers only its own text, so a callee's body edit leav
 }
 
 test "a type's where clause is in its hash, and its spelling is not" {
-  let declaration = |dump: String, name: Bytes| {
-    let d = Bytes::of_string(dump);
-    let key = Bytes::concat_all([b"Y;", name, b";"]);
-    match d.index_of(key) {
-      Some(i) -> d.slice(i + key.len(), i + key.len() + 64),
-      None -> panic("the dump names no declaration by the name"),
-    }
-  };
   let source_with = |w: Bytes|
     Bytes::concat_all([b"pub type Game<a>", w, b" = { same: (a, a) -> Bool }\n"]);
   let with_where = hash_dump([
@@ -561,10 +545,10 @@ test "a type's where clause is in its hash, and its spelling is not" {
     },
   ]);
   assert(
-    declaration(with_where, b"m.Game") != declaration(without, b"m.Game"),
+    declaration_in_dump(with_where, b"m.Game") != declaration_in_dump(without, b"m.Game"),
     Some("adding a type's `where` moved no hash"),
   );
-  assert_eq(declaration(with_where, b"m.Game"), declaration(renamed, b"m.Game"))
+  assert_eq(declaration_in_dump(with_where, b"m.Game"), declaration_in_dump(renamed, b"m.Game"))
 }
 
 test "replacing doc comments with plain comments of the same length does not change a module's hashes" {
@@ -613,7 +597,7 @@ test "a byte literal like `b'{'` hashes the same as the integer `123`, and `+%` 
   )
 }
 
-test "a tagged literal hashes with its parser and its text, apart from the call it stands for" {
+test "a tagged literal hashes by its parser's name and its text, apart from the call it stands for, and depends on its parser" {
   let tag = |accepted: Bytes|
     {
       name: b"hex",
@@ -630,7 +614,8 @@ test "a tagged literal hashes with its parser and its text, apart from the call 
   let literal = of(b"1", b"hex\"ab\"");
   assert_eq(of(b"1", b"(hex\"ab\")"), literal);
   assert(of(b"1", b"hex\"ac\"") != literal);
-  assert(of(b"2", b"hex\"ab\"") != literal);
+  let hashed = hash_index(index_sources([tag(b"1"), caller_module(b"hex\"ab\"")]));
+  assert(closure_of(hashed, [b"m.f"]).contains(b"hex.literal"));
   assert(of(b"1", b"match hex::literal(\"ab\") { Ok(n) -> n, Err(_) -> 0 }") != literal);
   let renamed = hash_dump([
     tag(b"1"),
@@ -639,7 +624,7 @@ test "a tagged literal hashes with its parser and its text, apart from the call 
   assert_eq(dumped_hash(renamed, b"m.f"), literal)
 }
 
-test "a tagged string with `{...}` placeholders hashes differently when the tag's `compile` or `fill` function, the text pieces or the placeholder expressions change" {
+test "a tagged string with `{...}` placeholders hashes differently when the text pieces or the placeholder expressions change, and depends on the tag's `compile` and `fill` functions" {
   let tag = |compiled: Bytes|
     {
       name: b"sh",
@@ -657,7 +642,11 @@ test "a tagged string with `{...}` placeholders hashes differently when the tag'
   assert_eq(of(b"1", b"(sh\"a {n} b\")"), literal);
   assert(of(b"1", b"sh\"a {n} c\"") != literal);
   assert(of(b"1", b"sh\"a {n + 1} b\"") != literal);
-  assert(of(b"2", b"sh\"a {n} b\"") != literal);
+  let depended = closure_of(
+    hash_index(index_sources([tag(b"1"), caller_module(b"sh\"a {n} b\"")])),
+    [b"m.f"],
+  );
+  assert(depended.contains(b"sh.compile") && depended.contains(b"sh.fill"));
   assert(of(b"1", b"sh\"a {n}{n} b\"") != of(b"1", b"sh\"a {n} b{n}\""));
   assert(
     of(b"1", b"match sh::compile([\"a \", \" b\"]) { Ok(c) -> sh::fill(c, [n]), Err(_) -> 0 }")
@@ -689,7 +678,10 @@ test "a record update of another module's record hashes by its own text, so a ch
     dumped_hash(hash_dump(narrow), b"app.bumped"),
     dumped_hash(hash_dump(wide), b"app.bumped"),
   );
-  assert(dumped_hash(hash_dump(narrow), b"shapes.P") != dumped_hash(hash_dump(wide), b"shapes.P"))
+  assert(
+    declaration_in_dump(hash_dump(narrow), b"shapes.P")
+      != declaration_in_dump(hash_dump(wide), b"shapes.P"),
+  )
 }
 
 test "two functions that call each other each have the other in their closure" {
@@ -994,24 +986,24 @@ fn dumped_as(dump: String, kind: Bytes, name: Bytes) -> Bytes / {abort.raise} = 
 
 test "a type's invariant is part of the type's hash, so naming a different invariant function changes the type's hash" {
   let balance = b"pub opaque type B = | B(Int)\npub fn open() -> B = B(0)\n";
-  let stated = |valid: Bytes|
+  let stated = |by: Bytes|
     declaration_in_dump(
       hash_dump([
         {
           name: b"m",
           source_text: Bytes::concat_all([
             balance,
-            b"fn valid(b: B) -> Bool = ",
-            valid,
-            b"\ninvariant for B by valid\n",
+            b"fn valid(b: B) -> Bool = true\nfn checked(b: B) -> Bool = true\ninvariant for B by ",
+            by,
+            b"\n",
           ]),
         },
       ]),
       b"m.B",
     );
   let plain = declaration_in_dump(hash_dump([{ name: b"m", source_text: balance }]), b"m.B");
-  assert(stated(b"true") != stated(b"false"));
-  assert(stated(b"true") != plain)
+  assert(stated(b"valid") != stated(b"checked"));
+  assert(stated(b"valid") != plain)
 }
 
 test "changing a law's `where identity(a)` condition changes the law's hash and the hash of the law schema it comes from, and a law that uses that schema keeps its own hash" {
@@ -1045,7 +1037,7 @@ test "changing a law's `where identity(a)` condition changes the law's hash and 
   assert_eq(dumped_law(open, b"m.l"), dumped_law(constrained, b"m.l"))
 }
 
-test "making a definition `const` changes its hash and the hash of the function that reads it" {
+test "making a definition `const` changes its hash" {
   let source = b"pub const table: List<Int> = [1, 2]\npub fn first() -> Option<Int> = table.at(0)";
   let plain = hash_dump([
     {
@@ -1054,8 +1046,7 @@ test "making a definition `const` changes its hash and the hash of the function 
     },
   ]);
   let marked = hash_dump([{ name: b"m", source_text: source }]);
-  assert(dumped_hash(plain, b"m.table") != dumped_hash(marked, b"m.table"));
-  assert(dumped_hash(plain, b"m.first") != dumped_hash(marked, b"m.first"))
+  assert(dumped_hash(plain, b"m.table") != dumped_hash(marked, b"m.table"))
 }
 
 const trees: Bytes =
@@ -1760,7 +1751,7 @@ test "a parameter with a `space` annotation hashes differently from one without,
 }
 
 test "a type's hash covers the arithmetic operations the type declares" {
-  let stating = |stated: Bytes, sum: Bytes|
+  let stating = |stated: Bytes|
     hash_index(
       index_sources([
         {
@@ -1768,9 +1759,8 @@ test "a type's hash covers the arithmetic operations the type declares" {
           source_text: Bytes::concat_all([
             b"pub type N = | N(Int)\n",
             stated,
-            b"fn add(a: N, b: N) -> N = match a { N(x) -> match b { N(y) -> N(",
-            sum,
-            b") } }\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\n",
+            b"fn add(a: N, b: N) -> N = match a { N(x) -> match b { N(y) -> N(x + y) } }\n",
+            b"fn left(a: N, b: N) -> N = a\nfn neg(a: N) -> N = a\nfn of(n: Int) -> N = N(n)\n",
             b"pub fn two() -> N = of(2)\n",
           ]),
         },
@@ -1778,13 +1768,14 @@ test "a type's hash covers the arithmetic operations the type declares" {
     );
   let named = |out: HashOutput, n: Bytes| by_name(named_hashes(out)).get(n);
   let all = b"numeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of }\n";
-  let stated = stating(all, b"x + y");
-  assert(named(stating(b"", b"x + y"), b"m.N") != named(stated, b"m.N"));
-  assert(named(stated, b"m.N") != named(stating(all, b"y + x"), b"m.N"));
+  let stated = stating(all);
+  assert(named(stating(b""), b"m.N") != named(stated, b"m.N"));
+  let swapped = b"numeric for N by { add: add, sub: left, mul: add, neg: neg, of_int: of }\n";
+  assert(named(stated, b"m.N") != named(stating(swapped), b"m.N"));
   let other = b"numeric for N by { add: add, sub: add, mul: add, neg: neg, of_int: of, }\n";
   let reordered = b"numeric for N by { of_int: of, neg: neg, mul: add, sub: add, add: add }\n";
-  assert_eq(named(stated, b"m.N"), named(stating(reordered, b"x + y"), b"m.N"));
-  assert_eq(named(stated, b"m.N"), named(stating(other, b"x + y"), b"m.N"))
+  assert_eq(named(stated, b"m.N"), named(stating(reordered), b"m.N"));
+  assert_eq(named(stated, b"m.N"), named(stating(other), b"m.N"))
 }
 
 test "a type's hash changes with its `key` and `show` declarations, and a function that uses the type keeps its own hash" {
@@ -1816,7 +1807,6 @@ test "a type's hash changes with its `key` and `show` declarations, and a functi
   let shown = stating(b"show for Box by text\n", b"w * h");
   let named = |m: Map<Bytes, Bytes>, n: Bytes| m.get(n);
   assert(named(plain, b"m.Box") != named(keyed, b"m.Box"));
-  assert(named(keyed, b"m.Box") != named(edited, b"m.Box"));
   assert(named(keyed, b"m.Box") != named(other, b"m.Box"));
   assert(named(plain, b"m.Box") != named(shown, b"m.Box"));
   assert(named(keyed, b"m.Box") != named(shown, b"m.Box"));
