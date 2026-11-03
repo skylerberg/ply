@@ -1,5 +1,5 @@
-import compiler.front.checking (analysed_over, lowered_over)
-import compiler.front.checking.unit_programs (value_fixture)
+import compiler.front.checking (FileAt, analysed_over)
+import compiler.front.checking.unit_programs (value_fixture, compiled_program)
 import compiler.check.infer.checker (decode_facts, RecordedFacts, BodyRecord, RecordedHere,
                                      CheckedElsewhere)
 import compiler.emit.print.lists (item_function)
@@ -9,7 +9,6 @@ import compiler.check.types (Type, NamedType, RecordType, SingletonResource, int
                              string_type, decode_type, float_type, unit_type, bool_type, list_type,
                              option_type, map_type, iter_type)
 import compiler.check.known (ordering_type, result_type, array_type, columns_type)
-import compiler.emit.typing (unknown_type)
 import compiler.front
 import compiler.front.rows (KnownDefinitionRow, Dump, ConstructorRow, EmitterConstructor)
 import compiler.front.published (dump_of)
@@ -34,25 +33,22 @@ import compiler.emit.keys (printed, RootKey, Named, Generated, Clause, ClauseKin
                            Lift, Lower, RootName, specialisation_key, root_name, root_text,
                            module_of, test_key)
 import compiler.emit.output (DefinitionSymbol, ExpectedPrototype, CallAt, GenericAt, SharedFunction,
-                             callee_name, Prototype, word_prototype, GenericCall, Need, Exact,
-                             Layout, Scalar, no_generics, Tables, no_tables, EmittedRoot,
-                             RootOutput, PublishedSignature, Output)
+                             callee_name, Prototype, word_prototype, GenericCall, Scalar,
+                             no_generics, Tables, no_tables, EmittedRoot, RootOutput,
+                             PublishedSignature, Output)
 import compiler.emit.statics (BytesDatum, EmbeddedDatum, statics_of)
 import compiler.emit.representations (SumConstructor, constructor_sums, at_args, has_variables)
 import compiler.front.facts (Analysis)
-import compiler.emit.emit_harness (program_of, lowered_root, SessionAnalysis, accepted_session)
+import compiler.emit.emit_harness (program_of, lowered_root)
 import compiler.emit.lower.module_context (Root)
 import compiler.emit.code (Code, code_children)
-import compiler.unit (requested_roots)
-import compiler.emit (diagnostics_text, emit_program, emit_root_results, lowered_roots, zip_sources,
-                      scope_of, root_outputs, LoweredProgram)
+import compiler.unit (UnitCode)
+import compiler.emit (diagnostics_text, zip_sources)
 import compiler.emit.print.count_functions (allocates, release_function, free_function, call_start,
                                             increments_count, calls_release, releases_word,
                                             counts_any)
-import compiler.emit.typed_ir (Plain, Block, Instruction, Variable, Let, If, Case, Match, Loop, Get,
-                               CapturePath, Declaration, Convert, ZeroOperand, Lambda, Closure,
-                               Function)
-import compiler.front.emitter_input
+import compiler.emit.typed_ir (Block, Instruction, Variable, Let, If, Case, Match, Loop,
+                               Declaration, Convert, ZeroOperand, Lambda, Closure)
 
 fn emitted_name(e: EmittedRoot) -> Bytes = root_text(e.name)
 
@@ -79,7 +75,7 @@ test "a definition generic over effects is resolved by its callers and emitted o
     twice_log,
   ]);
   let body = |k: RootKey| output_body(results, printed(k));
-  assert_eq(body(Named(b"m.apply")).text, b"");
+  assert(!emits(results, Named(b"m.apply")), None);
   assert_eq(printed(at_log), b"m.apply@/{m.log}");
   assert_eq(
     body(Named(b"m.logged")).tables.generics.calls.map(|g: GenericCall| g.effect_evidence),
@@ -116,8 +112,7 @@ test "a `handle` in a definition generic over effects forwards the operations it
 
 test "a body that would overrun this thread's stack makes room on the stack it runs on" {
   let source = b"fn g(n: Int) -> Int = if n <= 0 { 0 } else { 1 + g(n - 1) }\n";
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  let text = match out.at(0) { Some(e) -> e.text, None -> b"" };
+  let text = output_body(module_outputs(source), b"m.g").text;
   assert(
     text.index_of(probed_fn.concat(b"(ctx)")) != None
       && probed_helper.index_of(b"rt_stack_more_p(ctx)") != None,
@@ -138,8 +133,18 @@ test "a self call in tail position restarts the body instead of nesting" {
     b"fn ladder(n: Int) -> Int = if n <= 0 { 0 } else { 1 + ladder(n - 1) }\n",
     b"fn inner(n: Int) -> Int = { let k = if n > 5 { inner(n - 1) } else { 0 }; k + 1 }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 10);
+  let out = module_emitted(source, [
+    b"m.count",
+    b"m.upto",
+    b"m.all_below",
+    b"m.any_at_least",
+    b"m.last",
+    b"m.collect",
+    b"m.digit_sum",
+    b"m.countdown",
+    b"m.ladder",
+    b"m.inner",
+  ]);
   assert_eq(out.map(|e: EmittedRoot| e.text.index_of(b"goto ply_loop;") != None), [
     true,
     true,
@@ -160,9 +165,7 @@ test "a self call that takes no arguments restarts the body as well" {
     b"fn poll() -> Int / {clock.read, diverges} = { clock.now(); poll() }\n",
     b"fn ladder() -> Int / {diverges} = 1 + ladder()\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.map(emitted_name), [b"m.spin", b"m.poll", b"m.ladder"]);
-  assert_eq(out.len(), 3);
+  let out = module_emitted(source, [b"m.spin", b"m.poll", b"m.ladder"]);
   assert_eq(out.map(|e: EmittedRoot| e.text.index_of(b"goto ply_loop;") != None), [
     true,
     true,
@@ -180,9 +183,9 @@ test "a tail call into a definition's own recursive group jumps instead of nesti
     b"fn parity(n: Int) -> Bool = even(n)\n",
     b"fn count(n: Int, acc: Int) -> Int = if n <= 0 { acc } else { count(n - 1, acc + n) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.map(emitted_name), [b"m.even", b"m.parity", b"m.count"]);
-  assert_eq(out.len(), 3);
+  let outputs = module_outputs(source);
+  assert(!emits(outputs, Named(b"m.odd")), None);
+  let out = emitted_from(outputs, [b"m.even", b"m.parity", b"m.count"]);
   let group = match out.at(0) { Some(e) -> e, None -> panic("no root was emitted") };
   assert_eq(group.tables.members, [Named(b"m.even"), Named(b"m.odd")]);
   let scalars = { result: b"int64_t", params: [b"int64_t"] };
@@ -215,7 +218,7 @@ test "emitted code refers to each function it defines by a placeholder name, nev
     b"fn walk(n: Int) -> List<Int> = if n <= 0 { [] } else { [n].map(|x: Int| x + walk(n - 1).len()) }\n",
     b"fn ten() -> Int = if odd(3) { ladder(10) } else { 0 }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.even", b"m.ladder", b"m.walk", b"m.ten"]);
   let defines = |e: EmittedRoot|
     if e.tables.members.len() == 0 { [e.name] } else { e.tables.members.map(root_name) };
   assert_eq(
@@ -247,9 +250,9 @@ test "a group of mutually recursive functions whose `handle` clauses only return
     b"fn p(n: Int) -> Int = if n <= 0 { 0 } else { let _ = try { if n == 3 { stop.halt() } else { n } }; q(n - 1) }\n",
     b"fn q(n: Int) -> Int = if n <= 0 { 0 } else { p(n - 1) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.map(emitted_name), [b"m.a", b"m.p"]);
-  assert_eq(out.len(), 2);
+  let outputs = module_outputs(source);
+  assert_eq([b"m.b", b"m.q"].filter(|n: Bytes| emits(outputs, Named(n))), []);
+  let out = emitted_from(outputs, [b"m.a", b"m.p"]);
   assert_eq(out.map(|e: EmittedRoot| e.tables.members), [
     [Named(b"m.a"), Named(b"m.b")],
     [Named(b"m.p"), Named(b"m.q")],
@@ -264,9 +267,7 @@ test "a group of mutually recursive functions is emitted as separate functions w
     b"fn c(n: Int) -> Int = if n <= 0 { 0 } else { 1 + d(n - 1) }\n",
     b"fn d(n: Int) -> Int = if n <= 0 { 0 } else { c(n - 1) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.map(emitted_name), [b"m.a", b"m.b", b"m.c", b"m.d"]);
-  assert_eq(out.len(), 4);
+  let out = module_emitted(source, [b"m.a", b"m.b", b"m.c", b"m.d"]);
   assert_eq(out.map(|e: EmittedRoot| e.tables.members.len() == 2), [false, false, false, false]);
   assert_eq(out.map(|e: EmittedRoot| e.text.index_of(b"_group(PlyCtx *ctx, int which") != None), [
     false,
@@ -276,16 +277,13 @@ test "a group of mutually recursive functions is emitted as separate functions w
   ])
 }
 
-fn handled_body(source: Bytes, release: Bool) -> Bytes / {abort.raise} = {
-  let out = emit_all_program([{ name: b"m", source_text: source }], release);
-  match out.at(0) {
-    None -> b"the program produced no C output",
-    Some(e) -> match e.text.index_of(b"] = ctx->task;") {
-      None -> b"the C output contains no `handle` block",
-      Some(pushed) -> match e.text.index_of(b": ;\n") {
-        None -> b"the `handle` block has no label to jump to when it fails",
-        Some(landed) -> e.text.slice(pushed, landed),
-      },
+fn handled_body(source: Bytes) -> Bytes / {abort.raise} = {
+  let text = output_body(module_outputs(source), b"m.f").text;
+  match text.index_of(b"] = ctx->task;") {
+    None -> b"the C output contains no `handle` block",
+    Some(pushed) -> match text.index_of(b": ;\n") {
+      None -> b"the `handle` block has no label to jump to when it fails",
+      Some(landed) -> text.slice(pushed, landed),
     },
   }
 }
@@ -298,13 +296,13 @@ test "a body that fails inside a `handle` jumps to the handler's code, whatever 
     b"    x + Int::of_u8(U8::of_int(n)) + b.at(n) + xs.get(n) + (0 - n) * (n << 3)\n",
     b"  } with { abort.raise(m) -> 0 }\n",
   ]);
-  let bodies = [false, true].map(|release: Bool| handled_body(source, release));
-  let leaves = |raised: Bytes| bodies.map(|body: Bytes| body.index_of(raised) != None);
-  assert_eq(leaves(b"ply_let_no_match(ctx)"), [true, true]);
-  assert_eq(leaves(b"goto ply_h"), [true, true]);
-  assert_eq(leaves(b"ply_not_that_width(ctx, "), [true, true]);
-  assert_eq(leaves(b"ply_refused(ctx, INT64_C(8), "), [true, true]);
-  assert_eq(bodies.map(|body: Bytes| body.index_of(b"return")), [None, None])
+  let body = handled_body(source);
+  let leaves = |raised: Bytes| body.index_of(raised) != None;
+  assert_eq(leaves(b"ply_let_no_match(ctx)"), true);
+  assert_eq(leaves(b"goto ply_h"), true);
+  assert_eq(leaves(b"ply_not_that_width(ctx, "), true);
+  assert_eq(leaves(b"ply_refused(ctx, INT64_C(8), "), true);
+  assert_eq(body.index_of(b"return"), None)
 }
 
 test "a handler clause that matches on the value its continuation returns, outside tail position, is emitted with that value's own type" {
@@ -312,8 +310,7 @@ test "a handler clause that matches on the value its continuation returns, outsi
     b"effect ask { read get() -> Int }\n",
     b"fn f(n: Int) -> Result<Int, String> = handle { let y = ask.get(); if y > n { Ok(y) } else { Err(\"low\") } } with { ask.get() resume k -> match k(1) { Ok(v) -> Ok(v + 1), Err(m) -> Err(m) } }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 1)
+  assert(output_body(module_outputs(source), b"m.f").text.len() > 0, None)
 }
 
 test "a lambda given to `iterate` that contains a `handle` is emitted as a detached `handle`, capturing only variables of the enclosing function's frame" {
@@ -321,8 +318,7 @@ test "a lambda given to `iterate` that contains a `handle` is emitted as a detac
     b"effect ask { read get() -> Int }\n",
     b"fn f(k: Int, n: Int) -> Int / {abort.raise} = iterate(k, n + 1, |s: Int| handle { let y = ask.get(); if s + y >= n { Stop(s) } else { Continue(s + y) } } with { ask.get() resume r -> { let v = r(1); v } })\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 1);
+  let out = module_emitted(source, [b"m.f"]);
   assert_eq(out.map(|e: EmittedRoot| e.text.index_of(b"rt_detached_open_p(") != None), [true])
 }
 
@@ -351,9 +347,8 @@ test "every `parallel` block passes its branches to the runtime the same way, wh
 
 test "the emitter returns the C code for each function it is asked for, with that function's static data, group members and `handle` names as lists" {
   let source = b"fn greet() -> Bytes = b\"hi\"\nfn twice(x: Int) -> Int = x + x\nfn guarded() -> Option<Instant> / {clock.read} = handle { Some(clock.now()) } with { clock.now() -> clock.now(), }\n";
-  let wanted = [b"m.greet", b"m.twice", b"m.guarded"];
-  let results = outputs_at([b"m"], [source], wanted.map(Named));
-  assert_eq(results.map(output_name), wanted);
+  let wanted = [b"m.greet", b"m.twice", b"m.guarded"].map(Named);
+  let results = outputs_of(outputs_at([b"m"], [source], wanted), wanted);
   let greet = results.get(0).result;
   assert_eq(greet.tables.statics, statics_of(BytesDatum(b"hi")));
   assert_eq(greet.tables.members, []);
@@ -363,7 +358,10 @@ test "the emitter returns the C code for each function it is asked for, with tha
 
 test "guarded arms and every literal pattern are emitted" {
   let source = b"fn f(n: Int, m: Int) -> Int = match n { x if x > m -> x, 0 -> 1, x if x < 0 - m -> m, _ -> m }\nfn g(s: String) -> Int = match s { t if t == \"a\" -> 1, \"b\" -> 2, _ -> 3 }\nfn h(u: Unit, b: Bytes, f: Float, d: Decimal, w: U64, n: Int) -> Int = match u { () -> match b { b\"x\" -> 1, _ -> match f { -1.5 -> 2, _ -> match d { 2.50m -> 3, _ -> match w { 7u64 -> 4, _ -> match n { 4611686018427387904 -> 5, _ -> 6 } } } } } }\n";
-  assert_eq(emit_all_program([{ name: b"m", source_text: source }], true).len(), 3)
+  assert(
+    module_emitted(source, [b"m.f", b"m.g", b"m.h"]).all(|e: EmittedRoot| e.text.len() > 0),
+    None,
+  )
 }
 
 test "an operator is compiled for the type the checker resolved for its operands, wherever the operands come from" {
@@ -372,9 +370,8 @@ test "an operator is compiled for the type the checker resolved for its operands
     b"fn ints(xs: List<Int>) -> Int = match xs { [a, b, ..] -> a + b, _ -> 0 }\n",
     b"fn folded(xs: List<U8>) -> U8 = xs.fold(0u8, wrap_add)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.bytes", b"m.ints", b"m.folded"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 3);
   assert_eq(has(b"rt_binary_p"), [false, false, false]);
   assert_eq(has(b"_lambda0_value;"), [false, false, true]);
   assert_eq(has(b"INT64_C(255)"), [true, false, false]);
@@ -391,9 +388,8 @@ test "a `Float` is a C `double`: its operators are C's own and a literal is emit
     b"type Point = { x: Float, y: Float }\n",
     b"fn norm(p: Point) -> Float = p.x * p.x + p.y * p.y\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.poly", b"m.less", b"m.rest", b"m.norm"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 4);
   assert_eq(has(b"rt_binary_p"), [false, false, false, false]);
   assert_eq(has(b"double "), [true, true, true, true]);
   assert_eq(has(b"ply_f64(INT64_C(4602678819172646912))"), [true, false, false, false]);
@@ -449,24 +445,22 @@ test "a record stores every `Float` field as its bit pattern, at any field posit
     b"fn last(wide: Wide) -> Float = wide.f79\n",
     b"fn wrapped<a>(x: a) -> { inner: a } = { inner: x }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let outputs = module_outputs(source);
+  let out = emitted_from(outputs, [b"m.point", b"m.sum", b"m.weighed", b"m.moved", b"m.last"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 6);
   assert_eq(out.map(|e: EmittedRoot| body_code(e.text).index_of(b"rt_box_float_p") != None), [
     false,
     false,
     false,
     false,
     false,
-    false,
   ]);
-  assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [false, false, false, false, false, false]);
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [false, false, false, false, false]);
   assert(
     out.get(4).text.index_of(b"ply_f64(ply_words(p0)[69])") != None,
     Some(String::of_bytes_lossy(out.get(4).text)),
   );
-  assert_eq(out.get(5).text, b"");
-  assert(out.get(5).tables.generics.needs.map(|n: Need| n.reads).contains(Layout), None)
+  assert(!emits(outputs, Named(b"m.wrapped")), None)
 }
 
 test "a record containing a record wider than the registers stores it inline, wherever it is made, updated or read" {
@@ -485,8 +479,7 @@ test "a record containing a record wider than the registers stores it inline, wh
     b"fn k(o: Outer) -> List<Int> = o.k\n",
     b"fn tag(o: Outer) -> String = o.inner.tag\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 5);
+  let out = module_emitted(source, [b"m.made", b"m.set", b"m.kept", b"m.k", b"m.tag"]);
   let made = body_code(out.get(0).text);
   assert(
     made.split(b"ply_alloc").len() == 2 && made.index_of(b"PLY_RC_FRAME") != None,
@@ -501,7 +494,7 @@ test "a record containing a record wider than the registers stores it inline, wh
 
 test "a definition takes and returns a float as a C `double`, and a call uses the `double` signature the callee was declared with" {
   let source = b"fn half(x: Float) -> Float = x / 2.0\nfn quarter(x: Float) -> Float = half(half(x))\nfn same(x: Int) -> Int = x\n";
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.half", b"m.quarter", b"m.same"]);
   let floats = { result: b"double", params: [b"double"] };
   assert(
     out.get(0).text.index_of(
@@ -571,32 +564,15 @@ test "a lambda inlined into a specialised function gives each captured variable 
   let loop = specialisation_key(b"m.bumped", [], [
     { param: 1, owner: Named(b"m.captured"), nth: 0 },
   ]);
-  let w = lowered_in(analysed_at([b"m"], [source]), [loop]);
-  let read = w.roots.fold([], |accumulator: List<Type>, f: Function|
-    if root_name(f.key) != root_name(loop) { accumulator }
-    else { accumulator.concat(capture_reads(f.body).map(|v: Variable| v.ty)) });
-  assert(read.len() > 0 && read.all(|t: Type| t != unknown_type), None)
+  let looped = output_body(
+    outputs_at([b"m"], [source], [Named(b"m.captured"), loop]),
+    printed(loop),
+  );
+  assert(
+    looped.tables.fields == [] && !calls_a_value(body_code(looped.text)),
+    Some(String::of_bytes_lossy(looped.text)),
+  )
 }
-
-fn capture_reads(b: Block) -> List<Variable> =
-  b.fold([], |accumulator: List<Variable>, i: Instruction|
-    match i {
-      Let(l) -> match l.value {
-        Get(g) -> match g.path { CapturePath(_) -> accumulator.push(l.var), _ -> accumulator },
-        _ -> accumulator,
-      },
-      If(x) -> accumulator.concat(capture_reads(x.then)).concat(capture_reads(x.otherwise)),
-      Case(c) ->
-        c.arms.fold(
-          accumulator.concat(capture_reads(c.rest)),
-          |a: List<Variable>, arm: { when: Int, body: Block }| a.concat(capture_reads(arm.body)),
-        ),
-      Match(m) ->
-        m.arms.fold(accumulator.concat(capture_reads(m.rest)), |a: List<Variable>, arm: Block|
-          a.concat(capture_reads(arm))),
-      Loop(l) -> accumulator.concat(capture_reads(l.body)),
-      _ -> accumulator,
-    })
 
 fn zero_variables(b: Block) -> List<Variable> =
   b.fold([], |accumulator: List<Variable>, i: Instruction|
@@ -821,18 +797,16 @@ test "a definition at fully known type arguments passes its lambdas borrowed, as
   ]);
   assert(!calls_a_value(body_code(body(some).text)), None);
   assert(body_code(body(some).text).index_of(b"ply_loop") != None, None);
-  assert_eq(outputs_at([b"m"], [source], [somed]).map(|a: RootOutput| body_code(a.result.text)), [
+  assert_eq(
+    body_code(output_body(outputs_at([b"m"], [source], [somed]), some).text),
     body_code(body(some).text),
-  ])
+  )
 }
 
 test "a closure that captured a sum type releases it by switching on the case stored in the sum, in the same way as when the closure is copied" {
   let source = b"type Side = | Unread(() -> Int) | Read(Int, () -> Int) | Over\nfn made(left: Side, right: Side, n: Int) -> () -> Int = || match left { Over -> n, Read(x, _) -> x, Unread(f) -> match right { Over -> f(), _ -> 0 } }\n";
-  let text = match outputs_at([b"m"], [source], [Named(b"m.made")]).at(0) {
-    Some(a) ->
-      Bytes::concat_all(a.result.tables.shared.map(|f: SharedFunction| f.text).push(a.result.text)),
-    None -> panic("no result"),
-  };
+  let made = output_body(outputs_at([b"m"], [source], [Named(b"m.made")]), b"m.made");
+  let text = Bytes::concat_all(made.tables.shared.map(|f: SharedFunction| f.text).push(made.text));
   let named = match text.index_of(b"_desc = { ") {
     Some(i) -> text.slice(i + 10, text.len()),
     None -> b"",
@@ -856,8 +830,8 @@ test "a closure that captured a sum type releases it by switching on the case st
 test "only a definition with no parameters has an `_entry` function, and reading it as a constant calls that function" {
   let source = b"fn id<a>(x: a) -> a = x\nfn twice(n: Int) -> Int = id(n) + id(n)\nfn ten() -> Int = twice(5)\n";
   let at = specialisation_key(b"m.id", [int_type], []);
-  let results = outputs_at([b"m"], [source], [at, Named(b"m.twice"), Named(b"m.ten")]);
-  assert_eq(results.map(output_name), [printed(at), b"m.twice", b"m.ten"]);
+  let wanted = [at, Named(b"m.twice"), Named(b"m.ten")];
+  let results = outputs_of(outputs_at([b"m"], [source], wanted), wanted);
   let bodies = results.map(|a: RootOutput| a.result);
   assert_eq(bodies.map(|b: Output| b.tables.defined.map(|d: DefinitionSymbol| d.entered)), [
     [false],
@@ -875,8 +849,9 @@ test "the emitted C for a function that passes a lambda to another function is i
     specialisation_key(b"m.each", [], borrowed),
   ];
   let emitted = |above: Bytes|
-    outputs_at([b"m"], [above.concat(borrowing)], wanted).map(|a: RootOutput|
-      { name: a.name, text: a.result.text, calls: a.result.tables.calls });
+    outputs_of(outputs_at([b"m"], [above.concat(borrowing)], wanted), wanted).map(
+      |a: RootOutput| { name: a.name, text: a.result.text, calls: a.result.tables.calls },
+    );
   assert_eq(
     emitted(b"// a comment, and a definition, above them\nfn aside() -> Int = 7\n"),
     emitted(b""),
@@ -896,15 +871,14 @@ test "a definition's call to itself is emitted with the C signature of the funct
         called: a.result.tables.generics.expects.map(|e: ExpectedPrototype| e.head),
       });
   let floats = { result: b"double", params: [b"int64_t", b"double", b"int64_t"] };
-  assert_eq(heads(b"m.deepened"), [{ own: [], called: [] }]);
+  assert_eq(heads(b"m.deepened"), []);
   assert_eq(heads(b"m.deepened@Float"), [{ own: [floats], called: [floats] }])
 }
 
 test "a small record of floats is passed to and returned from a call as separate `double` fields" {
   let source = b"type P = { x: Float, y: Float }\nfn mid(a: P, b: P) -> P = { x: (a.x + b.x) / 2.0, y: (a.y + b.y) / 2.0 }\nfn twice(p: P) -> P = mid(p, p)\n";
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.mid", b"m.twice"]);
   let mid = { result: b"double", params: [b"double", b"double", b"double", b"double", b"Word*"] };
-  assert_eq(out.len(), 2);
   assert_eq(out.get(0).tables.defined.map(|d: DefinitionSymbol| d.head), [mid]);
   assert_eq(named_prototypes(out.get(1).tables), [{ callee: b"m.mid", head: mid }]);
   assert_eq(out.map(|e: EmittedRoot| body_code(e.text).index_of(b"rt_alloc_p") != None), [
@@ -924,14 +898,20 @@ test "a record field of a record type is stored inline, its words among the cont
     b"fn wrapped<a>(x: a) -> { outer: { inner: a } } = { outer: { inner: x } }\n",
     b"fn retargeted(s: Segment, to: Point) -> Segment = { ..s, to: to }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let outputs = module_outputs(source);
+  let out = emitted_from(outputs, [
+    b"m.segment",
+    b"m.end_x",
+    b"m.start",
+    b"m.relabelled",
+    b"m.retargeted",
+  ]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 6);
-  assert_eq(has(b"ply_alloc(ctx, INT64_C(80));"), [true, false, false, false, false, false]);
-  assert_eq(has(b"_copy_"), [false, false, false, true, false, true]);
+  assert_eq(has(b"ply_alloc(ctx, INT64_C(80));"), [true, false, false, false, false]);
+  assert_eq(has(b"_copy_"), [false, false, false, true, true]);
   [b"rt_alloc_p(", b"(ply_words(p0) + ", b"rt_box_float_p"].fold((), |_: Unit, t: Bytes|
-    assert_eq(has(t), [false, false, false, false, false, false]));
-  assert_eq(out.get(4).text, b"")
+    assert_eq(has(t), [false, false, false, false, false]));
+  assert(!emits(outputs, Named(b"m.wrapped")), None)
 }
 
 test "a 64-bit integer is a C value of its own type in a register, and its bit pattern inside a record" {
@@ -943,23 +923,22 @@ test "a 64-bit integer is a C value of its own type in a register, and its bit p
     b"fn largest() -> U64 = 0xFFFF_FFFF_FFFF_FFFFu64\n",
     b"fn kept<a>(x: a) -> { inner: a } = { inner: x }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let outputs = module_outputs(source);
+  let out = emitted_from(outputs, [b"m.bumped", b"m.scaled", b"m.turned", b"m.largest"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 5);
-  assert_eq(has(b"(uint64_t)"), [true, true, false, true, false]);
-  assert_eq(has(b"rt_binary_p"), [false, false, false, false, false]);
-  assert_eq(has(b"rt_wide_binary_p"), [false, false, false, false, false]);
-  assert_eq(has(b"ply_overflow(ctx, 3)"), [false, true, false, false, false]);
-  assert_eq(has(b"== INT64_MIN"), [false, false, true, false, false]);
-  assert_eq(has(b"] = (Word)("), [true, false, false, false, false]);
+  assert_eq(has(b"(uint64_t)"), [true, true, false, true]);
+  assert_eq(has(b"rt_binary_p"), [false, false, false, false]);
+  assert_eq(has(b"rt_wide_binary_p"), [false, false, false, false]);
+  assert_eq(has(b"ply_overflow(ctx, 3)"), [false, true, false, false]);
+  assert_eq(has(b"== INT64_MIN"), [false, false, true, false]);
+  assert_eq(has(b"] = (Word)("), [true, false, false, false]);
   assert_eq(out.map(|e: EmittedRoot| body_code(e.text).index_of(b"rt_box_fixed_p") != None), [
     false,
     false,
     false,
     false,
-    false,
   ]);
-  assert_eq(out.get(4).text, b"")
+  assert(!emits(outputs, Named(b"m.kept")), None)
 }
 
 test "an array stores a record's words inline and a float as its bit pattern" {
@@ -970,15 +949,15 @@ test "an array stores a record's words inline and a float as its bit pattern" {
     b"fn count(ps: Array<Point>) -> Int = ps.len()\n",
     b"fn element_of<a>(xs: Array<a>, i: Int) -> a / {abort.raise} = xs.get(i)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let outputs = module_outputs(source);
+  let out = emitted_from(outputs, [b"m.second_x", b"m.bumped", b"m.count"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 4);
-  assert_eq(has(b", INT64_C(32));"), [false, false, false, false]);
-  assert_eq(has(b"ply_f64((ply_words("), [true, true, false, false]);
-  assert_eq(has(b"PlyArrayHead *)ply_words("), [true, true, true, false]);
-  assert_eq(has(b"ply_refused(ctx, 4, "), [true, true, false, false]);
-  assert_eq(has(b"builtin_array_get"), [false, false, false, false]);
-  assert_eq(out.get(3).text, b"")
+  assert_eq(has(b", INT64_C(32));"), [false, false, false]);
+  assert_eq(has(b"ply_f64((ply_words("), [true, true, false]);
+  assert_eq(has(b"PlyArrayHead *)ply_words("), [true, true, true]);
+  assert_eq(has(b"ply_refused(ctx, 4, "), [true, true, false]);
+  assert_eq(has(b"builtin_array_get"), [false, false, false]);
+  assert(!emits(outputs, Named(b"m.element_of")), None)
 }
 
 test "a value's layout is taken from its node's type when the value has no layout of its own" {
@@ -989,8 +968,7 @@ test "a value's layout is taken from its node's type when the value has no layou
     b"fn opened(p: P, q: P) -> Int = { let { x, y } = max(p, q); x + y }\n",
     b"fn chosen(p: P, q: P) -> Int = match max(p, q) { { x, y } -> x + y }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 4);
+  let out = module_emitted(source, [b"m.larger", b"m.kept", b"m.opened", b"m.chosen"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
   assert_eq(has(b"builtin_max_p"), [false, false, false, false])
 }
@@ -1055,7 +1033,7 @@ test "every number builtin is code the emitter writes, at every type it is calle
   );
   let wanted = concrete.concat(generic);
   let results = outputs_at([b"m"], [source], wanted);
-  assert_eq(results.len(), wanted.len())
+  assert_eq(wanted.filter(|k: RootKey| !emits(results, k)), [])
 }
 
 test "`observe` returns its value hidden from the C compiler by an optimization barrier, at any type, and calls no function" {
@@ -1114,8 +1092,10 @@ test "a `Secret` builtin compiles to a call of the runtime's native function for
         b"; () }\n",
       ])),
   );
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), calls.len());
+  let out = module_emitted(
+    source,
+    range(0, calls.len()).map(|i: Int| b"m.f".concat(ascii_of_int(i))),
+  );
   assert_eq(
     range(0, calls.len()).filter(|i: Int| {
       let code = body_code(out.get(i).text);
@@ -1169,8 +1149,7 @@ test "building a `Con` from another `Con`'s fields writes the new record into th
     b"fn renamed(t: T, to: Bytes) -> T = match t { Con(c) -> Con({ name: to, args: c.args }), Leaf -> Leaf }\n",
     b"fn rebuilt(t: T) -> T = match t { Con(c) -> Con({ name: c.name, args: c.args.map(|a: T| rebuilt(a)) }), Leaf -> Leaf }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 2);
+  let out = module_emitted(source, [b"m.renamed", b"m.rebuilt"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
   assert_eq(has(b"rt_alloc_p("), [false, false]);
   assert_eq(has(b"ply_alloc("), [false, false])
@@ -1183,8 +1162,10 @@ test "code is emitted for an effect operation that returns a record and a handle
     b"fn summed() -> Int / {store.held} = { let p = store.held(); p.x + p.y }\n",
     b"fn kept(start: P) -> Int = handle { store.keep(start) } with { var seen = 0, store.keep(p) -> { seen = p.x + p.y; }, return u -> seen }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 2)
+  assert(
+    module_emitted(source, [b"m.summed", b"m.kept"]).all(|e: EmittedRoot| e.text.len() > 0),
+    None,
+  )
 }
 
 test "code is emitted for a handler whose `var` variable stores a record that a clause then reads and updates" {
@@ -1193,8 +1174,7 @@ test "code is emitted for a handler whose `var` variable stores a record that a 
     b"effect bump { write by(n: Int) -> Int }\n",
     b"fn bumped(start: Open, by: Int) -> Int = handle { bump.by(by) } with { var st = start, bump.by(n) -> { let o = st; st = { ..o, now: o.now + n }; st.now + o.held } }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 1)
+  assert(module_emitted(source, [b"m.bumped"]).all(|e: EmittedRoot| e.text.len() > 0), None)
 }
 
 test "a constructor pattern reads its argument as the subject's type lays it out" {
@@ -1208,8 +1188,14 @@ test "a constructor pattern reads its argument as the subject's type lays it out
     b"fn either(n: Int) -> Int = match found(n) { Some({ x, y: 3 }) -> x, Some({ x, y }) -> x + y, None -> 0 }\n",
     b"fn held(rs: List<Result<P, E>>) -> Int = match rs.at(0) { Some(Ok({ x, y })) -> x + y, Some(Err({ why })) -> why.len(), None -> 0 }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 6);
+  let out = module_emitted(source, [
+    b"m.made",
+    b"m.found",
+    b"m.summed",
+    b"m.first",
+    b"m.either",
+    b"m.held",
+  ]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
   assert_eq(has(b"(intptr_t)(ply_words("), [false, false, false, false, false, false])
 }
@@ -1226,9 +1212,18 @@ test "an `Option` of a pointer is a single word wherever it is stored, and no ob
     b"fn guarded(xs: List<Int>) -> Int = match xs.at(0) { Some(n) if n > 1 -> n, Some(1) -> 10, _ -> 0 }\n",
     b"fn asked(o: Option<String>) -> Int = match kept(\"k\") { Some(_) -> 1, None -> 0 }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [
+    b"m.picked",
+    b"m.found",
+    b"m.nested",
+    b"m.kept",
+    b"m.held",
+    b"m.same",
+    b"m.either",
+    b"m.guarded",
+    b"m.asked",
+  ]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 9);
   assert_eq(out.map(|e: EmittedRoot| e.text.index_of(b"ply_maybe_unrouted") != None), [
     false,
     false,
@@ -1266,9 +1261,8 @@ test "a `Result` is passed between functions as separate case and payload words 
     b"fn told(n: Int) -> Bytes = match quarter(n) { Ok(_) -> b\"\", Err(b) -> b.why }\n",
     b"fn plain(n: Int) -> Result<Int, Int> = if n > 0 { Ok(n) } else { Err(n) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.half", b"m.quarter", b"m.told", b"m.plain"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 4);
   assert_eq(has(b"ply_alloc"), [false, false, false, false])
 }
 
@@ -1279,9 +1273,8 @@ test "a `Result` with a small record as its error is passed between functions as
     b"fn quarter(n: Int) -> Result<Int, Bad> = { let h = half(n)?; half(h) }\n",
     b"fn told(n: Int) -> Bytes = match quarter(n) { Ok(_) -> b\"\", Err(b) -> b.why }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.half", b"m.quarter", b"m.told"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 3);
   assert_eq(has(b"rt_alloc_p"), [false, false, false]);
   assert_eq(has(b"o[0] = "), [true, true, false])
 }
@@ -1292,8 +1285,7 @@ test "a record rebuilt from a captured record's fields reads them directly from 
     b"type C = { own: Int, node: Int, span: Sp }\n",
     b"fn rebuilt(c: C, n: Int) -> C = { let at = |k: Int| { own: 0, node: k, span: c.span }; at(n) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 1)
+  assert(module_emitted(source, [b"m.rebuilt"]).all(|e: EmittedRoot| e.text.len() > 0), None)
 }
 
 test "records of a known type are compared field by field, not by the runtime" {
@@ -1304,9 +1296,8 @@ test "records of a known type are compared field by field, not by the runtime" {
     b"fn noted(a: { at: Int, note: Option<Int> }, b: { at: Int, note: Option<Int> }) -> Bool = a == b\n",
     b"fn found(a: Option<R>, b: Option<R>) -> Bool = a == b\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.same", b"m.differ", b"m.noted", b"m.found"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 4);
   assert_eq(has(b"ply_dec_order("), [true, true, false, false]);
   assert_eq(
     out.map(|e: EmittedRoot|
@@ -1325,9 +1316,8 @@ test "a value compared with a constructor of its sum is tested as a pattern test
     b"fn eof(k: TK) -> Bool = k == Eof\n",
     b"fn same(a: TK, b: TK) -> Bool = a == b\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.punct", b"m.num", b"m.eof", b"m.same"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 4);
   assert_eq(has(b"->layout"), [false, false, false, false]);
   assert_eq(has(b"memcmp(((unsigned char *)&ply_words("), [true, false, false, false]);
   assert_eq(has(symbol_of(b"m.TK#eq").concat(b"(ctx, ")), [false, false, false, true])
@@ -1363,13 +1353,15 @@ test "the compiler emits a type's generated drop, dup and copy functions, and th
     test_generated_key(keys::Copy, tk),
     test_generated_key(keys::OnCase({ operation: keys::Drop, case: 1 }), tk),
   ];
-  let walked = lowered_in(analysed_at([b"m"], [source]), wanted);
-  let kind_of = |k: RootKey|
-    match walked.roots.find(|f: Function| root_name(f.key) == root_name(k)) {
-      Some(f) -> Ok(f.kind),
-      None -> Err(b"not formed"),
-    };
-  assert_eq(wanted.map(kind_of), wanted.map(|_: RootKey| Ok(Plain)))
+  let results = outputs_at([b"m"], [source], wanted);
+  let probed = |k: RootKey|
+    output_body(results, printed(k)).text.index_of(probed_fn.concat(b"(ctx)")) != None;
+  assert_eq(wanted.map(probed), wanted.map(|_: RootKey| false));
+  assert_eq(
+    [wanted.get(0), wanted.get(3)].map(|k: RootKey|
+      output_body(results, printed(k)).text.index_of(b"ply_drop_done(ctx);") != None),
+    [true, true],
+  )
 }
 
 test "requesting only the generated `Keep` function for one boxed case returns that function, although its name has no module name in it" {
@@ -1378,10 +1370,7 @@ test "requesting only the generated `Keep` function for one boxed case returns t
     keys::OnCase({ operation: keys::Keep, case: 1 }),
     NamedType({ name: b"m.TK", args: [] }),
   );
-  let results = results_in(analysed_at([b"m"], [source]), [keep_key]);
-  assert_eq(results.map(|a: RootOutput| { name: a.name, body: { true } }), [
-    { name: root_name(keep_key), body: true },
-  ])
+  assert(emits(outputs_at([b"m"], [source], [keep_key]), keep_key), None)
 }
 
 test "a sum stored inside another sum, including inside `Option`, gets generated drop, share and keep functions" {
@@ -1454,7 +1443,7 @@ test "a `match` over a sum with many cases emits no chain of ternaries, and its 
   let counted = root_of(keys::Unboxed(keys::Dup), NamedType({ name: b"m.Big", args: [] }));
   let counted_name = root_text(root_name(counted));
   let code = |n: Int|
-    emit_all_program([{ name: b"m", source_text: source(n) }], true).map(|e: EmittedRoot|
+    module_emitted(source(n), [b"m.big", b"m.both", b"m.hue"]).map(|e: EmittedRoot|
       { name: emitted_name(e), text: body_code(e.text) }).push({
       name: counted_name,
       text: body_code(output_body(outputs_at([b"m"], [source(n)], [counted]), counted_name).text),
@@ -1502,8 +1491,7 @@ test "a generic function that compares its type argument is emitted again for ea
       None -> panic("no result"),
     };
   let has = |name: Bytes, text: Bytes| tables(name).text.index_of(text) != None;
-  assert_eq(tables(b"m.same").tables.generics.needs, [{ var: 0, reads: Exact }]);
-  assert_eq(tables(b"m.order").tables.generics.needs, [{ var: 0, reads: Exact }]);
+  assert_eq([b"m.same", b"m.order"].filter(|n: Bytes| emits(results, Named(n))), []);
   assert_eq(tables(b"m.tokens").tables.generics.calls, [
     {
       callee: Named(b"m.same"),
@@ -1513,8 +1501,6 @@ test "a generic function that compares its type argument is emitted again for ea
       effect_evidence: [],
     },
   ]);
-  assert_eq(tables(b"m.same").text, b"");
-  assert_eq(tables(b"m.order").text, b"");
   assert(has(b"m.same@m.TK", symbol_of(b"m.TK#eq")));
   assert(has(b"m.same@String", b"memcmp(((unsigned char *)&ply_words("));
   assert(has(b"m.order@m.TK", symbol_of(b"m.TK#cmp")))
@@ -1749,33 +1735,12 @@ const typed_fixture: Bytes =
 fn outputs_reachable_from(
   definitions: Bytes,
   start: List<RootKey>,
-) -> List<RootOutput> / {abort.raise} = {
-  let module_source = typed_fixture.concat(definitions);
-  let shipped = [value_fixture];
-  let x = accepted_session(zip_sources([b"m"], [module_source]), shipped);
-  let s = scope_of(x.analysis, true, start);
-  lowered_over(x.program, ||
-    iterate(
-      { results: [], next: start },
-      64,
-      |w: { results: List<RootOutput>, next: List<RootKey> }|
-        if w.next.len() == 0 { Stop(w.results) } else {
-          let all = w.results.concat(root_outputs(s, w.next, Map::new()));
-          let emitted_names = all.map(|a: RootOutput| a.name);
-          Continue({
-            results: all,
-            next: all.fold([], |accumulator: List<RootKey>, a: RootOutput|
-              a.result.tables.calls.fold(accumulator, |more: List<RootKey>, c: RootKey|
-                match c {
-                  Generated(_, _) -> if emitted_names.contains(root_name(c)) || more.contains(c) {
-                    more
-                  } else { more.push(c) },
-                  _ -> more,
-                })),
-          })
-        },
-    ))
-}
+) -> List<RootOutput> / {abort.raise} =
+  program_outputs(
+    [{ name: b"m", source_text: typed_fixture.concat(definitions) }],
+    [value_fixture],
+    Some(start),
+  )
 
 test "`compare`, `reflect`, `show` and `digest` are generated for every concrete type, and none of them is a runtime builtin" {
   let both = [
@@ -1898,8 +1863,7 @@ test "code is emitted for `Ok(x) == Ok(y)` where `x` and `y` are wide records th
     b", order: List<Bytes> }\n",
     b"fn ok_ok(x: Wide, y: Wide) -> Bool = Ok(x) == Ok(y)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: module_source }], true);
-  assert(out.len() > 0, None)
+  assert(module_emitted(module_source, [b"m.ok_ok"]).all(|e: EmittedRoot| e.text.len() > 0), None)
 }
 
 test "a sum with a `key for` function is compared and ordered by that key through generated functions, generic or not" {
@@ -2001,7 +1965,8 @@ test "a type's `numeric for` functions are called through generated functions, a
     )
   });
   assert(body(b"m.shorter").tables.calls.contains(test_generated_key(Order, length)), None);
-  assert(body(b"m.total").tables.generics.needs.contains({ var: 0, reads: Scalar }), None);
+  assert(!emits(results, Named(b"m.total")), None);
+  assert(body(printed(at_length)).tables.calls.contains(add), None);
   assert(body(printed(at_length)).text.index_of(b"numeric_binary") == None, None);
   [b"m.grown", b"m.shorter", printed(at_length)].fold((), |_: Unit, n: Bytes| unasked(n))
 }
@@ -2128,8 +2093,7 @@ test "updating a boxed record writes only the fields it sets, in place or in a c
     b"fn tagged(w: Wide, t: String) -> Wide = { ..w, tag: t }\n",
     b"fn bumped(w: Wide) -> Wide = { ..w, f10: w.f10 + 1, f49: 0 }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: module_source }], true);
-  assert_eq(out.len(), 2);
+  let out = module_emitted(module_source, [b"m.tagged", b"m.bumped"]);
   let writes = |text: Bytes| text.split(b"] = ").len() - 1;
   assert_eq(
     out.map(|e: EmittedRoot| {
@@ -2169,9 +2133,8 @@ test "creating an array, setting an element and converting a list to an array us
     b"fn listed(xs: List<Int>) -> Array<Int> = Array::of_list(xs)\n",
     b"fn words(n: Int, s: Bytes) -> Array<Bytes> / {abort.raise} = Array::new(n, s)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: module_source }], true);
+  let out = module_emitted(module_source, [b"m.made", b"m.put", b"m.listed", b"m.words"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 4);
   assert_eq(has(array_allocation), [true, true, true, true]);
   assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [false, false, false, false]);
   assert_eq(has(b") * 2);"), [true, true, false, false]);
@@ -2196,7 +2159,7 @@ test "a tail call passes a function parameter that came from a call's result as 
     b"fn pulled(k: () -> Step, fuel: Int) -> Bytes =\n",
     b"  match k() { Over -> b\"\", More(b, rest) -> if fuel <= 1 { b } else { pulled(rest, fuel - 1) } }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: module_source }], true);
+  let out = module_emitted(module_source, [b"m.pulled"]);
   assert_eq(out.map(|e: EmittedRoot| root_text(e.name)), [b"m.pulled"])
 }
 
@@ -2206,7 +2169,7 @@ test "a function generic only over a scope parameter such as `[r]` needs no memo
     b"  if 0 <= i && i < h.get().len() { h.get().at(i) } else { -1 }\n",
   ]);
   let results = outputs_at([b"m"], [module_source], [Named(b"m.held_byte")]);
-  assert_eq(results.map(|a: RootOutput| a.result.tables.generics.needs), [[]])
+  assert_eq(output_body(results, b"m.held_byte").tables.generics.needs, [])
 }
 
 test "generated functions still build and match the prelude's constructors when the module defines constructors with the same names" {
@@ -2229,7 +2192,7 @@ test "generated functions still build and match the prelude's constructors when 
     [module_source],
     [b"m.maybe", b"m.either", b"m.order", b"m.ordered"].map(Named).concat(roots),
   );
-  assert(results.len() > 0, None)
+  assert_eq(roots.filter(|k: RootKey| !emits(results, k)), [])
 }
 
 test "a list pattern reads its items and its rest in place, whatever the items' type lays out" {
@@ -2238,8 +2201,7 @@ test "a list pattern reads its items and its rest in place, whatever the items' 
     b"fn first(xs: List<Op>) -> Int = match xs { [Cased(c), ..rest] -> c.case + rest.len(), [_, ..rest] -> rest.len(), [] -> 0 }\n",
     b"fn pair(xs: List<Op>) -> Bool = match xs { [Plain, Named(_)] -> true, _ -> false }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: module_source }], true);
-  assert_eq(out.len(), 2);
+  let out = module_emitted(module_source, [b"m.first", b"m.pair"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
   assert_eq([has(b"rt_list_at_p("), has(b"rt_list_rest_p(")], [[false, false], [false, false]])
 }
@@ -2286,7 +2248,7 @@ test "an array of options stores each option as a single word, and a generic arr
       Some(a) -> a.result,
       None -> panic("no result"),
     };
-  assert_eq(body(b"m.filled").tables.generics.needs, [{ var: 0, reads: Layout }]);
+  assert(!emits(results, Named(b"m.filled")), None);
   assert(body(b"m.filled@Int").text.index_of(array_allocation) != None, None)
 }
 
@@ -2507,7 +2469,14 @@ test "a program's folds, maps and filters over a lambda emit none of the prelude
     b"fn each(xs: List<Int>, f: (Int) -> Int) -> List<Int> = xs.map(f)\n",
     b"fn lent(xs: List<Int>) -> List<Int> = each(xs, |x: Int| x - 1)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [
+    b"m.summed",
+    b"m.tallied",
+    b"m.kept",
+    b"m.nested",
+    b"m.each",
+    b"m.lent",
+  ]);
   let walks = [
     b"List::fold",
     b"List::map",
@@ -2573,8 +2542,7 @@ test "a map's length is the count in its header, whatever the layout of its valu
     b"fn counted(m: Map<Bytes, Seen>) -> Int = m.len()\n",
     b"fn names(m: Map<Bytes, Bytes>) -> Int = m.len()\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 2);
+  let out = module_emitted(source, [b"m.counted", b"m.names"]);
   assert_eq(out.map(|e: EmittedRoot| body_code(e.text).index_of(b"builtin_map_len") == None), [
     true,
     true,
@@ -2591,8 +2559,7 @@ test "emitted code reads and writes no field of a block's header but its count" 
     b"fn arrays(n: Int, p: P) -> Int / {abort.raise} = Array::new(n, p).set(0, p).len()\n",
     b"fn lambda(k: Int) -> List<Int> = [1, 2].map(|x: Int| x + k)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert(out.len() > 0, None);
+  let out = module_emitted(source, [b"m.texts", b"m.lists", b"m.maps", b"m.arrays", b"m.lambda"]);
   let fields = out.fold([], |accumulator: List<Bytes>, e: EmittedRoot|
     accumulator.concat(header_fields(body_code(e.text))));
   assert(
@@ -2825,11 +2792,7 @@ test "a lambda that captures nothing is one value made once, wherever it goes" {
     b"fn twice(x: Int) -> Int = x * 2\n",
     b"fn stored() -> List<(Int) -> Int> = kept([|x: Int| x + 1, twice])\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  let text = match out.filter(|e: EmittedRoot| emitted_name(e) == b"m.stored") {
-    [e, ..] -> body_code(e.text),
-    [] -> b"",
-  };
+  let text = body_code(output_body(module_outputs(source), b"m.stored").text);
   assert(text.index_of(b"_desc;") == None, Some(String::of_bytes_lossy(text)));
   assert_eq(text.split(b"extern PlyFnBlock ").len(), 3)
 }
@@ -2864,9 +2827,8 @@ test "strings and byte strings are compared by their bytes directly in memory" {
     b"fn worded(s: String) -> Int = match s { \"x\" -> 1, _ -> 0 }\n",
     b"fn lettered(c: Char) -> Int = match c { 'a' -> 1, _ -> 0 }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.same", b"m.other", b"m.named", b"m.worded", b"m.lettered"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 5);
   assert_eq(has(b"memcmp(((unsigned char *)&ply_words("), [true, true, true, true, false])
 }
 
@@ -2877,9 +2839,8 @@ test "a record with an `Option` field is built, matched and updated without allo
     b"fn noted(e: Entry) -> Int = match e.note { Some(_) -> 1, None -> 0 }\n",
     b"fn cleared(e: Entry) -> Entry = { ..e, note: None }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.made", b"m.noted", b"m.cleared"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 3);
   assert_eq(out.map(|e: EmittedRoot| allocates(body_code(e.text))), [false, false, false])
 }
 
@@ -2893,9 +2854,14 @@ test "a constructor stores each argument using the type its declaration gives it
     b"fn unit(s: Shape) -> Bool = match s { Circle(_, 1.0) -> true, _ -> false }\n",
     b"fn label(s: String) -> Shape = Label(s)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [
+    b"m.circle",
+    b"m.radius",
+    b"m.centre_x",
+    b"m.unit",
+    b"m.label",
+  ]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 5);
   [b"ply_alloc(", b"rt_alloc_p(", b"->layout == "].fold((), |_: Unit, t: Bytes|
     assert_eq(has(t), [false, false, false, false, false]))
 }
@@ -2908,9 +2874,8 @@ test "a record of ints is passed to calls as separate fields and stored in a lis
     b"fn twice(s: Span) -> Int = width(widened(widened(s, 1), 2))\n",
     b"fn kept(s: Span) -> List<Span> = [widened(s, 1)]\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.widened", b"m.width", b"m.twice", b"m.kept"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 4);
   assert_eq(has(b"ply_alloc(ctx, INT64_C(24));"), [false, false, false, false]);
   assert_eq(out.get(1).tables.defined.map(|d: DefinitionSymbol| d.head), [
     { result: b"int64_t", params: [b"int64_t", b"int64_t"] },
@@ -2927,9 +2892,8 @@ test "a record literal nested in another record is written directly into it, wit
     b"fn read(n: { v: Bytes }, a: { v: List<Int> }) -> T = TyC({ name: n.v, args: a.v })\n",
     b"fn held(c: { tag: Bytes, n: Int }, v: Int) -> { counter: { tag: Bytes, n: Int }, at: Int } = { counter: c, at: v }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.made", b"m.stepped", b"m.copied", b"m.read", b"m.held"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 5);
   assert_eq(out.map(|e: EmittedRoot| allocates(e.text)), [false, false, false, false, false])
 }
 
@@ -2940,9 +2904,8 @@ test "a call passes a record that contains a small record as separate fields, in
     b"fn counted(h: Holding, key: Bytes) -> Int = { let p = added(h, 1, key); p.at + p.h.held.len() }\n",
     b"fn kept(h: Holding, key: Bytes) -> List<Holding> = [added(h, 2, key).h]\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.added", b"m.counted", b"m.kept"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 3);
   assert_eq(has(b"ply_alloc(ctx, INT64_C(32));"), [false, false, false]);
   assert_eq(out.get(0).tables.defined.map(|d: DefinitionSymbol| d.head), [
     { result: b"int64_t", params: [b"Word", b"Word", b"Word", b"int64_t", b"Word", b"Word*"] },
@@ -2956,9 +2919,8 @@ test "`compare` on numbers, characters and strings is emitted as a C comparison 
     b"fn by_text(a: String, b: String) -> Ordering = compare_values(a, b)\n",
     b"fn by_list(a: List<Int>, b: List<Int>) -> Ordering = compare(a, b)\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.by_name", b"m.by_int", b"m.by_text", b"m.by_list"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
-  assert_eq(out.len(), 4);
   assert_eq(has(b"builtin_compare"), [false, false, false, false]);
   assert_eq(has(b"memcmp(((unsigned char *)&ply_words("), [true, false, true, false])
 }
@@ -3024,13 +2986,8 @@ test "comparing a `compare` result with `Less`, `Equal` or `Greater` tests the s
     b"fn sum(a: S, b: S) -> Bool = compare(a, b) == Less\n",
     b"fn listed(a: List<Int>, b: List<Int>) -> Bool = compare(a, b) == Less\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert(out.len() > 0, None);
-  let code = |name: Bytes|
-    match out.find(|e: EmittedRoot| emitted_name(e) == name) {
-      Some(e) -> body_code(e.text),
-      None -> b"",
-    };
+  let outputs = module_outputs(source);
+  let code = |name: Bytes| body_code(output_body(outputs, name).text);
   assert_eq(
     [b"m.later", b"m.same", b"m.sum"].map(|n: Bytes| code(n).index_of(b" < 0 ? 0 : ") != None),
     [true, true, false],
@@ -3051,8 +3008,7 @@ test "`Int` `/` and `%` use C's operators, and check for a zero divisor and for 
     b"fn by(n: Int, d: Int) -> Int / {abort.raise} = n / d\n",
     b"fn by_minus_one(n: Int) -> Int = n / -1\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 5);
+  let out = module_emitted(source, [b"m.half", b"m.rest", b"m.folded", b"m.by", b"m.by_minus_one"]);
   assert_eq(out.map(|e: EmittedRoot| body_code(e.text).index_of(b"ply_by_zero(") != None), [
     false,
     false,
@@ -3080,9 +3036,16 @@ test "a `Decimal` is passed in registers as two machine words, and stored in a r
     b"fn picked(up: Bool, d: Decimal) -> Decimal = if up { d + 1m } else { d - 1m }\n",
     b"fn listed(d: Decimal) -> List<{ price: Decimal }> = [{ price: d }]\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [
+    b"m.line",
+    b"m.doubled",
+    b"m.cheaper",
+    b"m.negated",
+    b"m.priced",
+    b"m.picked",
+    b"m.listed",
+  ]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 7);
   assert_eq(has(b"ply_alloc(ctx, INT64_C(32));"), [
     false,
     false,
@@ -3124,9 +3087,8 @@ test "reading a field of a `Columns` element loads it from that field's own colu
     b"fn label_at(ps: Columns<P>, i: Int) -> String / {abort.raise} = ps.get(i).label\n",
     b"fn whole(ps: Columns<P>, i: Int) -> List<P> / {abort.raise} = [ps.get(i)]\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.x_at", b"m.label_at", b"m.whole"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 3);
   assert_eq(has(b"ply_f64("), [true, false, true]);
   assert_eq(has(b"ply_alloc("), [false, false, false]);
   assert_eq(has(b"rt_alloc_p("), [false, false, false]);
@@ -3138,9 +3100,8 @@ test "a `Char` is a single machine word, and two `Char`s are compared with C's i
     b"fn lower(c: Char) -> Bool = c >= 'a' && c <= 'z'\n",
     b"fn same(a: Char, b: Char) -> Bool = a == b\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
+  let out = module_emitted(source, [b"m.lower", b"m.same"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| e.text.index_of(text) != None);
-  assert_eq(out.len(), 2);
   assert_eq(has(b"rt_binary_p"), [false, false]);
   assert_eq(has(b"((Word)INT64_C(778))"), [true, false])
 }
@@ -3150,17 +3111,18 @@ test "a record a pattern binds is read at the offsets its checked type gives" {
     b"type Point = { x: Int, y: Int }\n",
     b"fn sum(ps: List<Point>) -> Int = match ps { [p, ..] -> p.x + p.y, _ -> 0 }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 1)
+  assert(module_emitted(source, [b"m.sum"]).all(|e: EmittedRoot| e.text.len() > 0), None)
 }
 
 test "the emitter writes an embed out as the front end's result says it was read: by its digest" {
   let source = b"fn data() -> Bytes = embed(\"d.txt\")\n";
   let want = { path: b"d.txt", dir: false };
-  let x = accepted_session([{ name: b"m", source_text: source }], [], [
-    { module: b"m", path: want.path, bytes: b"one" },
-  ]);
-  let b = results_in(x, [Named(b"m.data")]).get(0).result;
+  let b = output_body(
+    program_outputs([{ name: b"m", source_text: source }], [], Some([Named(b"m.data")]), [
+      { module: b"m", path: want.path, bytes: b"one" },
+    ]),
+    b"m.data",
+  );
   assert_eq(b.tables.statics, statics_of(EmbeddedDatum(b"one".blake3())))
 }
 
@@ -3170,10 +3132,12 @@ test "an extern in a standard library module is called with raw machine values w
     b"pub extern fn counted(x: { n: Int }) -> Int\npub extern fn doubled(x: Int) -> Int\n",
     b"import std.native (counted, doubled)\nimport std.native as n\nfn f() -> Int = counted({ n: 2 }) + n::counted({ n: 3 })\nfn g() -> Int = doubled(2) + n::doubled(3)\n",
   ];
-  let x = accepted_session([{ name: b"m", source_text: sources.get(1) }], [
-    { name: b"std.native", source_text: sources.get(0) },
-  ]);
-  let results_of = |key: RootKey| results_in(x, [key]);
+  let results_of = |key: RootKey|
+    program_outputs(
+      [{ name: b"m", source_text: sources.get(1) }],
+      [{ name: b"std.native", source_text: sources.get(0) }],
+      Some([key]),
+    );
   match results_of(Named(b"m.g")).find(|a: RootOutput| a.name == root_name(Named(b"m.g"))) {
     Some(a) -> assert_eq(body_code(a.result.text).split(b"builtin_doubled_p(ctx, ").len(), 3),
     None -> panic("no result"),
@@ -3336,8 +3300,7 @@ test "a function that returns a record whose field is stored inside the record r
 
 test "matching an array read as `Some` or `None` checks the index and reads the element directly from the array" {
   let source = b"fn arrayed(xs: Array<Int>, i: Int) -> Int = match xs.at(i) { Some(v) -> v, None -> 0 }\n";
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 1);
+  let out = module_emitted(source, [b"m.arrayed"]);
   let calls = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
   assert_eq(calls(b" < (uint64_t)((PlyArrayHead *)ply_words(p0))->len"), [true])
 }
@@ -3368,15 +3331,13 @@ test "a list's item is read in place behind a test of its length, a generic read
       retired.map(Named),
     ),
   );
-  retired.fold((), |_: Unit, n: Bytes| assert_eq(output_body(results, n).text, b""));
+  retired.fold((), |_: Unit, n: Bytes|
+    assert(!emits(results, Named(n)), Some(String::of_bytes_lossy(n))));
   let called = |name: Bytes|
     output_body(results, name).tables.generics.calls.map(|g: GenericCall| g.callee);
   assert_eq([called(b"m.third"), called(b"m.listed"), called(b"m.gathered")], [[], [], []]);
-  [b"m.pushed", b"m.nested"].fold((), |_: Unit, n: Bytes| {
-    let generic = output_body(results, n);
-    assert(generic.tables.generics.needs.any(|k: Need| k.reads == Layout), None);
-    assert_eq(generic.text, b"")
-  });
+  [b"m.pushed", b"m.nested"].fold((), |_: Unit, n: Bytes|
+    assert(!emits(results, Named(n)), Some(String::of_bytes_lossy(n))));
   let code = |name: Bytes| body_code(output_body(results, name).text);
   [b"m.third", b"m.listed"].fold((), |_: Unit, n: Bytes| {
     let text = code(n);
@@ -3418,28 +3379,50 @@ fn parsed_types(ss: List<Bytes>) -> List<Type> / {abort.raise} =
       None -> panic(String::of_bytes_lossy(b"not the name of a type: ".concat(s))),
     })
 
+fn program_outputs(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  wanted: Option<List<RootKey>> = None,
+  files: List<FileAt> = [],
+) -> List<RootOutput> / {abort.raise} =
+  compiled_program(sources, shipped, wanted, files).codes.flat_map(|c: UnitCode| c.results)
+
 fn outputs_at(
   names: List<Bytes>,
   sources: List<Bytes>,
   wanted: List<RootKey>,
   shipped: List<Source> = [],
-  published: List<PublishedSignature> = [],
-) -> List<RootOutput> / {abort.raise} = {
-  results_in(accepted_session(zip_sources(names, sources), shipped), wanted, published)
-}
-
-fn results_in(
-  x: SessionAnalysis,
-  wanted: List<RootKey>,
-  published: List<PublishedSignature> = [],
 ) -> List<RootOutput> / {abort.raise} =
-  lowered_over(x.program, || emit_root_results(x.analysis, wanted, published))
+  program_outputs(zip_sources(names, sources), shipped, Some(wanted))
 
-fn lowered_in(x: SessionAnalysis, wanted: List<RootKey>) -> LoweredProgram / {abort.raise} =
-  lowered_over(x.program, || lowered_roots(x.analysis, wanted))
+fn output_of(results: List<RootOutput>, key: RootKey) -> RootOutput / {abort.raise} =
+  match results.find(|a: RootOutput| a.name == root_name(key)) {
+    Some(a) -> a,
+    None -> panic(String::of_bytes_lossy(b"no result for ".concat(printed(key)))),
+  }
 
-fn analysed_at(names: List<Bytes>, sources: List<Bytes>) -> SessionAnalysis / {abort.raise} =
-  accepted_session(zip_sources(names, sources))
+fn outputs_of(
+  results: List<RootOutput>,
+  wanted: List<RootKey>,
+) -> List<RootOutput> / {abort.raise} = wanted.map(|k: RootKey| output_of(results, k))
+
+fn emits(results: List<RootOutput>, key: RootKey) -> Bool =
+  results.any(|a: RootOutput| a.name == root_name(key))
+
+fn emitted_from(
+  results: List<RootOutput>,
+  names: List<Bytes>,
+) -> List<EmittedRoot> / {abort.raise} =
+  names.map(|n: Bytes| {
+    let a = output_of(results, Named(n));
+    { name: a.name, text: a.result.text, tables: a.result.tables }
+  })
+
+fn module_outputs(source: Bytes) -> List<RootOutput> / {abort.raise} =
+  program_outputs([{ name: b"m", source_text: source }])
+
+fn module_emitted(source: Bytes, names: List<Bytes>) -> List<EmittedRoot> / {abort.raise} =
+  emitted_from(module_outputs(source), names)
 
 test "a generic definition used at a type that is not a single machine word is emitted again for that type" {
   let source = Bytes::concat_all([
@@ -3462,7 +3445,7 @@ test "a generic definition used at a type that is not a single machine word is e
       None -> panic("no result"),
     };
   let has = |name: Bytes, text: Bytes| body(name).text.index_of(text) != None;
-  assert(has(b"m.go", b"@@g0@@"));
+  assert(body(b"m.go").tables.calls.map(printed).any(|n: Bytes| n.starts_with(b"m.twice@")), None);
   assert_eq(body(b"m.go").tables.generics.calls, [
     {
       callee: Named(b"m.twice"),
@@ -3613,16 +3596,13 @@ test "a tail loop runs at the types it is called with, and each function in it r
       effect_evidence: [],
     },
   ]);
-  assert_eq(body(b"m.spin").text, b"");
+  assert_eq([b"m.spin", b"m.ping", b"m.pong"].filter(|n: Bytes| emits(results, Named(n))), []);
   assert_eq(body(b"m.spin@Float,Int").tables.members.map(printed), [
     b"m.spin@Float,Int",
     b"m.spin@Int,Float",
   ]);
   assert(loops(b"m.spin@Float,Int"));
   assert_eq(body(b"m.spin@Float,Int").tables.generics.calls, []);
-  assert_eq(body(b"m.ping").text, b"");
-  assert_eq(body(b"m.ping").tables.members, [Named(b"m.ping"), Named(b"m.pong")]);
-  assert_eq(body(b"m.ping").tables.generics.needs, [{ var: 0, reads: Exact }]);
   assert_eq(body(b"m.ping@Float").tables.members.map(printed), [b"m.ping@Float", b"m.pong@Float"]);
   assert(loops(b"m.ping@Float"));
   assert_eq(
@@ -3707,11 +3687,8 @@ test "a generic definition used at a record type reads the record at the offsets
       effect_evidence: [],
     },
   ]);
-  assert_eq(text(b"m.first"), b"");
-  assert(
-    [0, 1].all(|v: Int| tables(b"m.first").generics.needs.contains({ var: v, reads: Layout })),
-    None,
-  )
+  assert(!emits(results, Named(b"m.first")), None);
+  assert(text(laid).len() > 0, None)
 }
 
 test "a generic call passing a record with a multi-word sum field passes it the way the specialised function expects" {
@@ -3787,11 +3764,11 @@ test "an operator the checker recorded for a definition's type variable is emitt
     Named(b"m.floats"),
     specialised_at(b"m.same", [b"Float"]),
   ]);
-  let texts = results.map(|a: RootOutput| a.result.text);
-  assert_eq(results.map(output_name), [b"m.same@Float", b"m.same", b"m.floats"]);
-  assert_eq(texts.get(1), b"");
-  let same = match results.at(1) { Some(a) -> a.result.tables.generics.needs, None -> [] };
-  assert_eq(same, [{ var: 0, reads: Exact }])
+  assert(!emits(results, Named(b"m.same")), None);
+  assert(
+    [b"m.same@Float", b"m.floats"].all(|n: Bytes| output_body(results, n).text.len() > 0),
+    None,
+  )
 }
 
 fn site_fixture(above: Bytes) -> List<Source> =
@@ -3921,8 +3898,7 @@ test "a sum whose cases store their fields separately is released by those cases
     b"fn terms(t: Term) -> List<Term> = named(t).map(|f: { name: Bytes, term: Term }| f.term)\n",
     b"fn first_base(ts: List<Term>) -> Option<Term> = ts.fold(None, |acc: Option<Term>, t: Term| match acc { Some(_) -> acc, None -> base_of(t) })\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert(out.len() > 0, None);
+  let out = module_outputs(source);
   assert_eq(
     [
       b"m.rebuilt",
@@ -3933,7 +3909,7 @@ test "a sum whose cases store their fields separately is released by those cases
       b"m.named",
       b"m.terms",
       b"m.first_base",
-    ].filter(|n: Bytes| !out.any(|e: EmittedRoot| emitted_name(e) == n)),
+    ].filter(|n: Bytes| !emits(out, Named(n))),
     [],
   )
 }
@@ -3953,8 +3929,7 @@ test "a scalar read from an `Option` needs no reference count, however the `Opti
     b"fn float_back(x: Float) -> Float = match some_float(x) { Some(y) -> y, None -> x }\n",
     b"fn bool_back(b: Bool) -> Bool = match some_bool(b) { Some(d) -> d, None -> b }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert(out.len() > 0, None);
+  let out = module_outputs(source);
   assert_eq(
     [
       b"m.char_of",
@@ -3965,21 +3940,15 @@ test "a scalar read from an `Option` needs no reference count, however the `Opti
       b"m.int_back",
       b"m.float_back",
       b"m.bool_back",
-    ].filter(|n: Bytes| !out.any(|e: EmittedRoot| emitted_name(e) == n)),
+    ].filter(|n: Bytes| !emits(out, Named(n))),
     [],
   );
-  let char_of = match out.filter(|e: EmittedRoot| emitted_name(e) == b"m.char_of") {
-    [e] -> body_code(e.text),
-    _ -> b"",
-  };
+  let char_of = body_code(output_body(out, b"m.char_of").text);
   assert(
     char_of.index_of(b"builtin_char_of_int_p(") == None,
     Some(String::of_bytes_lossy(char_of)),
   );
-  let shifted = match out.filter(|e: EmittedRoot| emitted_name(e) == b"m.shifted") {
-    [e] -> body_code(e.text),
-    _ -> b"",
-  };
+  let shifted = body_code(output_body(out, b"m.shifted").text);
   assert(
     shifted.len() > 0 && shifted.index_of(b"builtin_int_of_char_p(") == None,
     Some(String::of_bytes_lossy(shifted)),
@@ -3995,13 +3964,8 @@ test "a constant value built from constructors compiles to static data with no a
     b"fn sized(t: Tree) -> Int = match t { Leaf -> 0, Node(l, _, r) -> 1 + sized(l) + sized(r) }\n",
     b"fn walked() -> Int = sized(small())\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert(out.len() > 0, None);
-  let text = |name: Bytes|
-    match out.filter(|e: EmittedRoot| emitted_name(e) == name) {
-      [e] -> body_code(e.text),
-      _ -> b"",
-    };
+  let out = module_outputs(source);
+  let text = |name: Bytes| body_code(output_body(out, name).text);
   assert_eq(
     [b"m.small", b"m.broad"].filter(|n: Bytes|
       allocates(text(n)) || text(n).index_of(b"&ply_k_") == None),
@@ -4019,11 +3983,10 @@ test "a `handle` whose body returns a constant stores it like any other result, 
     b"fn mixed(s: String) -> String = handle { if amb.flip() { s } else { \"b\" } } with { amb.flip() resume k -> k(true) }\n",
     b"fn counted() -> Int = handle { if amb.flip() { 1 } else { 2 } } with { amb.flip() resume k -> k(true) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert(out.len() > 0, None);
+  let out = module_outputs(source);
   assert_eq(
     [b"m.branched", b"m.returned", b"m.alone", b"m.mixed", b"m.counted"].filter(|n: Bytes|
-      !out.any(|e: EmittedRoot| emitted_name(e) == n)),
+      !emits(out, Named(n))),
     [],
   )
 }
@@ -4034,8 +3997,7 @@ test "a record that a branch of a recursive function returns unchanged is passed
     b"fn walk(s: S, fuel: Int) -> S = if fuel <= 0 { s } else if fuel % 2 == 0 { walk({ out: s.out ++ b\"x\", n: s.n + 1 }, fuel - 1) } else { let k = fuel * 3; match k % 4 { 1 -> walk(s, fuel - 1), _ -> s } }\n",
     b"fn hop(s: S, fuel: Int) -> S = if fuel <= 0 { s } else { match fuel % 3 { 0 -> hop({ out: s.out ++ b\"y\", n: s.n }, fuel - 1), _ -> if fuel > 8 { hop(s, fuel - 2) } else if fuel % 2 == 0 { hop(s, fuel - 1) } else { s } } }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 2);
+  let out = module_emitted(source, [b"m.walk", b"m.hop"]);
   assert_eq(out.map(|e: EmittedRoot| body_code(e.text).index_of(b"rt_alloc_p(") == None), [
     true,
     true,
@@ -4043,16 +4005,10 @@ test "a record that a branch of a recursive function returns unchanged is passed
 }
 
 test "a byte returned by `byte_of_int` is stored in a list without adding to its reference count" {
-  let out = emit_all_program(
-    [
-      {
-        name: b"m",
-        source_text: b"fn wrap(n: Int) -> List<Bytes> / {abort.raise} = [byte_of_int(n)]\n",
-      },
-    ],
-    true,
-  );
-  let text = match out { [e, ..] -> e.text, [] -> b"" };
+  let text = output_body(
+    module_outputs(b"fn wrap(n: Int) -> List<Bytes> / {abort.raise} = [byte_of_int(n)]\n"),
+    b"m.wrap",
+  ).text;
   assert(
     text.index_of(b"ply_byte_text(ctx, ") != None
       && text.index_of(b"ply_refused(ctx, INT64_C(12), ") != None
@@ -4068,8 +4024,7 @@ test "a scalar parameter is passed by value, so a self tail call does not releas
     b"fn flip(b: Bool, k: Int) -> Bool = if k <= 0 { b } else { flip(b, k - 1) }\n",
     b"fn narrow(w: U32, k: Int) -> U32 = if k <= 0 { w } else { narrow(w, k - 1) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 3);
+  let out = module_emitted(source, [b"m.countdown", b"m.flip", b"m.narrow"]);
   assert_eq(out.map(|e: EmittedRoot| releases_word(e.text, b"p0")), [false, false, false])
 }
 
@@ -4079,8 +4034,7 @@ test "an accumulator record read more than once is still returned as separate fi
     b"fn narrow(s: S, x: Int) -> S = { ..s, i: x }\n",
     b"fn wide(s: S, x: Int) -> S = { ..s, i: s.i + x }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 2);
+  let out = module_emitted(source, [b"m.narrow", b"m.wide"]);
   let has = |text: Bytes| out.map(|e: EmittedRoot| body_code(e.text).index_of(text) != None);
   [b"rt_alloc_p(", b"ply_alloc("].fold((), |_: Unit, t: Bytes| assert_eq(has(t), [false, false]))
 }
@@ -4095,10 +4049,8 @@ test "a branch releases a parameter that only the other branch uses, but does no
     b"fn field(s: S) -> Int = { let out = s.out; if s.n < 0 { whole(s) } else { Bytes::len(out ++ b\"x\") + s.n } }\n",
     b"fn wide_field(w: W) -> Int = { let out = w.out; if w.n < 0 { wide(w) } else { Bytes::len(out ++ b\"x\") + w.n } }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 5);
-  let text = |name: Bytes|
-    match out.filter(|e: EmittedRoot| emitted_name(e) == name) { [e, ..] -> e.text, [] -> b"" };
+  let out = module_outputs(source);
+  let text = |name: Bytes| output_body(out, name).text;
   let slot = text(b"m.slot");
   assert(
     match slot.index_of(body_else) {
@@ -4188,47 +4140,40 @@ test "a generated function for a type takes the type in its defined representati
   )
 }
 
-fn emit_all_program(sources: List<Source>, release: Bool) -> List<EmittedRoot> / {abort.raise} = {
-  let x = accepted_session(sources);
-  let roots = requested_roots(dump_of(emitter_input::Analysed(x.analysis))).filter(|k: RootKey|
-    module_of(k) != prelude_module);
-  lowered_over(x.program, || emit_program(x.analysis, release, roots))
-}
-
 test "importing a module named like a builtin still lets an unqualified call of that name call the builtin" {
-  let emitted = emit_all_program(
-    [
+  let out = emitted_from(
+    program_outputs([
       { name: b"min", source_text: b"pub fn size(xs: List<Int>) -> Int = xs.len()\n" },
       {
         name: b"b",
         source_text: b"import min\nfn least(x: Int) -> Int = min(x, 1)\nfn n(xs: List<Int>) -> Int = min::size(xs)\n",
       },
-    ],
-    true,
+    ]),
+    [b"min.size", b"b.least", b"b.n"],
   );
-  assert_eq(emitted.len(), 3);
-  let calls = |full: Bytes| emitted.map(|e: EmittedRoot| e.text.index_of(symbol_of(full)) != None);
+  let calls = |full: Bytes| out.map(|e: EmittedRoot| e.text.index_of(symbol_of(full)) != None);
   assert_eq(calls(b"min.min"), [false, false, false]);
   assert_eq(calls(b"min.size"), [false, false, true])
 }
 
 test "a builtin's helper has a name derived from the builtin, and an imported function with that name is called instead" {
-  let own = emit_all_program(
-    [{ name: b"m", source_text: b"fn fresh<a>() -> Map<a, Int> = Map::new()\n" }],
-    true,
+  let own = module_outputs(b"fn fresh<a>() -> Map<a, Int> = Map::new()\n");
+  assert_eq(
+    own.filter(|a: RootOutput|
+      output_name(a) == b"m.fresh" && a.result.text.index_of(b"builtin_map_new_p") != None).map(
+      output_name,
+    ),
+    [],
   );
-  assert_eq(own.len(), 1);
-  assert_eq(own.map(|e: EmittedRoot| e.text.index_of(b"builtin_map_new_p") != None), [false]);
   assert_eq(builtin_helper(b"?numeric_binary"), b"builtin_elaborated_numeric_binary");
   assert_eq(builtin_helper(b"range"), b"builtin_range");
-  let imported = emit_all_program(
-    [
+  let imported = emitted_from(
+    program_outputs([
       { name: b"a", source_text: b"pub fn min(x: Int, y: Int) -> Int = x\n" },
       { name: b"b", source_text: b"import a (min)\nfn least(x: Int) -> Int = min(x, 1)\n" },
-    ],
-    true,
+    ]),
+    [b"a.min", b"b.least"],
   );
-  assert_eq(imported.len(), 2);
   assert_eq(imported.map(|e: EmittedRoot| e.text.index_of(b"builtin_min_p") != None), [
     false,
     false,
@@ -4241,17 +4186,13 @@ test "a body that names a constructor calls no generated function for it, whatev
   let stating = b"pub type Box = | Box(Int, Int)\nkey for Box by area\nshow for Box by text\n".concat(
     rest,
   );
-  let wanted = [b"m.area", b"m.text", b"m.make", b"m.same"].map(Named);
+  let wanted = [b"m.area", b"m.text", b"m.make"].map(Named);
   let calls = |source: Bytes|
-    outputs_at([b"m"], [source], wanted).map(|a: RootOutput|
-      { name: output_name(a), calls: a.result.tables.calls.map(printed) });
+    outputs_of(outputs_at([b"m"], [source], wanted.push(Named(b"m.same"))), wanted).map(
+      |a: RootOutput| { name: output_name(a), calls: a.result.tables.calls.map(printed) },
+    );
   [stating, plain].fold((), |_: Unit, source: Bytes|
-    assert_eq(calls(source).map(|c: { name: Bytes, calls: List<Bytes> }| c.calls), [
-      [],
-      [],
-      [],
-      [],
-    ]))
+    assert_eq(calls(source).map(|c: { name: Bytes, calls: List<Bytes> }| c.calls), [[], [], []]))
 }
 
 const borrowing_corpus: Bytes =
@@ -4272,8 +4213,7 @@ test "a payload read from a value built from constants needs no reference count,
     b"fn render(v: V) -> String = match v { VInt(n) -> n.to_string(), VStr(s) -> s.len().to_string() }\n",
     b"fn display(x: Int) -> String = match VInt(x) { VStr(s) -> s, v -> render(v) }\n",
   ]);
-  let out = emit_all_program([{ name: b"m", source_text: source }], true);
-  assert_eq(out.len(), 2);
+  let out = module_emitted(source, [b"m.render", b"m.display"]);
   assert_eq(out.map(|e: EmittedRoot| e.tables.handings.map(|h: PublishedSignature| h.borrowed)), [
     [[true]],
     [[true]],
@@ -4292,9 +4232,8 @@ test "a specialisation borrows and returns values the same way its generic defin
     specialised_at(b"m.name_of", [b"Int"]),
     specialised_at(b"m.err_or", [b"Int"]),
   ]);
-  let wanted = keyed.map(printed);
   let results = outputs_at([b"m"], [source], keyed);
-  assert_eq(results.map(output_name).sort(), wanted.sort());
+  assert_eq(keyed.filter(|k: RootKey| !emits(results, k)), []);
   let borrowed = |name: Bytes|
     results.fold([], |accumulator: List<PublishedSignature>, a: RootOutput|
       if output_name(a) != name { accumulator }
@@ -4310,8 +4249,7 @@ test "a specialisation borrows and returns values the same way its generic defin
 }
 
 test "a parameter that a body only reads is borrowed, so neither the function nor its caller changes its reference count for the call" {
-  let out = emit_all_program([{ name: b"m", source_text: borrowing_corpus }], true);
-  assert_eq(out.len(), 4);
+  let out = module_emitted(borrowing_corpus, [b"m.weight", b"m.twice", b"m.grown", b"m.both"]);
   let code = out.map(|e: EmittedRoot| body_code(e.text));
   assert_eq(code.map(counts_any), [false, false, false, true]);
   assert_eq(code.map(increments_count), [false, false, false, false]);
@@ -4330,32 +4268,33 @@ test "a parameter that a body only reads is borrowed, so neither the function no
 }
 
 test "a function body is compiled using the borrowing signatures of its callee that were already computed, and records which it relied on" {
-  let twice = |published: List<PublishedSignature>|
-    match outputs_at([b"m"], [borrowing_corpus], [Named(b"m.twice")], [], published) {
-      [a] ->
-        Some({
-          counted: increments_count(body_code(a.result.text)),
-          assumed: a.result.tables.assumed,
-          handings: a.result.tables.handings,
-        }),
-      _ -> None,
-    };
+  let twice = |weight: Bytes| {
+    let source = Bytes::concat_all([
+      b"type T = | Leaf | Node(T, Int, T)\n",
+      weight,
+      b"fn twice(t: T) -> Int = weight(t) + weight(t)\n",
+      b"fn grown(t: T) -> T = Node(t, 1, Leaf)\n",
+    ]);
+    let a = output_body(outputs_at([b"m"], [source], [Named(b"m.twice")]), b"m.twice");
+    {
+      counted: increments_count(body_code(a.text)),
+      assumed: a.tables.assumed,
+      handings: a.tables.handings,
+    }
+  };
   assert_eq(
-    twice([]),
-    Some({
+    twice(b"fn weight(t: T) -> Int = match grown(t) { Node(_, n, _) -> n, Leaf -> 0 }\n"),
+    {
       counted: true,
       assumed: [published_signature(b"m.weight", [false])],
       handings: [published_signature(b"m.twice", [false])],
-    }),
+    },
   );
-  assert_eq(
-    twice([published_signature(b"m.weight", [true])]),
-    Some({
-      counted: false,
-      assumed: [published_signature(b"m.weight", [true])],
-      handings: [published_signature(b"m.twice", [true])],
-    }),
-  )
+  assert_eq(twice(b"fn weight(t: T) -> Int = match t { Leaf -> 0, Node(_, n, _) -> n }\n"), {
+    counted: false,
+    assumed: [published_signature(b"m.weight", [true])],
+    handings: [published_signature(b"m.twice", [true])],
+  })
 }
 
 const array_allocation: Bytes =
