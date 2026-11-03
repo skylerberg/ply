@@ -38,8 +38,11 @@ const inline_limit: Int = 2048
 
 fn is_inline(output: Bytes) -> Bool = output.len() <= inline_limit
 
-fn sealed_record_of(record: Bytes) -> Option<SealedRecord> / {abort.raise} =
-  match bin::decode(record, sealed_record_bin()) { Ok(r) -> Some(r), Err(_) -> None }
+fn sealed_record_of(record: Bytes) -> SealedRecord / {abort.raise} =
+  match bin::decode(record, sealed_record_bin()) {
+    Ok(r) -> r,
+    Err(_) -> packs::damaged_pack("a record does not decode"),
+  }
 
 type PackBuild = {
   writing: packs::PackWriter,
@@ -88,6 +91,7 @@ type StoreRun = {
   details: Map<Bytes, FactDetails>,
   transient: Map<Bytes, Bytes>,
   pack: packs::PackReader,
+  sealed: Map<Bytes, Option<Map<Bytes, Bytes>>>,
   pack_use: PackUse,
   pack_differs: Bool,
   waiting: Waiting,
@@ -121,10 +125,11 @@ fn stored_output<[r]>(
   digest: Bytes,
   output: Bytes,
 ) -> StoreRun / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  {
-    ..remembered_output(o, digest, output),
-    db: fact_store::with_result[r](o.db, result_key(digest), output),
-  }
+  remembered_output(
+    { ..o, db: fact_store::with_result[r](o.db, result_key(digest), output) },
+    digest,
+    output,
+  )
 
 fn results_of_facts(
   found: Set<Bytes>,
@@ -184,7 +189,7 @@ type Ran<a> = { value: a, commit: CommitResult }
 
 fn over_database<a, [r] | e>(
   database: Database,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
@@ -208,6 +213,7 @@ fn over_database<a, [r] | e>(
       details: Map::new(),
       transient: Map::new(),
       pack: packs::open_reader(read),
+      sealed: Map::new(),
       pack_use: NoTrustedPack,
       pack_differs: false,
       waiting: nothing_waiting,
@@ -248,19 +254,24 @@ fn over_database<a, [r] | e>(
       },
     },
     memo_store.sealed(key) -> if !trusts_pack(st) { None } else {
-      let found = packs::record(st.pack, read, pack_key(key));
-      st = { ..st, pack: found.reading };
-      match match found.bytes { Some(b) -> sealed_record_of(b), None -> None } {
-        None -> None,
-        Some(r) -> {
+      match st.sealed.get(key) {
+        Some(parts) -> parts,
+        None -> {
+          let found = packs::record(st.pack, read, pack_key(key));
+          let record = match found.bytes { Some(b) -> Some(sealed_record_of(b)), None -> None };
+          let parts = match record { Some(r) -> Some(r.parts), None -> None };
           st = {
             ..st,
-            transient: r.inline.fold(
-              st.transient,
-              |t: Map<Bytes, Bytes>, digest: Bytes, o: Bytes| t.insert(digest, o),
-            ),
+            pack: found.reading,
+            sealed: st.sealed.insert(key, parts),
+            transient: match record {
+              Some(r) ->
+                r.inline.fold(st.transient, |t: Map<Bytes, Bytes>, digest: Bytes, o: Bytes|
+                  t.insert(digest, o)),
+              None -> st.transient,
+            },
           };
-          Some(r.parts)
+          parts
         },
       }
     },
@@ -481,7 +492,7 @@ pub fn with_opening<a, [r] | e>(
 
 fn session_on<a, [r] | e>(
   opening: fact_store::Opening,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
@@ -505,7 +516,7 @@ fn session_on<a, [r] | e>(
 
 fn session_in<a, [r] | e>(
   dir: String,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
@@ -516,7 +527,7 @@ fn session_in<a, [r] | e>(
 
 pub fn with_opened_database<a, [r] | e>(
   opening: fact_store::Opening,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
@@ -526,7 +537,7 @@ pub fn with_opened_database<a, [r] | e>(
 
 pub fn with_database<a, [r] | e>(
   dir: String,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
@@ -726,7 +737,7 @@ pub type InMemoryOutcome<a> =
 fn session_in_memory<a | e>(
   tree: fs::MemFs,
   limit: WriteLimit,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
@@ -742,7 +753,7 @@ fn session_in_memory<a | e>(
 pub fn with_writes_limited<a | e>(
   tree: fs::MemFs,
   limit: WriteLimit,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
@@ -759,7 +770,7 @@ pub fn with_writes_limited<a | e>(
 
 pub fn with_store_in_memory<a | e>(
   tree: fs::MemFs,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
@@ -1008,7 +1019,7 @@ test "a pack holds the facts of the keys it is built from, and a trusted run use
   let used = fs::on_mem[abs](fs::mem_of([]), ||
     with_database[abs](
       "s",
-      |path: String, offset: Int, len: Int| packs::frame_in(Some(pack.written), path, offset, len),
+      |part: packs::PackPart| packs::frame_in(Some(pack.written), part),
       b"files",
       |_: Bytes, _: Bytes| None,
       |_: Bytes| (),
@@ -1560,7 +1571,7 @@ test "a fact in a trusted pack is used as it is, and a project records what it u
     queries_id(qs),
     b"files",
   );
-  let read = |path: String, offset: Int, len: Int| packs::frame_in(Some(pack), path, offset, len);
+  let read = |part: packs::PackPart| packs::frame_in(Some(pack), part);
   let done = with_store_in_memory(fs::mem_empty(), read, b"files", |_: Bytes, _: Bytes| None, ||
     in_session_of(qs, b"label", b"a"));
   assert_eq(done.value, b"long 4");
@@ -1580,11 +1591,11 @@ test "a fact that used a sealed fact is recomputed when a new pack changes that 
       queries_id(plain_queries(q)),
       files,
     );
-    |path: String, offset: Int, len: Int| packs::frame_in(Some(written), path, offset, len)
+    |part: packs::PackPart| packs::frame_in(Some(written), part)
   };
   let older = pack_of(four(), b"old");
   let newer = pack_of(world_of([{ at: b"a", text: b"forty" }]), b"new");
-  let run_with = |store: fs::MemFs, read: (String, Int, Int) -> Option<Bytes> / {abort.raise}, files: Bytes|
+  let run_with = |store: fs::MemFs, read: (packs::PackPart) -> Option<Bytes> / {abort.raise}, files: Bytes|
     with_store_in_memory(store, read, files, |_: Bytes, _: Bytes| None, ||
       in_session_of(plain_queries(q), b"label", b"a"));
   let first = run_with(fs::mem_empty(), older, b"old");

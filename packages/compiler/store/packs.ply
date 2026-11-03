@@ -21,13 +21,23 @@ const index_magic: Bytes = b"PLYPACK\x07"
 pub fn index_bytes(i: Index) -> Bytes / {abort.raise} =
   index_magic.concat(bin::encode(i, index_bin()))
 
-pub fn index_from(b: Bytes) -> Option<Index> / {abort.raise} =
-  if b.len() < 8 || b.slice(0, 8) != index_magic { None }
-  else { match bin::decode(b.slice(8, b.len()), index_bin()) { Ok(i) -> Some(i), Err(_) -> None } }
+pub fn damaged_pack<a>(what: String) -> a / {abort.raise} =
+  panic("the shipped pack is damaged: " ++ what)
 
-pub fn frame_range(table: segments::SortedTable, key: Bytes) -> Option<Range> / {abort.raise} =
+fn index_from(b: Bytes) -> Option<Index> / {abort.raise} =
+  if b.len() < 8 || b.slice(0, 8) != index_magic { None } else {
+    match bin::decode(b.slice(8, b.len()), index_bin()) {
+      Ok(i) -> Some(i),
+      Err(_) -> damaged_pack("its index does not decode"),
+    }
+  }
+
+fn frame_range(table: segments::SortedTable, key: Bytes) -> Option<Range> / {abort.raise} =
   match segments::value_in(table, key) {
-    Some(value) -> match bin::decode(value, range_bin()) { Ok(at) -> Some(at), Err(_) -> None },
+    Some(value) -> match bin::decode(value, range_bin()) {
+      Ok(at) -> Some(at),
+      Err(_) -> damaged_pack("a frame's range does not decode"),
+    },
     None -> None,
   }
 
@@ -78,6 +88,8 @@ pub fn finish(
   }
 }
 
+pub type PackPart = | WholeIndex | StoreFrame(Range)
+
 pub type PackReader = {
   index: Option<Index>,
   records: Option<segments::SortedTable>,
@@ -87,79 +99,109 @@ pub type PackReader = {
 pub const empty_reader: PackReader = { index: None, records: None, results: None }
 
 pub fn open_reader<| e>(
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
 ) -> PackReader / {abort.raise | e} =
   {
-    index: match read(index_file, 0, 0) { Some(b) -> index_from(b), None -> None },
+    index: match read(WholeIndex) { Some(b) -> index_from(b), None -> None },
     records: None,
     results: None,
   }
 
+type PackTable = | RecordsTable | ResultsTable
+
+fn range_of(i: Index, table: PackTable) -> Range =
+  match table { RecordsTable -> i.records, ResultsTable -> i.results }
+
+fn cached_table(p: PackReader, table: PackTable) -> Option<segments::SortedTable> =
+  match table { RecordsTable -> p.records, ResultsTable -> p.results }
+
+fn with_table(p: PackReader, table: PackTable, rows: segments::SortedTable) -> PackReader =
+  match table {
+    RecordsTable -> { ..p, records: Some(rows) },
+    ResultsTable -> { ..p, results: Some(rows) },
+  }
+
+fn read_table<| e>(
+  i: Index,
+  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
+  table: PackTable,
+) -> segments::SortedTable / {abort.raise | e} =
+  match read(StoreFrame(range_of(i, table))) {
+    None -> damaged_pack("a table its index names cannot be read"),
+    Some(bytes) -> match segments::decoded_table(bytes) {
+      Some(rows) -> rows,
+      None -> damaged_pack("a table does not decode"),
+    },
+  }
+
+fn frame_of<| e>(
+  rows: segments::SortedTable,
+  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
+  key: Bytes,
+) -> Option<Bytes> / {abort.raise | e} =
+  match frame_range(rows, key) {
+    None -> None,
+    Some(at) -> match read(StoreFrame(at)) {
+      Some(bytes) -> Some(bytes),
+      None -> damaged_pack("a frame its table names cannot be read"),
+    },
+  }
+
 fn lookup<| e>(
   p: PackReader,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
   key: Bytes,
-  records: Bool,
+  table: PackTable,
 ) -> { reading: PackReader, bytes: Option<Bytes> } / {abort.raise | e} =
   match p.index {
     None -> { reading: p, bytes: None },
-    Some(i) -> {
-      let cached_table = if records { p.records } else { p.results };
-      let table = match cached_table {
-        Some(t) -> t,
-        None -> {
-          let at = if records { i.records } else { i.results };
-          let decoded = if at.len == 0 { None } else {
-            match read(store_file, at.offset, at.len) {
-              Some(t) -> segments::decoded_table(t),
-              None -> None,
-            }
-          };
-          match decoded { Some(t) -> t, None -> segments::empty_table }
-        },
-      };
-      let reading = if records { { ..p, records: Some(table) } }
-      else { { ..p, results: Some(table) } };
-      {
-        reading: reading,
-        bytes: match frame_range(table, key) {
-          Some(at) -> read(store_file, at.offset, at.len),
-          None -> None,
-        },
-      }
+    Some(i) -> match cached_table(p, table) {
+      Some(rows) -> { reading: p, bytes: frame_of(rows, read, key) },
+      None -> {
+        let rows = read_table(i, read, table);
+        { reading: with_table(p, table, rows), bytes: frame_of(rows, read, key) }
+      },
     },
   }
 
 pub fn record<| e>(
   p: PackReader,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
   key: Bytes,
-) -> { reading: PackReader, bytes: Option<Bytes> } / {abort.raise | e} = lookup(p, read, key, true)
+) -> { reading: PackReader, bytes: Option<Bytes> } / {abort.raise | e} =
+  lookup(p, read, key, RecordsTable)
 
 pub fn output<| e>(
   p: PackReader,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  read: (PackPart) -> Option<Bytes> / {abort.raise | e},
   digest: Bytes,
 ) -> { reading: PackReader, bytes: Option<Bytes> } / {abort.raise | e} =
   match output_key(digest) {
-    Some(name) -> lookup(p, read, name, false),
+    Some(name) -> lookup(p, read, name, ResultsTable),
     None -> { reading: p, bytes: None },
   }
 
-pub fn frame_in(
-  p: Option<PackFiles>,
-  path: String,
-  offset: Int,
-  len: Int,
-) -> Option<Bytes> / {abort.raise} =
+pub fn frame_in(p: Option<PackFiles>, part: PackPart) -> Option<Bytes> / {abort.raise} =
   match p {
     None -> None,
-    Some(w) -> if path == index_file { Some(w.index) }
-    else if path != store_file || offset < 0 || len < 0 || offset + len > w.store.len() { None }
-    else { Some(w.store.slice(offset, if len == 0 { w.store.len() } else { offset + len })) },
+    Some(w) -> match part {
+      WholeIndex -> Some(w.index),
+      StoreFrame(at) -> if at.offset < 0 || at.len < 0 || at.offset + at.len > w.store.len() {
+        None
+      } else { Some(w.store.slice(at.offset, at.offset + at.len)) },
+    },
   }
 
-pub fn no_pack(_: String, _: Int, _: Int) -> Option<Bytes> = None
+pub fn read_part<| e>(
+  read_range: (String, Int, Int) -> Option<Bytes> / e,
+  part: PackPart,
+) -> Option<Bytes> / e =
+  match part {
+    WholeIndex -> read_range(index_file, 0, 0),
+    StoreFrame(at) -> read_range(store_file, at.offset, at.len),
+  }
+
+pub fn no_pack(_: PackPart) -> Option<Bytes> = None
 
 fn queries_of(names: List<Bytes>) -> QueriesId =
   queries_id(
@@ -201,7 +243,7 @@ fn test_pack(
   )
 }
 
-test "a pack's index decodes to the value that was encoded" {
+test "a pack's index decodes to the value that was encoded, a damaged index raises, and another format's index is no index" {
   let i = {
     queries: queries_of([b"s"]),
     id: b"id",
@@ -211,9 +253,10 @@ test "a pack's index decodes to the value that was encoded" {
   };
   assert_eq(index_from(index_bytes(i)), Some(i));
   let b = index_bytes(i);
-  assert_eq(index_from(b.slice(0, b.len() - 1)), None);
-  assert_eq(index_from(b.concat(b"x")), None);
-  assert_eq(index_from(b"PLYPACK\x01"), None)
+  let read = |bytes: Bytes| handle { Some(index_from(bytes)) } with { abort.raise(_) -> None };
+  assert_eq(read(b.slice(0, b.len() - 1)), None);
+  assert_eq(read(b.concat(b"x")), None);
+  assert_eq(read(b"PLYPACK\x01"), Some(None))
 }
 
 test "each record and long result of a pack is found by its key, and no other" {
@@ -225,7 +268,7 @@ test "each record and long result of a pack is found by its key, and no other" {
     [{ key: long.slice(1, 33), bytes: b"a longer result" }],
     b"files",
   );
-  let read = |path: String, offset: Int, len: Int| frame_in(Some(written), path, offset, len);
+  let read = |part: PackPart| frame_in(Some(written), part);
   let p = open_reader(read);
   let first = record(p, read, a);
   assert_eq(first.bytes, Some(b"record a"));
@@ -238,8 +281,7 @@ test "each record and long result of a pack is found by its key, and no other" {
 
 test "a pack's records are reused only when the queries and the files match those the pack was written from" {
   let written = test_pack([{ key: b"a".blake3(), bytes: b"r" }], [], b"files one");
-  let i = match open_reader(|path: String, offset: Int, len: Int|
-      frame_in(Some(written), path, offset, len)).index {
+  let i = match open_reader(|part: PackPart| frame_in(Some(written), part)).index {
     Some(x) -> x,
     None -> panic("the index reads"),
   };
@@ -247,4 +289,16 @@ test "a pack's records are reused only when the queries and the files match thos
   assert(!is_trusted(i, queries_of([b"other queries"]), b"files one"));
   assert(!is_trusted(i, queries_of([b"queries"]), b"files two"));
   assert(!is_trusted(i, queries_of([b"queries"]), b""))
+}
+
+test "a pack whose store is cut short raises when a record is looked up, rather than reading as absent" {
+  let written = test_pack([{ key: b"a".blake3(), bytes: b"record a" }], [], b"files");
+  let cut = { ..written, store: written.store.slice(0, 8) };
+  let read = |part: PackPart| frame_in(Some(cut), part);
+  let looked = handle {
+    Some(record(open_reader(read), read, b"a".blake3()).bytes)
+  } with {
+    abort.raise(_) -> None,
+  };
+  assert_eq(looked, None)
 }

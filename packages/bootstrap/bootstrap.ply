@@ -10,7 +10,6 @@ import compiler.native
 import compiler.native (PackFile)
 import compiler.store.packs
 import compiler.unit (shipped, identity_of)
-import std.bin
 import std.bytes
 import std.env (env)
 import std.fs
@@ -47,10 +46,6 @@ type Target = {
 }
 
 type CacheKeys = { shipped: Bytes, linking: Bytes }
-
-type CachedFile = { path: String, bytes: Bytes }
-
-derive bin for CachedFile
 
 effect set Installs = {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], time.elapsed_ms, process.err[proc], entropy.next, abort.raise}
 
@@ -296,35 +291,44 @@ fn shipped_results_cache_key(
   key.hex_of()
 }
 
-fn encode_shipped_results(shipped_results: List<PackFile>) -> Bytes / {abort.raise} =
-  bin::encode(
-    shipped_results.map(|f: PackFile| { path: f.path, bytes: f.bytes }),
-    bin::list_bin(cached_file_bin()),
-  )
+const pack_key_file: String = "key"
 
-fn decode_shipped_results(bytes: Bytes) -> Option<List<PackFile>> / {abort.raise} =
-  match bin::decode(bytes, bin::list_bin(cached_file_bin())) {
-    Ok(files) -> Some(files.map(|f: CachedFile| { path: f.path, bytes: f.bytes })),
-    Err(_) -> None,
+fn pack_path(answers: String, name: String) -> String = strip_root(answers ++ "/pack/" ++ name)
+
+fn read_pack_files(answers: String) -> Option<List<PackFile>> / {fs.read[abs], abort.raise} =
+  match ((
+      chunked_read(pack_path(answers, packs::store_file), chunk_size),
+      fs.read_file[abs](pack_path(answers, packs::index_file)),
+    )) {
+    (Some(store), Some(index)) ->
+      Some([
+        { path: "answers/" ++ packs::store_file, bytes: store },
+        { path: "answers/" ++ packs::index_file, bytes: index },
+      ]),
+    _ -> None,
   }
+
+fn kept_pack(answers: String, key: String) -> Option<List<PackFile>> / {fs.read[abs], abort.raise} =
+  if fs.read_file[abs](pack_path(answers, pack_key_file)) == Some(Bytes::of_string(key)) {
+    read_pack_files(answers)
+  } else { None }
+
+fn written_key(answers: String, key: String) -> Bool / {fs.write[abs], abort.raise} =
+  fs.write_file[abs](pack_path(answers, pack_key_file), Bytes::of_string(key))
 
 fn build_shipped_results(
   ply: String,
-  dir: String,
-) -> Result<List<PackFile>, String> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
-  let ran = toolchain.run(cc::cache_relative(ply), ["std", "--answers", dir]);
-  let at = |name: String| strip_root(dir ++ "/pack/" ++ name);
-  if ran.code != 0 { Err("the new `ply` did not check the shipped modules") } else {
-    match ((
-        chunked_read(at(packs::store_file), chunk_size),
-        fs.read_file[abs](at(packs::index_file)),
-      )) {
-      (Some(store), Some(index)) ->
-        Ok([
-          { path: "answers/" ++ packs::store_file, bytes: store },
-          { path: "answers/" ++ packs::index_file, bytes: index },
-        ]),
-      _ -> Err("the new `ply` did not write check results for the standard library modules"),
+  answers: String,
+) -> Result<List<PackFile>, String> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
+  fs.remove[abs](pack_path(answers, pack_key_file));
+  if fs.read_file[abs](pack_path(answers, pack_key_file)) != None {
+    Err("the key of the standard library's stored check results could not be removed")
+  } else if toolchain.run(cc::cache_relative(ply), ["std", "--answers", answers]).code != 0 {
+    Err("the new `ply` did not check the shipped modules")
+  } else {
+    match read_pack_files(answers) {
+      Some(files) -> Ok(files),
+      None -> Err("the new `ply` did not write check results for the standard library modules"),
     }
   }
 }
@@ -336,7 +340,6 @@ fn shipped_results(
   front: Bytes,
   keys: CacheKeys,
 ) -> Result<{ returned: List<PackFile>, taken: Bool }, String> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
-  let results_file = strip_root(answers ++ "/results");
   let returning = exe ++ "-answering";
   if !fs.copy[abs](strip_root(exe), strip_root(returning)) {
     Err("the new `ply` could not be copied to run from")
@@ -355,29 +358,14 @@ fn shipped_results(
             ),
           )
         };
-        let had = match cached_results {
-          None -> None,
-          Some(key) -> match chunked_read(results_file, chunk_size) {
-            Some(bytes) -> {
-              let head = Bytes::of_string(key ++ "\n");
-              if bytes.starts_with(head) {
-                decode_shipped_results(bytes.slice(head.len(), bytes.len()))
-              } else { None }
-            },
-            None -> None,
-          },
-        };
+        let had = match cached_results { None -> None, Some(key) -> kept_pack(answers, key) };
         match had {
           Some(a) -> Ok({ returned: a, taken: true }),
           None -> match build_shipped_results(returning, answers) {
             Err(reason) -> Err(reason),
             Ok(files) -> match cached_results {
               None -> Ok({ returned: files, taken: false }),
-              Some(key) -> if fs.create_dir[abs](strip_root(answers))
-                  && fs.write_file[abs](
-                    results_file,
-                    Bytes::of_string(key ++ "\n").concat(encode_shipped_results(files)),
-                  ) { Ok({ returned: files, taken: false }) }
+              Some(key) -> if written_key(answers, key) { Ok({ returned: files, taken: false }) }
               else { Err("what the new `ply` returned could not be kept") },
             },
           },
@@ -711,9 +699,8 @@ test "`chunked_digest` of a file hashes the hashes of its chunks, whatever the c
   assert_eq(over("lib/absent", 4), None)
 }
 
-test "`shipped_results_cache_key` returns a key ending in `.answers`, equal for equal arguments and different when the shipped, linking, returning or gathering argument differs" {
+test "`shipped_results_cache_key` is equal for equal arguments and different when the shipped, linking, returning or gathering argument differs" {
   let results_key = shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering");
-  assert(results_key.ends_with(".answers"));
   assert_eq(
     shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering"),
     results_key,
@@ -728,14 +715,17 @@ test "`shipped_results_cache_key` returns a key ending in `.answers`, equal for 
   assert(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"moved") != results_key)
 }
 
-test "`decode_shipped_results` returns the stored results that `encode_shipped_results` produced, and `None` for truncated, extended or too-short bytes" {
-  let shipped_results = [
+test "a kept pack is reused only when the key beside it is the key asked for" {
+  let tree = fs::mem_of([
+    { path: "answers/pack/store", body: b"frames" },
+    { path: "answers/pack/index", body: b"index" },
+    { path: "answers/pack/key", body: b"one" },
+  ]);
+  let kept = |key: String| fs::on_mem[abs](tree, || kept_pack("/answers", key)).value;
+  let files = [
     { path: "answers/store", bytes: b"frames" },
-    { path: "answers/index", bytes: b"" },
+    { path: "answers/index", bytes: b"index" },
   ];
-  let encoded = encode_shipped_results(shipped_results);
-  assert_eq(decode_shipped_results(encoded), Some(shipped_results));
-  assert_eq(decode_shipped_results(encoded.slice(0, encoded.len() - 1)), None);
-  assert_eq(decode_shipped_results(encoded.concat(b"x")), None);
-  assert_eq(decode_shipped_results(b"short"), None)
+  assert_eq(kept("one"), Some(files));
+  assert_eq(kept("two"), None)
 }
