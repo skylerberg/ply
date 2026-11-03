@@ -1,5 +1,4 @@
 import std.bin
-import std.bytes (u32_le, u64_le)
 import std.hash (blake3)
 import compiler.store.segments
 import compiler.store.memo (Query, main_only, plain_queries)
@@ -17,7 +16,7 @@ pub type Index = { queries: QueriesId, id: Bytes, files: Bytes, records: Range, 
 
 derive bin for Index
 
-const index_magic: Bytes = b"PLYPACK\x06"
+const index_magic: Bytes = b"PLYPACK\x07"
 
 pub fn index_bytes(i: Index) -> Bytes / {abort.raise} =
   index_magic.concat(bin::encode(i, index_bin()))
@@ -26,17 +25,9 @@ pub fn index_from(b: Bytes) -> Option<Index> / {abort.raise} =
   if b.len() < 8 || b.slice(0, 8) != index_magic { None }
   else { match bin::decode(b.slice(8, b.len()), index_bin()) { Ok(i) -> Some(i), Err(_) -> None } }
 
-const row_width: Int = 44
-
-fn row_of(key: Bytes, at: Range) -> Bytes =
-  Bytes::concat_all([key, u64_le(at.offset), u32_le(at.len)])
-
-pub fn frame_range(table: Bytes, key: Bytes) -> Option<Range> / {abort.raise} =
-  match segments::row_of(table, row_width, key) {
-    Some(row) -> match ((row.u64_at(32), row.u32_at(40))) {
-      (Some(offset), Some(len)) -> Some({ offset: offset, len: len }),
-      _ -> None,
-    },
+pub fn frame_range(table: segments::SortedTable, key: Bytes) -> Option<Range> / {abort.raise} =
+  match segments::value_in(table, key) {
+    Some(value) -> match bin::decode(value, range_bin()) { Ok(at) -> Some(at), Err(_) -> None },
     None -> None,
   }
 
@@ -67,8 +58,11 @@ pub fn finish(
   files: Bytes,
 ) -> PackFiles / {abort.raise} = {
   let rows = |m: Map<Bytes, Range>|
-    Bytes::concat_all(
-      m.fold([], |accumulator: List<Bytes>, k: Bytes, at: Range| accumulator.push(row_of(k, at))),
+    segments::table_bytes(
+      segments::sorted_table(
+        m.fold(Map::new(), |table: Map<Bytes, Bytes>, k: Bytes, at: Range|
+          table.insert(k, bin::encode(at, range_bin()))),
+      ),
     );
   let r = append_frame(w, rows(records));
   let a = append_frame(r.writing, rows(results));
@@ -84,7 +78,11 @@ pub fn finish(
   }
 }
 
-pub type PackReader = { index: Option<Index>, records: Option<Bytes>, results: Option<Bytes> }
+pub type PackReader = {
+  index: Option<Index>,
+  records: Option<segments::SortedTable>,
+  results: Option<segments::SortedTable>,
+}
 
 pub const empty_reader: PackReader = { index: None, records: None, results: None }
 
@@ -111,8 +109,13 @@ fn lookup<| e>(
         Some(t) -> t,
         None -> {
           let at = if records { i.records } else { i.results };
-          if at.len == 0 { b"" }
-          else { match read(store_file, at.offset, at.len) { Some(t) -> t, None -> b"" } }
+          let decoded = if at.len == 0 { None } else {
+            match read(store_file, at.offset, at.len) {
+              Some(t) -> segments::decoded_table(t),
+              None -> None,
+            }
+          };
+          match decoded { Some(t) -> t, None -> segments::empty_table }
         },
       };
       let reading = if records { { ..p, records: Some(table) } }
