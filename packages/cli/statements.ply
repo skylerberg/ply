@@ -1,5 +1,4 @@
 import compiler.codes (undeclared_sql_name_code, unsupported_sql_code)
-import compiler.front.checking.view (ProgramSites)
 import compiler.front.checking.program_facts (ProgramSites, reached_modules)
 import compiler.front.facts (StatementSite, Argument, TextArgument, CallArgument, RowArgument,
                              TaggedArgument, ListArgument, ConstructorArgument, OtherArgument,
@@ -96,7 +95,14 @@ pub type CheckResult = | Checked({ text: String, found: List<StatementError> }) 
 
 derive bin for CheckResult
 
-pub type CheckSite = { site: StatementSite, check: StatementCheck, schemas: List<ConstSite> }
+pub type CheckSite = {
+  site: StatementSite,
+  check: StatementCheck,
+  identity: Option<Bytes>,
+  schemas: List<ConstSite>,
+}
+
+pub type KeyedCheck = { check: StatementCheck, identity: Option<Bytes> }
 
 pub fn check_sites(sites: ProgramSites) -> List<CheckSite> / {abort.raise} = {
   let schemas = sites.constants.filter(|c: ConstSite| c.type_name == schema_type);
@@ -110,12 +116,14 @@ pub fn check_sites(sites: ProgramSites) -> List<CheckSite> / {abort.raise} = {
           let reachable_modules = reached_modules(sites.imports, [site.module]);
           let reachable_schemas = schemas.filter(|s: ConstSite|
             reachable_modules.contains(s.module));
+          let check = {
+            ..a,
+            schema: if reachable_schemas.len() == 1 { reachable_schemas.at(0) } else { None },
+          };
           accumulator.push({
             site: site,
-            check: {
-              ..a,
-              schema: if reachable_schemas.len() == 1 { reachable_schemas.at(0) } else { None },
-            },
+            check: check,
+            identity: statement_identity(check, sites.callee_hashes),
             schemas: reachable_schemas,
           })
         },
@@ -195,36 +203,48 @@ fn scalar_kind(reader: Bytes) -> sql::FieldKind =
   else if reader == b"bytes_field" { sql::BytesField }
   else { sql::JsonField }
 
-fn argument_key(a: Argument, left: Int) -> Bytes / {abort.raise} =
-  if left <= 0 { b"?" } else {
+fn joined_keys(keys: List<Option<Bytes>>) -> Option<Bytes> =
+  keys.fold(Some(b""), |all: Option<Bytes>, one: Option<Bytes>|
+    match ((all, one)) { (Some(a), Some(k)) -> Some(a.concat(k)), _ -> None })
+
+fn argument_key(a: Argument, left: Int, hashes: Map<Bytes, Bytes>) -> Option<Bytes> / {abort.raise} =
+  if left <= 0 { Some(b"?") } else {
     match a {
-      TextArgument(b) -> b"t".concat(length_prefixed(b)),
+      TextArgument(b) -> Some(b"t".concat(length_prefixed(b))),
       CallArgument(c) ->
-        Bytes::concat_all([
-          b"c",
-          length_prefixed(c.callee),
-          length_prefixed(c.hash),
-          length_prefixed(ascii_of_int(c.args.len())),
-          Bytes::concat_all(c.args.map(|x: Argument| argument_key(x, left - 1))),
-        ]),
-      RowArgument(_) -> b"r",
+        match ((
+            hashes.get(c.callee),
+            joined_keys(c.args.map(|x: Argument| argument_key(x, left - 1, hashes))),
+          )) {
+          (Some(hash), Some(arguments)) ->
+            Some(
+              Bytes::concat_all([
+                b"c",
+                length_prefixed(c.callee),
+                length_prefixed(hash),
+                length_prefixed(ascii_of_int(c.args.len())),
+                arguments,
+              ]),
+            ),
+          _ -> None,
+        },
+      RowArgument(_) -> Some(b"r"),
       TaggedArgument(t) ->
-        Bytes::concat_all([
-          b"g",
-          length_prefixed(t.callee),
-          length_prefixed(t.hash),
-          length_prefixed(ascii_of_int(t.parts.len())),
-          Bytes::concat_all(t.parts.map(length_prefixed)),
-        ]),
+        hashes.get(t.callee).map(|hash: Bytes|
+          Bytes::concat_all([
+            b"g",
+            length_prefixed(t.callee),
+            length_prefixed(hash),
+            length_prefixed(ascii_of_int(t.parts.len())),
+            Bytes::concat_all(t.parts.map(length_prefixed)),
+          ])),
       ListArgument(items) ->
-        Bytes::concat_all([
-          b"l",
-          length_prefixed(ascii_of_int(items.len())),
-          Bytes::concat_all(items.map(|x: Argument| argument_key(x, left - 1))),
-        ]),
+        joined_keys(items.map(|x: Argument| argument_key(x, left - 1, hashes))).map(
+          |inner: Bytes| Bytes::concat_all([b"l", length_prefixed(ascii_of_int(items.len())), inner]),
+        ),
       ConstructorArgument(c) ->
-        Bytes::concat_all([b"k", length_prefixed(c.type_name), length_prefixed(c.name)]),
-      OtherArgument -> b"o",
+        Some(Bytes::concat_all([b"k", length_prefixed(c.type_name), length_prefixed(c.name)])),
+      OtherArgument -> Some(b"o"),
     }
   }
 
@@ -238,39 +258,59 @@ fn operation_text(o: Operation) -> Bytes =
 
 fn kind_key(k: sql::FieldKind) -> Bytes = Bytes::of_string(sql::field_text(k))
 
-pub fn check_result_key(toolchain: Bytes, a: StatementCheck) -> Bytes / {abort.raise} =
+pub fn check_result_key(toolchain: Bytes, identity: Bytes) -> Bytes / {abort.raise} =
   hex(
     blake3(
       Bytes::concat_all([
-        length_prefixed(b"ply statement judgement 3"),
+        length_prefixed(b"ply statement judgement 4"),
         length_prefixed(hex(bin::shape_digest(check_result_bin()))),
         length_prefixed(toolchain),
-        length_prefixed(match a.schema { Some(s) -> s.hash, None -> b"" }),
-        length_prefixed(match a.dialect { Postgres -> b"postgres", Sqlite -> b"sqlite" }),
-        length_prefixed(operation_text(a.operation)),
-        length_prefixed(match a.label { Some(l) -> Bytes::of_string(l), None -> b"\x00" }),
-        match a.given {
-          None -> length_prefixed(b"\x00"),
-          Some(given) ->
-            Bytes::concat_all(
-              given.map(|g: Option<String>|
-                length_prefixed(match g { Some(c) -> Bytes::of_string(c), None -> b"\x00" })),
-            ),
-        },
-        match a.row {
-          None -> length_prefixed(b"\x00"),
-          Some(fields) ->
-            Bytes::concat_all(
-              fields.map(|f: sql::Field|
-                length_prefixed(Bytes::of_string(f.name)).concat(
-                  length_prefixed(kind_key(f.kind)),
-                )),
-            ),
-        },
-        length_prefixed(argument_key(a.statement, 64)),
+        identity,
       ]),
     ),
   )
+
+fn schema_key(schema: Option<ConstSite>, hashes: Map<Bytes, Bytes>) -> Option<Bytes> =
+  match schema {
+    None -> Some(b"n"),
+    Some(s) -> hashes.get(s.name).map(|hash: Bytes| b"s".concat(length_prefixed(hash))),
+  }
+
+pub fn statement_identity(
+  a: StatementCheck,
+  hashes: Map<Bytes, Bytes>,
+) -> Option<Bytes> / {abort.raise} =
+  match ((schema_key(a.schema, hashes), argument_key(a.statement, 64, hashes))) {
+    (Some(schema), Some(statement)) ->
+      Some(
+        Bytes::concat_all([
+          length_prefixed(schema),
+          length_prefixed(match a.dialect { Postgres -> b"postgres", Sqlite -> b"sqlite" }),
+          length_prefixed(operation_text(a.operation)),
+          length_prefixed(match a.label { Some(l) -> Bytes::of_string(l), None -> b"\x00" }),
+          match a.given {
+            None -> length_prefixed(b"\x00"),
+            Some(given) ->
+              Bytes::concat_all(
+                given.map(|g: Option<String>|
+                  length_prefixed(match g { Some(c) -> Bytes::of_string(c), None -> b"\x00" })),
+              ),
+          },
+          match a.row {
+            None -> length_prefixed(b"\x00"),
+            Some(fields) ->
+              Bytes::concat_all(
+                fields.map(|f: sql::Field|
+                  length_prefixed(Bytes::of_string(f.name)).concat(
+                    length_prefixed(kind_key(f.kind)),
+                  )),
+              ),
+          },
+          length_prefixed(statement),
+        ]),
+      ),
+    _ -> None,
+  }
 
 fn callees_in(a: Argument, accumulator: List<Bytes>, left: Int) -> List<Bytes> =
   if left <= 0 { accumulator } else {
@@ -656,7 +696,7 @@ test "every operation and definition that runs a statement is declared in a stat
 }
 
 test "`statement_check_of` reads a database call's query text, parameter types and result row fields from the arguments written at the call" {
-  let text = CallArgument({ callee: b"m.items_all", hash: b"h", args: [] });
+  let text = CallArgument({ callee: b"m.items_all", args: [] });
   let query = statement_check_of(
     a_site(b"std.db.db.query", [text, ListArgument([a_param(b"PInt"), OtherArgument])]),
   );
@@ -680,7 +720,6 @@ test "`statement_check_of` reads a database call's query text, parameter types a
   );
   let bound = CallArgument({
     callee: b"std.sqlite.bound",
-    hash: b"b",
     args: [text, ListArgument([a_param(b"PText")])],
   });
   assert_eq(
@@ -764,7 +803,6 @@ test "what the check found is reported at the call, naming the statement and the
     span: span_between(0, 1),
     name: b"m.schema",
     type_name: schema_type,
-    hash: b"s",
   };
   let a = {
     site: a_site(b"std.db.db.query", []),
@@ -772,11 +810,12 @@ test "what the check found is reported at the call, naming the statement and the
       dialect: Postgres,
       operation: Reads,
       label: Some("items"),
-      statement: CallArgument({ callee: b"m.items_all", hash: b"h", args: [] }),
+      statement: CallArgument({ callee: b"m.items_all", args: [] }),
       given: None,
       row: None,
       schema: Some(declared),
     },
+    identity: None,
     schemas: [declared],
   };
   let found = {

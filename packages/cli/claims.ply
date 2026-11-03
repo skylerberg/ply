@@ -19,13 +19,14 @@ import units
 import units (CodeProgram, emit)
 import compiler.front.emitter_input (LawPlace)
 import compiler.front.facts (Analysis, schemas_instantiated)
-import compiler.front.rows (LawRow, ModuleSpan, module_span_bin)
+import compiler.front.rows (LawRow)
 import compiler.emit.keys as root_keys
 import compiler.emit.keys (Clause, ClauseKind, LawBody, LawGuard, LawPart, Named, Requires, RootKey,
                            law_key, root_name, root_text)
 import compiler.check.infer.checker (DefinitionInfo)
 import compiler.cc
-import compiler.check.resolve.tables (Diagnostic, error_with_labels, error_at)
+import compiler.check.resolve.tables (Diagnostic, InSource, Place, Unplaced, WholeFile,
+                                      error_with_labels, place_bin)
 import signature (provenance)
 import std.bytes
 import proof.keys (claim_key, run_key)
@@ -54,7 +55,6 @@ import std.list (somes)
 import proof.rules (Rule, CaseSplit, Congruence, ExhaustiveEnumeration, LinearArithmetic,
                     Propositional, Unfold, rules_json)
 import std.string
-import compiler.syntax.parsing (no_module, span_between, Span)
 
 pub type Options = { jobs: Option<Int>, prove: ProveOptions, sim: machine::SimulationOptions }
 
@@ -89,7 +89,7 @@ pub type Claim = {
   kind: Kind,
   guarded: Bool,
   frame: Frame,
-  at: ModuleSpan,
+  at: Place,
   unused_effects: List<String>,
   schema: Option<String>,
 }
@@ -315,15 +315,20 @@ pub fn once_each(diagnostics: List<Diagnostic>) -> List<Diagnostic> =
         seen || (k.code == d.code && k.message == d.message)) { accumulator }
     else { accumulator.push(d) })
 
-pub fn location_text(places: List<SourceText>, at: ModuleSpan) -> Option<String> / {abort.raise} =
-  if at.module == no_module { None } else {
-    match places.at(at.module) {
-      None -> None,
-      Some(p) -> {
-        let spot: Position = position_of(p.text, at.start);
-        Some(p.path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.column.to_string())
-      },
-    }
+pub fn location_text(places: List<SourceText>, at: Place) -> Option<String> / {abort.raise} =
+  match at {
+    InSource(s) -> position_text(places, s.module, s.start),
+    WholeFile(m) -> position_text(places, m, 0),
+    Unplaced -> None,
+  }
+
+fn position_text(places: List<SourceText>, module: Int, offset: Int) -> Option<String> / {abort.raise} =
+  match places.at(module) {
+    None -> None,
+    Some(p) -> {
+      let spot: Position = position_of(p.text, offset);
+      Some(p.path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.column.to_string())
+    },
   }
 
 fn escaped(text: String) -> String =
@@ -786,7 +791,7 @@ pub type ProofContext = {
   unit_id: Int,
   obligations: List<Obligation>,
   laws: Map<String, LawPlace>,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   timeout_ms: Int,
 }
 
@@ -1091,7 +1096,7 @@ pub fn claim_at(claims: List<Claim>, i: Int) -> Claim =
         kind: Ensures(0),
         guarded: false,
         frame: NoWrites,
-        at: { module: 0, start: 0, end: 0 },
+        at: Unplaced,
         unused_effects: [],
         schema: None,
       },
@@ -1285,14 +1290,20 @@ pub fn plan_json(p: Plan) -> Json / {abort.raise} =
     { key: "sim", value: sim_json(p.sim) },
   ])
 
-fn span_of(at: ModuleSpan) -> Span = span_between(at.start, at.end)
+fn claim_error(
+  row: Row,
+  code: Bytes,
+  message: Bytes,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> Diagnostic =
+  error_with_labels(code, message, [{ place: row.claim.at, primary: true, text: label }], notes)
 
 fn refutation(row: Row, context: Counterexample) -> Diagnostic = {
   let notes = [Bytes::of_string(quantifier(row.claim, context.bindings))];
-  error_at(
+  claim_error(
+    row,
     b"E0419",
-    row.claim.at.module,
-    span_of(row.claim.at),
     Bytes::of_string(label_of(row.claim) ++ " is false at " ++ bindings_text(context.bindings)),
     b"this claim does not hold",
     match context.seed {
@@ -1302,13 +1313,11 @@ fn refutation(row: Row, context: Counterexample) -> Diagnostic = {
   )
 }
 
-fn vacuity(row: Row, guard: ModuleSpan) -> Diagnostic =
-  error_at(
+fn vacuity(row: Row, guard: { module: Int, start: Int, end: Int }) -> Diagnostic =
+  error_with_labels(
     b"E0420",
-    guard.module,
-    span_of(guard),
     Bytes::of_string(label_of(row.claim) ++ " is vacuous: " ++ vacuity_summary),
-    b"this guard admits nothing",
+    [{ place: InSource(guard), primary: true, text: b"this guard admits nothing" }],
     [
       b"an obligation over an empty domain is trivially valid and says nothing",
       b"widen the guard, or delete the claim",
@@ -1316,10 +1325,9 @@ fn vacuity(row: Row, guard: ModuleSpan) -> Diagnostic =
   )
 
 fn unproved(row: Row, reason: Reason) -> Diagnostic / {abort.raise} =
-  error_at(
+  claim_error(
+    row,
     b"E0474",
-    row.claim.at.module,
-    span_of(row.claim.at),
     Bytes::of_string(label_of(row.claim) ++ " is not proved: " ++ reason_summary(reason)),
     b"nothing proves this claim",
     List::concat(
@@ -1338,10 +1346,9 @@ fn unproved(row: Row, reason: Reason) -> Diagnostic / {abort.raise} =
 fn internal_error(row: Row, fault: Fault) -> Diagnostic / {abort.raise} = {
   let at = if fault.bindings.len() == 0 { [] }
   else { [Bytes::of_string("at " ++ bindings_text(fault.bindings))] };
-  error_at(
+  claim_error(
+    row,
     Bytes::of_string(fault.code),
-    row.claim.at.module,
-    span_of(row.claim.at),
     Bytes::of_string(label_of(row.claim) ++ " is not proved: " ++ fault_summary(fault)),
     b"Ply hit an internal error while trying to prove this",
     fault_notes(fault).map(Bytes::of_string).concat(at),
@@ -1368,7 +1375,7 @@ pub fn failure_output(
     CacheUnavailable(r) -> reported(style, command, r.diagnostics, r.places),
   }
 
-pub const a_span: ModuleSpan = { module: 0, start: 3, end: 7 }
+pub const a_span: Place = InSource({ module: 0, start: 3, end: 7 })
 
 pub fn a_claim(owner: String, kind: Kind) -> Claim =
   {

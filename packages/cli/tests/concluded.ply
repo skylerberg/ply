@@ -1,6 +1,5 @@
 import std.set (Set)
 import compiler.codes (internal_error_code, replay_mismatch_code)
-import compiler.front.rows (module_span_place)
 import compiler.cc
 import compiler.syntax.parsing (Error, Warning)
 import args (matches_filters)
@@ -49,13 +48,12 @@ import std.string
 import std.text (shell_join)
 import signature (effect_texts)
 import std.option
-import compiler.syntax.parsing (no_module)
 import std.term (Style)
 import tests.report (Entry, RunDecision, cached_count, Program, Cost, SearchSummary, Outcome, Site,
                      finished_line, display_name_at, Failed, Fault, RunReport, no_time_spent,
-                     case_of, canonical)
+                     case_of, canonical, SourceSpan, source_place)
 import tests.listing (hash_at, listing_of_program, sources_named, test_at)
-import tests.listing (TestListing, TestRecord, run_hash)
+import tests.listing (TestListing, SelectedTest, run_hash)
 import tests.history (IndexedVersion, store_versions)
 
 pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
@@ -134,14 +132,7 @@ pub fn journaling_of(
   {
     started: |i: Int| {
       let t = analysis.tests.get(i);
-      match run_hash(t) {
-        Some(hash) -> { key: t.info.key, hash: hash },
-        None ->
-          panic(
-            "the run started the test `" ++ String::of_bytes_lossy(t.info.key)
-              ++ "`, which it did not select",
-          ),
-      }
+      { key: t.info.key, hash: run_hash(t) }
     },
     stored: |done: JobResult|
       match declared.get(done.test) {
@@ -157,11 +148,12 @@ pub fn crashes_of(
 ) -> Map<Int, KnownFailure> / {abort.raise} =
   if interrupted.len() == 0 { Map::new() } else {
     range(0, analysis.tests.len()).fold(Map::new(), |found: Map<Int, KnownFailure>, i: Int|
-      match test_at(analysis, i).map(|x: TestRecord| x.info) {
+      match test_at(analysis, i) {
         None -> found,
-        Some(t) -> {
-          let hash = run_hash(analysis.tests.get(i));
-          if interrupted.any(|s: StartedTest| s.key == t.key && Some(s.hash) == hash) {
+        Some(listed) -> {
+          let t = listed.info;
+          let hash = run_hash(listed);
+          if interrupted.any(|s: StartedTest| s.key == t.key && s.hash == hash) {
             found.insert(
               i,
               tester::crashed(
@@ -320,8 +312,8 @@ fn reproduce(seed: Seed) -> String / {abort.raise} =
   "reproduce with `--sim once --seed " ++ plan::seed_text(seed)
     ++ "`, and report it with the test's source"
 
-fn spanned(span: { module: Int, start: Int, end: Int }, text: String) -> Label =
-  { place: module_span_place(span), primary: true, text: Bytes::of_string(text) }
+fn spanned(span: Option<SourceSpan>, text: String) -> Label =
+  { place: source_place(span), primary: true, text: Bytes::of_string(text) }
 
 fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abort.raise} =
   match search::run_failure(fl) {
@@ -376,7 +368,7 @@ pub fn hashes_of(analysis: ProgramListing) -> Hashes =
     declarations: by_name(analysis.hashes.declarations),
     closure: |keys: List<Bytes>| {
       let reachable = reach(analysis.hashes, keys.map(|k: Bytes| ItemKeyed(k)));
-      { functions: reachable.functions.keys(), declarations: reachable.declarations.keys() }
+      { functions: reachable.functions.elements(), declarations: reachable.declarations.elements() }
     },
   }
 
@@ -391,7 +383,7 @@ pub fn changes_of_test(h: Hashes, seen: Set<Bytes>, key: Bytes) -> List<Bytes> /
   (h.closure)([key]).functions.filter(|name: Bytes|
     !name.starts_with(b"std.prelude.")
       && (match h.definitions.get(name) {
-        Some(hash) -> seen.get(hash) != Some(true),
+        Some(hash) -> !seen.contains(hash),
         None -> false,
       })).sort(
   )
@@ -406,7 +398,7 @@ pub fn conclude_tests(analysis: TestListing, program: Program) -> List<conclude:
           index: i,
           key: t.key,
           seeded: uses_simulation(t.effects),
-          hash: run_hash(listed),
+          hash: Some(run_hash(listed)),
           start: match entry { Some(e) -> e.key, None -> t.key },
           case: match entry { Some(e) -> e.case != None, None -> false },
         })
@@ -415,13 +407,13 @@ pub fn conclude_tests(analysis: TestListing, program: Program) -> List<conclude:
     })
 
 pub fn seen_of(h: Hashes, failed: List<Bytes>) -> Set<Bytes> / {result_cache.known, abort.raise} =
-  if failed.len() == 0 { Map::new() } else {
+  if failed.len() == 0 { Set::empty() } else {
     let hashes = (h.closure)(failed).functions.fold([], |found: List<Bytes>, name: Bytes|
       match h.definitions.get(name) { Some(hash) -> found.push(hash), None -> found });
     let results = result_cache.known(hashes);
     range(0, hashes.len()).fold(Set::empty(), |accumulator: Set<Bytes>, i: Int|
       match ((hashes.at(i), results.at(i))) {
-        (Some(hash), Some(known)) -> accumulator.insert(hash, known),
+        (Some(hash), Some(known)) -> if known { accumulator.insert(hash) } else { accumulator },
         _ -> accumulator,
       })
   }
@@ -490,7 +482,7 @@ fn site_of(x: search::RaceSite) -> Site =
     task: "@" ++ x.task.to_string(),
     definition: x.definition,
     access: x.access,
-    at: if x.span.module == no_module { None } else { Some(x.span) },
+    at: x.span,
   }
 
 pub fn job_outcome(analysis: TestListing, done: JobResult) -> Outcome / {abort.raise} =
@@ -540,7 +532,7 @@ fn failed_of(
   done: Map<Int, JobResult>,
   failed: conclude::TestFailure<RuntimeDiagnostic>,
 ) -> Failed / {abort.raise} = {
-  let t = test_at(analysis, failed.index).map(|x: TestRecord| x.info);
+  let t = test_at(analysis, failed.index).map(|x: SelectedTest| x.info);
   let e = exploration_of(done, failed.index);
   let key = String::of_bytes_lossy(failed.key);
   {

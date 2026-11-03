@@ -1,3 +1,4 @@
+import std.set (Set)
 import progress (progress)
 import progress
 import sources (ProjectFiles)
@@ -6,8 +7,7 @@ import args (Flags, matches_filters, style_of)
 import units
 import units (EmbeddedFiles, emit)
 import update_costs (cost_checker)
-import literals (SiteCheck, Settled, Unsettled, evaluation, site_errors, stored_site_check)
-import update_costs (reuse_violations)
+import literals (evaluation, later_errors)
 import builder (builder)
 import compiler.cc (toolchain)
 import std.env (env)
@@ -32,10 +32,6 @@ import program (ProgramStore, Refusal, Session, embeds_of, places_of, session_ov
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
 import compiler.front.checking.world (Modules)
-import compiler.front.checking.identity (test_identities)
-import compiler.front.checking.view (NamedRollup)
-import compiler.front.checking.identity (test_identities)
-import compiler.front.checking.world (Modules)
 import module_queries (later_checks)
 import entries
 import compiler.store.memo (memo)
@@ -56,15 +52,14 @@ import views
 import testing.select (Decision, Row, by_code, code_keys, decide, to_run)
 import std.string
 import signature (effect_texts)
-import proof.context (set_of)
 import std.option
-import tests.listing (TestListing, TestReading, TestRecord, infos_of, run_hash, selected_listing,
-                      test_at)
+import tests.listing (TestListing, TestReading, SelectedTest, infos_of, listing_of, run_hash,
+                      stored_identity, test_at)
 import tests.report (Entry, Case, group_of_class, classes_of, run_decision_of, Program, TimeSpent,
                      no_time_spent, primary_of, placed_cases, unbound, canonical,
                      outside_effects_text)
 import tests.concluded (DecidedCases, uses_simulation, entry_of, cases_of)
-import tests.cases (CasedTest, Scope, case_scope, scope_of, over_cases, list_cases, run_unit,
+import tests.cases (CasedTest, Scope, scope_of, selection_of, over_cases, list_cases, run_unit,
                     ExpandedTests, expand_cases, codes_of, passed_by_code, concluded_run, search_of,
                     sim_json)
 import semantics (semantics)
@@ -89,14 +84,11 @@ fn test_reading(
   read: ProgramSummary,
 ) -> TestReading / {memo.read, abort.raise} = {
   let list = view::test_list(modules);
-  let unselected = selected_listing(list, Map::new());
-  let chosen = scope_of(unselected, flags.filters, options.shard, named).visible.concat(
-    case_scope(unselected, flags.filters, named),
-  );
   {
-    listing: selected_listing(
+    listing: listing_of(
       list,
-      test_identities(modules, chosen.map(|i: Int| unselected.tests.get(i).info.key)),
+      selection_of(list, flags.filters, options.shard, named),
+      stored_identity,
     ),
     later: later_checks(modules, read, false),
     schema: config_schema::listed_schema_error(modules, options.machine.config.schema),
@@ -171,25 +163,6 @@ fn opened_tests(
   }
 }
 
-fn checks_stored(
-  t: Session<TestReading>,
-  places: List<SourceText>,
-) -> SiteCheck / {cost_checker.report, evaluation.stored, abort.raise} =
-  match reuse_violations(t, t.value.later.facts) {
-    [] -> stored_site_check(t.place, t.value.later.reading.sites, places),
-    broken -> Settled(broken),
-  }
-
-fn checks_settled(
-  t: Session<TestReading>,
-  check: SiteCheck,
-  places: List<SourceText>,
-) -> List<Diagnostic> / {evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} =
-  match check {
-    Settled(diagnostics) -> diagnostics,
-    Unsettled -> site_errors(t, t.value.later.reading, places),
-  }
-
 pub fn file_stamps(
   rs: List<paths::ResolvedPath>,
 ) -> Option<List<String>> / {fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.modified_ms[cwd], fs.modified_ms[abs], fs.file_size[cwd], fs.file_size[abs], abort.raise, diverges} = {
@@ -211,20 +184,20 @@ fn root_of(rs: List<paths::ResolvedPath>) -> String =
   match rs.at(0) { None -> ".", Some(r) -> r.machine }
 
 pub fn rows_of(analysis: TestListing) -> List<Row> =
-  analysis.tests.fold([], |accumulator: List<Row>, t: TestRecord|
+  analysis.tests.fold([], |accumulator: List<Row>, t: SelectedTest|
     accumulator.push({
       index: accumulator.len(),
       label: String::of_bytes_lossy(t.info.name),
       name: String::of_bytes_lossy(t.info.key),
       module: String::of_bytes_lossy(t.info.module),
-      hash: run_hash(t),
+      hash: Some(run_hash(t)),
       seeded: uses_simulation(t.info.effects),
       nondet: t.info.nondet,
     }))
 
 fn is_write_mode(m: type_syntax::Mode) -> Bool = match m { WriteMode -> true, _ -> false }
 
-pub fn case_view(analysis: TestListing, i: Int, listed: TestRecord) -> Case / {abort.raise} = {
+pub fn case_view(analysis: TestListing, i: Int, listed: SelectedTest) -> Case / {abort.raise} = {
   let test_info = listed.info;
   let effects = canonical(test_info.effects);
   let texts = effect_texts(effects);
@@ -235,7 +208,7 @@ pub fn case_view(analysis: TestListing, i: Int, listed: TestRecord) -> Case / {a
     name: String::of_bytes_lossy(test_info.name),
     module: String::of_bytes_lossy(test_info.module),
     nondet: test_info.nondet,
-    hash: run_hash(listed).map(|h: Bytes| h.hex_of()),
+    hash: Some(run_hash(listed).hex_of()),
     effects: outside_effects_text(effects),
     listed: range(0, effects.len()).map(|j: Int|
       match effects.at(j) {
@@ -319,14 +292,14 @@ fn tests_over(
   begun: Int,
 ) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, MachineAccess, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], env.working_directory, env.variables, fs.resolved_kind[cwd], fs.resolved_kind[abs], emit.code, emit.libraries, cost_checker.report, evaluation.verdicts, evaluation.statements, evaluation.stored, shipped.read_pack, Derives, abort.raise} = {
   let loaded_at = time.elapsed_us();
-  let broken = checks_settled(t, checks_stored(t, places), places);
+  let broken = later_errors(t, t.value.later, places);
   let promised_at = time.elapsed_us();
   let spent = { ..no_time_spent, before_us: begun, promises_us: promised_at - loaded_at };
   if broken.len() > 0 { rejected(style, "test", broken, places) } else {
     results::with_result_cache(results::store_for(flags.paths), || {
       let configuring = time.elapsed_us();
-      let plan = planned(flags, options, t);
-      carried_out(flags, style, options, t, places, plan, {
+      let plan = plan_of(flags, options, t);
+      run_plan(flags, style, options, t, places, plan, {
         ..spent,
         store_us: time.elapsed_us() - configuring,
       })
@@ -336,37 +309,32 @@ fn tests_over(
 
 type CaseListing = { index: Int, request: ListingRequest, stored: Option<List<ListedCase>> }
 
-type Selection = {
+type Chosen = {
   over: ExpandedTests,
   scope: Scope,
-  reckoned: DecidedCases,
+  decided_cases: DecidedCases,
   first: List<Decision>,
 }
 
-type Listing = | Listed(Selection) | Unlisted(List<Int>)
+type Listing = | Listed(Chosen) | Unlisted
 
 type Plan = { opened: List<Diagnostic>, listings: List<CaseListing>, listing: Listing }
 
-fn planned(
+fn plan_of(
   flags: Flags,
   options: Options,
   t: Session<TestReading>,
 ) -> Plan / {result_cache.open_warnings, result_cache.listings, result_cache.passes, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let opened = result_cache.open_warnings();
-  let cased = over_cases(
-    t.value.listing,
-    flags.filters,
-    named_modules(flags.paths, t.project.files),
-  );
+  let cased = over_cases(t.value.listing);
   let stored = result_cache.listings(cased.map(|c: CasedTest| c.request));
   let listings = range(0, cased.len()).map(|k: Int|
     { index: cased.get(k).index, request: cased.get(k).request, stored: stored.get(k) });
-  let to_list = listings.filter(|c: CaseListing| c.stored == None).map(|c: CaseListing| c.index);
   {
     opened: opened,
     listings: listings,
-    listing: if to_list.len() > 0 { Unlisted(to_list) }
-    else { Listed(selection(flags, options, t, stored_cases(listings, Map::new()))) },
+    listing: if listings.any(|c: CaseListing| c.stored == None) { Unlisted }
+    else { Listed(chosen_of(flags, options, t, stored_cases(listings, Map::new()))) },
   }
 }
 
@@ -379,14 +347,14 @@ fn stored_cases(
 
 const no_shipped_texts: Map<Bytes, Bytes> = Map::new()
 
-fn selection(
+fn chosen_of(
   flags: Flags,
   options: Options,
   t: Session<TestReading>,
   cases: Map<Int, Result<List<ListedCase>, KnownFailure>>,
-) -> Selection / {result_cache.passes, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
+) -> Chosen / {result_cache.passes, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
   let over = expand_cases(t.value.listing, cases);
-  let reckoned = cases_of(
+  let decided_cases = cases_of(
     rows_of(over.listing),
     search_of(machine::sim_plan_of(options.sim), options.machine.profile),
     no_shipped_texts,
@@ -399,12 +367,12 @@ fn selection(
       options.shard,
       named_modules(flags.paths, t.project.files),
     ),
-    reckoned: reckoned,
-    first: decide(reckoned.cases),
+    decided_cases: decided_cases,
+    first: decide(decided_cases.cases),
   }
 }
 
-fn carried_out(
+fn run_plan(
   flags: Flags,
   style: Style,
   options: Options,
@@ -417,8 +385,10 @@ fn carried_out(
   let handoff_start = time.elapsed_us();
   let chosen = match plan.listing {
     Listed(chosen) -> Ok(chosen),
-    Unlisted(to_list) -> {
+    Unlisted -> {
       process.err[proc](indent ++ "listing the test cases");
+      let to_list = plan.listings.filter(|c: CaseListing| c.stored == None).map(|c: CaseListing|
+        c.index);
       match match units::code_program_of(t, t.value.later.reading.rollup) {
           Err(diagnostics) -> Err(diagnostics),
           Ok(program) -> list_cases(testing, program, t.value.listing, to_list),
@@ -433,7 +403,7 @@ fn carried_out(
                 _ -> kept,
               }),
           );
-          Ok(selection(flags, options, t, stored_cases(plan.listings, found)))
+          Ok(chosen_of(flags, options, t, stored_cases(plan.listings, found)))
         },
       }
     },
@@ -462,11 +432,11 @@ fn decided_run(
   testing: TestRun,
   t: Session<TestReading>,
   places: List<SourceText>,
-  chosen: Selection,
+  chosen: Chosen,
   opened: List<Diagnostic>,
   spent: TimeSpent,
   listing: Int,
-) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], ProjectFiles, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.working_directory, env.variables, MachineAccess, result_cache.interrupted, result_cache.started, result_cache.finished, result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, emit.code, emit.libraries, shipped.read_pack, fs.read[abs], fs.write[abs], fs.read[cwd], fs.write[cwd], Derives, abort.raise} = {
+) -> CommandOutput / {semantics.cached, process.out[proc], process.err[proc], ProjectFiles, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_us, env.working_directory, env.variables, MachineAccess, result_cache.interrupted, result_cache.started, result_cache.finished, result_cache.open_warnings, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, emit.code, emit.libraries, shipped.read_pack, fs.read[abs], fs.write[abs], fs.read[cwd], fs.write[cwd], Derives, abort.raise} = {
   let options = testing.options;
   let over = chosen.over;
   let analysis = over.listing;
@@ -488,7 +458,7 @@ fn decided_run(
   let searching = machine::sim_plan_of(options.sim);
   let search = search_of(searching, options.machine.profile);
   let building = time.elapsed_us();
-  let visible = set_of(scope.visible);
+  let visible = Set::of_list(scope.visible);
   let running = to_run(first).filter(|i: Int| visible.contains(i));
   let schema = options.machine.config.schema;
   let runs_code = schema != None || running.len() > 0;
@@ -550,7 +520,7 @@ fn decided_run(
                   testing,
                   entries::runnable_from(
                     t.value.later.reading.rollup,
-                    t.value.listing.tests.flat_map(|x: TestRecord| x.info.effects),
+                    t.value.listing.tests.flat_map(|x: SelectedTest| x.info.effects),
                   ),
                   configuration::run_configuration(r.configuration),
                 )
@@ -569,7 +539,7 @@ fn decided_run(
                   decisions,
                   decided,
                   keyed,
-                  returned.written_passes.concat(chosen.reckoned.rolled),
+                  returned.written_passes.concat(chosen.decided_cases.rolled),
                   searching,
                   r.warnings,
                   {

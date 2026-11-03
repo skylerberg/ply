@@ -4,10 +4,9 @@ import std.cli (Parsed, has, parse_nat, value, values_of, nat_value)
 import surface
 import surface (range_of)
 import compiler.cc
-import compiler.check.resolve.tables (Diagnostic, Label, InSource, Unplaced, place_module)
+import compiler.check.resolve.tables (Diagnostic, Label, InSource, Place, Unplaced, place_module)
 import compiler.unit (entered_timeout_ms)
-import compiler.front.rows (Dump, EmitterRoot, ModuleSpan, module_span_place)
-import compiler.syntax.parsing (no_module)
+import compiler.front.rows (Dump, EmitterRoot)
 import diagnostic (SourceText, RuntimeDiagnostic, diagnostic_of, with_notes, shown)
 import entry (Main, Module)
 import std.bin
@@ -151,8 +150,8 @@ pub fn project_root(path: String) -> String = {
   if joined == "" { if path.starts_with("/") { "/" } else { "." } } else { joined }
 }
 
-pub fn roots_of(d: Dump) -> Map<Bytes, ModuleSpan> =
-  d.emitter_roots.fold(Map::new(), |m: Map<Bytes, ModuleSpan>, r: EmitterRoot|
+pub fn roots_of(d: Dump) -> Map<Bytes, Place> =
+  d.emitter_roots.fold(Map::new(), |m: Map<Bytes, Place>, r: EmitterRoot|
     m.insert(r.root, r.at))
 
 pub fn arguments_of(values: List<Value>) -> Bytes =
@@ -165,16 +164,11 @@ pub fn is_timed_out(code: Bytes) -> Bool = code == timed_out_code
 
 pub fn locate_failure(
   f: entering::Failure,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   entry: String,
 ) -> RuntimeDiagnostic / {abort.raise} = {
-  let labels = f.labels.map(|l: entering::Label| {
-    let text = Bytes::of_string(l.text);
-    match site_of(l.site, roots) {
-      Some(at) -> { place: module_span_place(at), primary: l.primary, text: text },
-      None -> { place: Unplaced, primary: l.primary, text: text },
-    }
-  });
+  let labels = f.labels.map(|l: entering::Label|
+    { place: site_of(l.site, roots), primary: l.primary, text: Bytes::of_string(l.text) });
   let details = entering::failure_details(f);
   let diagnostic = diagnostic_of(
     severity_of(f.severity),
@@ -193,13 +187,14 @@ pub fn locate_failure(
 pub fn unplaced(f: entering::Failure) -> Diagnostic / {abort.raise} =
   shown(locate_failure(f, Map::new(), ""))
 
-pub fn site_of(site: Option<entering::Site>, roots: Map<Bytes, ModuleSpan>) -> Option<ModuleSpan> =
+pub fn site_of(site: Option<entering::Site>, roots: Map<Bytes, Place>) -> Place =
   match site {
-    None -> None,
+    None -> Unplaced,
     Some(s) -> match roots.get(Bytes::of_string(s.root)) {
-      Some(root) ->
-        Some({ module: root.module, start: root.start + s.start, end: root.start + s.end }),
-      None -> None,
+      Some(InSource(root)) ->
+        InSource({ module: root.module, start: root.start + s.start, end: root.start + s.end }),
+      Some(whole) -> whole,
+      None -> Unplaced,
     },
   }
 
@@ -211,7 +206,7 @@ fn unlocated_note(entry: String) -> String =
     ++ entry
     ++ "` was running, in code the runtime runs on the program's behalf"
 
-pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
+pub fn step_of(s: entering::Step, roots: Map<Bytes, Place>) -> Step =
   {
     scheduler: s.scheduler,
     task: s.task,
@@ -225,10 +220,7 @@ pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
       }),
     site: {
       definition: s.definition,
-      span: match site_of(s.site, roots) {
-        Some(at) -> at,
-        None -> { module: no_module, start: 0, end: 0 },
-      },
+      span: match site_of(s.site, roots) { InSource(at) -> Some(at), _ -> None },
     },
     vector_clock: s.stamp,
   }
@@ -237,7 +229,7 @@ pub type CallResult = { result: Result<Value, RuntimeDiagnostic>, warnings: List
 
 pub fn machine_call(
   unit: Int,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   name: String,
   args: List<Value>,
   run: entering::Run,
@@ -248,7 +240,7 @@ pub fn machine_call(
 
 pub fn result_of(
   o: entering::Outcome,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   name: String,
 ) -> Result<Value, RuntimeDiagnostic> / {abort.raise} =
   if o.exit != None { Ok(value::VUnit) } else {
@@ -267,7 +259,7 @@ pub fn result_of(
 
 pub fn warnings_of(
   o: entering::Outcome,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
 ) -> List<Diagnostic> / {abort.raise} =
   o.warnings.map(|w: entering::Failure| shown(locate_failure(w, roots, "")))
 
