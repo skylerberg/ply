@@ -303,7 +303,9 @@ const clause_domain: Bytes = b"ply.clause.2"
 
 const contract_domain: Bytes = b"ply.contract.4"
 
-const identity_domain: Bytes = b"ply.identity.1"
+const identity_domain: Bytes = b"ply.identity.2"
+
+const node_domain: Bytes = b"ply.node.1"
 
 pub fn own_hash(payload: Bytes) -> Bytes = blake3(own_domain.concat(payload))
 
@@ -374,12 +376,11 @@ pub opaque type Identities = | Identities(Map<Identified, Bytes>)
 pub fn identity_in(identities: Identities, subject: Identified) -> Option<Bytes> =
   match identities { Identities(found) -> found.get(subject) }
 
-pub fn identities_listed(identities: Identities) -> List<SubjectIdentity> =
-  match identities {
-    Identities(found) ->
-      found.fold([], |listed: List<SubjectIdentity>, subject: Identified, identity: Bytes|
-        listed.push({ subject: subject, identity: identity })),
-  }
+pub fn identities_of(listed: List<SubjectIdentity>) -> Identities =
+  Identities(
+    listed.fold(Map::new(), |found: Map<Identified, Bytes>, s: SubjectIdentity|
+      found.insert(s.subject, s.identity)),
+  )
 
 pub fn joined_identities(parts: List<Identities>) -> Identities =
   Identities(
@@ -391,25 +392,31 @@ pub fn joined_identities(parts: List<Identities>) -> Identities =
       }),
   )
 
-type Reached = { reference: NodeRef, hash: Bytes }
+type Digested = { own: List<Bytes>, reached: List<Bytes> }
 
-fn identity_digest(own: Bytes, reached: List<Reached>) -> Bytes / {abort.raise} = {
-  let keyed = reached.map(|r: Reached|
-    definition_key(r.reference.name, r.reference.kind).concat(b"\x00").concat(r.hash)).sort(
-  ).unique(
-  );
+derive bin for Digested
+
+fn digest_of(domain: Bytes, own: List<Bytes>, reached: List<Bytes>) -> Bytes / {abort.raise} =
   blake3(
-    Bytes::concat_all(
-      [identity_domain, own, u32_le(keyed.len())].concat(
-        keyed.map(|k: Bytes| u32_le(k.len()).concat(k)),
-      ),
+    domain.concat(
+      bin::encode({ own: own.sort().unique(), reached: reached.sort().unique() }, digested_bin()),
     ),
   )
-}
 
 pub type Boundary = | InsidePackage | OutsidePackage
 
-pub type Found<at> = { at: at, definition: DefinitionHash, boundary: Boundary }
+pub type Origin = | FromSubject(Identified) | FromDefinition(NodeRef)
+
+pub type ReadIdentities = { body: Bytes, contract: Bytes, proof: Bytes }
+
+derive bin for ReadIdentities
+
+pub type DefinitionIdentities = { reference: NodeRef, identities: ReadIdentities }
+
+pub type WorldIdentities = {
+  definitions: List<DefinitionIdentities>,
+  subjects: List<SubjectIdentity>,
+}
 
 type Policy = | BodyPolicy | ContractPolicy | ProofPolicy
 
@@ -424,128 +431,160 @@ fn policy_of(subject: Identified) -> Policy =
     DefinitionContract(_) -> ContractPolicy,
   }
 
-type Reading = | ReadsBody | ReadsContract
+type Reading = | ReadsBody | ReadsContract | ReadsProof
 
-type Edge = | BodyEdge | ClauseEdge
+derive bin for Reading
 
-type Step = { reference: NodeRef, source: Reading, edge: Edge, from: Boundary }
+const readings: List<Reading> = [ReadsBody, ReadsContract, ReadsProof]
 
-type Unvisited<at> = { at: at, step: Step }
+fn reading_number(reading: Reading) -> Int =
+  match reading { ReadsBody -> 0, ReadsContract -> 1, ReadsProof -> 2 }
 
-fn inherited(source: Reading, edge: Edge) -> Reading =
-  match source {
-    ReadsBody -> ReadsBody,
-    ReadsContract -> match edge { ClauseEdge -> ReadsBody, BodyEdge -> ReadsContract },
-  }
+fn node_at(definition: Int, reading: Reading) -> Int = 3 * definition + reading_number(reading)
 
-fn reading_of(policy: Policy, step: Step, target: Boundary) -> Reading =
-  match policy {
-    BodyPolicy -> ReadsBody,
-    ContractPolicy -> inherited(step.source, step.edge),
-    ProofPolicy -> match target {
-      InsidePackage -> ReadsBody,
-      OutsidePackage -> match step.from {
-        InsidePackage -> ReadsContract,
-        OutsidePackage -> inherited(step.source, step.edge),
-      },
-    },
-  }
+type Next = { reference: NodeRef, inside: Reading, outside: Reading }
 
-fn starting_reading(policy: Policy) -> Reading =
-  match policy {
-    ContractPolicy -> ReadsContract,
-    BodyPolicy -> ReadsBody,
-    ProofPolicy -> ReadsBody,
-  }
+fn nexts(references: List<NodeRef>, inside: Reading, outside: Reading) -> List<Next> =
+  references.map(|r: NodeRef| { reference: r, inside: inside, outside: outside })
 
-type Walk<at> = { seen: Set<Step>, reached: List<Reached>, work: List<Unvisited<at>> }
-
-const unbounded_walk: Int = 1099511627776
-
-fn steps_from<at>(
-  work: List<Unvisited<at>>,
-  at: at,
-  references: List<NodeRef>,
-  source: Reading,
-  edge: Edge,
-  from: Boundary,
-) -> List<Unvisited<at>> =
-  references.fold(work, |all: List<Unvisited<at>>, r: NodeRef|
-    all.push({ at: at, step: { reference: r, source: source, edge: edge, from: from } }))
-
-fn visited<at>(w: Walk<at>, reference: NodeRef, reading: Reading, found: Found<at>) -> Walk<at> = {
-  let d = found.definition;
+fn nexts_of(d: DefinitionHash, reading: Reading) -> List<Next> =
   match reading {
-    ReadsBody ->
-      {
-        ..w,
-        reached: d.clauses.fold(
-          w.reached.push({ reference: reference, hash: d.hash }),
-          |all: List<Reached>, c: Bytes| all.push({ reference: reference, hash: c }),
-        ),
-        work: steps_from(
-          steps_from(w.work, found.at, d.uses, ReadsBody, BodyEdge, found.boundary),
-          found.at,
-          d.clause_uses,
-          ReadsBody,
-          ClauseEdge,
-          found.boundary,
-        ),
-      },
+    ReadsBody -> nexts(d.uses.concat(d.clause_uses), ReadsBody, ReadsBody),
     ReadsContract ->
-      {
-        ..w,
-        reached: w.reached.push({ reference: reference, hash: d.contract }),
-        work: steps_from(
-          steps_from(w.work, found.at, d.contract_uses, ReadsContract, BodyEdge, found.boundary),
-          found.at,
-          d.clause_uses,
-          ReadsContract,
-          ClauseEdge,
-          found.boundary,
+      nexts(d.contract_uses, ReadsContract, ReadsContract).concat(
+        nexts(d.clause_uses, ReadsBody, ReadsBody),
+      ),
+    ReadsProof -> nexts(d.uses.concat(d.clause_uses), ReadsProof, ReadsContract),
+  }
+
+fn starts_of(policy: Policy, uses: List<NodeRef>) -> List<Next> =
+  match policy {
+    BodyPolicy -> nexts(uses, ReadsBody, ReadsBody),
+    ContractPolicy -> nexts(uses, ReadsContract, ReadsContract),
+    ProofPolicy -> nexts(uses, ReadsProof, ReadsContract),
+  }
+
+fn own_of(d: DefinitionHash, reading: Reading) -> List<Bytes> =
+  match reading {
+    ReadsBody -> [d.hash].concat(d.clauses),
+    ReadsContract -> [d.contract],
+    ReadsProof -> [d.hash].concat(d.clauses),
+  }
+
+type ReadNode = { definition: DefinitionHash, reading: Reading }
+
+type NodeEntry = { definition: Bytes, reading: Reading, own: List<Bytes> }
+
+derive bin for NodeEntry
+
+fn entry_of(node: ReadNode) -> Bytes / {abort.raise} =
+  bin::encode(
+    {
+      definition: definition_key(node.definition.name, node.definition.kind),
+      reading: node.reading,
+      own: own_of(node.definition, node.reading),
+    },
+    node_entry_bin(),
+  )
+
+type Resolved = | LocalNode(Int) | KnownIdentity(Bytes)
+
+fn identity_read(found: ReadIdentities, reading: Reading) -> Bytes =
+  match reading {
+    ReadsBody -> found.body,
+    ReadsContract -> found.contract,
+    ReadsProof -> found.proof,
+  }
+
+fn local_nodes(targets: List<Resolved>) -> List<Int> =
+  targets.flat_map(|t: Resolved| match t { LocalNode(n) -> [n], KnownIdentity(_) -> [] })
+
+fn known_identities(targets: List<Resolved>) -> List<Bytes> =
+  targets.flat_map(|t: Resolved|
+    match t { LocalNode(_) -> [], KnownIdentity(identity) -> [identity] })
+
+type World = { at: Map<Bytes, Int>, definitions: List<DefinitionHash> }
+
+fn world_of(definitions: List<DefinitionHash>) -> World =
+  definitions.fold({ at: Map::new(), definitions: [] }, |w: World, d: DefinitionHash| {
+    let key = definition_key(d.name, d.kind);
+    if w.at.contains(key) { w }
+    else { { at: w.at.insert(key, w.definitions.len()), definitions: w.definitions.push(d) } }
+  })
+
+pub fn world_identities<| e>(
+  own: OwnHashes,
+  beyond: (NodeRef) -> List<ReadIdentities> / {abort.raise | e},
+  boundary: (Origin, NodeRef) -> Boundary / {abort.raise | e},
+) -> WorldIdentities / {abort.raise | e} = {
+  let world = world_of(own.definitions);
+  let resolved = |origin: Origin, next: Next| {
+    let reading = match boundary(origin, next.reference) {
+      InsidePackage -> next.inside,
+      OutsidePackage -> next.outside,
+    };
+    match world.at.get(definition_key(next.reference.name, next.reference.kind)) {
+      Some(i) -> [LocalNode(node_at(i, reading))],
+      None ->
+        beyond(next.reference).map(|found: ReadIdentities|
+          KnownIdentity(identity_read(found, reading))),
+    }
+  };
+  let nodes = world.definitions.flat_map(|d: DefinitionHash|
+    readings.map(|reading: Reading| { definition: d, reading: reading }));
+  let targets = nodes.map(|node: ReadNode| {
+    let origin = FromDefinition({ name: node.definition.name, kind: node.definition.kind });
+    nexts_of(node.definition, node.reading).flat_map(|next: Next| resolved(origin, next))
+  });
+  let condensed = graph::condensation({ out: targets.map(local_nodes) });
+  let component_identities = range(0, condensed.members.len()).fold(
+    [],
+    |found: List<Bytes>, c: Int| {
+      let members = condensed.members.get(c);
+      found.push(
+        digest_of(
+          node_domain,
+          members.map(|n: Int| entry_of(nodes.get(n))),
+          condensed.graph.out.get(c).map(|lower: Int| found.get(lower)).concat(
+            members.flat_map(|n: Int| known_identities(targets.get(n))),
+          ),
         ),
-      },
+      )
+    },
+  );
+  let identity_at = |n: Int| component_identities.get(condensed.component.get(n));
+  let identity_of_target = |t: Resolved|
+    match t { LocalNode(n) -> identity_at(n), KnownIdentity(identity) -> identity };
+  {
+    definitions: range(0, world.definitions.len()).map(|i: Int| {
+      let d = world.definitions.get(i);
+      {
+        reference: { name: d.name, kind: d.kind },
+        identities: {
+          body: identity_at(node_at(i, ReadsBody)),
+          contract: identity_at(node_at(i, ReadsContract)),
+          proof: identity_at(node_at(i, ReadsProof)),
+        },
+      }
+    }),
+    subjects: begun_of(own).map(|begun: Begun| {
+      let origin = FromSubject(begun.subject);
+      {
+        subject: begun.subject,
+        identity: digest_of(
+          identity_domain,
+          [begun.own],
+          starts_of(policy_of(begun.subject), begun.uses).flat_map(|next: Next|
+            resolved(origin, next)).map(identity_of_target),
+        ),
+      }
+    }),
   }
 }
 
-fn identity_over<at | e>(
-  policy: Policy,
-  own: Bytes,
-  from: at,
-  uses: List<NodeRef>,
-  found: (at, NodeRef) -> List<Found<at>> / {abort.raise | e},
-) -> Bytes / {abort.raise | e} = {
-  let step = |w: Walk<at>, item: Unvisited<at>|
-    if w.seen.contains(item.step) { w } else {
-      found(item.at, item.step.reference).fold(
-        { ..w, seen: w.seen.insert(item.step) },
-        |a: Walk<at>, f: Found<at>|
-          visited(a, item.step.reference, reading_of(policy, item.step, f.boundary), f),
-      )
-    };
-  identity_digest(
-    own,
-    iterate(
-      {
-        seen: Set::empty(),
-        reached: [],
-        work: steps_from([], from, uses, starting_reading(policy), BodyEdge, InsidePackage),
-      },
-      unbounded_walk,
-      |w: Walk<at>|
-        match w.work.at(w.work.len() - 1) {
-          None -> Stop(w.reached),
-          Some(item) -> Continue(step({ ..w, work: w.work.take(w.work.len() - 1) }, item)),
-        },
-    ),
-  )
-}
+type Begun = { subject: Identified, own: Bytes, uses: List<NodeRef> }
 
-pub opaque type Begun = new { subject: Identified, own: Bytes, uses: List<NodeRef> }
-
-pub fn begun_subject(begun: Begun) -> Identified = begun.subject
-
-pub fn begun_of(own: OwnHashes) -> List<Begun> = {
+fn begun_of(own: OwnHashes) -> List<Begun> = {
   let definitions = own.definitions.flat_map(|d: DefinitionHash| {
     let itself = { name: d.name, kind: d.kind };
     let contract: Begun = { subject: DefinitionContract(itself), own: d.contract, uses: [itself] };
@@ -571,45 +610,25 @@ pub fn begun_of(own: OwnHashes) -> List<Begun> = {
   definitions.concat(tests).concat(laws)
 }
 
-pub fn identity_of_begun<at | e>(
-  begun: Begun,
-  from: at,
-  found: (Identified, at, NodeRef) -> List<Found<at>> / {abort.raise | e},
-) -> Bytes / {abort.raise | e} = {
-  identity_over(
-    policy_of(begun.subject),
-    begun.own,
-    from,
-    begun.uses,
-    |at: at, reference: NodeRef| found(begun.subject, at, reference),
-  )
-}
-
-pub fn identities_over<at | e>(
-  begun: List<Begun>,
-  from: at,
-  found: (Identified, at, NodeRef) -> List<Found<at>> / {abort.raise | e},
-) -> Identities / {abort.raise | e} =
-  Identities(
-    begun.fold(Map::new(), |all: Map<Identified, Bytes>, b: Begun|
-      all.insert(b.subject, identity_of_begun(b, from, found))),
-  )
-
 pub fn hash_identities(
   hashes: HashOutput,
-  boundary: (Identified, NodeRef) -> Boundary / {abort.raise},
-) -> Identities / {abort.raise} = {
-  let defined = hashes.own.definitions.fold(
-    Map::new(),
-    |all: Map<Bytes, DefinitionHash>, d: DefinitionHash|
-      all.insert(definition_key(d.name, d.kind), d),
-  );
-  identities_over(begun_of(hashes.own), (), |subject: Identified, _: Unit, reference: NodeRef|
-    match defined.get(definition_key(reference.name, reference.kind)) {
-      Some(d) -> [{ at: (), definition: d, boundary: boundary(subject, reference) }],
-      None -> [],
-    })
-}
+  boundary: (Origin, NodeRef) -> Boundary / {abort.raise},
+) -> Identities / {abort.raise} =
+  identities_of(world_identities(hashes.own, |_: NodeRef| [], boundary).subjects)
+
+pub type TestIdentities = | PlainTestRun(Bytes) | TestRunOverCases({ run: Bytes, listing: Bytes })
+
+pub fn identities_of_test<| e>(
+  test: Bytes,
+  lookup: (Identified) -> Option<Bytes> / {abort.raise | e},
+) -> TestIdentities / {abort.raise | e} =
+  match lookup(TestRun(test)) {
+    None -> panic("the test `" ++ String::of_bytes_lossy(test) ++ "` has no run identity"),
+    Some(run) -> match lookup(TestListing(test)) {
+      Some(listing) -> TestRunOverCases({ run: run, listing: listing }),
+      None -> PlainTestRun(run),
+    },
+  }
 
 pub type HashOutput = {
   definitions: List<{ name: Bytes, hash: Bytes }>,
@@ -629,8 +648,7 @@ pub type HashOutput = {
 }
 
 pub type Refs = {
-  names: List<Bytes>,
-  kinds: List<HeldKind>,
+  nodes: List<NodeRef>,
   edges: List<List<Int>>,
   functions: Map<Bytes, Int>,
   declared: Map<Bytes, List<Int>>,
@@ -1249,8 +1267,7 @@ pub fn hash_output(sk: HashLayout, own: OwnHashes) -> HashOutput / {abort.raise}
     specs: [],
     dependencies: [],
     refs: {
-      names: sk.nodes.map(|node: NodeRef| node.name),
-      kinds: sk.nodes.map(|node: NodeRef| node.kind),
+      nodes: sk.nodes,
       edges: edges,
       functions: range(0, sk.nodes.len()).fold(
         Map::new(),
@@ -1439,10 +1456,12 @@ fn meanings(key: Bytes) -> List<Subject> =
 fn reachable_names(r: Refs, nodes: List<Int>) -> ReachableNames / {abort.raise} =
   nodes.fold(
     { functions: Set::empty(), declarations: Set::empty() },
-    |accumulator: ReachableNames, v: Int|
-      if is_declared_kind(r.kinds.get(v)) {
-        { ..accumulator, declarations: accumulator.declarations.insert(r.names.get(v)) }
-      } else { { ..accumulator, functions: accumulator.functions.insert(r.names.get(v)) } },
+    |accumulator: ReachableNames, v: Int| {
+      let node = r.nodes.get(v);
+      if is_declared_kind(node.kind) {
+        { ..accumulator, declarations: accumulator.declarations.insert(node.name) }
+      } else { { ..accumulator, functions: accumulator.functions.insert(node.name) } }
+    },
   )
 
 pub fn reach(hashes: HashOutput, roots: List<Subject>) -> ReachableNames / {abort.raise} =
@@ -1466,8 +1485,10 @@ pub fn reachable_functions(hashes: HashOutput, roots: List<Subject>) -> Set<Byte
 
 fn unit_reach(r: Refs, starts: List<Int>) -> Set<Bytes> / {abort.raise} = {
   let scheduled = scheduler_module.concat(b".");
-  let written = range(0, r.names.len()).filter(|v: Int|
-    r.kinds.get(v) == HeldValue && r.names.get(v).starts_with(scheduled));
+  let written = range(0, r.nodes.len()).filter(|v: Int| {
+    let node = r.nodes.get(v);
+    node.kind == HeldValue && node.name.starts_with(scheduled)
+  });
   reachable_names(r, walked(with_clauses(r), starts.concat(written)).all).functions
 }
 
@@ -1506,11 +1527,11 @@ pub fn references_in(hashes: HashOutput, which: Subject) -> List<NodeRef> / {abo
       nodes_of(r, which).fold([], |accumulator: List<Int>, v: Int|
         accumulator.concat(r.edges.get(v))),
   };
-  direct.map(|v: Int| { name: r.names.get(v), kind: r.kinds.get(v) })
+  direct.map(|v: Int| r.nodes.get(v))
 }
 
 fn back_edges(r: Refs) -> List<List<Int>> / {abort.raise} = {
-  let n = r.names.len();
+  let n = r.nodes.len();
   range(0, n).fold(range(0, n).map(|i: Int| []), |accumulator: List<List<Int>>, v: Int|
     r.edges.get(v).fold(accumulator, |a: List<List<Int>>, w: Int| {
       let into = a.get(w);
@@ -1527,7 +1548,7 @@ pub fn find_referrers(
 ) -> Referrers / {abort.raise} = {
   let r = hashes.refs;
   let targets = nodes_of(r, target);
-  let n = r.names.len();
+  let n = r.nodes.len();
   let marked = if through { walked(back_edges(r), targets).seen } else {
     targets.fold(range(0, n).map(|i: Int| false), |accumulator: List<Bool>, v: Int|
       accumulator.set(v, true))
@@ -1550,24 +1571,27 @@ pub fn build_closure(hashes: HashOutput, roots: List<Bytes>) -> List<ClosureEntr
   let r = hashes.refs;
   let definitions = by_name(hashes.definitions);
   let declarations = by_name(hashes.declarations);
-  let hash_of = |v: Int|
-    Map::get(if r.kinds.get(v) == HeldValue { definitions } else { declarations }, r.names.get(v));
-  let closure_nodes = walked(
+  let hash_of = |node: NodeRef|
+    Map::get(if node.kind == HeldValue { definitions } else { declarations }, node.name);
+  let hashed = walked(
     r.edges,
     start_nodes(r, roots.map(|name: Bytes| FunctionNamed(name))),
-  ).all.filter(|v: Int| hash_of(v) != None);
-  let place = range(0, closure_nodes.len()).fold(
+  ).all.flat_map(|v: Int|
+    match hash_of(r.nodes.get(v)) { Some(hash) -> [{ at: v, hash: hash }], None -> [] });
+  let place = range(0, hashed.len()).fold(
     Map::new(),
-    |accumulator: Map<Int, Int>, i: Int| accumulator.insert(closure_nodes.get(i), i),
+    |accumulator: Map<Int, Int>, i: Int| accumulator.insert(hashed.get(i).at, i),
   );
-  closure_nodes.map(|v: Int|
+  hashed.map(|h: HashedNode|
     {
-      reference: { name: r.names.get(v), kind: r.kinds.get(v) },
-      hash: match hash_of(v) { Some(h) -> h, None -> b"" },
-      refs: r.edges.get(v).fold([], |accumulator: List<Int>, w: Int|
+      reference: r.nodes.get(h.at),
+      hash: h.hash,
+      refs: r.edges.get(h.at).fold([], |accumulator: List<Int>, w: Int|
         match place.get(w) { Some(i) -> accumulator.push(i), None -> accumulator }),
     })
 }
+
+type HashedNode = { at: Int, hash: Bytes }
 
 pub fn walk(edges: List<List<Int>>, from: List<Int>) -> List<Int> / {abort.raise} =
   walked(edges, from).all

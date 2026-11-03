@@ -1,103 +1,109 @@
 import std.bin
-import std.list
 import compiler.store.memo (memo)
-import compiler.store.handles (QueryOf, Written, written, fetched, query_definition)
-import compiler.store.hash.forms (Identified, TestRun, TestListing, LawRun, LawProof, DefinitionRun,
-                                  DefinitionProof, DefinitionContract, identified_bin, NodeRef,
-                                  DefinitionHash, Begun, Found, InsidePackage, OutsidePackage,
-                                  Identities, begun_of, begun_subject, identity_of_begun,
-                                  identities_over)
+import compiler.store.handles (QueryOf, KeyedPartOf, Written, written, with_keyed_part, fetched,
+                               keyed_part_fetched, query_definition)
+import compiler.store.hash.forms (Identified, identified_bin, NodeRef, node_ref_bin,
+                                  ReadIdentities, read_identities_bin, DefinitionIdentities,
+                                  SubjectIdentity, Identities, Origin, InsidePackage,
+                                  OutsidePackage, TestIdentities, world_identities, identities_of,
+                                  identities_of_test)
 import compiler.front.exports (named_node)
 import compiler.front.checking.world (ModuleKey, module_key_bin, CheckDefinition, shipped_for,
                                       package_location_of)
-import compiler.front.checking.groups (OwnerKey, declared_of, module_own_hashes, owner_hash_query)
+import compiler.front.checking.groups (module_own_hashes)
 
 pub type SubjectKey = { module: ModuleKey, subject: Identified }
 
-derive bin for SubjectKey
+pub fn identities_query() -> QueryOf<ModuleKey, List<Identified>> =
+  { name: b"identities", input: module_key_bin(), output: bin::list_bin(identified_bin()) }
 
-pub fn identity_query() -> QueryOf<SubjectKey, Option<Bytes>> =
-  { name: b"identity", input: subject_key_bin(), output: bin::option_bin(bin::bytes_bin()) }
+fn subject_part() -> KeyedPartOf<ModuleKey, List<Identified>, Identified, Bytes> =
+  { query: identities_query(), name: b"subject", key: identified_bin(), output: bin::bytes_bin() }
+
+fn definition_part() -> KeyedPartOf<ModuleKey, List<Identified>, NodeRef, ReadIdentities> =
+  {
+    query: identities_query(),
+    name: b"definition",
+    key: node_ref_bin(),
+    output: read_identities_bin(),
+  }
 
 pub fn identity_of(key: SubjectKey) -> Option<Bytes> / {memo.read, abort.raise} =
-  fetched(identity_query(), key)
+  keyed_part_fetched(subject_part(), key.module, key.subject)
+
+pub fn test_identity_of(
+  module: ModuleKey,
+  test: Bytes,
+) -> TestIdentities / {memo.read, abort.raise} =
+  identities_of_test(test, |subject: Identified| identity_of({ module: module, subject: subject }))
+
+pub fn listed_identities(
+  module: ModuleKey,
+  wanted: (Identified) -> Bool,
+) -> List<SubjectIdentity> / {memo.read, abort.raise} =
+  fetched(identities_query(), module).filter(wanted).map(|subject: Identified|
+    match identity_of({ module: module, subject: subject }) {
+      Some(identity) -> { subject: subject, identity: identity },
+      None ->
+        panic(
+          "the identities of the module `" ++ String::of_bytes_lossy(module.module)
+            ++ "` list a subject whose identity they did not write",
+        ),
+    })
 
 pub fn module_identities(
   module: ModuleKey,
   wanted: (Identified) -> Bool,
-) -> Identities / {memo.read, abort.raise} =
-  identities_over(
-    begun_of(module_own_hashes(module)).filter(|b: Begun| wanted(begun_subject(b))),
-    module,
-    |_: Identified, at: ModuleKey, reference: NodeRef| found_in(module, at, reference),
-  )
-
-fn simple_in(module: Bytes, name: Bytes) -> Bytes / {abort.raise} =
-  name.slice(module.len() + 1, name.len())
-
-fn owner_in(module: ModuleKey, owner: Bytes) -> OwnerKey =
-  { module: module.module, shipped: module.shipped, tested: module.tested, owner: owner }
+) -> Identities / {memo.read, abort.raise} = identities_of(listed_identities(module, wanted))
 
 fn package_of(key: ModuleKey) -> Option<Int> / {memo.read, abort.raise} =
   if key.shipped { None }
   else { match package_location_of(key.module) { Some(p) -> Some(p.package), None -> None } }
 
-fn found_in(
-  origin: ModuleKey,
+fn module_reached(from: ModuleKey, reference: NodeRef) -> ModuleKey / {memo.read, abort.raise} = {
+  let module = named_node(reference.name).module;
+  if module == from.module { from }
+  else { { module: module, shipped: shipped_for(from.shipped, module), tested: false } }
+}
+
+fn defined_elsewhere(
   from: ModuleKey,
   reference: NodeRef,
-) -> List<Found<ModuleKey>> / {memo.read, abort.raise} = {
-  let m = named_node(reference.name);
-  let at = if m.module == from.module { from }
-  else { { module: m.module, shipped: shipped_for(from.shipped, m.module), tested: false } };
-  let boundary = if package_of(at) == package_of(origin) { InsidePackage } else { OutsidePackage };
-  declared_of(at.module, at.shipped, at.tested, m.name).flat_map(|o: Bytes|
-    fetched(owner_hash_query(), owner_in(at, o)).definitions.filter(|d: DefinitionHash|
-      d.name == reference.name && d.kind == reference.kind).map(|d: DefinitionHash|
-      { at: at, definition: d, boundary: boundary }))
-}
-
-fn owners_of(key: SubjectKey) -> List<Bytes> / {memo.read, abort.raise} = {
-  let module = key.module;
-  let declared = |name: Bytes|
-    declared_of(module.module, module.shipped, module.tested, named_node(name).name);
-  let test_owner = |k: Bytes| [b"test ".concat(simple_in(module.module, k))];
-  let law = |k: Bytes| [b"law ".concat(simple_in(module.module, k))];
-  match key.subject {
-    TestRun(k) -> test_owner(k),
-    TestListing(k) -> test_owner(k),
-    LawRun(k) -> law(k),
-    LawProof(k) -> law(k),
-    DefinitionRun(name) -> declared(name),
-    DefinitionProof(name) -> declared(name),
-    DefinitionContract(reference) -> declared(reference.name),
+) -> List<ReadIdentities> / {memo.read, abort.raise} = {
+  let at = module_reached(from, reference);
+  if at.module == from.module { [] } else {
+    match keyed_part_fetched(definition_part(), at, reference) {
+      Some(found) -> [found],
+      None -> [],
+    }
   }
 }
 
-fn begun_for(key: SubjectKey) -> Option<Begun> / {memo.read, abort.raise} =
-  match owners_of(key).flat_map(|o: Bytes|
-      begun_of(fetched(owner_hash_query(), owner_in(key.module, o))).filter(|b: Begun|
-        begun_subject(b) == key.subject)) {
-    [] -> None,
-    [begun] -> Some(begun),
-    _ -> panic("more than one owner of a module defines the same subject"),
-  }
-
-pub fn identity_result(key: SubjectKey) -> Written / {memo.read, abort.raise} =
-  written(identity_query(), match begun_for(key) {
-    None -> None,
-    Some(begun) ->
-      Some(
-        identity_of_begun(begun, key.module, |_: Identified, at: ModuleKey, reference: NodeRef|
-          found_in(key.module, at, reference)),
-      ),
-  })
+pub fn identities_result(key: ModuleKey) -> Written / {memo.read, abort.raise} = {
+  let package = package_of(key);
+  let boundary = |_: Origin, reference: NodeRef| {
+    let at = module_reached(key, reference);
+    if at.module == key.module || package_of(at) == package { InsidePackage }
+    else { OutsidePackage }
+  };
+  let world = world_identities(
+    module_own_hashes(key),
+    |reference: NodeRef| defined_elsewhere(key, reference),
+    boundary,
+  );
+  let with_subjects = world.subjects.fold(
+    written(identities_query(), world.subjects.map(|s: SubjectIdentity| s.subject)),
+    |w: Written, s: SubjectIdentity| with_keyed_part(w, subject_part(), s.subject, s.identity),
+  );
+  world.definitions.fold(with_subjects, |w: Written, d: DefinitionIdentities|
+    with_keyed_part(w, definition_part(), d.reference, d.identities))
+}
 
 pub fn identity_queries() -> List<CheckDefinition> =
   [
     query_definition(
-      identity_query(),
-      b"compiler.front.checking.identity.identity_result",
-      identity_result,
+      identities_query(),
+      b"compiler.front.checking.identity.identities_result",
+      identities_result,
     ),
   ]
