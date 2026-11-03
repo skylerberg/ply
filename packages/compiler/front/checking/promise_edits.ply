@@ -1,30 +1,30 @@
 import compiler.emit.reads (over_analysis)
 import std.bin
 import std.list
-import compiler.store.memo (MemoryStore, Run, empty_memory_store, in_session, query_output)
-import compiler.emit.costs (Costed, Report, cost_input_of, report_bin, report_of,
-                            report_over_one_walk)
+import compiler.store.memo (MemoryStore, Run, empty_memory_store, in_session, reading)
+import compiler.store.handles (QueryOf, Written, written, fetched, query_definition)
+import compiler.emit.costs (Costed, Report, cost_input_of, report_of, report_over_one_walk)
 import compiler.check.resolve.tables (Source)
-import compiler.front.checking (QueryDefinition, fresh_registry, inputs_alone, lookup_input_alone,
-                                over_decoding, prelude_files, prelude_frames)
+import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_alone, over_decoding,
+                                prelude_files, prelude_frames)
 import compiler.check.infer.checker (DefinitionInfo)
-import compiler.front.checking.promises (MeasureEntry, measure_entry_bin, measure_program,
-                                         measures_query, module_costs_query)
+import compiler.front.checking.promises (MeasureEntry, measure_program, measures_query,
+                                         module_costs_query)
 import compiler.front.checking.groups (GroupKey, group_key_bin)
-import compiler.front.checking.world (QueryEffects, decoded, module_key_bin)
+import compiler.front.checking.world (ModuleKey, QueryEffects, CheckDefinition)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.published (analyse)
 
-type Asked = { store: MemoryStore, run: Run, outputs: List<Bytes> }
+type Queried<o> = { store: MemoryStore, run: Run, outputs: List<o> }
 
-fn queried(
+fn queried<i, o>(
   store: MemoryStore,
   sources: List<Source>,
-  query: Bytes,
-  inputs: List<Bytes>,
-  more: List<QueryDefinition> = [],
-) -> Asked / {abort.raise} = {
+  q: QueryOf<i, o>,
+  inputs: List<i>,
+  more: List<CheckDefinition> = [],
+) -> Queried<o> / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry(more);
   let done = over_decoding(
@@ -34,27 +34,19 @@ fn queried(
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
     ||
       in_session(qs, |run: Run| {
-        let read = inputs.fold(
-          { run: run, outputs: [] },
-          |accumulator: { run: Run, outputs: List<Bytes> }, input: Bytes| {
-            let a = query_output(qs, accumulator.run, query, input);
-            { run: a.run, outputs: accumulator.outputs.push(a.output) }
-          },
-        );
+        let read = reading(qs, run, || inputs.map(|input: i| fetched(q, input)));
         { run: read.run, value: read }
       }),
   );
-  { store: done.store, run: done.value.run, outputs: done.value.outputs }
+  { store: done.store, run: done.value.run, outputs: done.value.value }
 }
 
-fn module_input(s: Source) -> Bytes / {abort.raise} =
-  bin::encode({ module: s.name, shipped: false, tested: false }, module_key_bin())
+fn module_key(s: Source) -> ModuleKey = { module: s.name, shipped: false, tested: false }
 
-fn costs_asked(store: MemoryStore, sources: List<Source>) -> Asked / {abort.raise} =
-  queried(store, sources, module_costs_query, sources.map(module_input))
+fn costs_queried(store: MemoryStore, sources: List<Source>) -> Queried<Report> / {abort.raise} =
+  queried(store, sources, module_costs_query(), sources.map(module_key))
 
-fn report_in(a: Asked) -> Report / {abort.raise} =
-  report_of(a.outputs.map(|b: Bytes| decoded(b, report_bin(), "a module's costs")))
+fn report_in(a: Queried<Report>) -> Report = report_of(a.outputs)
 
 fn costed_sources(pushed: Bytes, kept_twice: Bool) -> List<Source> =
   [
@@ -72,20 +64,20 @@ fn costed_sources(pushed: Bytes, kept_twice: Bool) -> List<Source> =
   ]
 
 test "an edit to a body that leaves its demands alone gives the report of a fresh check" {
-  let first = costs_asked(empty_memory_store, costed_sources(b"1", false));
-  let edited = costs_asked(first.store, costed_sources(b"2", false));
+  let first = costs_queried(empty_memory_store, costed_sources(b"1", false));
+  let edited = costs_queried(first.store, costed_sources(b"2", false));
   assert_eq(
     report_in(edited),
-    report_in(costs_asked(empty_memory_store, costed_sources(b"2", false))),
+    report_in(costs_queried(empty_memory_store, costed_sources(b"2", false))),
   )
 }
 
 test "an edit that changes what a body demands gives the report of a fresh check" {
-  let first = costs_asked(empty_memory_store, costed_sources(b"1", false));
-  let edited = costs_asked(first.store, costed_sources(b"1", true));
+  let first = costs_queried(empty_memory_store, costed_sources(b"1", false));
+  let edited = costs_queried(first.store, costed_sources(b"1", true));
   assert_eq(
     report_in(edited),
-    report_in(costs_asked(empty_memory_store, costed_sources(b"1", true))),
+    report_in(costs_queried(empty_memory_store, costed_sources(b"1", true))),
   )
 }
 
@@ -107,7 +99,7 @@ fn sites_by_label(r: Report) -> List<Costed> =
 
 test "the report over one walk of each unit equals the report over one walk of the whole program" {
   let sources = varied_sources;
-  let by_units = report_in(costs_asked(empty_memory_store, sources));
+  let by_units = report_in(costs_queried(empty_memory_store, sources));
   match analyse(parse_all(sources)) {
     Rejected(_) -> panic("the checker rejected a program that should be valid"),
     Analysed(w) -> {
@@ -129,41 +121,42 @@ fn measured_sources(spare: Bytes) -> List<Source> =
     { name: b"n", source_text: Bytes::concat_all([b"pub fn spare() -> Int = ", spare, b"\n"]) },
   ]
 
-fn measures_asked(store: MemoryStore, sources: List<Source>) -> Asked / {abort.raise} =
-  queried(store, sources, measures_query, sources.map(module_input))
+fn measures_queried(
+  store: MemoryStore,
+  sources: List<Source>,
+) -> Queried<List<MeasureEntry>> / {abort.raise} =
+  queried(store, sources, measures_query(), sources.map(module_key))
 
-fn entries_in(a: Asked) -> List<MeasureEntry> / {abort.raise} =
-  a.outputs.fold([], |accumulator: List<MeasureEntry>, b: Bytes|
-    accumulator.concat(decoded(b, bin::list_bin(measure_entry_bin()), "a module's measures")))
+fn entries_in(a: Queried<List<MeasureEntry>>) -> List<MeasureEntry> =
+  a.outputs.fold([], |accumulator: List<MeasureEntry>, entries: List<MeasureEntry>|
+    accumulator.concat(entries))
 
 test "an edit that a measured function does not reach leaves its program alone" {
-  let first = measures_asked(empty_memory_store, measured_sources(b"1"));
+  let first = measures_queried(empty_memory_store, measured_sources(b"1"));
   assert_eq(entries_in(first).len(), 1);
-  let edited = measures_asked(first.store, measured_sources(b"2"));
+  let edited = measures_queried(first.store, measured_sources(b"2"));
   assert_eq(entries_in(edited), entries_in(first))
 }
 
-const names_query: Bytes = b"names in a measured program"
+fn names_query() -> QueryOf<GroupKey, List<Bytes>> =
+  {
+    name: b"names in a measured program",
+    input: group_key_bin(),
+    output: bin::list_bin(bin::bytes_bin()),
+  }
 
-fn names_in_program(input: Bytes) -> Bytes / {QueryEffects, abort.raise} =
-  bin::encode(
-    match measure_program(decoded(input, group_key_bin(), "a group's name")).outcome {
-      Rejected(_) -> [],
-      Analysed(a) -> a.checked.definitions.map(|d: DefinitionInfo| d.name),
-    },
-    bin::list_bin(bin::bytes_bin()),
-  )
+fn names_in_program(unit: GroupKey) -> Written / {QueryEffects, abort.raise} =
+  written(names_query(), match measure_program(unit).outcome {
+    Rejected(_) -> [],
+    Analysed(a) -> a.checked.definitions.map(|d: DefinitionInfo| d.name),
+  })
 
 test "a measured function's program holds the bodies it calls and checks on its own" {
-  let first = measures_asked(empty_memory_store, measured_sources(b"1"));
+  let first = measures_queried(empty_memory_store, measured_sources(b"1"));
   let unit: GroupKey = entries_in(first).get(0).unit;
-  let read = queried(
-    first.store,
-    measured_sources(b"1"),
-    names_query,
-    [bin::encode(unit, group_key_bin())],
-    [{ name: names_query, definition: names_query, body: names_in_program }],
-  );
-  let names = decoded(read.outputs.get(0), bin::list_bin(bin::bytes_bin()), "a program's names");
+  let read = queried(first.store, measured_sources(b"1"), names_query(), [unit], [
+    query_definition(names_query(), names_query().name, names_in_program),
+  ]);
+  let names = read.outputs.get(0);
   assert(names.contains(b"m.lowered") && names.contains(b"m.is_small"), None)
 }

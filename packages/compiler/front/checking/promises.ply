@@ -1,6 +1,7 @@
 import std.bin
 import std.list
 import compiler.store.memo (memo)
+import compiler.store.handles (QueryOf, Written, written, fetched, query_definition)
 import compiler.check.infer.checker (CheckReads, DefinitionInfo, EffectInfo, TypeFacts, program,
                                      StoredDeclarations, declarations_joined,
                                      no_stored_declarations)
@@ -15,7 +16,7 @@ import compiler.front.exports (item_at_bin, Imported, ItemAt, Mention, OwnerSour
 import compiler.emit.costs (cost_input_of, GroupWalk, ParamSharing, ReturnOwnership, FreshReturn,
                             WalkedBody, demands_of, group_walk_bin, module_costs,
                             module_demands_bin, parameters_bin, parameters_of, report_bin,
-                            return_ownership_bin, walked_group)
+                            return_ownership_bin, walked_group, ModuleDemands, Parameters, Report)
 import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, item_span)
 import compiler.check.resolve.tables (Diagnostic, ParsedModule, placed_in, qualify)
 import compiler.check.infer (item_owner)
@@ -23,32 +24,39 @@ import compiler.store.hash.forms (CachedHashes, CachedNode, NodeRef, hash_layout
                                   no_cached_hashes)
 import compiler.front.checking.units (with_code_reads)
 import compiler.program.group_check (LoadedSource, checked_group, resolved_group)
-import compiler.front.checking.world (ModuleKey, QueryEffects, SessionReads, context_once, decoded,
+import compiler.front.checking.world (ModuleKey, InterfaceKey, QueryEffects, SessionReads, decoded,
                                       interface_key_bin, module_key_bin, own_modules_kind,
-                                      package_location_of, shipped_for)
+                                      package_location_of, shipped_for, CheckDefinition)
 import compiler.front.checking.groups (GroupKey, GroupSource, OwnerFacts, OwnerKey, OwnersResult,
                                        always_entire, with_performed_effects, known_of_types,
                                        declared_of, group_key_bin, layout_of, placed_facts,
                                        group_keys, no_bodies, owner_facts, owner_hash_query,
                                        owner_key_bin, owners_result_of, with_group_read, GroupRead,
                                        unit_key_of, group_key_of, group_of, group_hashes_of, Entire,
-                                       stored_declarations_of)
+                                       stored_declarations_of, context_once)
 
-pub const cost_walk_query: Bytes = b"cost walk"
+pub fn cost_walk_query() -> QueryOf<GroupKey, GroupWalk> =
+  { name: b"cost walk", input: group_key_bin(), output: group_walk_bin() }
 
-pub const cost_return_query: Bytes = b"cost return"
+pub fn cost_return_query() -> QueryOf<InterfaceKey, ReturnOwnership> =
+  { name: b"cost return", input: interface_key_bin(), output: return_ownership_bin() }
 
-pub const cost_demands_query: Bytes = b"cost demands"
+pub fn cost_demands_query() -> QueryOf<ModuleKey, ModuleDemands> =
+  { name: b"cost demands", input: module_key_bin(), output: module_demands_bin() }
 
-pub const cost_parameters_query: Bytes = b"cost parameters"
+pub fn cost_parameters_query() -> QueryOf<Unit, Parameters> =
+  { name: b"cost parameters", input: bin::unit_bin(), output: parameters_bin() }
 
-pub const module_parameters_query: Bytes = b"module parameters"
+pub fn module_parameters_query() -> QueryOf<ModuleKey, Parameters> =
+  { name: b"module parameters", input: module_key_bin(), output: parameters_bin() }
 
-pub const module_costs_query: Bytes = b"module costs"
+pub fn module_costs_query() -> QueryOf<ModuleKey, Report> =
+  { name: b"module costs", input: module_key_bin(), output: report_bin() }
 
-pub const measure_query: Bytes = b"measure"
+pub const measure_name: Bytes = b"measure"
 
-pub const measures_query: Bytes = b"measures"
+pub fn measures_query() -> QueryOf<ModuleKey, List<MeasureEntry>> =
+  { name: b"measures", input: module_key_bin(), output: bin::list_bin(measure_entry_bin()) }
 
 fn in_root(module: Bytes) -> Bool / {memo.read, abort.raise} =
   match package_location_of(module) { Some(p) -> p.package == 0, None -> false }
@@ -128,21 +136,10 @@ fn unit_roots(m: ParsedModule, source: OwnerSource) -> Map<Bytes, Bool> / {abort
 
 fn returned_by(name: Bytes) -> ReturnOwnership / {memo.read, abort.raise} = {
   let m = named_node(name);
-  decoded(
-    memo.fetch(
-      cost_return_query,
-      bin::encode(
-        { module: m.module, shipped: false, full_text: false, name: m.name },
-        interface_key_bin(),
-      ),
-    ),
-    return_ownership_bin(),
-    "what a definition returns",
-  )
+  fetched(cost_return_query(), { module: m.module, shipped: false, full_text: false, name: m.name })
 }
 
-pub fn cost_walk_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
-  let u = decoded(input, group_key_bin(), "a unit's names");
+pub fn cost_walk_result(u: GroupKey) -> Written / {QueryEffects, abort.raise} = {
   let members = unit_members(u);
   let read = with_group_read(
     [{ named: module_of_unit(u), members: members, imported: imports_for_unit(u, members) }],
@@ -156,39 +153,31 @@ pub fn cost_walk_result(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
       },
   );
   let unwalked = { ok: false, bodies: [], declared: [] };
-  bin::encode(
-    match read.out.checked {
-      None -> unwalked,
-      Some(w) -> handle {
-        with_code_reads(u.tested, ||
-          walked_group(
-            {
-              ..cost_input_of(w),
-              walked: [0],
-              roots: Some(unit_roots(w.modules.get(0), read.source)),
-              origin: read.source.offset,
-            },
-            returned_by,
-          ))
-      } with {
-        lowering.fail(_) -> unwalked,
-      },
+  written(cost_walk_query(), match read.out.checked {
+    None -> unwalked,
+    Some(w) -> handle {
+      with_code_reads(u.tested, ||
+        walked_group(
+          {
+            ..cost_input_of(w),
+            walked: [0],
+            roots: Some(unit_roots(w.modules.get(0), read.source)),
+            origin: read.source.offset,
+          },
+          returned_by,
+        ))
+    } with {
+      lowering.fail(_) -> unwalked,
     },
-    group_walk_bin(),
-  )
+  })
 }
 
-fn walk_of(u: GroupKey) -> GroupWalk / {memo.read, abort.raise} =
-  decoded(
-    memo.fetch(cost_walk_query, bin::encode(u, group_key_bin())),
-    group_walk_bin(),
-    "a unit's update walk",
-  )
+fn walk_of(u: GroupKey) -> GroupWalk / {memo.read, abort.raise} = fetched(cost_walk_query(), u)
 
-pub fn cost_return_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let key = decoded(input, interface_key_bin(), "a definition's name");
+pub fn cost_return_result(key: InterfaceKey) -> Written / {memo.read, abort.raise} = {
   let definition = qualify(key.module, key.name);
-  bin::encode(
+  written(
+    cost_return_query(),
     declared_of(key.module, key.shipped, key.full_text, key.name).fold(
       FreshReturn,
       |found: ReturnOwnership, o: Bytes|
@@ -204,54 +193,35 @@ pub fn cost_return_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
           None -> found,
         },
     ),
-    return_ownership_bin(),
   )
 }
 
-pub fn cost_demands_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let named = decoded(input, module_key_bin(), "a module's name");
-  bin::encode(
+pub fn cost_demands_result(named: ModuleKey) -> Written / {memo.read, abort.raise} =
+  written(
+    cost_demands_query(),
     demands_of(walked_units(named, owners_result_of(named)).map(walk_of)),
-    module_demands_bin(),
   )
-}
 
-pub fn cost_parameters_result(_: Bytes) -> Bytes / {memo.read, abort.raise} =
-  bin::encode(
-    parameters_of(
-      root_modules().map(|m: Bytes|
-        decoded(
-          memo.fetch(cost_demands_query, bin::encode(root_module(m), module_key_bin())),
-          module_demands_bin(),
-          "a module's demands",
-        )),
+pub fn cost_parameters_result(_: Unit) -> Written / {memo.read, abort.raise} =
+  written(
+    cost_parameters_query(),
+    parameters_of(root_modules().map(|m: Bytes| fetched(cost_demands_query(), root_module(m)))),
+  )
+
+pub fn module_parameters_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
+  let all = fetched(cost_parameters_query(), ());
+  written(module_parameters_query(), {
+    ..all,
+    table: all.table.fold(
+      Map::new(),
+      |own_slots: Map<Bytes, Map<Int, ParamSharing>>, name: Bytes, slots: Map<Int, ParamSharing>|
+        if named_node(name).module == named.module { own_slots.insert(name, slots) }
+        else { own_slots },
     ),
-    parameters_bin(),
-  )
-
-pub fn module_parameters_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let named = decoded(input, module_key_bin(), "a module's name");
-  let all = decoded(
-    memo.fetch(cost_parameters_query, b""),
-    parameters_bin(),
-    "the program's parameters",
-  );
-  bin::encode(
-    {
-      ..all,
-      table: all.table.fold(
-        Map::new(),
-        |own_slots: Map<Bytes, Map<Int, ParamSharing>>, name: Bytes, slots: Map<Int, ParamSharing>|
-          if named_node(name).module == named.module { own_slots.insert(name, slots) }
-          else { own_slots },
-      ),
-    },
-    parameters_bin(),
-  )
+  })
 }
 
-pub fn module_costs_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let named = decoded(input, module_key_bin(), "a module's name");
+pub fn module_costs_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let read = owners_result_of(named);
   let facts = placed_facts(named, layout_of(named));
   let text_of = |o: Bytes|
@@ -259,17 +229,13 @@ pub fn module_costs_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
       Some(f) -> f.text,
       None -> panic("a unit names a declaration that its module does not hold"),
     };
-  bin::encode(
+  written(
+    module_costs_query(),
     module_costs(
       walked_units(named, read).map(|u: GroupKey|
         { items: item_layout(u.owners.map(text_of)), walk: walk_of(u) }),
-      decoded(
-        memo.fetch(module_parameters_query, input),
-        parameters_bin(),
-        "a module's parameters",
-      ),
+      fetched(module_parameters_query(), named),
     ),
-    report_bin(),
   )
 }
 
@@ -280,10 +246,8 @@ fn owners_of_function(name: Bytes) -> List<OwnerKey> / {memo.read, abort.raise} 
     { module: m.module, shipped: shipped, tested: false, owner: o })
 }
 
-fn hashed_nodes(o: OwnerKey) -> List<CachedNode> / {memo.read, abort.raise} = {
-  let e = memo.fetch(owner_hash_query, bin::encode(o, owner_key_bin()));
-  if e.len() == 0 { [] } else { decoded(e, hash_entry_bin(), "a hash entry").cached_nodes }
-}
+fn hashed_nodes(o: OwnerKey) -> List<CachedNode> / {memo.read, abort.raise} =
+  match fetched(owner_hash_query(), o) { Some(e) -> e.cached_nodes, None -> [] }
 
 pub fn hash_of_definition(name: Bytes) -> Option<Bytes> / {memo.read, abort.raise} =
   owners_of_function(name).fold(None, |found: Option<Bytes>, o: OwnerKey|
@@ -576,62 +540,59 @@ pub type MeasureEntry = { unit: GroupKey, items: List<ItemAt> }
 
 derive bin for MeasureEntry
 
-pub fn measures_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let named = decoded(input, module_key_bin(), "a module's name");
+pub fn measures_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let read = owners_result_of(named);
   let measured = functions_of(read, measured_function);
-  bin::encode(
-    if measured.len() == 0 { [] } else {
-      let facts = placed_facts(named, layout_of(named));
-      group_keys(named, read).filter(|u: GroupKey|
-        u.owners.any(|o: Bytes| measured.contains(o))).map(|u: GroupKey|
+  written(measures_query(), if measured.len() == 0 { [] } else {
+    let facts = placed_facts(named, layout_of(named));
+    group_keys(named, read).filter(|u: GroupKey| u.owners.any(|o: Bytes| measured.contains(o))).map(
+      |u: GroupKey|
         {
           unit: u,
           items: item_layout(
             u.owners.fold([], |texts: List<OwnerText>, o: Bytes|
               match facts.get(o) { Some(f) -> texts.push(f.text), None -> texts }),
           ),
-        })
-    },
-    bin::list_bin(measure_entry_bin()),
-  )
+        },
+    )
+  })
 }
 
-pub fn promise_queries() -> List<{ name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }> =
+pub fn promise_queries() -> List<CheckDefinition> =
   [
-    {
-      name: cost_walk_query,
-      definition: b"compiler.front.checking.promises.cost_walk_result",
-      body: cost_walk_result,
-    },
-    {
-      name: cost_return_query,
-      definition: b"compiler.front.checking.promises.cost_return_result",
-      body: cost_return_result,
-    },
-    {
-      name: cost_demands_query,
-      definition: b"compiler.front.checking.promises.cost_demands_result",
-      body: cost_demands_result,
-    },
-    {
-      name: cost_parameters_query,
-      definition: b"compiler.front.checking.promises.cost_parameters_result",
-      body: cost_parameters_result,
-    },
-    {
-      name: module_parameters_query,
-      definition: b"compiler.front.checking.promises.module_parameters_result",
-      body: module_parameters_result,
-    },
-    {
-      name: module_costs_query,
-      definition: b"compiler.front.checking.promises.module_costs_result",
-      body: module_costs_result,
-    },
-    {
-      name: measures_query,
-      definition: b"compiler.front.checking.promises.measures_result",
-      body: measures_result,
-    },
+    query_definition(
+      cost_walk_query(),
+      b"compiler.front.checking.promises.cost_walk_result",
+      cost_walk_result,
+    ),
+    query_definition(
+      cost_return_query(),
+      b"compiler.front.checking.promises.cost_return_result",
+      cost_return_result,
+    ),
+    query_definition(
+      cost_demands_query(),
+      b"compiler.front.checking.promises.cost_demands_result",
+      cost_demands_result,
+    ),
+    query_definition(
+      cost_parameters_query(),
+      b"compiler.front.checking.promises.cost_parameters_result",
+      cost_parameters_result,
+    ),
+    query_definition(
+      module_parameters_query(),
+      b"compiler.front.checking.promises.module_parameters_result",
+      module_parameters_result,
+    ),
+    query_definition(
+      module_costs_query(),
+      b"compiler.front.checking.promises.module_costs_result",
+      module_costs_result,
+    ),
+    query_definition(
+      measures_query(),
+      b"compiler.front.checking.promises.measures_result",
+      measures_result,
+    ),
   ]

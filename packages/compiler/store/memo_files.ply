@@ -6,12 +6,13 @@ import compiler.store.fact_store
 import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, fact_damage,
                                   recent_reads, with_recent_reads)
 import compiler.store.memo
-import compiler.store.memo (FactDetails, StoredFact, StoredInput, Waiting, deferred_kind, digest_of,
-                            fact_details_bin, first_waiting, in_session, inline_output, location_id,
-                            lowest_waiting, memo, memo_store, nothing_left_waiting, nothing_waiting,
-                            pack_digest_of, pack_inline_of, pack_record_bytes, pack_row_key, query,
-                            sealed_lookup, session_input, session_inputs, stored_fact_bin,
-                            stored_input_bin, with_mark, with_session_inputs, without_mark)
+import compiler.store.memo (FactDetails, PackBuild, StoredFact, StoredInput, Waiting, deferred_kind,
+                            empty_pack_build, fact_details_bin, finished_pack, first_waiting,
+                            in_session, is_inline, location_id, lowest_waiting, main_part, memo,
+                            memo_store, nothing_left_waiting, nothing_waiting, query, sealed_lookup,
+                            sealed_record_of, session_input, session_inputs, stored_fact_bin,
+                            stored_input_bin, with_mark, with_packed_fact, with_session_inputs,
+                            without_mark)
 import compiler.store.packs
 import compiler.store.segments
 import compiler.store.segments (Committed, LockHeld, StoreChanged, WriteFailed)
@@ -78,7 +79,11 @@ fn results_of_facts(
 ) -> Map<Bytes, Bool> / {abort.raise} =
   values.fold(found, |live: Map<Bytes, Bool>, b: Bytes|
     match bin::decode(b, stored_fact_bin()) {
-      Ok(f) -> live.insert(result_key(f.output), true).insert(f.details, true),
+      Ok(f) ->
+        f.parts.fold(
+          live.insert(f.details, true),
+          |l: Map<Bytes, Bool>, _: Bytes, digest: Bytes| l.insert(result_key(digest), true),
+        ),
       Err(_) -> live,
     })
 
@@ -189,16 +194,17 @@ fn over_database<a, [r] | e>(
     memo_store.sealed(key) -> if !st.trusted { None } else {
       let found = sealed_lookup(st.pack, read, key);
       st = { ..st, pack: found.reading };
-      match found.record {
+      match match found.record { Some(b) -> sealed_record_of(b), None -> None } {
         None -> None,
-        Some(b) -> {
-          match pack_inline_of(b) {
-            Some(o) -> {
-              st = { ..st, transient: st.transient.insert(digest_of(Some(o)), o) };
-            },
-            None -> (),
+        Some(r) -> {
+          st = {
+            ..st,
+            transient: r.inline.fold(
+              st.transient,
+              |t: Map<Bytes, Bytes>, digest: Bytes, o: Bytes| t.insert(digest, o),
+            ),
           };
-          pack_digest_of(b)
+          Some(r.parts)
         },
       }
     },
@@ -219,18 +225,12 @@ fn over_database<a, [r] | e>(
     memo_store.code(name) -> fact_store::value_of[r](st.db, Codes, code_key(name)),
     memo_store.external(kind, at) -> looked(st.db, kind, at),
     memo_store.is_out_of_date(key) -> st.waiting.depths.contains(key),
-    memo_store.put_fact(key, fact) -> {
-      st = {
-        ..st,
-        db: fact_store::with_value(st.db, Facts, key, bin::encode(fact, stored_fact_bin())),
-      };
-    },
     memo_store.next_out_of_date() -> first_waiting(st.waiting),
     memo_store.out_of_date_level() -> lowest_waiting(st.waiting),
-    memo_store.put(key, fact, _, encoded_details, output, lasting) -> {
-      let persisted = lasting || inline_output(output) != None;
-      let stored = if persisted { stored_output[r](st, fact.output, output) }
-      else { { ..st, transient: st.transient.insert(fact.output, output) } };
+    memo_store.put(key, fact, _, encoded_details, outputs, lasting) -> {
+      let stored = outputs.fold(st, |o: StoreRun, digest: Bytes, output: Bytes|
+        if lasting || is_inline(output) { stored_output[r](o, digest, output) }
+        else { { ..o, transient: o.transient.insert(digest, output) } });
       st = {
         ..stored,
         db: fact_store::with_value(
@@ -475,7 +475,8 @@ fn with_fact_of_kind<[r]>(
     None -> kinds,
     Some(b) -> {
       let name = undecoded(b, fact_details_bin()).query;
-      let size = fact_store::stored_result_size[r](db, result_key(fact.output));
+      let size = fact.parts.fold(0, |n: Int, _: Bytes, digest: Bytes|
+        n + fact_store::stored_result_size[r](db, result_key(digest)));
       let was = match kinds.get(name) { Some(k) -> k, None -> { query: name, facts: 0, bytes: 0 } };
       kinds.insert(name, { ..was, facts: was.facts + 1, bytes: was.bytes + size })
     },
@@ -514,13 +515,6 @@ pub fn outputs_by_digest<[r]>(
         })
     }))
 
-type PackBuild = {
-  writing: packs::PackWriter,
-  records: Map<Bytes, packs::Range>,
-  results: Map<Bytes, packs::Range>,
-  returned: Map<Bytes, Bytes>,
-}
-
 pub fn write_pack<[r]>(
   from: String,
   keys: List<Bytes>,
@@ -530,59 +524,21 @@ pub fn write_pack<[r]>(
   with_recent_reads(||
     fact_store::undamaged(|| {
       let db = fact_store::read_only[r](from);
-      let laid = keys.fold(
-        {
-          writing: packs::new_writer,
-          records: Map::new(),
-          results: Map::new(),
-          returned: Map::new(),
-        },
-        |built: PackBuild, key: Bytes|
-          match fact_store::value_of[r](db, Facts, key) {
-            None -> built,
-            Some(b) -> {
-              let f = undecoded(b, stored_fact_bin());
-              let output = fact_store::result_of[r](db, result_key(f.output));
-              let inline = match output { Some(o) -> inline_output(o), None -> None };
-              let with_output = match ((output, inline, packs::output_key(f.output))) {
-                (Some(o), None, Some(name)) -> if built.results.contains(name) { built } else {
-                  let framed = packs::append_frame(built.writing, o);
-                  {
-                    ..built,
-                    writing: framed.writing,
-                    results: built.results.insert(name, framed.at),
-                  }
-                },
-                _ -> built,
-              };
-              let framed = packs::append_frame(
-                with_output.writing,
-                pack_record_bytes(f.output, inline),
-              );
-              {
-                ..with_output,
-                writing: framed.writing,
-                records: with_output.records.insert(pack_row_key(key), framed.at),
-                returned: with_output.returned.insert(pack_row_key(key), f.output),
-              }
-            },
-          },
-      );
-      {
-        written: packs::finish(
-          laid.writing,
-          laid.records,
-          laid.results,
-          laid.returned,
-          queries,
-          files,
-        ),
-        records: laid.records.len(),
-      }
+      let laid = keys.fold(empty_pack_build, |built: PackBuild, key: Bytes|
+        match fact_store::value_of[r](db, Facts, key) {
+          None -> built,
+          Some(b) ->
+            with_packed_fact(built, key, undecoded(b, stored_fact_bin()), |digest: Bytes|
+              fact_store::result_of[r](db, result_key(digest))),
+        });
+      { written: finished_pack(laid, queries, files), records: laid.records.len() }
     }))
 
-fn quoted(input: Bytes) -> Bytes / {memo.read} =
-  Bytes::concat_all([b"\"", memo.fetch(b"text", input), b"\""])
+fn quoted(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  match memo.fetch(b"text", input, main_part) {
+    Some(text) -> Bytes::concat_all([b"\"", text, b"\""]),
+    None -> panic("the text query returned no main part"),
+  }
 
 fn test_queries() -> memo::Queries<| {}> =
   memo::plain_queries(
