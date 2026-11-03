@@ -1,4 +1,4 @@
-import sources (ProjectFiles)
+import sources (ProjectFiles, File, load_resolved)
 import compiler.load (Derives)
 import compiler.store.memo (QueryStats)
 import compiler.unit (shipped)
@@ -11,7 +11,10 @@ import literals (evaluation, site_errors)
 import units (EmbeddedFiles)
 import diagnostic (SourceText, all_to_json, to_text)
 import program (Phases, Refusal, Session, ModuleReport, module_reports, definitions_in_order,
-                own_tests, location_of, places_of, session)
+                own_tests, location_of, places_of, session, session_over)
+import paths (write_file)
+import fixes (change_lines, changes_json)
+import fixes
 import compiler.front.checking.groups (ProgramSummary)
 import compiler.front.checking.view
 import compiler.front.checking.view (Modules)
@@ -19,8 +22,8 @@ import module_queries (LaterChecks, later_checks)
 import compiler.store.memo (memo)
 import compiler.cc (toolchain)
 import compiler.store.hash.encoding (hex)
-import report (CommandOutput, ok_code, count_of, indent, rejected, reuse_members, warning_lines,
-               with_front_end)
+import report (CommandOutput, ok_code, compile_error, count_of, indent, rejected, reuse_members,
+               warning_lines, with_front_end)
 import signature (SetLine, Provenance, counted_lines, effect_sets, head_lines, provenance,
                   provenance_lines, set_lines, effect_texts, raise_text, raise_kind)
 import signature
@@ -36,7 +39,7 @@ import compiler.check.types (Effect, Type, NamedType, printer_new, print_effect_
                              type_text, effect_text, named_type)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, InvalidMode, RaiseMode, is_raise)
 import std.fs (fs)
-import std.json (Json, Member, Str, Bool, Array, Null, object, int)
+import std.json (Json, Member, Object, Str, Bool, Array, Null, object, int)
 import std.time (time)
 import std.list
 import std.string
@@ -734,6 +737,45 @@ fn reported_of(s: Session<CheckReading>) -> Reported / {fs.read_file[shipped]} =
   }
 
 pub fn run(
+  flags: Flags,
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} =
+  if flags.fix { fixed_run(flags) } else { checked(flags) }
+
+fn fixed_run(
+  flags: Flags,
+) -> CommandOutput / {shipped.read_pack, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} = {
+  let project = load_resolved(flags.paths);
+  let found = match session_over(
+      flags.paths,
+      project,
+      time.elapsed_ms(),
+      flags.verify_dependencies,
+      |_: Modules, _: ProgramSummary| (),
+    ) {
+    Err(r) -> r.diagnostics,
+    Ok(s) -> s.warnings,
+  };
+  let result = fixes::fixed(project.files.map(|file: File| file.text), found);
+  let unwritten = range(0, project.files.len()).fold([], |errors: List<String>, i: Int| {
+    let file = project.files.get(i);
+    let text = result.texts.get(i);
+    if text == file.text || write_file(file.at, text) { errors }
+    else { errors.push("error: " ++ file.path ++ ": could not write") }
+  });
+  let places = project.files.map(|file: File| { path: file.path, text: file.text });
+  let output = checked(flags);
+  {
+    json: match output.json {
+      Object(members) -> Object(members.insert("fixed", changes_json(places, result.applied))),
+      other -> other,
+    },
+    lines: change_lines(places, result.applied).concat(output.lines),
+    errs: output.errs.concat(unwritten),
+    code: if unwritten.len() == 0 { output.code } else { compile_error },
+  }
+}
+
+fn checked(
   flags: Flags,
 ) -> CommandOutput / {shipped.read_pack, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], cost_checker.report, evaluation.verdicts, evaluation.statements, toolchain.reuse_dir, Derives, abort.raise, diverges, shipped.report_view_used} =
   match session(
