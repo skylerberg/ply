@@ -132,6 +132,7 @@ fn over_database<a, [r] | e>(
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, abort.raise | e} = {
   let looked = |db: Database, kind: Bytes, at: Bytes| {
@@ -226,6 +227,7 @@ fn over_database<a, [r] | e>(
     memo_store.is_out_of_date(key) -> st.waiting.depths.contains(key),
     memo_store.next_out_of_date() -> first_waiting(st.waiting),
     memo_store.out_of_date_level() -> lowest_waiting(st.waiting),
+    memo_store.computed(query) -> noted(query),
     memo_store.put(key, fact, _, encoded_details, outputs, lasting) -> {
       let stored = outputs.fold(st, |o: StoreRun, digest: Bytes, output: Bytes|
         if lasting || is_inline(output) { stored_output[r](o, digest, output) }
@@ -382,13 +384,14 @@ pub fn with_memo_store<a, [r] | e>(
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
   with_recent_reads(|| {
     let db = fact_store::open[r](dir);
     let run = with_session_inputs(|| {
       let first = handle {
-        Ok(over_database[r](db, read, world, look, work))
+        Ok(over_database[r](db, read, world, look, noted, work))
       } with {
         fact_damage.damaged(reason) -> Err(reason),
       };
@@ -397,7 +400,7 @@ pub fn with_memo_store<a, [r] | e>(
         Err(reason) ->
           {
             value: fact_store::undamaged(||
-              over_database[r](fact_store::emptied(db), read, world, look, work)),
+              over_database[r](fact_store::emptied(db), read, world, look, noted, work)),
             damage: Some(reason),
           },
       }
@@ -580,7 +583,7 @@ pub fn with_store_in_memory<a | e>(
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> fs::MemResult<a> / {abort.raise | e} = {
   let ran = fs::on_mem[memory](tree, ||
-    with_memo_store[memory](memory_dir, read, world, look, work));
+    with_memo_store[memory](memory_dir, read, world, look, |_: Bytes| (), work));
   match ran.value.damage {
     Some(reason) -> panic("the fact database held in memory is damaged: " ++ reason),
     None -> { value: ran.value.value, tree: ran.tree },
@@ -631,11 +634,18 @@ fn quoted_in<[r]>(
   text: Bytes,
 ) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
   let queries = test_queries();
-  with_memo_store[r](checkout, packs::no_pack, b"", |_: Bytes, _: Bytes| Some(text), ||
-    in_session(queries, |run: memo::Run| {
-      let a = memo::query_output(queries, run, b"quoted", b"a");
-      { run: a.run, value: { output: a.output, ran: memo::executed_count(a.run) } }
-    })).value
+  with_memo_store[r](
+    checkout,
+    packs::no_pack,
+    b"",
+    |_: Bytes, _: Bytes| Some(text),
+    |_: Bytes| (),
+    ||
+      in_session(queries, |run: memo::Run| {
+        let a = memo::query_output(queries, run, b"quoted", b"a");
+        { run: a.run, value: { output: a.output, ran: memo::executed_count(a.run) } }
+      }),
+  ).value
 }
 
 fn quoted_over<[r]>(
@@ -695,6 +705,7 @@ fn session_over_files<[r]>(
     packs::no_pack,
     b"",
     |_: Bytes, at: Bytes| read_then_saved[r]("files/" ++ String::of_bytes_lossy(at), saved),
+    |_: Bytes| (),
     ||
       in_session(queries, |run: memo::Run| {
         let a = memo::query_output(queries, run, name, b"a");
@@ -772,6 +783,7 @@ test "a pack holds the facts of the keys it is built from, and a trusted run use
       |path: String, offset: Int, len: Int| packs::frame_in(Some(pack.written), path, offset, len),
       b"files",
       |_: Bytes, _: Bytes| None,
+      |_: Bytes| (),
       ||
         in_session(queries, |run: memo::Run| {
           let a = memo::query_output(queries, run, b"quoted", b"a");

@@ -1,3 +1,10 @@
+import compiler.store.memo (memo)
+import progress
+import compiler.store.handles (part_label)
+import compiler.store.memo (RecordedFact, RecordedRead, ReadOfFact, ReadOfDeletedFact, ReadOfInput,
+                            fact_inspection)
+import compiler.front.checking.groups (declared_of, unit_key_of, group_query, group_hash_query,
+                                       group_key_bin)
 import compiler.syntax.parsing (Error, Warning)
 import sources (ProjectFiles)
 import compiler.load (Derives)
@@ -106,7 +113,96 @@ pub type Entry = {
   outcome: Option<Outcome>,
 }
 
-pub type Matches = { directory: String, warnings: List<Diagnostic>, entries: List<Entry> }
+pub type DefinitionFacts = { name: Bytes, facts: List<RecordedFact> }
+
+pub type Matches = {
+  directory: String,
+  warnings: List<Diagnostic>,
+  entries: List<Entry>,
+  facts: List<DefinitionFacts>,
+}
+
+fn facts_matching(
+  listing: ProgramListing,
+  query: String,
+) -> List<DefinitionFacts> / {memo.read, fact_inspection.read, abort.raise} =
+  listing.checked.definitions.filter(|d: DefinitionInfo| matches_query(query, d.name, b"")).map(
+    |d: DefinitionInfo|
+      {
+        name: d.name,
+        facts: declared_of(d.module, false, false, d.simple_name).flat_map(|owner: Bytes| {
+          let input = bin::encode(
+            unit_key_of({ module: d.module, shipped: false, tested: false, owner: owner }),
+            group_key_bin(),
+          );
+          [group_query().name, group_hash_query().name].flat_map(|q: Bytes|
+            match fact_inspection.recorded_fact(q, input) { Some(f) -> [f], None -> [] })
+        }),
+      },
+  )
+
+fn read_changed(r: RecordedRead) -> Bool =
+  match r {
+    ReadOfFact(f) -> f.recorded != f.current,
+    ReadOfDeletedFact(_) -> true,
+    ReadOfInput(i) -> i.recorded != i.current,
+  }
+
+fn read_text(r: RecordedRead) -> String / {abort.raise} =
+  match r {
+    ReadOfFact(f) ->
+      String::of_bytes_lossy(f.query) ++ " " ++ String::of_bytes_lossy(hex(f.input)).slice(0, 12)
+        ++ (if f.part.len() == 0 { "" }
+        else { " part " ++ String::of_bytes_lossy(part_label(f.part)) }),
+    ReadOfDeletedFact(f) -> "a deleted fact " ++ String::of_bytes_lossy(hex(f.fact)).slice(0, 12),
+    ReadOfInput(i) -> String::of_bytes_lossy(i.kind) ++ " " ++ String::of_bytes_lossy(i.at),
+  }
+
+fn fact_lines(style: Style, d: DefinitionFacts) -> List<String> / {abort.raise} =
+  d.facts.fold(
+    [indent ++ bold(style, "facts of `" ++ String::of_bytes_lossy(d.name) ++ "`")],
+    |lines: List<String>, f: RecordedFact| {
+      let changed = f.reads.filter(read_changed);
+      lines.push(
+        indent ++ "  " ++ String::of_bytes_lossy(f.query) ++ " · "
+          ++ count_of(f.parts.len(), "part")
+          ++ " · read "
+          ++ count_of(f.reads.len(), "fact")
+          ++ ", "
+          ++ changed.len().to_string()
+          ++ " changed since",
+      ).concat(
+        f.reads.map(|r: RecordedRead|
+          indent ++ "    " ++ (if read_changed(r) { "changed  " } else { "same     " })
+            ++ read_text(r)),
+      )
+    },
+  )
+
+fn facts_json(d: DefinitionFacts) -> Json / {abort.raise} =
+  object([
+    { key: "name", value: Str(String::of_bytes_lossy(d.name)) },
+    {
+      key: "facts",
+      value: Array(
+        d.facts.map(|f: RecordedFact|
+          object([
+            { key: "query", value: Str(String::of_bytes_lossy(f.query)) },
+            { key: "parts", value: int(f.parts.len()) },
+            {
+              key: "reads",
+              value: Array(
+                f.reads.map(|r: RecordedRead|
+                  object([
+                    { key: "read", value: Str(read_text(r)) },
+                    { key: "changed", value: Bool(read_changed(r)) },
+                  ])),
+              ),
+            },
+          ])),
+      ),
+    },
+  ])
 
 fn decimal(text: String) -> Json =
   match Decimal::of_string(text) { Some(d) -> Number(d), None -> int(0) }
@@ -428,6 +524,7 @@ fn inspect_json(query: String, matches: Matches, entries: List<Entry>) -> Json /
     { key: "query", value: Str(query) },
     { key: "directory", value: Str(matches.directory) },
     { key: "matches", value: Array(entries.map(entry_json)) },
+    { key: "facts", value: Array(matches.facts.map(facts_json)) },
     { key: "warnings", value: all_to_json(matches.warnings, []) },
   ])
 
@@ -487,7 +584,11 @@ fn inspect_output(style: Style, query: String, matches: Matches) -> CommandOutpu
   } else {
     {
       json: inspect_json(query, matches, entries),
-      lines: warning_lines(style, matches.warnings).concat(inspect_lines(style, query, entries)),
+      lines: warning_lines(style, matches.warnings).concat(
+        inspect_lines(style, query, entries),
+      ).concat(
+        matches.facts.flat_map(|d: DefinitionFacts| [""].concat(fact_lines(style, d))),
+      ),
       errs: [],
       code: ok_code,
     }
@@ -769,6 +870,7 @@ fn inspect_store<[r]>(
     directory: display_path(place, ""),
     warnings: project_store::diagnostics_of(tables::warnings(c)),
     entries: matches_in(places, listing, query, proven),
+    facts: [],
   }
 }
 
@@ -787,27 +889,20 @@ pub fn run(
   } else if flags.action == "clear" {
     clear_result(s, if cwd { clear_store[cwd](place) } else { clear_store[abs](place) })
   } else if flags.action == "copy" { copied_result(s, flags) } else {
-    inspect_result(
-      s,
-      flags.query,
-      match session(
-          flags.paths,
-          flags.verify_dependencies,
-          |modules: Modules, _: ProgramSummary| view::listed(modules),
-        ) {
-        Err(r) ->
-          Err({
-            directory: Some(display_path(place, "")),
-            diagnostics: r.diagnostics,
-            warnings: [],
-          }),
-        Ok(opened) -> {
-          let places = places_of(opened);
-          Ok(if cwd { inspect_store[cwd](place, places, opened.value, flags.query) }
-          else { inspect_store[abs](place, places, opened.value, flags.query) })
-        },
+    inspect_result(s, flags.query, match progress::silently(||
+        session(flags.paths, flags.verify_dependencies, |modules: Modules, _: ProgramSummary| {
+          let listing = view::listed(modules);
+          { listing: listing, facts: facts_matching(listing, flags.query) }
+        })) {
+      Err(r) ->
+        Err({ directory: Some(display_path(place, "")), diagnostics: r.diagnostics, warnings: [] }),
+      Ok(opened) -> {
+        let places = places_of(opened);
+        let found = if cwd { inspect_store[cwd](place, places, opened.value.listing, flags.query) }
+        else { inspect_store[abs](place, places, opened.value.listing, flags.query) };
+        Ok({ ..found, facts: opened.value.facts })
       },
-    )
+    })
   }
 }
 
@@ -1069,7 +1164,7 @@ test "a rejection after the store opened names the cache and carries its warning
 }
 
 test "inspecting a name the program does not define is E0101 and exits two" {
-  let empty: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [] };
+  let empty: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [], facts: [] };
   let result = run_with(
     flags_of("inspect", "no_such_thing", false),
     Err(no_rejection),
@@ -1085,7 +1180,7 @@ test "inspecting a name the program does not define is E0101 and exits two" {
 }
 
 test "a match is one object under `matches`, with the hash shortened and the type resolved" {
-  let hits: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [an_entry] };
+  let hits: Matches = { directory: "/p/.ply-cache", warnings: [], entries: [an_entry], facts: [] };
   let result = run_with(
     flags_of("inspect", "active", true),
     Err(no_rejection),

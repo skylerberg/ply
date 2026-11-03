@@ -212,6 +212,7 @@ pub effect memo_store {
   read next_out_of_date() -> Option<Waited>
   read out_of_date_level() -> List<Waited>
   write put(key: Bytes, fact: StoredFact, details: FactDetails, encoded_details: Bytes, outputs: Map<Bytes, Bytes>, lasting: Bool) -> Unit
+  write computed(query: Bytes) -> Unit
   write keep_output(digest: Bytes, output: Bytes, lasting: Bool) -> Unit
   write delete(key: Bytes) -> Unit
   write add_dependent(key: Bytes, dependent: Bytes) -> Unit
@@ -389,15 +390,61 @@ pub fn in_session_of<| e>(
     { run: a.run, value: a.output }
   })
 
+pub type RecordedRead =
+  | ReadOfFact({ query: Bytes, input: Bytes, part: Bytes, recorded: Option<Bytes>, current: Option<Bytes> })
+  | ReadOfDeletedFact({ fact: Bytes, part: Bytes, recorded: Option<Bytes> })
+  | ReadOfInput({ kind: Bytes, at: Bytes, recorded: Bytes, current: Bytes })
+
+pub type RecordedFact = { query: Bytes, parts: Map<Bytes, Bytes>, reads: List<RecordedRead> }
+
+pub effect fact_inspection {
+  read recorded_fact(query: Bytes, input: Bytes) -> Option<RecordedFact>
+}
+
+fn recorded_read(r: Dependency) -> RecordedRead / {memo_store.read, abort.raise} =
+  match r {
+    QueryDependency(q) -> {
+      let stored = memo_store.fact(q.fact);
+      match details_before(stored) {
+        None -> ReadOfDeletedFact({ fact: q.fact, part: q.part, recorded: q.digest }),
+        Some(d) ->
+          ReadOfFact({
+            query: d.query,
+            input: d.input,
+            part: q.part,
+            recorded: q.digest,
+            current: match stored { Some(f) -> f.parts.get(q.part), None -> None },
+          }),
+      }
+    },
+    ExternalDependency(e) ->
+      ReadOfInput({
+        kind: e.kind,
+        at: e.at,
+        recorded: e.digest,
+        current: memo_store.external(e.kind, e.at).digest,
+      }),
+  }
+
+fn recorded_fact_of(key: Bytes) -> Option<RecordedFact> / {memo_store.read, abort.raise} =
+  match memo_store.fact(key) {
+    None -> None,
+    Some(f) -> match memo_store.details(f.details) {
+      None -> None,
+      Some(d) -> Some({ query: d.query, parts: f.parts, reads: d.reads.map(recorded_read) }),
+    },
+  }
+
 pub fn reading<a | e>(
   queries: Queries<| e>,
   run: Run,
-  body: () -> a / {memo.read, abort.raise | e},
+  body: () -> a / {memo.read, fact_inspection.read, abort.raise | e},
 ) -> { run: Run, value: a } / {memo_store.read, memo_store.write, abort.raise | e} =
   handle {
     body()
   } with {
     var at = run,
+    fact_inspection.recorded_fact(name, input) -> recorded_fact_of(fact_key(name, input)),
     memo.external(kind, place) -> memo_store.external(kind, place).value,
     memo.fetch(name, input, part) -> {
       let a = part_outputs(queries, at, name, [input], part);
@@ -1029,6 +1076,7 @@ fn execution_ended<| e>(
   s: Execution,
   output: Parts,
 ) -> { run: Run, at: Settled } / {memo_store.read, memo_store.write, abort.raise} = {
+  memo_store.computed(q.name);
   let at = recorded(q, key, input, s, output);
   if memo_store.is_out_of_date(key) && !reads_moved(s) { memo_store.settle(key) };
   { run: s.run, at: at }
