@@ -4,22 +4,81 @@ import std.fs
 import std.fs (fs)
 import std.list
 import std.hash (blake3)
+import std.show (show)
 import compiler.store.fact_store
 import compiler.store.fact_store (Database, Dependents, Facts, Inputs, Codes, Records, Cursors,
-                                  fact_damage, recent_reads, with_recent_reads)
-import compiler.store.memo
-import compiler.store.memo (Dependency, ExternalInput, FactDetails, PackBuild, Parts, Product,
-                            Query, Run, SealedInput, Step, StoredFact, StoredInput, Waiting,
-                            deferred_kind, empty_pack_build, fact_details_bin, finished_pack,
-                            first_waiting, in_session, in_session_of, is_inline, location_id,
-                            lowest_waiting, main_only, main_part, memo, memo_store,
-                            nothing_left_waiting, nothing_waiting, plain_queries, query_output,
-                            sealed_lookup, sealed_record_of, fixed_digest, input_id, session_input,
-                            session_inputs, stored_fact_bin, stored_input_bin, with_mark,
-                            with_packed_fact, with_session_inputs, without_mark)
+                                  PackUsed, fact_damage, recent_reads, with_recent_reads)
+import compiler.store.memo (Parts, Product, Queries, Query, main_only, main_part, memo, plain_queries)
+import compiler.store.memo.store (Dependency, ExternalInput, FactDetails, QueriesId, SealedInput,
+                                  StoredFact, StoredInput, Waiting, deferred_kind, fact_details_bin,
+                                  fact_key, first_waiting, fixed_digest, input_id, location_id,
+                                  lowest_waiting, memo_store, nothing_left_waiting, nothing_waiting,
+                                  parts_digest, queries_id, session_input, session_inputs,
+                                  stored_fact_bin, stored_input_bin, trusted_pack_id, with_mark,
+                                  with_session_inputs, without_mark)
+import compiler.store.memo.engine (in_session_of)
 import compiler.store.packs
 import compiler.store.segments
-import compiler.store.segments (Committed, LockHeld, StoreChanged, WriteFailed)
+import compiler.store.segments (CommitResult, Committed, LockHeld, StoreChanged, WriteFailed)
+
+type PackUse = | NoTrustedPack | TrustedPack(Bytes)
+
+derive bin for PackUse
+
+const pack_use_key: Bytes = b"pack"
+
+fn pack_key(key: Bytes) -> Bytes = blake3(key)
+
+type SealedRecord = { parts: Map<Bytes, Bytes>, inline: Map<Bytes, Bytes> }
+
+derive bin for SealedRecord
+
+const inline_limit: Int = 2048
+
+fn is_inline(output: Bytes) -> Bool = output.len() <= inline_limit
+
+fn sealed_record_of(record: Bytes) -> Option<SealedRecord> / {abort.raise} =
+  match bin::decode(record, sealed_record_bin()) { Ok(r) -> Some(r), Err(_) -> None }
+
+type PackBuild = {
+  writing: packs::PackWriter,
+  records: Map<Bytes, packs::Range>,
+  results: Map<Bytes, packs::Range>,
+  returned: Map<Bytes, Bytes>,
+}
+
+const empty_pack_build: PackBuild =
+  { writing: packs::new_writer, records: Map::new(), results: Map::new(), returned: Map::new() }
+
+fn with_packed_fact<| e>(
+  built: PackBuild,
+  key: Bytes,
+  fact: StoredFact,
+  output_of: (Bytes) -> Option<Bytes> / {abort.raise | e},
+) -> PackBuild / {abort.raise | e} = {
+  let outputs = fact.parts.fold(Map::new(), |found: Map<Bytes, Bytes>, _: Bytes, digest: Bytes|
+    match output_of(digest) { Some(o) -> found.insert(digest, o), None -> found });
+  let inline = outputs.fold(Map::new(), |found: Map<Bytes, Bytes>, digest: Bytes, o: Bytes|
+    if is_inline(o) { found.insert(digest, o) } else { found });
+  let with_results = outputs.fold(built, |b: PackBuild, digest: Bytes, o: Bytes|
+    match packs::output_key(digest) {
+      Some(name) -> if inline.contains(digest) || b.results.contains(name) { b } else {
+        let framed = packs::append_frame(b.writing, o);
+        { ..b, writing: framed.writing, results: b.results.insert(name, framed.at) }
+      },
+      None -> b,
+    });
+  let framed = packs::append_frame(
+    with_results.writing,
+    bin::encode({ parts: fact.parts, inline: inline }, sealed_record_bin()),
+  );
+  {
+    ..with_results,
+    writing: framed.writing,
+    records: with_results.records.insert(pack_key(key), framed.at),
+    returned: with_results.returned.insert(pack_key(key), parts_digest(fact.parts)),
+  }
+}
 
 type StoreRun = {
   db: Database,
@@ -28,7 +87,7 @@ type StoreRun = {
   details: Map<Bytes, FactDetails>,
   transient: Map<Bytes, Bytes>,
   pack: packs::PackReader,
-  trusted: Bool,
+  pack_use: PackUse,
   pack_differs: Bool,
   waiting: Waiting,
   changes: List<Bytes>,
@@ -37,8 +96,6 @@ type StoreRun = {
 }
 
 const max_cached_size: Int = 268435456
-
-const pack_id_name: Bytes = b"\x00pack"
 
 fn int_bytes(n: Int) -> Bytes / {abort.raise} = bin::encode(n, bin::int_bin())
 
@@ -119,6 +176,11 @@ fn lowest_cursor<[r]>(
     |lowest: Int, b: Bytes| min(lowest, undecoded(b, bin::int_bin())),
   )
 
+fn trusts_pack(st: StoreRun) -> Bool =
+  match st.pack_use { TrustedPack(_) -> true, NoTrustedPack -> false }
+
+type Ran<a> = { value: a, commit: CommitResult }
+
 fn over_database<a, [r] | e>(
   database: Database,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
@@ -126,7 +188,7 @@ fn over_database<a, [r] | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, abort.raise | e} = {
+) -> Ran<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, abort.raise | e} = {
   let looked = |db: Database, kind: Bytes, at: Bytes| {
     let id = location_id(kind, at);
     session_input(id, ||
@@ -145,7 +207,7 @@ fn over_database<a, [r] | e>(
       details: Map::new(),
       transient: Map::new(),
       pack: packs::open_reader(read),
-      trusted: false,
+      pack_use: NoTrustedPack,
       pack_differs: false,
       waiting: nothing_waiting,
       changes: [],
@@ -176,7 +238,7 @@ fn over_database<a, [r] | e>(
             st = remembered_output(st, digest, o);
             Some(o)
           },
-          None -> if !st.trusted { None } else {
+          None -> if !trusts_pack(st) { None } else {
             let found = packs::output(st.pack, read, digest);
             st = { ..st, pack: found.reading };
             found.bytes
@@ -184,10 +246,10 @@ fn over_database<a, [r] | e>(
         },
       },
     },
-    memo_store.sealed(key) -> if !st.trusted { None } else {
-      let found = sealed_lookup(st.pack, read, key);
+    memo_store.sealed(key) -> if !trusts_pack(st) { None } else {
+      let found = packs::record(st.pack, read, pack_key(key));
       st = { ..st, pack: found.reading };
-      match match found.record { Some(b) -> sealed_record_of(b), None -> None } {
+      match match found.bytes { Some(b) -> sealed_record_of(b), None -> None } {
         None -> None,
         Some(r) -> {
           st = {
@@ -297,7 +359,7 @@ fn over_database<a, [r] | e>(
       st = { ..st, waiting: { ..st.waiting, products: kinds } };
     },
     memo_store.push_products(kind) -> {
-      st = { ..st, waiting: { ..st.waiting, pushing: st.waiting.pushing.insert(kind, true) } };
+      st = { ..st, waiting: { ..st.waiting, pushing: st.waiting.pushing.insert(kind) } };
     },
     memo_store.logged_changes(kind) -> match cursor_of[r](st.db, kind) {
       None -> [],
@@ -310,19 +372,21 @@ fn over_database<a, [r] | e>(
     memo_store.log_read(kind) -> {
       st = { ..st, kinds_read: st.kinds_read.insert(kind, st.changes.len()) };
     },
-    memo_store.running(id) -> {
-      let trusted = match st.pack.index {
-        Some(i) -> packs::is_trusted(i, id, world),
-        None -> false,
+    memo_store.running(queries) -> {
+      let used = match st.pack.index {
+        Some(i) -> if packs::is_trusted(i, queries, world) {
+          TrustedPack(trusted_pack_id(queries, world))
+        } else { NoTrustedPack },
+        None -> NoTrustedPack,
       };
-      let pack_id = if trusted { id.concat(world).blake3() } else { b"" };
-      let was = fact_store::value_of[r](st.db, Codes, code_key(pack_id_name));
+      let encoded = bin::encode(used, pack_use_bin());
+      let was = fact_store::value_of[r](st.db, PackUsed, pack_use_key);
       st = {
         ..st,
-        trusted: trusted,
-        pack_differs: was != Some(pack_id),
-        db: if was == Some(pack_id) { st.db }
-        else { fact_store::with_value(st.db, Codes, code_key(pack_id_name), pack_id) },
+        pack_use: used,
+        pack_differs: was != Some(encoded),
+        db: if was == Some(encoded) { st.db }
+        else { fact_store::with_value(st.db, PackUsed, pack_use_key, encoded) },
       };
     },
     return value -> {
@@ -339,18 +403,59 @@ fn over_database<a, [r] | e>(
           int_bytes(if changes_seen == st.changes.len() { fact_store::log_end(logged) }
           else { before }),
         ));
-      fact_store::commit[r](
-        fact_store::with_log_floor(read_kinds, lowest_cursor[r](read_kinds)),
-        |current: Database| live_results[r](current),
-      );
-      value
+      {
+        value: value,
+        commit: fact_store::commit[r](
+          fact_store::with_log_floor(read_kinds, lowest_cursor[r](read_kinds)),
+          |current: Database| live_results[r](current),
+        ),
+      }
     },
   }
 }
 
+
 pub type StoreOutcome<a> = { value: a, damage: Option<String> }
 
-pub fn with_memo_store<a, [r] | e>(
+type Session<a> = { outcome: StoreOutcome<a>, commit: CommitResult }
+
+fn with_opened<a, [r] | e>(
+  dir: String,
+  go: (fact_store::Opening) -> a / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e},
+) -> a / {fs.read[r], fs.write[r], abort.raise | e} =
+  with_recent_reads(|| {
+    let opening = fact_store::open[r](dir);
+    let value = go(opening);
+    fact_store::close[r](opening);
+    value
+  })
+
+fn session_in<a, [r] | e>(
+  dir: String,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  noted: (Bytes) -> Unit / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} =
+  with_opened[r](dir, |opening: fact_store::Opening|
+    with_session_inputs(|| {
+      let first = handle {
+        Ok(over_database[r](fact_store::loaded[r](opening), read, world, look, noted, work))
+      } with {
+        fact_damage.damaged(reason) -> Err(reason),
+      };
+      match first {
+        Ok(ran) -> { outcome: { value: ran.value, damage: None }, commit: ran.commit },
+        Err(reason) -> {
+          let ran = fact_store::undamaged(||
+            over_database[r](fact_store::emptied(opening), read, world, look, noted, work));
+          { outcome: { value: ran.value, damage: Some(reason) }, commit: ran.commit }
+        },
+      }
+    }))
+
+pub fn with_database<a, [r] | e>(
   dir: String,
   read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
   world: Bytes,
@@ -358,48 +463,42 @@ pub fn with_memo_store<a, [r] | e>(
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
-  with_recent_reads(|| {
-    let opening = fact_store::open[r](dir);
-    let run = with_session_inputs(|| {
-      let first = handle {
-        Ok(over_database[r](fact_store::loaded[r](opening), read, world, look, noted, work))
-      } with {
-        fact_damage.damaged(reason) -> Err(reason),
-      };
-      match first {
-        Ok(v) -> { value: v, damage: None },
-        Err(reason) ->
-          {
-            value: fact_store::undamaged(||
-              over_database[r](fact_store::emptied(opening), read, world, look, noted, work)),
-            damage: Some(reason),
-          },
-      }
-    });
-    fact_store::close[r](opening);
-    run
-  })
+  session_in[r](dir, read, world, look, noted, work).outcome
 
 pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
 
-pub fn records<[r]>(dir: String) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], abort.raise} =
+fn read_only_in<a, [r]>(
+  dir: String,
+  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
+) -> Result<a, String> / {fs.read[r], abort.raise} =
   with_recent_reads(||
     handle {
-      Ok(fact_store::entries_under[r](fact_store::read_only[r](dir), Records, b""))
+      Ok(read(fact_store::read_only[r](dir)))
     } with {
       fact_damage.damaged(reason) -> Err(reason),
     })
 
-pub fn records_written<[r]>(
+fn undamaged_in<a, [r]>(
+  dir: String,
+  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
+) -> a / {fs.read[r], abort.raise} =
+  match read_only_in[r](dir, read) {
+    Ok(value) -> value,
+    Err(reason) -> panic("the fact database is damaged: " ++ reason),
+  }
+
+pub fn read_records<[r]>(dir: String) -> Result<Map<Bytes, Bytes>, String> / {fs.read[r], abort.raise} =
+  read_only_in[r](dir, |db: Database| fact_store::entries_under[r](db, Records, b""))
+
+pub fn write_records<[r]>(
   dir: String,
   puts: Map<Bytes, Bytes>,
-  deleted: Map<Bytes, Bool>,
+  deleted: Set<Bytes>,
 ) -> Result<Unit, String> / {fs.read[r], fs.write[r], abort.raise} =
-  with_recent_reads(|| {
-    let opening = fact_store::open[r](dir);
-    let outcome = handle {
+  with_opened[r](dir, |opening: fact_store::Opening|
+    handle {
       let written = puts.fold(
-        deleted.fold(fact_store::loaded[r](opening), |d: Database, key: Bytes, _: Bool|
+        deleted.fold(fact_store::loaded[r](opening), |d: Database, key: Bytes|
           fact_store::without_value(d, Records, key)),
         |d: Database, key: Bytes, value: Bytes| fact_store::with_value(d, Records, key, value),
       );
@@ -411,10 +510,7 @@ pub fn records_written<[r]>(
       }
     } with {
       fact_damage.damaged(reason) -> Err("the store is damaged (" ++ reason ++ ")"),
-    };
-    fact_store::close[r](opening);
-    outcome
-  })
+    })
 
 pub fn copy_database<[r]>(from: String, to: String) -> Unit / {fs.read[r], fs.write[r]} = {
   fs.create_dir[r](to);
@@ -430,6 +526,7 @@ pub fn copy_database<[r]>(from: String, to: String) -> Unit / {fs.read[r], fs.wr
     })
 }
 
+
 pub type KindUsage = { query: Bytes, facts: Int, bytes: Int }
 
 pub type Usage = {
@@ -441,73 +538,86 @@ pub type Usage = {
   bytes: Int,
 }
 
+fn stored_size<[r]>(
+  db: Database,
+  digest: Bytes,
+) -> Int / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match fact_store::stored_result_size[r](db, result_key(digest)) {
+    Some(size) -> size,
+    None -> 0,
+  }
+
 fn with_fact_of_kind<[r]>(
   db: Database,
   kinds: Map<Bytes, KindUsage>,
   fact: StoredFact,
 ) -> Map<Bytes, KindUsage> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   match fact_store::result_of[r](db, fact.details) {
-    None -> kinds,
+    None -> fact_damage.damaged("a stored fact names details that are not stored"),
     Some(b) -> {
       let name = undecoded(b, fact_details_bin()).query;
-      let size = fact.parts.fold(0, |n: Int, _: Bytes, digest: Bytes|
-        n + fact_store::stored_result_size[r](db, result_key(digest)).unwrap_or(0));
+      let size = fact.parts.fold(0, |n: Int, _: Bytes, digest: Bytes| n + stored_size[r](db, digest));
       let was = match kinds.get(name) { Some(k) -> k, None -> { query: name, facts: 0, bytes: 0 } };
       kinds.insert(name, { ..was, facts: was.facts + 1, bytes: was.bytes + size })
     },
   }
 
 pub fn usage<[r]>(dir: String) -> Usage / {fs.read[r], abort.raise} =
-  with_recent_reads(||
-    fact_store::undamaged(|| {
-      let db = fact_store::read_only[r](dir);
-      let size = fact_store::store_size(db);
-      let facts = fact_store::entries_under[r](db, Facts, b"").values();
-      let kinds = facts.fold(Map::new(), |found: Map<Bytes, KindUsage>, b: Bytes|
-        with_fact_of_kind[r](db, found, undecoded(b, stored_fact_bin())));
-      let output_bytes = kinds.fold(0, |n: Int, _: Bytes, k: KindUsage| n + k.bytes);
-      {
-        records: facts.len(),
-        results: live_results[r](db).len(),
-        output_bytes: output_bytes,
-        kinds: kinds.values(),
-        segments: size.segments,
-        bytes: size.bytes,
-      }
-    }))
+  undamaged_in[r](dir, |db: Database| {
+    let size = fact_store::store_size(db);
+    let facts = fact_store::entries_under[r](db, Facts, b"").values();
+    let kinds = facts.fold(Map::new(), |found: Map<Bytes, KindUsage>, b: Bytes|
+      with_fact_of_kind[r](db, found, undecoded(b, stored_fact_bin())));
+    let output_bytes = kinds.fold(0, |n: Int, _: Bytes, k: KindUsage| n + k.bytes);
+    {
+      records: facts.len(),
+      results: live_results[r](db).size(),
+      output_bytes: output_bytes,
+      kinds: kinds.values(),
+      segments: size.segments,
+      bytes: size.bytes,
+    }
+  })
+
+pub type StoredOutput = | Stored(Bytes) | NotKept
 
 pub fn outputs_by_digest<[r]>(
   dir: String,
   digests: List<Bytes>,
-) -> Map<Bytes, Bytes> / {fs.read[r], abort.raise} =
-  with_recent_reads(||
-    fact_store::undamaged(|| {
-      let db = fact_store::read_only[r](dir);
-      digests.fold(Map::new(), |found: Map<Bytes, Bytes>, digest: Bytes|
-        match fact_store::result_of[r](db, result_key(digest)) {
-          Some(output) -> found.insert(digest, output),
-          None -> found,
-        })
-    }))
+) -> Map<Bytes, StoredOutput> / {fs.read[r], abort.raise} =
+  undamaged_in[r](dir, |db: Database|
+    digests.fold(Map::new(), |found: Map<Bytes, StoredOutput>, digest: Bytes|
+      found.insert(digest, match fact_store::result_of[r](db, result_key(digest)) {
+        Some(output) -> Stored(output),
+        None -> NotKept,
+      })))
 
 pub fn write_pack<[r]>(
   from: String,
   keys: List<Bytes>,
-  queries: Bytes,
+  queries: QueriesId,
   files: Bytes,
 ) -> { written: packs::PackFiles, records: Int } / {fs.read[r], abort.raise} =
-  with_recent_reads(||
-    fact_store::undamaged(|| {
-      let db = fact_store::read_only[r](from);
-      let laid = keys.fold(empty_pack_build, |built: PackBuild, key: Bytes|
-        match fact_store::value_of[r](db, Facts, key) {
-          None -> built,
-          Some(b) ->
-            with_packed_fact(built, key, undecoded(b, stored_fact_bin()), |digest: Bytes|
-              fact_store::result_of[r](db, result_key(digest))),
-        });
-      { written: finished_pack(laid, queries, files), records: laid.records.len() }
-    }))
+  undamaged_in[r](from, |db: Database| {
+    let laid = keys.fold(empty_pack_build, |built: PackBuild, key: Bytes|
+      match fact_store::value_of[r](db, Facts, key) {
+        None -> built,
+        Some(b) ->
+          with_packed_fact(built, key, undecoded(b, stored_fact_bin()), |digest: Bytes|
+            fact_store::result_of[r](db, result_key(digest))),
+      });
+    {
+      written: packs::finish(
+        laid.writing,
+        laid.records,
+        laid.results,
+        laid.returned,
+        queries,
+        files,
+      ),
+      records: laid.records.len(),
+    }
+  })
 
 pub type FactRecord = {
   query: Bytes,
@@ -517,31 +627,66 @@ pub type FactRecord = {
 }
 
 fn fact_records<[r]>(dir: String) -> Map<Bytes, FactRecord> / {fs.read[r], abort.raise} =
-  with_recent_reads(||
-    fact_store::undamaged(|| {
-      let db = fact_store::read_only[r](dir);
-      fact_store::entries_under[r](db, Facts, b"").fold(
-        Map::new(),
-        |found: Map<Bytes, FactRecord>, key: Bytes, b: Bytes| {
-          let fact = undecoded(b, stored_fact_bin());
-          let details = match fact_store::result_of[r](db, fact.details) {
-            Some(encoded) -> undecoded(encoded, fact_details_bin()),
-            None -> fact_damage.damaged("a stored fact names details that are not stored"),
-          };
-          found.insert(key, {
-            query: details.query,
-            input: details.input,
-            reads: details.reads,
-            parts: fact.parts,
-          })
-        },
-      )
-    }))
+  undamaged_in[r](dir, |db: Database|
+    fact_store::entries_under[r](db, Facts, b"").fold(
+      Map::new(),
+      |found: Map<Bytes, FactRecord>, key: Bytes, b: Bytes| {
+        let fact = undecoded(b, stored_fact_bin());
+        let details = match fact_store::result_of[r](db, fact.details) {
+          Some(encoded) -> undecoded(encoded, fact_details_bin()),
+          None -> fact_damage.damaged("a stored fact names details that are not stored"),
+        };
+        found.insert(key, {
+          query: details.query,
+          input: details.input,
+          reads: details.reads,
+          parts: fact.parts,
+        })
+      },
+    ))
 
 fn stored_inputs<[r]>(dir: String) -> List<StoredInput> / {fs.read[r], abort.raise} =
-  with_recent_reads(|| fact_store::undamaged(|| inputs_of[r](fact_store::read_only[r](dir))))
+  undamaged_in[r](dir, |db: Database| inputs_of[r](db))
 
-pub const memory_dir: String = "store"
+pub const in_memory_database_dir: String = "store"
+
+pub type WriteLimit = | AllWrites | FailAfter(Int)
+
+pub type InMemoryOutcome<a> = | Finished(fs::MemResult<a>) | Stopped({ tree: fs::MemFs, reason: String })
+
+fn session_in_memory<a | e>(
+  tree: fs::MemFs,
+  limit: WriteLimit,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> fs::MemResult<Session<a>> / {abort.raise | e} = {
+  let session = ||
+    session_in[memory](in_memory_database_dir, read, world, look, |_: Bytes| (), work);
+  match limit {
+    AllWrites -> fs::on_mem[memory](tree, session),
+    FailAfter(writes) -> fs::on_mem_failing[memory](tree, writes, session),
+  }
+}
+
+pub fn with_writes_limited<a | e>(
+  tree: fs::MemFs,
+  limit: WriteLimit,
+  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
+  world: Bytes,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> InMemoryOutcome<a> / {abort.raise | e} = {
+  let ran = session_in_memory(tree, limit, read, world, look, work);
+  match ran.value.outcome.damage {
+    Some(reason) -> Stopped({ tree: ran.tree, reason: "it was damaged: " ++ reason }),
+    None -> match ran.value.commit {
+      Committed(_) -> Finished({ value: ran.value.outcome.value, tree: ran.tree }),
+      refused -> Stopped({ tree: ran.tree, reason: "its commit was refused: " ++ show(refused) }),
+    },
+  }
+}
 
 pub fn with_store_in_memory<a | e>(
   tree: fs::MemFs,
@@ -550,18 +695,27 @@ pub fn with_store_in_memory<a | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> fs::MemResult<a> / {abort.raise | e} = {
-  let ran = fs::on_mem[memory](tree, ||
-    with_memo_store[memory](memory_dir, read, world, look, |_: Bytes| (), work));
-  match ran.value.damage {
+  let ran = session_in_memory(tree, AllWrites, read, world, look, work);
+  match ran.value.outcome.damage {
     Some(reason) -> panic("the fact database held in memory is damaged: " ++ reason),
-    None -> { value: ran.value.value, tree: ran.tree },
+    None -> { value: ran.value.outcome.value, tree: ran.tree },
   }
 }
+
+fn database_files(tree: fs::MemFs) -> List<{ name: String, body: Option<Bytes> }> / {abort.raise} =
+  (match fs::listed_names(fs::mem_list(tree, in_memory_database_dir)) {
+    Some(names) -> names,
+    None -> [],
+  }).map(|name: String|
+    { name: name, body: fs::mem_read(tree, in_memory_database_dir ++ "/" ++ name) })
+
+pub fn same_database_in_memory(a: fs::MemFs, b: fs::MemFs) -> Bool / {abort.raise} =
+  database_files(a) == database_files(b)
 
 fn read_in_memory<a>(
   tree: fs::MemFs,
   read: (String) -> a / {fs.read[memory], abort.raise},
-) -> a / {abort.raise} = fs::on_mem[memory](tree, || read(memory_dir)).value
+) -> a / {abort.raise} = fs::on_mem[memory](tree, || read(in_memory_database_dir)).value
 
 pub fn facts_in_memory(tree: fs::MemFs) -> Map<Bytes, FactRecord> / {abort.raise} =
   read_in_memory(tree, |dir: String| fact_records[memory](dir))
@@ -572,13 +726,13 @@ pub fn inputs_in_memory(tree: fs::MemFs) -> List<StoredInput> / {abort.raise} =
 pub fn outputs_in_memory(
   tree: fs::MemFs,
   digests: List<Bytes>,
-) -> Map<Bytes, Bytes> / {abort.raise} =
+) -> Map<Bytes, StoredOutput> / {abort.raise} =
   read_in_memory(tree, |dir: String| outputs_by_digest[memory](dir, digests))
 
 pub fn pack_in_memory(
   tree: fs::MemFs,
   keys: List<Bytes>,
-  queries: Bytes,
+  queries: QueriesId,
   files: Bytes,
 ) -> packs::PackFiles / {abort.raise} =
   read_in_memory(tree, |dir: String| write_pack[memory](dir, keys, queries, files).written)
@@ -589,63 +743,42 @@ fn quoted(input: Bytes) -> Bytes / {memo.read, abort.raise} =
     None -> panic("the text query returned no main part"),
   }
 
-fn test_queries() -> memo::Queries<| {}> =
-  memo::plain_queries(
+fn test_queries() -> Queries<| {}> =
+  plain_queries(
     Map::new().insert(b"text", query(b"text", b"t1", read_file)).insert(
       b"quoted",
       query(b"quoted", b"q1", quoted),
     ),
   )
 
-fn quoted_in<[r]>(
-  checkout: String,
-  text: Bytes,
-) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = {
-  let queries = test_queries();
-  with_memo_store[r](
+fn quoted_in<[r]>(checkout: String, text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} =
+  with_database[r](
     checkout,
     packs::no_pack,
     b"",
     |_: Bytes, _: Bytes| Some(text),
     |_: Bytes| (),
-    ||
-      in_session(queries, |run: memo::Run| {
-        let a = memo::query_output(queries, run, b"quoted", b"a");
-        { run: a.run, value: { output: a.output, ran: memo::executed_count(a.run) } }
-      }),
+    || in_session_of(test_queries(), b"quoted", b"a"),
   ).value
-}
 
-fn quoted_over<[r]>(
-  text: Bytes,
-) -> { output: Bytes, ran: Int } / {fs.read[r], fs.write[r], abort.raise} = quoted_in[r]("s", text)
+fn quoted_over<[r]>(text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} =
+  quoted_in[r]("s", text)
 
 fn stored_names(tree: fs::MemFs) -> List<String> / {abort.raise} =
   match fs::listed_names(fs::mem_list(tree, "s")) { Some(names) -> names, None -> [] }
 
-test "a run interrupted after any number of writes leaves a store from which the next run returns what a run on a fresh store returns" {
-  let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
-  assert_eq(first.value.output, b"\"four\"");
-  iterate(0, 1000, |n: Int| {
-    let died = fs::on_mem_failing[abs](first.tree, n, || quoted_over[abs](b"forty"));
-    assert_eq(fs::on_mem[abs](died.tree, || quoted_over[abs](b"forty")).value.output, b"\"forty\"");
-    if fs::on_mem[abs](died.tree, || quoted_over[abs](b"forty")).value.ran == 0 { Stop(()) }
-    else { Continue(n + 1) }
-  })
-}
-
-test "a run that finds no change runs no query and writes nothing but its own run directory" {
+test "a run that finds no change writes nothing but its own run directory" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
   let again = fs::on_mem[abs](first.tree, || quoted_over[abs](b"four"));
-  assert_eq(again.value, { output: b"\"four\"", ran: 0 });
+  assert_eq(again.value, b"\"four\"");
   assert_eq(stored_names(again.tree), stored_names(first.tree))
 }
 
-test "a query's digest and result survive a reopen, and an edit reruns what depends on it" {
+test "a query's result survives a reopen, and an edit changes what depends on it" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
   let moved = fs::on_mem[abs](first.tree, || quoted_over[abs](b"forty"));
-  assert_eq(moved.value, { output: b"\"forty\"", ran: 2 });
-  assert_eq(fs::on_mem[abs](moved.tree, || quoted_over[abs](b"forty")).value.ran, 0)
+  assert_eq(moved.value, b"\"forty\"");
+  assert_eq(fs::on_mem[abs](moved.tree, || quoted_over[abs](b"forty")).value, b"\"forty\"")
 }
 
 fn read_then_saved<[r]>(
@@ -666,21 +799,15 @@ fn read_then_saved<[r]>(
 fn session_over_files<[r]>(
   saved: Option<Bytes>,
   name: Bytes,
-) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], abort.raise} = {
-  let queries = test_queries();
-  with_memo_store[r](
+) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], abort.raise} =
+  with_database[r](
     "s",
     packs::no_pack,
     b"",
     |_: Bytes, at: Bytes| read_then_saved[r]("files/" ++ String::of_bytes_lossy(at), saved),
     |_: Bytes| (),
-    ||
-      in_session(queries, |run: memo::Run| {
-        let a = memo::query_output(queries, run, name, b"a");
-        { run: a.run, value: a.output }
-      }),
+    || in_session_of(test_queries(), name, b"a"),
   )
-}
 
 test "a session uses the bytes it compared at its start, so a file saved after that read waits for the next command" {
   let first = fs::on_mem[abs](fs::mem_of([{ path: "files/a", body: b"four" }]), ||
@@ -697,68 +824,75 @@ test "a session uses the bytes it compared at its start, so a file saved after t
   ])
 }
 
-test "a stored value that fails its checksum makes the run start over from nothing" {
+test "a stored value that fails its checksum makes the run start over from nothing and report the damage" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
   let segment = stored_names(first.tree).filter(|n: String| n.starts_with("seg-")).get(0);
   let torn = fs::on_mem[abs](first.tree, || {
     fs.write_file[abs]("s/" ++ segment, b"not a segment");
-    quoted_over[abs](b"four")
+    session_over_files[abs](None, b"quoted")
   });
-  assert_eq(torn.value.output, b"\"four\"")
+  assert(torn.value.damage != None)
+}
+
+test "a manifest that names a missing segment is damage, not an empty store" {
+  let first = fs::on_mem[abs](fs::mem_of([{ path: "files/a", body: b"four" }]), ||
+    session_over_files[abs](None, b"quoted"));
+  let segment = stored_names(first.tree).filter(|n: String| n.starts_with("seg-")).get(0);
+  let lost = fs::on_mem[abs](first.tree, || {
+    fs.remove[abs]("s/" ++ segment);
+    session_over_files[abs](None, b"quoted")
+  });
+  assert_eq(lost.value.value, b"\"four\"");
+  assert(lost.value.damage != None)
 }
 
 test "records survive a reopen beside the facts, and a dropped record is gone" {
   let facts = fs::on_mem[abs](fs::mem_of([]), || quoted_over[abs](b"four"));
   let written = fs::on_mem[abs](facts.tree, ||
-    records_written[abs]("s", Map::new().insert(b"a", b"1").insert(b"b", b"2"), Map::new()));
+    write_records[abs]("s", Map::new().insert(b"a", b"1").insert(b"b", b"2"), Set::empty()));
   let dropped = fs::on_mem[abs](written.tree, ||
-    records_written[abs]("s", Map::new(), Map::new().insert(b"a", true)));
+    write_records[abs]("s", Map::new(), Set::empty().insert(b"a")));
   assert_eq(
-    fs::on_mem[abs](dropped.tree, || records[abs]("s")).value,
+    fs::on_mem[abs](dropped.tree, || read_records[abs]("s")).value,
     Ok(Map::new().insert(b"b", b"2")),
   );
-  assert_eq(fs::on_mem[abs](dropped.tree, || quoted_over[abs](b"four")).value.ran, 0)
+  assert_eq(fs::on_mem[abs](dropped.tree, || quoted_over[abs](b"four")).value, b"\"four\"")
 }
-test "a copied database is correct for its new place, and an edit there runs what it changes" {
+
+test "a copied database is correct for its new place, and an edit there changes what it reads" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_in[abs]("one", b"four"));
-  assert_eq(first.value.ran, 2);
   let copied = fs::on_mem[abs](first.tree, || {
     copy_database[abs]("one", "two");
     quoted_in[abs]("two", b"four")
   });
-  assert_eq(copied.value, { output: b"\"four\"", ran: 0 });
-  assert_eq(fs::on_mem[abs](copied.tree, || quoted_in[abs]("two", b"forty")).value.ran, 2)
+  assert_eq(copied.value, b"\"four\"");
+  assert_eq(fs::on_mem[abs](copied.tree, || quoted_in[abs]("two", b"forty")).value, b"\"forty\"")
 }
 
 test "two checkouts share nothing, so an edit in one leaves the other's results in place" {
   let first = fs::on_mem[abs](fs::mem_of([]), || quoted_in[abs]("one", b"four"));
   let other = fs::on_mem[abs](first.tree, || quoted_in[abs]("two", b"forty"));
-  assert_eq(fs::on_mem[abs](other.tree, || quoted_in[abs]("one", b"four")).value.ran, 0)
+  assert_eq(fs::on_mem[abs](other.tree, || quoted_in[abs]("one", b"four")).value, b"\"four\"")
 }
 
-test "a pack holds the facts of the keys it is built from, and a trusted run uses them with no query" {
+test "a pack holds the facts of the keys it is built from, and a trusted run uses them without reading the files" {
   let queries = test_queries();
   let long = b"long ".repeat(1000);
-  let keys = [b"text", b"quoted"].map(|name: Bytes| memo::fact_key(name, b"a"));
+  let keys = [b"text", b"quoted"].map(|name: Bytes| fact_key(name, b"a"));
   let pack = fs::on_mem[abs](fs::mem_of([]), || {
     quoted_over[abs](long);
-    write_pack[abs]("s", keys, memo::queries_id(queries), b"files")
+    write_pack[abs]("s", keys, queries_id(queries), b"files")
   }).value;
-  assert_eq(pack.records, 2);
   let used = fs::on_mem[abs](fs::mem_of([]), ||
-    with_memo_store[abs](
+    with_database[abs](
       "s",
       |path: String, offset: Int, len: Int| packs::frame_in(Some(pack.written), path, offset, len),
       b"files",
       |_: Bytes, _: Bytes| None,
       |_: Bytes| (),
-      ||
-        in_session(queries, |run: memo::Run| {
-          let a = memo::query_output(queries, run, b"quoted", b"a");
-          { run: a.run, value: { output: a.output, ran: memo::executed_count(a.run) } }
-        }),
+      || in_session_of(queries, b"quoted", b"a"),
     ));
-  assert_eq(used.value.value, { output: Bytes::concat_all([b"\"", long, b"\""]), ran: 0 })
+  assert_eq(used.value.value, Bytes::concat_all([b"\"", long, b"\""]))
 }
 
 fn query(
@@ -795,7 +929,9 @@ fn world_of(files: List<{ at: Bytes, text: Bytes }>) -> TestWorld =
 fn edited(w: TestWorld, at: Bytes, text: Bytes) -> TestWorld =
   { ..w, files: w.files.insert(at, text) }
 
-type Answered = { output: Bytes, ran: List<Bytes>, steps: List<Step>, world: TestWorld }
+fn from_nothing(w: TestWorld) -> TestWorld = { ..w, store: fs::mem_empty() }
+
+type Answered = { output: Bytes, world: TestWorld }
 
 fn fetched_in(
   named: Map<Bytes, Query<| {}>>,
@@ -803,24 +939,25 @@ fn fetched_in(
   name: Bytes,
   input: Bytes,
 ) -> Answered / {abort.raise} = {
-  let queries = plain_queries(named);
-  let done = with_store_in_memory(
-    w.store,
-    packs::no_pack,
-    b"",
-    |_: Bytes, at: Bytes| w.files.get(at),
-    ||
-      in_session(queries, |run: Run| {
-        let a = query_output(queries, run, name, input);
-        { run: a.run, value: { output: a.output, steps: a.run.inputs } }
-      }),
-  );
-  {
-    output: done.value.output,
-    ran: done.value.steps.map(|s: Step| s.query),
-    steps: done.value.steps,
-    world: { ..w, store: done.tree },
-  }
+  let done = with_store_in_memory(w.store, packs::no_pack, b"", |_: Bytes, at: Bytes|
+    w.files.get(at), || in_session_of(plain_queries(named), name, input));
+  { output: done.value, world: { ..w, store: done.tree } }
+}
+
+fn agreed(
+  named: Map<Bytes, Query<| {}>>,
+  w: TestWorld,
+  name: Bytes,
+  input: Bytes,
+) -> Answered / {abort.raise} = {
+  let stored = fetched_in(named, w, name, input);
+  assert_eq(stored.output, fetched_in(named, from_nothing(w), name, input).output);
+  stored
+}
+
+fn same_facts(a: Answered, b: Answered) -> Unit / {abort.raise} = {
+  assert_eq(a.output, b.output);
+  assert_eq(facts_in_memory(a.world.store), facts_in_memory(b.world.store))
 }
 
 fn length_of(input: Bytes) -> Bytes / {memo.read} =
@@ -836,6 +973,20 @@ fn lengths(length_code: Bytes) -> Map<Bytes, Query<| {}>> =
   )
 
 fn four() -> TestWorld = world_of([{ at: b"a", text: b"four" }])
+
+test "a run stopped after any number of writes leaves a store from which the next run returns what a build from nothing returns" {
+  let q = lengths(b"h1");
+  let moved = edited(fetched_in(q, four(), b"label", b"a").world, b"a", b"forty");
+  let complete = fetched_in(q, moved, b"label", b"a").world.store;
+  let look = |_: Bytes, at: Bytes| moved.files.get(at);
+  iterate(0, 1099511627776, |writes: Int| {
+    let tried = with_writes_limited(moved.store, FailAfter(writes), packs::no_pack, b"", look, ||
+      in_session_of(plain_queries(q), b"label", b"a"));
+    let left = match tried { Finished(ran) -> ran.tree, Stopped(stopped) -> stopped.tree };
+    agreed(q, { ..moved, store: left }, b"label", b"a");
+    if same_database_in_memory(left, complete) { Stop(()) } else { Continue(writes + 1) }
+  })
+}
 
 fn fixed_reader(code: Bytes) -> Map<Bytes, Query<| {}>> =
   Map::new().insert(
@@ -937,38 +1088,24 @@ test "a run reads each input once, in the update and in every query that reads i
   assert_eq(input_looks(first.store, b"a").looks, [b"a"])
 }
 
-test "a run with no changed input runs no query" {
+test "a result that comes out the same after an edit leaves its dependents as a build from nothing makes them" {
   let q = lengths(b"h1");
-  let first = fetched_in(q, four(), b"label", b"a");
-  assert_eq(first.output, b"long 4");
-  assert_eq(first.ran.len(), 2);
-  assert_eq(fetched_in(q, first.world, b"label", b"a").ran, [])
-}
-
-test "a result that comes out the same stops a change from reaching its dependents" {
-  let q = lengths(b"h1");
-  let first = fetched_in(q, four(), b"label", b"a");
-  let same = fetched_in(q, edited(first.world, b"a", b"FOUR"), b"label", b"a");
+  let first = agreed(q, four(), b"label", b"a");
+  let same = agreed(q, edited(first.world, b"a", b"FOUR"), b"label", b"a");
   assert_eq(same.output, b"long 4");
-  assert_eq(same.ran, [b"length"]);
-  let longer = fetched_in(q, edited(same.world, b"a", b"forty"), b"label", b"a");
-  assert_eq(longer.output, b"long 5");
-  assert_eq(longer.ran, [b"length", b"label"])
+  assert_eq(agreed(q, edited(same.world, b"a", b"forty"), b"label", b"a").output, b"long 5")
 }
 
 test "a change reaches every stored dependent, including ones this command does not ask for" {
   let q = lengths(b"h1");
   let first = fetched_in(q, four(), b"label", b"a");
-  let elsewhere = fetched_in(q, edited(first.world, b"a", b"forty"), b"length", b"a");
-  assert_eq(elsewhere.ran, [b"length", b"label"]);
-  assert_eq(fetched_in(q, elsewhere.world, b"label", b"a").ran, [])
+  let elsewhere = agreed(q, edited(first.world, b"a", b"forty"), b"length", b"a");
+  assert_eq(agreed(q, elsewhere.world, b"label", b"a").output, b"long 5")
 }
 
-test "a query whose code changed runs again, and its dependents stop there if its result is the same" {
+test "a query whose code changed gives its dependents what a build from nothing gives them" {
   let first = fetched_in(lengths(b"h1"), four(), b"label", b"a");
-  let moved = fetched_in(lengths(b"h2"), first.world, b"label", b"a");
-  assert_eq(moved.ran, [b"length"]);
-  assert_eq(fetched_in(lengths(b"h2"), moved.world, b"label", b"a").ran, [])
+  assert_eq(agreed(lengths(b"h2"), first.world, b"label", b"a").output, b"long 4")
 }
 
 fn split_lines(input: Bytes) -> Parts / {memo.read, abort.raise} = {
@@ -991,34 +1128,28 @@ fn line_queries() -> Map<Bytes, Query<| {}>> =
 
 fn lines_world(text: Bytes) -> TestWorld = world_of([{ at: b"f", text: text }])
 
-fn shouted(a: Answered) -> List<Bytes> =
-  a.steps.filter(|s: Step| s.query == b"shout").map(|s: Step| s.input)
-
-test "a reader of one part is not recomputed when another part of the same fact changes" {
+test "a reader of one part reads what a build from nothing reads after another part of the same fact changes" {
   let q = line_queries();
   let first = fetched_in(q, lines_world(b"one\ntwo"), b"shout", b"f0");
   let second = fetched_in(q, first.world, b"shout", b"f1");
   assert_eq([first.output, second.output], [b"one!", b"two!"]);
-  let edit = fetched_in(q, edited(second.world, b"f", b"one\nTWO"), b"shout", b"f0");
+  let edit = agreed(q, edited(second.world, b"f", b"one\nTWO"), b"shout", b"f0");
   assert_eq(edit.output, b"one!");
-  assert_eq(shouted(edit), [b"f1"])
+  assert_eq(agreed(q, edit.world, b"shout", b"f1").output, b"TWO!")
 }
 
-test "a reader that found no part is recomputed when the part appears" {
+test "a reader that found no part reads the part once it appears" {
   let q = line_queries();
   let first = fetched_in(q, lines_world(b"one"), b"shout", b"f1");
   assert_eq(first.output, b"no line!");
-  let grown = fetched_in(q, edited(first.world, b"f", b"one\ntwo"), b"shout", b"f2");
-  assert_eq(shouted(grown), [b"f1", b"f2"]);
-  assert_eq(fetched_in(q, grown.world, b"shout", b"f1").output, b"two!")
+  let grown = agreed(q, edited(first.world, b"f", b"one\ntwo"), b"shout", b"f2");
+  assert_eq(agreed(q, grown.world, b"shout", b"f1").output, b"two!")
 }
 
 test "a part its query stops returning is gone, and its readers see what a fresh build sees" {
   let q = line_queries();
   let first = fetched_in(q, lines_world(b"one\ntwo"), b"shout", b"f1");
-  let shorter = fetched_in(q, edited(first.world, b"f", b"one"), b"shout", b"f1");
-  assert_eq(shorter.output, b"no line!");
-  assert_eq(shorter.output, fetched_in(q, lines_world(b"one"), b"shout", b"f1").output)
+  assert_eq(agreed(q, edited(first.world, b"f", b"one"), b"shout", b"f1").output, b"no line!")
 }
 
 fn gated(input: Bytes) -> Bytes / {memo.read, abort.raise} =
@@ -1036,7 +1167,7 @@ test "a fact that nothing uses any more is deleted" {
   let q = gated_queries();
   let first = fetched_in(q, world_of([{ at: b"gate", text: b"open" }]), b"gated", b"x");
   let closed = fetched_in(q, edited(first.world, b"gate", b"shut"), b"gated", b"x");
-  assert_eq(fetched_in(q, edited(closed.world, b"inner", b"new"), b"gated", b"x").ran, [])
+  same_facts(closed, fetched_in(q, from_nothing(closed.world), b"gated", b"x"))
 }
 
 fn guarded(input: Bytes) -> Bytes / {memo.read, abort.raise} =
@@ -1057,12 +1188,7 @@ test "a recomputation that fails deletes its fact, and the run ends as a build f
   assert_eq(first.output, b"walked");
   let looped = fetched_in(q, edited(first.world, b"cycle", b"yes"), b"guard", b"x");
   assert_eq(looped.output, b"reported");
-  assert_eq(
-    facts_in_memory(looped.world.store),
-    facts_in_memory(
-      fetched_in(q, world_of([{ at: b"cycle", text: b"yes" }]), b"guard", b"x").world.store,
-    ),
-  )
+  same_facts(looped, fetched_in(q, from_nothing(looped.world), b"guard", b"x"))
 }
 
 fn ring_a(input: Bytes) -> Bytes / {memo.read, abort.raise} =
@@ -1081,7 +1207,7 @@ test "a query that asks for its own result fails after an edit as it fails in a 
   let tried = |w: TestWorld|
     handle { Some(fetched_in(q, w, b"b", b"x").output) } with { abort.raise(_) -> None };
   assert_eq(tried(ringed), None);
-  assert_eq(tried({ ..ringed, store: fs::mem_empty() }), None)
+  assert_eq(tried(from_nothing(ringed)), None)
 }
 
 fn cascading(input: Bytes) -> Bytes / {memo.read, abort.raise} =
@@ -1092,15 +1218,13 @@ const hash_kind: Option<Product> = Some({ kind: b"hash", after: [] })
 fn product_queries() -> Map<Bytes, Query<| {}>> =
   lengths(b"h1").insert(b"hash", { ..query(b"hash", b"p1", cascading), product: hash_kind })
 
-test "an edit leaves a product alone until a command asks for it, and then updates it from the log" {
+test "a product asked for after an edit that another command read first comes out as a build from nothing makes it" {
   let q = product_queries();
   let first = fetched_in(q, four(), b"hash", b"a");
-  let moved = fetched_in(q, edited(first.world, b"a", b"forty"), b"length", b"a");
-  assert_eq(moved.ran, [b"length"]);
-  let later = fetched_in(q, moved.world, b"hash", b"a");
-  assert_eq(later.ran, [b"hash"]);
+  let moved = agreed(q, edited(first.world, b"a", b"forty"), b"length", b"a");
+  let later = agreed(q, moved.world, b"hash", b"a");
   assert_eq(later.output, blake3(b"5"));
-  assert_eq(fetched_in(q, later.world, b"hash", b"a").ran, [])
+  agreed(q, later.world, b"hash", b"a")
 }
 
 fn doc_of(input: Bytes) -> Bytes / {memo.read, abort.raise} =
@@ -1112,69 +1236,57 @@ fn two_kinds() -> Map<Bytes, Query<| {}>> =
     product: Some({ kind: b"doc", after: [] }),
   })
 
-test "each kind of product catches up by itself, so asking for one leaves the other behind" {
+test "each kind of product catches up by itself, and each comes out as a build from nothing makes it" {
   let q = two_kinds();
   let hashed = fetched_in(q, four(), b"hash", b"a");
   let both = fetched_in(q, hashed.world, b"doc", b"a");
-  let moved = fetched_in(q, edited(both.world, b"a", b"forty"), b"hash", b"a");
-  assert_eq(moved.ran, [b"length", b"hash"]);
-  assert_eq(fetched_in(q, moved.world, b"doc", b"a").ran, [b"doc"])
+  let moved = agreed(q, edited(both.world, b"a", b"forty"), b"hash", b"a");
+  assert_eq(agreed(q, moved.world, b"doc", b"a").output, b"doc 5")
 }
 
-test "a product whose code changed runs when a command asks for it" {
+test "a product whose code changed comes out as a build from nothing makes it" {
   let labelled = fetched_in(product_queries(), four(), b"label", b"a");
   let first = fetched_in(product_queries(), labelled.world, b"hash", b"a");
   let q = lengths(b"h1").insert(b"hash", {
-    ..query(b"hash", b"p2", cascading),
+    ..query(b"hash", b"p2", |input: Bytes| blake3(b"again ".concat(fetched_main(b"length", input)))),
     product: hash_kind,
   });
-  assert_eq(fetched_in(q, first.world, b"length", b"a").ran, []);
-  assert_eq(fetched_in(q, first.world, b"hash", b"a").ran, [b"hash"])
+  let length = agreed(q, first.world, b"length", b"a");
+  assert_eq(agreed(q, length.world, b"hash", b"a").output, blake3(b"again 4"))
 }
 
 fn over_two(input: Bytes) -> Bytes / {memo.read, abort.raise} =
   Bytes::concat_all([fetched_main(b"length", input), fetched_main(b"label", input)])
 
-test "a query with two paths to a change runs once, after both paths" {
+test "a query with two paths to a change comes out as a build from nothing makes it" {
   let q = lengths(b"h1").insert(b"both", query(b"both", b"b1", over_two));
   let first = fetched_in(q, four(), b"both", b"a");
-  let moved = fetched_in(q, edited(first.world, b"a", b"forty"), b"both", b"a");
-  assert_eq(moved.output, b"5long 5");
-  assert_eq(moved.ran, [b"length", b"label", b"both"])
+  assert_eq(agreed(q, edited(first.world, b"a", b"forty"), b"both", b"a").output, b"5long 5")
 }
 
 fn shout_text(input: Bytes) -> Bytes / {memo.read, abort.raise} =
   fetched_main(b"text", input).concat(b"!")
 
+fn unkept_shout() -> Map<Bytes, Query<| {}>> =
+  Map::new().insert(b"text", { ..query(b"text", b"t1", read_file), persistent: false }).insert(
+    b"shout",
+    query(b"shout", b"o1", shout_text),
+  )
+
 test "a result that is not stored is computed again, even when an earlier version of its fact would hold" {
   let long = b"long ".repeat(1000);
   let longer = b"longer ".repeat(1000);
-  let q = Map::new().insert(b"text", {
-    ..query(b"text", b"t1", read_file),
-    persistent: false,
-  }).insert(
-    b"shout",
-    query(b"shout", b"o1", shout_text),
-  );
+  let q = unkept_shout();
   let first = fetched_in(q, world_of([{ at: b"a", text: long }]), b"shout", b"a");
   let moved = fetched_in(q, edited(first.world, b"a", longer), b"shout", b"a");
-  let undone = fetched_in(q, edited(moved.world, b"a", long), b"shout", b"a");
-  assert_eq(undone.output, long.concat(b"!"))
+  assert_eq(agreed(q, edited(moved.world, b"a", long), b"shout", b"a").output, long.concat(b"!"))
 }
 
 test "a large result of a query that does not keep its results is computed again when needed" {
   let long = b"long ".repeat(1000);
-  let q = Map::new().insert(b"text", {
-    ..query(b"text", b"t1", read_file),
-    persistent: false,
-  }).insert(
-    b"shout",
-    query(b"shout", b"o1", shout_text),
-  );
+  let q = unkept_shout();
   let first = fetched_in(q, world_of([{ at: b"a", text: long }]), b"shout", b"a");
-  let text = fetched_in(q, first.world, b"text", b"a");
-  assert_eq(text.output, long);
-  assert_eq(text.ran, [b"text"])
+  assert_eq(fetched_in(q, first.world, b"text", b"a").output, long)
 }
 
 test "a fact in a trusted pack is used as it is, and a project records what it used" {
@@ -1184,20 +1296,16 @@ test "a fact in a trusted pack is used as it is, and a project records what it u
   let pack = pack_in_memory(
     source.store,
     facts_in_memory(source.store).keys(),
-    memo::queries_id(qs),
+    queries_id(qs),
     b"files",
   );
   let read = |path: String, offset: Int, len: Int| packs::frame_in(Some(pack), path, offset, len);
   let done = with_store_in_memory(fs::mem_empty(), read, b"files", |_: Bytes, _: Bytes| None, ||
-    in_session(qs, |run: Run| {
-      let a = query_output(qs, run, b"label", b"a");
-      { run: a.run, value: { output: a.output, ran: a.run.inputs.map(|s: Step| s.query) } }
-    }));
-  assert_eq(done.value, { output: b"long 4", ran: [b"label"] });
-  assert_eq(
-    inputs_in_memory(done.tree).map(|i: StoredInput|
+    in_session_of(qs, b"label", b"a"));
+  assert_eq(done.value, b"long 4");
+  assert(
+    inputs_in_memory(done.tree).any(|i: StoredInput|
       match i { SealedInput(_) -> true, ExternalInput(_) -> false }),
-    [true],
   )
 }
 
@@ -1208,7 +1316,7 @@ test "a fact that used a sealed fact is recomputed when a new pack changes that 
     let written = pack_in_memory(
       built.store,
       facts_in_memory(built.store).keys(),
-      memo::queries_id(plain_queries(q)),
+      queries_id(plain_queries(q)),
       files,
     );
     |path: String, offset: Int, len: Int| packs::frame_in(Some(written), path, offset, len)
@@ -1254,11 +1362,6 @@ fn batched(
 const three_files: List<{ at: Bytes, text: Bytes }> =
   [{ at: b"a", text: b"four" }, { at: b"b", text: b"seven" }, { at: b"c", text: b"ten" }]
 
-fn same_facts(a: Answered, b: Answered) -> Unit / {abort.raise} = {
-  assert_eq(a.output, b.output);
-  assert_eq(facts_in_memory(a.world.store), facts_in_memory(b.world.store))
-}
-
 test "facts fetched together store the outputs and reads that fetching them one at a time stores" {
   let w = world_of(three_files);
   let apart = fetched_in(batched(together), w, b"lengths", b"a,b,c");
@@ -1271,10 +1374,7 @@ test "facts of one depth recomputed together after an edit end as a build from n
   let moved = edited(edited(first.world, b"a", b"forty"), b"c", b"eleven");
   let after = fetched_in(batched(together), moved, b"lengths", b"a,b,c");
   assert_eq(after.output, b"5,5,6");
-  same_facts(
-    after,
-    fetched_in(batched(together), { ..moved, store: fs::mem_empty() }, b"lengths", b"a,b,c"),
-  )
+  same_facts(after, fetched_in(batched(together), from_nothing(moved), b"lengths", b"a,b,c"))
 }
 
 test "a fact fetched together whose body needs a fact not yet computed still comes out right" {

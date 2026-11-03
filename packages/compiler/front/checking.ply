@@ -5,11 +5,12 @@ import std.bytes
 import std.list
 import std.fs
 import std.fs (fs)
-import compiler.store.memo
-import compiler.store.memo (memo, Run, reading, in_session, Product, main_only, main_part,
-                            reachable_keys)
-import compiler.store.handles (fetched, all_fetched)
-import compiler.store.memo_files
+import compiler.store.memo (memo, Product, main_only, main_part)
+import compiler.store.handles (fetch, fetch_all)
+import compiler.store.database
+import compiler.store.database (WriteLimit, Finished, Stopped, Stored, NotKept)
+import compiler.store.memo.store (QueriesId, queries_id)
+import compiler.store.memo.engine (Run, reading, in_session, reachable_keys)
 import compiler.store.packs
 import compiler.unit (definition_hash)
 import compiler.front.owner_checks
@@ -266,7 +267,7 @@ pub fn listed_module(named: ModuleKey) -> CheckedModule / {memo.read, abort.rais
   else { { module: named.module, result: listed_result(named) } }
 
 pub fn module_of(named: ModuleKey) -> CheckedModule / {memo.read, abort.raise} =
-  { module: named.module, result: fetched(module_query(), named) }
+  { module: named.module, result: fetch(module_query(), named) }
 
 pub fn query_load(
   own: List<Bytes>,
@@ -400,9 +401,9 @@ pub fn check_shipped_modules(
   let rejected = dependency_levels(
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
   ).levels.fold([], |accumulator: List<CheckedModule>, level: List<ModuleKey>| {
-    all_fetched(hashes_query(), level);
-    all_fetched(wanted_files_query(), level);
-    all_fetched(module_listing_query(), level);
+    fetch_all(hashes_query(), level);
+    fetch_all(wanted_files_query(), level);
+    fetch_all(module_listing_query(), level);
     level.fold(accumulator, |found: List<CheckedModule>, named: ModuleKey|
       if module_rejected(named) { found.push(module_of(named)) } else { found })
   });
@@ -417,17 +418,17 @@ pub fn wanted_all(
   pulled.fold(Map::new(), |accumulator: Map<Bytes, ShippedWants>, m: Bytes|
     accumulator.insert(
       m,
-      fetched(wanted_files_query(), { module: m, shipped: true, tested: tested }),
+      fetch(wanted_files_query(), { module: m, shipped: true, tested: tested }),
     ))
 
 pub fn documented_all(modules: List<ModuleKey>) -> List<Pages> / {memo.read, abort.raise} =
-  modules.map(|named: ModuleKey| fetched(documented_query(), named))
+  modules.map(|named: ModuleKey| fetch(documented_query(), named))
 
 pub fn declaring_in(package: Bytes) -> Map<Bytes, List<Bytes>> / {memo.read, abort.raise} =
-  fetched(declaring_query(), package)
+  fetch(declaring_query(), package)
 
 fn imports_of_key(named: ModuleKey) -> List<ImportOf> / {memo.read, abort.raise} =
-  fetched(imports_query(), named).imports
+  fetch(imports_query(), named).imports
 
 fn dependencies_first(
   modules: List<ModuleKey>,
@@ -494,7 +495,7 @@ pub fn hashed_all(
   )
 
 pub fn module_hashes(named: ModuleKey) -> ModuleHashes / {memo.read, abort.raise} = {
-  let h = fetched(hashes_query(), named);
+  let h = fetch(hashes_query(), named);
   { record: h.record, own: h.own }
 }
 
@@ -632,7 +633,7 @@ pub fn over_decoding<a | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {RunEffects, abort.raise},
 ) -> { store: fs::MemFs, value: a } / {abort.raise | e} = {
-  let done = memo_files::with_store_in_memory(store, read, world, look, || with_decode_cache(work));
+  let done = database::with_store_in_memory(store, read, world, look, || with_decode_cache(work));
   { store: done.tree, value: done.value }
 }
 
@@ -680,10 +681,10 @@ pub fn queried_under(
 
 pub const prelude_files: Bytes = b"the shipped files"
 
-pub const prelude_pack: Option<packs::PackFiles> = shipped_pack([])
+pub const prelude_pack: packs::PackFiles = shipped_pack([])
 
 pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} =
-  packs::frame_in(prelude_pack, path, offset, len)
+  packs::frame_in(Some(prelude_pack), path, offset, len)
 
 pub fn read_over<a>(
   sources: List<Source>,
@@ -813,13 +814,13 @@ fn queried_in(
   };
   let done = fs::on_mem[abs](tree, ||
     handle {
-      memo_files::with_memo_store[abs](
+      database::with_database[abs](
         "s",
         prelude_frames,
         prelude_files,
         |kind: Bytes, at: Bytes| {
           if raced.is_first_lookup() {
-            memo_files::with_memo_store[abs](
+            database::with_database[abs](
               "s",
               prelude_frames,
               prelude_files,
@@ -850,22 +851,24 @@ fn queried_in(
   }
 }
 
-pub fn stopped_over(
+pub fn checked_with_write_limit(
   store: fs::MemFs,
   sources: List<Source>,
-  writes: Int,
+  limit: WriteLimit,
 ) -> fs::MemFs / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry();
-  fs::on_mem_failing[abs](store, writes, ||
-    memo_files::with_memo_store[abs](
-      memo_files::memory_dir,
+  match database::with_writes_limited(
+      store,
+      limit,
       prelude_frames,
       prelude_files,
       |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-      |_: Bytes| (),
       || with_decode_cache(|| query_alone(qs, w).own_hashes),
-    )).tree
+    ) {
+    Finished(ran) -> ran.tree,
+    Stopped(stopped) -> stopped.tree,
+  }
 }
 
 effect raced {
@@ -891,23 +894,33 @@ test "every query whose results the toolchain ships caches its results" {
   assert_eq(shipped_queries.filter(|n: Bytes| digest_only_queries.contains(n)), [])
 }
 
+fn kept_outputs(
+  store: fs::MemFs,
+  digests: List<Bytes>,
+) -> List<Bytes> / {abort.raise} =
+  database::outputs_in_memory(store, digests).values().flat_map(|o: database::StoredOutput|
+    match o { Stored(bytes) -> [bytes], NotKept -> [] })
+
 fn stored_results(name: Bytes) -> List<Bytes> / {abort.raise} = {
   let store = check_sources(
     fs::mem_empty(),
     layered(b"pub fn step(n: Int) -> Int = n + 1\n"),
     [],
   ).store;
-  let digests = memo_files::facts_in_memory(store).values().flat_map(|r: memo_files::FactRecord|
+  let digests = database::facts_in_memory(store).values().flat_map(|r: database::FactRecord|
     if r.query != name { [] } else { match r.parts.get(main_part) { Some(d) -> [d], None -> [] } });
-  memo_files::outputs_in_memory(store, digests).values()
+  let outputs = database::outputs_in_memory(store, digests).values();
+  outputs.map(|o: database::StoredOutput|
+    match o {
+      Stored(bytes) -> bytes,
+      NotKept -> panic("a result of a query that keeps its results is not stored"),
+    })
 }
 
 fn stored_outputs(store: fs::MemFs) -> List<Bytes> / {abort.raise} =
-  memo_files::outputs_in_memory(
+  kept_outputs(
     store,
-    memo_files::facts_in_memory(store).values().flat_map(|r: memo_files::FactRecord|
-      r.parts.values()),
-  ).values(
+    database::facts_in_memory(store).values().flat_map(|r: database::FactRecord| r.parts.values()),
   )
 
 fn results_round_trip<a>(results: List<Bytes>, codec: bin::BinCodec<a>) -> Bool / {abort.raise} =
@@ -1016,7 +1029,7 @@ fn session_over_embeds<[r]>(
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest| embed_from_files[r](want);
   let qs = fresh_registry();
-  memo_files::with_memo_store[r](
+  database::with_database[r](
     "s",
     packs::no_pack,
     b"",
@@ -1061,7 +1074,7 @@ pub fn check_sources(
   shipped: List<Source>,
   derived: (Bytes, Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> CheckedSources / {abort.raise} =
-  check_with_pack(store, prelude_pack, sources, shipped, derived: derived)
+  check_with_pack(store, Some(prelude_pack), sources, shipped, derived: derived)
 
 pub fn check_with_pack(
   store: fs::MemFs,
@@ -1144,7 +1157,7 @@ pub fn check_under(
 }
 
 effect fetching {
-  write fetched(b: Bytes) -> Unit
+  write fetch(b: Bytes) -> Unit
 }
 
 pub fn layered(lib: Bytes) -> List<Source> =
@@ -1224,26 +1237,35 @@ test "a group that calls a group with a type error is checked against its writte
   )
 }
 
-type ShippedStore = { store: fs::MemFs, keys: List<Bytes>, rejected: List<CheckedModule> }
+type ShippedStore = {
+  store: fs::MemFs,
+  queries: QueriesId,
+  keys: List<Bytes>,
+  rejected: List<CheckedModule>,
+}
 
 fn shipped_store(shipped: List<Source>) -> ShippedStore / {abort.raise} = {
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   let wanted = Set::of_list(shipped_queries);
+  let qs = fresh_registry();
   let done = over_decoding(
     fs::mem_empty(),
     packs::no_pack,
     b"",
     |kind: Bytes, at: Bytes| lookup_input_shipping(nowhere, shipped, kind, at),
-    || {
-      let qs = fresh_registry();
+    ||
       in_session(qs, |run: Run| {
         let all = reading(qs, run, ||
           check_shipped_modules(with_prelude_source(shipped).map(|s: Source| s.name)));
         { run: all.run, value: { keys: reachable_keys(qs, wanted, all.run), rejected: all.value } }
-      })
-    },
+      }),
   );
-  { store: done.store, keys: done.value.keys, rejected: done.value.rejected }
+  {
+    store: done.store,
+    queries: queries_id(qs),
+    keys: done.value.keys,
+    rejected: done.value.rejected,
+  }
 }
 
 test "computing the shipped modules' results names each one that fails" {
@@ -1281,16 +1303,9 @@ test "a compiler module imports another below the compiler's root by its full na
   )
 }
 
-pub fn shipped_pack(shipped: List<Source>) -> Option<packs::PackFiles> / {abort.raise} = {
+pub fn shipped_pack(shipped: List<Source>) -> packs::PackFiles / {abort.raise} = {
   let built = shipped_store(shipped);
-  Some(
-    memo_files::pack_in_memory(
-      built.store,
-      built.keys,
-      memo::queries_id(fresh_registry()),
-      prelude_files,
-    ),
-  )
+  database::pack_in_memory(built.store, built.keys, built.queries, prelude_files)
 }
 
 test "a module whose text fails to parse outside its items is rejected with the parse error" {
@@ -1508,7 +1523,7 @@ test "a program checked over a prebuilt store of shipped results gives the resul
   let user = [
     { name: b"main", source_text: b"import std.pair (both)\npub fn main() -> Bool = both(3)\n" },
   ];
-  let load = check_with_pack(fs::mem_empty(), shipped_pack(shipped), user, shipped);
+  let load = check_with_pack(fs::mem_empty(), Some(shipped_pack(shipped)), user, shipped);
   assert_eq(load.results, check_sources(fs::mem_empty(), user, shipped).results)
 }
 

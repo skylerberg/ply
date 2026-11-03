@@ -1,5 +1,6 @@
 import std.fs (fs, mem_empty)
-import compiler.store.memo_files
+import std.set (Set)
+import compiler.store.database
 import fake (run_in_memory)
 
 pub const key_width: Int = 32
@@ -13,7 +14,7 @@ pub type Store = {
   schema: Bytes,
   rows: Map<Bytes, Bytes>,
   puts: Map<Bytes, Bytes>,
-  deleted: Map<Bytes, Bool>,
+  deleted: Set<Bytes>,
   warnings: List<Warning>,
 }
 
@@ -29,25 +30,25 @@ pub fn warn(store: Store, trouble: WarningKind, message: String) -> Store =
 fn add_warning(ws: List<Warning>, w: Warning) -> List<Warning> =
   if ws.fold(false, |seen: Bool, x: Warning| seen || x == w) { ws } else { ws.push(w) }
 
-pub fn unreadable_store(reason: String) -> String =
-  "the store is unreadable (" ++ reason ++ "); this run starts empty"
+pub fn damaged_store(reason: String) -> Warning =
+  { kind: Corrupt, message: "the store is unreadable (" ++ reason ++ "); this run starts empty" }
 
 pub fn messages(ws: List<Warning>) -> List<String> = ws.map(|w: Warning| w.message)
 
 fn store_of(dir: String, schema: Bytes, rows: Map<Bytes, Bytes>) -> Store =
-  { dir: dir, schema: schema, rows: rows, puts: Map::new(), deleted: Map::new(), warnings: [] }
+  { dir: dir, schema: schema, rows: rows, puts: Map::new(), deleted: Set::empty(), warnings: [] }
 
 pub fn open<[r]>(dir: String, schema: Bytes) -> Store / {fs.read[r], abort.raise} =
-  match memo_files::records[r](dir) {
-    Err(reason) -> warn(store_of(dir, schema, Map::new()), Corrupt, unreadable_store(reason)),
+  match database::read_records[r](dir) {
+    Err(reason) -> { ..store_of(dir, schema, Map::new()), warnings: [damaged_store(reason)] },
     Ok(rows) -> if rows.get(schema_slot) == Some(schema) || rows.remove(schema_slot).len() == 0 {
       store_of(dir, schema, rows.remove(schema_slot))
     } else {
       warn(
         {
           ..store_of(dir, schema, Map::new()),
-          deleted: rows.fold(Map::new(), |found: Map<Bytes, Bool>, sl: Bytes, _: Bytes|
-            found.insert(sl, true)),
+          deleted: rows.fold(Set::empty(), |found: Set<Bytes>, sl: Bytes, _: Bytes|
+            found.insert(sl)),
         },
         OtherVersion,
         "the store was written by another version; this run starts empty",
@@ -68,14 +69,13 @@ pub fn contains_key(store: Store, table: Int, key: Bytes) -> Bool / {abort.raise
   match get(store, table, key) { Hit(_) -> true, _ -> false }
 
 pub fn keys(store: Store, table: Int) -> List<Bytes> / {abort.raise} = {
-  let in_table = |found: Map<Bytes, Bool>, sl: Bytes|
-    if sl.at(0) == table && !store.deleted.contains(sl) {
-      found.insert(sl.slice(1, sl.len()), true)
-    } else { found };
+  let in_table = |found: Set<Bytes>, sl: Bytes|
+    if sl.at(0) == table && !store.deleted.contains(sl) { found.insert(sl.slice(1, sl.len())) }
+    else { found };
   store.puts.fold(
-    store.rows.fold(Map::new(), |found: Map<Bytes, Bool>, sl: Bytes, _: Bytes| in_table(found, sl)),
-    |found: Map<Bytes, Bool>, sl: Bytes, _: Bytes| in_table(found, sl),
-  ).keys(
+    store.rows.fold(Set::empty(), |found: Set<Bytes>, sl: Bytes, _: Bytes| in_table(found, sl)),
+    |found: Set<Bytes>, sl: Bytes, _: Bytes| in_table(found, sl),
+  ).elements(
   )
 }
 
@@ -102,10 +102,10 @@ pub fn put(store: Store, table: Int, key: Bytes, payload: Bytes) -> Store / {abo
 
 pub fn drop(store: Store, table: Int, key: Bytes) -> Store / {abort.raise} = {
   let sl = checked_slot(table, key);
-  { ..store, puts: store.puts.remove(sl), deleted: store.deleted.insert(sl, true) }
+  { ..store, puts: store.puts.remove(sl), deleted: store.deleted.insert(sl) }
 }
 
-pub fn pending_count(store: Store) -> Int = store.puts.len() + store.deleted.len()
+pub fn pending_count(store: Store) -> Int = store.puts.len() + store.deleted.size()
 
 pub type Row = { slot: Bytes, payload: Bytes }
 
@@ -113,7 +113,7 @@ pub fn pending_rows(store: Store) -> List<Row> =
   store.puts.fold([], |rows: List<Row>, sl: Bytes, payload: Bytes|
     rows.push({ slot: sl, payload: payload }))
 
-pub fn without_pending(store: Store) -> Store = { ..store, puts: Map::new(), deleted: Map::new() }
+pub fn without_pending(store: Store) -> Store = { ..store, puts: Map::new(), deleted: Set::empty() }
 
 pub fn with_rows(store: Store, rows: List<Row>) -> Store / {abort.raise} =
   rows.fold(store, |s: Store, row: Row|
@@ -122,7 +122,7 @@ pub fn with_rows(store: Store, rows: List<Row>) -> Store / {abort.raise} =
 
 pub fn flush<[r]>(store: Store) -> Store / {fs.read[r], fs.write[r], abort.raise} =
   if pending_count(store) == 0 { store } else {
-    match memo_files::records_written[r](
+    match database::write_records[r](
         store.dir,
         store.puts.insert(schema_slot, store.schema),
         store.deleted,
