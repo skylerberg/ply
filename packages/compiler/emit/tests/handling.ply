@@ -37,8 +37,8 @@ import compiler.emit.typed_ir.handling (HandleOperation, HandleSite, Clause, Per
                                         AllocateForwarding, SetForwarding, ObjectAt,
                                         InstanceAddress, SchedulerEvidence, ClauseSlot, KeyedSlot,
                                         ReturnsResult, Resumes, Suspends, ForwardedSlot, Returning,
-                                        VariableInitialize, VariableRead, VariableWrite,
-                                        raise_offset, task_offset)
+                                        VariableInitialize, VariableRead, VariableTake,
+                                        VariableWrite, raise_offset, task_offset)
 import compiler.emit.typing (SiteType, unknown_type)
 import compiler.check.infer.checker (prelude_effects, EffectInfo, OperationInfo, Builtin, builtins,
                                      elsewhere)
@@ -716,6 +716,7 @@ fn variable_operations(body: List<Instruction>) -> List<Bytes> =
       Some(OperationCall(o)) -> match o.operation {
         OfHandling(VariableInitialize(_)) -> accumulator.push(b"init"),
         OfHandling(VariableRead(_)) -> accumulator.push(b"read"),
+        OfHandling(VariableTake(_)) -> accumulator.push(b"take"),
         OfHandling(VariableWrite(_)) -> accumulator.push(b"write"),
         _ -> accumulator,
       },
@@ -1944,6 +1945,58 @@ test "a `handle` reads and writes each handler variable and its result in its st
             assert(0 <= linked && linked < unlinked && unlinked < released, message)
           },
         }),
+  }
+}
+
+const tally_updates: Bytes =
+  Bytes::concat_all([
+    b"effect counting {\n  write bump(i: Int) -> Unit\n}\n",
+    b"effect clock {\n  read now() -> Int\n}\n",
+    b"type Tally = { count: Int, seen: List<Int> }\n",
+    b"fn quiet() -> Tally = handle { counting.bump(1); counting.bump(2) } with { var t: Tally = { count: 0, seen: [] }, counting.bump(i) -> { t = { ..t, count: t.count + i, seen: t.seen.push(i) }; }, return u -> t }\n",
+    b"fn waiting() -> Tally / {clock.now} = handle { counting.bump(1); counting.bump(2) } with { var t: Tally = { count: 0, seen: [] }, counting.bump(i) -> { t = { ..t, count: t.count + clock.now(), seen: t.seen.push(i) }; }, return u -> t }\n",
+  ])
+
+fn clause_variable_operations(p: Program, name: Bytes) -> List<List<Bytes>> / {abort.raise} =
+  lowered_root(p, name).lambdas.map(|l: typed_ir::Lambda|
+    match l { Closure(c) -> variable_operations(c.body.body) })
+
+fn printed_or_reason(p: Program, name: Bytes) -> Bytes / {abort.raise} =
+  match printed_by_ir(p, name) { Ok(text) -> text, Err(reason) -> reason }
+
+test "an assignment whose value performs nothing takes the handler variable out of its cell, so the clause updates it without sharing it" {
+  match program_of(tally_updates) {
+    Err(reason) -> assert_eq(reason, b""),
+    Ok(p) ->
+      over_program(p, || {
+        let taking = clause_variable_operations(p, b"quiet").filter(|ops: List<Bytes>|
+          ops.contains(b"take"));
+        let refilled = |ops: List<Bytes>| ops.contains(b"init") && !ops.contains(b"read");
+        assert_eq(taking.map(refilled), [true]);
+        let shared = b")->inc(ctx, ";
+        let quiet = printed_or_reason(p, b"quiet");
+        let waiting = printed_or_reason(p, b"waiting");
+        assert(
+          occurrences(quiet, shared) < occurrences(waiting, shared),
+          Some(String::of_bytes_lossy(quiet)),
+        )
+      }),
+  }
+}
+
+test "an assignment whose value performs an operation reads the handler variable shared and writes it back, since the operation could wait and let another task read the variable" {
+  match program_of(tally_updates) {
+    Err(reason) -> assert_eq(reason, b""),
+    Ok(p) ->
+      over_program(p, || {
+        let operations = clause_variable_operations(p, b"waiting");
+        assert_eq(operations.filter(|ops: List<Bytes>| ops.contains(b"take")), []);
+        assert_eq(
+          operations.filter(|ops: List<Bytes>| ops.contains(b"write")).map(|ops: List<Bytes>|
+            ops.contains(b"read")),
+          [true],
+        )
+      }),
   }
 }
 
