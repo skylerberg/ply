@@ -1,3 +1,4 @@
+import compiler.front.checking (analysed_over)
 import std.set (Set)
 import compiler.codes (internal_error_code)
 import builder (Rejection)
@@ -10,12 +11,11 @@ import compiler.cc (toolchain)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected, RootPlace, checked_program_of)
 import compiler.front.facts (ProgramListing, listing_of)
-import compiler.front.published (analyse)
 import compiler.front.rows (DeclaredEffect, Outline, OutlineItem, OutlinedFunction, OutlinedTest,
                             OutlinedLaw, OutlinedType, OutlinedEffect)
 import compiler.syntax.items (Visibility, Public, Private)
 import compiler.store.hash.forms (ClosureEntry, HashOutput, NodeRef, by_name, build_closure, walk,
-                                  definition_key)
+                                  definition_key, FramedBody, framed_body_bin)
 import compiler.store.hash.graph (HeldEffect, HeldKind, HeldType, HeldValue)
 import compiler.store.hash.printer (Printed, Unprintable, PrintedDefinition, DefinitionRole,
                                     WrittenWith, FromShippedModule, print_bodies)
@@ -149,10 +149,10 @@ pub const bound_digest: Bytes =
 fn header_of(entry: Bytes) -> Header / {shipped.definitions, abort.raise} =
   { frontend: frontend(), runtime: bound_digest, entry: entry }
 
-fn bodies_by_name(h: HashOutput) -> Map<Bytes, List<Bytes>> / {abort.raise} =
+fn bodies_by_name(h: HashOutput) -> Map<Bytes, List<FramedBody>> / {abort.raise} =
   h.bodies.fold(
     Map::new(),
-    |accumulator: Map<Bytes, List<Bytes>>, b: { name: Bytes, body: Bytes }|
+    |accumulator: Map<Bytes, List<FramedBody>>, b: { name: Bytes, body: FramedBody }|
       if body_key(b.body) == None { accumulator } else {
         accumulator.insert(
           b.name,
@@ -161,10 +161,10 @@ fn bodies_by_name(h: HashOutput) -> Map<Bytes, List<Bytes>> / {abort.raise} =
       },
   )
 
-fn body_for_hash(stored: List<Bytes>, hash: Bytes) -> Option<Bytes> / {abort.raise} =
+fn body_for_hash(stored: List<FramedBody>, hash: Bytes) -> Option<FramedBody> / {abort.raise} =
   match stored {
     [only] -> Some(only),
-    many -> match many.filter(|b: Bytes| body_key(b) == Some(hash)) {
+    many -> match many.filter(|b: FramedBody| body_key(b) == Some(hash)) {
       [b, ..] -> Some(b),
       [] -> None,
     },
@@ -172,9 +172,9 @@ fn body_for_hash(stored: List<Bytes>, hash: Bytes) -> Option<Bytes> / {abort.rai
 
 type NamedHash = { name: Bytes, hash: Bytes }
 
-fn bodies_of(h: HashOutput, pairs: List<NamedHash>) -> Map<Bytes, Bytes> / {abort.raise} = {
+fn bodies_of(h: HashOutput, pairs: List<NamedHash>) -> Map<Bytes, FramedBody> / {abort.raise} = {
   let stored = bodies_by_name(h);
-  pairs.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, pair: NamedHash|
+  pairs.fold(Map::new(), |accumulator: Map<Bytes, FramedBody>, pair: NamedHash|
     match stored.get(pair.name) {
       None -> accumulator,
       Some(bodies) -> match body_for_hash(bodies, pair.hash) {
@@ -275,7 +275,7 @@ type PrintedEntries = { definitions: List<PrintedDefinition>, unknown: List<Byte
 fn printed_files(
   outlines: List<Outline>,
   closure_entries: List<ClosureEntry>,
-  bodies: Map<Bytes, Bytes>,
+  bodies: Map<Bytes, FramedBody>,
 ) -> Result<List<SourceFile>, Diagnostic> / {shipped.names, abort.raise} = {
   let shipped_names = shipped.names().fold(Set::empty(), |accumulator: Set<Bytes>, n: String|
     accumulator.insert(Bytes::of_string(n)));
@@ -361,13 +361,15 @@ fn closures_of(closure_entries: List<ClosureEntry>) -> List<Dependencies> / {abo
   )
 }
 
-fn bodies_section(bodies: Map<Bytes, Bytes>) -> Section =
+fn bodies_section(bodies: Map<Bytes, FramedBody>) -> Section / {abort.raise} =
   {
     name: b"bodies",
     count: bodies.keys().len(),
     payload: Bytes::concat_all(
-      bodies.fold([], |accumulator: List<Bytes>, h: Bytes, b: Bytes|
-        accumulator.push(Bytes::concat_all([h, u32_le(b.len()), b]))),
+      bodies.fold([], |accumulator: List<Bytes>, h: Bytes, body: FramedBody| {
+        let b = bin::encode(body, framed_body_bin());
+        accumulator.push(Bytes::concat_all([h, u32_le(b.len()), b]))
+      }),
     ),
   }
 
@@ -560,13 +562,13 @@ fn utf8(b: Bytes) -> Option<String> = {
   if Bytes::of_string(s) == b { Some(s) } else { None }
 }
 
-type BodiesCursor = { at: Int, by_hash: Map<Bytes, Bytes> }
+type BodiesCursor = { at: Int, by_hash: Map<Bytes, FramedBody> }
 
 fn read_bodies(
   path: String,
   b: Bytes,
   p: SectionLocation,
-) -> Result<Map<Bytes, Bytes>, Diagnostic> / {abort.raise} = {
+) -> Result<Map<Bytes, FramedBody>, Diagnostic> / {abort.raise} = {
   let end = p.at + p.len;
   let walked = range(0, p.count).fold(
     Ok({ at: p.at, by_hash: Map::new() }),
@@ -579,8 +581,25 @@ fn read_bodies(
             None -> Err(overrun_error(path, "definition", s.at)),
             Some(n) -> if s.at + 36 + n > end { Err(overrun_error(path, "definition", s.at)) }
             else {
-              let body = match b.slice_at(s.at + 36, n) { Some(x) -> x, None -> b"" };
-              if body_key(body) != Some(hash) {
+              let decoded = match b.slice_at(s.at + 36, n) {
+                Some(x) -> match bin::decode(x, framed_body_bin()) {
+                  Ok(body) -> Some(body),
+                  Err(_) -> None,
+                },
+                None -> None,
+              };
+              match decoded {
+                None ->
+                  Err(
+                    invalid_artifact(
+                      path,
+                      "the definition recorded under `" ++ short(hash) ++ "` at offset "
+                        ++ s.at.to_string()
+                        ++ " is not a stored body",
+                      [b"the artifact is corrupted"],
+                    ),
+                  ),
+                Some(body) -> if body_key(body) != Some(hash) {
                 Err(
                   invalid_artifact(
                     path,
@@ -596,7 +615,8 @@ fn read_bodies(
                 Err(
                   invalid_artifact(path, "the artifact carries `" ++ short(hash) ++ "` twice", []),
                 )
-              } else { Ok({ at: s.at + 36 + n, by_hash: s.by_hash.insert(hash, body) }) }
+              } else { Ok({ at: s.at + 36 + n, by_hash: s.by_hash.insert(hash, body) }) },
+              }
             },
           }
         },
@@ -990,7 +1010,7 @@ test "`path_of` maps a module name to its source file path, and `module_of` maps
 }
 
 fn listing_over(source: Bytes) -> ProgramListing / {abort.raise} =
-  match analyse(parse_all([{ name: b"m", source_text: source }])) {
+  match analysed_over([{ name: b"m", source_text: source }]) {
     Rejected(_) -> panic("the fixture checks"),
     Analysed(w) -> listing_of(checked_program_of(w)),
   }

@@ -1,10 +1,10 @@
 import std.set (Set)
 import compiler.codes (never_used_code)
-import compiler.store.hash.forms (framed_body, body_head, CallsResolved, CallsPending, Identities,
-                                  Identified, TestRun, TestListing, LawRun, LawProof, DefinitionRun,
-                                  DefinitionProof, DefinitionContract, InsidePackage,
+import compiler.store.hash.forms (Identities, Identified, TestRun, TestListing, LawRun, LawProof,
+                                  DefinitionRun, DefinitionProof, DefinitionContract, InsidePackage,
                                   OutsidePackage, Origin, FromSubject, FromDefinition,
-                                  hash_identities, identity_in, node_ref_bin)
+                                  hash_identities, identity_in, node_ref_bin, FramedBody,
+                                  ChosenCalls, PendingCalls)
 import compiler.syntax.parsing (Warning)
 import compiler.store.hash.graph (NodeElsewhere)
 import compiler.syntax.parsing (Span, span_bin, generated_span)
@@ -32,9 +32,8 @@ import compiler.store.hash.template (called_at, choice_at, test_template, law_te
                                      spec_template, type_template, new_encoder)
 import compiler.store.hash.fill (references, type_references)
 import compiler.store.hash.graph (HeldKind, HeldType, HeldEffect, HeldValue)
-import compiler.store.hash.forms (build_index, listed_refs, encoded_resolutions,
-                                  pending_resolutions_bin, HashOutput, Refs, single_body, HashInput,
-                                  NodeRef, OwnHashes, DefinitionHash, TestHash, LawHash,
+import compiler.store.hash.forms (build_index, listed_refs, HashOutput, Refs, single_body,
+                                  HashInput, NodeRef, OwnHashes, DefinitionHash, TestHash, LawHash,
                                   no_own_hashes, own_hashes, own_hash, index_forms, module_forms,
                                   filtered_forms, module_selection, selection_forms, joined_forms,
                                   own_hashes_of, node_kind, node_references, definition_key,
@@ -44,57 +43,24 @@ import compiler.store.hash.forms (build_index, listed_refs, encoded_resolutions,
                                   build_closure, by_name, of_key, module_record, module_record_bin,
                                   record_digest, recorded_graph, recorded_reachable_hashes,
                                   recorded_hashes, ReachableHashes)
-import compiler.store.hash.printer (envelope, picks_of, Printed, Unprintable, WrittenWith,
-                                    FromShippedModule, print_bodies)
+import compiler.store.hash.printer (Printed, Unprintable, WrittenWith, FromShippedModule,
+                                    print_bodies)
 
-pub fn body_key(body: Bytes) -> Option<Bytes> / {abort.raise} =
-  match envelope(body) { Some(e) -> Some(own_hash(body.slice(e.at, body.len()))), None -> None }
+pub fn body_key(body: FramedBody) -> Option<Bytes> =
+  match body.calls { ChosenCalls(_) -> Some(own_hash(body.form)), PendingCalls(_) -> None }
 
-pub fn checked_body(body: Bytes, resolved_calls: Map<CallSite, Choice>) -> Bytes / {abort.raise} =
-  match framed_body(body) {
-    None -> body,
-    Some(framed) -> match framed.calls {
-      CallsResolved -> body,
-      CallsPending -> {
-        let picks = match bin::decode(
-            body.slice(framed.picks, framed.at),
-            pending_resolutions_bin(),
-          ) {
-          Ok(p) -> p,
-          Err(_) -> panic("a malformed body"),
-        };
-        Bytes::concat_all([
-          body_head(CallsResolved),
-          encoded_resolutions(
-            picks.map(|p: CallResolution|
-              match p { Known(c) -> c, Pending(site) -> choice_at(resolved_calls, site) }),
-          ),
-          body.slice(framed.at, body.len()),
-        ])
+pub fn checked_body(body: FramedBody, resolved_calls: Map<CallSite, Choice>) -> FramedBody / {abort.raise} =
+  match body.calls {
+    ChosenCalls(_) -> body,
+    PendingCalls(picks) ->
+      {
+        ..body,
+        calls: ChosenCalls(
+          picks.map(|p: CallResolution|
+            match p { Known(c) -> c, Pending(site) -> choice_at(resolved_calls, site) }),
+        ),
       },
-    },
   }
-
-pub fn checked_hashes(
-  hashes: HashOutput,
-  sites: List<MemberSite>,
-  unread: Set<Bytes>,
-  unread_tests: Set<Bytes>,
-) -> HashOutput / {abort.raise} = {
-  let resolved_calls = called_at(sites);
-  {
-    ..hashes,
-    bodies: hashes.bodies.map(|b: { name: Bytes, body: Bytes }|
-      if unread.contains(b.name) { b }
-      else { { name: b.name, body: checked_body(b.body, resolved_calls) } }),
-    test_bodies: hashes.test_bodies.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, Bytes>, k: Bytes, b: Bytes|
-        accumulator.insert(k, if unread_tests.contains(k) { b }
-        else { checked_body(b, resolved_calls) }),
-    ),
-  }
-}
 
 pub const no_hashes: HashOutput =
   {
@@ -107,10 +73,6 @@ pub const no_hashes: HashOutput =
     refs: no_refs,
     bodies: [],
     test_bodies: Map::new(),
-    test_refs: Map::new(),
-    test_runs: Map::new(),
-    law_refs: Map::new(),
-    listing_hashes: Map::new(),
     own: no_own_hashes,
   }
 
@@ -1025,7 +987,7 @@ fn printed_modules(
   shipped: List<Bytes>,
 ) -> List<{ module: Bytes, text: Bytes }> / {abort.raise} =
   match print_bodies(
-      out.bodies.map(|b: { name: Bytes, body: Bytes }|
+      out.bodies.map(|b: { name: Bytes, body: FramedBody }|
         {
           name: b.name,
           body: b.body,
@@ -1264,7 +1226,7 @@ test "printing a body that calls a method on a value imports each module whose f
   );
   let out = {
     ..hashed,
-    bodies: hashed.bodies.map(|b: { name: Bytes, body: Bytes }|
+    bodies: hashed.bodies.map(|b: { name: Bytes, body: FramedBody }|
       { ..b, body: checked_body(b.body, Map::new()) }),
   };
   let ms = printed_modules(out, []);
@@ -1785,14 +1747,11 @@ test "the digest of a fixed sample of published hashes equals a fixed expected v
   assert(digest(grown) != digest(sample))
 }
 
-test "a stored body's key is the hash of its bytes, and bytes that are not a stored body have no key" {
+test "a stored body's key is the hash of its form, and a body with a pending call has no key until the call is resolved" {
   let picked = [{ targets: [] }, { targets: [2, 1] }];
   let solo = single_body({ bytes: b"abc", chosen: picked.map(|c: Choice| Known(c)) });
   assert_eq(body_key(solo), Some(own_hash(b"abc")));
-  match envelope(solo) { Some(e) -> assert_eq(picks_of(solo, e), picked), None -> assert(false) };
-  assert_eq(body_key(b""), None);
-  assert_eq(body_key(b"\x07rest"), None);
-  assert_eq(body_key(b"\x01\x00"), None);
+  assert_eq(solo.calls, ChosenCalls(picked));
   let site = { owner: b"m.f", site: 1 };
   let pending = single_body({ bytes: b"abc", chosen: [Known(picked.get(0)), Pending(site)] });
   assert_eq(body_key(pending), None);

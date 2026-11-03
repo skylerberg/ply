@@ -1,18 +1,19 @@
+import compiler.emit.representations (EmitReads)
+import compiler.unit (UnitCode)
+import compiler.front.checking.unit_programs (compiled_program)
+import compiler.front.checking (InMemory, in_memory, checked_in_memory, lowered_over, FileAt)
 import compiler.emit.print.probe (probed_fn)
-import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.front.facts (Analysis)
-import compiler.front.published (analyse, dump_of, facts_read, rows_of, inferred_facts)
+import compiler.front.published (facts_read, rows_of, inferred_facts)
 import compiler.check.infer (facts_by_owner)
 import compiler.emit.typing (SiteAnnotations, annotations_of, no_annotations)
-import compiler.front (analyse_pulling_std_with)
 import compiler.front.rows (ModuleRow)
 import compiler.syntax.expressions (prelude_module, scheduler_module)
 import compiler.prelude_source
-import compiler.check.resolve.tables (Diagnostic, qualify)
+import compiler.check.resolve.tables (Diagnostic, qualify, Source)
 import compiler.check.types (encode_type)
 import std.bytes (ascii_of_int, hex_digit)
-import compiler.emit (emit_root_results)
 import compiler.check.infer.definitions (Extern, program_natives)
 import compiler.emit.output
 import compiler.emit.output (RootOutput, GenericCall, SharedFunction, needs_specialisation)
@@ -25,22 +26,71 @@ import compiler.emit.typed_ir (Variable, Arg, VariableOperand, BoolOperand, AsIn
                                Member)
 import compiler.emit.lower (root_lowered)
 import compiler.emit.lower.module_context (ModuleContext, Root, module_context_in)
-import compiler.emit.reads (over_analysis)
 import compiler.emit.print (printed_function)
 import compiler.emit.print.text (PrintOutput)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.verify (ownership_fault)
 
-pub type Program = { source: Bytes, analysis: Analysis, setting: ModuleContext, roots: List<Root> }
+pub type Program = {
+  source: Bytes,
+  program: InMemory,
+  analysis: Analysis,
+  setting: ModuleContext,
+  roots: List<Root>,
+}
 
-pub fn program_of(source: Bytes) -> Result<Program, Bytes> / {abort.raise} =
-  match analyse(parse_all([{ name: b"m", source_text: source }])) {
+pub fn program_in(
+  source: Bytes,
+  module: Bytes,
+  memory: InMemory,
+) -> Result<Program, Bytes> / {abort.raise} = {
+  let checked = checked_in_memory(memory);
+  match checked.outcome {
     Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
-    Analysed(a) -> match module_context_in(a, b"m") {
+    Analysed(a) -> match module_context_in(a, module) {
       Err(reason) -> Err(reason),
-      Ok(s) -> Ok({ source: source, analysis: a, setting: s.setting, roots: s.roots }),
+      Ok(s) ->
+        Ok({
+          source: source,
+          program: checked.program,
+          analysis: a,
+          setting: s.setting,
+          roots: s.roots,
+        }),
     },
   }
+}
+
+pub type SessionAnalysis = { program: InMemory, analysis: Analysis }
+
+pub fn session_analysis(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+) -> Result<SessionAnalysis, List<Diagnostic>> / {abort.raise} = {
+  let checked = checked_in_memory(in_memory(sources, shipped, files));
+  match checked.outcome {
+    Rejected(diagnostics) -> Err(diagnostics),
+    Analysed(a) -> Ok({ program: checked.program, analysis: a }),
+  }
+}
+
+pub fn accepted_session(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+) -> SessionAnalysis / {abort.raise} =
+  match session_analysis(sources, shipped, files) {
+    Err(diagnostics) ->
+      panic(String::of_bytes_lossy(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n"))),
+    Ok(x) -> x,
+  }
+
+pub fn program_of(source: Bytes) -> Result<Program, Bytes> / {abort.raise} =
+  program_in(source, b"m", in_memory([{ name: b"m", source_text: source }]))
+
+pub fn over_program<a>(p: Program, body: () -> a / {EmitReads}) -> a / {abort.raise} =
+  lowered_over(p.program, body)
 
 pub fn recorded_in(a: Analysis, owner: Bytes) -> SiteAnnotations / {abort.raise} =
   match facts_read(rows_of(a), inferred_facts(a), None, a.modules) {
@@ -71,13 +121,7 @@ pub fn scheduled_program_of(source: Bytes) -> Result<Program, Bytes> / {abort.ra
     { name: scheduler_module, source_text: scheduler_stub },
     { name: b"std.internal.native", source_text: b"pub nondet effect native {}\n" },
   ];
-  match analyse_pulling_std_with([{ name: b"m", source_text: source }], shipped).out {
-    Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
-    Analysed(a) -> match module_context_in(a, b"m") {
-      Err(reason) -> Err(reason),
-      Ok(s) -> Ok({ source: source, analysis: a, setting: s.setting, roots: s.roots }),
-    },
-  }
+  program_in(source, b"m", in_memory([{ name: b"m", source_text: source }], shipped))
 }
 
 pub fn lowered_root(p: Program, name: Bytes) -> Function / {abort.raise} =
@@ -87,7 +131,7 @@ fn lowered_at(p: Program, key: RootKey) -> Function / {abort.raise} =
   match p.roots.find(|r: Root| r.key == key) {
     None ->
       panic(String::of_bytes_lossy(b"no such definition: ".concat(root_text(root_name(key))))),
-    Some(r) -> over_analysis(p.analysis, || root_lowered(p.setting, r)),
+    Some(r) -> over_program(p, || root_lowered(p.setting, r)),
   }
 
 pub fn shipped_lowered(
@@ -96,17 +140,9 @@ pub fn shipped_lowered(
   module: Bytes,
   name: Bytes,
 ) -> Function / {abort.raise} =
-  match analyse_pulling_std_with([{ name: b"m", source_text: source }], shipped).out {
-    Rejected(diagnostics) ->
-      panic(String::of_bytes_lossy(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n"))),
-    Analysed(a) -> match module_context_in(a, module) {
-      Err(reason) -> panic(String::of_bytes_lossy(reason)),
-      Ok(s) ->
-        lowered_at(
-          { source: source, analysis: a, setting: s.setting, roots: s.roots },
-          Named(qualify(module, name)),
-        ),
-    },
+  match program_in(source, module, in_memory([{ name: b"m", source_text: source }], shipped)) {
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
+    Ok(p) -> lowered_at(p, Named(qualify(module, name))),
   }
 
 pub fn checked(p: Program, name: Bytes) -> Result<Function, Bytes> / {abort.raise} = {
@@ -145,7 +181,7 @@ pub fn printed_by_ir(p: Program, name: Bytes) -> Result<Bytes, Bytes> / {abort.r
   match checked(p, name) { Err(reason) -> Err(reason), Ok(form) -> Ok(printed_text(p, form)) }
 
 pub fn printed_in(p: Program, f: Function) -> PrintOutput / {abort.raise} =
-  over_analysis(p.analysis, || printed_function(f))
+  over_program(p, || printed_function(f))
 
 pub fn build_failure(p: Program, f: Function) -> Option<Bytes> = {
   let counted = built_form(f);
@@ -199,20 +235,15 @@ pub fn built_c(
   key: RootKey,
 ) -> Result<Bytes, Bytes> / {abort.raise} = {
   let root = root_name(key);
-  match analyse_pulling_std_with([{ name: b"m", source_text: source }], shipped).out {
-    Rejected(diagnostics) -> Err(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n")),
-    Analysed(a) -> handle {
-      match emit_root_results(a, [key]).fold(
-          None,
-          |accumulator: Option<RootOutput>, r: RootOutput|
-            if r.name == root { Some(r) } else { accumulator },
-        ) {
-        Some(r) -> Ok(own_written(r)),
-        None -> Err(b"the program has no definition with that name"),
-      }
-    } with {
-      abort.raise(m) -> Err(Bytes::of_string(m)),
-    },
+  handle {
+    match compiled_program([{ name: b"m", source_text: source }], shipped, Some([key])).codes.flat_map(
+        |c: UnitCode| c.results,
+      ).find(|r: RootOutput| r.name == root) {
+      Some(r) -> Ok(own_written(r)),
+      None -> Err(b"the program has no definition with that name"),
+    }
+  } with {
+    abort.raise(m) -> Err(Bytes::of_string(m)),
   }
 }
 

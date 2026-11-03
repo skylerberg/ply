@@ -1,20 +1,19 @@
+import compiler.front.checking (in_memory)
 import compiler.prelude_source
 import compiler.syntax.expressions (prelude_module)
 import compiler.check.resolve.tables (Diagnostic, qualify)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.published (analyse)
 import compiler.front.facts (Analysis)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text, site_owner_text)
 import compiler.emit.lower (root_lowered, group_lowered)
 import compiler.emit.specialisations (tail_loop_of)
-import compiler.emit.emit_harness (recorded_in)
+import compiler.emit.emit_harness (recorded_in, Program, program_in, over_program)
 import compiler.emit.lower.module_context (ModuleContext, Root, module_context_in)
 import compiler.emit.borrow_inference (OwnershipSignature, InferenceTarget, inference_targets_of,
                                        infer_signatures, ownership_text, reset_params,
                                        with_conventions)
 import compiler.emit (declared_borrows_of)
-import compiler.emit.reads (over_analysis)
 import compiler.emit.representations (EmitReads)
 import compiler.emit.typed_ir (with_ownerships, Instruction, Block, Function, Member,
                                ParamOwnership, Reset, If, Case, Match, Loop, Handle, OwnedParam,
@@ -49,21 +48,20 @@ const corpus: Bytes =
     b"fn later(f: keep (Int) -> Int) -> () -> Int = || f(1)\n",
   ])
 
-fn analysed(source: Bytes) -> Analysis / {abort.raise} = analysed_as(b"m", source)
+fn analysed(source: Bytes) -> Program / {abort.raise} = analysed_as(b"m", source)
 
-fn analysed_as(name: Bytes, source: Bytes) -> Analysis / {abort.raise} =
-  match analyse(parse_all([{ name: name, source_text: source }])) {
-    Rejected(diagnostics) ->
-      panic(String::of_bytes_lossy(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n"))),
-    Analysed(a) -> a,
+fn analysed_as(name: Bytes, source: Bytes) -> Program / {abort.raise} =
+  match program_in(source, name, in_memory([{ name: name, source_text: source }])) {
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
+    Ok(p) -> p,
   }
 
 fn emitter_input(
-  a: Analysis,
+  a: Program,
   module: Bytes,
   names: List<Bytes>,
 ) -> { setting: ModuleContext, roots: List<Root> } / {abort.raise} =
-  match module_context_in(a, module) {
+  match module_context_in(a.analysis, module) {
     Err(reason) -> panic(String::of_bytes_lossy(reason)),
     Ok(read) ->
       {
@@ -74,7 +72,7 @@ fn emitter_input(
   }
 
 fn lowered_functions(
-  a: Analysis,
+  a: Program,
   s: ModuleContext,
   roots: List<Root>,
 ) -> List<Function> / {EmitReads} = {
@@ -84,7 +82,7 @@ fn lowered_functions(
     m.insert(site_owner_text(roots.get(i).key), i));
   let read_of = |full: Bytes|
     match named.get(root_name(Named(full))) {
-      Some(r) -> Some({ code: r.code, recorded: recorded_in(a, full) }),
+      Some(r) -> Some({ code: r.code, recorded: recorded_in(a.analysis, full) }),
       None -> None,
     };
   roots.fold([], |accumulator: List<Function>, r: Root| {
@@ -103,7 +101,7 @@ fn lowered_functions(
 }
 
 fn inference_inputs(
-  a: Analysis,
+  a: Program,
   module: Bytes,
   names: List<Bytes>,
 ) -> List<InferenceTarget> / {abort.raise} = {
@@ -112,10 +110,10 @@ fn inference_inputs(
 }
 
 fn lowered_and_declared(
-  a: Analysis,
+  a: Program,
   s: { setting: ModuleContext, roots: List<Root> },
 ) -> { functions: List<Function>, declared: Map<RootName, List<Int>> } / {abort.raise} =
-  over_analysis(a, || {
+  over_program(a, || {
     let functions = lowered_functions(a, s.setting, s.roots);
     { functions: functions, declared: declared_borrows_of(functions) }
   })
@@ -247,7 +245,7 @@ test "a group of functions that tail call each other passes the ownership check 
     Map::new(),
     l.declared,
   ).signatures;
-  let group = over_analysis(a, || group_lowered(s.setting, s.roots));
+  let group = over_program(a, || group_lowered(s.setting, s.roots));
   let checked = |params: (RootName) -> List<ParamOwnership>|
     ownership_fault(
       insert_reference_counts({

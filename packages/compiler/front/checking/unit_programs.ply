@@ -7,10 +7,10 @@ import compiler.check.infer.definitions (declared_natives)
 import compiler.emit.print.unit_header (bound_functions)
 import compiler.emit.layout (intrinsics)
 import std.bytes (ascii_of_int)
-import compiler.emit.cases (value_fixture)
 import compiler.emit.keys (RootKey, RootName)
 import compiler.front.checking (fresh_registry, inputs_alone, lookup_input_shipping, over_decoding,
-                                prelude_files, prelude_frames, query_load, listed_module)
+                                prelude_files, prelude_frames, query_load, listed_module,
+                                analysed_over)
 import compiler.front.checking.units (entries_of, program_code, reached_codes, roots_of_modules)
 import compiler.store.memo.engine (Run, in_session, reading)
 import compiler.unit (UnitCode, UnitOutput, program_output)
@@ -31,9 +31,8 @@ import compiler.emit.print.count_functions (identity_function)
 import compiler.emit.roots (builtin_helper, entry_symbol, symbol_of)
 import compiler.emit.release (root_of)
 import compiler.emit.print.count_functions (allocates)
-import compiler.front (analyse_pulling_std_with)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.published (analyse, dump_of)
+import compiler.front.published (dump_of)
 import compiler.unit (UnitBody, a_runtime, bridged_in, code_rejections, declared_signature,
                       defined_in, fresh, holes, natives_rejected, no_machine, one_each, own_root,
                       placeholders_named, pointers_named, read_of, rejection_codes, results_by_name,
@@ -41,6 +40,19 @@ import compiler.unit (UnitBody, a_runtime, bridged_in, code_rejections, declared
 import compiler.emit.output (Keyed, KeyedTag, SharedFunction)
 import compiler.front.rows (EffectRow)
 import compiler.unit (Hole, keyed_key, keyed_of)
+
+pub const value_fixture: Source =
+  {
+    name: b"std.value",
+    source_text: Bytes::concat_all([
+      b"pub type Value = | VUnit | VBool(Bool) | VInt(Int) | VFloat(Float) | VDecimal(Decimal) | VFixed(String, U128) | VChar(Char) | VStr(String) | VBytes(Bytes) | VList(List<Value>) | VRecord(List<Field>) | VCtor(String, List<Value>) | VMap(List<Entry>) | VFn(Fun) | VHold | VSecret | VElided(Int) | VArray(List<Value>) | VShown(String)\n",
+      b"pub type Field = { name: String, value: Value }\n",
+      b"pub type Entry = { key: Value, value: Value }\n",
+      b"pub type Fun = | FNamed(String) | FAnonymous | FConst({ arity: U8, value: Value }) | FProject({ arity: U8, index: U8 }) | FTable({ arity: U8, entries: List<Entry>, default: Value })\n",
+      b"pub extern fn reflect<a>(x: a) -> Value\n",
+      b"pub extern fn shown<a>(x: a) -> Value\n",
+    ]),
+  }
 
 pub type Compiled = { output: UnitOutput, codes: List<UnitCode>, roots: List<RootKey> }
 
@@ -355,7 +367,7 @@ test "generated code that compares or hashes a value, or runs a test on it, comp
       ]),
     },
   ];
-  let dump = dump_of(analyse(parse_all(user)));
+  let dump = dump_of(analysed_over(user));
   let e = compiled_program(user, []);
   assert_eq(dump.diagnostics.map(|d: Diagnostic| d.message), []);
   let ran = e.roots.map(printed);
@@ -441,7 +453,7 @@ test "a function's entry function runs it under the runtime's own handler for ea
     name: b"std.fact",
     source_text: b"pub effect fact {\n  read get() -> Int\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get | e}) -> a / e = handle { go() } with { fact.get() -> 7 }\n",
   };
-  let dump = dump_of(analyse_pulling_std_with(user, [fact]).out);
+  let dump = dump_of(analysed_over(user, [fact]));
   assert_eq(
     dump.effects.filter(|r: EffectRow| r.name == b"std.fact.fact").map(|r: EffectRow| r.host),
     [Some(b"std.fact.served")],
@@ -498,7 +510,7 @@ test "a function that performs `task` runs under the scheduler and the runtime's
       b"  handle { go() } with {\n    clock.now() -> Instant(0),\n    clock.sleep(_d) -> (),\n  }\n",
     ]),
   };
-  let dump = dump_of(analyse_pulling_std_with(user, [scheduler]).out);
+  let dump = dump_of(analysed_over(user, [scheduler]));
   assert_eq(
     dump.diagnostics.filter(|d: Diagnostic| d.severity == Error).map(|d: Diagnostic| d.message),
     [],
@@ -534,7 +546,7 @@ test "a function's entry function passes it the runtime's handler for each effec
     name: b"std.time",
     source_text: b"pub nondet effect time {\n  read now() -> Int\n}\n",
   };
-  let dump = dump_of(analyse_pulling_std_with(user, [time]).out);
+  let dump = dump_of(analysed_over(user, [time]));
   let e = compiled_program(user, [time]);
   let entry = defined_in(
     unit_text(e.output.parts),
@@ -563,7 +575,7 @@ test "a simulation passes the scheduler a handler for each effect it needs, incl
     ]),
   };
   let native = { name: b"std.internal.native", source_text: b"pub nondet effect native {}\n" };
-  let dump = dump_of(analyse_pulling_std_with(user, [scheduler, native]).out);
+  let dump = dump_of(analysed_over(user, [scheduler, native]));
   assert_eq(
     dump.diagnostics.filter(|d: Diagnostic| d.severity == Error).map(|d: Diagnostic| d.message),
     [],
@@ -583,7 +595,7 @@ test "a test's entry function runs it under the runtime's handler for each effec
     name: b"std.fact",
     source_text: b"pub effect fact {\n  read get() -> Int\n  write put[r](x: Int) -> Unit\n}\nhost for fact by served\nfn served<a | e>(go: () -> a / {fact.get, fact.put[*] | e}) -> a / e = handle { go() } with { fact.get() -> 7, fact.put[*](x) -> () }\n",
   };
-  let dump = dump_of(analyse_pulling_std_with(user, [fact]).out);
+  let dump = dump_of(analysed_over(user, [fact]));
   let e = compiled_program(user, [fact]);
   assert(
     e.output.taken.any(|n: RootName| root_text(n).starts_with(b"std.fact.served")),

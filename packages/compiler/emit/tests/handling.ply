@@ -3,7 +3,7 @@ import std.bytes (occurrences, ascii_of_int)
 import compiler.emit.representations
 import compiler.emit.representations (Definition, parallel_results_type, sums_around, code_facts,
                                       lowering, type_names, EmitReads)
-import compiler.emit.reads (over_analysis, over_nothing_declared)
+import compiler.emit.reads (over_nothing_declared)
 import compiler.emit.code (Code, NBuiltin, CodeHandle, CodeBlock, CodeApply, CodeLambda,
                            NDefinition, CodeLiteral, CodeIf, CodeMatch, CodeRecord, CodeFieldRead,
                            CodeBinary, Lambda, Capture, CodeHandler, CodeClause, CodeArm,
@@ -40,7 +40,8 @@ import compiler.emit.typed_ir.handling (HandleOperation, HandleSite, Clause, Per
                                         VariableInitialize, VariableRead, VariableWrite,
                                         raise_offset, task_offset)
 import compiler.emit.typing (SiteType, unknown_type)
-import compiler.check.infer.checker (prelude_effects, EffectInfo, OperationInfo, Builtin, builtins)
+import compiler.check.infer.checker (prelude_effects, EffectInfo, OperationInfo, Builtin, builtins,
+                                     elsewhere)
 import compiler.check.infer.expression (marshalling_variables)
 import compiler.syntax.expressions (marshalling_operations, task_operations, scheduler_module,
                                     prelude_own)
@@ -71,7 +72,8 @@ import compiler.emit.print (printed_function)
 import compiler.emit.print.effects (landing_jump)
 import compiler.emit.emit_harness (entry_handler_words, Program, program_of, scheduled_program_of,
                                    lowered_root, checked, printed_by_ir, build_failures,
-                                   printed_text, build_failure, built_c, shipped_lowered)
+                                   printed_text, build_failure, built_c, shipped_lowered,
+                                   over_program)
 
 fn word(id: Int) -> Variable = local_var(id, string_type, AsWord)
 
@@ -171,7 +173,7 @@ test "a function containing a hole `???` lowers, and the hole becomes a raise th
   match program_of(b"pub fn pick(n: Int) -> Int = if n > 3 { 9 } else { ??? }\n") {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || assert_eq(lowered_root(p, b"pick").key, Named(b"m.pick"))),
+      over_program(p, || assert_eq(lowered_root(p, b"pick").key, Named(b"m.pick"))),
   }
 }
 
@@ -179,7 +181,7 @@ test "a perform passes its operation's entry in the effect object, with its argu
   match program_of(perform_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let int = int_type;
         {
           let f = lowered_root(p, b"note");
@@ -311,7 +313,7 @@ test "a resource label such as `conn` lowers to an `Int` index into the effect's
   match program_of(perform_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match root_context(p, b"sent") {
           None -> assert(false),
           Some(r) -> {
@@ -359,7 +361,7 @@ test "a continuation read as a value is the closure of a lambda that resumes it,
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let f = lowered_root(p, b"parked");
         let resumes = |c: { body: Function, captures: Int, at: Span, words: typed_ir::ClosureEvidence }|
           c.body.kind == typed_ir::Plain
@@ -383,7 +385,7 @@ test "a clause that binds the call site's label passes the runtime the descripto
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let f = lowered_root(p, b"tagged");
         let sites = f.body.fold(
           [],
@@ -420,7 +422,7 @@ test "a clause handling `abort.raise` passes the runtime the descriptor of the m
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let f = lowered_root(p, b"caught");
         let clauses = f.body.fold([], |accumulator: List<Clause>, i: Instruction|
           match i { Handle(h) -> accumulator.concat(h.site.clauses), _ -> accumulator });
@@ -440,7 +442,7 @@ test "a clause that calls `resume` in tail position stores its result as a singl
   match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let f = lowered_root(p, b"run");
         assert_eq(
           match f.lambdas.at(0) {
@@ -459,7 +461,7 @@ test "a `handle` runs its body in place, and stores its result at the result's o
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match handle_at(p, b"guarded") {
           None -> assert(false),
           Some(g) -> {
@@ -570,18 +572,24 @@ test "lowering a handle of an effect whose operations it does not know fails wit
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match handle_at(p, b"guarded") {
           None -> assert(false, Some("`guarded` is a handle")),
           Some(g) -> {
-            let blind = { ..p.analysis, declared: { ..p.analysis.declared, effects: Map::new() } };
-            let message = over_analysis(blind, ||
+            let message = handle {
               handle {
                 handle_plan(g.context, initial_lowering([]), g.h, sample_span);
                 b""
               } with {
                 lowering.fail(reason) -> reason,
-              });
+              }
+            } with {
+              elsewhere.look_up_type(name) -> elsewhere.look_up_type(name),
+              elsewhere.look_up_effect(name) -> None,
+              elsewhere.look_up_constructor(name) -> elsewhere.look_up_constructor(name),
+              elsewhere.look_up_definition(name) -> elsewhere.look_up_definition(name),
+              elsewhere.look_up_host(name) -> elsewhere.look_up_host(name),
+            };
             assert(
               message.contains(b"a handle expression uses an effect whose operations"),
               Some("a handle laid out an object of no slots"),
@@ -595,7 +603,7 @@ test "a clause that calls `resume` outside tail position runs the `handle` body 
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let planned = |g: { context: Context, h: CodeHandler }|
           handle_plan(g.context, initial_lowering([]), g.h, sample_span);
         let frame_of = |name: Bytes|
@@ -676,7 +684,7 @@ test "a `handle` body run as a separate function captures the initial value of e
   match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let f = lowered_root(p, b"resumed");
         let evidence = evidence_type;
         assert_eq(
@@ -731,7 +739,7 @@ test "a type parameter of an operation is marked wherever it occurs inside a typ
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let marked = |operation: keys::TypeOperation, t: Type, marks: List<Int>|
           keys::with_marks(keys::generated_key(operation, t, b"m"), marks);
         let names = |k: RootKey|
@@ -754,7 +762,7 @@ test "an operation descriptor records the concrete types of a `perform`, includi
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match root_context(p, b"held") {
           None -> assert(false),
           Some(r) -> {
@@ -912,7 +920,7 @@ test "a value passed to a clause of a generic operation is boxed as `Kept`, the 
   match program_of(generic_operation_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let f = lowered_root(p, b"swapped");
         let boxed_type = NamedType({ name: b"std.internal.schedule.Kept", args: [] });
         let called = natives_in(f.body);
@@ -937,7 +945,7 @@ test "a clause compares the boxed `Kept` values it receives using equality gener
   match program_of(generic_operation_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let ints = list_type(int_type);
         {
           let f = lowered_root(p, b"compared");
@@ -1007,7 +1015,7 @@ test "a value nested in the arguments of a generic operation is boxed one part a
   match program_of(nested_marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let int = int_type;
         let rooted_call = |accumulator: List<RootKey>, i: Instruction|
           match i {
@@ -1062,7 +1070,7 @@ test "a parallel block passes the runtime its branches and the descriptor of eac
   match program_of(parallel_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let int = int_type;
         let branches = [
           VariableOperand(closure_variable(0, int)),
@@ -1351,7 +1359,7 @@ const lowered_roots: List<Bytes> =
 test "every function in the handling test program lowers to IR and prints C without errors" {
   match program_of(corpus) {
     Err(reason) -> assert_eq(reason, b""),
-    Ok(p) -> over_analysis(p.analysis, || assert_eq(build_failures(p, lowered_roots), [])),
+    Ok(p) -> over_program(p, || assert_eq(build_failures(p, lowered_roots), [])),
   }
 }
 
@@ -1390,7 +1398,7 @@ test "simulation and task operations on their own types become calls into the sc
   match scheduled_program_of(scheduler_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let roots = [
           b"ticked",
           b"clocked",
@@ -1478,7 +1486,7 @@ test "handler variables of many types, including maps and bytes, lower and print
   match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         assert_eq(build_failures(p, [b"kept", b"halves", b"lanes"]), [])),
   }
 }
@@ -1496,7 +1504,7 @@ fn sites_of(
   match program_of(handle_corpus) {
     Err(reason) -> panic(String::of_bytes_lossy(reason)),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let f = lowered_root(p, name);
         {
           operations: operations_in(f.body),
@@ -1595,7 +1603,7 @@ test "a handler object can be shared between threads only if its clauses return,
   match program_of(sharing_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let over = |name: Bytes|
           all_operations_in(lowered_root(p, name)).fold(
             [],
@@ -1715,7 +1723,7 @@ test "a `handle` catches a raise of an operation that one of its clauses handles
   match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match printed_by_ir(p, b"caught") {
           Err(reason) -> assert_eq(reason, b""),
           Ok(t) ->
@@ -1739,7 +1747,7 @@ test "a `?` inside a `handle` lowers as a raise that the enclosing `handle` catc
   match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match printed_by_ir(p, b"asked") {
           Err(reason) -> assert_eq(reason, b""),
           Ok(t) ->
@@ -1756,7 +1764,7 @@ test "a label's clauses print as clause tables on the handle's state, and a sepa
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let text = |name: Bytes| match printed_by_ir(p, name) { Ok(t) -> t, Err(reason) -> reason };
         let has = |t: Bytes, s: Bytes| t.index_of(s) != None;
         assert(
@@ -1781,7 +1789,7 @@ test "each `handle` creates a state object in which its body runs, whether or no
   match program_of(handle_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let names = [
           b"guarded",
           b"off_tail",
@@ -1812,7 +1820,7 @@ test "a `try` block selects each clause by its operation and stores the result a
   match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         {
           let f = lowered_root(p, b"tried");
           match handles_in(f.body) {
@@ -1863,7 +1871,7 @@ test "a body that fails inside a handle jumps to the handle's failure target, wh
   match program_of(landing_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match printed_by_ir(p, b"guarded") {
           Err(reason) -> assert_eq(reason, b""),
           Ok(t) -> match t.index_of(task_set) {
@@ -1910,7 +1918,7 @@ test "a `handle` reads and writes each handler variable and its result in its st
   match program_of(source) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match printed_by_ir(p, b"finished") {
           Err(reason) -> assert_eq(reason, b""),
           Ok(t) -> {
@@ -1951,7 +1959,7 @@ test "a parallel block receives the evidence for the operations it performs, whi
   match program_of(effects_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match printed_by_ir(p, b"under") {
           Err(reason) -> assert_eq(reason, b""),
           Ok(t) -> {
@@ -1984,7 +1992,7 @@ test "what an operation returns and what its clause receives are stored as their
   match program_of(record_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         {
           let f = lowered_root(p, b"summed");
           match operations_in(f.body) {
@@ -2043,7 +2051,7 @@ test "a step that `iterate` runs in place is copied into a separate-function `ha
   match program_of(step_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match root_context(p, b"stepped") {
           None -> assert(false),
           Some(r) -> match lambda_argument(r.code) {
@@ -2135,7 +2143,7 @@ test "a marshalling native receives machine words: a string as its bytes' addres
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match root_context(p, b"held") {
           None -> assert(false),
           Some(r) -> {
@@ -2215,7 +2223,7 @@ test "an `assert_eq` at a type that is still unresolved is resolved later, when 
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match root_context(p, b"alike") {
           None -> assert(false),
           Some(r) -> match r.code.node {
@@ -2546,7 +2554,7 @@ test "a generated marshalling function calls only marshalling builtins, function
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let shape = NamedType({ name: b"m.Shape", args: [] });
         let record = RecordType(
           fields_sorted([{ name: b"w", ty: int_type }, { name: b"h", ty: float_type }]),
@@ -2695,7 +2703,7 @@ test "a type can be sent to the runtime when its marshalling functions exist, an
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let shape = NamedType({ name: b"m.Shape", args: [] });
         let hook = NamedType({ name: b"m.Hook", args: [] });
         let callback = function_type([int_type], int_type, no_effects);
@@ -2785,7 +2793,7 @@ test "a type's runtime descriptor is emitted once, and lists the type's name bef
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, ||
+      over_program(p, ||
         match root_context(p, b"held") {
           None -> assert(false),
           Some(r) -> {
@@ -2850,7 +2858,7 @@ test "functions that convert a type to and from the runtime's one-word form buil
   match program_of(marshalling_corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) ->
-      over_analysis(p.analysis, || {
+      over_program(p, || {
         let types = [
           int_type,
           float_type,

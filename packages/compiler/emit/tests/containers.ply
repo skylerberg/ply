@@ -1,5 +1,5 @@
+import compiler.front.checking (in_memory)
 import compiler.emit.representations (layout_of, EmitReads)
-import compiler.emit.reads (over_analysis)
 import std.bytes (ascii_of_int)
 import compiler.prelude_source
 import compiler.check.types (Type, NamedType, RecordType, int_type, string_type, float_type,
@@ -8,8 +8,6 @@ import compiler.check.known (map_node_type)
 import compiler.emit.typing (unknown_type)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed)
-import compiler.front.published (analyse)
-import compiler.front (analyse_pulling_std_with)
 import compiler.check.resolve.tables (qualify)
 import compiler.emit.layout (Intrinsic, intrinsics, container_layouts, words, branch_layout,
                              array_head)
@@ -38,7 +36,7 @@ import compiler.emit.lower.module_context (Root, module_context_in, native_calle
 import compiler.emit.keys (RootKey, Named, Generated, Copy)
 import compiler.emit.print (printed_function)
 import compiler.emit.emit_harness (entry_handler_words, Program, program_of, lowered_root, checked,
-                                   printed_text, build_failures)
+                                   printed_text, build_failures, program_in, over_program)
 import compiler.emit.print.count_functions (increments_count)
 import compiler.emit.tests.data (program_from)
 
@@ -134,7 +132,7 @@ test "a list pattern reads an item directly from the list and binds the rest as 
       Some(r) -> {
         let code = r.code;
         let xs = { id: 0, ty: ty, representation: AsWord };
-        over_analysis(p.analysis, || act(context_of(p.setting, r, code), xs))
+        over_program(p, || act(context_of(p.setting, r, code), xs))
       },
     };
   let bound = |l: LoweredValue|
@@ -204,7 +202,7 @@ test "`len` on a list, byte string or array reads the length directly, cannot fa
 }
 
 fn element_in(p: Program, t: Type) -> Element / {abort.raise} = {
-  let l = over_analysis(p.analysis, || layout_of(t));
+  let l = over_program(p, || layout_of(t));
   { layout: l, stride: max(1, words(l)) }
 }
 
@@ -404,7 +402,7 @@ test "reading a field of a `Columns` element reads that field's array directly, 
     match p.roots.find(|r: Root| r.key == Named(qualify(b"m", name))) {
       None -> [],
       Some(r) ->
-        over_analysis(p.analysis, || {
+        over_program(p, || {
           let code = r.code;
           let context = context_of(p.setting, r, code);
           let base = match code.node {
@@ -753,12 +751,9 @@ test "an operator on a numeric type variable lowers to a generic builtin that is
 fn program_of_modules(
   sources: List<{ name: Bytes, source_text: Bytes }>,
 ) -> Program / {abort.raise} =
-  match analyse(parse_all(sources)) {
-    Analysed(a) -> match module_context_in(a, b"m") {
-      Ok(s) -> { source: b"", analysis: a, setting: s.setting, roots: s.roots },
-      Err(reason) -> panic(String::of_bytes_lossy(reason)),
-    },
-    _ -> panic("the program does not check"),
+  match program_in(b"", b"m", in_memory(sources)) {
+    Ok(p) -> p,
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
   }
 
 test "a name that no import provides refers to the builtin, but an imported function with a builtin's name is called instead" {
@@ -808,12 +803,9 @@ test "a name that no import provides refers to the builtin, but an imported func
 
 fn program_with_native(native: Bytes, user: Bytes) -> Program / {abort.raise} = {
   let shipped = [{ name: b"std.native", source_text: native }];
-  match analyse_pulling_std_with([{ name: b"m", source_text: user }], shipped).out {
-    Analysed(a) -> match module_context_in(a, b"m") {
-      Ok(s) -> { source: user, analysis: a, setting: s.setting, roots: s.roots },
-      Err(reason) -> panic(String::of_bytes_lossy(reason)),
-    },
-    _ -> panic("the program does not check"),
+  match program_in(user, b"m", in_memory([{ name: b"m", source_text: user }], shipped)) {
+    Ok(p) -> p,
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
   }
 }
 
@@ -837,7 +829,7 @@ test "a standard library extern listed in the program's machine-function setting
     b"pub extern fn halved(x: Int) -> Int\n",
     b"import std.native (halved)\nfn f() -> Int = halved(4)\n",
   );
-  assert(over_analysis(p.analysis, || native_called(b"std.native.halved")) != None, None);
+  assert(over_program(p, || native_called(b"std.native.halved")) != None, None);
   assert_eq(lowered_root(p, b"f").key, Named(b"m.f"))
 }
 
@@ -846,7 +838,7 @@ test "a `Secret` passed to a native function and returned from it stays an opaqu
     b"pub extern fn resealed(s: Secret<Bytes>) -> Secret<String>\n",
     b"import std.native (resealed)\nfn f() -> Int = if resealed(Secret::of_bytes(b\"key\")).is_empty() { 0 } else { 1 }\n",
   );
-  assert(over_analysis(p.analysis, || native_called(b"std.native.resealed")) != None, None);
+  assert(over_program(p, || native_called(b"std.native.resealed")) != None, None);
   assert_eq(lowered_root(p, b"f").key, Named(b"m.f"))
 }
 
@@ -1055,12 +1047,14 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
     ),
     [],
   );
-  match analyse(
-      parse_all([{ name: b"std.prelude", source_text: prelude_source::text.concat(probes) }]),
+  match program_in(
+      probes,
+      b"std.prelude",
+      in_memory([{ name: b"std.prelude", source_text: prelude_source::text.concat(probes) }]),
     ) {
-    Analysed(a) -> match module_context_in(a, b"std.prelude") {
-      Ok(s) ->
-        over_analysis(a, || {
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
+    Ok(s) ->
+        over_program(s, || {
           let lowered = |name: Bytes| {
             let full = b"std.prelude.probe_".concat(name);
             match s.roots.find(|r: Root| r.key == Named(full)) {
@@ -1187,8 +1181,5 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
             }),
           )
         }),
-      Err(reason) -> panic(String::of_bytes_lossy(reason)),
-    },
-    _ -> panic("the prelude and its probes do not check"),
   }
 }
