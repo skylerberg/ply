@@ -23,8 +23,8 @@ import obligation (Builds, Cost, Ensures, Law, Space)
 import rules (CostBound, SpaceBound, Rule, Cited)
 import sort (canonical)
 import prover_input (Bounded, NotEnumerable, Measure, Obligation, TrustedLaw, ProverInput,
-                     Interleave, Run, Every, measures_in, measures_input, fallback_of,
-                     whole_program_input, written_before)
+                     Interleave, Run, Every, measures_in, measures_input, fallback_of, Claimed,
+                     claimed_session, claimed_input, written_before)
 import prover_input
 import std.list
 import std.set (Set)
@@ -537,10 +537,10 @@ fn check_cost_bound(context: Context, definition: String, index: Int) -> Diagnos
 
 fn with_fixture<a>(
   sources: List<{ name: Bytes, source_text: Bytes }>,
-  body: (Analysis) -> a / {elsewhere.read, code_facts.read, abort.raise},
+  body: (Claimed) -> a / {elsewhere.read, code_facts.read, abort.raise},
 ) -> a / {abort.raise} = {
-  let fixture = accepted_session(sources);
-  lowered_over(fixture.program, || body(fixture.analysis))
+  let fixture = claimed_session(sources);
+  lowered_over(fixture.program, || body(fixture))
 }
 
 fn index_of(analysis: Analysis, name: Bytes) -> Int =
@@ -549,8 +549,8 @@ fn index_of(analysis: Analysis, name: Bytes) -> Int =
 
 fn claimed(cs: Claims) -> List<Bytes> = cs.definitions.keys().map(Bytes::of_string)
 
-fn obligation_for(analysis: Analysis, owner: String) -> Obligation / {abort.raise} =
-  match whole_program_input(analysis, prover_input::every).world.obligations.fold(
+fn obligation_for(claimed: Claimed, owner: String) -> Obligation / {abort.raise} =
+  match claimed_input(claimed, prover_input::every).world.obligations.fold(
       None,
       |found: Option<Obligation>, o: Obligation| if o.owner == owner { Some(o) } else { found },
     ) {
@@ -581,12 +581,16 @@ test "an obligation is resolved by what the prover decides, and only when its st
       source_text: b"fn same(x: Int) -> Int ensures result == x = x\nfn bump(x: Int) -> Int requires x < 10 ensures result > x = x + 1\nfn never(x: Int) -> Int requires x > 0 && x < 0 ensures result == 0 = x\n",
     },
   ];
-  with_fixture(sources, |w: Analysis| {
-    let p = prover_of(claims_for(w, [0]), whole_program_input(w, prover_input::every).world, 10000);
-    assert(match static_result(p, obligation_for(w, "m.same")) { Certified(_) -> true, _ -> false });
-    let bump = obligation_for(w, "m.bump");
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let p = prover_of(claims_for(w, [0]), claimed_input(fixture, prover_input::every).world, 10000);
+    assert(match static_result(p, obligation_for(fixture, "m.same")) {
+      Certified(_) -> true,
+      _ -> false,
+    });
+    let bump = obligation_for(fixture, "m.bump");
     assert(match static_result(p, bump) { Unwitnessed(_) -> true, _ -> false });
-    assert(static_result(p, obligation_for(w, "m.never")) == GuardRefuted);
+    assert(static_result(p, obligation_for(fixture, "m.never")) == GuardRefuted);
     assert(static_result(p, { ..bump, strategy: Interleave(NotEnumerable) }) == not_attempted);
     assert(diagnosis_of(p, { ..bump, strategy: Interleave(NotEnumerable) }) == None)
   })
@@ -599,14 +603,15 @@ test "the static prover certifies a `cost` bound when the definition's body prov
       source_text: b"fn total(xs: List<Int>) -> Int cost xs.len() = xs.fold(0, |a: Int, x: Int| a + x)\nfn wrong(xs: List<Int>) -> Int cost 1 = xs.fold(0, |a: Int, x: Int| a + x)\n",
     },
   ];
-  with_fixture(sources, |w: Analysis| {
-    let p = prover_of(claims_for(w, [0]), whole_program_input(w, prover_input::every).world, 10000);
-    assert(match static_result(p, obligation_for(w, "m.total")) {
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let p = prover_of(claims_for(w, [0]), claimed_input(fixture, prover_input::every).world, 10000);
+    assert(match static_result(p, obligation_for(fixture, "m.total")) {
       Certified(s) -> s.rules == [CostBound({ definition: "m.total" })],
       _ -> false,
     });
     assert_eq(
-      static_result(p, obligation_for(w, "m.wrong")),
+      static_result(p, obligation_for(fixture, "m.wrong")),
       Undecided({
         budget_exhausted: false,
         blockers: [
@@ -626,14 +631,15 @@ test "a `space` bound is proved when the function body shows it, and otherwise s
       source_text: b"fn total(xs: List<Int>) -> Int space 0 = xs.fold(0, |a: Int, x: Int| a + x)\nfn wrong(xs: List<Int>) -> List<Int> space 0 = xs.map(|x: Int| x)\n",
     },
   ];
-  with_fixture(sources, |w: Analysis| {
-    let p = prover_of(claims_for(w, [0]), whole_program_input(w, prover_input::every).world, 10000);
-    assert(match static_result(p, obligation_for(w, "m.total")) {
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let p = prover_of(claims_for(w, [0]), claimed_input(fixture, prover_input::every).world, 10000);
+    assert(match static_result(p, obligation_for(fixture, "m.total")) {
       Certified(s) -> s.rules == [SpaceBound({ definition: "m.total" })],
       _ -> false,
     });
     assert_eq(
-      static_result(p, obligation_for(w, "m.wrong")),
+      static_result(p, obligation_for(fixture, "m.wrong")),
       Undecided({
         budget_exhausted: false,
         blockers: [
@@ -657,18 +663,19 @@ test "a claim about an imported module relies only on that module's contracts, b
       source_text: b"import base\nfn quad(x: Int) -> Int ensures result == x = base::same(x)\nfn also(x: Int) -> Int ensures result == x = base::kept(x)\n",
     },
   ];
-  with_fixture(sources, |w: Analysis| {
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
     let mine = |m: Bytes| m == b"app";
     let p = prover_of(
       claims_for(w, [index_of(w, b"app")], mine),
-      whole_program_input(w, mine).world,
+      claimed_input(fixture, mine).world,
       10000,
     );
-    assert(match static_result(p, obligation_for(w, "app.quad")) {
+    assert(match static_result(p, obligation_for(fixture, "app.quad")) {
       Certified(_) -> true,
       _ -> false,
     });
-    assert(match static_result(p, obligation_for(w, "app.also")) {
+    assert(match static_result(p, obligation_for(fixture, "app.also")) {
       Certified(_) -> false,
       _ -> true,
     })
@@ -686,17 +693,18 @@ test "a proved `law` can be cited as a lemma by claims in modules that import it
       source_text: b"import base\nlaw \"a push counts one more\" forall (xs: List<Int>, x: Int) { base::count(xs.push(x)) == xs.len() + 1 }\n",
     },
   ];
-  with_fixture(sources, |w: Analysis| {
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
     let p = prover_of(
       claims_for(w, range(0, w.modules.len())),
-      whole_program_input(w, prover_input::every).world,
+      claimed_input(fixture, prover_input::every).world,
       10000,
     );
-    assert(match static_result(p, obligation_for(w, "base.counting counts")) {
+    assert(match static_result(p, obligation_for(fixture, "base.counting counts")) {
       Certified(_) -> true,
       _ -> false,
     });
-    assert(match static_result(p, obligation_for(w, "app.a push counts one more")) {
+    assert(match static_result(p, obligation_for(fixture, "app.a push counts one more")) {
       Certified(c) ->
         c.rules.fold(false, |f: Bool, r: Rule|
           f || r == Cited({ law: "base.counting counts", label: "counting counts" })),
@@ -716,18 +724,19 @@ test "a `law` about an imported function that has an `ensures` clause fails to p
       source_text: b"import base\nlaw \"same answers\" forall (n: Int) { base::same(n) == n }\nfn again(n: Int) -> Int ensures result == n = base::same(n)\n",
     },
   ];
-  with_fixture(sources, |w: Analysis| {
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
     let mine = |m: Bytes| m == b"app";
     let p = prover_of(
       claims_for(w, [index_of(w, b"app")], mine),
-      whole_program_input(w, mine).world,
+      claimed_input(fixture, mine).world,
       10000,
     );
-    assert(match static_result(p, obligation_for(w, "app.same answers")) {
+    assert(match static_result(p, obligation_for(fixture, "app.same answers")) {
       Certified(_) -> false,
       _ -> true,
     });
-    assert(match static_result(p, obligation_for(w, "app.again")) {
+    assert(match static_result(p, obligation_for(fixture, "app.again")) {
       Certified(_) -> true,
       _ -> false,
     })
@@ -745,14 +754,15 @@ test "a `law` from an imported module can be cited as a lemma even when only the
       source_text: b"import base\nlaw \"a push counts one more\" forall (xs: List<Int>, x: Int) { base::count(xs.push(x)) == xs.len() + 1 }\n",
     },
   ];
-  with_fixture(sources, |w: Analysis| {
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
     let mine = |m: Bytes| m == b"app";
     let p = prover_of(
       claims_for(w, [index_of(w, b"app")], mine),
-      whole_program_input(w, mine).world,
+      claimed_input(fixture, mine).world,
       10000,
     );
-    assert(match static_result(p, obligation_for(w, "app.a push counts one more")) {
+    assert(match static_result(p, obligation_for(fixture, "app.a push counts one more")) {
       Certified(_) -> true,
       _ -> false,
     })

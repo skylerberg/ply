@@ -20,8 +20,7 @@ import compiler.front.rows (Rows, Outline)
 import compiler.front (Published, published, ShippedWants, shipped_wants_bin, locked_packages)
 import compiler.front.published (decode_rows, reserved_prefix_diagnostics)
 import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_module_tables,
-                             pulled_next, checked_program_over, analysis_identities, ToolchainTree,
-                             NoTree)
+                             pulled_next, checked_program_over, ToolchainTree, NoTree)
 import compiler.front.diagnostics (diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
                               embed_snapshot, request_of_key, snapshot_embed, with_embed_snapshot)
@@ -45,7 +44,8 @@ import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, Mod
                                       CheckQuery, CheckQueries, check_queries, with_decode_cache,
                                       decoded, prefix_in, imports_query, ImportOf, imports_of_bin,
                                       absent, shipped_names_listed, CheckDefinition)
-import compiler.front.checking.promises (promise_queries, program_analysed)
+import compiler.front.checking.promises (promise_queries, program_analysed, claims_analysed,
+                                         ClaimsOutcome, ClaimsRejected, ClaimsAnalysed)
 import compiler.front.checking.groups (module_contents_query, group_key_bin, module_rejected,
                                        listed_result, owners_result_bin, owners_query, calls_query,
                                        cycles_query, group_imports_query, visible_modules_query,
@@ -717,6 +717,14 @@ pub fn checked_in_memory(program: InMemory) -> CheckedInMemory / {abort.raise} =
   { program: done.program, outcome: done.value }
 }
 
+pub type ClaimedInMemory = { program: InMemory, outcome: ClaimsOutcome }
+
+pub fn claimed_in_memory(program: InMemory) -> ClaimedInMemory / {abort.raise} = {
+  let done = session_over(program, |own: List<Bytes>|
+    program_claims(own, query_load(own, [], false, module_of).results));
+  { program: done.program, outcome: done.value }
+}
+
 pub fn analysed_over(
   sources: List<Source>,
   shipped: List<Source> = [],
@@ -823,14 +831,26 @@ pub fn program_outcome(
   own: List<Bytes>,
   results: List<CheckedModule>,
 ) -> AnalysisOutcome / {SessionReads, abort.raise} =
-  match rejected_first(results) {
-    [] -> program_analysed(own.map(|m: Bytes| { module: m, shipped: false, tested: true })),
-    first ->
-      Rejected(
-        first.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
-          accumulator.concat(a.result.rejected)),
-      ),
+  match rejections_of(results) {
+    [] -> program_analysed(open_modules(own)),
+    diagnostics -> Rejected(diagnostics),
   }
+
+fn program_claims(
+  own: List<Bytes>,
+  results: List<CheckedModule>,
+) -> ClaimsOutcome / {SessionReads, abort.raise} =
+  match rejections_of(results) {
+    [] -> claims_analysed(open_modules(own)).outcome,
+    diagnostics -> ClaimsRejected(diagnostics),
+  }
+
+fn rejections_of(results: List<CheckedModule>) -> List<Diagnostic> =
+  rejected_first(results).fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
+    accumulator.concat(a.result.rejected))
+
+fn open_modules(own: List<Bytes>) -> List<ModuleKey> =
+  own.map(|m: Bytes| { module: m, shipped: false, tested: true })
 
 pub type StoreSharing = | Alone | Concurrent | Turns
 
@@ -1862,6 +1882,16 @@ test "a signature may use an effect set whose effects live in a module it does n
   assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
 }
 
+test "a constructor whose type has a label parameter, declared in another group, is a value that needs no label" {
+  let sources = [
+    {
+      name: b"m",
+      source_text: b"effect log {\n  write note[l](line: String) -> Unit\n}\n\ntype Sink<[l]> = | Sink((String) -> Unit / {log.note[l]}) | Quiet\n\nfn write_line<[l]>(s: Sink<[l]>, line: String) -> Unit / {log.note[l]} =\n  match s { Sink(f) -> f(line), Quiet -> () }\n\nfn hush() -> Unit / {log.note[app]} = write_line[app](Quiet, \"unheard\")\n",
+    },
+  ];
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
+}
+
 test "a signature that names a type keyed by its parameter implies that the parameter is ordered" {
   let sources = [
     {
@@ -1882,22 +1912,16 @@ test "a module's stored interface and contracts equal those its checked groups g
   let read = read_over(sources, ||
     {
       stored: published_module({ module: b"lib", shipped: false, tested: false }),
-      analysed: program_analysed([{ module: b"lib", shipped: false, tested: true }]),
+      claimed: claims_analysed([{ module: b"lib", shipped: false, tested: true }]).outcome,
     });
-  let stored = read.stored;
-  let whole = match read.analysed {
-    Analysed(a) -> a,
-    Rejected(_) -> panic("the sample program was rejected"),
-  };
-  match stored {
-    None -> panic("the stored interface is missing"),
-    Some(p) -> {
+  match ((read.stored, read.claimed)) {
+    (None, _) -> panic("the stored interface is missing"),
+    (_, ClaimsRejected(_)) -> panic("the sample program was rejected"),
+    (Some(p), ClaimsAnalysed(whole, identities)) -> {
       assert_eq(p.interface, module_interface_of(whole, sources, b"lib"));
       assert_eq(
         contract_lines(p.contracts),
-        contract_lines(
-          public_contracts(whole.index, analysis_identities(whole), |m: Bytes| m == b"lib"),
-        ),
+        contract_lines(public_contracts(whole.index, identities, |m: Bytes| m == b"lib")),
       )
     },
   }
