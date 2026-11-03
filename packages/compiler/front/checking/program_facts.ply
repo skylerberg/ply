@@ -2,20 +2,19 @@ import std.bin
 import std.list
 import std.set (Set)
 import compiler.store.memo (memo)
-import compiler.store.handles (QueryOf, Written, written, fetched, part_fetched, query_definition)
-import compiler.check.infer.checker (EffectInfo, Location, TestInfo, location_bin, prelude_effects,
-                                     test_info_bin)
+import compiler.store.handles (QueryOf, Written, written, part_fetched, query_definition)
+import compiler.check.infer.checker (TestInfo, test_info_bin)
 import compiler.check.resolve.tables (in_module)
 import compiler.expand.embed (ModuleEmbed, module_embed_bin)
-import compiler.front.emitter_input (ConstSite, LawPlace, MainPlace, ModuleTests, RootPlace,
-                                     const_site_bin, law_place_bin, main_place_bin, root_place_bin)
+import compiler.front.emitter_input (ConstSite, LawPlace, MainPlace, RootPlace, const_site_bin,
+                                     law_place_bin, main_place_bin, root_place_bin)
 import compiler.front.exports (named_node)
 import compiler.front.facts (Argument, StatementSite, TaggedSite, callees_of, statement_site_bin,
                              tagged_site_bin)
 import compiler.front.rows (DeclaredEffect, DeclaredOperation, declared_effect_bin)
 import compiler.front.checking.world (CheckDefinition, ModuleKey, Modules, modules_bin, shipped_for)
-import compiler.front.checking.groups (code_part, declared_effects_part, hashes_query, imports_part,
-                                       sites_part, tests_part)
+import compiler.front.checking.groups (code_part, declared_effects_part, imports_part, sites_part,
+                                       tests_part)
 import compiler.front.checking.identity (identity_of)
 import compiler.store.hash.forms (DefinitionRun)
 
@@ -28,87 +27,27 @@ pub fn keys_of(modules: Modules) -> List<ModuleKey> =
 
 pub fn names_of(modules: Modules) -> List<Bytes> = modules.own.concat(modules.pulled)
 
-pub type ListedTest = { info: TestInfo, label: Location }
-
-pub type TestList = {
-  root: Int,
-  names: List<Bytes>,
-  tests: List<ListedTest>,
-  effects: Map<Bytes, Bool>,
-  records: List<Bytes>,
-}
-
-derive bin for ListedTest
+pub type TestList = { root: Int, names: List<Bytes>, tests: List<TestInfo> }
 
 derive bin for TestList
-
-pub fn test_list(
-  root: Int,
-  names: List<Bytes>,
-  tests: List<TestInfo>,
-  labels: Map<Bytes, Location>,
-  effects: Map<Bytes, Bool>,
-  records: List<Bytes>,
-) -> TestList / {abort.raise} =
-  {
-    root: root,
-    names: names,
-    tests: tests.map(|t: TestInfo|
-      {
-        info: t,
-        label: match labels.get(t.key) {
-          Some(at) -> at,
-          None ->
-            panic(
-              "the program holds no label of the test `" ++ String::of_bytes_lossy(t.key) ++ "`",
-            ),
-        },
-      }),
-    effects: effects.fold(
-      prelude_effects.fold(Map::new(), |found: Map<Bytes, Bool>, e: EffectInfo|
-        found.insert(e.name, e.nondet)),
-      |found: Map<Bytes, Bool>, name: Bytes, varies: Bool| found.insert(name, varies),
-    ),
-    records: records,
-  }
 
 pub fn test_list_query() -> QueryOf<Modules, TestList> =
   { name: b"test list", input: modules_bin(), output: test_list_bin() }
 
-type PlacedTests = { tests: List<TestInfo>, labels: Map<Bytes, Location> }
-
 pub fn test_list_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
   let keys = keys_of(modules);
-  let placed = range(0, modules.own.len()).fold(
-    { tests: [], labels: Map::new() },
-    |found: PlacedTests, i: Int| {
-      let read: ModuleTests = part_fetched(tests_part(), keys.get(i));
-      {
-        tests: read.tests.fold(found.tests, |tests: List<TestInfo>, t: TestInfo|
-          tests.push({ ..t, index: tests.len(), at: { ..t.at, module: i } })),
-        labels: read.labels.fold(
-          found.labels,
-          |labels: Map<Bytes, Location>, key: Bytes, at: Location|
-            labels.insert(key, { ..at, module: i }),
-        ),
-      }
-    },
-  );
-  written(
-    test_list_query(),
-    test_list(
-      modules.root,
-      names_of(modules),
-      placed.tests,
-      placed.labels,
-      keys.fold(Map::new(), |found: Map<Bytes, Bool>, k: ModuleKey|
-        part_fetched(declared_effects_part(), k).fold(
-          found,
-          |m: Map<Bytes, Bool>, d: DeclaredEffect| m.insert(d.name, d.nondet),
-        )),
-      keys.map(|k: ModuleKey| fetched(hashes_query(), k).record),
-    ),
-  )
+  written(test_list_query(), {
+    root: modules.root,
+    names: names_of(modules),
+    tests: range(0, modules.own.len()).fold([], |found: List<TestInfo>, i: Int|
+      part_fetched(tests_part(), keys.get(i)).fold(found, |tests: List<TestInfo>, t: TestInfo|
+        tests.push({
+          ..t,
+          index: tests.len(),
+          at: { ..t.at, module: i },
+          label: { ..t.label, module: i },
+        }))),
+  })
 }
 
 pub type ProgramRollup = {
@@ -151,7 +90,6 @@ pub fn program_rollup_result(modules: Modules) -> Written / {memo.read, abort.ra
 }
 
 pub type ProgramSites = {
-  imports: List<List<Int>>,
   tagged: List<TaggedSite>,
   statements: List<StatementSite>,
   constants: List<ConstSite>,
@@ -163,13 +101,23 @@ derive bin for ProgramSites
 pub fn program_sites_query() -> QueryOf<Modules, ProgramSites> =
   { name: b"program sites", input: modules_bin(), output: program_sites_bin() }
 
-pub fn module_imports(modules: Modules) -> List<List<Int>> / {memo.read, abort.raise} = {
+pub fn program_imports_query() -> QueryOf<Modules, List<List<Int>>> =
+  {
+    name: b"program imports",
+    input: modules_bin(),
+    output: bin::list_bin(bin::list_bin(bin::int_bin())),
+  }
+
+pub fn program_imports_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
   let names = names_of(modules);
   let slots = range(0, names.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
     found.insert(names.get(i), i));
-  keys_of(modules).map(|k: ModuleKey|
-    part_fetched(imports_part(), k).fold([], |found: List<Int>, name: Bytes|
-      match slots.get(name) { Some(i) -> found.push(i), None -> found }))
+  written(
+    program_imports_query(),
+    keys_of(modules).map(|k: ModuleKey|
+      part_fetched(imports_part(), k).fold([], |found: List<Int>, name: Bytes|
+        match slots.get(name) { Some(i) -> found.push(i), None -> found })),
+  )
 }
 
 pub fn reached_modules(imports: List<List<Int>>, start: List<Int>) -> Set<Int> / {abort.raise} =
@@ -226,7 +174,6 @@ pub fn program_sites_result(modules: Modules) -> Written / {memo.read, abort.rai
   let constants = root.fold([], |found: List<ConstSite>, i: Int|
     found.concat(read.get(i).constants.map(|c: ConstSite| { ..c, module: i })));
   written(program_sites_query(), {
-    imports: module_imports(modules),
     tagged: tagged,
     statements: statements,
     constants: constants,
@@ -256,6 +203,11 @@ pub fn program_queries() -> List<CheckDefinition> =
       program_sites_query(),
       b"compiler.front.checking.program_facts.program_sites_result",
       program_sites_result,
+    ),
+    query_definition(
+      program_imports_query(),
+      b"compiler.front.checking.program_facts.program_imports_result",
+      program_imports_result,
     ),
   ]
 

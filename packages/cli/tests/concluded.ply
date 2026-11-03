@@ -54,7 +54,6 @@ import tests.report (Entry, RunDecision, cached_count, Program, Cost, SearchSumm
                      case_of, canonical, SourceSpan, source_place)
 import tests.listing (hash_at, listing_of_program, sources_named, test_at)
 import tests.listing (TestListing, SelectedTest, run_hash)
-import tests.history (IndexedVersion, store_versions)
 
 pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
   effects.fold(false, |found: Bool, a: types::Effect| found || a.effect == b"sim")
@@ -398,7 +397,7 @@ pub fn conclude_tests(analysis: TestListing, program: Program) -> List<conclude:
           index: i,
           key: t.key,
           seeded: uses_simulation(t.effects),
-          hash: Some(run_hash(listed)),
+          hash: run_hash(listed),
           start: match entry { Some(e) -> e.key, None -> t.key },
           case: match entry { Some(e) -> e.case != None, None -> false },
         })
@@ -697,21 +696,17 @@ type ModuleRollup = { key: Bytes, at: List<Int> }
 
 fn module_rollups(
   rows: List<Row>,
-  keys: List<Option<Bytes>>,
+  keys: List<Bytes>,
   search: Search,
 ) -> List<ModuleRollup> / {abort.raise} =
   List::group_by(
     range(0, rows.len()).filter(|i: Int|
-      keys.at_or(i, None) != None && !rows.get(i).nondet && !keyed_per_root(rows.get(i), search)),
+      !rows.get(i).nondet && !keyed_per_root(rows.get(i), search)),
     |i: Int| rows.get(i).module,
   ).values(
   ).map(|at: List<Int>|
     {
-      key: blake3(
-        Bytes::concat_all(
-          at.map(|i: Int| keys.at_or(i, None).unwrap_or(b"")).push(b"a module's tests"),
-        ),
-      ),
+      key: blake3(Bytes::concat_all(at.map(|i: Int| keys.get(i)).push(b"a module's tests"))),
       at: at,
     })
 
@@ -719,15 +714,23 @@ pub type DecidedCases = { cases: List<select::Case>, rolled: List<Pass> }
 
 test "a module's rollup covers its plain tests, leaves out `test/nondet`, and moves with any identity" {
   let row = |name: String, module: String, always: Bool|
-    { ..no_row, name: name, module: module, hash: Some(b"h"), nondet: always };
+    {
+      index: 0,
+      label: name,
+      name: name,
+      module: module,
+      hash: b"h",
+      seeded: false,
+      nondet: always,
+    };
   let rows = [row("a", "m", false), row("b", "m", false), row("c", "n", true)];
   let search = { mode: "", roots: [], budget: 0, steps: 0, path: [], profile: cc::development() };
-  let rollups_of = |keys: List<Option<Bytes>>| module_rollups(rows, keys, search);
-  let keys = [Some(b"one"), Some(b"two"), Some(b"three")];
+  let rollups_of = |keys: List<Bytes>| module_rollups(rows, keys, search);
+  let keys = [b"one", b"two", b"three"];
   assert_eq(rollups_of(keys).map(|m: ModuleRollup| m.at), [[0, 1]]);
   assert(
     rollups_of(keys).map(|m: ModuleRollup| m.key)
-      != rollups_of([Some(b"one"), Some(b"moved"), Some(b"three")]).map(|m: ModuleRollup| m.key),
+      != rollups_of([b"one", b"moved", b"three"]).map(|m: ModuleRollup| m.key),
   )
 }
 
@@ -742,23 +745,19 @@ pub fn cases_of(
   let whole = range(0, rollups.len()).fold(Set::empty(), |found: Set<Int>, k: Int|
     if rollup_passes.at_or(k, None) == None { found }
     else { rollups.get(k).at.fold(found, |in_whole: Set<Int>, i: Int| in_whole.insert(i)) });
-  let keyed = range(0, rows.len()).filter(|i: Int| keys.at_or(i, None) != None);
-  let queried = keyed.filter(|i: Int| !whole.contains(i));
-  let answers = result_cache.passes(queried.map(|i: Int| keys.at_or(i, None).unwrap_or(b"")));
+  let tests = range(0, rows.len());
+  let queried = tests.filter(|i: Int| !whole.contains(i));
+  let answers = result_cache.passes(queried.map(|i: Int| keys.get(i)));
   let answered = range(0, queried.len()).fold(
     Map::new(),
     |found: Map<Int, Option<Bytes>>, k: Int| found.insert(queried.get(k), answers.at_or(k, None)),
   );
   let trace_of = |i: Int|
     if whole.contains(i) { Some(b"") } else { answered.get(i).unwrap_or(None) };
-  let recorded = keyed.map(trace_of);
+  let recorded = tests.map(trace_of);
   let rooted = rows.map(|r: Row|
-    match r.hash {
-      Some(h) -> if keyed_per_root(r, search) {
-        Some(seed_keys(h, search.roots, [], search.profile))
-      } else { None },
-      None -> None,
-    });
+    if keyed_per_root(r, search) { Some(seed_keys(r.hash, search.roots, [], search.profile)) }
+    else { None });
   let seeded = rooted.map(|ks: Option<List<Bytes>>|
     match ks { Some(xs) -> Some(result_cache.passes(xs)), None -> None });
   let now = views::shipped_state_of(
@@ -770,15 +769,7 @@ pub fn cases_of(
     ),
     |m: Bytes| views::read_shipped_text(loaded, m),
   );
-  let results = recorded.map(|trace: Option<Bytes>| pass_status(now, trace));
-  let stored_results = keys.fold(
-    { at: 0, out: [] },
-    |st: { at: Int, out: List<Option<StoredResult>> }, k: Option<Bytes>|
-      match k {
-        None -> { ..st, out: st.out.push(None) },
-        Some(_) -> { at: st.at + 1, out: st.out.push(results.at_or(st.at, None)) },
-      },
-  ).out;
+  let stored_results = recorded.map(|trace: Option<Bytes>| pass_status(now, trace));
   let pending_seed_roots = seeded.map(|o: Option<List<Option<Bytes>>>|
     match o {
       Some(xs) ->
@@ -786,13 +777,8 @@ pub fn cases_of(
       None -> None,
     });
   {
-    cases: range(0, rows.len()).map(|i: Int|
-      select::case_of(
-        rows.at_or(i, no_row),
-        keys.at_or(i, None),
-        stored_results.at_or(i, None),
-        pending_seed_roots.at_or(i, None),
-      )),
+    cases: tests.map(|i: Int|
+      select::case_of(rows.get(i), keys.get(i), stored_results.get(i), pending_seed_roots.get(i))),
     rolled: rollups.filter(|m: ModuleRollup|
       m.at.any(|i: Int| !whole.contains(i)) && m.at.all(|i: Int| trace_of(i) == Some(b""))).map(
       |m: ModuleRollup| { key: m.key, trace: b"" },
@@ -814,9 +800,6 @@ pub fn pass_status(now: views::ShippedState, stored_trace: Option<Bytes>) -> Opt
       }
     },
   }
-
-const no_row: Row =
-  { index: 0, label: "", name: "", module: "", hash: None, seeded: false, nondet: false }
 
 pub fn diagnosed_all(
   view: Option<{ whole: ProgramListing, places: List<SourceText> }>,
