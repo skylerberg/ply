@@ -15,7 +15,8 @@ import compiler.store.memo.store (Dependency, FactDetails, StoredFact, StoredInp
                                   fixed_digest, input_id, location_id, lowest_waiting, memo_store,
                                   nothing_left_waiting, nothing_waiting, interfaces, session_input,
                                   session_inputs, stored_fact_bin, stored_input_bin, with_mark,
-                                  with_mark_moved, with_session_inputs, without_mark)
+                                  with_mark_moved, with_session_inputs, without_mark, Layer,
+                                  ProjectLayer, PackLayer)
 import compiler.store.memo.engine (in_session_of)
 import compiler.store.handles (part_label)
 import compiler.store.packs
@@ -38,6 +39,12 @@ fn base_of(pack: packs::Pack) -> Segment / {abort.raise} =
 
 fn base_table_name(id: Bytes, table: Int) -> Bytes / {abort.raise} =
   Bytes::concat_all([b"shipped pack\x00", id, bin::encode(table, bin::int_bin())])
+
+fn layer_of(db: Database, layer: Layer) -> Database =
+  match layer {
+    ProjectLayer -> fact_store::without_base(db),
+    PackLayer -> fact_store::base_only(db),
+  }
 
 fn unpackable_part<a>(part: Bytes) -> a / {abort.raise} =
   panic(
@@ -160,6 +167,11 @@ fn over_database<a, [r] | e>(
       Some(b) -> Some(b),
       None -> match pack { Some(p) -> packs::result(p, read, key), None -> None },
     };
+  let details_bytes = |db: Database, digest: Bytes|
+    match result_bytes(db, digest) {
+      Some(b) -> b,
+      None -> fact_damage.damaged("a stored fact names details that are not stored"),
+    };
   let looked = |db: Database, kind: Bytes, at: Bytes| {
     let id = location_id(kind, at);
     session_input(id, ||
@@ -189,13 +201,10 @@ fn over_database<a, [r] | e>(
     memo_store.from_pack(key) -> fact_store::from_base[r](st.db, Facts, key),
     memo_store.details(digest) -> match st.details.get(digest) {
       Some(d) -> d,
-      None -> match result_bytes(st.db, digest) {
-        None -> fact_damage.damaged("a stored fact names details that are not stored"),
-        Some(b) -> {
-          let d = undecoded(b, fact_details_bin());
-          st = { ..st, details: st.details.insert(digest, d) };
-          d
-        },
+      None -> {
+        let d = undecoded(details_bytes(st.db, digest), fact_details_bin());
+        st = { ..st, details: st.details.insert(digest, d) };
+        d
       },
     },
     memo_store.output(digest) -> match st.outputs.get(digest) {
@@ -214,8 +223,10 @@ fn over_database<a, [r] | e>(
     memo_store.dependents(key) -> fact_store::members[r](st.db, Dependents, key),
     memo_store.has_dependents(key) -> fact_store::has_members[r](st.db, Dependents, key),
     memo_store.inputs() -> inputs_of[r](st.db),
-    memo_store.facts_of(prefix) -> fact_store::entries_under[r](st.db, Facts, prefix).keys(),
-    memo_store.code(name) -> fact_store::value_of[r](st.db, Codes, blake3(name)),
+    memo_store.facts_of(prefix, layer) ->
+      fact_store::entries_under[r](layer_of(st.db, layer), Facts, prefix).keys(),
+    memo_store.code(name, layer) ->
+      fact_store::value_of[r](layer_of(st.db, layer), Codes, blake3(name)),
     memo_store.external(kind, at) -> looked(st.db, kind, at),
     memo_store.is_out_of_date(key) -> st.waiting.depths.contains(key),
     memo_store.next_out_of_date() -> first_waiting(st.waiting),
@@ -245,7 +256,7 @@ fn over_database<a, [r] | e>(
           ..st,
           waiting: with_mark_moved(st.waiting, key, deeper),
           db: fact_store::with_value(
-            st.db,
+            fact_store::with_result[r](st.db, fact.details, details_bytes(st.db, fact.details)),
             Facts,
             key,
             bin::encode({ ..fact, depth: deeper }, stored_fact_bin()),
@@ -555,20 +566,20 @@ pub fn usage<[r]>(
   opening: fact_store::Opening,
 ) -> Usage / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
   match read_opened[r](opening, |db: Database| {
-    let size = fact_store::store_size(db);
-    let facts = fact_store::entries_under[r](db, Facts, b"").values();
-    let kinds = facts.fold(Map::new(), |found: Map<Bytes, KindUsage>, b: Bytes|
-      with_fact_of_kind[r](db, found, undecoded(b, stored_fact_bin())));
-    let output_bytes = kinds.fold(0, |n: Int, _: Bytes, k: KindUsage| n + k.bytes);
-    {
-      records: facts.len(),
-      results: live_results[r](db).size(),
-      output_bytes: output_bytes,
-      kinds: kinds.values(),
-      segments: size.segments,
-      bytes: size.bytes,
-    }
-  }) {
+      let size = fact_store::store_size(db);
+      let facts = fact_store::entries_under[r](db, Facts, b"").values();
+      let kinds = facts.fold(Map::new(), |found: Map<Bytes, KindUsage>, b: Bytes|
+        with_fact_of_kind[r](db, found, undecoded(b, stored_fact_bin())));
+      let output_bytes = kinds.fold(0, |n: Int, _: Bytes, k: KindUsage| n + k.bytes);
+      {
+        records: facts.len(),
+        results: live_results[r](db).size(),
+        output_bytes: output_bytes,
+        kinds: kinds.values(),
+        segments: size.segments,
+        bytes: size.bytes,
+      }
+    }) {
     Ok(found) -> found,
     Err(_) -> { records: 0, results: 0, output_bytes: 0, kinds: [], segments: 0, bytes: 0 },
   }
@@ -1535,6 +1546,42 @@ test "a store used under a newer pack gives the newer pack's results" {
   let first = run_with(fs::mem_empty(), older, b"four");
   assert_eq(first.value, b"long 4");
   assert_eq(run_with(first.tree, newer, b"forty").value, b"long 5")
+}
+
+fn sized_label(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  b"size ".concat(fetched_main(b"length", input))
+
+test "a fact computed here under older code is computed again under a pack the new code built" {
+  let older = lengths(b"h1");
+  let newer = older.insert(b"label", query(b"label", b"l2", sized_label));
+  let reader = |pack: packs::PackFiles| |part: packs::PackPart| packs::frame_in(Some(pack), part);
+  let run_with = |store: fs::MemFs, named: Map<Bytes, Query<| {}>>, read: (packs::PackPart) -> Option<Bytes> / {abort.raise}|
+    with_store_in_memory(store, read, |_: Bytes, _: Bytes| Some(b"forty"), ||
+      in_session_of(plain_queries(named), b"label", b"a"));
+  let first = run_with(fs::mem_empty(), older, reader(packed(older, four(), b"label")));
+  assert_eq(first.value, b"long 5");
+  assert_eq(run_with(first.tree, newer, reader(packed(newer, four(), b"label"))).value, b"size 5")
+}
+
+fn length_through_raw(input: Bytes) -> Bytes / {memo.read, abort.raise} =
+  fetched_main(b"raw", input)
+
+test "a shipped fact made deeper here keeps its details in this store, so the store reads without the pack" {
+  let older = lengths(b"h1");
+  let newer = older.insert(b"length", query(b"length", b"h2", length_through_raw)).insert(
+    b"raw",
+    query(b"raw", b"r1", length_of),
+  );
+  let pack = packed(older, four(), b"label");
+  let read = |part: packs::PackPart| packs::frame_in(Some(pack), part);
+  let ran = with_store_in_memory(
+    fs::mem_empty(),
+    read,
+    |_: Bytes, at: Bytes| four().files.get(at),
+    || in_session_of(plain_queries(newer), b"label", b"a"),
+  );
+  assert_eq(ran.value, b"long 4");
+  assert(facts_in_memory(ran.tree).values().any(|r: FactRecord| r.query == b"label"))
 }
 
 fn measured(input: Bytes) -> Parts / {memo.read} = {
