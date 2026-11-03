@@ -20,8 +20,6 @@ const flush_threshold: Int = 8388608
 
 const stale_run_ms: Int = 3600000
 
-const stale_manifest_ms: Int = 172800000
-
 fn read_u32(b: Bytes, at: Int) -> Int = match b.u32_at(at) { Some(n) -> n, None -> 0 }
 
 fn read_u64(b: Bytes, at: Int) -> Int = match b.u64_at(at) { Some(n) -> n, None -> 0 }
@@ -139,16 +137,6 @@ pub fn listed(file: ManifestFile) -> Manifest = match file { Listed(m) -> m, _ -
 
 pub fn manifest<[r]>(dir: String, schema: Bytes) -> Manifest / {fs.read[r], abort.raise} =
   listed(manifest_file[r](dir, schema))
-
-pub fn has_other_manifests<[r]>(dir: String, schema: Bytes) -> Bool / {fs.read[r], abort.raise} = {
-  let own = manifest_name(schema);
-  List::fold(
-    match fs::listed_names(fs.list_dir[r](dir)) { Some(names) -> names, None -> [] },
-    false,
-    |any: Bool, name: String|
-      any || (name.starts_with("manifest-") && name != own && !name.starts_with(own ++ ".")),
-  )
-}
 
 pub fn start_run<[r]>(dir: String) -> Option<String> / {fs.write[r]} = {
   fs.create_dir[r](dir);
@@ -523,18 +511,6 @@ pub fn merge_start(m: Manifest) -> Int / {abort.raise} = {
   }
 }
 
-fn has_segment_header<[r]>(
-  dir: String,
-  name: String,
-  schema: Bytes,
-) -> Bool / {fs.read[r], abort.raise} =
-  match fs.read_at[r](dir ++ "/" ++ name, 0, header_len) {
-    Some(b) ->
-      b.len() == header_len && b.slice(0, 8) == segment_magic && read_u32(b, 8) == format_version
-        && b.slice(20, 52) == schema,
-    None -> false,
-  }
-
 pub fn sweep<[r]>(
   dir: String,
   schema: Bytes,
@@ -542,32 +518,26 @@ pub fn sweep<[r]>(
 ) -> Unit / {fs.read[r], fs.write[r], abort.raise} = {
   let names = match fs::listed_names(fs.list_dir[r](dir)) { Some(ns) -> ns, None -> [] };
   let now = run_start_ms[r](Some(run));
-  let own = manifest_name(schema);
-  let older = |name: String, bound: Int|
-    match fs.modified_ms[r](dir ++ "/" ++ name) { Some(ms) -> now - ms > bound, None -> false };
+  let abandoned = |name: String|
+    match fs.modified_ms[r](dir ++ "/" ++ name) {
+      Some(ms) -> now - ms > stale_run_ms,
+      None -> false,
+    };
   let removed = |name: String| {
     fs.remove[r](dir ++ "/" ++ name);
     ()
   };
   let running = names.fold(false, |any: Bool, name: String|
-    if !name.starts_with("run") || run.ends_with("/" ++ name) { any }
-    else if older(name, stale_run_ms) {
-      removed(name);
-      any
-    } else { true });
-  let has_other_manifests = names.fold(false, |any: Bool, name: String|
-    if !name.starts_with("manifest-") || name == own || name.starts_with(own ++ ".") { any }
-    else if older(name, stale_manifest_ms) {
+    if !name.starts_with("run") || run.ends_with("/" ++ name) { any } else if abandoned(name) {
       removed(name);
       any
     } else { true });
   if !running {
-    let m = manifest[r](dir, schema);
-    let committed_manifest = m.segments.map(|s: Segment| segment_name(s.token));
+    let own = manifest_name(schema);
+    let listed_segments = manifest[r](dir, schema).segments.map(|s: Segment| segment_name(s.token));
     names.fold((), |_: Unit, name: String|
-      if name.starts_with(own ++ ".") { removed(name) }
-      else if name.starts_with("seg-") && !committed_manifest.contains(name)
-          && (!has_other_manifests || has_segment_header[r](dir, name, schema)) { removed(name) })
+      if (name.starts_with("manifest-") && name != own)
+          || (name.starts_with("seg-") && !listed_segments.contains(name)) { removed(name) })
   }
 }
 
@@ -730,63 +700,68 @@ test "`merge_start` returns where to start merging: the newest run of segments i
   assert_eq(due([400, 150, 80]), 0)
 }
 
-test "a sweep deletes files that no manifest lists, but deletes nothing while another run is active" {
-  let made = fs::on_mem[abs](fs::mem_of([]), || {
+const other_shapes: Bytes = b"other shapes".blake3()
+
+fn two_schemas_and_another_run() -> fs::MemResult<Option<String>> / {abort.raise} =
+  fs::on_mem[abs](fs::mem_of([]), || {
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     commit[abs]("s", test_shapes, a);
     write_segment[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
-    write_test_segment[abs]("s", b"other shapes".blake3(), b"token--o", [
+    let o = write_test_segment[abs]("s", other_shapes, b"token--o", [
       { key: b"o".blake3(), value: b"other" },
     ]);
+    commit[abs]("s", other_shapes, o);
     fs.write_file[abs]("s/" ++ manifest_name(test_shapes) ++ ".746f6b656e.tmp", b"torn");
+    fs.write_file[abs]("s/" ++ manifest_name(other_shapes) ++ ".746f6b656e.tmp", b"torn");
     fs.temp_dir[abs]("s", "run")
-  });
-  let other = match made.value { Some(path) -> path, None -> "" };
-  let seg = |token: Bytes| segment_name(token);
-  let held_back = fs::on_mem[abs](made.tree, || {
+  })
+
+fn swept(tree: fs::MemFs) -> fs::MemFs / {abort.raise} =
+  fs::on_mem[abs](tree, || {
     let run = start_run[abs]("s");
-    sweep[abs]("s", test_shapes, match run { Some(path) -> path, None -> "" });
+    match run {
+      Some(path) -> sweep[abs]("s", test_shapes, path),
+      None -> panic("the test's file system could not make a run directory"),
+    };
     end_run[abs](run)
-  });
-  let remaining_names = names_in(held_back.tree, "s");
-  assert(remaining_names.contains(seg(b"token--b")) && remaining_names.contains(seg(b"token--o")));
-  let alone = fs::on_mem[abs](held_back.tree, || {
-    fs.remove[abs](other);
-    let run = start_run[abs]("s");
-    sweep[abs]("s", test_shapes, match run { Some(path) -> path, None -> "" });
-    end_run[abs](run)
-  });
-  assert_eq(names_in(alone.tree, "s"), [manifest_name(test_shapes), seg(b"token--a")])
+  }).tree
+
+fn ended(tree: fs::MemFs, run: Option<String>) -> fs::MemFs / {abort.raise} =
+  fs::on_mem[abs](tree, || end_run[abs](run)).tree
+
+test "a sweep removes every other schema's manifest and every segment its own manifest does not list once no other run is active" {
+  let made = two_schemas_and_another_run();
+  assert_eq(names_in(swept(ended(made.tree, made.value)), "s"), [
+    manifest_name(test_shapes),
+    segment_name(b"token--a"),
+  ])
 }
 
-test "a sweep keeps the segments of another store in the same directory when that store has its own committed manifest" {
-  let other = b"other shapes".blake3();
+test "a sweep removes nothing while another run is active, whatever that run's schema" {
+  let made = two_schemas_and_another_run();
+  assert_eq(names_in(swept(made.tree), "s"), names_in(made.tree, "s"))
+}
+
+test "a sweep never removes a segment its own manifest lists, and every value stays readable" {
   let made = fs::on_mem[abs](fs::mem_of([]), || {
     let a = write_segment[abs]("s", b"token--a", [{ key: b"a".blake3(), value: b"one" }]);
     commit[abs]("s", test_shapes, a);
-    write_segment[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
-    let o = write_test_segment[abs]("s", other, b"token--o", [
+    let o = write_test_segment[abs]("s", other_shapes, b"token--o", [
       { key: b"o".blake3(), value: b"other" },
     ]);
-    commit[abs]("s", other, o);
-    let run = start_run[abs]("s");
-    sweep[abs]("s", test_shapes, match run { Some(path) -> path, None -> "" });
-    end_run[abs](run)
+    commit[abs]("s", other_shapes, o);
+    let b = write_segment[abs]("s", b"token--b", [{ key: b"b".blake3(), value: b"two" }]);
+    commit[abs]("s", test_shapes, b);
+    ()
   });
-  let remaining_names = names_in(made.tree, "s");
+  let read = fs::on_mem[abs](swept(made.tree), ||
+    [lookup[abs]("s", b"a".blake3()), lookup[abs]("s", b"b".blake3())]);
+  assert_eq(read.value, [Some(b"one"), Some(b"two")]);
+  let remaining_names = names_in(read.tree, "s");
   assert(
-    remaining_names.contains(segment_name(b"token--o"))
-      && remaining_names.contains(manifest_name(other)),
-  );
-  assert(!remaining_names.contains(segment_name(b"token--b")));
-  let later = fs::on_mem[abs](made.tree, || {
-    let run = start_run[abs]("s");
-    let path = match run { Some(p) -> p, None -> "" };
-    fs.set_modified[abs](path, run_start_ms[abs](run) + stale_manifest_ms + 1);
-    sweep[abs]("s", test_shapes, path);
-    end_run[abs](run)
-  });
-  assert_eq(names_in(later.tree, "s"), [manifest_name(test_shapes), segment_name(b"token--a")])
+    remaining_names.contains(segment_name(b"token--a"))
+      && remaining_names.contains(segment_name(b"token--b")),
+  )
 }
 
 pub fn rows_folded<a | e>(count: Int, init: a, f: (a, Int) -> a / e) -> a / {abort.raise | e} =
