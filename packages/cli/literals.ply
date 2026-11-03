@@ -12,7 +12,9 @@ import compiler.syntax.parsing (Span, span_between)
 import compiler.check.resolve.tables (Diagnostic, error_at)
 import compiler.unit (shipped, shipped_runtime, compiler_roots, entered_timeout_ms, identity_of)
 import store.tables
-import project_store (databases)
+import project_store
+import project_store (Databases, WorkingDirectory, Absolute)
+import compiler.store.fact_store (recent_reads)
 import results
 import semantics (semantics)
 import diagnostic (SourceText, diagnostic_of, shown)
@@ -58,12 +60,15 @@ pub type Looked<a, b> = { request: a, found: Found<b> }
 pub type StoredJudgements = {
   verdicts: List<Looked<EvaluationRequest, Verdict>>,
   statements: List<Looked<StatementCheck, CheckResult>>,
+  warnings: List<Diagnostic>,
 }
+
+pub type Judgements<b> = { found: List<b>, warnings: List<Diagnostic> }
 
 pub effect evaluation {
   read stored(place: ProgramPlace, requests: List<EvaluationRequest>, checks: List<KeyedCheck>) -> StoredJudgements
-  read verdicts(program: CodeProgram, looked: List<Looked<EvaluationRequest, Verdict>>) -> Result<List<Verdict>, List<Diagnostic>>
-  read statements(program: CodeProgram, looked: List<Looked<StatementCheck, CheckResult>>) -> Result<List<CheckResult>, List<Diagnostic>>
+  read verdicts(program: CodeProgram, looked: List<Looked<EvaluationRequest, Verdict>>) -> Result<Judgements<Verdict>, List<Diagnostic>>
+  read statements(program: CodeProgram, looked: List<Looked<StatementCheck, CheckResult>>) -> Result<Judgements<CheckResult>, List<Diagnostic>>
 }
 
 fn request_of(
@@ -233,9 +238,16 @@ pub fn site_errors<a>(
       parsers,
       checks.map(|a: CheckSite| { check: a.check, identity: a.identity }),
     );
-    match ((all_stored(looked.verdicts), all_stored(looked.statements))) {
+    looked.warnings.concat(match ((all_stored(looked.verdicts), all_stored(looked.statements))) {
       (Some(verdicts), Some(judgements)) ->
-        judged_site_errors(sites, places, parsers, checks, Ok(verdicts), Ok(judgements)),
+        judged_site_errors(
+          sites,
+          places,
+          parsers,
+          checks,
+          Ok(all_read(verdicts)),
+          Ok(all_read(judgements)),
+        ),
       _ -> match units::code_program_of(s, later.rollup) {
         Err(diagnostics) -> diagnostics,
         Ok(program) ->
@@ -245,18 +257,20 @@ pub fn site_errors<a>(
             parsers,
             checks,
             match all_stored(looked.verdicts) {
-              Some(verdicts) -> Ok(verdicts),
+              Some(verdicts) -> Ok(all_read(verdicts)),
               None -> evaluation.verdicts(program, looked.verdicts),
             },
             match all_stored(looked.statements) {
-              Some(judgements) -> Ok(judgements),
+              Some(judgements) -> Ok(all_read(judgements)),
               None -> evaluation.statements(program, looked.statements),
             },
           ),
       },
-    }
+    })
   }
 }
+
+fn all_read<b>(found: List<b>) -> Judgements<b> = { found: found, warnings: [] }
 
 pub fn later_errors<a>(
   s: Session<a>,
@@ -273,16 +287,16 @@ fn judged_site_errors(
   places: List<SourceText>,
   parsers: List<EvaluationRequest>,
   checks: List<CheckSite>,
-  verdicts: Result<List<Verdict>, List<Diagnostic>>,
-  judgements: Result<List<CheckResult>, List<Diagnostic>>,
+  verdicts: Result<Judgements<Verdict>, List<Diagnostic>>,
+  judgements: Result<Judgements<CheckResult>, List<Diagnostic>>,
 ) -> List<Diagnostic> / {abort.raise} = {
   let literal = match verdicts {
     Err(diagnostics) -> diagnostics,
-    Ok(found) -> verdict_errors(sites, places, parsers, found),
+    Ok(judged) -> verdict_errors(sites, places, parsers, judged.found).concat(judged.warnings),
   };
   literal.concat(match judgements {
     Err(diagnostics) -> schemas_rejected(checks).concat(diagnostics),
-    Ok(found) -> judged_errors(checks, found),
+    Ok(judged) -> judged_errors(checks, judged.found).concat(judged.warnings),
   })
 }
 
@@ -423,7 +437,7 @@ type Judging = Option<results::OpenStore>
 
 fn judging_store(
   place: ProgramPlace,
-) -> Judging / {databases.open, fs.read[cwd], fs.read[abs], fs.read_file[shipped], semantics.cached, abort.raise} =
+) -> Judging / {Databases, fs.read[cwd], fs.read[abs], fs.read_file[shipped], semantics.cached, abort.raise} =
   match place.store { None -> None, Some(r) -> Some(results::store_for([r])) }
 
 fn judgement_of(j: Judging, kind: tables::Judged, key: Bytes) -> Option<Bytes> / {abort.raise} =
@@ -505,18 +519,30 @@ fn to_store<a, b | e>(
       },
   ).out
 
+fn open_warnings(j: Judging) -> List<Diagnostic> =
+  match j {
+    None -> [],
+    Some(opened) -> project_store::diagnostics_of(tables::warnings(opened.cache)),
+  }
+
 fn judgements_stored(
   j: Judging,
   kind: tables::Judged,
   judgements: Map<Bytes, Bytes>,
-) -> Unit / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise} =
+) -> List<Diagnostic> / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} =
   match j {
-    None -> (),
+    None -> [],
     Some(opened) -> {
-      let replaced = tables::judgements_replaced(opened.cache, kind, judgements);
-      if opened.place.label == "cwd" { tables::flush_cache[cwd](replaced) }
-      else { tables::flush_cache[abs](replaced) };
-      ()
+      let replaced = tables::judgements_replaced(
+        results::without_warnings(opened).cache,
+        kind,
+        judgements,
+      );
+      let flushed = match opened.place.label {
+        WorkingDirectory -> tables::flush_cache[cwd](replaced),
+        Absolute -> tables::flush_cache[abs](replaced),
+      };
+      project_store::diagnostics_of(tables::warnings(flushed))
     },
   }
 
@@ -525,7 +551,7 @@ fn toolchain_now() -> Bytes / {shipped.definitions, shipped.runtime, shipped.ver
 
 pub fn with_evaluation_cache<a | e>(
   body: () -> a / {evaluation.stored, evaluation.verdicts, evaluation.statements | e},
-) -> a / {databases.open, emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, shipped.version, semantics.cached, fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise | e} =
+) -> a / {Databases, emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, shipped.runtime, shipped.definitions, shipped.version, semantics.cached, fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], abort.raise | e} =
   handle {
     body()
   } with {
@@ -533,6 +559,7 @@ pub fn with_evaluation_cache<a | e>(
       let toolchain = toolchain_now();
       let j = judging_store(place);
       {
+        warnings: open_warnings(j),
         verdicts: requests.map(|a: EvaluationRequest|
           looked_up(a, verdict_key(toolchain, a), |k: Bytes| stored_verdict(j, k))),
         statements: checks.map(|a: KeyedCheck|
@@ -545,35 +572,35 @@ pub fn with_evaluation_cache<a | e>(
     },
     evaluation.verdicts(program, looked) -> match evaluate(program, missing(looked)) {
       Err(diagnostics) -> Err(diagnostics),
-      Ok(found) -> {
-        judgements_stored(
-          judging_store(program.place),
-          tables::Verdicts,
-          to_store(
-            looked,
-            found.map(|v: Verdict| if cacheable(v) { Some(v) } else { None }),
-            |v: Verdict| bin::encode(v, verdict_bin()),
+      Ok(found) ->
+        Ok({
+          found: merged(looked, found),
+          warnings: judgements_stored(
+            judging_store(program.place),
+            tables::Verdicts,
+            to_store(
+              looked,
+              found.map(|v: Verdict| if cacheable(v) { Some(v) } else { None }),
+              |v: Verdict| bin::encode(v, verdict_bin()),
+            ),
           ),
-        );
-        Ok(merged(looked, found))
-      },
+        }),
     },
     evaluation.statements(program, looked) -> match check_statements(program, missing(looked)) {
       Err(diagnostics) -> Err(diagnostics),
-      Ok(checked) -> {
-        judgements_stored(
-          judging_store(program.place),
-          tables::StatementChecks,
-          to_store(looked, checked, |r: CheckResult| bin::encode(r, check_result_bin())),
-        );
-        Ok(
-          merged(
+      Ok(checked) ->
+        Ok({
+          found: merged(
             looked,
             checked.map(|r: Option<CheckResult>|
               match r { Some(found) -> found, None -> Unchecked }),
           ),
-        )
-      },
+          warnings: judgements_stored(
+            judging_store(program.place),
+            tables::StatementChecks,
+            to_store(looked, checked, |r: CheckResult| bin::encode(r, check_result_bin())),
+          ),
+        }),
     },
   }
 

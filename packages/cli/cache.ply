@@ -614,11 +614,10 @@ fn inspect_result(
     Ok(m) -> inspect_output(s, query, m),
   }
 
-fn display_path(place: project_store::StoreLocation, name: String) -> String =
-  paths::displayed({
-    label: place.label,
-    path: if name == "" { place.dir } else { place.dir ++ "/" ++ name },
-  })
+fn display_path(place: project_store::StoreLocation, name: String) -> String = {
+  let path = if name == "" { place.dir } else { place.dir ++ "/" ++ name };
+  paths::displayed(project_store::rooted_path(place.label, path))
+}
 
 fn memo_dir(place: project_store::StoreLocation) -> String = database::database_in(place.dir)
 
@@ -649,34 +648,34 @@ fn copied_result(
 fn stats_of<[r]>(
   place: project_store::StoreLocation,
   current: Set<Bytes>,
-) -> Stats / {databases.open, fs.read[r], time.elapsed_us, abort.raise} = {
+) -> Stats / {project_store::Databases, fs.read[r], time.elapsed_us, abort.raise} = {
   let started = time.elapsed_us();
-  let c = tables::open_cache[r](
-    databases.open(project_store::database_place_of(place)),
-    place.stamps,
-  );
+  let opening = databases.open(project_store::database_place_of(place));
+  let c = tables::open_cache[r](opening, place.stamps);
   let open_us = time.elapsed_us() - started;
   let counts = tables::counts(c);
   {
     directory: display_path(place, ""),
     warnings: project_store::diagnostics_of(tables::warnings(c)),
-    root: paths::displayed({
-      label: place.label,
-      path: if place.label == "cwd" { place.root } else { place.root.slice(1, place.root.len()) },
-    }),
+    root: paths::displayed(
+      project_store::rooted_path(place.label, match place.label {
+        project_store::WorkingDirectory -> place.root,
+        project_store::Absolute -> place.root.slice(1, place.root.len()),
+      }),
+    ),
     open_us: open_us,
     results: counts.passed,
     definitions_seen: counts.seen,
     obligations: counts.evidence,
     reviews: counts.reviews,
     texts: counts.texts,
-    memo: database::usage[r](memo_dir(place)),
+    memo: database::usage[r](opening),
   }
 }
 
 fn clear_store<[r]>(
   place: project_store::StoreLocation,
-) -> Result<ClearResult, Rejection> / {databases.open, fs.read[r], fs.write[r], abort.raise} = {
+) -> Result<ClearResult, Rejection> / {project_store::Databases, fs.read[r], fs.write[r], abort.raise} = {
   let c = tables::open_cache[r](
     databases.open(project_store::database_place_of(place)),
     place.stamps,
@@ -872,7 +871,7 @@ fn inspect_store<[r]>(
   listing: ProgramListing,
   tests: List<IdentifiedTest>,
   query: String,
-) -> Matches / {databases.open, fs.read[r], abort.raise} = {
+) -> Matches / {project_store::Databases, fs.read[r], abort.raise} = {
   let c = tables::open_cache[r](
     databases.open(project_store::database_place_of(place)),
     place.stamps,
@@ -896,18 +895,23 @@ fn inspect_store<[r]>(
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {databases.open, env.working_directory, semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, time.elapsed_us, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {project_store::Databases, env.working_directory, semantics.cached, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, time.elapsed_us, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise, diverges, shipped.report_view_used} = {
   let s: Style = style_of(flags);
   let place = project_store::store_location_of(flags.paths, project_store::shipped_stamps());
-  let cwd = place.label == "cwd";
   if flags.action == "stats" {
     let current = module_queries::current_hashes();
     stats_result(
       s,
-      Ok(if cwd { stats_of[cwd](place, current) } else { stats_of[abs](place, current) }),
+      Ok(match place.label {
+        project_store::WorkingDirectory -> stats_of[cwd](place, current),
+        project_store::Absolute -> stats_of[abs](place, current),
+      }),
     )
   } else if flags.action == "clear" {
-    clear_result(s, if cwd { clear_store[cwd](place) } else { clear_store[abs](place) })
+    clear_result(s, match place.label {
+      project_store::WorkingDirectory -> clear_store[cwd](place),
+      project_store::Absolute -> clear_store[abs](place),
+    })
   } else if flags.action == "copy" { copied_result(s, flags) } else {
     inspect_result(s, flags.query, match progress::silently(||
         session(flags.paths, flags.verify_dependencies, |modules: Modules, _: ProgramSummary| {
@@ -926,9 +930,12 @@ pub fn run(
       Ok(opened) -> {
         let places = places_of(opened);
         let read = opened.value;
-        let found = if cwd {
-          inspect_store[cwd](place, places, read.listing, read.tests, flags.query)
-        } else { inspect_store[abs](place, places, read.listing, read.tests, flags.query) };
+        let found = match place.label {
+          project_store::WorkingDirectory ->
+            inspect_store[cwd](place, places, read.listing, read.tests, flags.query),
+          project_store::Absolute ->
+            inspect_store[abs](place, places, read.listing, read.tests, flags.query),
+        };
         Ok({ ..found, facts: read.facts })
       },
     })

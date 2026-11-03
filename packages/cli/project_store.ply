@@ -11,21 +11,31 @@ import store.engine (Warning, Unreadable, Corrupt, OtherVersion, problem_warning
 import store.tables (Stamps)
 import compiler.store.database
 import compiler.store.database (StoreProblem)
-import compiler.store.fact_store (Opening)
+import compiler.store.fact_store (Opening, recent_reads, with_recent_reads)
 
-pub type StoreLocation = { label: String, dir: String, root: String, stamps: Stamps }
+pub type PathLabel = | WorkingDirectory | Absolute
+
+pub type StoreLocation = { label: PathLabel, dir: String, root: String, stamps: Stamps }
+
+pub fn path_label(resolved: paths::ResolvedPath) -> PathLabel =
+  if resolved.label == "cwd" { WorkingDirectory } else { Absolute }
+
+pub fn rooted_path(label: PathLabel, path: String) -> paths::RootedPath =
+  { label: match label { WorkingDirectory -> "cwd", Absolute -> "abs" }, path: path }
 
 pub fn cache_dir_in(resolved: paths::ResolvedPath) -> String =
   paths::in_root(resolved, ".ply-cache").path
 
 pub type DatabasePlace = | InWorkingDirectory(String) | AtAbsolutePath(String)
 
-fn database_place_in(label: String, cache_dir: String) -> DatabasePlace =
-  if label == "cwd" { InWorkingDirectory(database::database_in(cache_dir)) }
-  else { AtAbsolutePath(database::database_in(cache_dir)) }
+fn database_place_in(label: PathLabel, cache_dir: String) -> DatabasePlace =
+  match label {
+    WorkingDirectory -> InWorkingDirectory(database::database_in(cache_dir)),
+    Absolute -> AtAbsolutePath(database::database_in(cache_dir)),
+  }
 
 pub fn database_place(resolved: paths::ResolvedPath) -> DatabasePlace =
-  database_place_in(resolved.label, cache_dir_in(resolved))
+  database_place_in(path_label(resolved), cache_dir_in(resolved))
 
 pub fn database_place_of(location: StoreLocation) -> DatabasePlace =
   database_place_in(location.label, location.dir)
@@ -33,6 +43,8 @@ pub fn database_place_of(location: StoreLocation) -> DatabasePlace =
 pub effect databases {
   write open(place: DatabasePlace) -> Opening
 }
+
+pub effect set Databases = {databases.open, recent_reads.read, recent_reads.write}
 
 type OpenDatabase = { place: DatabasePlace, opening: Opening }
 
@@ -49,36 +61,39 @@ fn closed(held: OpenDatabase) -> Unit / {fs.write[cwd], fs.write[abs]} =
   }
 
 pub fn with_databases<a | e>(
-  body: () -> a / {databases.open | e},
+  body: () -> a / {databases.open, recent_reads.read, recent_reads.write | e},
 ) -> a / {fs.write[cwd], fs.write[abs] | e} =
-  handle {
-    body()
-  } with {
-    var opened: List<OpenDatabase> = [],
-    databases.open(place) -> match opened.find(|o: OpenDatabase| o.place == place) {
-      Some(o) -> o.opening,
-      None -> {
-        let opening = opened_at(place);
-        opened = opened.push({ place: place, opening: opening });
-        opening
+  with_recent_reads(||
+    handle {
+      body()
+    } with {
+      var opened: List<OpenDatabase> = [],
+      databases.open(place) -> match opened.find(|o: OpenDatabase| o.place == place) {
+        Some(o) -> o.opening,
+        None -> {
+          let opening = opened_at(place);
+          opened = opened.push({ place: place, opening: opening });
+          opening
+        },
       },
-    },
-    return value -> {
-      opened.fold((), |_: Unit, o: OpenDatabase| closed(o));
-      value
-    },
-  }
+      return value -> {
+        opened.fold((), |_: Unit, o: OpenDatabase| closed(o));
+        value
+      },
+    })
 
 pub fn store_location_of(paths: List<paths::ResolvedPath>, stamps: Stamps) -> StoreLocation =
   match paths.at(0) {
-    Some(r) ->
+    Some(r) -> {
+      let label = path_label(r);
       {
-        label: r.label,
+        label: label,
         dir: cache_dir_in(r),
-        root: if r.label == "cwd" { r.root_path } else { "/" ++ r.root_path },
+        root: match label { WorkingDirectory -> r.root_path, Absolute -> "/" ++ r.root_path },
         stamps: stamps,
-      },
-    None -> { label: "cwd", dir: ".ply-cache", root: ".", stamps: stamps },
+      }
+    },
+    None -> { label: WorkingDirectory, dir: ".ply-cache", root: ".", stamps: stamps },
   }
 
 const verdict_roots: List<Bytes> =
