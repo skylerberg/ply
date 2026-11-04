@@ -99,12 +99,14 @@ pub fn deriver_wrapper_text(deriver: Bytes) -> Bytes =
     b" as deriver\n\npub fn derived(declaration: derive::Declaration) -> Result<String, derive::Refused> / {abort.raise} =\n  deriver::derive(declaration)\n",
   ])
 
-pub fn deriver_identity(module: Bytes) -> Bytes / {memo.read, abort.raise} =
+pub fn deriver_identity_over<| e>(
+  module: Bytes,
+  text_of: (Bytes) -> Option<Bytes> / {abort.raise | e},
+) -> Bytes / {abort.raise | e} =
   blake3(
     Bytes::concat_all(
       traverse([module], |name: Bytes| {
-        let text = if is_shipped(name) { shipped_text(name) }
-        else { memo.external(text_kind, name) };
+        let text = text_of(name);
         {
           value: Bytes::concat_all([name, b"\x00", blake3(text.unwrap_or(b""))]),
           next: match text {
@@ -119,21 +121,30 @@ pub fn deriver_identity(module: Bytes) -> Bytes / {memo.read, abort.raise} =
     ),
   )
 
-fn derivation_of(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} = {
-  let at = bin::encode(
-    { deriver: deriver_identity(ask.module), request: ask },
+pub fn derivation_key<| e>(
+  ask: DeriverRequest,
+  text_of: (Bytes) -> Option<Bytes> / {abort.raise | e},
+) -> Bytes / {abort.raise | e} =
+  bin::encode(
+    { deriver: deriver_identity_over(ask.module, text_of), request: ask },
     derivation_at_bin(),
-  );
-  match memo.external(derived_kind, at) {
+  )
+
+pub const missing_derivation: DeriverResponse =
+  Unavailable({
+    code: b"E0155",
+    message: b"no derived code was generated for this `derive` declaration",
+    notes: [b"this command runs no `derive` generators"],
+  })
+
+fn read_text(name: Bytes) -> Option<Bytes> / {memo.read} =
+  if is_shipped(name) { shipped_text(name) } else { memo.external(text_kind, name) }
+
+fn derivation_of(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} =
+  match memo.external(derived_kind, derivation_key(ask, read_text)) {
     Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
-    None ->
-      Unavailable({
-        code: b"E0155",
-        message: b"no derived code was generated for this `derive` declaration",
-        notes: [b"this command runs no `derive` generators"],
-      }),
+    None -> missing_derivation,
   }
-}
 
 pub fn embed_at(root: Bytes, module: Bytes, key: Bytes) -> Bytes =
   Bytes::concat_all([root, b"\x00", module, b"\x00", key])
@@ -256,6 +267,39 @@ test "a second read of a parsed text reads the same derivations again" {
   assert_eq(kinds.take(kinds.len() / 2), kinds.drop(kinds.len() / 2))
 }
 
+test "a scan for derivations computes the key that checking the module reads" {
+  let source = {
+    name: b"m",
+    source_text: b"import sizes\n\npub type T = | A\n\nderive sizes for T\n",
+  };
+  let texts = |name: Bytes|
+    if name == b"sizes" { Some(b"pub fn derive(x: Int) -> Int = x\n") } else { None };
+  let scanned = requested_derivations(source, |_: DeriverRequest| missing_derivation).map(
+    |ask: DeriverRequest| derivation_key(ask, texts),
+  );
+  let read = handle {
+    with_decode_cache(|| {
+      read_once(source);
+      ()
+    })
+  } with {
+    var keys: List<Bytes> = [],
+    memo.external(kind, at) -> {
+      if kind == derived_kind {
+        keys = keys.push(at);
+      };
+      if kind == text_kind { texts(at) } else { None }
+    },
+    memo.fetch(query, input, part) -> None,
+    memo.fetch_all(query, inputs, part) -> inputs.map(|_: Bytes| None),
+    memo.output_digest(query, input, part) -> None,
+    memo.stored_output(digest) -> None,
+    return done -> keys,
+  };
+  assert(scanned.len() > 0);
+  assert_eq(read, scanned)
+}
+
 pub fn text_key(source: Source) -> Bytes =
   Bytes::concat_all([source.name, b"\x00", blake3(source.source_text)])
 
@@ -263,10 +307,11 @@ effect derivations {
   write requested(ask: DeriverRequest) -> Unit
 }
 
-fn expanded(
+fn expanded<| e>(
   source: Source,
   parsed: ParseOutput<Module>,
-) -> { given: ParsedSource, requested: List<DeriverRequest> } / {memo.read, abort.raise} =
+  answer: keep (DeriverRequest) -> DeriverResponse / {abort.raise | e},
+) -> { given: ParsedSource, requested: List<DeriverRequest> } / {abort.raise | e} =
   handle {
     parse_from(
       0,
@@ -274,7 +319,7 @@ fn expanded(
       parsed,
       library: Some(|ask: DeriverRequest| {
         derivations.requested(ask);
-        derivation_of(ask)
+        answer(ask)
       }),
     )
   } with {
@@ -284,6 +329,15 @@ fn expanded(
     },
     return given -> { given: given, requested: requested },
   }
+
+pub fn requested_derivations<| e>(
+  source: Source,
+  answer: keep (DeriverRequest) -> DeriverResponse / {abort.raise | e},
+) -> List<DeriverRequest> / {abort.raise | e} = {
+  let parsed = parse_started(start(source.source_text));
+  let distinct = without_redefinitions(0, source.name, parsed.node);
+  expanded(source, { ..parsed, node: distinct.module }, answer).requested
+}
 
 pub fn read_once(
   source: Source,
@@ -301,7 +355,7 @@ pub fn read_once(
       let lexed = start(source.source_text);
       let parsed = parse_started(lexed);
       let distinct = without_redefinitions(0, source.name, parsed.node);
-      let made = expanded(source, { ..parsed, node: distinct.module });
+      let made = expanded(source, { ..parsed, node: distinct.module }, derivation_of);
       let r = {
         lexed: lexed,
         raw: distinct.module,

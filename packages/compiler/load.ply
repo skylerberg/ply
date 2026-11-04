@@ -1,4 +1,5 @@
 import std.set (Set)
+import std.math (unlimited_steps)
 import std.graph (Visit, traverse)
 import compiler.check.resolve.tables (error_unplaced)
 import compiler.front.published (dump_of)
@@ -25,7 +26,8 @@ import compiler.front.checking (CheckedModule, OwnPackage, LoadInputs, query_loa
                                 registry, root_warnings, checked_program_from_results,
                                 load_inputs_of, package_location_in, listed_module)
 import compiler.front.checking.world (CheckQueries, RunEffects, ModuleResult, with_decode_cache,
-                                      derived_kind, decoded, deriver_wrapper, deriver_wrapper_text)
+                                      decoded, deriver_wrapper, deriver_wrapper_text,
+                                      derivation_key, missing_derivation, requested_derivations)
 import compiler.store.fact_store
 import compiler.store.fact_store (recent_reads)
 import compiler.store.packs
@@ -410,7 +412,7 @@ fn open_memo_store<a, [r], [s]>(
   let read_embed = |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want);
   let qs = query_registry();
   database::with_opening[r](dir, |opening: fact_store::Opening|
-    deriving[r](opening, pack_frame, w.texts, |derived: (Bytes) -> Option<Bytes>|
+    deriving[r](opening, pack_frame, w.texts, w.texts, |derived: (Bytes) -> Option<Bytes>|
       database::with_opened_database[r](
         opening,
         pack_frame,
@@ -796,30 +798,55 @@ fn is_unavailable(response: Bytes) -> Bool / {abort.raise} =
     _ -> false,
   }
 
+fn wanted_derivations(
+  scanned: Map<Bytes, Bytes>,
+  results: Map<Bytes, Bytes>,
+  text_of: keep (Bytes) -> Option<Bytes> / {shipped.module, abort.raise},
+) -> List<Bytes> / {shipped.module, abort.raise} =
+  scanned.fold([], |found: List<Bytes>, name: Bytes, text: Bytes|
+    if !text.contains(b"derive") { found } else {
+      requested_derivations({ name: name, source_text: text }, |ask: DeriverRequest|
+        match results.get(derivation_key(ask, text_of)) {
+          Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
+          None -> missing_derivation,
+        }).fold(found, |keys: List<Bytes>, ask: DeriverRequest|
+        keys.push_unique(derivation_key(ask, text_of)))
+    })
+
+type Derived = { results: Map<Bytes, Bytes>, problems: List<database::StoreProblem> }
+
 pub fn deriving<a, [r] | e>(
   opening: fact_store::Opening,
   read: (packs::PackPart) -> Option<Bytes> / {ReadsShipped, abort.raise},
+  scanned: Map<Bytes, Bytes>,
   own: Map<Bytes, Bytes>,
   session: ((Bytes) -> Option<Bytes>) -> database::StoreOutcome<a> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e},
 ) -> database::StoreOutcome<a> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e} = {
-  let known = match database::read_derivations[r](opening, read) {
+  let text_of = |name: Bytes|
+    if is_shipped(name) { shipped_module_text(name) } else { own.get(name) };
+  let stored = match database::read_derivations[r](opening, read) {
     Ok(found) -> found,
     Err(_) -> Map::new(),
   };
-  let first = session(|at: Bytes| known.get(at));
-  match database::missing_inputs[r](opening, derived_kind) {
-    [] -> first,
-    missing -> {
-      let ran = derivations_run[r](opening, read, own, missing);
-      let kept = ran.fold(Map::new(), |found: Map<Bytes, Bytes>, at: Bytes, response: Bytes|
-        if is_unavailable(response) { found } else { found.insert(at, response) });
-      let problems = database::write_derivations[r](opening, kept);
-      let all = ran.fold(known, |found: Map<Bytes, Bytes>, at: Bytes, response: Bytes|
-        found.insert(at, response));
-      let second = session(|at: Bytes| all.get(at));
-      { ..second, problems: problems.concat(second.problems) }
-    },
-  }
+  let derived = iterate({ results: stored, problems: [] }, unlimited_steps, |sofar: Derived|
+    match wanted_derivations(scanned, sofar.results, text_of).filter(|at: Bytes|
+        !sofar.results.contains(at)) {
+      [] -> Stop(sofar),
+      missing -> {
+        let ran = derivations_run[r](opening, read, own, missing);
+        let kept = ran.fold(Map::new(), |found: Map<Bytes, Bytes>, at: Bytes, response: Bytes|
+          if is_unavailable(response) { found } else { found.insert(at, response) });
+        Continue({
+          results: ran.fold(
+            sofar.results,
+            |found: Map<Bytes, Bytes>, at: Bytes, response: Bytes| found.insert(at, response),
+          ),
+          problems: sofar.problems.concat(database::write_derivations[r](opening, kept)),
+        })
+      },
+    });
+  let done = session(|at: Bytes| derived.results.get(at));
+  { ..done, problems: derived.problems.concat(done.problems) }
 }
 
 fn ran_deriver(
