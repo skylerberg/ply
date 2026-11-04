@@ -1,6 +1,10 @@
 import harness (shipped_sources, Shipped)
 import compiler.check.resolve.tables (Source)
 import compiler.front.checking.code_edits (lowered_over_shipped)
+import compiler.syntax.items (header, ImportDeclaration)
+import compiler.expand.derive (import_path)
+import compiler.syntax.expressions (prelude_module, scheduler_module, home_modules)
+import std.set (Set)
 import std.list
 import std.string
 
@@ -11,11 +15,42 @@ fn sources_of(files: List<File>) -> List<Source> / {abort.raise} =
     f.name.ends_with(".ply") && !f.name.contains("/") && f.name != "ply.pkg").map(|f: File|
     { name: Bytes::of_string(f.name.slice(0, f.name.len() - 4)), source_text: f.bytes })
 
+fn imports_of(text: Bytes) -> List<Bytes> / {abort.raise} =
+  match header(text) { Some(m) -> m.imports.map(|i: ImportDeclaration| import_path(i)), None -> [] }
+
+type Reaching = { todo: List<Bytes>, seen: Set<Bytes> }
+
+fn reached(sources: List<Source>, shipped: List<Source>) -> List<Source> / {abort.raise} = {
+  let start = sources.flat_map(|s: Source| imports_of(s.source_text)).concat([
+    prelude_module,
+    scheduler_module,
+  ]).concat(
+    home_modules,
+  );
+  let seen = iterate(
+    { todo: start, seen: Set::empty() },
+    shipped.len() * 4 + start.len() + 1,
+    |r: Reaching|
+      match r.todo {
+        [] -> Stop(r.seen),
+        [name, ..rest] -> if r.seen.contains(name) { Continue({ ..r, todo: rest }) } else {
+          match shipped.find(|s: Source| s.name == name) {
+            None -> Continue({ ..r, todo: rest }),
+            Some(s) ->
+              Continue({ todo: rest.concat(imports_of(s.source_text)), seen: r.seen.insert(name) }),
+          }
+        },
+      },
+  );
+  shipped.filter(|s: Source| seen.contains(s.name))
+}
+
 test "a real package lowers one unit at a time" {
   let shipped = shipped_sources().map(|s: { path: String, text: String }|
     {
       name: Bytes::of_string(s.path.slice(0, s.path.len() - 4)),
       source_text: Bytes::of_string(s.text),
     });
-  assert(lowered_over_shipped(sources_of(embed_dir("../../packages/sim")), shipped).len() > 0, None)
+  let sim = sources_of(embed_dir("../../packages/sim"));
+  assert(lowered_over_shipped(sim, reached(sim, shipped)).len() > 0, None)
 }
