@@ -217,3 +217,13 @@ fn reading_a_bundle_whose_file_list_is_not_sorted_by_path_fails_with_an_error() 
     let rejected = read(&data).err().expect("an unsorted table is rejected");
     assert!(rejected.contains("ascending"), "{rejected}");
 }
+
+#[test]
+fn the_evaluator_stamp_is_the_runtime_identity_that_the_pack_is_built_under() {
+    let evaluator = format!("evaluator {}", ply_compiled::c::runtime_identity());
+    assert!(
+        ply_launcher::stamps().lines().any(|line| line == evaluator),
+        "{}",
+        ply_launcher::stamps()
+    );
+}

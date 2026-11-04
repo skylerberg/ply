@@ -107,7 +107,7 @@ pub fn stamps() -> String {
     };
     format!(
         "evaluator {}\nruntime {}\n",
-        stamp(&["ply.stamp.evaluator.1", ply_compiled::c::semantics_digest()]),
+        ply_compiled::c::runtime_identity(),
         stamp(&["ply.stamp.runtime.4", RUNTIME_SOURCES])
     )
 }
