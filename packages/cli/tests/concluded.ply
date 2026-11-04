@@ -1,4 +1,5 @@
 import std.set (Set)
+import std.fs (fs)
 import compiler.codes (internal_error_code, replay_mismatch_code)
 import compiler.cc
 import compiler.syntax.parsing (Error, Warning)
@@ -163,23 +164,33 @@ pub fn with_crash(j: Job, crashes: Map<Int, KnownFailure>) -> Job =
     None -> j,
   }
 
+effect journal {
+  read started(at: TestJournal, running: StartedTest) -> Unit
+  read finished(at: TestJournal, key: Bytes, update: StoreUpdate) -> Unit
+}
+
 pub fn run_class(
   jobs: List<Job>,
   search_options: SearchOptions,
-) -> List<JobResult> / {entering::machine.enter, entering::machine.report, result_cache.started, result_cache.finished, abort.raise} = {
+) -> List<JobResult> / {entering::machine.enter, entering::machine.report, fs.write[cwd], fs.write[abs], abort.raise} = {
   let lanes = machine::split_into_lanes(jobs, search_options.lanes);
-  machine::merge_lanes(run_lanes(lanes, search_options, 0, lanes.len(), 64))
+  handle {
+    machine::merge_lanes(run_lanes(lanes, search_options, 0, lanes.len(), 64))
+  } with {
+    journal.started(at, running) -> results::journal_started(at, running),
+    journal.finished(at, key, update) -> results::journal_finished(at, key, update),
+  }
 }
 
 fn journaled_run(
   j: Job,
   measuring: Bool,
   journaling: Journaling,
-) -> JobResult / {entering::machine.enter, result_cache.started, result_cache.finished, abort.raise} = {
+) -> JobResult / {entering::machine.enter, journal.started, journal.finished, abort.raise} = {
   let started = (journaling.started)(j.test);
-  result_cache.started(journaling.journal, started);
+  journal.started(journaling.journal, started);
   let done = run_job(j, measuring);
-  result_cache.finished(journaling.journal, started.key, (journaling.stored)(done));
+  journal.finished(journaling.journal, started.key, (journaling.stored)(done));
   done
 }
 
@@ -201,7 +212,7 @@ fn run_lanes(
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<List<JobResult>> / {entering::machine.enter, entering::machine.report, result_cache.started, result_cache.finished, abort.raise} =
+) -> List<List<JobResult>> / {entering::machine.enter, entering::machine.report, journal.started, journal.finished, abort.raise} =
   if hi - lo <= 0 { [] } else if hi - lo == 1 || depth_left <= 0 {
     range(lo, hi).fold([], |lanes_done: List<List<JobResult>>, i: Int|
       match lanes.at(i) {
