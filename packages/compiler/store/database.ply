@@ -12,7 +12,7 @@ import compiler.store.memo (Parts, Product, Queries, Query, main_only, main_part
                             plain_queries)
 import compiler.store.memo.store (Dependency, FactDetails, StoredFact, StoredInput, Waiting,
                                   deferred_kind, fact_details_bin, fact_key, first_waiting,
-                                  fixed_digest, input_id, location_id, lowest_waiting, memo_store,
+                                  input_id, location_id, lowest_waiting, memo_store,
                                   nothing_left_waiting, nothing_waiting, interfaces, session_input,
                                   session_inputs, stored_fact_bin, stored_input_bin, with_mark,
                                   with_mark_moved, with_session_inputs, without_mark, Layer,
@@ -20,6 +20,7 @@ import compiler.store.memo.store (Dependency, FactDetails, StoredFact, StoredInp
 import compiler.store.memo.engine (in_session_of)
 import compiler.store.handles (part_label)
 import compiler.store.packs
+import compiler.expand.derive (derivers, without_derivers)
 import compiler.store.segments
 import compiler.store.segments (CommitResult, Committed, LockHeld, Segment, StoreChanged,
                                 WriteFailed)
@@ -103,20 +104,7 @@ fn inputs_of<[r]>(
 fn live_results<[r]>(
   db: Database,
 ) -> Set<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  inputs_of[r](db).fold(
-    results_of_facts(Set::empty(), fact_store::entries_under[r](db, Facts, b"").values()),
-    |live: Set<Bytes>, input: StoredInput|
-      match fixed_digest(input) { Some(d) -> live.insert(result_key(d)), None -> live },
-  )
-
-fn fixed_input<[r]>(
-  db: Database,
-  id: Bytes,
-) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match fact_store::value_of[r](db, Inputs, id) {
-    Some(b) -> { fixed_digest(undecoded(b, stored_input_bin())) },
-    None -> None,
-  }
+  results_of_facts(Set::empty(), fact_store::entries_under[r](db, Facts, b"").values())
 
 fn cursor_of<[r]>(
   db: Database,
@@ -142,8 +130,8 @@ fn over_database<a, [r] | e>(
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Ran<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, abort.raise | e} = {
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> Ran<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, derivers.run, abort.raise | e} = {
   match packs::opened(read) {
     None -> in_layered[r](database, look, noted, work),
     Some(base) -> handle {
@@ -159,21 +147,14 @@ fn in_layered<a, [r] | e>(
   layered: Database,
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Ran<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, abort.raise | e} = {
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> Ran<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, derivers.run, abort.raise | e} = {
   let details_bytes = |db: Database, digest: Bytes|
     match fact_store::result_of[r](db, digest) {
       Some(b) -> b,
       None -> fact_damage.damaged("a stored fact names details that are not stored"),
     };
-  let looked = |db: Database, kind: Bytes, at: Bytes| {
-    let id = location_id(kind, at);
-    session_input(id, ||
-      match fixed_input[r](db, id) {
-        Some(d) -> fact_store::result_of[r](db, result_key(d)),
-        None -> look(kind, at),
-      })
-  };
+  let looked = |kind: Bytes, at: Bytes| session_input(location_id(kind, at), || look(kind, at));
   handle {
     work()
   } with {
@@ -220,7 +201,7 @@ fn in_layered<a, [r] | e>(
       fact_store::entries_under[r](layer_of(st.db, layer), Facts, prefix).keys(),
     memo_store.code(name, layer) ->
       fact_store::value_of[r](layer_of(st.db, layer), Codes, blake3(name)),
-    memo_store.external(kind, at) -> looked(st.db, kind, at),
+    memo_store.external(kind, at) -> looked(kind, at),
     memo_store.is_out_of_date(key) -> st.waiting.depths.contains(key),
     memo_store.next_out_of_date() -> first_waiting(st.waiting),
     memo_store.out_of_date_level() -> lowest_waiting(st.waiting),
@@ -278,26 +259,8 @@ fn in_layered<a, [r] | e>(
       let id = input_id(input);
       let encoded = bin::encode(input, stored_input_bin());
       let held = fact_store::value_of[r](st.db, Inputs, id);
-      if held != Some(encoded) && fixed_input[r](st.db, id) == None {
+      if held != Some(encoded) {
         st = { ..st, db: fact_store::with_value(st.db, Inputs, id, encoded) };
-      };
-    },
-    memo_store.fix_input(kind, at) -> {
-      let id = location_id(kind, at);
-      match if fixed_input[r](st.db, id) == None { session_inputs.held(id) } else { None } {
-        Some({ value: Some(v), digest: d }) -> {
-          let stored = stored_output[r](st, d, v);
-          st = {
-            ..stored,
-            db: fact_store::with_value(
-              stored.db,
-              Inputs,
-              id,
-              bin::encode({ kind: kind, at: at, digest: d, fixed: true }, stored_input_bin()),
-            ),
-          };
-        },
-        _ -> (),
       };
     },
     memo_store.delete_input(id) -> {
@@ -417,8 +380,8 @@ fn session_on<a, [r] | e>(
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Session<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e} =
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> Session<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, derivers.run, abort.raise | e} =
   with_session_inputs(|| {
     let first = handle {
       Ok(over_database[r](fact_store::loaded[r](opening), read, look, noted, work))
@@ -440,8 +403,8 @@ fn session_in<a, [r] | e>(
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Session<a> / {fs.read[r], fs.write[r], abort.raise | e} =
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> Session<a> / {fs.read[r], fs.write[r], derivers.run, abort.raise | e} =
   with_opening[r](dir, |opening: fact_store::Opening|
     session_on[r](opening, read, look, noted, work))
 
@@ -450,8 +413,8 @@ pub fn with_opened_database<a, [r] | e>(
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> StoreOutcome<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e} =
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> StoreOutcome<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, derivers.run, abort.raise | e} =
   outcome_of(session_on[r](opening, read, look, noted, work))
 
 pub fn with_database<a, [r] | e>(
@@ -459,8 +422,8 @@ pub fn with_database<a, [r] | e>(
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   noted: (Bytes) -> Unit / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> StoreOutcome<a> / {fs.read[r], fs.write[r], abort.raise | e} =
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> StoreOutcome<a> / {fs.read[r], fs.write[r], derivers.run, abort.raise | e} =
   outcome_of(session_in[r](dir, read, look, noted, work))
 
 pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
@@ -631,12 +594,7 @@ pub fn write_pack<[r]>(
           },
       )
     });
-    let results = inputs_of[r](db).fold(of_facts, |held: Map<Bytes, Bytes>, input: StoredInput|
-      match fixed_digest(input) {
-        Some(d) -> held.insert(result_key(d), stored(result_key(d))),
-        None -> held,
-      });
-    { written: packs::written(fact_store::base_written[r](db, results)), records: facts.len() }
+    { written: packs::written(fact_store::base_written[r](db, of_facts)), records: facts.len() }
   })
 
 pub type FactRecord = {
@@ -685,8 +643,8 @@ fn session_in_memory<a | e>(
   limit: WriteLimit,
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> fs::MemResult<Session<a>> / {abort.raise | e} = {
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> fs::MemResult<Session<a>> / {derivers.run, abort.raise | e} = {
   let session = || session_in[memory](in_memory_database_dir, read, look, |_: Bytes| (), work);
   match limit {
     AllWrites -> fs::on_mem[memory](tree, session),
@@ -698,8 +656,8 @@ pub fn operations_of_session<a | e>(
   tree: fs::MemFs,
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> Int / {abort.raise | e} =
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> Int / {derivers.run, abort.raise | e} =
   fs::on_mem_counted[memory](tree, ||
     session_in[memory](in_memory_database_dir, read, look, |_: Bytes| (), work)).operations
 
@@ -708,8 +666,8 @@ pub fn with_writes_limited<a | e>(
   limit: WriteLimit,
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> InMemoryOutcome<a> / {abort.raise | e} = {
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> InMemoryOutcome<a> / {derivers.run, abort.raise | e} = {
   let ran = session_in_memory(tree, limit, read, look, work);
   match ran.value.damage {
     Some(reason) -> Stopped({ tree: ran.tree, reason: "it was damaged: " ++ reason }),
@@ -724,8 +682,8 @@ pub fn with_store_in_memory<a | e>(
   tree: fs::MemFs,
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
-  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
-) -> fs::MemResult<a> / {abort.raise | e} = {
+  work: () -> a / {memo_store.read, memo_store.write, derivers.run, abort.raise},
+) -> fs::MemResult<a> / {derivers.run, abort.raise | e} = {
   let ran = session_in_memory(tree, AllWrites, read, look, work);
   match ran.value.damage {
     Some(reason) -> panic("the fact database held in memory is damaged: " ++ reason),
@@ -784,13 +742,14 @@ fn test_queries() -> Queries<| {}> =
   )
 
 fn quoted_in<[r]>(checkout: String, text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} =
-  with_database[r](
-    checkout,
-    packs::no_pack,
-    |_: Bytes, _: Bytes| Some(text),
-    |_: Bytes| (),
-    || in_session_of(test_queries(), b"quoted", b"a"),
-  ).value
+  without_derivers(||
+    with_database[r](
+      checkout,
+      packs::no_pack,
+      |_: Bytes, _: Bytes| Some(text),
+      |_: Bytes| (),
+      || in_session_of(test_queries(), b"quoted", b"a"),
+    )).value
 
 fn quoted_over<[r]>(text: Bytes) -> Bytes / {fs.read[r], fs.write[r], abort.raise} =
   quoted_in[r]("s", text)
@@ -831,13 +790,14 @@ fn session_over_files<[r]>(
   saved: Option<Bytes>,
   name: Bytes,
 ) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], abort.raise} =
-  with_database[r](
-    "s",
-    packs::no_pack,
-    |_: Bytes, at: Bytes| read_then_saved[r]("files/" ++ String::of_bytes_lossy(at), saved),
-    |_: Bytes| (),
-    || in_session_of(test_queries(), name, b"a"),
-  )
+  without_derivers(||
+    with_database[r](
+      "s",
+      packs::no_pack,
+      |_: Bytes, at: Bytes| read_then_saved[r]("files/" ++ String::of_bytes_lossy(at), saved),
+      |_: Bytes| (),
+      || in_session_of(test_queries(), name, b"a"),
+    ))
 
 test "a session uses the bytes it compared at its start, so a file saved after that read waits for the next command" {
   let first = fs::on_mem[abs](fs::mem_of([{ path: "files/a", body: b"four" }]), ||
@@ -911,13 +871,14 @@ fn quoted_on<[r]>(
   opening: fact_store::Opening,
   text: Bytes,
 ) -> StoreOutcome<Bytes> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} =
-  with_opened_database[r](
-    opening,
-    packs::no_pack,
-    |_: Bytes, _: Bytes| Some(text),
-    |_: Bytes| (),
-    || in_session_of(test_queries(), b"quoted", b"a"),
-  )
+  without_derivers(||
+    with_opened_database[r](
+      opening,
+      packs::no_pack,
+      |_: Bytes, _: Bytes| Some(text),
+      |_: Bytes| (),
+      || in_session_of(test_queries(), b"quoted", b"a"),
+    ))
 
 test "one opening serves sessions and records writes in turn, and each commit builds on the one before" {
   let ran = fs::on_mem[abs](fs::mem_of([]), ||
@@ -957,7 +918,7 @@ test "two checkouts share nothing, so an edit in one leaves the other's results 
 fn query(
   name: Bytes,
   hash: Bytes,
-  body: keep (Bytes) -> Bytes / {memo.read, memo.write, abort.raise},
+  body: keep (Bytes) -> Bytes / {memo.read, abort.raise},
 ) -> Query<| {}> =
   {
     name: name,
@@ -966,6 +927,7 @@ fn query(
     persistent: true,
     product: None,
     interface: Set::of_list([main_part]),
+    serial: false,
   }
 
 fn read_file(input: Bytes) -> Bytes / {memo.read} =
@@ -999,12 +961,9 @@ fn fetched_in(
   name: Bytes,
   input: Bytes,
 ) -> Answered / {abort.raise} = {
-  let done = with_store_in_memory(
-    w.store,
-    packs::no_pack,
-    |_: Bytes, at: Bytes| w.files.get(at),
-    || in_session_of(plain_queries(named), name, input),
-  );
+  let done = without_derivers(||
+    with_store_in_memory(w.store, packs::no_pack, |_: Bytes, at: Bytes| w.files.get(at), ||
+      in_session_of(plain_queries(named), name, input)));
   { output: done.value, world: { ..w, store: done.tree } }
 }
 
@@ -1045,26 +1004,18 @@ test "a run stopped after any number of writes leaves a store from which the nex
   let look = |_: Bytes, at: Bytes| moved.files.get(at);
   let session = || in_session_of(plain_queries(q), b"label", b"a");
   let left_after = |writes: Int|
-    match with_writes_limited(moved.store, FailAfter(writes), packs::no_pack, look, session) {
+    match without_derivers(||
+        with_writes_limited(moved.store, FailAfter(writes), packs::no_pack, look, session)) {
       Finished(ran) -> ran.tree,
       Stopped(stopped) -> stopped.tree,
     };
-  let operations = operations_of_session(moved.store, packs::no_pack, look, session);
+  let operations = without_derivers(||
+    operations_of_session(moved.store, packs::no_pack, look, session));
   range(0, operations + 1).fold((), |_: Unit, writes: Int| {
     agreed(q, { ..moved, store: left_after(writes) }, b"label", b"a");
   });
   assert(same_database_in_memory(left_after(operations), complete))
 }
-
-fn fixed_reader(code: Bytes) -> Map<Bytes, Query<| {}>> =
-  Map::new().insert(
-    b"read",
-    query(b"read", code, |input: Bytes| {
-      let found = memo.external(b"file", input);
-      memo.fix(b"file", input);
-      match found { Some(b) -> b, None -> b"" }
-    }),
-  )
 
 fn picker() -> Map<Bytes, Query<| {}>> =
   Map::new().insert(
@@ -1074,12 +1025,6 @@ fn picker() -> Map<Bytes, Query<| {}>> =
       match memo.external(b"file", chosen) { Some(b) -> b, None -> b"" }
     }),
   )
-
-test "a fixed input keeps the value it was read with, so a query that runs again reads that value" {
-  let first = fetched_in(fixed_reader(b"r1"), four(), b"read", b"a");
-  let again = fetched_in(fixed_reader(b"r2"), edited(first.world, b"a", b"FOUR"), b"read", b"a");
-  assert_eq([first.output, again.output], [b"four", b"four"])
-}
 
 test "an input that no fact reads any more is deleted" {
   let w = world_of([
@@ -1131,15 +1076,16 @@ fn input_looks(
 ) -> { store: fs::MemFs, looks: List<Bytes> } / {abort.raise} = {
   let q = lengths(b"h1").insert(b"doubled", query(b"doubled", b"d1", doubled_length));
   handle {
-    with_store_in_memory(
-      store,
-      packs::no_pack,
-      |_: Bytes, at: Bytes| {
-        looking.looked_at(at);
-        Some(at)
-      },
-      || in_session_of(plain_queries(q), b"doubled", input),
-    ).tree
+    without_derivers(||
+      with_store_in_memory(
+        store,
+        packs::no_pack,
+        |_: Bytes, at: Bytes| {
+          looking.looked_at(at);
+          Some(at)
+        },
+        || in_session_of(plain_queries(q), b"doubled", input),
+      )).tree
   } with {
     var looks: List<Bytes> = [],
     looking.looked_at(at) -> {
@@ -1524,8 +1470,9 @@ test "a pack's facts are used while their inputs are unchanged, and the facts re
   let pack = packed(q, four(), b"label");
   let read = |part: packs::PackPart| packs::frame_in(Some(pack), part);
   let run_over = |text: Bytes|
-    with_store_in_memory(fs::mem_empty(), read, |_: Bytes, _: Bytes| Some(text), ||
-      in_session_of(plain_queries(q), b"label", b"a"));
+    without_derivers(||
+      with_store_in_memory(fs::mem_empty(), read, |_: Bytes, _: Bytes| Some(text), ||
+        in_session_of(plain_queries(q), b"label", b"a")));
   let unchanged = run_over(b"four");
   assert_eq(unchanged.value, b"long 4");
   assert_eq(facts_in_memory(unchanged.tree).len(), 0);
@@ -1538,8 +1485,9 @@ test "a store used under a newer pack gives the newer pack's results" {
   let older = reader(packed(q, four(), b"label"));
   let newer = reader(packed(q, world_of([{ at: b"a", text: b"forty" }]), b"label"));
   let run_with = |store: fs::MemFs, read: (packs::PackPart) -> Option<Bytes> / {abort.raise}, text: Bytes|
-    with_store_in_memory(store, read, |_: Bytes, _: Bytes| Some(text), ||
-      in_session_of(plain_queries(q), b"label", b"a"));
+    without_derivers(||
+      with_store_in_memory(store, read, |_: Bytes, _: Bytes| Some(text), ||
+        in_session_of(plain_queries(q), b"label", b"a")));
   let first = run_with(fs::mem_empty(), older, b"four");
   assert_eq(first.value, b"long 4");
   assert_eq(run_with(first.tree, newer, b"forty").value, b"long 5")
@@ -1553,8 +1501,9 @@ test "a fact computed here under older code is computed again under a pack the n
   let newer = older.insert(b"label", query(b"label", b"l2", sized_label));
   let reader = |pack: packs::PackFiles| |part: packs::PackPart| packs::frame_in(Some(pack), part);
   let run_with = |store: fs::MemFs, named: Map<Bytes, Query<| {}>>, read: (packs::PackPart) -> Option<Bytes> / {abort.raise}|
-    with_store_in_memory(store, read, |_: Bytes, _: Bytes| Some(b"forty"), ||
-      in_session_of(plain_queries(named), b"label", b"a"));
+    without_derivers(||
+      with_store_in_memory(store, read, |_: Bytes, _: Bytes| Some(b"forty"), ||
+        in_session_of(plain_queries(named), b"label", b"a")));
   let first = run_with(fs::mem_empty(), older, reader(packed(older, four(), b"label")));
   assert_eq(first.value, b"long 5");
   assert_eq(run_with(first.tree, newer, reader(packed(newer, four(), b"label"))).value, b"size 5")
@@ -1571,12 +1520,9 @@ test "a shipped fact made deeper here keeps its details in this store, so the st
   );
   let pack = packed(older, four(), b"label");
   let read = |part: packs::PackPart| packs::frame_in(Some(pack), part);
-  let ran = with_store_in_memory(
-    fs::mem_empty(),
-    read,
-    |_: Bytes, at: Bytes| four().files.get(at),
-    || in_session_of(plain_queries(newer), b"label", b"a"),
-  );
+  let ran = without_derivers(||
+    with_store_in_memory(fs::mem_empty(), read, |_: Bytes, at: Bytes| four().files.get(at), ||
+      in_session_of(plain_queries(newer), b"label", b"a")));
   assert_eq(ran.value, b"long 4");
   assert(facts_in_memory(ran.tree).values().any(|r: FactRecord| r.query == b"label"))
 }
@@ -1608,12 +1554,13 @@ fn measured_over(pack: packs::PackFiles, name: Bytes) -> Result<Bytes, Bytes> = 
   let read = |part: packs::PackPart| packs::frame_in(Some(pack), part);
   handle {
     Ok(
-      with_store_in_memory(
-        fs::mem_empty(),
-        read,
-        |_: Bytes, at: Bytes| four().files.get(at),
-        || in_session_of(plain_queries(measures()), name, b"a"),
-      ).value,
+      without_derivers(||
+        with_store_in_memory(
+          fs::mem_empty(),
+          read,
+          |_: Bytes, at: Bytes| four().files.get(at),
+          || in_session_of(plain_queries(measures()), name, b"a"),
+        )).value,
     )
   } with {
     abort.raise(message) -> Err(Bytes::of_string(message)),

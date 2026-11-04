@@ -2055,7 +2055,8 @@ type's own `json` codec.
 derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`. Its only allowed
 effect is raising an error. The module `std.derive` defines the type `derive::Declaration`, which
 describes the declaration the deriver is run on, and the type `derive::Refused`. The checker runs a
-deriver once per declaration, with a 60-second limit, and caches the result. If the deriver fails,
+deriver once per declaration, with a 60-second limit, and caches the result until the deriver's
+code, the declaration or the C compiler changes. If the deriver fails,
 or the code it generates does not pass the checker, the error is an error (`E0155`).
 
 ## 13. Builtins and the standard library

@@ -17,7 +17,7 @@ import project_store (DatabasePlace, InWorkingDirectory, AtAbsolutePath, Databas
 import compiler.unit (shipped, pack_frame)
 import compiler.front.checking (CheckedModule, PackageFile, LoadInputs, LoadResults, query_load,
                                 declaring_in, documented_all, evaluator_of, hashed_all,
-                                lookup_input, nothing_derived, rejected_first, registry,
+                                lookup_input, no_toolchain, rejected_first, registry,
                                 check_shipped_modules, wanted_all, load_inputs_of,
                                 package_location_in, module_of)
 import compiler.front.checking.world (CheckQuery, CheckQueries, RunEffects, SessionReads,
@@ -30,7 +30,8 @@ import compiler.front.checking.promises (MeasureEntry, measures_query, module_co
 import compiler.store.handles (fetch)
 import measures (proof_queries)
 import compiler.emit.costs (Report)
-import compiler.load (Derives, derivation_response)
+import compiler.load (Derives, derivation_queries, toolchain_here, with_derivers)
+import compiler.expand.derive (without_derivers)
 import compiler.front.pages (Pages)
 import compiler.front (ShippedWants, embed_inputs_of, shipped_bytes)
 import compiler.store.hash.forms (ModuleHashes)
@@ -65,7 +66,7 @@ fn read_project_input<| e>(
     |name: Bytes| shipped_data(name),
     || shipped_names(),
     read,
-    |kind: Bytes, at: Bytes| derivation_response(w, kind, at),
+    toolchain_here,
     kind,
     at,
   )
@@ -100,7 +101,8 @@ pub fn shipped_data(name: Bytes) -> Option<Bytes> / {fs.read_file[shipped]} =
 
 fn running_queries() -> CheckQueries / {fs.read_file[shipped], abort.raise} =
   match ((fs.read_file[shipped]("definitions"), fs.read_file[shipped]("stamps"))) {
-    (Some(d), Some(stamps)) -> registry(d, evaluator_of(stamps), proof_queries()),
+    (Some(d), Some(stamps)) ->
+      registry(d, evaluator_of(stamps), proof_queries().concat(derivation_queries())),
     _ -> panic("the toolchain ships no `definitions` or no `stamps`"),
   }
 
@@ -157,12 +159,16 @@ pub fn stored_session<a>(
     );
   let noted = |query: Bytes| progress.computed(query);
   let session = || with_decode_cache(|| read_session(qs, w, work));
-  opened_from(w, match place {
-    InWorkingDirectory(_) ->
-      database::with_opened_database[cwd](opening, pack_frame, look, noted, session),
-    AtAbsolutePath(_) ->
-      database::with_opened_database[abs](opening, pack_frame, look, noted, session),
-  })
+  opened_from(
+    w,
+    with_derivers(||
+      match place {
+        InWorkingDirectory(_) ->
+          database::with_opened_database[cwd](opening, pack_frame, look, noted, session),
+        AtAbsolutePath(_) ->
+          database::with_opened_database[abs](opening, pack_frame, look, noted, session),
+      }),
+  )
 }
 
 pub type PromiseFacts = { costs: List<Report>, measures: List<MeasureEntry> }
@@ -201,18 +207,19 @@ pub fn temporary_session<a>(
   let qs = running_queries();
   let w = query_inputs(project);
   opened_from(w, {
-    value: database::with_store_in_memory(
-      fs::mem_empty(),
-      pack_frame,
-      |kind: Bytes, at: Bytes|
-        read_project_input(
-          w,
-          |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-          kind,
-          at,
-        ),
-      || with_decode_cache(|| read_session(qs, w, work)),
-    ).value,
+    value: with_derivers(||
+      database::with_store_in_memory(
+        fs::mem_empty(),
+        pack_frame,
+        |kind: Bytes, at: Bytes|
+          read_project_input(
+            w,
+            |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
+            kind,
+            at,
+          ),
+        || with_decode_cache(|| read_session(qs, w, work)),
+      )).value,
     problems: [],
   })
 }
@@ -225,28 +232,29 @@ pub fn shipped_results<[r]>(
 ) -> StoreOutcome<ShippedResults> / {fs.list_dir[shipped], fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fs.read_file[shipped], Derives, abort.raise} = {
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  database::with_opened_database[r](
-    opening,
-    packs::no_pack,
-    |kind: Bytes, at: Bytes|
-      lookup_input(
-        nowhere,
-        shipped_text,
-        shipped_data,
-        shipped_names,
-        |k: Int, m: Bytes, want: EmbedRequest| Err(b"no file is there"),
-        |kind: Bytes, at: Bytes| derivation_response(nowhere, kind, at),
-        kind,
-        at,
-      ),
-    |_: Bytes| (),
-    ||
-      with_decode_cache(||
-        in_session(qs, |run: Run| {
-          let all = reading(qs, run, || check_shipped_modules(shipped));
-          { run: all.run, value: { interfaces: interfaces(qs), rejected: all.value } }
-        })),
-  )
+  with_derivers(||
+    database::with_opened_database[r](
+      opening,
+      packs::no_pack,
+      |kind: Bytes, at: Bytes|
+        lookup_input(
+          nowhere,
+          shipped_text,
+          shipped_data,
+          shipped_names,
+          |k: Int, m: Bytes, want: EmbedRequest| Err(b"no file is there"),
+          toolchain_here,
+          kind,
+          at,
+        ),
+      |_: Bytes| (),
+      ||
+        with_decode_cache(||
+          in_session(qs, |run: Run| {
+            let all = reading(qs, run, || check_shipped_modules(shipped));
+            { run: all.run, value: { interfaces: interfaces(qs), rejected: all.value } }
+          })),
+    ))
 }
 
 pub fn write_shipped_pack<[r]>(
@@ -260,22 +268,23 @@ fn query_shipped<a>(
 ) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.read_pack, abort.raise} = {
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  database::with_store_in_memory(
-    fs::mem_empty(),
-    pack_frame,
-    |kind: Bytes, at: Bytes|
-      lookup_input(
-        nowhere,
-        shipped_text,
-        shipped_data,
-        shipped_names,
-        |k: Int, m: Bytes, want: EmbedRequest| Err(b"no file is there"),
-        nothing_derived,
-        kind,
-        at,
-      ),
-    || with_decode_cache(|| in_session(qs, |run: Run| reading(qs, run, query))),
-  ).value
+  without_derivers(||
+    database::with_store_in_memory(
+      fs::mem_empty(),
+      pack_frame,
+      |kind: Bytes, at: Bytes|
+        lookup_input(
+          nowhere,
+          shipped_text,
+          shipped_data,
+          shipped_names,
+          |k: Int, m: Bytes, want: EmbedRequest| Err(b"no file is there"),
+          no_toolchain,
+          kind,
+          at,
+        ),
+      || with_decode_cache(|| in_session(qs, |run: Run| reading(qs, run, query))),
+    )).value
 }
 
 pub fn shipped_doc_pages(

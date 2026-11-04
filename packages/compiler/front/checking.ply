@@ -22,6 +22,7 @@ import compiler.front.published (decode_rows, reserved_prefix_diagnostics)
 import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_module_tables,
                              pulled_next, checked_program_over, ToolchainTree, NoTree)
 import compiler.front.diagnostics (diagnostic_in_module, with_prelude_source)
+import compiler.expand.derive (without_derivers)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
                               embed_snapshot, request_of_key, snapshot_embed, with_embed_snapshot)
 import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, read_packages,
@@ -39,11 +40,12 @@ import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, Mod
                                       package_location_bin, module_key_bin, embedding_bin,
                                       layout_kind, module_kind, text_kind, shipped_kind,
                                       shipped_exists_kind, data_kind, embedded_file_kind,
-                                      derived_kind, deriver_kind, shipped_names_kind,
-                                      own_modules_kind, QueryEffects, RunEffects, SessionReads,
-                                      CheckQuery, CheckQueries, check_queries, with_decode_cache,
-                                      decoded, prefix_in, imports_query, ImportOf, imports_of_bin,
-                                      absent, shipped_names_listed, CheckDefinition)
+                                      toolchain_kind, shipped_names_kind, wrapped_deriver,
+                                      deriver_wrapper_text, own_modules_kind, QueryEffects,
+                                      RunEffects, SessionReads, CheckQuery, CheckQueries,
+                                      check_queries, with_decode_cache, decoded, prefix_in,
+                                      imports_query, ImportOf, imports_of_bin, absent,
+                                      shipped_names_listed, CheckDefinition)
 import compiler.front.checking.promises (promise_queries, program_analysed, claims_analysed,
                                          ClaimsOutcome, ClaimsRejected, ClaimsAnalysed)
 import compiler.front.checking.groups (module_rejected, listed_result, owners_result_bin,
@@ -162,19 +164,24 @@ pub fn lookup_input<| e>(
   data: (Bytes) -> Option<Bytes> / {abort.raise | e},
   names: () -> List<Bytes> / {abort.raise | e},
   reader: (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {abort.raise | e},
-  derived: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  toolchain: (Bytes) -> Option<Bytes> / {abort.raise | e},
   kind: Bytes,
   at: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} =
   if kind == layout_kind { Some(w.layout) }
   else if kind == shipped_names_kind { Some(bin::encode(names(), bin::list_bin(bin::bytes_bin()))) }
-  else if kind == module_kind { w.places.get(at) }
-  else if kind == text_kind { w.texts.get(at) }
-  else if kind == shipped_kind { shipped(at) }
+  else if kind == module_kind {
+    match wrapped_deriver(at) {
+      Some(_) -> Some(bin::encode({ package: 0, relative: at }, package_location_bin())),
+      None -> w.places.get(at),
+    }
+  } else if kind == text_kind {
+    match wrapped_deriver(at) { Some(d) -> Some(deriver_wrapper_text(d)), None -> w.texts.get(at) }
+  } else if kind == shipped_kind { shipped(at) }
   else if kind == shipped_exists_kind { match shipped(at) { Some(_) -> Some(b""), None -> None } }
   else if kind == data_kind { data(at) }
   else if kind == embedded_file_kind { embedded_at(w, reader, at) }
-  else if kind == derived_kind || kind == deriver_kind { derived(kind, at) }
+  else if kind == toolchain_kind { toolchain(at) }
   else if kind == own_modules_kind { Some(bin::encode(w.own, bin::list_bin(bin::bytes_bin()))) }
   else { None }
 
@@ -218,6 +225,7 @@ pub fn registry(
           persistent: !digest_only_queries.contains(q.name),
           product: q.product,
           interface: q.interface,
+          serial: q.serial,
         }),
     ),
   )
@@ -234,6 +242,7 @@ pub fn fresh_registry(more: List<CheckDefinition> = []) -> CheckQueries =
           persistent: true,
           product: q.product,
           interface: q.interface,
+          serial: q.serial,
         }),
     ),
   )
@@ -546,7 +555,7 @@ pub fn outcome_summary(outcome: AnalysisOutcome) -> OutcomeSummary / {abort.rais
 pub fn reject_embed(package: Int, module: Bytes, want: EmbedRequest) -> EmbedBytesResult =
   Err(b"no file is there")
 
-pub fn nothing_derived(kind: Bytes, at: Bytes) -> Option<Bytes> = None
+pub fn no_toolchain(part: Bytes) -> Option<Bytes> = None
 
 pub fn over_decoding<a | e>(
   store: fs::MemFs,
@@ -554,7 +563,8 @@ pub fn over_decoding<a | e>(
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {RunEffects, abort.raise},
 ) -> { store: fs::MemFs, value: a } / {abort.raise | e} = {
-  let done = database::with_store_in_memory(store, read, look, || with_decode_cache(work));
+  let done = without_derivers(||
+    database::with_store_in_memory(store, read, look, || with_decode_cache(work)));
   { store: done.tree, value: done.value }
 }
 
@@ -672,7 +682,7 @@ pub fn session_over<a>(
         text_of,
         || all.map(|s: Source| s.name),
         read,
-        nothing_derived,
+        no_toolchain,
         kind,
         at,
       ),
@@ -733,7 +743,6 @@ pub fn lookup_input_shipping(
   shipped: List<Source>,
   kind: Bytes,
   at: Bytes,
-  derived: (Bytes, Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> Option<Bytes> / {abort.raise} = {
   let all = with_prelude_source(shipped);
   let source_text = |name: Bytes|
@@ -744,7 +753,7 @@ pub fn lookup_input_shipping(
     source_text,
     || all.map(|s: Source| s.name),
     reject_embed,
-    derived,
+    no_toolchain,
     kind,
     at,
   )
@@ -869,30 +878,32 @@ fn queried_in(
         persistent: true,
         product: None,
         interface: Set::empty(),
+        serial: false,
       }),
     }
   };
   let done = fs::on_mem[abs](tree, ||
     handle {
-      database::with_database[abs](
-        "s",
-        prelude_frames,
-        |kind: Bytes, at: Bytes| {
-          if raced.is_first_lookup() {
-            database::with_database[abs](
-              "s",
-              prelude_frames,
-              |k: Bytes, a: Bytes| lookup_input_alone(w, k, a),
-              |_: Bytes| (),
-              || with_decode_cache(|| query_alone(qs, w).run),
-            );
-            ()
-          };
-          lookup_input_alone(w, kind, at)
-        },
-        |_: Bytes| (),
-        || with_decode_cache(|| query_outcome(qs, w)),
-      ).value
+      without_derivers(||
+        database::with_database[abs](
+          "s",
+          prelude_frames,
+          |kind: Bytes, at: Bytes| {
+            if raced.is_first_lookup() {
+              database::with_database[abs](
+                "s",
+                prelude_frames,
+                |k: Bytes, a: Bytes| lookup_input_alone(w, k, a),
+                |_: Bytes| (),
+                || with_decode_cache(|| query_alone(qs, w).run),
+              );
+              ()
+            };
+            lookup_input_alone(w, kind, at)
+          },
+          |_: Bytes| (),
+          || with_decode_cache(|| query_outcome(qs, w)),
+        )).value
     } with {
       var begun = company != Concurrent,
       raced.is_first_lookup() -> {
@@ -916,13 +927,14 @@ pub fn checked_with_write_limit(
 ) -> fs::MemFs / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry();
-  match database::with_writes_limited(
-      store,
-      limit,
-      prelude_frames,
-      |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-      || with_decode_cache(|| query_alone(qs, w).own_hashes),
-    ) {
+  match without_derivers(||
+      database::with_writes_limited(
+        store,
+        limit,
+        prelude_frames,
+        |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+        || with_decode_cache(|| query_alone(qs, w).own_hashes),
+      )) {
     Finished(ran) -> ran.tree,
     Stopped(stopped) -> stopped.tree,
   }
@@ -931,12 +943,13 @@ pub fn checked_with_write_limit(
 pub fn operations_of_check(store: fs::MemFs, sources: List<Source>) -> Int / {abort.raise} = {
   let w = inputs_alone(sources);
   let qs = fresh_registry();
-  database::operations_of_session(
-    store,
-    prelude_frames,
-    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-    || with_decode_cache(|| query_alone(qs, w).own_hashes),
-  )
+  without_derivers(||
+    database::operations_of_session(
+      store,
+      prelude_frames,
+      |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+      || with_decode_cache(|| query_alone(qs, w).own_hashes),
+    ))
 }
 
 effect raced {
@@ -1049,7 +1062,7 @@ fn embedding_queried(
   let done = over_decoding(
     fs::mem_empty(),
     packs::no_pack,
-    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
+    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, no_toolchain, kind, at),
     || query_alone(fresh_registry(), w),
   );
   { store: done.store, results: done.value.results, own_hashes: done.value.own_hashes }
@@ -1289,16 +1302,17 @@ fn session_over_embeds<[r]>(
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest| embed_from_files[r](want);
   let qs = fresh_registry();
-  database::with_database[r](
-    "s",
-    packs::no_pack,
-    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
-    |_: Bytes| (),
-    ||
-      with_decode_cache(||
-        if checks { own_hash_of(query_alone(qs, w).own_hashes, b"m.a") }
-        else { in_session(qs, |run: Run| { run: run, value: None }) }),
-  ).value
+  without_derivers(||
+    database::with_database[r](
+      "s",
+      packs::no_pack,
+      |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, no_toolchain, kind, at),
+      |_: Bytes| (),
+      ||
+        with_decode_cache(||
+          if checks { own_hash_of(query_alone(qs, w).own_hashes, b"m.a") }
+          else { in_session(qs, |run: Run| { run: run, value: None }) }),
+    )).value
 }
 
 test "a third session in a command reads the embedded file the second session read first, and the next command reads the saved file" {
@@ -1331,18 +1345,18 @@ pub fn check_sources(
   store: fs::MemFs,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes, Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
+  derivations: List<CheckDefinition> = [],
 ) -> CheckedSources / {abort.raise} =
-  check_with_pack(store, Some(prelude_pack), sources, shipped, derived: derived)
+  check_with_pack(store, Some(prelude_pack), sources, shipped, derivations: derivations)
 
 pub fn check_with_pack(
   store: fs::MemFs,
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes, Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
+  derivations: List<CheckDefinition> = [],
 ) -> CheckedSources / {abort.raise} =
-  check_under(fresh_registry(), store, packed, sources, shipped, derived)
+  check_under(fresh_registry(derivations), store, packed, sources, shipped)
 
 pub fn check_under(
   qs: CheckQueries,
@@ -1350,7 +1364,6 @@ pub fn check_under(
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes, Bytes) -> Option<Bytes> / {abort.raise},
 ) -> CheckedSources / {abort.raise} = {
   let w = load_inputs_of(
     {
@@ -1368,7 +1381,7 @@ pub fn check_under(
         match found { Some(b) -> fetching.fetch(b), None -> () };
         found
       },
-      |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at, derived: derived),
+      |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at),
       || {
         in_session(qs, |run: Run| {
           let done = reading(qs, run, || {
