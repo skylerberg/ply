@@ -412,7 +412,7 @@ fn open_memo_store<a, [r], [s]>(
   let read_embed = |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want);
   let qs = query_registry();
   database::with_opening[r](dir, |opening: fact_store::Opening|
-    deriving[r](opening, pack_frame, w.texts, w.texts, |derived: (Bytes) -> Option<Bytes>|
+    deriving[r](opening, pack_frame, w.own, w.texts, |derived: (Bytes) -> Option<Bytes>|
       database::with_opened_database[r](
         opening,
         pack_frame,
@@ -682,24 +682,6 @@ fn cannot_run(module: Bytes, notes: List<Bytes>) -> DeriverFailure =
 
 type DeriverModule = { name: Bytes, text: Bytes }
 
-fn deriver_closure(
-  module: Bytes,
-  own: Map<Bytes, Bytes>,
-) -> List<DeriverModule> / {shipped.module, abort.raise} =
-  traverse([module], |name: Bytes| {
-    let text = if is_shipped(name) { shipped_module_text(name) } else { own.get(name) };
-    {
-      value: { name: name, text: text.unwrap_or(b"") },
-      next: match text {
-        None -> [],
-        Some(t) ->
-          (match header(t) { Some(head) -> head.imports, None -> parse(t).node.imports }).map(
-            import_path,
-          ),
-      },
-    }
-  }).map(|v: Visit<Bytes, DeriverModule>| v.value)
-
 fn uses_derive(text: Bytes) -> Bool / {abort.raise} = {
   let parsed = parse(text).node;
   parsed.items.any(|item: Item|
@@ -712,7 +694,10 @@ fn deriver_program<[r]>(
   module: Bytes,
   own: Map<Bytes, Bytes>,
 ) -> Result<RunnableProgram, DeriverFailure> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
-  let closure = deriver_closure(module, own).filter(|m: DeriverModule| !is_shipped(m.name));
+  let closure = reached_texts([module], |name: Bytes|
+    if is_shipped(name) { shipped_module_text(name) } else { own.get(name) }).filter(
+    |m: DeriverModule| !is_shipped(m.name),
+  );
   match closure.find(|m: DeriverModule| uses_derive(m.text)) {
     Some(m) -> Err(cannot_run(module, [Bytes::concat_all([b"`", m.name, b"` uses `derive`"])])),
     None -> {
@@ -798,14 +783,31 @@ fn is_unavailable(response: Bytes) -> Bool / {abort.raise} =
     _ -> false,
   }
 
+fn imported_by(text: Bytes) -> List<Bytes> / {abort.raise} =
+  (match header(text) { Some(head) -> head.imports, None -> parse(text).node.imports }).map(
+    import_path,
+  )
+
+fn reached_texts(
+  roots: List<Bytes>,
+  text_of: (Bytes) -> Option<Bytes> / {shipped.module, abort.raise},
+) -> List<DeriverModule> / {shipped.module, abort.raise} =
+  traverse(roots, |name: Bytes| {
+    let text = text_of(name);
+    {
+      value: { name: name, text: text.unwrap_or(b"") },
+      next: match text { None -> [], Some(t) -> imported_by(t) },
+    }
+  }).map(|v: Visit<Bytes, DeriverModule>| v.value)
+
 fn wanted_derivations(
-  scanned: Map<Bytes, Bytes>,
+  reached: List<DeriverModule>,
   results: Map<Bytes, Bytes>,
   text_of: keep (Bytes) -> Option<Bytes> / {shipped.module, abort.raise},
 ) -> List<Bytes> / {shipped.module, abort.raise} =
-  scanned.fold([], |found: List<Bytes>, name: Bytes, text: Bytes|
-    if !text.contains(b"derive") { found } else {
-      requested_derivations({ name: name, source_text: text }, |ask: DeriverRequest|
+  reached.fold([], |found: List<Bytes>, m: DeriverModule|
+    if !m.text.contains(b"derive") { found } else {
+      requested_derivations({ name: m.name, source_text: m.text }, |ask: DeriverRequest|
         match results.get(derivation_key(ask, text_of)) {
           Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
           None -> missing_derivation,
@@ -818,18 +820,19 @@ type Derived = { results: Map<Bytes, Bytes>, problems: List<database::StoreProbl
 pub fn deriving<a, [r] | e>(
   opening: fact_store::Opening,
   read: (packs::PackPart) -> Option<Bytes> / {ReadsShipped, abort.raise},
-  scanned: Map<Bytes, Bytes>,
+  roots: List<Bytes>,
   own: Map<Bytes, Bytes>,
   session: ((Bytes) -> Option<Bytes>) -> database::StoreOutcome<a> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e},
 ) -> database::StoreOutcome<a> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e} = {
   let text_of = |name: Bytes|
     if is_shipped(name) { shipped_module_text(name) } else { own.get(name) };
+  let reached = reached_texts(roots, text_of);
   let stored = match database::read_derivations[r](opening, read) {
     Ok(found) -> found,
     Err(_) -> Map::new(),
   };
   let derived = iterate({ results: stored, problems: [] }, unlimited_steps, |sofar: Derived|
-    match wanted_derivations(scanned, sofar.results, text_of).filter(|at: Bytes|
+    match wanted_derivations(reached, sofar.results, text_of).filter(|at: Bytes|
         !sofar.results.contains(at)) {
       [] -> Stop(sofar),
       missing -> {
