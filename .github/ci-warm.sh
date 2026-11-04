@@ -64,15 +64,16 @@ case "${1:-}" in
     fi
     ;;
   this-run)
-    name=${2:?usage: ci-warm.sh this-run NAME}
-    if laid "${GITHUB_RUN_ID:?the run whose artifact this is}" "$name" cache; then
+    name=${2:?usage: ci-warm.sh this-run NAME PART...}
+    shift 2
+    if laid "${GITHUB_RUN_ID:?the run whose artifact this is}" "$name" "${@:-cache}"; then
       echo "found=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     else
       echo "could not download the stage $name: this job starts from the cache"
     fi
     ;;
   *)
-    echo "usage: ci-warm.sh pack TAR | shared NAME | this-run NAME" >&2
+    echo "usage: ci-warm.sh pack TAR | shared NAME | this-run NAME PART..." >&2
     exit 2
     ;;
 esac

@@ -57,6 +57,7 @@ pub effect emit {
   read code(program: CodeProgram, roots: List<RootKey>) -> Emitted
   read compiled(owner: String, text: Bytes, profile: cc::Profile) -> Result<String, List<Diagnostic>>
   read libraries(emitted: Emitted, profile: cc::Profile) -> Result<List<String>, List<Diagnostic>>
+  read codes(emitted: Emitted, digests: List<Bytes>) -> Map<Bytes, Bytes>
 }
 
 pub effect set Emits = {shipped.runtime, shipped.definitions, toolchain.bodies_dir, env.variable, fs.read[abs], fs.write[abs], entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], compilers.read[cc], compilers.write[cc], compilers.read[tcc], compilers.write[tcc], toolchain.read, toolchain.write, shipped.read_pack, toolchain.reuse_dir, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], Loads}
@@ -88,7 +89,7 @@ pub fn library_of(
   }
 
 pub fn emitting<a | e>(
-  body: () -> a / {emit.code, emit.compiled, emit.libraries | e},
+  body: () -> a / {emit.code, emit.codes, emit.compiled, emit.libraries | e},
 ) -> a / {abort.raise, Emits, EmbedSnapshot, Databases | e} =
   handle {
     body()
@@ -99,6 +100,7 @@ pub fn emitting<a | e>(
     } else { library_of_text[cc](owner, text, profile) },
     emit.libraries(emitted, profile) -> if by_tcc(profile) { part_libraries[tcc](emitted, profile) }
     else { part_libraries[cc](emitted, profile) },
+    emit.codes(emitted, digests) -> codes_for(emitted, digests),
   }
 
 pub fn artifact_library(
@@ -137,45 +139,16 @@ fn with_codes(
     },
   }
 
-fn codes_stored(
-  r: paths::ResolvedPath,
-  code: ProgramCode,
-) -> Bool / {Databases, fs.read[cwd], fs.read[abs], recent_reads.read, recent_reads.write, shipped.read_pack, abort.raise} = {
-  let place = database_place(r);
-  let opening = databases.open(place);
-  let digests = code.parts.flat_map(|p: PartCode| p.made.codes);
-  let outputs = match place {
-    InWorkingDirectory(_) -> database::outputs_by_digest[cwd](opening, pack_frame, digests),
-    AtAbsolutePath(_) -> database::outputs_by_digest[abs](opening, pack_frame, digests),
-  };
-  outputs.values().all(|o: database::StoredOutput| match o { Stored(_) -> true, NotKept -> false })
-}
-
-fn kept_all(problems: List<database::StoreProblem>) -> Bool =
-  !problems.any(|p: database::StoreProblem|
-    match p { database::NotWritten(_) -> true, database::Damaged(_) -> false })
-
 fn code_of(
   program: CodeProgram,
   roots: List<RootKey>,
 ) -> Emitted / {Emits, EmbedSnapshot, Databases, abort.raise} = {
-  let session = |held: Bool|
-    progress::silently(||
-      in_program_store(program.place, |_: LoadInputs|
-        with_codes(program_code(entries_of(roots)), held)));
-  let first = session(program.place.store == None);
-  let stored = match program.place.store {
-    Some(r) -> if kept_all(first.problems) && codes_stored(r, first.value.code) { Some(r) }
-    else { None },
-    None -> None,
-  };
-  let found = match ((program.place.store, stored)) {
-    (Some(_), None) -> session(true).value,
-    _ -> first.value,
-  };
+  let found = progress::silently(||
+    in_program_store(program.place, |_: LoadInputs|
+      with_codes(program_code(entries_of(roots)), program.place.store == None))).value;
   {
     code: found.code,
-    source: match stored {
+    source: match program.place.store {
       None -> HeldInMemory(found.held),
       Some(r) -> {
         let place = database_place(r);
@@ -187,26 +160,36 @@ fn code_of(
   }
 }
 
-fn stored_codes(
+fn codes_for(
   e: Emitted,
   digests: List<Bytes>,
-) -> Map<Bytes, Bytes> / {fs.read[cwd], fs.read[abs], recent_reads.read, recent_reads.write, shipped.read_pack, abort.raise} =
+) -> Map<Bytes, Bytes> / {Emits, EmbedSnapshot, Databases, abort.raise} =
   match e.source {
     HeldInMemory(held) -> held,
-    InDatabase(stored) ->
-      kept_codes(match stored.place {
+    InDatabase(stored) -> {
+      let outputs = match stored.place {
         InWorkingDirectory(_) ->
           database::outputs_by_digest[cwd](stored.opening, pack_frame, digests),
         AtAbsolutePath(_) -> database::outputs_by_digest[abs](stored.opening, pack_frame, digests),
-      }),
+      };
+      let stored_codes = outputs.fold(
+        Map::new(),
+        |found: Map<Bytes, Bytes>, digest: Bytes, o: database::StoredOutput|
+          match o { Stored(code) -> found.insert(digest, code), NotKept -> found },
+      );
+      if stored_codes.len() == digests.len() { stored_codes } else {
+        let missing = Set::of_list(digests.filter(|d: Bytes| !stored_codes.contains(d)));
+        let parts = e.code.parts.filter(|p: PartCode|
+          p.made.codes.any(|d: Bytes| missing.contains(d)));
+        progress::silently(||
+          in_program_store(e.place, |_: LoadInputs|
+            with_codes({ ..e.code, parts: parts }, true))).value.held.fold(
+          stored_codes,
+          |found: Map<Bytes, Bytes>, digest: Bytes, code: Bytes| found.insert(digest, code),
+        )
+      }
+    },
   }
-
-fn kept_codes(outputs: Map<Bytes, database::StoredOutput>) -> Map<Bytes, Bytes> / {abort.raise} =
-  outputs.fold(Map::new(), |found: Map<Bytes, Bytes>, digest: Bytes, o: database::StoredOutput|
-    match o {
-      Stored(code) -> found.insert(digest, code),
-      NotKept -> panic("a part's code is not kept in the database that listed it"),
-    })
 
 pub type WholeProgram = { code: CodeProgram, constructors: List<Bytes>, modules: Int }
 
@@ -225,10 +208,10 @@ pub fn whole_program(code: CodeProgram, listing: ProgramListing) -> WholeProgram
 pub fn whole_text(
   program: WholeProgram,
   roots: List<RootKey>,
-) -> Result<Bytes, List<Diagnostic>> / {emit.code, fs.read[cwd], fs.read[abs], recent_reads.read, recent_reads.write, shipped.runtime, shipped.read_pack, abort.raise} = {
+) -> Result<Bytes, List<Diagnostic>> / {emit.code, emit.codes, emit.codes, shipped.runtime, abort.raise} = {
   let e = emit.code(program.code, roots);
   let digests = reached_digests(e.code);
-  let stored = stored_codes(e, digests);
+  let stored = emit.codes(e, digests);
   let codes = reached_only(
     e.code,
     digests.map(|digest: Bytes|
@@ -262,7 +245,7 @@ fn libraries_of_parts<[c]>(
   e: Emitted,
   profile: cc::Profile,
   parts: List<PartCode>,
-) -> Result<List<String>, List<Diagnostic>> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, shipped.runtime, shipped.read_pack, fs.read[cwd], fs.read[abs], recent_reads.read, recent_reads.write, abort.raise} = {
+) -> Result<List<String>, List<Diagnostic>> / {compilers.read[c], compilers.write[c], Emits, EmbedSnapshot, Databases, abort.raise} = {
   let wanted = parts.map(|p: PartCode|
     { owner: part_owner(profile, p.part), key: p.made.identity });
   match cc::found_libraries[c](profile, wanted) {
@@ -271,7 +254,7 @@ fn libraries_of_parts<[c]>(
       let paths = found.map(|k: cc::FoundLibrary| k.path);
       let missing = range(0, parts.len()).filter(|i: Int| !found.get(i).built);
       if missing.len() == 0 { Ok(paths) } else {
-        let stored = stored_codes(
+        let stored = codes_for(
           e,
           missing.fold([], |all: List<Bytes>, i: Int| all.concat(parts.get(i).made.codes)),
         );
@@ -301,7 +284,7 @@ fn libraries_of_parts<[c]>(
 fn part_libraries<[c]>(
   e: Emitted,
   profile: cc::Profile,
-) -> Result<List<String>, List<Diagnostic>> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, shipped.runtime, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, entropy.next, abort.raise, shipped.read_pack} = {
+) -> Result<List<String>, List<Diagnostic>> / {compilers.read[c], compilers.write[c], Emits, EmbedSnapshot, Databases, abort.raise} = {
   let shipped_parts = e.code.parts.filter(|p: PartCode| shipped_part(p.part));
   let own_parts = e.code.parts.filter(|p: PartCode| !shipped_part(p.part));
   let own = || libraries_of_parts[c](e, profile, own_parts);
