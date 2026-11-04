@@ -112,21 +112,43 @@ pub fn without_base(db: Database) -> Database = { ..db, base: None }
 pub fn base_only(db: Database) -> Database =
   { ..db, basis: Replacing(manifest_of(db.basis)), pending: Map::new() }
 
-pub const base_trees: List<Tree> = [Facts, Dependents, Inputs, Codes]
+const base_trees: List<Tree> = [Facts, Dependents, Inputs, Codes]
 
-pub fn tree_number_of(tree: Tree) -> Int = table_number(TreeTable(tree))
+const base_token: Bytes = b"shipped\x00"
 
-pub fn tree_table<[r]>(
+pub fn base_written<[r]>(
   db: Database,
-  tree: Tree,
-) -> SortedTable / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  segments::sorted_table(
-    entries_under[r](db, tree, b"").fold(
-      Map::new(),
-      |rows: Map<Bytes, Bytes>, key: Bytes, value: Bytes|
-        rows.insert(key, bin::encode(Present(value), stored_entry_bin())),
-    ),
+  kept: Map<Bytes, Bytes>,
+) -> segments::SegmentFile / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} = {
+  let placed = kept.fold(
+    { writing: segments::new_writer, places: Map::new() },
+    |sofar: { writing: SegmentWriter, places: Map<Bytes, Bytes> }, key: Bytes, bytes: Bytes| {
+      let a = segments::append_payload(sofar.writing, bytes);
+      {
+        writing: a.writing,
+        places: sofar.places.insert(
+          key,
+          bin::encode({ at: a.at, size: bytes.len() }, payload_place_bin()),
+        ),
+      }
+    },
+  );
+  let trees = base_trees.map(|tree: Tree|
+    segments::table(
+      table_number(TreeTable(tree)),
+      entries_under[r](db, tree, b"").fold(
+        Map::new(),
+        |rows: Map<Bytes, Bytes>, key: Bytes, value: Bytes|
+          rows.insert(key, bin::encode(Present(value), stored_entry_bin())),
+      ),
+    ));
+  segments::segment_in_memory(
+    schema,
+    base_token,
+    placed.writing,
+    trees.push(segments::table(table_number(ResultsTable), placed.places)),
   )
+}
 
 fn segments_kept(basis: Basis, now: Manifest) -> Int =
   match basis { Extending(_) -> now.segments.len(), Replacing(_) -> 0 }
@@ -294,21 +316,6 @@ pub fn value_of<[r]>(
     None -> stored_value[r](db, tree, key),
   }
 
-pub fn from_base<[r]>(
-  db: Database,
-  tree: Tree,
-  key: Bytes,
-) -> Bool / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  match db.base {
-    None -> false,
-    Some(base) ->
-      pending_in(db, tree).get(key) == None
-        && (match stored_row[r](db, TreeTable(tree), key) {
-          Some(found) -> found.token == base.token,
-          None -> false,
-        }),
-  }
-
 fn prefix_end(prefix: Bytes) -> Option<Bytes> / {abort.raise} = {
   let length = iterate(prefix.len(), prefix.len() + 1, |length: Int|
     if length > 0 && prefix.at(length - 1) == 255 { Continue(length - 1) } else { Stop(length) });
@@ -423,8 +430,8 @@ pub fn with_result<[r]>(
   digest: Bytes,
   bytes: Bytes,
 ) -> Database / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
-  if db.written_results.contains(digest) || stored_row[r](db, ResultsTable, digest) != None { db }
-  else {
+  if db.written_results.contains(digest)
+      || stored_row[r](without_base(db), ResultsTable, digest) != None { db } else {
     let placed = segments::append_payload(db.writing, bytes);
     {
       ..db,
@@ -970,14 +977,17 @@ test "a run that started from an older manifest cannot commit, so a store never 
 
 test "a disk that fails at any write leaves the old store or the whole new one" {
   let start = after_first(fs::mem_of([]));
-  iterate(0, 1000, |n: Int| {
-    let died = fs::on_mem_failing[abs](start, n, ||
-      in_store[abs](|db: Database| commit[abs](second_edit(db), no_results)));
-    let first = value_stored(died.tree, b"first".blake3());
-    let second = value_stored(died.tree, b"second".blake3());
-    assert(first != second);
-    if second == Some(b"two") && died.value != WriteFailed { Stop(()) } else { Continue(n + 1) }
-  })
+  let edit = || in_store[abs](|db: Database| commit[abs](second_edit(db), no_results));
+  let operations = fs::on_mem_counted[abs](start, edit).operations;
+  range(0, operations + 1).fold((), |_: Unit, n: Int| {
+    let died = fs::on_mem_failing[abs](start, n, edit);
+    assert(
+      value_stored(died.tree, b"first".blake3()) != value_stored(died.tree, b"second".blake3()),
+    )
+  });
+  let finished = fs::on_mem_failing[abs](start, operations, edit);
+  assert(finished.value != WriteFailed);
+  assert_eq(value_stored(finished.tree, b"second".blake3()), Some(b"two"))
 }
 
 test "a table that fails its checksum raises `damaged`, and starting over replaces the store" {

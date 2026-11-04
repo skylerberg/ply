@@ -28,17 +28,8 @@ const inline_limit: Int = 2048
 
 fn is_inline(output: Bytes) -> Bool = output.len() <= inline_limit
 
-fn base_of(pack: packs::Pack) -> Segment / {abort.raise} =
-  {
-    token: pack.id.slice(0, 8),
-    at: 0,
-    size: 0,
-    parts: pack.tables.map(|t: packs::PackTable|
-      { table: t.table, offset: 0, size: 0, sum: b"", name: base_table_name(pack.id, t.table) }),
-  }
-
-fn base_table_name(id: Bytes, table: Int) -> Bytes / {abort.raise} =
-  Bytes::concat_all([b"shipped pack\x00", id, bin::encode(table, bin::int_bin())])
+fn base_path(database: Database, base: Segment) -> String / {abort.raise} =
+  segments::segment_path(database.dir, base.token)
 
 fn layer_of(db: Database, layer: Layer) -> Database =
   match layer {
@@ -153,22 +144,25 @@ fn over_database<a, [r] | e>(
   noted: (Bytes) -> Unit / {abort.raise | e},
   work: () -> a / {memo_store.read, memo_store.write, abort.raise},
 ) -> Ran<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, abort.raise | e} = {
-  let pack = packs::opened(read);
-  let layered = match pack {
-    None -> database,
-    Some(p) -> {
-      p.tables.fold((), |_: Unit, t: packs::PackTable|
-        recent_reads.keep_table(base_table_name(p.id, t.table), t.rows));
-      fact_store::with_base(database, base_of(p))
+  match packs::opened(read) {
+    None -> in_layered[r](database, look, noted, work),
+    Some(base) -> handle {
+      packs::served[r](base_path(database, base), ||
+        in_layered[r](fact_store::with_base(database, base), look, noted, work))
+    } with {
+      packs::pack_frames.frame(part) -> read(part),
     },
-  };
-  let result_bytes = |db: Database, key: Bytes|
-    match fact_store::result_of[r](db, key) {
-      Some(b) -> Some(b),
-      None -> match pack { Some(p) -> packs::result(p, read, key), None -> None },
-    };
+  }
+}
+
+fn in_layered<a, [r] | e>(
+  layered: Database,
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  noted: (Bytes) -> Unit / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> Ran<a> / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fact_damage.damaged, session_inputs.read, session_inputs.write, abort.raise | e} = {
   let details_bytes = |db: Database, digest: Bytes|
-    match result_bytes(db, digest) {
+    match fact_store::result_of[r](db, digest) {
       Some(b) -> b,
       None -> fact_damage.damaged("a stored fact names details that are not stored"),
     };
@@ -176,7 +170,7 @@ fn over_database<a, [r] | e>(
     let id = location_id(kind, at);
     session_input(id, ||
       match fixed_input[r](db, id) {
-        Some(d) -> result_bytes(db, result_key(d)),
+        Some(d) -> fact_store::result_of[r](db, result_key(d)),
         None -> look(kind, at),
       })
   };
@@ -198,7 +192,6 @@ fn over_database<a, [r] | e>(
       Some(b) -> Some(undecoded(b, stored_fact_bin())),
       None -> None,
     },
-    memo_store.from_pack(key) -> fact_store::from_base[r](st.db, Facts, key),
     memo_store.details(digest) -> match st.details.get(digest) {
       Some(d) -> d,
       None -> {
@@ -211,7 +204,7 @@ fn over_database<a, [r] | e>(
       Some(o) -> Some(o),
       None -> match st.transient.get(digest) {
         Some(o) -> Some(o),
-        None -> match result_bytes(st.db, result_key(digest)) {
+        None -> match fact_store::result_of[r](st.db, result_key(digest)) {
           Some(o) -> {
             st = remembered_output(st, digest, o);
             Some(o)
@@ -472,20 +465,20 @@ pub fn with_database<a, [r] | e>(
 
 pub fn database_in(cache_dir: String) -> String = cache_dir ++ "/memo"
 
-fn read_opened<a, [r]>(
+fn read_opened<a, [r] | e>(
   opening: fact_store::Opening,
-  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
-) -> Result<a, String> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e},
+) -> Result<a, String> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise | e} =
   handle {
     Ok(read(fact_store::loaded[r](opening)))
   } with {
     fact_damage.damaged(reason) -> Err(reason),
   }
 
-fn undamaged_opened<a, [r]>(
+fn undamaged_opened<a, [r] | e>(
   opening: fact_store::Opening,
-  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise},
-) -> a / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  read: (Database) -> a / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e},
+) -> a / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise | e} =
   match read_opened[r](opening, read) {
     Ok(value) -> value,
     Err(reason) -> panic("the fact database is damaged: " ++ reason),
@@ -562,27 +555,27 @@ fn with_fact_of_kind<[r]>(
     },
   }
 
+pub const no_usage: Usage =
+  { records: 0, results: 0, output_bytes: 0, kinds: [], segments: 0, bytes: 0 }
+
 pub fn usage<[r]>(
   opening: fact_store::Opening,
-) -> Usage / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
-  match read_opened[r](opening, |db: Database| {
-      let size = fact_store::store_size(db);
-      let facts = fact_store::entries_under[r](db, Facts, b"").values();
-      let kinds = facts.fold(Map::new(), |found: Map<Bytes, KindUsage>, b: Bytes|
-        with_fact_of_kind[r](db, found, undecoded(b, stored_fact_bin())));
-      let output_bytes = kinds.fold(0, |n: Int, _: Bytes, k: KindUsage| n + k.bytes);
-      {
-        records: facts.len(),
-        results: live_results[r](db).size(),
-        output_bytes: output_bytes,
-        kinds: kinds.values(),
-        segments: size.segments,
-        bytes: size.bytes,
-      }
-    }) {
-    Ok(found) -> found,
-    Err(_) -> { records: 0, results: 0, output_bytes: 0, kinds: [], segments: 0, bytes: 0 },
-  }
+) -> Result<Usage, String> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise} =
+  read_opened[r](opening, |db: Database| {
+    let size = fact_store::store_size(db);
+    let facts = fact_store::entries_under[r](db, Facts, b"").values();
+    let kinds = facts.fold(Map::new(), |found: Map<Bytes, KindUsage>, b: Bytes|
+      with_fact_of_kind[r](db, found, undecoded(b, stored_fact_bin())));
+    let output_bytes = kinds.fold(0, |n: Int, _: Bytes, k: KindUsage| n + k.bytes);
+    {
+      records: facts.len(),
+      results: live_results[r](db).size(),
+      output_bytes: output_bytes,
+      kinds: kinds.values(),
+      segments: size.segments,
+      bytes: size.bytes,
+    }
+  })
 
 pub type StoredOutput = | Stored(Bytes) | NotKept
 
@@ -591,24 +584,22 @@ pub fn outputs_by_digest<[r] | e>(
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   digests: List<Bytes>,
 ) -> Map<Bytes, StoredOutput> / {fs.read[r], recent_reads.read, recent_reads.write, abort.raise | e} = {
-  let held = undamaged_opened[r](opening, |db: Database|
-    digests.fold(Map::new(), |found: Map<Bytes, Bytes>, digest: Bytes|
-      match fact_store::result_of[r](db, result_key(digest)) {
-        Some(output) -> found.insert(digest, output),
-        None -> found,
-      }));
-  let pack = packs::opened(read);
-  digests.fold(Map::new(), |found: Map<Bytes, StoredOutput>, digest: Bytes|
-    found.insert(digest, match held.get(digest) {
-      Some(output) -> Stored(output),
-      None -> match match pack {
-          Some(p) -> packs::result(p, read, result_key(digest)),
-          None -> None,
-        } {
+  let outputs = |db: Database|
+    digests.fold(Map::new(), |found: Map<Bytes, StoredOutput>, digest: Bytes|
+      found.insert(digest, match fact_store::result_of[r](db, result_key(digest)) {
         Some(output) -> Stored(output),
         None -> NotKept,
-      },
-    }))
+      }));
+  let base = packs::opened(read);
+  handle {
+    undamaged_opened[r](opening, |db: Database|
+      match base {
+        None -> outputs(db),
+        Some(b) -> packs::served[r](base_path(db, b), || outputs(fact_store::with_base(db, b))),
+      })
+  } with {
+    packs::pack_frames.frame(part) -> read(part),
+  }
 }
 
 pub fn write_pack<[r]>(
@@ -645,14 +636,7 @@ pub fn write_pack<[r]>(
         Some(d) -> held.insert(result_key(d), stored(result_key(d))),
         None -> held,
       });
-    {
-      written: packs::written(
-        fact_store::base_trees.map(|tree: fact_store::Tree|
-          { table: fact_store::tree_number_of(tree), rows: fact_store::tree_table[r](db, tree) }),
-        results,
-      ),
-      records: facts.len(),
-    }
+    { written: packs::written(fact_store::base_written[r](db, results)), records: facts.len() }
   })
 
 pub type FactRecord = {
@@ -709,6 +693,15 @@ fn session_in_memory<a | e>(
     FailAfter(writes) -> fs::on_mem_failing[memory](tree, writes, session),
   }
 }
+
+pub fn operations_of_session<a | e>(
+  tree: fs::MemFs,
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
+  look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
+  work: () -> a / {memo_store.read, memo_store.write, abort.raise},
+) -> Int / {abort.raise | e} =
+  fs::on_mem_counted[memory](tree, ||
+    session_in[memory](in_memory_database_dir, read, look, |_: Bytes| (), work)).operations
 
 pub fn with_writes_limited<a | e>(
   tree: fs::MemFs,
@@ -1050,13 +1043,17 @@ test "a run stopped after any number of writes leaves a store from which the nex
   let moved = edited(fetched_in(q, four(), b"label", b"a").world, b"a", b"forty");
   let complete = fetched_in(q, moved, b"label", b"a").world.store;
   let look = |_: Bytes, at: Bytes| moved.files.get(at);
-  iterate(0, 1099511627776, |writes: Int| {
-    let tried = with_writes_limited(moved.store, FailAfter(writes), packs::no_pack, look, ||
-      in_session_of(plain_queries(q), b"label", b"a"));
-    let left = match tried { Finished(ran) -> ran.tree, Stopped(stopped) -> stopped.tree };
-    agreed(q, { ..moved, store: left }, b"label", b"a");
-    if same_database_in_memory(left, complete) { Stop(()) } else { Continue(writes + 1) }
-  })
+  let session = || in_session_of(plain_queries(q), b"label", b"a");
+  let left_after = |writes: Int|
+    match with_writes_limited(moved.store, FailAfter(writes), packs::no_pack, look, session) {
+      Finished(ran) -> ran.tree,
+      Stopped(stopped) -> stopped.tree,
+    };
+  let operations = operations_of_session(moved.store, packs::no_pack, look, session);
+  range(0, operations + 1).fold((), |_: Unit, writes: Int| {
+    agreed(q, { ..moved, store: left_after(writes) }, b"label", b"a");
+  });
+  assert(same_database_in_memory(left_after(operations), complete))
 }
 
 fn fixed_reader(code: Bytes) -> Map<Bytes, Query<| {}>> =

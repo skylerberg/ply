@@ -55,7 +55,7 @@ fn segment_bytes(s: Segment) -> Bytes =
     Bytes::concat_all(s.parts.map(table_entry_bytes)),
   ])
 
-fn manifest_bytes(m: Manifest) -> Bytes / {abort.raise} = {
+pub fn manifest_bytes(m: Manifest) -> Bytes / {abort.raise} = {
   let body = Bytes::concat_all([
     manifest_magic,
     u32_le(format_version),
@@ -118,7 +118,7 @@ fn segments_from(
     )
   }
 
-fn manifest_from(b: Bytes) -> Option<Manifest> / {abort.raise} = {
+pub fn manifest_from(b: Bytes) -> Option<Manifest> / {abort.raise} = {
   let n = b.len();
   if n < 32 || b.slice(0, 8) != manifest_magic || read_u32(b, 8) != format_version { None }
   else if checksum(b.slice(0, n - 8)) != b.slice(n - 8, n) { None } else {
@@ -407,15 +407,11 @@ pub opaque type Table = new { table: Int, rows: SortedTable }
 pub fn table(table: Int, table_rows: Map<Bytes, Bytes>) -> Table =
   { table: table, rows: sorted_table(table_rows) }
 
-pub fn finish<[r]>(
-  dir: String,
-  schema: Bytes,
-  token: Bytes,
-  w: SegmentWriter,
-  tables: List<Table>,
-) -> Option<Segment> / {fs.write[r], abort.raise} = {
+type Laid = { parts: List<TableEntry>, bytes: Bytes }
+
+fn laid_out(token: Bytes, start: Int, tables: List<Table>) -> Laid / {abort.raise} = {
   let built = tables.fold(
-    { at: w.end, parts: [], bytes: [] },
+    { at: start, parts: [], bytes: [] },
     |accumulator: { at: Int, parts: List<TableEntry>, bytes: List<Bytes> }, t: Table|
       if t.rows.count == 0 { accumulator } else {
         let at = accumulator.at;
@@ -436,8 +432,34 @@ pub fn finish<[r]>(
         }
       },
   );
-  let done = flush[r](dir, schema, token, w, Bytes::concat_all(built.bytes));
-  if done.failed { None } else { Some({ token: token, at: 0, size: done.end, parts: built.parts }) }
+  { parts: built.parts, bytes: Bytes::concat_all(built.bytes) }
+}
+
+pub fn finish<[r]>(
+  dir: String,
+  schema: Bytes,
+  token: Bytes,
+  w: SegmentWriter,
+  tables: List<Table>,
+) -> Option<Segment> / {fs.write[r], abort.raise} = {
+  let laid = laid_out(token, w.end, tables);
+  let done = flush[r](dir, schema, token, w, laid.bytes);
+  if done.failed { None } else { Some({ token: token, at: 0, size: done.end, parts: laid.parts }) }
+}
+
+pub type SegmentFile = { segment: Segment, bytes: Bytes }
+
+pub fn segment_in_memory(
+  schema: Bytes,
+  token: Bytes,
+  w: SegmentWriter,
+  tables: List<Table>,
+) -> SegmentFile / {abort.raise} = {
+  let laid = laid_out(token, w.end, tables);
+  {
+    segment: { token: token, at: 0, size: w.end + laid.bytes.len(), parts: laid.parts },
+    bytes: Bytes::concat_all([header(schema, token), Bytes::concat_all(w.waiting), laid.bytes]),
+  }
 }
 
 pub type CommitResult = | Committed(Manifest) | LockHeld | StoreChanged | WriteFailed
