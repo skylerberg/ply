@@ -15,9 +15,10 @@ import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_sha
                              encode_tables)
 import compiler.syntax.items (Module, ImportDeclaration, header, parse, parse_started,
                               import_declaration_bin, read_without_import, homes_declaring,
-                              home_names_in, unimported_of)
+                              home_names_in, unimported_of, is_shipped)
 import compiler.expand.derive (DeriverRequest, DeriverResponse, Failed, Unavailable, import_path,
-                               derivers, deriver_request_bin, deriver_response_bin)
+                               derivation_at_bin, deriver_response_bin)
+import std.graph (Visit, traverse)
 import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.syntax.expressions (prelude_module)
 import compiler.front.interface (imported)
@@ -78,11 +79,7 @@ pub const embedded_file_kind: Bytes = b"embed"
 
 pub const shipped_names_kind: Bytes = b"shipped names"
 
-pub const toolchain_kind: Bytes = b"toolchain"
-
-pub const runtime_part: Bytes = b"runtime"
-
-pub const compiler_part: Bytes = b"compiler"
+pub const derived_kind: Bytes = b"derived"
 
 pub const own_modules_kind: Bytes = b"own modules"
 
@@ -102,11 +99,41 @@ pub fn deriver_wrapper_text(deriver: Bytes) -> Bytes =
     b" as deriver\n\npub fn derived(declaration: derive::Declaration) -> Result<String, derive::Refused> / {abort.raise} =\n  deriver::derive(declaration)\n",
   ])
 
-pub fn derivation_query() -> QueryOf<DeriverRequest, DeriverResponse> =
-  { name: b"derivation", input: deriver_request_bin(), output: deriver_response_bin() }
+pub fn deriver_identity(module: Bytes) -> Bytes / {memo.read, abort.raise} =
+  blake3(
+    Bytes::concat_all(
+      traverse([module], |name: Bytes| {
+        let text = if is_shipped(name) { shipped_text(name) }
+        else { memo.external(text_kind, name) };
+        {
+          value: Bytes::concat_all([name, b"\x00", blake3(text.unwrap_or(b""))]),
+          next: match text {
+            None -> [],
+            Some(t) ->
+              (match header(t) { Some(head) -> head.imports, None -> parse(t).node.imports }).map(
+                import_path,
+              ),
+          },
+        }
+      }).map(|v: Visit<Bytes, Bytes>| v.value),
+    ),
+  )
 
-fn derivation_of(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} =
-  fetch(derivation_query(), ask)
+fn derivation_of(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} = {
+  let at = bin::encode(
+    { deriver: deriver_identity(ask.module), request: ask },
+    derivation_at_bin(),
+  );
+  match memo.external(derived_kind, at) {
+    Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
+    None ->
+      Unavailable({
+        code: b"E0155",
+        message: b"no derived code was generated for this `derive` declaration",
+        notes: [b"this command runs no `derive` generators"],
+      }),
+  }
+}
 
 pub fn embed_at(root: Bytes, module: Bytes, key: Bytes) -> Bytes =
   Bytes::concat_all([root, b"\x00", module, b"\x00", key])
@@ -133,13 +160,13 @@ pub type ParsedText = {
 
 pub effect set QueryEffects = {memo.read, decode_cache.read, decode_cache.write}
 
-pub effect set RunEffects = {memo_store.read, memo_store.write, decode_cache.read, decode_cache.write, derivers.run}
+pub effect set RunEffects = {memo_store.read, memo_store.write, decode_cache.read, decode_cache.write}
 
 pub effect set SessionReads = {memo.read, decode_cache.read, decode_cache.write}
 
-pub type CheckQuery = Query<| {decode_cache.read, decode_cache.write, derivers.run}>
+pub type CheckQuery = Query<| {decode_cache.read, decode_cache.write}>
 
-pub type CheckDefinition = QueryDefinition<| {decode_cache.read, decode_cache.write, derivers.run}>
+pub type CheckDefinition = QueryDefinition<| {decode_cache.read, decode_cache.write}>
 
 pub const hash_products: Product = { kind: b"hashes", after: [] }
 
@@ -160,17 +187,13 @@ pub const interface_products: Product = { kind: b"interfaces", after: [hash_prod
 pub const program_products: Product =
   { kind: b"program", after: [hash_products.kind, listing_products.kind] }
 
-pub type CheckQueries = Queries<| {decode_cache.read, decode_cache.write, derivers.run}>
+pub type CheckQueries = Queries<| {decode_cache.read, decode_cache.write}>
 
 pub fn check_queries(named: Map<Bytes, CheckQuery>) -> CheckQueries =
   {
     named: named,
-    apart: |work: () -> Bytes / {abort.raise, decode_cache.read, decode_cache.write, derivers.run}|
-      handle {
-        with_decode_cache(work)
-      } with {
-        derivers.run(_, _) -> panic("a derivation runs serially, so no parallel attempt runs one"),
-      },
+    apart: |work: () -> Bytes / {abort.raise, decode_cache.read, decode_cache.write}|
+      with_decode_cache(work),
   }
 
 pub fn with_decode_cache<a | e>(
@@ -219,16 +242,11 @@ test "a second read of a parsed text reads the same derivations again" {
     })
   } with {
     var read: List<Bytes> = [],
-    memo.external(kind, at) -> None,
-    memo.fetch(query, input, part) -> {
-      read = read.push(input);
-      Some(
-        bin::encode(
-          Failed({ code: b"E0155", message: b"no deriver runs in this test", notes: [] }),
-          deriver_response_bin(),
-        ),
-      )
+    memo.external(kind, at) -> {
+      read = read.push(at);
+      None
     },
+    memo.fetch(query, input, part) -> None,
     memo.fetch_all(query, inputs, part) -> inputs.map(|_: Bytes| None),
     memo.output_digest(query, input, part) -> None,
     memo.stored_output(digest) -> None,

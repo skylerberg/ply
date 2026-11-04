@@ -14,26 +14,24 @@ import compiler.store.hash.forms (FunctionNamed, HashOutput, ModuleHashes, joine
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (imported)
 import compiler.store.memo
-import compiler.store.memo (memo, main_part)
+import compiler.store.memo (memo)
 import compiler.store.memo.engine (Run, in_session, reading)
 import compiler.front.checking.units (NoCode, entries_of, program_code, reached_codes,
                                       roots_of_modules, unit_of_root)
 import compiler.store.database
 import compiler.front.checking (CheckedModule, OwnPackage, LoadInputs, query_load,
                                 placeholder_definitions, evaluator_of, hashed_all, lookup_input,
-                                no_toolchain, reject_embed, packages_rejected, rejected_first,
+                                nothing_derived, reject_embed, packages_rejected, rejected_first,
                                 registry, root_warnings, checked_program_from_results,
                                 load_inputs_of, package_location_in, listed_module)
 import compiler.front.checking.world (CheckQueries, RunEffects, ModuleResult, with_decode_cache,
-                                      CheckDefinition, ImportOf, toolchain_kind, runtime_part,
-                                      compiler_part, text_kind, shipped_kind, data_kind, decoded,
-                                      derivation_query, deriver_wrapper, deriver_wrapper_text)
-import compiler.front.checking.groups (imports_of_module)
-import compiler.store.handles (QueryOf, Written, written, fetch, query_definition, run_serially,
-                               with_interface)
+                                      derived_kind, decoded, deriver_wrapper, deriver_wrapper_text)
+import compiler.store.fact_store
+import compiler.store.fact_store (recent_reads)
+import compiler.store.packs
 import compiler.expand.derive (DeriverRequest, DeriverResponse, DeriverFailure, Rejection,
-                               Generated, Declined, Failed, Unavailable, import_path, derivers,
-                               deriver_module, deriver_failure_bin)
+                               Generated, Declined, Failed, Unavailable, import_path,
+                               deriver_module, derivation_at_bin, deriver_response_bin)
 import compiler.syntax.items (header, parse, is_shipped, Item, DeriveItem)
 import compiler.cc
 import compiler.cc (compilers, toolchain, WrittenPart, written_part_bin)
@@ -384,12 +382,12 @@ fn world_for(p: ProgramPackages) -> LoadInputs / {abort.raise} =
 fn shipped_module_text(name: Bytes) -> Option<Bytes> / {shipped.module} =
   shipped.module(String::of_bytes_lossy(name))
 
-effect set ReadsShipped = {shipped.names, shipped.module, shipped.read_pack}
+pub effect set ReadsShipped = {shipped.names, shipped.module, shipped.read_pack}
 
 fn looking_up<| e>(
   w: LoadInputs,
   read_embed: keep (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {ReadsShipped, abort.raise | e},
-  toolchain: keep (Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e},
+  derived: keep (Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e},
 ) -> (Bytes, Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e} =
   |kind: Bytes, at: Bytes|
     lookup_input(
@@ -398,7 +396,7 @@ fn looking_up<| e>(
       shipped_module_text,
       || shipped.names().map(Bytes::of_string),
       read_embed,
-      toolchain,
+      derived,
       kind,
       at,
     )
@@ -411,22 +409,19 @@ fn open_memo_store<a, [r], [s]>(
   let w = world_for(p);
   let read_embed = |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want);
   let qs = query_registry();
-  with_derivers(||
-    database::with_database[r](
-      dir,
-      pack_frame,
-      looking_up(w, read_embed, toolchain_here),
-      |_: Bytes| (),
-      || with_decode_cache(|| in_session(qs, |run: Run| work(qs, w, run))),
-    ))
+  database::with_opening[r](dir, |opening: fact_store::Opening|
+    deriving[r](opening, pack_frame, w.texts, |derived: (Bytes) -> Option<Bytes>|
+      database::with_opened_database[r](
+        opening,
+        pack_frame,
+        looking_up(w, read_embed, derived),
+        |_: Bytes| (),
+        || with_decode_cache(|| in_session(qs, |run: Run| work(qs, w, run))),
+      )))
 }
 
 fn query_registry() -> CheckQueries / {shipped.definitions, shipped.stamps, abort.raise} =
-  registry(
-    shipped.definitions(),
-    evaluator_of(Bytes::of_string(shipped.stamps())),
-    derivation_queries(),
-  )
+  registry(shipped.definitions(), evaluator_of(Bytes::of_string(shipped.stamps())))
 
 pub type CheckResults = {
   results: List<CheckedModule>,
@@ -670,41 +665,7 @@ fn with_no_files<a | e>(
     fs.read_file[memory](_) -> None,
   }
 
-pub fn toolchain_here(part: Bytes) -> Option<Bytes> / {Derives, abort.raise} =
-  if part == runtime_part { Some(shipped.runtime()) }
-  else { match compilers.find[cc]() { Some(c) -> Some(c.identity), None -> None } }
-
 type RunnableProgram = { wrapper: Bytes, key: Bytes, parts: List<WrittenPart> }
-
-derive bin for RunnableProgram
-
-type DeriverProgram = | Runnable(RunnableProgram) | Unrunnable(DeriverFailure) | NoRuntime
-
-derive bin for DeriverProgram
-
-fn deriver_program_query() -> QueryOf<Bytes, DeriverProgram> =
-  { name: b"deriver program", input: bin::bytes_bin(), output: deriver_program_bin() }
-
-pub fn derivation_queries() -> List<CheckDefinition> =
-  [
-    query_definition(
-      deriver_program_query(),
-      b"compiler.load.deriver_program_result",
-      deriver_program_result,
-    ),
-    with_interface(
-      run_serially(
-        query_definition(derivation_query(), b"compiler.load.derivation_result", derivation_result),
-      ),
-      [main_part],
-    ),
-  ]
-
-fn deriver_program_result(module: Bytes) -> Written / {memo.read, abort.raise} =
-  written(deriver_program_query(), match memo.external(toolchain_kind, runtime_part) {
-    None -> NoRuntime,
-    Some(runtime) -> deriver_program_of(module, runtime),
-  })
 
 fn cannot_run(module: Bytes, notes: List<Bytes>) -> DeriverFailure =
   {
@@ -717,15 +678,25 @@ fn cannot_run(module: Bytes, notes: List<Bytes>) -> DeriverFailure =
     ),
   }
 
-fn own_closure(module: Bytes) -> List<Bytes> / {memo.read, abort.raise} =
-  traverse([module], |name: Bytes|
+type DeriverModule = { name: Bytes, text: Bytes }
+
+fn deriver_closure(
+  module: Bytes,
+  own: Map<Bytes, Bytes>,
+) -> List<DeriverModule> / {shipped.module, abort.raise} =
+  traverse([module], |name: Bytes| {
+    let text = if is_shipped(name) { shipped_module_text(name) } else { own.get(name) };
     {
-      value: name,
-      next: imports_of_module({ module: name, shipped: is_shipped(name), tested: false }).map(
-        |i: ImportOf| i.named.module,
-      ),
-    }).fold([], |found: List<Bytes>, v: Visit<Bytes, Bytes>|
-    if is_shipped(v.value) { found } else { found.push(v.value) })
+      value: { name: name, text: text.unwrap_or(b"") },
+      next: match text {
+        None -> [],
+        Some(t) ->
+          (match header(t) { Some(head) -> head.imports, None -> parse(t).node.imports }).map(
+            import_path,
+          ),
+      },
+    }
+  }).map(|v: Visit<Bytes, DeriverModule>| v.value)
 
 fn uses_derive(text: Bytes) -> Bool / {abort.raise} = {
   let parsed = parse(text).node;
@@ -733,16 +704,19 @@ fn uses_derive(text: Bytes) -> Bool / {abort.raise} = {
     match item { DeriveItem(d) -> deriver_module(parsed, d.deriver) != None, _ -> false })
 }
 
-fn deriver_program_of(module: Bytes, runtime: Bytes) -> DeriverProgram / {memo.read, abort.raise} = {
-  let own = own_closure(module).map(|name: Bytes|
-    { name: name, text: memo.external(text_kind, name).unwrap_or(b"") });
-  match own.find(|m: { name: Bytes, text: Bytes }| uses_derive(m.text)) {
-    Some(m) ->
-      Unrunnable(cannot_run(module, [Bytes::concat_all([b"`", m.name, b"` uses `derive`"])])),
+fn deriver_program<[r]>(
+  opening: fact_store::Opening,
+  read: (packs::PackPart) -> Option<Bytes> / {ReadsShipped, abort.raise},
+  module: Bytes,
+  own: Map<Bytes, Bytes>,
+) -> Result<RunnableProgram, DeriverFailure> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
+  let closure = deriver_closure(module, own).filter(|m: DeriverModule| !is_shipped(m.name));
+  match closure.find(|m: DeriverModule| uses_derive(m.text)) {
+    Some(m) -> Err(cannot_run(module, [Bytes::concat_all([b"`", m.name, b"` uses `derive`"])])),
     None -> {
       let wrapper = deriver_wrapper(module);
-      let files = own.push({ name: wrapper, text: deriver_wrapper_text(module) }).map(
-        |m: { name: Bytes, text: Bytes }|
+      let files = closure.push({ name: wrapper, text: deriver_wrapper_text(module) }).map(
+        |m: DeriverModule|
           {
             path: String::of_bytes_lossy(m.name) ++ ".ply",
             name: String::of_bytes_lossy(m.name),
@@ -755,12 +729,27 @@ fn deriver_program_of(module: Bytes, runtime: Bytes) -> DeriverProgram / {memo.r
         packages: { root: b"", manifest: None, supplied: [] },
         tree: NoTree,
       };
-      let loaded = code_loaded(world_for(p), |_: LoadInputs| [Named(wrapper.concat(b".derived"))]);
-      match with_no_files(||
-          shipped_as_inputs(runtime, || written_from[memory](p, loaded, false))) {
-        Err(u) -> Unrunnable(cannot_run(module, u.diagnostics.map(diagnostic_line))),
+      let w = world_for(p);
+      let qs = query_registry();
+      let loaded = database::with_opened_database[r](
+        opening,
+        read,
+        looking_up(
+          w,
+          |k: Int, name: Bytes, want: EmbedRequest| reject_embed(k, name, want),
+          nothing_derived,
+        ),
+        |_: Bytes| (),
+        ||
+          with_decode_cache(||
+            in_session(qs, |run: Run|
+              reading(qs, run, ||
+                code_loaded(w, |_: LoadInputs| [Named(wrapper.concat(b".derived"))])))),
+      );
+      match with_no_files(|| written_from[memory](p, loaded.value, false)) {
+        Err(u) -> Err(cannot_run(module, u.diagnostics.map(diagnostic_line))),
         Ok(program) ->
-          Runnable({
+          Ok({
             wrapper: wrapper,
             key: blake3(bin::encode(program.parts, bin::list_bin(written_part_bin()))),
             parts: program.parts,
@@ -770,47 +759,68 @@ fn deriver_program_of(module: Bytes, runtime: Bytes) -> DeriverProgram / {memo.r
   }
 }
 
-fn shipped_as_inputs<a | e>(
-  runtime: Bytes,
-  work: () -> a / {shipped.module, shipped.runtime, memo.read | e},
-) -> a / {memo.read | e} =
-  handle {
-    work()
-  } with {
-    shipped.module(name) -> {
-      let at = Bytes::of_string(name);
-      match memo.external(shipped_kind, at) {
-        Some(text) -> Some(text),
-        None -> memo.external(data_kind, at),
+fn derivations_run<[r]>(
+  opening: fact_store::Opening,
+  read: (packs::PackPart) -> Option<Bytes> / {ReadsShipped, abort.raise},
+  own: Map<Bytes, Bytes>,
+  missing: List<Bytes>,
+) -> Map<Bytes, Bytes> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
+  let asks = missing.fold([], |found: List<{ at: Bytes, ask: DeriverRequest }>, at: Bytes|
+    match bin::decode(at, derivation_at_bin()) {
+      Ok(a) -> found.push({ at: at, ask: a.request }),
+      Err(_) -> found,
+    });
+  let programs = asks.fold(
+    Map::new(),
+    |found: Map<Bytes, Result<RunnableProgram, DeriverFailure>>, x: { at: Bytes, ask: DeriverRequest }|
+      if found.contains(x.ask.module) { found }
+      else { found.insert(x.ask.module, deriver_program[r](opening, read, x.ask.module, own)) },
+  );
+  asks.fold(Map::new(), |found: Map<Bytes, Bytes>, x: { at: Bytes, ask: DeriverRequest }| {
+    let response = if value::decode(x.ask.declaration) == None {
+      unran(b"E0155", b"no derived code was generated for this `derive` declaration", [])
+    } else {
+      match programs.get(x.ask.module) {
+        Some(Ok(program)) -> ran_deriver(program, x.ask),
+        Some(Err(failure)) -> Failed(failure),
+        None -> unavailable(b"the deriver's program was not built", []),
       }
-    },
-    shipped.runtime() -> runtime,
-  }
-
-fn derivation_result(ask: DeriverRequest) -> Written / {memo.read, derivers.run, abort.raise} =
-  written(derivation_query(), if value::decode(ask.declaration) == None {
-    unran(b"E0155", b"no derived code was generated for this `derive` declaration", [])
-  } else {
-    match fetch(deriver_program_query(), ask.module) {
-      NoRuntime -> unavailable(b"this command runs no `derive` generators", []),
-      Unrunnable(failure) -> Failed(failure),
-      Runnable(program) -> match derivers.run(bin::encode(program, runnable_program_bin()), ask) {
-        Unavailable(failure) -> {
-          memo.external(toolchain_kind, compiler_part);
-          Unavailable(failure)
-        },
-        response -> response,
-      },
-    }
+    };
+    found.insert(x.at, bin::encode(response, deriver_response_bin()))
   })
+}
 
-pub fn with_derivers<a | e>(work: () -> a / {derivers.run | e}) -> a / {Derives, abort.raise | e} =
-  handle {
-    work()
-  } with {
-    derivers.run(program, ask) ->
-      ran_deriver(decoded(program, runnable_program_bin(), "a deriver's program"), ask),
+fn is_unavailable(response: Bytes) -> Bool / {abort.raise} =
+  match decoded(response, deriver_response_bin(), "a derivation") {
+    Unavailable(_) -> true,
+    _ -> false,
   }
+
+pub fn deriving<a, [r] | e>(
+  opening: fact_store::Opening,
+  read: (packs::PackPart) -> Option<Bytes> / {ReadsShipped, abort.raise},
+  own: Map<Bytes, Bytes>,
+  session: ((Bytes) -> Option<Bytes>) -> database::StoreOutcome<a> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e},
+) -> database::StoreOutcome<a> / {Derives, fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise | e} = {
+  let known = match database::read_derivations[r](opening, read) {
+    Ok(found) -> found,
+    Err(_) -> Map::new(),
+  };
+  let first = session(|at: Bytes| known.get(at));
+  match database::missing_inputs[r](opening, derived_kind) {
+    [] -> first,
+    missing -> {
+      let ran = derivations_run[r](opening, read, own, missing);
+      let kept = ran.fold(Map::new(), |found: Map<Bytes, Bytes>, at: Bytes, response: Bytes|
+        if is_unavailable(response) { found } else { found.insert(at, response) });
+      let problems = database::write_derivations[r](opening, kept);
+      let all = ran.fold(known, |found: Map<Bytes, Bytes>, at: Bytes, response: Bytes|
+        found.insert(at, response));
+      let second = session(|at: Bytes| all.get(at));
+      { ..second, problems: problems.concat(second.problems) }
+    },
+  }
+}
 
 fn ran_deriver(
   program: RunnableProgram,
