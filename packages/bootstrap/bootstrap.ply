@@ -37,14 +37,7 @@ type Options = {
   out: String,
 }
 
-type Target = {
-  files: List<ShippedFile>,
-  description: Bytes,
-  identity: Bytes,
-  definitions: Bytes,
-  tool: String,
-  work: String,
-}
+type Target = { files: List<ShippedFile>, description: Bytes, identity: Bytes, definitions: Bytes }
 
 type CacheKeys = { shipped: Bytes, linking: Bytes }
 
@@ -54,8 +47,8 @@ effect set Bootstraps = {Installs, compilers.read[cc], compilers.write[cc], fs.l
 
 fn on_target<a | e>(
   target: Target,
-  body: () -> a / {shipped.names, shipped.module, shipped.read_pack, shipped.stamps, shipped.runtime, shipped.definitions, shipped.run_root | e},
-) -> a / {toolchain.cache, toolchain.write_file, toolchain.run, abort.raise | e} = {
+  body: () -> a / {shipped.names, shipped.module, shipped.read_pack, shipped.stamps, shipped.runtime, shipped.definitions | e},
+) -> a / e = {
   let by_name = target.files.fold(Map::new(), |accumulator: Map<String, Bytes>, f: ShippedFile|
     accumulator.insert(f.name, f.bytes));
   let names = module_names(target.files);
@@ -71,27 +64,6 @@ fn on_target<a | e>(
     shipped.stamps() -> "evaluator " ++ String::of_bytes_lossy(target.identity) ++ "\n",
     shipped.runtime() -> target.description,
     shipped.definitions() -> target.definitions,
-    shipped.run_root(library, root, arguments, timeout_ms) ->
-      entered(target, library, root, arguments, timeout_ms),
-  }
-}
-
-fn entered(
-  target: Target,
-  library: String,
-  root: String,
-  arguments: Bytes,
-  timeout_ms: Int,
-) -> Option<Bytes> / {toolchain.cache, toolchain.write_file, toolchain.run, abort.raise} = {
-  let held = target.work ++ "/" ++ blake3(arguments).hex_of() ++ ".arguments";
-  if !toolchain.write_file(held, arguments) { None } else {
-    let ran = toolchain.run(target.tool, [
-      library,
-      root,
-      toolchain.cache() ++ "/" ++ held,
-      timeout_ms.to_string(),
-    ]);
-    if ran.code == 0 { Some(ran.out) } else { None }
   }
 }
 
@@ -509,8 +481,6 @@ fn bootstrap_ply(
               description: described.out,
               identity: runtime.identity,
               definitions: definitions,
-              tool: tool,
-              work: work,
             };
             timed(phases, "read the runtime library's description", started);
             let at = time.elapsed_ms();
@@ -624,28 +594,20 @@ const a_target: Target =
     description: b"the checkout's runtime",
     identity: b"rt",
     definitions: b"compiler.unit.produce aa\n",
-    tool: "tool",
-    work: "work",
   }
 
 test "inside `on_target` the program sees the checkout's files and runtime, and no pack of results" {
-  let seen = handle {
-    on_target(a_target, ||
-      {
-        names: shipped.names(),
-        module: shipped.module("std.a"),
-        data: shipped.module("std/a/data.txt"),
-        absent: shipped.module("std.absent"),
-        results: shipped.read_pack(packs::WholeIndex),
-        runtime: shipped.runtime(),
-        definitions: shipped.definitions(),
-        stamps: shipped.stamps(),
-      })
-  } with {
-    toolchain.cache() -> "/cache",
-    toolchain.write_file(_path, _bytes) -> false,
-    toolchain.run(_path, _args) -> { code: 1, out: b"" },
-  };
+  let seen = on_target(a_target, ||
+    {
+      names: shipped.names(),
+      module: shipped.module("std.a"),
+      data: shipped.module("std/a/data.txt"),
+      absent: shipped.module("std.absent"),
+      results: shipped.read_pack(packs::WholeIndex),
+      runtime: shipped.runtime(),
+      definitions: shipped.definitions(),
+      stamps: shipped.stamps(),
+    });
   assert_eq(seen.names, ["std.a"]);
   assert_eq(seen.module, Some(b"pub fn a() -> Int = 1\n"));
   assert_eq(seen.data, Some(b"data"));
@@ -654,32 +616,6 @@ test "inside `on_target` the program sees the checkout's files and runtime, and 
   assert_eq(seen.runtime, b"the checkout's runtime");
   assert_eq(seen.definitions, b"compiler.unit.produce aa\n");
   assert_eq(seen.stamps, "evaluator rt\n")
-}
-
-test "a unit is entered by the runtime's tool, which is handed its arguments in a file and whose failure is no result" {
-  let ask = |code: Int|
-    handle {
-      on_target(a_target, || shipped.run_root("/cache/unit.so", "m.root", b"args", 5))
-    } with {
-      var wrote = [],
-      var ran = [],
-      toolchain.cache() -> "/cache",
-      toolchain.write_file(path, bytes) -> {
-        wrote = wrote.push(path);
-        bytes == b"args"
-      },
-      toolchain.run(path, args) -> {
-        ran = ran.push(path).concat(args);
-        { code: code, out: b"result" }
-      },
-      return result -> { result: result, wrote: wrote, ran: ran },
-    };
-  let held = "work/" ++ blake3(b"args").hex_of() ++ ".arguments";
-  let good = ask(0);
-  assert_eq(good.result, Some(b"result"));
-  assert_eq(good.wrote, [held]);
-  assert_eq(good.ran, ["tool", "/cache/unit.so", "m.root", "/cache/" ++ held, "5"]);
-  assert_eq(ask(1).result, None)
 }
 
 test "each listed definition is named by a digest of everything it reaches, in name order" {

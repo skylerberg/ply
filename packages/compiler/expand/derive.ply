@@ -30,8 +30,11 @@ import compiler.check.resolve.tables (Diagnostic, error_at, error_at_and, source
 import std.list
 import std.string
 import std.bin
+import std.json
+import std.sql
 import std.derive
-import std.value
+import std.derive.map as map_deriver
+import std.derive.children as children_deriver
 
 fn identifier_at(identifier: Identifier, span: Span) -> Identifier =
   { name: identifier.name, span: span }
@@ -371,34 +374,53 @@ fn failed_derivation(
 type NameClaim = { name: Bytes, definition: DeriveDefinition }
 type GeneratedFunctions = { source: Bytes, definitions: List<FnDefinition>, derived: DeriveOrigin }
 
-pub type DeriverRequest = { module: Bytes, declaration: Bytes }
+pub type DeriverRequest = { module: Bytes, declaration: derive::Declaration }
 
 pub type DeriverFailure = { code: Bytes, message: Bytes, notes: List<Bytes> }
 
 pub type Rejection = { message: Bytes, at: Option<Bytes>, notes: List<Bytes> }
 
-pub type DeriverResponse =
-  | Generated(Bytes)
-  | Declined(Rejection)
-  | Failed(DeriverFailure)
-  | Unavailable(DeriverFailure)
+pub type DeriverResponse = | Generated(Bytes) | Declined(Rejection) | Failed(DeriverFailure)
 
-pub type DerivationAt = { deriver: Bytes, request: DeriverRequest }
+fn shipped_deriver(
+  module: Bytes,
+  declaration: derive::Declaration,
+) -> Option<Result<String, derive::Refused>> / {abort.raise} =
+  if module == b"std.bin" { Some(bin::derive(declaration)) }
+  else if module == b"std.json" { Some(json::derive(declaration)) }
+  else if module == b"std.derive.map" { Some(map_deriver::derive(declaration)) }
+  else if module == b"std.derive.children" { Some(children_deriver::derive(declaration)) }
+  else if module == b"std.sql" { Some(sql::derive(declaration)) }
+  else { None }
 
-derive bin for DeriverRequest
+fn not_a_shipped_deriver(module: Bytes) -> DeriverResponse =
+  Failed({
+    code: b"E0160",
+    message: Bytes::concat_all([b"`", module, b"` is not a deriver"]),
+    notes: [
+      b"`derive` runs the derivers the standard library ships: `std.bin`, `std.json`, `std.derive.map`, `std.derive.children` and `std.sql`",
+    ],
+  })
 
-derive bin for DerivationAt
-
-derive bin for DeriverFailure
-
-derive bin for Rejection
-
-derive bin for DeriverResponse
-
-pub fn declaration_bytes(declaration: derive::Declaration) -> Bytes / {abort.raise} =
-  match value::encode(value::VList([value::reflect(declaration)])) {
-    Some(b) -> b,
-    None -> panic("internal error: a declaration contains a value that cannot be written as bytes"),
+pub fn run_shipped(ask: DeriverRequest) -> DeriverResponse / {abort.raise} =
+  handle {
+    match shipped_deriver(ask.module, ask.declaration) {
+      None -> not_a_shipped_deriver(ask.module),
+      Some(Ok(text)) -> Generated(Bytes::of_string(text)),
+      Some(Err(refused)) ->
+        Declined({
+          message: Bytes::of_string(refused.message),
+          at: refused.at.map(Bytes::of_string),
+          notes: refused.notes.map(Bytes::of_string),
+        }),
+    }
+  } with {
+    abort.raise(message) ->
+      Failed({
+        code: b"E0155",
+        message: Bytes::concat_all([b"the deriver `", ask.module, b"` raised"]),
+        notes: [Bytes::of_string(message)],
+      }),
   }
 
 type ItemResponse = { span: Span, result: DeriverResponse }
@@ -489,24 +511,13 @@ fn deriver_requests(
               span: d.span,
               ask: {
                 module: deriver,
-                declaration: declaration_bytes(
-                  declaration_of(path, module, d.target.name, d.deriver),
-                ),
+                declaration: declaration_of(path, module, d.target.name, d.deriver),
               },
             }),
         }
       },
       _ -> accumulator,
     })
-
-const no_runner_failure: DeriverResponse =
-  Failed({
-    code: b"E0155",
-    message: b"a library deriver cannot run here; it runs only during a command that checks the program",
-    notes: [
-      b"`ply check`, `ply test`, `ply run` and `ply build` run each deriver a module names; this read of the module ran none",
-    ],
-  })
 
 fn derive_one(expander: Expander, definition: DeriveDefinition) -> Expander / {abort.raise} =
   match find_type(expander.types, definition.target.name) {
@@ -520,7 +531,6 @@ fn derive_one(expander: Expander, definition: DeriveDefinition) -> Expander / {a
           Generated(text) -> add_generated_source(expander, definition, [text]),
           Declined(rejected) -> report_derive_error(expander, definition, target, rejected),
           Failed(u) -> failed_derivation(expander, definition, u),
-          Unavailable(u) -> failed_derivation(expander, definition, u),
         },
       },
     },
@@ -746,17 +756,13 @@ pub fn expand_derives<| e>(
   path: Bytes,
   module: Module,
   previous: List<Derivation> = [],
-  library: Option<(DeriverRequest) -> DeriverResponse / {abort.raise | e}> = None,
+  deriver: (DeriverRequest) -> DeriverResponse / {abort.raise | e} = run_shipped,
 ) -> Expansion / {abort.raise | e} =
   if !module.items.any(|item: Item| match item { DeriveItem(_) -> true, _ -> false }) {
     { module: module, derived: [], diagnostics: [] }
   } else {
     let results = deriver_requests(path, module, previous).map(
-      |x: { span: Span, ask: DeriverRequest }|
-        {
-          span: x.span,
-          result: match library { Some(run) -> run(x.ask), None -> no_runner_failure },
-        },
+      |x: { span: Span, ask: DeriverRequest }| { span: x.span, result: deriver(x.ask) },
     );
     let ex = run_expander(new_expander(m, path, module, previous, results));
     {
@@ -785,10 +791,10 @@ fn expand_with_response(
       0,
       b"t",
       parse(source).node,
-      library: Some(|ask: DeriverRequest| {
+      deriver: |ask: DeriverRequest| {
         request_log.record(ask);
         result
-      }),
+      },
     );
     { expansion: x, requested: [] }
   } with {
@@ -814,7 +820,7 @@ test "a `derive` item calls the module's deriver function with the module's type
   assert_eq(x.expansion.diagnostics, []);
   assert_eq(x.requested.map(|a: DeriverRequest| a.module), [b"lib.mapping"]);
   let declaration = declaration_of(b"t", parse(source).node, b"Box", b"mapping");
-  assert_eq(x.requested.get(0).declaration, declaration_bytes(declaration));
+  assert_eq(x.requested.get(0).declaration, declaration);
   assert_eq(declaration.target, "Box");
   assert_eq(declaration.binder, "mapping");
   assert_eq(declaration.derived, ["Box"]);

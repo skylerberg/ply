@@ -2051,13 +2051,10 @@ them.
 is a nullable column, and a `List` of those is an array. Any other field is stored as JSON with its
 type's own `json` codec.
 
-**Writing a deriver.** A deriver is a function in a module with the signature `pub fn
-derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`. Its only allowed
-effect is raising an error. The module `std.derive` defines the type `derive::Declaration`, which
-describes the declaration the deriver is run on, and the type `derive::Refused`. The checker runs a
-deriver once per declaration, with a 60-second limit, and caches the result until the deriver's
-code or the declaration changes. If the deriver fails,
-or the code it generates does not pass the checker, the error is an error (`E0155`).
+The derivers in the table are the only ones. A `derive` whose module is not one of them is an error
+(`E0160`). A deriver reads only the module that holds the `derive`, so its result changes only when
+that module's text does. If the code a deriver generates does not pass the checker, the error is
+`E0155`.
 
 ## 13. Builtins and the standard library
 

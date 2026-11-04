@@ -5,7 +5,6 @@ import std.set (Set)
 import sources (ProjectFiles)
 import std.fs
 import std.fs (fs)
-import compiler.cc (toolchain)
 import compiler.store.memo (memo)
 import compiler.store.memo.engine (Run, QueryStats, missing_count, reading, in_session, query_stats)
 import compiler.store.memo.store (interfaces)
@@ -17,9 +16,8 @@ import project_store (DatabasePlace, InWorkingDirectory, AtAbsolutePath, Databas
 import compiler.unit (shipped, pack_frame)
 import compiler.front.checking (CheckedModule, PackageFile, LoadInputs, LoadResults, query_load,
                                 declaring_in, documented_all, evaluator_of, hashed_all,
-                                lookup_input, nothing_derived, rejected_first, registry,
-                                check_shipped_modules, wanted_all, load_inputs_of,
-                                package_location_in, module_of)
+                                lookup_input, rejected_first, registry, check_shipped_modules,
+                                wanted_all, load_inputs_of, package_location_in, module_of)
 import compiler.front.checking.world (CheckQuery, CheckQueries, RunEffects, SessionReads,
                                       with_decode_cache, ModuleKey)
 import compiler.front.checking.groups (ProgramSummary)
@@ -31,7 +29,7 @@ import compiler.store.handles (fetch)
 import measures (proof_queries)
 import compiler.emit.costs (Report)
 import compiler.load
-import compiler.load (Derives)
+import compiler.load (Loads)
 import compiler.front.pages (Pages)
 import compiler.front (ShippedWants, embed_inputs_of, shipped_bytes)
 import compiler.store.hash.forms (ModuleHashes)
@@ -56,18 +54,16 @@ fn query_inputs(project: Project) -> LoadInputs / {abort.raise} =
 
 fn read_project_input<| e>(
   w: LoadInputs,
-  read: (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise | e},
-  derived: (Bytes) -> Option<Bytes>,
+  read: (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {fs.list_dir[shipped], fs.read_file[shipped], Loads, abort.raise | e},
   kind: Bytes,
   at: Bytes,
-) -> Option<Bytes> / {fs.list_dir[shipped], fs.read_file[shipped], Derives, abort.raise | e} =
+) -> Option<Bytes> / {fs.list_dir[shipped], fs.read_file[shipped], Loads, abort.raise | e} =
   lookup_input(
     w,
     |name: Bytes| shipped_text(name),
     |name: Bytes| shipped_data(name),
     || shipped_names(),
     read,
-    derived,
     kind,
     at,
   )
@@ -146,28 +142,24 @@ pub fn stored_session<a>(
   place: DatabasePlace,
   project: Project,
   work: (LoadInputs) -> a / {SessionReads, fact_inspection.read, abort.raise},
-) -> Opened<a> / {Databases, toolchain.read, fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Derives, progress.write, abort.raise} = {
+) -> Opened<a> / {Databases, fs.list_dir[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Loads, progress.write, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
   let opening = databases.open(place);
-  let look = |known: Map<Bytes, Bytes>|
-    |kind: Bytes, at: Bytes|
-      read_project_input(
-        w,
-        |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-        |a: Bytes| known.get(a),
-        kind,
-        at,
-      );
+  let look = |kind: Bytes, at: Bytes|
+    read_project_input(
+      w,
+      |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
+      kind,
+      at,
+    );
   let noted = |query: Bytes| progress.computed(query);
   let session = || with_decode_cache(|| read_session(qs, w, work));
   opened_from(w, match place {
     InWorkingDirectory(_) ->
-      load::deriving[cwd](opening, pack_frame, w.own, w.texts, |known: Map<Bytes, Bytes>|
-        database::with_opened_database[cwd](opening, pack_frame, look(known), noted, session)),
+      database::with_opened_database[cwd](opening, pack_frame, look, noted, session),
     AtAbsolutePath(_) ->
-      load::deriving[abs](opening, pack_frame, w.own, w.texts, |known: Map<Bytes, Bytes>|
-        database::with_opened_database[abs](opening, pack_frame, look(known), noted, session)),
+      database::with_opened_database[abs](opening, pack_frame, look, noted, session),
   })
 }
 
@@ -203,7 +195,7 @@ pub fn later_checks(
 pub fn temporary_session<a>(
   project: Project,
   work: (LoadInputs) -> a / {SessionReads, fact_inspection.read, abort.raise},
-) -> Opened<a> / {fs.list_dir[shipped], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Derives, abort.raise} = {
+) -> Opened<a> / {fs.list_dir[shipped], fs.read_file[shipped], ProjectFiles, shipped.read_pack, Loads, abort.raise} = {
   let qs = running_queries();
   let w = query_inputs(project);
   let session = || with_decode_cache(|| read_session(qs, w, work));
@@ -211,26 +203,18 @@ pub fn temporary_session<a>(
     w,
     fs::on_mem[memory](fs::mem_empty(), ||
       database::with_opening[memory](database::in_memory_database_dir, |opening: Opening|
-        load::deriving[memory](
+        database::with_opened_database[memory](
           opening,
           pack_frame,
-          w.own,
-          w.texts,
-          |known: Map<Bytes, Bytes>|
-            database::with_opened_database[memory](
-              opening,
-              pack_frame,
-              |kind: Bytes, at: Bytes|
-                read_project_input(
-                  w,
-                  |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
-                  |a: Bytes| known.get(a),
-                  kind,
-                  at,
-                ),
-              |_: Bytes| (),
-              session,
+          |kind: Bytes, at: Bytes|
+            read_project_input(
+              w,
+              |k: Int, m: Bytes, want: EmbedRequest| read_module_embed(project, k, m, want),
+              kind,
+              at,
             ),
+          |_: Bytes| (),
+          session,
         ))).value,
   )
 }
@@ -240,32 +224,30 @@ pub type ShippedResults = { interfaces: Map<Bytes, Set<Bytes>>, rejected: List<C
 pub fn shipped_results<[r]>(
   opening: Opening,
   modules: List<Bytes>,
-) -> StoreOutcome<ShippedResults> / {fs.list_dir[shipped], fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fs.read_file[shipped], Derives, abort.raise} = {
+) -> StoreOutcome<ShippedResults> / {fs.list_dir[shipped], fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, fs.read_file[shipped], Loads, abort.raise} = {
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  load::deriving[r](opening, packs::no_pack, modules, Map::new(), |known: Map<Bytes, Bytes>|
-    database::with_opened_database[r](
-      opening,
-      packs::no_pack,
-      |kind: Bytes, at: Bytes|
-        lookup_input(
-          nowhere,
-          shipped_text,
-          shipped_data,
-          shipped_names,
-          |k: Int, m: Bytes, want: EmbedRequest| Err(b"no file is there"),
-          |a: Bytes| known.get(a),
-          kind,
-          at,
-        ),
-      |_: Bytes| (),
-      ||
-        with_decode_cache(||
-          in_session(qs, |run: Run| {
-            let all = reading(qs, run, || check_shipped_modules(modules));
-            { run: all.run, value: { interfaces: interfaces(qs), rejected: all.value } }
-          })),
-    ))
+  database::with_opened_database[r](
+    opening,
+    packs::no_pack,
+    |kind: Bytes, at: Bytes|
+      lookup_input(
+        nowhere,
+        shipped_text,
+        shipped_data,
+        shipped_names,
+        |k: Int, m: Bytes, want: EmbedRequest| Err(b"no file is there"),
+        kind,
+        at,
+      ),
+    |_: Bytes| (),
+    ||
+      with_decode_cache(||
+        in_session(qs, |run: Run| {
+          let all = reading(qs, run, || check_shipped_modules(modules));
+          { run: all.run, value: { interfaces: interfaces(qs), rejected: all.value } }
+        })),
+  )
 }
 
 pub fn write_shipped_pack<[r]>(
@@ -280,11 +262,7 @@ fn query_shipped<a>(
   let qs = running_queries();
   let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
   fs::on_mem[memory](fs::mem_empty(), ||
-    database::with_opening[memory](database::in_memory_database_dir, |opening: Opening| {
-      let known = match database::read_derivations[memory](opening, pack_frame) {
-        Ok(found) -> found,
-        Err(_) -> Map::new(),
-      };
+    database::with_opening[memory](database::in_memory_database_dir, |opening: Opening|
       database::with_opened_database[memory](
         opening,
         pack_frame,
@@ -295,14 +273,12 @@ fn query_shipped<a>(
             shipped_data,
             shipped_names,
             |k: Int, m: Bytes, want: EmbedRequest| Err(b"no file is there"),
-            |a: Bytes| known.get(a),
             kind,
             at,
           ),
         |_: Bytes| (),
         || with_decode_cache(|| in_session(qs, |run: Run| reading(qs, run, query))),
-      ).value
-    })).value
+      ).value)).value
 }
 
 pub fn shipped_doc_pages(

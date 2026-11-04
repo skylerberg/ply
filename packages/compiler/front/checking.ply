@@ -39,8 +39,7 @@ import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, Mod
                                       package_location_bin, module_key_bin, embedding_bin,
                                       layout_kind, module_kind, text_kind, shipped_kind,
                                       shipped_exists_kind, data_kind, embedded_file_kind,
-                                      derived_kind, shipped_names_kind, wrapped_deriver,
-                                      deriver_wrapper_text, own_modules_kind, QueryEffects,
+                                      shipped_names_kind, own_modules_kind, QueryEffects,
                                       RunEffects, SessionReads, CheckQuery, CheckQueries,
                                       check_queries, with_decode_cache, decoded, prefix_in,
                                       imports_query, ImportOf, imports_of_bin, absent,
@@ -163,24 +162,17 @@ pub fn lookup_input<| e>(
   data: (Bytes) -> Option<Bytes> / {abort.raise | e},
   names: () -> List<Bytes> / {abort.raise | e},
   reader: (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {abort.raise | e},
-  derived: (Bytes) -> Option<Bytes> / {abort.raise | e},
   kind: Bytes,
   at: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} =
   if kind == layout_kind { Some(w.layout) }
   else if kind == shipped_names_kind { Some(bin::encode(names(), bin::list_bin(bin::bytes_bin()))) }
-  else if kind == module_kind {
-    match wrapped_deriver(at) {
-      Some(_) -> Some(bin::encode({ package: 0, relative: at }, package_location_bin())),
-      None -> w.places.get(at),
-    }
-  } else if kind == text_kind {
-    match wrapped_deriver(at) { Some(d) -> Some(deriver_wrapper_text(d)), None -> w.texts.get(at) }
-  } else if kind == shipped_kind { shipped(at) }
+  else if kind == module_kind { w.places.get(at) }
+  else if kind == text_kind { w.texts.get(at) }
+  else if kind == shipped_kind { shipped(at) }
   else if kind == shipped_exists_kind { match shipped(at) { Some(_) -> Some(b""), None -> None } }
   else if kind == data_kind { data(at) }
   else if kind == embedded_file_kind { embedded_at(w, reader, at) }
-  else if kind == derived_kind { derived(at) }
   else if kind == own_modules_kind { Some(bin::encode(w.own, bin::list_bin(bin::bytes_bin()))) }
   else { None }
 
@@ -552,8 +544,6 @@ pub fn outcome_summary(outcome: AnalysisOutcome) -> OutcomeSummary / {abort.rais
 pub fn reject_embed(package: Int, module: Bytes, want: EmbedRequest) -> EmbedBytesResult =
   Err(b"no file is there")
 
-pub fn nothing_derived(at: Bytes) -> Option<Bytes> = None
-
 pub fn over_decoding<a | e>(
   store: fs::MemFs,
   read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
@@ -672,16 +662,7 @@ pub fn session_over<a>(
     program.store,
     |part: packs::PackPart| packs::frame_in(Some(pack), part),
     |kind: Bytes, at: Bytes|
-      lookup_input(
-        w,
-        text_of,
-        text_of,
-        || all.map(|s: Source| s.name),
-        read,
-        nothing_derived,
-        kind,
-        at,
-      ),
+      lookup_input(w, text_of, text_of, || all.map(|s: Source| s.name), read, kind, at),
     || in_session(qs, |run: Run| reading(qs, run, || work(w.own))),
   );
   { program: { ..program, store: done.store }, value: done.value }
@@ -739,21 +720,11 @@ pub fn lookup_input_shipping(
   shipped: List<Source>,
   kind: Bytes,
   at: Bytes,
-  derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> Option<Bytes> / {abort.raise} = {
   let all = with_prelude_source(shipped);
   let source_text = |name: Bytes|
     match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.source_text), None -> None };
-  lookup_input(
-    w,
-    source_text,
-    source_text,
-    || all.map(|s: Source| s.name),
-    reject_embed,
-    derived,
-    kind,
-    at,
-  )
+  lookup_input(w, source_text, source_text, || all.map(|s: Source| s.name), reject_embed, kind, at)
 }
 
 fn hashed_load(
@@ -1055,7 +1026,7 @@ fn embedding_queried(
   let done = over_decoding(
     fs::mem_empty(),
     packs::no_pack,
-    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
+    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, kind, at),
     || query_alone(fresh_registry(), w),
   );
   { store: done.store, results: done.value.results, own_hashes: done.value.own_hashes }
@@ -1298,7 +1269,7 @@ fn session_over_embeds<[r]>(
   database::with_database[r](
     "s",
     packs::no_pack,
-    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
+    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, kind, at),
     |_: Bytes| (),
     ||
       with_decode_cache(||
@@ -1337,18 +1308,14 @@ pub fn check_sources(
   store: fs::MemFs,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
-) -> CheckedSources / {abort.raise} =
-  check_with_pack(store, Some(prelude_pack), sources, shipped, derived: derived)
+) -> CheckedSources / {abort.raise} = check_with_pack(store, Some(prelude_pack), sources, shipped)
 
 pub fn check_with_pack(
   store: fs::MemFs,
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
-) -> CheckedSources / {abort.raise} =
-  check_under(fresh_registry(), store, packed, sources, shipped, derived)
+) -> CheckedSources / {abort.raise} = check_under(fresh_registry(), store, packed, sources, shipped)
 
 pub fn check_under(
   qs: CheckQueries,
@@ -1356,7 +1323,6 @@ pub fn check_under(
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes) -> Option<Bytes> / {abort.raise},
 ) -> CheckedSources / {abort.raise} = {
   let w = load_inputs_of(
     {
@@ -1374,7 +1340,7 @@ pub fn check_under(
         match found { Some(b) -> fetching.fetch(b), None -> () };
         found
       },
-      |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at, derived: derived),
+      |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at),
       || {
         in_session(qs, |run: Run| {
           let done = reading(qs, run, || {

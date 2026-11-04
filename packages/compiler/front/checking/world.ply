@@ -15,10 +15,8 @@ import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_sha
                              encode_tables)
 import compiler.syntax.items (Module, ImportDeclaration, header, parse, parse_started,
                               import_declaration_bin, read_without_import, homes_declaring,
-                              home_names_in, unimported_of, is_shipped)
-import compiler.expand.derive (DeriverRequest, DeriverResponse, Failed, Unavailable, import_path,
-                               derivation_at_bin, deriver_response_bin)
-import std.graph (Visit, traverse)
+                              home_names_in, unimported_of)
+import compiler.expand.derive (import_path)
 import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.syntax.expressions (prelude_module)
 import compiler.front.interface (imported)
@@ -79,72 +77,7 @@ pub const embedded_file_kind: Bytes = b"embed"
 
 pub const shipped_names_kind: Bytes = b"shipped names"
 
-pub const derived_kind: Bytes = b"derived"
-
 pub const own_modules_kind: Bytes = b"own modules"
-
-const deriver_wrapper_prefix: Bytes = b"derive:"
-
-pub fn deriver_wrapper(deriver: Bytes) -> Bytes = deriver_wrapper_prefix.concat(deriver)
-
-pub fn wrapped_deriver(module: Bytes) -> Option<Bytes> / {abort.raise} =
-  if module.starts_with(deriver_wrapper_prefix) {
-    Some(module.slice(deriver_wrapper_prefix.len(), module.len()))
-  } else { None }
-
-pub fn deriver_wrapper_text(deriver: Bytes) -> Bytes =
-  Bytes::concat_all([
-    b"import std.derive\nimport ",
-    deriver,
-    b" as deriver\n\npub fn derived(declaration: derive::Declaration) -> Result<String, derive::Refused> / {abort.raise} =\n  deriver::derive(declaration)\n",
-  ])
-
-pub fn deriver_identity_over<| e>(
-  module: Bytes,
-  text_of: (Bytes) -> Option<Bytes> / {abort.raise | e},
-) -> Bytes / {abort.raise | e} =
-  blake3(
-    Bytes::concat_all(
-      traverse([module], |name: Bytes| {
-        let text = text_of(name);
-        {
-          value: Bytes::concat_all([name, b"\x00", blake3(text.unwrap_or(b""))]),
-          next: match text {
-            None -> [],
-            Some(t) ->
-              (match header(t) { Some(head) -> head.imports, None -> parse(t).node.imports }).map(
-                import_path,
-              ),
-          },
-        }
-      }).map(|v: Visit<Bytes, Bytes>| v.value),
-    ),
-  )
-
-pub fn derivation_key<| e>(
-  ask: DeriverRequest,
-  text_of: (Bytes) -> Option<Bytes> / {abort.raise | e},
-) -> Bytes / {abort.raise | e} =
-  bin::encode(
-    { deriver: deriver_identity_over(ask.module, text_of), request: ask },
-    derivation_at_bin(),
-  )
-
-pub const missing_derivation: DeriverResponse =
-  Unavailable({
-    code: b"E0155",
-    message: b"no derived code was generated for this `derive` declaration",
-    notes: [b"this command runs no `derive` generators"],
-  })
-
-fn read_text(name: Bytes) -> Option<Bytes> / {memo.read} =
-  if is_shipped(name) { shipped_text(name) } else { memo.external(text_kind, name) }
-
-fn derivation_of(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} =
-  match memo.external(derived_kind, derivation_key(ask, read_text)) {
-    Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
-    None -> missing_derivation,
-  }
 
 pub fn embed_at(root: Bytes, module: Bytes, key: Bytes) -> Bytes =
   Bytes::concat_all([root, b"\x00", module, b"\x00", key])
@@ -162,12 +95,7 @@ pub effect decode_cache {
   write cache_imported_text(digest: Bytes, text: Bytes) -> Unit
 }
 
-pub type ParsedText = {
-  lexed: ParseStart,
-  raw: Module,
-  given: ParsedSource,
-  requested: List<DeriverRequest>,
-}
+pub type ParsedText = { lexed: ParseStart, raw: Module, given: ParsedSource }
 
 pub effect set QueryEffects = {memo.read, decode_cache.read, decode_cache.write}
 
@@ -240,127 +168,24 @@ pub fn with_decode_cache<a | e>(
     },
   }
 
-test "a second read of a parsed text reads the same derivations again" {
-  let source = {
-    name: b"m",
-    source_text: b"import sizes\n\npub type T = | A\n\nderive sizes for T\n",
-  };
-  let kinds = handle {
-    with_decode_cache(|| {
-      read_once(source);
-      read_once(source);
-      ()
-    })
-  } with {
-    var read: List<Bytes> = [],
-    memo.external(kind, at) -> {
-      read = read.push(at);
-      None
-    },
-    memo.fetch(query, input, part) -> None,
-    memo.fetch_all(query, inputs, part) -> inputs.map(|_: Bytes| None),
-    memo.output_digest(query, input, part) -> None,
-    memo.stored_output(digest) -> None,
-    return done -> read,
-  };
-  assert(kinds.len() > 0);
-  assert_eq(kinds.take(kinds.len() / 2), kinds.drop(kinds.len() / 2))
-}
-
-test "a scan for derivations computes the key that checking the module reads" {
-  let source = {
-    name: b"m",
-    source_text: b"import sizes\n\npub type T = | A\n\nderive sizes for T\n",
-  };
-  let texts = |name: Bytes|
-    if name == b"sizes" { Some(b"pub fn derive(x: Int) -> Int = x\n") } else { None };
-  let scanned = requested_derivations(source, |_: DeriverRequest| missing_derivation).map(
-    |ask: DeriverRequest| derivation_key(ask, texts),
-  );
-  let read = handle {
-    with_decode_cache(|| {
-      read_once(source);
-      ()
-    })
-  } with {
-    var keys: List<Bytes> = [],
-    memo.external(kind, at) -> {
-      if kind == derived_kind {
-        keys = keys.push(at);
-      };
-      if kind == text_kind { texts(at) } else { None }
-    },
-    memo.fetch(query, input, part) -> None,
-    memo.fetch_all(query, inputs, part) -> inputs.map(|_: Bytes| None),
-    memo.output_digest(query, input, part) -> None,
-    memo.stored_output(digest) -> None,
-    return done -> keys,
-  };
-  assert(scanned.len() > 0);
-  assert_eq(read, scanned)
-}
-
 pub fn text_key(source: Source) -> Bytes =
   Bytes::concat_all([source.name, b"\x00", blake3(source.source_text)])
-
-effect derivations {
-  write requested(ask: DeriverRequest) -> Unit
-}
-
-fn expanded<| e>(
-  source: Source,
-  parsed: ParseOutput<Module>,
-  answer: keep (DeriverRequest) -> DeriverResponse / {abort.raise | e},
-) -> { given: ParsedSource, requested: List<DeriverRequest> } / {abort.raise | e} =
-  handle {
-    parse_from(
-      0,
-      source,
-      parsed,
-      library: Some(|ask: DeriverRequest| {
-        derivations.requested(ask);
-        answer(ask)
-      }),
-    )
-  } with {
-    var requested: List<DeriverRequest> = [],
-    derivations.requested(ask) -> {
-      requested = requested.push(ask);
-    },
-    return given -> { given: given, requested: requested },
-  }
-
-pub fn requested_derivations<| e>(
-  source: Source,
-  answer: keep (DeriverRequest) -> DeriverResponse / {abort.raise | e},
-) -> List<DeriverRequest> / {abort.raise | e} = {
-  let parsed = parse_started(start(source.source_text));
-  let distinct = without_redefinitions(0, source.name, parsed.node);
-  expanded(source, { ..parsed, node: distinct.module }, answer).requested
-}
 
 pub fn read_once(
   source: Source,
 ) -> ParsedText / {memo.read, decode_cache.read, decode_cache.write, abort.raise} = {
   let key = text_key(source);
   match decode_cache.text_read(key) {
-    Some(r) -> {
-      r.requested.fold((), |_: Unit, ask: DeriverRequest| {
-        derivation_of(ask);
-        ()
-      });
-      r
-    },
+    Some(r) -> r,
     None -> {
       let lexed = start(source.source_text);
       let parsed = parse_started(lexed);
       let distinct = without_redefinitions(0, source.name, parsed.node);
-      let made = expanded(source, { ..parsed, node: distinct.module }, derivation_of);
+      let given = parse_from(0, source, { ..parsed, node: distinct.module });
       let r = {
         lexed: lexed,
         raw: distinct.module,
-        given: { ..made.given, diagnostics: made.given.diagnostics.concat(distinct.redefinitions) },
-        requested: made.requested,
+        given: { ..given, diagnostics: given.diagnostics.concat(distinct.redefinitions) },
       };
       decode_cache.cache_text_read(key, r);
       r
