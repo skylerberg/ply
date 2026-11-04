@@ -485,11 +485,32 @@ toolchain_inputs() {
           embeds_from <<< "$prev" | while IFS=: read -r file target; do
             covered "$target" "$prev" || printf '%s\n' "$target"
           done
+          deriver_sources
         fi
       } | grep . | LC_ALL=C sort -u
     )
   done
   printf '%s\n' "$all"
+}
+
+deriver_sources() {
+  local std file module next seen=''
+  std=$(role std)
+  next=$(std_imports "$root/$(role compiler)/expand/derive.ply")
+  while [[ -n $next ]]; do
+    module=${next%%$'\n'*}
+    [[ $next == *$'\n'* ]] && next=${next#*$'\n'} || next=
+    file="$std/$(tr . / <<< "${module#std.}").ply"
+    [[ $'\n'$seen$'\n' == *$'\n'$file$'\n'* || ! -f $root/$file ]] && continue
+    seen+=$file$'\n'
+    printf '%s\n' "$file"
+    next+=$'\n'$(std_imports "$root/$file")
+    next=$(grep . <<< "$next" || true)
+  done
+}
+
+std_imports() {
+  sed -nE 's/^import (std(\.[a-z_0-9]+)+).*/\1/p' "$1" | LC_ALL=C sort -u
 }
 
 embeds_from() {
