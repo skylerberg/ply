@@ -234,23 +234,27 @@ fn timeout_note(whose: Bytes) -> Bytes =
     b" ms of wall clock, and stops it there",
   ])
 
-pub fn site_errors<a>(
+pub type SiteCheck = { errors: List<Diagnostic>, warnings: List<Diagnostic> }
+
+fn only_errors(errors: List<Diagnostic>) -> SiteCheck = { errors: errors, warnings: [] }
+
+pub fn site_check<a>(
   s: Session<a>,
   later: LaterReading,
   places: List<SourceText>,
-) -> List<Diagnostic> / {evaluation.stored, evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} = {
+) -> SiteCheck / {evaluation.stored, evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} = {
   let sites = later.sites;
   let parsers = distinct_requests(sites);
   let checks = check_sites(sites, later.imports);
-  if parsers.len() + checks.len() == 0 { schemas_rejected(checks) } else {
+  if parsers.len() + checks.len() == 0 { only_errors(schemas_rejected(checks)) } else {
     let looked = evaluation.stored(s.place, parsers, checks);
-    looked.warnings.concat(match ((all_stored(looked.verdicts), all_stored(looked.statements))) {
+    let judged = match ((all_stored(looked.verdicts), all_stored(looked.statements))) {
       (Some(verdicts), Some(judgements)) ->
-        judged_site_errors(places, checks, Ok(all_read(verdicts)), Ok(all_read(judgements))),
+        judged_sites(places, checks, Ok(all_read(verdicts)), Ok(all_read(judgements))),
       _ -> match units::code_program_of(s, later.rollup) {
-        Err(diagnostics) -> diagnostics,
+        Err(diagnostics) -> only_errors(diagnostics),
         Ok(program) ->
-          judged_site_errors(
+          judged_sites(
             places,
             checks,
             match all_stored(looked.verdicts) {
@@ -263,36 +267,41 @@ pub fn site_errors<a>(
             },
           ),
       },
-    })
+    };
+    { errors: judged.errors, warnings: looked.warnings.concat(judged.warnings) }
   }
 }
 
 fn all_read<b>(found: List<b>) -> Judgements<b> = { results: found, warnings: [] }
 
-pub fn later_errors<a>(
+pub fn later_check<a>(
   s: Session<a>,
   later: LaterChecks,
   places: List<SourceText>,
-) -> List<Diagnostic> / {cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} =
+) -> SiteCheck / {cost_checker.report, evaluation.stored, evaluation.verdicts, evaluation.statements, EmbeddedFiles, abort.raise} =
   match reuse_violations(s, later.facts) {
-    [] -> site_errors(s, later.reading, places),
-    broken -> broken,
+    [] -> site_check(s, later.reading, places),
+    broken -> only_errors(broken),
   }
 
-fn judged_site_errors(
+fn judged_sites(
   places: List<SourceText>,
   checks: List<CheckSite>,
   verdicts: Result<Judgements<Judged<EvaluationRequest, Verdict>>, List<Diagnostic>>,
   judgements: Result<Judgements<Judged<CheckSite, CheckResult>>, List<Diagnostic>>,
-) -> List<Diagnostic> / {abort.raise} = {
+) -> SiteCheck / {abort.raise} = {
   let literal = match verdicts {
-    Err(diagnostics) -> diagnostics,
-    Ok(found) -> verdict_errors(places, found.results).concat(found.warnings),
+    Err(diagnostics) -> only_errors(diagnostics),
+    Ok(found) -> { errors: verdict_errors(places, found.results), warnings: found.warnings },
   };
-  literal.concat(match judgements {
-    Err(diagnostics) -> schemas_rejected(checks).concat(diagnostics),
-    Ok(found) -> judged_errors(checks, found.results).concat(found.warnings),
-  })
+  let checked = match judgements {
+    Err(diagnostics) -> only_errors(schemas_rejected(checks).concat(diagnostics)),
+    Ok(found) -> { errors: judged_errors(checks, found.results), warnings: found.warnings },
+  };
+  {
+    errors: literal.errors.concat(checked.errors),
+    warnings: literal.warnings.concat(checked.warnings),
+  }
 }
 
 fn judged_errors(
@@ -776,4 +785,16 @@ test "`toolchain_key` changes with the code that checks literals, the runtime an
   assert(toolchain_key(definition_hashes(b"s2", b"o1"), b"runtime", "0.1.0") != toolchain);
   assert(toolchain_key(definition_hashes(b"s1", b"o1"), b"other runtime", "0.1.0") != toolchain);
   assert(toolchain_key(definition_hashes(b"s1", b"o1"), b"runtime", "0.2.0") != toolchain)
+}
+
+test "a warning about stored results is a warning of the site check, never one of its errors" {
+  let stale = error_at(b"W0603", 0, span_between(0, 0), b"recorded by another build", b"", []);
+  let checked = judged_sites(
+    [],
+    [],
+    Ok({ results: [], warnings: [stale] }),
+    Ok({ results: [], warnings: [] }),
+  );
+  assert_eq(checked.errors, []);
+  assert_eq(checked.warnings, [stale])
 }
