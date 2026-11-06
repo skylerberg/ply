@@ -2,10 +2,10 @@ import std.set (Set)
 import std.fs
 import std.fs (fs)
 import std.hash (checksum)
-import std.bytes (u32_le, u64_le)
+import std.bytes (u32_be, u32_le, u64_le)
 import std.list
 
-const format_version: Int = 4
+const format_version: Int = 5
 
 const segment_magic: Bytes = b"PLYSEGM1"
 
@@ -16,6 +16,8 @@ const frame_header_len: Int = 12
 pub const header_len: Int = 52
 
 const max_read_size: Int = 33554432
+
+const block_size: Int = 4096
 
 const flush_threshold: Int = 8388608
 
@@ -200,25 +202,37 @@ pub fn read_range<[r]>(
 pub fn table_entry(seg: Segment, table: Int) -> Option<TableEntry> =
   seg.parts.find(|p: TableEntry| p.table == table)
 
-pub fn unverified_table_rows<[r]>(
-  dir: String,
-  token: Bytes,
-  entry: TableEntry,
+pub type BlockPlace = { offset: Int, size: Int, sum: Bytes }
+
+fn rows_read<[r]>(
+  path: String,
+  place: BlockPlace,
+  verified: Bool,
 ) -> Option<SortedTable> / {fs.read[r], abort.raise} =
-  match read_range[r](segment_path(dir, token), entry.offset, entry.size) {
-    Some(b) -> decoded_table(b),
+  match read_range[r](path, place.offset, place.size) {
+    Some(b) -> if verified && checksum(b) != place.sum { None } else { decoded_table(b) },
     None -> None,
   }
 
-pub fn table_rows<[r]>(
+pub fn table_index<[r]>(
   dir: String,
   token: Bytes,
   entry: TableEntry,
+  verified: Bool,
 ) -> Option<SortedTable> / {fs.read[r], abort.raise} =
-  match read_range[r](segment_path(dir, token), entry.offset, entry.size) {
-    Some(b) -> if checksum(b) == entry.sum { decoded_table(b) } else { None },
-    None -> None,
-  }
+  rows_read[r](
+    segment_path(dir, token),
+    { offset: entry.offset, size: entry.size, sum: entry.sum },
+    verified,
+  )
+
+pub fn block_rows<[r]>(
+  dir: String,
+  token: Bytes,
+  place: BlockPlace,
+  verified: Bool,
+) -> Option<SortedTable> / {fs.read[r], abort.raise} =
+  rows_read[r](segment_path(dir, token), place, verified)
 
 pub type Row = { key: Bytes, value: Bytes }
 
@@ -235,10 +249,12 @@ fn value_end(table: SortedTable, row: Int) -> Int = read_u32(table.bytes, bounds
 fn row_start(table: SortedTable, row: Int) -> Int =
   if row == 0 { 0 } else { value_end(table, row - 1) }
 
-pub fn sorted_table(table_rows: Map<Bytes, Bytes>) -> SortedTable = {
+pub fn table_of_rows(table_rows: List<Row>) -> SortedTable = {
   let built = table_rows.fold(
     { end: 0, bounds: [], body: [] },
-    |accumulator: { end: Int, bounds: List<Bytes>, body: List<Bytes> }, key: Bytes, value: Bytes| {
+    |accumulator: { end: Int, bounds: List<Bytes>, body: List<Bytes> }, row: Row| {
+      let key = row.key;
+      let value = row.value;
       let after_key = accumulator.end + key.len();
       let after_value = after_key + value.len();
       let bounds = accumulator.bounds;
@@ -308,6 +324,57 @@ pub fn value_in(table: SortedTable, key: Bytes) -> Option<Bytes> / {abort.raise}
     let row = row_at(table, at);
     if row.key == key { Some(row.value) } else { None }
   }
+}
+
+pub fn rows_between(
+  table: SortedTable,
+  from: Bytes,
+  until: Option<Bytes>,
+) -> List<Row> / {abort.raise} =
+  range(lower_bound(table, from), match until {
+    Some(u) -> lower_bound(table, u),
+    None -> table.count,
+  }).map(|row: Int| row_at(table, row))
+
+fn place_bytes(p: BlockPlace) -> Bytes =
+  Bytes::concat_all([u64_le(p.offset), u64_le(p.size), p.sum])
+
+fn block_place_at(index: SortedTable, block: Int) -> BlockPlace / {abort.raise} = {
+  let value = row_at(index, block).value;
+  { offset: read_u64(value, 0), size: read_u64(value, 8), sum: value.slice(16, value.len()) }
+}
+
+fn first_block_for(index: SortedTable, key: Bytes) -> Int / {abort.raise} = {
+  let at = lower_bound(index, key);
+  if at < index.count && key_at(index, at) == key { at } else if at == 0 { 0 } else { at - 1 }
+}
+
+pub fn block_holding(index: SortedTable, key: Bytes) -> Option<BlockPlace> / {abort.raise} =
+  if index.count == 0 { None } else { Some(block_place_at(index, first_block_for(index, key))) }
+
+pub fn blocks_for(
+  index: SortedTable,
+  from: Bytes,
+  until: Option<Bytes>,
+) -> List<BlockPlace> / {abort.raise} =
+  if index.count == 0 { [] } else {
+    let first = first_block_for(index, from);
+    let last = match until { Some(u) -> lower_bound(index, u), None -> index.count };
+    range(first, if last > first { last } else { first + 1 }).map(|block: Int|
+      block_place_at(index, block))
+  }
+
+fn blocks_of(table_rows: List<Row>) -> List<List<Row>> = {
+  let split = table_rows.fold(
+    { done: [], current: [], size: 0 },
+    |accumulator: { done: List<List<Row>>, current: List<Row>, size: Int }, row: Row| {
+      let current = accumulator.current.push(row);
+      let size = accumulator.size + row.key.len() + row.value.len() + row_bounds_width;
+      if size >= block_size { { done: accumulator.done.push(current), current: [], size: 0 } }
+      else { { ..accumulator, current: current, size: size } }
+    },
+  );
+  if split.current.len() == 0 { split.done } else { split.done.push(split.current) }
 }
 
 pub fn framed(payload: Bytes) -> Bytes / {abort.raise} = {
@@ -412,10 +479,10 @@ pub fn flush_when_full<[r]>(
 ) -> SegmentWriter / {fs.write[r], abort.raise} =
   if w.buffered > flush_threshold { flush[r](dir, schema, token, w, b"") } else { w }
 
-pub opaque type Table = new { table: Int, rows: SortedTable }
+pub opaque type Table = new { table: Int, rows: List<Row> }
 
 pub fn table(table: Int, table_rows: Map<Bytes, Bytes>) -> Table =
-  { table: table, rows: sorted_table(table_rows) }
+  { table: table, rows: table_rows.entries() }
 
 type Laid = { parts: List<TableEntry>, bytes: Bytes }
 
@@ -423,22 +490,32 @@ fn laid_out(token: Bytes, start: Int, tables: List<Table>) -> Laid / {abort.rais
   let built = tables.fold(
     { at: start, parts: [], bytes: [] },
     |accumulator: { at: Int, parts: List<TableEntry>, bytes: List<Bytes> }, t: Table|
-      if t.rows.count == 0 { accumulator } else {
-        let at = accumulator.at;
+      if t.rows.len() == 0 { accumulator } else {
+        let blocks = blocks_of(t.rows).fold(
+          { at: accumulator.at, index: [], bytes: [] },
+          |b: { at: Int, index: List<Row>, bytes: List<Bytes> }, block: List<Row>| {
+            let encoded = table_of_rows(block).bytes;
+            let place = { offset: b.at, size: encoded.len(), sum: checksum(encoded) };
+            {
+              at: b.at + encoded.len(),
+              index: b.index.push({ key: block.get(0).key, value: place_bytes(place) }),
+              bytes: b.bytes.push(encoded),
+            }
+          },
+        );
+        let index = table_of_rows(blocks.index).bytes;
+        let sum = checksum(index);
         let parts = accumulator.parts;
-        let bytes = accumulator.bytes;
-        let encoded = t.rows.bytes;
-        let sum = checksum(encoded);
         {
-          at: at + encoded.len(),
+          at: blocks.at + index.len(),
           parts: parts.push({
             table: t.table,
-            offset: at,
-            size: encoded.len(),
+            offset: blocks.at,
+            size: index.len(),
             sum: sum,
             name: table_name(token, t.table, sum),
           }),
-          bytes: bytes.push(encoded),
+          bytes: accumulator.bytes.concat(blocks.bytes).push(index),
         }
       },
   );
@@ -641,11 +718,17 @@ fn lookup<[r]>(dir: String, key: Bytes) -> Option<Bytes> / {fs.read[r], abort.ra
         let seg = m.segments.get(m.segments.len() - 1 - i);
         match table_entry(seg, 1) {
           None -> None,
-          Some(entry) -> match table_rows[r](dir, seg.token, entry) {
+          Some(entry) -> match table_index[r](dir, seg.token, entry, true) {
             None -> None,
-            Some(section) -> match value_in(section, key) {
+            Some(index) -> match block_holding(index, key) {
               None -> None,
-              Some(place) -> payload[r](dir, seg.token, read_u64(place, 0), read_u32(place, 8)),
+              Some(block) -> match block_rows[r](dir, seg.token, block, true) {
+                None -> None,
+                Some(rows) -> match value_in(rows, key) {
+                  None -> None,
+                  Some(place) -> payload[r](dir, seg.token, read_u64(place, 0), read_u32(place, 8)),
+                },
+              },
             },
           },
         }
@@ -700,8 +783,8 @@ test "a manifest or table that fails verification is treated as missing, never p
     let seg = write_segment[abs]("s", b"token--1", [{ key: b"a".blake3(), value: b"one" }]);
     let m = committed_manifest(commit[abs]("s", test_shapes, seg));
     let entry = List::get(m.segments.get(0).parts, 0);
-    let whole = table_rows[abs]("s", seg.token, entry) != None;
-    let torn = table_rows[abs]("s", seg.token, { ..entry, sum: b"12345678" });
+    let whole = table_index[abs]("s", seg.token, entry, true) != None;
+    let torn = table_index[abs]("s", seg.token, { ..entry, sum: b"12345678" }, true);
     let path = "s/" ++ manifest_name(test_shapes);
     let bytes = match fs.read_file[abs](path) { Some(b) -> b, None -> b"" };
     fs.write_file[abs](path, bytes.slice(0, bytes.len() - 1));
@@ -844,7 +927,7 @@ test "a sorted table returns each key's value, nothing for other keys, and its r
     b"abc",
     b"three",
   );
-  let encoded = table_bytes(sorted_table(rows));
+  let encoded = table_bytes(table_of_rows(rows.entries()));
   let read = match decoded_table(encoded) {
     Some(table) -> table,
     None -> panic("a table that was just encoded does not decode"),
@@ -863,6 +946,45 @@ test "a sorted table returns each key's value, nothing for other keys, and its r
   assert_eq(row_at(read, lower_bound(read, b"aa")).key, b"ab");
   assert_eq(value_in(empty_table, b"a"), None);
   assert_eq(decoded_table(encoded.slice(0, 9)), None)
+}
+
+test "a table larger than a block finds every key through its index, and a range spans the blocks it crosses" {
+  let rows = range(0, 2000).fold(Map::new(), |m: Map<Bytes, Bytes>, i: Int|
+    m.insert(u32_be(i), Bytes::of_string("value " ++ i.to_string())));
+  let run = fs::on_mem[abs](fs::mem_of([]), || {
+    let seg = write_segment[abs]("s", b"token--1", rows.entries());
+    let entry = List::get(seg.parts, 0);
+    let index = match table_index[abs]("s", seg.token, entry, true) {
+      Some(i) -> i,
+      None -> panic("the index reads"),
+    };
+    let block = |key: Bytes|
+      match block_holding(index, key) {
+        Some(place) -> match block_rows[abs]("s", seg.token, place, true) {
+          Some(b) -> b,
+          None -> panic("a block reads"),
+        },
+        None -> empty_table,
+      };
+    let middle = blocks_for(index, u32_be(500), Some(u32_be(1500))).fold(
+      [],
+      |found: List<Row>, place: BlockPlace|
+        match block_rows[abs]("s", seg.token, place, true) {
+          Some(b) -> found.concat(rows_between(b, u32_be(500), Some(u32_be(1500)))),
+          None -> found,
+        },
+    );
+    {
+      blocks: row_count(index),
+      found: rows.keys().all(|key: Bytes| value_in(block(key), key) != None),
+      missing: value_in(block(u32_be(5000)), u32_be(5000)),
+      middle: middle,
+    }
+  });
+  assert(run.value.blocks > 1, None);
+  assert(run.value.found, None);
+  assert_eq(run.value.missing, None);
+  assert_eq(run.value.middle.map(|r: Row| r.key), range(500, 1500).map(u32_be))
 }
 
 test "`rows_folded` visits each row index exactly once, in order" {

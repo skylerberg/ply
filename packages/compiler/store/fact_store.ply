@@ -8,7 +8,7 @@ import std.list
 import std.show (show)
 import compiler.store.segments
 import compiler.store.segments (CommitResult, Committed, LockHeld, Manifest, Row, Segment,
-                                SegmentWriter, SortedTable, StoreChanged, WriteFailed)
+                                SegmentWriter, SortedTable, StoreChanged, TableEntry, WriteFailed)
 
 pub effect fact_damage {
   raise damaged(reason: String)
@@ -43,7 +43,7 @@ pub type Database = {
   base: Option<Segment>,
 }
 
-const schema: Bytes = b"ply fact database 15".blake3()
+const schema: Bytes = b"ply fact database 16".blake3()
 
 type Table = | ChangesTable | LogEndTable | ResultsTable | TreeTable(Tree)
 
@@ -79,25 +79,66 @@ const log_end_key: Bytes = b"log end"
 
 fn changes_codec() -> bin::BinCodec<List<Bytes>> = bin::list_bin(bin::bytes_bin())
 
-fn loaded_rows<[r]>(
+fn kept_rows<| e>(
+  name: Bytes,
+  read: () -> Option<SortedTable> / {abort.raise | e},
+) -> SortedTable / {recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise | e} =
+  match recent_reads.table(name) {
+    Some(rows) -> rows,
+    None -> match read() {
+      Some(rows) -> {
+        recent_reads.keep_table(name, rows);
+        rows
+      },
+      None -> fact_damage.damaged("a table does not match its checksum"),
+    },
+  }
+
+fn index_of<[r]>(
+  db: Database,
+  seg: Segment,
+  entry: TableEntry,
+) -> SortedTable / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  kept_rows(entry.name, ||
+    segments::table_index[r](db.dir, seg.token, entry, seg.token != base_token))
+
+fn block_of<[r]>(
+  db: Database,
+  seg: Segment,
+  entry: TableEntry,
+  place: segments::BlockPlace,
+) -> SortedTable / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  kept_rows(entry.name.concat(u64_be(place.offset)), ||
+    segments::block_rows[r](db.dir, seg.token, place, seg.token != base_token))
+
+fn value_in_segment<[r]>(
   db: Database,
   seg: Segment,
   table: Table,
-) -> SortedTable / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  key: Bytes,
+) -> Option<Bytes> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   match segments::table_entry(seg, table_number(table)) {
-    None -> segments::empty_table,
-    Some(entry) -> match recent_reads.table(entry.name) {
-      Some(rows) -> rows,
-      None -> match if seg.token == base_token {
-          segments::unverified_table_rows[r](db.dir, seg.token, entry)
-        } else { segments::table_rows[r](db.dir, seg.token, entry) } {
-        Some(rows) -> {
-          recent_reads.keep_table(entry.name, rows);
-          rows
-        },
-        None -> fact_damage.damaged("a table does not match its checksum"),
-      },
+    None -> None,
+    Some(entry) -> match segments::block_holding(index_of[r](db, seg, entry), key) {
+      None -> None,
+      Some(place) -> segments::value_in(block_of[r](db, seg, entry, place), key),
     },
+  }
+
+fn rows_in<[r]>(
+  db: Database,
+  seg: Segment,
+  table: Table,
+  from: Bytes,
+  until: Option<Bytes>,
+) -> List<Row> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
+  match segments::table_entry(seg, table_number(table)) {
+    None -> [],
+    Some(entry) ->
+      segments::blocks_for(index_of[r](db, seg, entry), from, until).flat_map(
+        |place: segments::BlockPlace|
+          segments::rows_between(block_of[r](db, seg, entry, place), from, until),
+      ),
   }
 
 fn manifest_of(basis: Basis) -> Manifest = match basis { Extending(m) -> m, Replacing(m) -> m }
@@ -166,7 +207,7 @@ fn stored_row<[r]>(
   iterate(stored.len() - 1, stored.len() + 1, |i: Int|
     if i < 0 { Stop(None) } else {
       let seg = stored.get(i);
-      match segments::value_in(loaded_rows[r](db, seg, table), key) {
+      match value_in_segment[r](db, seg, table, key) {
         Some(value) -> Stop(Some({ token: seg.token, value: value })),
         None -> Continue(i - 1),
       }
@@ -334,16 +375,6 @@ fn pending_under(
   unwritten.range(Some(prefix), true, prefix_end(prefix), false, unwritten.len())
 }
 
-fn end_under(rows: SortedTable, prefix: Bytes) -> Int / {abort.raise} =
-  match prefix_end(prefix) {
-    Some(after) -> segments::lower_bound(rows, after),
-    None -> segments::row_count(rows),
-  }
-
-fn rows_under(rows: SortedTable, prefix: Bytes) -> List<Row> / {abort.raise} =
-  range(segments::lower_bound(rows, prefix), end_under(rows, prefix)).map(|row: Int|
-    segments::row_at(rows, row))
-
 pub fn entries_under<[r]>(
   db: Database,
   tree: Tree,
@@ -352,7 +383,7 @@ pub fn entries_under<[r]>(
   let stored = readable_segments(db).fold(
     Map::new(),
     |found: Map<Bytes, StoredEntry>, seg: Segment|
-      rows_under(loaded_rows[r](db, seg, TreeTable(tree)), prefix).fold(
+      rows_in[r](db, seg, TreeTable(tree), prefix, prefix_end(prefix)).fold(
         found,
         |newer: Map<Bytes, StoredEntry>, row: Row|
           newer.insert(row.key, decoded(row.value, stored_entry_bin())),
@@ -369,26 +400,19 @@ pub fn entries_under<[r]>(
 type MemberSearch = | FoundMember | Undecided(Set<Bytes>)
 
 fn member_in(
-  rows: SortedTable,
-  prefix: Bytes,
+  rows: List<Row>,
   decided: Set<Bytes>,
-) -> MemberSearch / {fact_damage.damaged, abort.raise} = {
-  let end = end_under(rows, prefix);
-  iterate(
-    { at: segments::lower_bound(rows, prefix), decided: decided },
-    end + 1,
-    |search: { at: Int, decided: Set<Bytes> }|
-      if search.at >= end { Stop(Undecided(search.decided)) } else {
-        let row = segments::row_at(rows, search.at);
-        if search.decided.contains(row.key) { Continue({ ..search, at: search.at + 1 }) } else {
-          match decoded(row.value, stored_entry_bin()) {
-            Present(_) -> Stop(FoundMember),
-            Removed -> Continue({ at: search.at + 1, decided: search.decided.insert(row.key) }),
-          }
+) -> MemberSearch / {fact_damage.damaged, abort.raise} =
+  rows.fold(Undecided(decided), |search: MemberSearch, row: Row|
+    match search {
+      FoundMember -> FoundMember,
+      Undecided(seen) -> if seen.contains(row.key) { search } else {
+        match decoded(row.value, stored_entry_bin()) {
+          Present(_) -> FoundMember,
+          Removed -> Undecided(seen.insert(row.key)),
         }
       },
-  )
-}
+    })
 
 pub fn has_members<[r]>(
   db: Database,
@@ -407,7 +431,8 @@ pub fn has_members<[r]>(
         |sofar: MemberSearch, seg: Segment|
           match sofar {
             FoundMember -> FoundMember,
-            Undecided(seen) -> member_in(loaded_rows[r](db, seg, TreeTable(tree)), key, seen),
+            Undecided(seen) ->
+              member_in(rows_in[r](db, seg, TreeTable(tree), key, prefix_end(key)), seen),
           },
       );
       match search { FoundMember -> true, Undecided(_) -> false }
@@ -644,15 +669,8 @@ fn merged_rows<[r]>(
   table: Table,
 ) -> Map<Bytes, StoredRow> / {fs.read[r], recent_reads.read, recent_reads.write, fact_damage.damaged, abort.raise} =
   merging.fold(Map::new(), |found: Map<Bytes, StoredRow>, seg: Segment| {
-    let rows = loaded_rows[r](db, seg, table);
-    segments::rows_folded(
-      segments::row_count(rows),
-      found,
-      |newer: Map<Bytes, StoredRow>, i: Int| {
-        let row = segments::row_at(rows, i);
-        newer.insert(row.key, { token: seg.token, value: row.value })
-      },
-    )
+    rows_in[r](db, seg, table, b"", None).fold(found, |newer: Map<Bytes, StoredRow>, row: Row|
+      newer.insert(row.key, { token: seg.token, value: row.value }))
   })
 
 fn located(row: StoredRow) -> Located / {fact_damage.damaged, abort.raise} = {
