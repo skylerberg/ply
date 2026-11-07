@@ -5,8 +5,9 @@ import compiler.check.known (char_type, ordering_type, result_type, width_type, 
                              result_name, ordering_name, none_constructor, some_constructor,
                              ok_constructor, err_constructor, less_constructor, equal_constructor,
                              greater_constructor)
-import compiler.emit.representations (SumConstructor, Constructors, kind_of, known_layout,
-                                      inside_layout, constructors_of, constructor_fields_at)
+import compiler.emit.representations (SumConstructor, kind_of, known_layout, inside_layout,
+                                      constructor_fields_at, ShapeReads, code_facts,
+                                      over_code_facts, table_sources)
 import compiler.emit.c (Width, Kind, IntKind, BoolKind, SizedIntKind, FloatKind, DecimalKind,
                         WideKind, in_register)
 import compiler.emit.typed_ir (owned_params, Representation, AsInt, AsBool, AsFixed, AsFloat,
@@ -16,41 +17,23 @@ import compiler.emit.typed_ir (owned_params, Representation, AsInt, AsBool, AsFi
 import compiler.emit.layout (ValueLayout, SumCases, RecordFields, PlainWords, InlineRecord,
                              FieldLayout, Pointer, Mixed, Always, Inline, Boxed, Nullary, SumLayout,
                              words, max_flat_words, any_integer, has_counted_references)
-import compiler.emit.lower.module_context (ModuleContext)
 
-pub fn representation_of(s: ModuleContext, ty: Type) -> Representation =
-  representation_with(s.constructors, ty)
-
-pub fn typed_convention(
-  constructors: Constructors,
-  params: List<Type>,
-  result: Type,
-) -> Convention =
+pub fn typed_convention(params: List<Type>, result: Type) -> Convention / {ShapeReads} =
   {
-    params: owned_params(params.map(|t: Type| representation_with(constructors, t))),
-    result: representation_with(constructors, result),
-    destination_passing: match inside_layout(constructors, result) {
-      Some(InlineRecord(_)) -> true,
-      _ -> false,
-    },
+    params: owned_params(params.map(|t: Type| representation_of(t))),
+    result: representation_of(result),
+    destination_passing: match inside_layout(result) { Some(InlineRecord(_)) -> true, _ -> false },
     returned: OwnedResult,
   }
 
-pub fn representation_with(constructors: Constructors, ty: Type) -> Representation =
-  match inside_layout(constructors, ty) {
-    None -> AsWord,
-    Some(l) -> representation_of_layout(constructors, ty, l),
-  }
+pub fn representation_of(ty: Type) -> Representation / {ShapeReads} =
+  match inside_layout(ty) { None -> AsWord, Some(l) -> representation_of_layout(ty, l) }
 
-fn representation_of_layout(
-  constructors: Constructors,
-  ty: Type,
-  l: ValueLayout,
-) -> Representation =
+fn representation_of_layout(ty: Type, l: ValueLayout) -> Representation / {ShapeReads} =
   if words(l) == 0 { AsUnit } else {
     match l {
-      SumCases(x) -> AsSum({ layout: x, cases: case_names(constructors, ty) }),
-      RecordFields(fs) -> AsFlattened(record_leaves(constructors, ty, fs)),
+      SumCases(x) -> AsSum({ layout: x, cases: case_names(ty) }),
+      RecordFields(fs) -> AsFlattened(record_leaves(ty, fs)),
       InlineRecord(_) -> AsWord,
       PlainWords(_) -> match scalar_representation(kind_of(ty).kind) {
         AsWord -> if has_counted_references(l) { AsWord } else { AsImmediate },
@@ -59,24 +42,24 @@ fn representation_of_layout(
     }
   }
 
-pub fn layout_leaves(constructors: Constructors, ty: Type) -> Option<List<Leaf>> =
-  match known_layout(constructors, ty) {
-    Some(RecordFields(fs)) -> match representation_of_layout(constructors, ty, RecordFields(fs)) {
+pub fn layout_leaves(ty: Type) -> Option<List<Leaf>> / {ShapeReads} =
+  match known_layout(ty) {
+    Some(RecordFields(fs)) -> match representation_of_layout(ty, RecordFields(fs)) {
       AsFlattened(ls) -> Some(ls),
       _ -> None,
     },
     _ -> None,
   }
 
-pub fn flattened_leaves(constructors: Constructors, ty: Type) -> Option<List<Leaf>> =
-  match representation_with(constructors, ty) { AsFlattened(ls) -> Some(ls), _ -> None }
+pub fn flattened_leaves(ty: Type) -> Option<List<Leaf>> / {ShapeReads} =
+  match representation_of(ty) { AsFlattened(ls) -> Some(ls), _ -> None }
 
-pub fn is_inline_record(constructors: Constructors, ty: Type) -> Bool =
-  match inside_layout(constructors, ty) { Some(InlineRecord(_)) -> true, _ -> false }
+pub fn is_inline_record(ty: Type) -> Bool / {ShapeReads} =
+  match inside_layout(ty) { Some(InlineRecord(_)) -> true, _ -> false }
 
-fn case_names(constructors: Constructors, ty: Type) -> List<Bytes> =
+fn case_names(ty: Type) -> List<Bytes> / {ShapeReads} =
   match ty {
-    NamedType(c) -> match constructors.sums.get(c.name) {
+    NamedType(c) -> match code_facts.sum_named(c.name) {
       Some(cs) -> cs.map(|x: SumConstructor| x.name),
       None -> [],
     },
@@ -102,21 +85,14 @@ pub fn record_fields(ty: Type) -> List<Field> =
 
 pub type RecordPart = { field: Int, name: Bytes, ty: Type, representation: Representation }
 
-pub fn record_parts(constructors: Constructors, ty: Type) -> List<RecordPart> =
-  match known_layout(constructors, ty) {
-    Some(RecordFields(fs)) -> record_parts_of_layout(constructors, ty, fs),
-    _ -> [],
-  }
+pub fn record_parts(ty: Type) -> List<RecordPart> / {ShapeReads} =
+  match known_layout(ty) { Some(RecordFields(fs)) -> record_parts_of_layout(ty, fs), _ -> [] }
 
-fn record_parts_of_layout(
-  constructors: Constructors,
-  ty: Type,
-  fs: List<FieldLayout>,
-) -> List<RecordPart> = {
+fn record_parts_of_layout(ty: Type, fs: List<FieldLayout>) -> List<RecordPart> / {ShapeReads} = {
   let fields = record_fields(ty);
   range(0, fields.len()).fold([], |accumulator: List<RecordPart>, i: Int|
     match ((fields.at(i), fs.at(i))) {
-      (Some(f), Some(laid)) -> match representation_of_layout(constructors, f.ty, laid.layout) {
+      (Some(f), Some(laid)) -> match representation_of_layout(f.ty, laid.layout) {
         AsUnit -> accumulator,
         r -> accumulator.push({ field: i, name: f.name, ty: f.ty, representation: r }),
       },
@@ -126,13 +102,13 @@ fn record_parts_of_layout(
 
 pub type CasePart = { ty: Type, representation: Representation }
 
-pub fn case_parts(constructors: Constructors, ty: Type, case: Int) -> List<CasePart> =
+pub fn case_parts(ty: Type, case: Int) -> List<CasePart> / {ShapeReads} =
   match ty {
-    NamedType(c) -> match constructors.sums.get(c.name) {
+    NamedType(c) -> match code_facts.sum_named(c.name) {
       Some(cs) -> match cs.at(case) {
         Some(k) ->
           constructor_fields_at(k, c.args).map(|t: Type|
-            { ty: t, representation: representation_with(constructors, t) }),
+            { ty: t, representation: representation_of(t) }),
         None -> [],
       },
       None -> [],
@@ -140,8 +116,8 @@ pub fn case_parts(constructors: Constructors, ty: Type, case: Int) -> List<CaseP
     _ -> [],
   }
 
-fn record_leaves(constructors: Constructors, ty: Type, fs: List<FieldLayout>) -> List<Leaf> =
-  record_parts_of_layout(constructors, ty, fs).fold([], |accumulator: List<Leaf>, p: RecordPart|
+fn record_leaves(ty: Type, fs: List<FieldLayout>) -> List<Leaf> / {ShapeReads} =
+  record_parts_of_layout(ty, fs).fold([], |accumulator: List<Leaf>, p: RecordPart|
     match p.representation {
       AsFlattened(inner) ->
         accumulator.concat(
@@ -205,8 +181,8 @@ pub fn leaf_type(ty: Type, name: Bytes) -> Option<Type> =
 pub fn field_types(ty: Type) -> Map<Bytes, Type> =
   record_fields(ty).fold(Map::new(), |m: Map<Bytes, Type>, f: Field| m.insert(f.name, f.ty))
 
-pub fn field_offsets(s: ModuleContext, ty: Type) -> Map<Bytes, Int> =
-  match known_layout(s.constructors, ty) {
+pub fn field_offsets(ty: Type) -> Map<Bytes, Int> / {ShapeReads} =
+  match known_layout(ty) {
     Some(RecordFields(ls)) -> {
       let fs = record_fields(ty);
       range(0, fs.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
@@ -272,18 +248,8 @@ fn after(b: Bytes, at: Int) -> Bytes =
 
 fn before(b: Bytes, at: Int) -> Bytes = match b.slice_at(0, at) { Some(x) -> x, None -> b"" }
 
-fn module_context_of(constructors: Constructors) -> ModuleContext =
-  {
-    module: b"m",
-    definitions: [],
-    imports: [],
-    constructors: constructors,
-    builtins: [],
-    declared: Map::new(),
-    machine: Map::new(),
-    effects: [],
-    release_build: false,
-  }
+fn over_test_sums<a>(body: () -> a / {ShapeReads}) -> a / {abort.raise} =
+  over_code_facts(table_sources(test_sums), body)
 
 fn record(fs: List<{ name: Bytes, ty: Type }>) -> Type = RecordType(fs)
 
@@ -303,130 +269,130 @@ const large_record: Type =
     ),
   )
 
-const test_constructors: Constructors = {
+const test_sums: Map<Bytes, List<SumConstructor>> = {
   let constructor = |n: Bytes, i: Int, fields: List<Type>, params: List<Int>|
     { name: n, index: i, fields: fields, params: params };
-  constructors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(option_name, [
-      constructor(none_constructor, 0, [], [0]),
-      constructor(some_constructor, 1, [VariableType(0)], [0]),
-    ]).insert(result_name, [
-      constructor(ok_constructor, 0, [VariableType(0)], [0, 1]),
-      constructor(err_constructor, 1, [VariableType(1)], [0, 1]),
-    ]).insert(ordering_name, [
-      constructor(less_constructor, 0, [], []),
-      constructor(equal_constructor, 1, [], []),
-      constructor(greater_constructor, 2, [], []),
-    ]).insert(b"m.Token", [constructor(b"m.Token", 0, [], [])]),
-  )
+  Map::new().insert(option_name, [
+    constructor(none_constructor, 0, [], [0]),
+    constructor(some_constructor, 1, [VariableType(0)], [0]),
+  ]).insert(result_name, [
+    constructor(ok_constructor, 0, [VariableType(0)], [0, 1]),
+    constructor(err_constructor, 1, [VariableType(1)], [0, 1]),
+  ]).insert(ordering_name, [
+    constructor(less_constructor, 0, [], []),
+    constructor(equal_constructor, 1, [], []),
+    constructor(greater_constructor, 2, [], []),
+  ]).insert(b"m.Token", [constructor(b"m.Token", 0, [], [])])
 }
 
 test "a scalar is represented as itself, a pointer as one word, and a value with no data as nothing" {
-  let s = module_context_of(test_constructors);
-  assert_eq(representation_of(s, int_type), AsInt);
-  assert_eq(representation_of(s, float_type), AsFloat);
-  assert_eq(
-    representation_of(s, width_type({ bits: 8, signed: false })),
-    AsFixed({ bits: 8, signed: false }),
-  );
-  assert_eq(
-    representation_of(s, width_type({ bits: 128, signed: true })),
-    AsWideFixed({ bits: 128, signed: true }),
-  );
-  assert_eq([string_type, char_type].map(|t: Type| representation_of(s, t)), [AsWord, AsImmediate]);
-  assert_eq(
-    [unit_type, record([]), record([{ name: b"u", ty: unit_type }]), named_type(b"m.Token")].map(
-      |t: Type| representation_of(s, t),
-    ),
-    [AsUnit, AsUnit, AsUnit, AsUnit],
-  );
-  assert_eq(representation_of(s, VariableType(0)), AsWord)
+  over_test_sums(|| {
+    assert_eq(representation_of(int_type), AsInt);
+    assert_eq(representation_of(float_type), AsFloat);
+    assert_eq(
+      representation_of(width_type({ bits: 8, signed: false })),
+      AsFixed({ bits: 8, signed: false }),
+    );
+    assert_eq(
+      representation_of(width_type({ bits: 128, signed: true })),
+      AsWideFixed({ bits: 128, signed: true }),
+    );
+    assert_eq([string_type, char_type].map(|t: Type| representation_of(t)), [AsWord, AsImmediate]);
+    assert_eq(
+      [unit_type, record([]), record([{ name: b"u", ty: unit_type }]), named_type(b"m.Token")].map(
+        |t: Type| representation_of(t),
+      ),
+      [AsUnit, AsUnit, AsUnit, AsUnit],
+    );
+    assert_eq(representation_of(VariableType(0)), AsWord)
+  })
 }
 
 test "a declared sum is represented by the words of its layout, and a sum with an unresolved type variable as a single word" {
-  let s = module_context_of(test_constructors);
-  match representation_of(s, option_type(string_type)) {
-    AsSum(x) -> {
-      assert_eq(x.cases, [b"None", b"Some"]);
-      assert_eq(c_values_of(AsSum(x)), [AsWord])
-    },
-    other -> assert_eq(other, AsWord),
-  };
-  assert_eq(c_values_of(representation_of(s, option_type(int_type))), [AsWord, AsWord]);
-  assert_eq(case_index(representation_of(s, ordering_type), greater_constructor), Some(2));
-  assert_eq(representation_of(s, option_type(VariableType(0))), AsWord)
+  over_test_sums(|| {
+    match representation_of(option_type(string_type)) {
+      AsSum(x) -> {
+        assert_eq(x.cases, [b"None", b"Some"]);
+        assert_eq(c_values_of(AsSum(x)), [AsWord])
+      },
+      other -> assert_eq(other, AsWord),
+    };
+    assert_eq(c_values_of(representation_of(option_type(int_type))), [AsWord, AsWord]);
+    assert_eq(case_index(representation_of(ordering_type), greater_constructor), Some(2));
+    assert_eq(representation_of(option_type(VariableType(0))), AsWord)
+  })
 }
 
 test "a record is represented as its leaf fields in order, with nested records contributing their leaves and unit fields contributing none" {
-  let s = module_context_of(test_constructors);
-  assert_eq(
-    representation_of(s, point),
-    AsFlattened([{ name: b"x", representation: AsFloat }, { name: b"y", representation: AsFloat }]),
-  );
-  let leaves = match representation_of(s, point_pair) { AsFlattened(ls) -> ls, _ -> [] };
-  assert_eq(leaves.map(|l: Leaf| l.name), [b"from.x", b"from.y", b"to.x", b"to.y"]);
-  assert_eq(leaf_span(leaves, b"to"), Some({ at: 2, n: 2 }));
-  assert_eq(leaf_span(leaves, b"from"), Some({ at: 0, n: 2 }));
-  assert_eq(leaves_within(leaves, { at: 2, n: 2 }).map(|l: Leaf| l.name), [b"x", b"y"]);
-  let holder = record([
-    { name: b"o", ty: option_type(int_type) },
-    { name: b"u", ty: unit_type },
-    { name: b"z", ty: int_type },
-  ]);
-  let hs = match representation_of(s, holder) { AsFlattened(ls) -> ls, _ -> [] };
-  assert_eq(hs.map(|l: Leaf| l.name), [b"o", b"z"]);
-  assert_eq(c_values_of(AsFlattened(hs)), [AsWord, AsWord, AsInt]);
-  assert_eq([leaf_values(hs, 0), leaf_values(hs, 1)], [{ at: 0, n: 2 }, { at: 2, n: 1 }]);
-  assert_eq(representation_of(s, record([{ name: b"inner", ty: VariableType(0) }])), AsWord)
+  over_test_sums(|| {
+    assert_eq(
+      representation_of(point),
+      AsFlattened([
+        { name: b"x", representation: AsFloat },
+        { name: b"y", representation: AsFloat },
+      ]),
+    );
+    let leaves = match representation_of(point_pair) { AsFlattened(ls) -> ls, _ -> [] };
+    assert_eq(leaves.map(|l: Leaf| l.name), [b"from.x", b"from.y", b"to.x", b"to.y"]);
+    assert_eq(leaf_span(leaves, b"to"), Some({ at: 2, n: 2 }));
+    assert_eq(leaf_span(leaves, b"from"), Some({ at: 0, n: 2 }));
+    assert_eq(leaves_within(leaves, { at: 2, n: 2 }).map(|l: Leaf| l.name), [b"x", b"y"]);
+    let holder = record([
+      { name: b"o", ty: option_type(int_type) },
+      { name: b"u", ty: unit_type },
+      { name: b"z", ty: int_type },
+    ]);
+    let hs = match representation_of(holder) { AsFlattened(ls) -> ls, _ -> [] };
+    assert_eq(hs.map(|l: Leaf| l.name), [b"o", b"z"]);
+    assert_eq(c_values_of(AsFlattened(hs)), [AsWord, AsWord, AsInt]);
+    assert_eq([leaf_values(hs, 0), leaf_values(hs, 1)], [{ at: 0, n: 2 }, { at: 2, n: 1 }]);
+    assert_eq(representation_of(record([{ name: b"inner", ty: VariableType(0) }])), AsWord)
+  })
 }
 
 test "a record too wide for a call's registers is passed as a pointer, stored inline inside a smaller record, and stored as a pointer in a case" {
-  let s = module_context_of(test_constructors);
-  assert_eq(representation_of(s, large_record), AsWord);
-  let small = record([{ name: b"n", ty: int_type }, { name: b"s", ty: large_record }]);
-  assert(representation_of(s, small) != AsWord, None);
-  let holder = record(
-    range(0, max_flat_words).map(|i: Int|
-      { name: b"a".concat(Bytes::of_string(i.to_string())), ty: int_type }).push({
-      name: b"s",
-      ty: large_record,
-    }),
-  );
-  assert_eq(representation_of(s, holder), AsWord);
-  assert(is_inline_record(s.constructors, large_record), None);
-  assert_eq(
-    case_parts(s.constructors, option_type(large_record), 1).map(|p: CasePart| p.representation),
-    [AsWord],
-  );
-  assert_eq(c_values_of(representation_of(s, option_type(large_record))), [AsWord])
+  over_test_sums(|| {
+    assert_eq(representation_of(large_record), AsWord);
+    let small = record([{ name: b"n", ty: int_type }, { name: b"s", ty: large_record }]);
+    assert(representation_of(small) != AsWord, None);
+    let holder = record(
+      range(0, max_flat_words).map(|i: Int|
+        { name: b"a".concat(Bytes::of_string(i.to_string())), ty: int_type }).push({
+        name: b"s",
+        ty: large_record,
+      }),
+    );
+    assert_eq(representation_of(holder), AsWord);
+    assert(is_inline_record(large_record), None);
+    assert_eq(case_parts(option_type(large_record), 1).map(|p: CasePart| p.representation), [
+      AsWord,
+    ]);
+    assert_eq(c_values_of(representation_of(option_type(large_record))), [AsWord])
+  })
 }
 
 test "a field's offset is the index of its first word within its boxed record" {
-  let s = module_context_of(test_constructors);
-  assert_eq(field_offsets(s, large_record).get(b"label"), Some(2));
-  assert_eq(field_offsets(s, large_record).get(b"to"), Some(3));
-  assert_eq(
-    field_offsets(s, record([{ name: b"inner", ty: VariableType(0) }])).get(b"inner"),
-    None,
-  );
-  assert_eq(field_type(large_record, b"to"), Some(point))
+  over_test_sums(|| {
+    assert_eq(field_offsets(large_record).get(b"label"), Some(2));
+    assert_eq(field_offsets(large_record).get(b"to"), Some(3));
+    assert_eq(field_offsets(record([{ name: b"inner", ty: VariableType(0) }])).get(b"inner"), None);
+    assert_eq(field_type(large_record, b"to"), Some(point))
+  })
 }
 
 test "a case's argument offset is where that argument starts when the case's arguments are laid out as a record" {
-  let s = module_context_of(test_constructors);
-  match representation_of(s, result_type(int_type, point)) {
-    AsSum(x) -> {
-      assert_eq([case_argument_offset(x.layout, 0, 0), case_argument_offset(x.layout, 1, 0)], [
-        Some(0),
-        Some(0),
-      ]);
-      assert_eq(case_index(AsSum(x), err_constructor), Some(1))
-    },
-    other -> assert_eq(other, AsWord),
-  }
+  over_test_sums(|| {
+    match representation_of(result_type(int_type, point)) {
+      AsSum(x) -> {
+        assert_eq([case_argument_offset(x.layout, 0, 0), case_argument_offset(x.layout, 1, 0)], [
+          Some(0),
+          Some(0),
+        ]);
+        assert_eq(case_index(AsSum(x), err_constructor), Some(1))
+      },
+      other -> assert_eq(other, AsWord),
+    }
+  })
 }
 
 test "a result of one word needs no return buffer, and a wider result needs buffer words for the words after the first" {

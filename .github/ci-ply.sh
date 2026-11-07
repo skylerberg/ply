@@ -10,7 +10,6 @@ work() {
 }
 TAB=$'\t'
 caches=/tmp
-mark=$caches/ply-c-runs.mark
 durations=$caches/ply-test-durations.tsv
 
 postgres_bin() {
@@ -115,8 +114,7 @@ spent() {
   jq -r --argjson wall "$2" '
     def s(ms): (ms / 1000 | floor | tostring) + "s";
     (.phases // {}) as $p
-    | (if .front_end.reused then "spent: read a cached result in \(s(.front_end.phases.total // 0)); the run that cached it spent " else "spent: " end)
-      + "before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))" + '"$answers"'
+    | "spent: before \(s($p.before // 0)), load \(s($p.load // 0)), promises \(s($p.promises // 0)), store \(s($p.store // 0)), selection \(s($p.selection // 0)), handoff \(s($p.handoff // 0)), unit \(s($p.unit // 0)) (C analysis \(s((.backend.analysis_nanos // 0) / 1e6)), codegen \(s((.backend.codegen_nanos // 0) / 1e6))), bind \(s($p.bind // 0)), tests \(s($p.tests // 0)), conclude \(s($p.conclude // 0)), other \(s([$wall - ($p.total // 0), 0] | max))" + '"$answers"'
   ' "$1" 2>/dev/null
 }
 
@@ -135,6 +133,7 @@ tests_of() {
   local -a picked=()
   shift
   placed "$id" || return 2
+  [[ " $* " == *" --filter "* ]] && picked=()
   out=$(mktemp)
   started=$(now_ms)
   tested "$path" ${picked[@]+"${picked[@]}"} ${part:+--shard "$part"} "$@" > "$out" || status=$?
@@ -219,30 +218,12 @@ disproved() {
   ' "$1" 2>/dev/null || cat "$1"
 }
 
-marked() {
-  [ -f "$mark" ] || { echo "nothing is marked: run 'ci-ply.sh mark' before the runs" >&2; return 1; }
-}
-
 store_dirs() {
   local dir
   for dir in $(work std) $(work std-tests) $(work compiler) $(work cli) $(work cli-tests) \
     $(work package) $(work suite); do
     printf '%s\n' "$root/$dir"
   done | LC_ALL=C sort -u
-}
-
-# shellcheck disable=SC2100
-stores=ply-c-cache/bodies
-
-kept_answers() {
-  local dir=$1 store
-  rm -rf "$dir"
-  mkdir -p "$dir"
-  for store in "$caches/$stores"/*/; do
-    [ -f "$store.used" ] && [ "$store.used" -nt "$mark" ] || continue
-    (cd "$caches" && tar --exclude='run*' --exclude=lock --exclude='*.tmp' -cf - \
-      "$stores/$(basename "$store")") | tar -xf - -C "$dir"
-  done
 }
 
 case "${1:-}" in
@@ -310,36 +291,6 @@ case "${1:-}" in
     fi
     rm -f "$out"
     ;;
-  mark)
-    touch "$mark"
-    ;;
-  keep)
-    dir=${2:?a directory}
-    marked || exit 2
-    kept_answers "$dir" || exit 1
-    du -sh "$dir"
-    ;;
-  restore)
-    dir=${2:?a directory}
-    [ -d "$dir" ] || exit 0
-    for store in "$dir/$stores"/*/; do
-      [ -d "$store" ] && rm -rf "${caches:?}/$stores/$(basename "$store")"
-    done
-    tar -C "$dir" -cf - . | tar -C "$caches" --skip-old-files -xf -
-    ;;
-  compact)
-    marked || exit 2
-    for dir in $(store_dirs); do
-      [ -d "$dir/.ply-cache" ] || continue
-      if [ -z "$(find "$dir/.ply-cache" -newer "$mark" -print -quit)" ]; then
-        rm -rf "$dir/.ply-cache"
-        echo "=== ${dir#"$root"/}: opened by no run of this job, and removed"
-        continue
-      fi
-      echo "=== ${dir#"$root"/}"
-      "$ply" cache compact "$dir" || echo "the store under ${dir#"$root"/} was not compacted" >&2
-    done
-    ;;
   pack)
     file=${2:?a file}
     kept=()
@@ -373,7 +324,7 @@ case "${1:-}" in
     rm -rf "$dir"
     ;;
   *)
-    echo "usage: ci-ply.sh run ID [ARG...] | nightly ROLE [MODULE...] [ARG...] | mark | keep DIR | restore DIR | compact | pack FILE | unpack NAME" >&2
+    echo "usage: ci-ply.sh run ID [ARG...] | nightly ROLE [MODULE...] [ARG...] | pack FILE | unpack NAME" >&2
     exit 2
     ;;
 esac

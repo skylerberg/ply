@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 cache=${PLY_C_CACHE:-/tmp/ply-c-cache}
-stage=${PLY_C_STAGE:-/tmp/ply-c-stage}
-stores=$cache/bodies
+stage=${PLY_CI_STAGE:-/tmp/ply-c-stage}
 
 megabytes() { du -sm "$@" 2>/dev/null | awk '{ s += $1 } END { print s + 0 }'; }
 
@@ -12,46 +11,40 @@ shared() {
     -q '[.artifacts[] | select(.expired == false and .workflow_run.head_repository_id == .workflow_run.repository_id)]
         | sort_by(.created_at) | last | .workflow_run.id // empty') || return 1
   [ -n "$run" ] || { echo "no run has packed a stage for these sources"; return 1; }
-  laid "$run" "$name"
+  laid "$run" "$name" cache stage
+}
+
+placed() {
+  local from=$1 to=$2
+  [ -d "$from" ] || return 0
+  if [ -d "$to" ] && [ -n "$(ls -A "$to")" ]; then
+    cp -R "$from/." "$to/"
+  else
+    rm -rf "$to"
+    mkdir -p "$(dirname "$to")"
+    mv "$from" "$to"
+  fi
 }
 
 laid() {
-  local run=$1 name=$2 dir
+  local run=$1 name=$2 dir part
+  shift 2
   dir=$(mktemp -d)
   gh run download "$run" -n "$name" -D "$dir" || return 1
   mkdir "$dir/unpacked"
-  zstd -d -c "$dir/stage.tar.zst" | tar -xf - -C "$dir/unpacked" || return 1
-  mkdir -p "$cache" "$stage"
-  if [ -d "$dir/unpacked/cache" ]; then cp -R "$dir/unpacked/cache/." "$cache/" || return 1; fi
-  if [ -d "$dir/unpacked/stage" ]; then cp -R "$dir/unpacked/stage/." "$stage/" || return 1; fi
+  zstd -d -c "$dir/stage.tar.zst" | tar -xf - -C "$dir/unpacked" "$@" || return 1
+  rm -f "$dir/stage.tar.zst"
+  for part in "$@"; do
+    case $part in
+      cache) placed "$dir/unpacked/cache" "$cache" || return 1 ;;
+      stage) placed "$dir/unpacked/stage" "$stage" || return 1 ;;
+    esac
+  done
   rm -rf "$dir"
-  echo "$name came back from run $run: $(megabytes "$cache" "$stage") MB of C cache and stages"
+  echo "$name came back from run $run: $(megabytes "$cache" "$stage") MB of $*"
 }
 
 case "${1:-}" in
-  used)
-    mark=${2:?usage: ci-warm.sh used MARK}
-    [ -f "$mark" ] || { echo "nothing is marked at $mark" >&2; exit 2; }
-    before=$(megabytes "$cache" "$stage")
-    for dir in "$stores"/*/; do
-      [ -d "$dir" ] || continue
-      [ "$dir.used" -nt "$mark" ] || [ "$dir" -nt "$mark" ] || rm -rf "$dir"
-    done
-    [ -d "$cache" ] && find "$cache" -path "$stores/*" -type d -prune -o -type f ! -newer "$mark" -print0 |
-      xargs -0 rm -f --
-    if [ -d "$stage" ]; then
-      for dir in "$stage"/*/; do
-        [ -d "$dir" ] || continue
-        case "$(basename "$dir")" in
-          answered | reused) find "$dir" -type f ! -newer "$mark" -delete ;;
-          *) [ -n "$(find "$dir" -newer "$mark" -print -quit)" ] || rm -rf "$dir" ;;
-        esac
-      done
-    fi
-    [ -d "$stage" ] && find "$stage" -maxdepth 1 -type f ! -name '.*' ! -newer "$mark" -delete
-    find "$cache" "$stage" -mindepth 1 -type d -empty -delete 2>/dev/null || true
-    echo "the C cache and stages kept $(megabytes "$cache" "$stage") MB of $before MB"
-    ;;
   pack)
     tar=${2:?usage: ci-warm.sh pack TAR}
     dir=$(mktemp -d)
@@ -71,19 +64,16 @@ case "${1:-}" in
     fi
     ;;
   this-run)
-    name=${2:?usage: ci-warm.sh this-run NAME}
-    if laid "${GITHUB_RUN_ID:?the run whose artifact this is}" "$name"; then
+    name=${2:?usage: ci-warm.sh this-run NAME PART...}
+    shift 2
+    if laid "${GITHUB_RUN_ID:?the run whose artifact this is}" "$name" "${@:-cache}"; then
       echo "found=true" >> "${GITHUB_OUTPUT:-/dev/null}"
     else
       echo "could not download the stage $name: this job starts from the cache"
     fi
     ;;
-  foreign)
-    [ -d "$stage" ] && find "$stage" -mindepth 1 -maxdepth 1 ! -name memo-std -exec rm -rf {} +
-    echo "kept $(megabytes "$cache") MB of the C cache and $(megabytes "$stage") MB of the std records from another toolchain, and deleted its stages"
-    ;;
   *)
-    echo "usage: ci-warm.sh used MARK | pack TAR | shared NAME | this-run NAME | foreign" >&2
+    echo "usage: ci-warm.sh pack TAR | shared NAME | this-run NAME PART..." >&2
     exit 2
     ;;
 esac

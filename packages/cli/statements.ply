@@ -1,12 +1,15 @@
-import compiler.front.facts (Frame, StatementSite, Argument, TextArgument, CallArgument,
-                             RowArgument, TaggedArgument, ListArgument, ConstructorArgument,
-                             OtherArgument, statement_modules, RowField, RowRead, ScalarRead,
-                             OptionalRead, ArrayRead, DocumentRead, JsonRead)
-import compiler.front.emitter_input (ConstSite, TestRunScope, consts_of_type)
+import compiler.codes (undeclared_sql_name_code, unsupported_sql_code)
+import compiler.front.checking.program_facts (Callee, IdentifiedSite, NoRunIdentity, ProgramSites,
+                                              reached_modules, run_identity)
+import compiler.front.facts (StatementSite, Argument, TextArgument, CallArgument, RowArgument,
+                             TaggedArgument, ListArgument, ConstructorArgument, OtherArgument,
+                             statement_modules, RowField, RowRead, ScalarRead, OptionalRead,
+                             ArrayRead, DocumentRead, JsonRead)
+import compiler.front.emitter_input (ConstSite)
+import compiler.emit.keys (Named)
 import compiler.store.hash.forms (FunctionNamed, reach)
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (length_prefixed)
-import compiler.load (reachable_roots, LoadedAnalysis)
 import compiler.cc
 import compiler.check.resolve.tables (Diagnostic, error_at, error_with_labels, label_at)
 import machine
@@ -22,7 +25,7 @@ import std.sql (Dialect, Postgres, Sqlite, Operation, Reads, Writes, WritesRows,
                 Unsupported, RowMismatch, ValueMismatch)
 import std.value (Value, VBool, VCtor, VInt, VList, VRecord, VStr, field_named, constructor_name)
 import units
-import units (emit)
+import units (CodeProgram, emit)
 import compiler.syntax.parsing (span_between)
 
 pub const schema_type: Bytes = b"std.sql.Schema"
@@ -79,10 +82,10 @@ pub type StatementCheck = {
   dialect: Dialect,
   operation: Operation,
   label: Option<String>,
-  statement: Argument,
+  statement: Argument<Callee>,
   given: Option<List<Option<String>>>,
   row: Option<List<sql::Field>>,
-  schema: Option<ConstSite>,
+  schema: Option<IdentifiedSite<ConstSite>>,
 }
 
 pub type StatementError = { code: Bytes, at: Int, message: String }
@@ -93,33 +96,37 @@ pub type CheckResult = | Checked({ text: String, found: List<StatementError> }) 
 
 derive bin for CheckResult
 
-pub type CheckSite = { site: StatementSite, check: StatementCheck, schemas: List<ConstSite> }
+pub type CheckSite = {
+  site: StatementSite<Callee>,
+  check: StatementCheck,
+  identity: Option<Bytes>,
+  schemas: List<IdentifiedSite<ConstSite>>,
+}
 
-pub fn check_sites(frame: Frame) -> List<CheckSite> / {abort.raise} = {
-  let schemas = consts_of_type(frame, schema_type);
+pub fn check_sites(
+  sites: ProgramSites,
+  imports: List<List<Int>>,
+) -> List<CheckSite> / {abort.raise} = {
+  let schemas = sites.constants.filter(|c: IdentifiedSite<ConstSite>|
+    c.site.type_name == schema_type);
   let callees = statement_runners.map(|p: StatementRunner| p.callee);
-  let places = range(0, frame.outlines.len()).fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Int>, i: Int| accumulator.insert(frame.outlines.get(i).name, i),
-  );
-  let imports = frame.imports.map(|names: List<Bytes>|
-    names.fold([], |accumulator: List<Int>, n: Bytes|
-      match places.get(n) { Some(i) -> accumulator.push(i), None -> accumulator }));
-  frame.statements.filter(|site: StatementSite| callees.contains(site.callee)).fold(
+  sites.statements.filter(|site: StatementSite<Callee>| callees.contains(site.callee)).fold(
     [],
-    |accumulator: List<CheckSite>, site: StatementSite|
+    |accumulator: List<CheckSite>, site: StatementSite<Callee>|
       match statement_check_of(site) {
         None -> accumulator,
         Some(a) -> {
-          let reachable_modules = transitive_modules(imports, site.module);
-          let reachable_schemas = schemas.filter(|s: ConstSite|
-            reachable_modules.contains(s.module));
+          let reachable_modules = reached_modules(imports, [site.module]);
+          let reachable_schemas = schemas.filter(|s: IdentifiedSite<ConstSite>|
+            reachable_modules.contains(s.site.module));
+          let check = {
+            ..a,
+            schema: if reachable_schemas.len() == 1 { reachable_schemas.at(0) } else { None },
+          };
           accumulator.push({
             site: site,
-            check: {
-              ..a,
-              schema: if reachable_schemas.len() == 1 { reachable_schemas.at(0) } else { None },
-            },
+            check: check,
+            identity: statement_identity(check),
             schemas: reachable_schemas,
           })
         },
@@ -127,16 +134,7 @@ pub fn check_sites(frame: Frame) -> List<CheckSite> / {abort.raise} = {
   )
 }
 
-fn transitive_modules(imports: List<List<Int>>, module: Int) -> List<Int> =
-  range(0, imports.len()).fold([module], |seen: List<Int>, _: Int|
-    seen.fold(seen, |accumulator: List<Int>, m: Int|
-      List::fold(
-        match imports.at(m) { Some(xs) -> xs, None -> [] },
-        accumulator,
-        |more: List<Int>, x: Int| if more.contains(x) { more } else { more.push(x) },
-      )))
-
-fn statement_check_of(site: StatementSite) -> Option<StatementCheck> =
+fn statement_check_of(site: StatementSite<Callee>) -> Option<StatementCheck> =
   match statement_runners.find(|p: StatementRunner| p.callee == site.callee) {
     None -> None,
     Some(p) -> match site.args.at(p.statement) {
@@ -164,9 +162,12 @@ fn statement_check_of(site: StatementSite) -> Option<StatementCheck> =
     },
   }
 
-fn unwrap_bound(a: Argument) -> { statement: Argument, given: Option<List<Option<String>>> } =
+fn unwrap_bound(
+  a: Argument<Callee>,
+) -> { statement: Argument<Callee>, given: Option<List<Option<String>>> } =
   match a {
-    CallArgument(c) -> if c.callee != b"std.sqlite.bound" { { statement: a, given: None } } else {
+    CallArgument(c) -> if c.callee.name != b"std.sqlite.bound" { { statement: a, given: None } }
+    else {
       match c.args {
         [statement, params] -> { statement: statement, given: parameters_of(Some(params)) },
         _ -> { statement: a, given: None },
@@ -176,10 +177,10 @@ fn unwrap_bound(a: Argument) -> { statement: Argument, given: Option<List<Option
     _ -> { statement: a, given: None },
   }
 
-fn parameters_of(a: Option<Argument>) -> Option<List<Option<String>>> =
+fn parameters_of(a: Option<Argument<Callee>>) -> Option<List<Option<String>>> =
   match a { Some(ListArgument(items)) -> Some(items.map(param_of)), _ -> None }
 
-fn param_of(a: Argument) -> Option<String> =
+fn param_of(a: Argument<Callee>) -> Option<String> =
   match a {
     ConstructorArgument(c) -> if c.type_name == b"std.sql.Param" {
       Some(String::of_bytes_lossy(c.name))
@@ -208,37 +209,45 @@ fn scalar_kind(reader: Bytes) -> sql::FieldKind =
   else if reader == b"bytes_field" { sql::BytesField }
   else { sql::JsonField }
 
-fn argument_key(a: Argument, left: Int) -> Bytes / {abort.raise} =
-  if left <= 0 { b"?" } else {
-    match a {
-      TextArgument(b) -> b"t".concat(length_prefixed(b)),
-      CallArgument(c) ->
-        Bytes::concat_all([
-          b"c",
-          length_prefixed(c.callee),
-          length_prefixed(c.hash),
-          length_prefixed(ascii_of_int(c.args.len())),
-          Bytes::concat_all(c.args.map(|x: Argument| argument_key(x, left - 1))),
-        ]),
-      RowArgument(_) -> b"r",
-      TaggedArgument(t) ->
+fn joined_keys(keys: List<Option<Bytes>>) -> Option<Bytes> =
+  keys.fold(Some(b""), |all: Option<Bytes>, one: Option<Bytes>|
+    match ((all, one)) { (Some(a), Some(k)) -> Some(a.concat(k)), _ -> None })
+
+fn argument_key(a: Argument<Callee>) -> Option<Bytes> / {abort.raise} =
+  match a {
+    TextArgument(b) -> Some(b"t".concat(length_prefixed(b))),
+    CallArgument(c) -> match ((
+        run_identity(c.callee.identity),
+        joined_keys(c.args.map(argument_key)),
+      )) {
+      (Some(hash), Some(arguments)) ->
+        Some(
+          Bytes::concat_all([
+            b"c",
+            length_prefixed(c.callee.name),
+            length_prefixed(hash),
+            length_prefixed(ascii_of_int(c.args.len())),
+            arguments,
+          ]),
+        ),
+      _ -> None,
+    },
+    RowArgument(_) -> Some(b"r"),
+    TaggedArgument(t) ->
+      run_identity(t.callee.identity).map(|hash: Bytes|
         Bytes::concat_all([
           b"g",
-          length_prefixed(t.callee),
-          length_prefixed(t.hash),
+          length_prefixed(t.callee.name),
+          length_prefixed(hash),
           length_prefixed(ascii_of_int(t.parts.len())),
           Bytes::concat_all(t.parts.map(length_prefixed)),
-        ]),
-      ListArgument(items) ->
-        Bytes::concat_all([
-          b"l",
-          length_prefixed(ascii_of_int(items.len())),
-          Bytes::concat_all(items.map(|x: Argument| argument_key(x, left - 1))),
-        ]),
-      ConstructorArgument(c) ->
-        Bytes::concat_all([b"k", length_prefixed(c.type_name), length_prefixed(c.name)]),
-      OtherArgument -> b"o",
-    }
+        ])),
+    ListArgument(items) ->
+      joined_keys(items.map(argument_key)).map(|inner: Bytes|
+        Bytes::concat_all([b"l", length_prefixed(ascii_of_int(items.len())), inner])),
+    ConstructorArgument(c) ->
+      Some(Bytes::concat_all([b"k", length_prefixed(c.type_name), length_prefixed(c.name)])),
+    OtherArgument -> Some(b"o"),
   }
 
 fn operation_text(o: Operation) -> Bytes =
@@ -251,100 +260,113 @@ fn operation_text(o: Operation) -> Bytes =
 
 fn kind_key(k: sql::FieldKind) -> Bytes = Bytes::of_string(sql::field_text(k))
 
-pub fn check_result_key(toolchain: Bytes, a: StatementCheck) -> Bytes / {abort.raise} =
+pub fn check_result_key(toolchain: Bytes, identity: Bytes) -> Bytes / {abort.raise} =
   hex(
     blake3(
       Bytes::concat_all([
-        length_prefixed(b"ply statement judgement 3"),
+        length_prefixed(b"ply statement judgement 4"),
         length_prefixed(hex(bin::shape_digest(check_result_bin()))),
         length_prefixed(toolchain),
-        length_prefixed(match a.schema { Some(s) -> s.hash, None -> b"" }),
-        length_prefixed(match a.dialect { Postgres -> b"postgres", Sqlite -> b"sqlite" }),
-        length_prefixed(operation_text(a.operation)),
-        length_prefixed(match a.label { Some(l) -> Bytes::of_string(l), None -> b"\x00" }),
-        match a.given {
-          None -> length_prefixed(b"\x00"),
-          Some(given) ->
-            Bytes::concat_all(
-              given.map(|g: Option<String>|
-                length_prefixed(match g { Some(c) -> Bytes::of_string(c), None -> b"\x00" })),
-            ),
-        },
-        match a.row {
-          None -> length_prefixed(b"\x00"),
-          Some(fields) ->
-            Bytes::concat_all(
-              fields.map(|f: sql::Field|
-                length_prefixed(Bytes::of_string(f.name)).concat(
-                  length_prefixed(kind_key(f.kind)),
-                )),
-            ),
-        },
-        length_prefixed(argument_key(a.statement, 64)),
+        identity,
       ]),
     ),
   )
 
-fn callees_in(a: Argument, accumulator: List<Bytes>, left: Int) -> List<Bytes> =
-  if left <= 0 { accumulator } else {
-    match a {
-      CallArgument(c) ->
-        c.args.fold(
-          if accumulator.contains(c.callee) { accumulator } else { accumulator.push(c.callee) },
-          |more: List<Bytes>, x: Argument| callees_in(x, more, left - 1),
-        ),
-      TaggedArgument(t) -> if accumulator.contains(t.callee) { accumulator }
-      else { accumulator.push(t.callee) },
-      ListArgument(items) ->
-        items.fold(accumulator, |more: List<Bytes>, x: Argument| callees_in(x, more, left - 1)),
-      _ -> accumulator,
-    }
+fn schema_key(schema: Option<IdentifiedSite<ConstSite>>) -> Option<Bytes> =
+  match schema {
+    None -> Some(b"n"),
+    Some(s) -> run_identity(s.identity).map(|hash: Bytes| b"s".concat(length_prefixed(hash))),
+  }
+
+pub fn statement_identity(a: StatementCheck) -> Option<Bytes> / {abort.raise} =
+  match ((schema_key(a.schema), argument_key(a.statement))) {
+    (Some(schema), Some(statement)) ->
+      Some(
+        Bytes::concat_all([
+          length_prefixed(schema),
+          length_prefixed(match a.dialect { Postgres -> b"postgres", Sqlite -> b"sqlite" }),
+          length_prefixed(operation_text(a.operation)),
+          length_prefixed(match a.label { Some(l) -> Bytes::of_string(l), None -> b"\x00" }),
+          match a.given {
+            None -> length_prefixed(b"\x00"),
+            Some(given) ->
+              Bytes::concat_all(
+                given.map(|g: Option<String>|
+                  length_prefixed(match g { Some(c) -> Bytes::of_string(c), None -> b"\x00" })),
+              ),
+          },
+          match a.row {
+            None -> length_prefixed(b"\x00"),
+            Some(fields) ->
+              Bytes::concat_all(
+                fields.map(|f: sql::Field|
+                  length_prefixed(Bytes::of_string(f.name)).concat(
+                    length_prefixed(kind_key(f.kind)),
+                  )),
+              ),
+          },
+          length_prefixed(statement),
+        ]),
+      ),
+    _ -> None,
+  }
+
+fn callees_in(a: Argument<Callee>, accumulator: List<Bytes>) -> List<Bytes> =
+  match a {
+    CallArgument(c) ->
+      c.args.fold(
+        if accumulator.contains(c.callee.name) { accumulator }
+        else { accumulator.push(c.callee.name) },
+        |more: List<Bytes>, x: Argument<Callee>| callees_in(x, more),
+      ),
+    TaggedArgument(t) -> if accumulator.contains(t.callee.name) { accumulator }
+    else { accumulator.push(t.callee.name) },
+    ListArgument(items) ->
+      items.fold(accumulator, |more: List<Bytes>, x: Argument<Callee>| callees_in(x, more)),
+    TextArgument(_) -> accumulator,
+    RowArgument(_) -> accumulator,
+    ConstructorArgument(_) -> accumulator,
+    OtherArgument -> accumulator,
   }
 
 type Computed = | Known(Value) | Unknown | Stopped
 
 fn computed_value(
-  a: Argument,
-  left: Int,
+  a: Argument<Callee>,
   call: (String, List<Value>) -> CallResult / {entering::machine.enter, abort.raise},
 ) -> Computed / {entering::machine.enter, abort.raise} =
-  if left <= 0 { Unknown } else {
-    match a {
-      TextArgument(b) -> Known(VStr(String::of_bytes_lossy(b))),
-      ListArgument(items) -> match all_computed(items, left - 1, call) {
-        Ok(vs) -> Known(VList(vs)),
-        Err(c) -> c,
-      },
-      CallArgument(c) -> match all_computed(c.args, left - 1, call) {
-        Err(e) -> e,
-        Ok(args) -> computed_of(call(String::of_bytes_lossy(c.callee), args)),
-      },
-      TaggedArgument(t) -> {
-        let texts = t.parts.map(|p: Bytes| VStr(String::of_bytes_lossy(p)));
-        let tag_argument = match texts { [one] -> one, _ -> VList(texts) };
-        match computed_of(call(String::of_bytes_lossy(t.callee), [tag_argument])) {
-          Known(VCtor(name, [v])) -> if constructor_name(name) == "Ok" { Known(v) }
-          else { Unknown },
-          Stopped -> Stopped,
-          _ -> Unknown,
-        }
-      },
-      _ -> Unknown,
-    }
+  match a {
+    TextArgument(b) -> Known(VStr(String::of_bytes_lossy(b))),
+    ListArgument(items) -> match all_computed(items, call) {
+      Ok(vs) -> Known(VList(vs)),
+      Err(c) -> c,
+    },
+    CallArgument(c) -> match all_computed(c.args, call) {
+      Err(e) -> e,
+      Ok(args) -> computed_of(call(String::of_bytes_lossy(c.callee.name), args)),
+    },
+    TaggedArgument(t) -> {
+      let texts = t.parts.map(|p: Bytes| VStr(String::of_bytes_lossy(p)));
+      let tag_argument = match texts { [one] -> one, _ -> VList(texts) };
+      match computed_of(call(String::of_bytes_lossy(t.callee.name), [tag_argument])) {
+        Known(VCtor(name, [v])) -> if constructor_name(name) == "Ok" { Known(v) } else { Unknown },
+        Stopped -> Stopped,
+        _ -> Unknown,
+      }
+    },
+    RowArgument(_) -> Unknown,
+    ConstructorArgument(_) -> Unknown,
+    OtherArgument -> Unknown,
   }
 
 fn all_computed(
-  xs: List<Argument>,
-  left: Int,
+  xs: List<Argument<Callee>>,
   call: (String, List<Value>) -> CallResult / {entering::machine.enter, abort.raise},
 ) -> Result<List<Value>, Computed> / {entering::machine.enter, abort.raise} =
-  xs.fold(Ok([]), |accumulator: Result<List<Value>, Computed>, x: Argument|
+  xs.fold(Ok([]), |accumulator: Result<List<Value>, Computed>, x: Argument<Callee>|
     match accumulator {
       Err(_) -> accumulator,
-      Ok(vs) -> match computed_value(x, left, call) {
-        Known(v) -> Ok(vs.push(v)),
-        other -> Err(other),
-      },
+      Ok(vs) -> match computed_value(x, call) { Known(v) -> Ok(vs.push(v)), other -> Err(other) },
     })
 
 fn computed_of(called: CallResult) -> Computed =
@@ -353,46 +375,44 @@ fn computed_of(called: CallResult) -> Computed =
     Err(raised) -> if machine::is_timed_out(raised.diagnostic.code) { Stopped } else { Unknown },
   }
 
-pub fn check_statements(
-  analysis_for: (TestRunScope) -> LoadedAnalysis / {abort.raise},
-  frame: Frame,
+pub fn with_statement_checker<r>(
+  program: CodeProgram,
   statement_checks: List<StatementCheck>,
-) -> Result<List<Option<CheckResult>>, List<Diagnostic>> / {emit.unit, emit.compiled, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
+  body: ((StatementCheck) -> Option<CheckResult> / {entering::machine.enter, abort.raise}) -> r / {entering::machine.enter, abort.raise},
+) -> Result<r, List<Diagnostic>> / {emit.code, emit.libraries, entering::machine.open, entering::machine.enter, entering::machine.close, abort.raise} = {
   let schemas = statement_checks.fold([], |accumulator: List<Bytes>, a: StatementCheck|
     match a.schema {
-      Some(s) -> if accumulator.contains(s.name) { accumulator } else { accumulator.push(s.name) },
+      Some(s) -> if accumulator.contains(s.site.name) { accumulator }
+      else { accumulator.push(s.site.name) },
       None -> accumulator,
     });
   let named = statement_checks.fold(schemas, |accumulator: List<Bytes>, a: StatementCheck|
-    callees_in(a.statement, accumulator, 64));
+    callees_in(a.statement, accumulator));
   if named.len() == 0 {
-    Ok(
-      statement_checks.map(|a: StatementCheck|
-        Some(check_result_of(None, a, computed_text(a.statement)))),
-    )
+    Ok(body(|a: StatementCheck| Some(check_result_of(None, a, computed_text(a.statement)))))
   } else {
-    let reachable_functions = reach(frame.hashes, named.map(|n: Bytes| FunctionNamed(n))).functions;
-    let front = analysis_for({ owners: reachable_functions, tests: Map::new() });
-    match units::library_over(
-        emit.unit(front, reachable_roots(front, reachable_functions), None),
-        cc::development(),
-      ) {
+    match emit.libraries(emit.code(program, named.map(Named)), cc::development()) {
       Err(diagnostics) -> Err(diagnostics),
       Ok(library) -> match entering::machine.open(library) {
         Err(reason) -> Err([machine::unit_load_error(reason)]),
         Ok(opened) -> {
-          let roots = machine::roots_of(front.dump);
           let call = |name: String, args: List<Value>|
-            machine::machine_call(opened.unit, roots, name, args, machine::evaluation_limits);
+            machine::machine_call(
+              opened.unit,
+              program.roots,
+              name,
+              args,
+              machine::evaluation_limits,
+            );
           let declared = schemas.fold(
             Map::new(),
             |accumulator: Map<Bytes, Computed>, name: Bytes|
               accumulator.insert(name, computed_of(call(String::of_bytes_lossy(name), []))),
           );
-          let check_statements = statement_checks.map(|a: StatementCheck| {
-            match match a.schema { Some(s) -> declared.get(s.name), None -> None } {
+          let checked = body(|a: StatementCheck| {
+            match match a.schema { Some(s) -> declared.get(s.site.name), None -> None } {
               Some(Stopped) -> None,
-              schema_result -> match computed_value(a.statement, 64, call) {
+              schema_result -> match computed_value(a.statement, call) {
                 Stopped -> None,
                 value ->
                   Some(
@@ -406,14 +426,14 @@ pub fn check_statements(
             }
           });
           entering::machine.close(opened.unit);
-          Ok(check_statements)
+          Ok(checked)
         },
       },
     }
   }
 }
 
-fn computed_text(a: Argument) -> Option<Value> =
+fn computed_text(a: Argument<Callee>) -> Option<Value> =
   match a { TextArgument(b) -> Some(VStr(String::of_bytes_lossy(b))), _ -> None }
 
 fn check_result_of(
@@ -446,13 +466,13 @@ fn check_result_of(
 pub fn code_of(m: FindingKind) -> Bytes =
   match m {
     Unreadable -> b"E0431",
-    Undeclared -> b"E0433",
+    Undeclared -> undeclared_sql_name_code,
     LabelMismatch -> b"E0435",
     OperationMismatch -> b"E0436",
     RowMismatch -> b"E0437",
     ValueMismatch -> b"E0438",
     SelectStar -> b"E0447",
-    Unsupported -> b"E0470",
+    Unsupported -> unsupported_sql_code,
   }
 
 fn text_in(v: Option<Value>) -> Option<String> = match v { Some(VStr(s)) -> Some(s), _ -> None }
@@ -505,7 +525,7 @@ fn column_of(v: Value) -> Option<sql::Column> =
         field_named(fields, "ty"),
         field_named(fields, "nullable"),
       )) {
-      (Some(name), Some(ty), Some(VBool(nullable))) -> match column_type_of(ty, 8) {
+      (Some(name), Some(ty), Some(VBool(nullable))) -> match column_type_of(ty) {
         Some(t) -> Some({ name: name, ty: t, nullable: nullable, default: sql::DNone }),
         None -> None,
       },
@@ -514,7 +534,7 @@ fn column_of(v: Value) -> Option<sql::Column> =
     _ -> None,
   }
 
-fn column_type_of(v: Value, left: Int) -> Option<sql::ColumnType> =
+fn column_type_of(v: Value) -> Option<sql::ColumnType> =
   match v {
     VCtor(name, args) -> {
       let n = constructor_name(name);
@@ -525,12 +545,9 @@ fn column_type_of(v: Value, left: Int) -> Option<sql::ColumnType> =
       else if n == "TFloat" { Some(sql::FloatColumn) }
       else if n == "TJson" { Some(sql::JsonColumn) } else if n == "TNumeric" {
         match args { [VInt(p), VInt(s)] -> Some(sql::TNumeric(p, s)), _ -> None }
-      } else if n == "TArray" && left > 0 {
+      } else if n == "TArray" {
         match args {
-          [inner] -> match column_type_of(inner, left - 1) {
-            Some(t) -> Some(sql::TArray(t)),
-            None -> None,
-          },
+          [inner] -> match column_type_of(inner) { Some(t) -> Some(sql::TArray(t)), None -> None },
           _ -> None,
         }
       } else { None }
@@ -547,11 +564,11 @@ fn statement_of(v: Value) -> Option<String> =
     _ -> None,
   }
 
-fn source_of(a: Argument) -> Bytes =
+fn source_of(a: Argument<Callee>) -> Bytes =
   match a {
-    CallArgument(c) -> if c.callee == b"std.sql.statement_of" { b"the text written here" }
-    else { Bytes::concat_all([b"`", c.callee, b"()`"]) },
-    TaggedArgument(t) -> Bytes::concat_all([b"a tagged literal, read by `", t.callee, b"`"]),
+    CallArgument(c) -> if c.callee.name == b"std.sql.statement_of" { b"the text written here" }
+    else { Bytes::concat_all([b"`", c.callee.name, b"()`"]) },
+    TaggedArgument(t) -> Bytes::concat_all([b"a tagged literal, read by `", t.callee.name, b"`"]),
     _ -> b"the text written here",
   }
 
@@ -567,11 +584,11 @@ pub fn check_diagnostics(a: CheckSite, j: CheckResult) -> List<Diagnostic> / {ab
     Checked(check_statements) ->
       check_statements.found.map(|f: StatementError| {
         let schema = a.check.schema;
-        let schema_name = match schema { Some(s) -> s.name, None -> b"" };
+        let schema_name = match schema { Some(s) -> s.site.name, None -> b"" };
         let message = Bytes::of_string(f.message);
-        let headline = if f.code == b"E0433" {
+        let headline = if f.code == undeclared_sql_name_code {
           Bytes::concat_all([b"this statement ", message, b" in the schema `", schema_name, b"`"])
-        } else if f.code == b"E0470" {
+        } else if f.code == unsupported_sql_code {
           Bytes::concat_all([
             b"the SQL schema check does not support ",
             message,
@@ -634,15 +651,20 @@ pub fn schemas_rejected(check_sites: List<CheckSite>) -> List<Diagnostic> =
                   b"E0471",
                   Bytes::concat_all([
                     b"this statement's module uses two SQL schemas, `",
-                    first.name,
+                    first.site.name,
                     b"` and `",
-                    second.name,
+                    second.site.name,
                     b"`, and its statements are limited to one",
                   ]),
                   [
                     label_at(a.site.module, a.site.span, true, b"this call runs a statement"),
-                    label_at(first.module, first.span, false, b"a constant of `std.sql.Schema`"),
-                    label_at(second.module, second.span, false, b"another"),
+                    label_at(
+                      first.site.module,
+                      first.site.span,
+                      false,
+                      b"a constant of `std.sql.Schema`",
+                    ),
+                    label_at(second.site.module, second.site.span, false, b"another"),
                   ],
                   [
                     b"a statement is checked against the schema its module declares or imports; split the modules so each uses one",
@@ -655,10 +677,12 @@ pub fn schemas_rejected(check_sites: List<CheckSite>) -> List<Diagnostic> =
       },
   ).diagnostics
 
-fn a_site(callee: Bytes, args: List<Argument>) -> StatementSite =
+fn a_site(callee: Bytes, args: List<Argument<Callee>>) -> StatementSite<Callee> =
   { module: 0, span: span_between(3, 9), callee: callee, label: b"items", args: args }
 
-fn a_param(name: Bytes) -> Argument =
+fn unidentified(name: Bytes) -> Callee = { name: name, identity: NoRunIdentity }
+
+fn a_param(name: Bytes) -> Argument<Callee> =
   ConstructorArgument({ type_name: b"std.sql.Param", name: name })
 
 test "every operation and definition that runs a statement is declared in a statement module" {
@@ -670,7 +694,7 @@ test "every operation and definition that runs a statement is declared in a stat
 }
 
 test "`statement_check_of` reads a database call's query text, parameter types and result row fields from the arguments written at the call" {
-  let text = CallArgument({ callee: b"m.items_all", hash: b"h", args: [] });
+  let text = CallArgument({ callee: unidentified(b"m.items_all"), args: [] });
   let query = statement_check_of(
     a_site(b"std.db.db.query", [text, ListArgument([a_param(b"PInt"), OtherArgument])]),
   );
@@ -693,8 +717,7 @@ test "`statement_check_of` reads a database call's query text, parameter types a
     ]),
   );
   let bound = CallArgument({
-    callee: b"std.sqlite.bound",
-    hash: b"b",
+    callee: unidentified(b"std.sqlite.bound"),
     args: [text, ListArgument([a_param(b"PText")])],
   });
   assert_eq(
@@ -772,27 +795,23 @@ test "a schema is decoded from the value that evaluating its definition returns"
   )
 }
 
-test "a module's statements are checked against the schema it declares or imports, directly or indirectly" {
-  let imports = [[1], [2], [], [0], []];
-  assert_eq(transitive_modules(imports, 0), [0, 1, 2]);
-  assert_eq(transitive_modules(imports, 3), [3, 0, 1, 2]);
-  assert_eq(transitive_modules(imports, 4), [4]);
-  assert_eq(transitive_modules([[1], [0]], 1), [1, 0])
-}
-
 test "what the check found is reported at the call, naming the statement and the schema" {
-  let declared: ConstSite = { module: 0, span: span_between(0, 1), name: b"m.schema", hash: b"s" };
+  let declared: IdentifiedSite<ConstSite> = {
+    site: { module: 0, span: span_between(0, 1), name: b"m.schema", type_name: schema_type },
+    identity: NoRunIdentity,
+  };
   let a = {
     site: a_site(b"std.db.db.query", []),
     check: {
       dialect: Postgres,
       operation: Reads,
       label: Some("items"),
-      statement: CallArgument({ callee: b"m.items_all", hash: b"h", args: [] }),
+      statement: CallArgument({ callee: unidentified(b"m.items_all"), args: [] }),
       given: None,
       row: None,
       schema: Some(declared),
     },
+    identity: None,
     schemas: [declared],
   };
   let found = {
@@ -816,7 +835,10 @@ test "what the check found is reported at the call, naming the statement and the
     ],
   ]);
   assert_eq(check_diagnostics(a, Unchecked), []);
-  let twice = { ..a, schemas: [declared, { ..declared, name: b"n.schema" }] };
+  let twice = {
+    ..a,
+    schemas: [declared, { ..declared, site: { ..declared.site, name: b"n.schema" } }],
+  };
   assert_eq(schemas_rejected([twice, twice]).map(|d: Diagnostic| d.code), [b"E0471"]);
   assert_eq(schemas_rejected([a]), []);
   assert_eq(code_of(sql::Unsupported), b"E0470")

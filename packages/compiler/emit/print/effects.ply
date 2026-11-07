@@ -8,13 +8,13 @@ import compiler.emit.lower.base (type_of)
 import compiler.emit.typed_ir.handling (HandleOperation, Perform, Label, Parallel, CurrentSite,
                                         UnspecialisedBuiltin, WordArray, WordAt, SchedulerEvidence,
                                         UnhandledEvidence, Instance, VariableInitialize,
-                                        VariableRead, VariableWrite, Entering, AllocateForwarding,
-                                        SetForwarding, ObjectAt, EffectsMapping, Slot, ClauseSlot,
-                                        CopiedSlot, ForwardedSlot, KeyedSlot, KeyedCase,
-                                        ClauseEntry, ReturnsResult, Schedules, Resumes, Suspends,
-                                        Raises, Clause, HandleSite, HandleInstance, DetachedBody,
-                                        HeapInstance, InstanceAddress, Returning, raise_offset,
-                                        task_offset)
+                                        VariableRead, VariableTake, VariableWrite, Entering,
+                                        AllocateForwarding, SetForwarding, ObjectAt, EffectsMapping,
+                                        Slot, ClauseSlot, CopiedSlot, ForwardedSlot, KeyedSlot,
+                                        KeyedCase, ClauseEntry, ReturnsResult, Schedules, Resumes,
+                                        Suspends, Raises, Clause, HandleSite, HandleInstance,
+                                        DetachedBody, HeapInstance, InstanceAddress, Returning,
+                                        raise_offset, task_offset)
 import compiler.emit.abi (heap_instance_layout)
 import compiler.emit.print.text (operand, Printing, InstructionContext, line, pad, temp, named,
                                  name_of, arg_text, part_names, assigned, source_position, check,
@@ -23,7 +23,8 @@ import compiler.emit.print.value_printing (c_type, c_types, zeros, word_to_parts
                                            values_as_words, parts_read, arg_parts)
 import compiler.emit.print.calling (convention_of, typed_convention, typed_callee)
 import compiler.emit.print.count_functions (duplicate_function, call_text)
-import compiler.emit.lower.representation (representation_with, c_values_of, passing, ByValue,
+import compiler.emit.representations (ShapeReads)
+import compiler.emit.lower.representation (representation_of, c_values_of, passing, ByValue,
                                            ByReference, return_buffer_words)
 import compiler.emit.layout (header_bytes)
 
@@ -35,7 +36,7 @@ pub fn handle_opened(
   uses: OperationSignature,
   site: HandleSite,
   result: Variable,
-) -> Printing =
+) -> Printing / {ShapeReads} =
   match site.detached {
     Some(d) -> detached_opened(p, printing, args, site, d, result),
     None -> instance_opened(p, printing, args, site, result),
@@ -64,7 +65,7 @@ fn instance_opened(
   args: List<Arg>,
   site: HandleSite,
   result: Variable,
-) -> Printing = {
+) -> Printing / {ShapeReads} = {
   let i = site.instance;
   let a = result_declared(printing, site, result);
   let given = match returned_rep(printing, args, site) {
@@ -211,7 +212,7 @@ pub fn handle_closed(
   args: List<Arg>,
   site: HandleSite,
   result: Variable,
-) -> Printing =
+) -> Printing / {ShapeReads} =
   match site.detached {
     Some(_) -> printing,
     None -> instance_closed(p, printing, label, args, site, result),
@@ -224,7 +225,7 @@ fn instance_closed(
   args: List<Arg>,
   site: HandleSite,
   result: Variable,
-) -> Printing = {
+) -> Printing / {ShapeReads} = {
   let i = site.instance;
   let d = p.depth;
   let instance_word_at = |at: Int| instance_word(printing, args, i.operand, at);
@@ -421,13 +422,13 @@ fn clause_call(
   t: Type,
   from: ClauseInput,
   result: Variable,
-) -> List<Piece> = {
+) -> List<Piece> / {ShapeReads} = {
   let names = part_names(name_of(printing, result), result.representation);
   if preset {
     let words = match from { FromWords(w) -> w, FromValues(_) -> b"0" };
     [Text(Bytes::concat_all([nth(names, 0), b" = ply_uniform(ctx, ", f, b", ", words, b");"]))]
   } else {
-    let plain = convention_of(printing.constructors, match t {
+    let plain = convention_of(match t {
       FunctionType(x) -> { params: x.params, result_type: x.return_type },
       _ -> { params: [], result_type: t },
     });
@@ -507,13 +508,17 @@ fn stop_result(preset: Bool, w: Bytes, result: Variable, names: List<Bytes>) -> 
     )
   }
 
-fn returned_rep(printing: Printing, args: List<Arg>, site: HandleSite) -> Option<Representation> =
+fn returned_rep(
+  printing: Printing,
+  args: List<Arg>,
+  site: HandleSite,
+) -> Option<Representation> / {ShapeReads} =
   if site.instance.preset { None } else {
     match site.return_clause {
       None -> None,
       Some(r) -> match operand_type(args, r) {
         FunctionType(f) -> match f.params.at(0) {
-          Some(t) -> Some(representation_with(printing.constructors, t)),
+          Some(t) -> Some(representation_of(t)),
           None -> None,
         },
         _ -> None,
@@ -533,7 +538,7 @@ pub fn effect_operation(
   operation: HandleOperation,
   args: List<Arg>,
   uses: OperationSignature,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match operation {
     Perform(x) -> performed(p, printing, into, x, args),
     Label(name) -> match into {
@@ -700,6 +705,39 @@ pub fn effect_operation(
           ]),
         )
       },
+    },
+    VariableTake(at) -> {
+      let emptied = Bytes::concat_all([instance_word(printing, args, 0, at + 1), b" = 0;"]);
+      match into {
+        None ->
+          line(
+            printing,
+            p.depth,
+            Bytes::concat_all([
+              b"((const PlyType *)(intptr_t)",
+              instance_word(printing, args, 0, at + 1),
+              b")->dec(ctx, ",
+              instance_word(printing, args, 0, at),
+              b"); ",
+              emptied,
+            ]),
+          ),
+        Some(v) -> {
+          let n = named(printing, v);
+          line(
+            n.printing,
+            p.depth,
+            Bytes::concat_all([
+              b"Word ",
+              n.name,
+              b" = ",
+              instance_word(printing, args, 0, at),
+              b"; ",
+              emptied,
+            ]),
+          )
+        },
+      }
     },
     Returning -> {
       let value = match args.at(1) { Some(a) -> a, None -> IntOperand(0) };
@@ -879,7 +917,7 @@ fn tables_set(
   printing: Printing,
   args: List<Arg>,
   slots: List<Slot>,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   slots.fold(printing, |q: Printing, s: Slot|
     match s {
       KeyedSlot(k) -> {
@@ -949,7 +987,7 @@ fn object_at(
   at: Int,
   slots: List<Slot>,
   shared_from: Option<Int>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let word = |k: Int| instance_word(printing, args, 0, k);
   let set = |left: Bytes, right: Bytes| Bytes::concat_all([left, b" = ", right, b";"]);
   let flags = match shared_from {

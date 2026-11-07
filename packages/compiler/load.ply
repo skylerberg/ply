@@ -1,42 +1,40 @@
-import compiler.front.published (no_rows, dump_of)
-import compiler.front.rows (Dump, Rows, module_of, HashTableRow, DefinitionHashRow)
+import std.set (Set)
+import std.graph (Visit, traverse)
+import compiler.check.resolve.tables (error_unplaced)
+import compiler.front.published (dump_of)
+import compiler.front.rows (Dump, EmitterConstructor, module_of, HashTableRow, DefinitionHashRow)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected, view_dump)
-import compiler.front (ShippedInputs, analyse_pulling_std_with, checked_staged, dependencies_of,
-                       shipped_inputs_of, load_with_shipped, viewed_text, embed_inputs_of,
-                       shipped_bytes, EmbedRecord, embeds_wanted)
-import compiler.front.facts (ShippedModuleSummary, ModuleShape, assembled_load)
+import compiler.front (embed_inputs_of, shipped_bytes, EmbedRecord, embeds_wanted)
+import compiler.front.facts (ModuleShape, assembled_load, ToolchainTree, NoTree, toolchain_tree)
+import compiler.checkout (PartRole)
 import compiler.expand.embed (ModuleEmbed, EmbedBytesResult, EmbedResult, EmbedRequest, embed_file,
                               request_of_key)
-import compiler.store.hash.forms (FunctionNamed, HashOutput, ModuleHashes, joined_cached_hashes,
+import compiler.store.hash.forms (FunctionNamed, HashOutput, ModuleHashes, joined_module_hashes,
                                   reach)
 import compiler.store.hash.encoding (hex)
 import compiler.front.interface (imported)
 import compiler.store.memo
-import compiler.store.memo (Run, memo, memo_store, start_run)
-import compiler.store.memo_files
-import compiler.front.checking (CheckedModule, OwnPackage, LoadInputs, query_load, entry_hash,
-                                evaluator_of, hashed_all, lookup_input, packages_rejected,
-                                rejected_first, registry, root_warnings,
-                                checked_program_from_results, load_inputs_of, package_location_in)
-import compiler.front.checking.world (QueryEffects, CheckQuery, RunEffects, ModuleResult,
-                                      with_decode_cache)
-import compiler.expand.derive (DeriverRequest, DeriverResponse, Rejection, Generated, Declined,
-                               Failed, import_path, deriver_request_bin, deriver_response_bin)
-import compiler.syntax.items (header, parse, is_shipped)
+import compiler.store.memo (memo)
+import compiler.store.memo.engine (Run, in_session, reading)
+import compiler.front.checking.units (NoCode, entries_of, program_code, reached_codes,
+                                      roots_of_modules, unit_of_root)
+import compiler.store.database
+import compiler.front.checking (CheckedModule, OwnPackage, LoadInputs, query_load,
+                                placeholder_definitions, evaluator_of, hashed_all, lookup_input,
+                                reject_embed, packages_rejected, rejected_first, registry,
+                                root_warnings, checked_program_from_results, load_inputs_of,
+                                package_location_in, listed_module)
+import compiler.front.checking.world (CheckQueries, RunEffects, ModuleResult, with_decode_cache)
+import compiler.store.fact_store
 import compiler.cc
-import compiler.cc (compilers, toolchain)
-import std.bin
-import std.value
-import std.value (Value, VCtor, VStr, VRecord, VList)
-import compiler.front.checking.groups (queries)
-import compiler.front.pkg (PackageSources, SuppliedPackage, closure, git_spec, roots_wanted)
-import compiler.check.resolve.tables (Source, Diagnostic, Label, error_at)
+import compiler.front.pkg (PackageSources, SuppliedPackage, git_spec, dependency_roots)
+import compiler.check.resolve.tables (placed_in, place_module)
+import compiler.check.resolve.tables (Source, Diagnostic, Label)
 import compiler.unit
-import compiler.unit (shipped, shipped_runtime, emitted, pack_frame, declared_signature,
-                      requested_roots)
+import compiler.unit (UnitCode, shipped, shipped_runtime, code_rejections, pack_frame,
+                      declared_signature, program_output, requested_roots)
 import compiler.emit.abi (description, serving_runtime)
 import compiler.emit.keys (RootKey, Named, test_key)
-import compiler.store.records (Record)
 import compiler.check.infer.definitions (program_natives)
 import std.hash (blake3)
 import std.fs
@@ -44,7 +42,6 @@ import std.fs (fs, Listed, File, Dir, Missing, Symlink)
 import std.path (extension, is_absolute, join, normalize, parent)
 import std.list
 import compiler.prelude_source
-import compiler.syntax.parsing (no_module, dummy_span)
 
 pub type SourceFile = { path: String, name: String, text: Bytes }
 
@@ -73,7 +70,7 @@ fn joined(dir: String, name: String) -> String =
   if dir == "" || dir == "." { name } else if name == "" { dir } else { dir ++ "/" ++ name }
 
 fn load_error(message: String) -> Diagnostic =
-  error_at(b"E0502", no_module, dummy_span, Bytes::of_string(message), b"nothing to load", [])
+  error_unplaced(b"E0502", Bytes::of_string(message), b"nothing to load", [])
 
 const max_directory_depth: Int = 2048
 
@@ -145,7 +142,7 @@ fn package_at<[r]>(
   }
 }
 
-fn sources_of(files: List<SourceFile>) -> List<Source> =
+pub fn sources_of(files: List<SourceFile>) -> List<Source> =
   files.map(|f: SourceFile| { name: Bytes::of_string(f.name), source_text: f.text })
 
 fn supplied_of(package: Package) -> SuppliedPackage =
@@ -163,31 +160,32 @@ fn git_dependency_error(key: Bytes) -> Diagnostic =
 
 fn packages_of<[r]>(
   root: Package,
-) -> Result<List<Package>, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
-  iterate(Ok([]), 4096, |accumulator: Result<List<Package>, List<Diagnostic>>|
-    match accumulator {
-      Err(e) -> Stop(Err(e)),
-      Ok(read) -> {
-        let known = read.push(root).map(|p: Package| Bytes::of_string(p.root));
-        match roots_wanted(known, [root].concat(read).map(supplied_of)) {
-          [] -> Stop(Ok(read)),
-          next ->
-            Continue(
-              next.fold(Ok(read), |got: Result<List<Package>, List<Diagnostic>>, key: Bytes|
-                match got {
-                  Err(e) -> Err(e),
-                  Ok(so_far) -> match git_spec(key) {
-                    Some(_) -> Err([git_dependency_error(key)]),
-                    None -> match package_at[r](String::of_bytes(key)) {
-                      Err(e) -> Err(e),
-                      Ok(p) -> Ok(so_far.push(p)),
-                    },
-                  },
-                }),
-            ),
-        }
+) -> Result<List<Package>, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} = {
+  let program_root = Bytes::of_string(root.root);
+  let read = traverse([program_root], |key: Bytes| {
+    let package = if key == program_root { Ok(root) } else { dependency_at[r](key) };
+    {
+      value: package,
+      next: match package { Ok(p) -> dependency_roots(program_root, supplied_of(p)), Err(_) -> [] },
+    }
+  });
+  read.drop(1).fold(
+    Ok([]),
+    |accumulator: Result<List<Package>, List<Diagnostic>>, v: Visit<Bytes, Result<Package, List<Diagnostic>>>|
+      match accumulator {
+        Ok(packages) -> match v.value { Ok(p) -> Ok(packages.push(p)), Err(e) -> Err(e) },
+        Err(errors) -> match v.value { Ok(_) -> accumulator, Err(e) -> Err(errors.concat(e)) },
       },
-    })
+  )
+}
+
+fn dependency_at<[r]>(
+  key: Bytes,
+) -> Result<Package, List<Diagnostic>> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
+  match git_spec(key) {
+    Some(_) -> Err([git_dependency_error(key)]),
+    None -> package_at[r](String::of_bytes(key)),
+  }
 
 fn embed_target(file: String, path: String) -> String = normalize(join(parent(file), path))
 
@@ -325,10 +323,12 @@ pub type ProgramPackages = {
   main_package: Package,
   dependencies: List<Package>,
   packages: PackageSources,
+  tree: ToolchainTree,
 }
 
 pub fn read_packages<[r]>(
   root: String,
+  part: Option<PartRole>,
 ) -> Result<ProgramPackages, LoadFailure> / {fs.list_dir[r], fs.read_file[r], abort.raise} =
   match package_at[r](root) {
     Err(diagnostics) -> Err(load_failure(diagnostics)),
@@ -343,7 +343,12 @@ pub fn read_packages<[r]>(
             manifest: own.manifest,
             supplied: dependencies.map(supplied_of),
           };
-          Ok({ main_package: own, dependencies: dependencies, packages: packages })
+          Ok({
+            main_package: own,
+            dependencies: dependencies,
+            packages: packages,
+            tree: toolchain_tree(part),
+          })
         },
       }
     },
@@ -366,41 +371,44 @@ fn world_for(p: ProgramPackages) -> LoadInputs / {abort.raise} =
 fn shipped_module_text(name: Bytes) -> Option<Bytes> / {shipped.module} =
   shipped.module(String::of_bytes_lossy(name))
 
-fn open_memo_store<a, [r], [s]>(
-  p: ProgramPackages,
-  dir: String,
-  work: (Map<Bytes, CheckQuery>, LoadInputs, Run) -> { run: Run, value: a } / {RunEffects, abort.raise},
-) -> a / {shipped.read_pack, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.stamps, Derives, abort.raise} = {
-  let w = world_for(p);
-  let qs = query_registry();
-  let look = |kind: Bytes, at: Bytes|
+pub effect set ReadsShipped = {shipped.names, shipped.module, shipped.read_pack}
+
+pub effect set Loads = {ReadsShipped, shipped.stamps, shipped.definitions, shipped.runtime}
+
+fn looking_up<| e>(
+  w: LoadInputs,
+  read_embed: keep (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {ReadsShipped, abort.raise | e},
+) -> (Bytes, Bytes) -> Option<Bytes> / {ReadsShipped, abort.raise | e} =
+  |kind: Bytes, at: Bytes|
     lookup_input(
       w,
       shipped_module_text,
       shipped_module_text,
       || shipped.names().map(Bytes::of_string),
-      |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want),
-      |ask: Bytes| derivation_response(w, ask),
+      read_embed,
       kind,
       at,
-    );
-  if dir == "" {
-    memo::with_temporary_store(pack_frame, b"", look, ||
-      with_decode_cache(|| work(qs, w, start_run(qs)).value))
-  } else {
-    memo_files::with_memo_store[r](dir, pack_frame, b"", look, ||
-      with_decode_cache(|| work(qs, w, start_run(qs)).value))
-  }
+    )
+
+fn open_memo_store<a, [r], [s]>(
+  p: ProgramPackages,
+  dir: String,
+  work: (CheckQueries, LoadInputs, Run) -> { run: Run, value: a } / {RunEffects, abort.raise},
+) -> database::StoreOutcome<a> / {Loads, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
+  let w = world_for(p);
+  let read_embed = |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want);
+  let qs = query_registry();
+  database::with_opening[r](dir, |opening: fact_store::Opening|
+    database::with_opened_database[r](
+      opening,
+      pack_frame,
+      looking_up(w, read_embed),
+      |_: Bytes| (),
+      || with_decode_cache(|| in_session(qs, |run: Run| work(qs, w, run))),
+    ))
 }
 
-pub fn derivation_response(w: LoadInputs, at: Bytes) -> Option<Bytes> / {Derives, abort.raise} =
-  match bin::decode(at, deriver_request_bin()) {
-    Ok(ask) -> if value::decode(ask.declaration) == None { None }
-    else { Some(bin::encode(derivation_result(ask, w.texts), deriver_response_bin())) },
-    Err(_) -> None,
-  }
-
-fn query_registry() -> Map<Bytes, CheckQuery> / {shipped.definitions, shipped.stamps, abort.raise} =
+fn query_registry() -> CheckQueries / {shipped.definitions, shipped.stamps, abort.raise} =
   registry(shipped.definitions(), evaluator_of(Bytes::of_string(shipped.stamps())))
 
 pub type CheckResults = {
@@ -409,63 +417,69 @@ pub type CheckResults = {
   modules: List<ModuleHashes>,
 }
 
-fn check_modules(
-  qs: Map<Bytes, CheckQuery>,
-  w: LoadInputs,
-  run: Run,
-) -> { run: Run, value: CheckResults } / {RunEffects, abort.raise} = {
-  let all = query_load(qs, w.own, [], false, run);
-  let results = all.value.results;
-  let pulled = all.value.pulled;
-  if rejected_first(results).len() > 0 {
-    { run: all.run, value: { results: results, shipped_module_names: pulled, modules: [] } }
-  } else {
-    let fixed = hashed_all(qs, w.own, pulled, false, all.run);
-    {
-      run: fixed.run,
-      value: { results: results, shipped_module_names: pulled, modules: fixed.value },
-    }
+fn results_loaded(w: LoadInputs) -> CheckResults / {memo.read, abort.raise} = {
+  let all = query_load(w.own, [], false, listed_module);
+  {
+    results: all.results,
+    shipped_module_names: all.pulled,
+    modules: if rejected_first(all.results).len() > 0 { [] }
+    else { hashed_all(w.own, all.pulled, false) },
   }
 }
 
-pub fn check_results<[r], [s]>(
+type LoadedCode = { results: CheckResults, codes: Result<List<UnitCode>, List<Diagnostic>> }
+
+fn code_loaded(
+  w: LoadInputs,
+  wanted: (LoadInputs) -> List<RootKey> / {memo.read, abort.raise},
+) -> LoadedCode / {memo.read, abort.raise} = {
+  let results = results_loaded(w);
+  {
+    results: results,
+    codes: if rejected_first(results.results).len() > 0 { Ok([]) } else {
+      reached_codes(
+        program_code(entries_of(wanted(w).filter(|k: RootKey| unit_of_root(k, false) != NoCode))),
+      )
+    },
+  }
+}
+
+fn written_from<[s]>(
+  p: ProgramPackages,
+  loaded: LoadedCode,
+  tested: Bool,
+) -> Result<LoadedProgram, LoadFailure> / {shipped.module, shipped.runtime, fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} =
+  match checked_program[s](p, loaded.results, tested) {
+    Err(u) -> Err(u),
+    Ok(c) -> match match loaded.codes {
+        Err(failed) -> Err(failed),
+        Ok(codes) -> match code_rejections(shipped_runtime(), codes) {
+          [] -> Ok(codes),
+          rejected -> Err(rejected),
+        },
+      } {
+      Ok(codes) ->
+        Ok({
+          front: c.front,
+          parts: program_output(
+            codes,
+            c.front.dump.emitter_constructors.map(|e: EmitterConstructor| e.name),
+            c.front.dump.modules.len(),
+            c.front.inputs,
+          ).parts,
+        }),
+      Err(rejected) -> Err({ diagnostics: rejected, files: c.front.files }),
+    },
+  }
+
+pub fn program_written<[r], [s]>(
   p: ProgramPackages,
   dir: String,
-) -> CheckResults / {shipped.read_pack, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.stamps, Derives, abort.raise} =
-  open_memo_store[r, s](p, dir, |qs: Map<Bytes, CheckQuery>, w: LoadInputs, run: Run|
-    check_modules(qs, w, run))
-
-pub fn entry_hash_of<[r], [s]>(
-  p: ProgramPackages,
-  dir: String,
-  entry: Bytes,
-) -> Option<Bytes> / {shipped.read_pack, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.stamps, Derives, abort.raise} =
-  open_memo_store[r, s](p, dir, |qs: Map<Bytes, CheckQuery>, w: LoadInputs, run: Run| {
-    let h = entry_hash(qs, run, entry_module(entry), entry);
-    { run: h.run, value: h.hash }
-  })
-
-pub fn fresh_check_results<[s]>(
-  p: ProgramPackages,
-) -> CheckResults / {shipped.read_pack, fs.list_dir[s], fs.kind[s], fs.read_file[s], shipped.stamps, Derives, abort.raise} = {
-  let w = world_for(p);
-  let qs = query_registry();
-  memo::with_temporary_store(
-    pack_frame,
-    b"",
-    |kind: Bytes, at: Bytes|
-      lookup_input(
-        w,
-        shipped_module_text,
-        shipped_module_text,
-        || shipped.names().map(Bytes::of_string),
-        |k: Int, name: Bytes, want: EmbedRequest| package_embed[s](p, k, name, want),
-        |ask: Bytes| derivation_response(w, ask),
-        kind,
-        at,
-      ),
-    || with_decode_cache(|| check_modules(qs, w, start_run(qs)).value),
-  )
+  roots: List<RootKey>,
+) -> database::StoreOutcome<Result<LoadedProgram, LoadFailure>> / {Loads, fs.read[r], fs.write[r], fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
+  let loaded = open_memo_store[r, s](p, dir, |qs: CheckQueries, w: LoadInputs, run: Run|
+    reading(qs, run, || code_loaded(w, |_: LoadInputs| roots)));
+  { value: written_from[s](p, loaded.value, false), problems: loaded.problems }
 }
 
 fn pulled_texts(pulled: List<Bytes>) -> Map<Bytes, Bytes> / {shipped.module, abort.raise} =
@@ -474,12 +488,6 @@ fn pulled_texts(pulled: List<Bytes>) -> Map<Bytes, Bytes> / {shipped.module, abo
       Some(text) -> accumulator.insert(n, imported(text)),
       None -> accumulator,
     })
-
-fn entry_module(entry: Bytes) -> Bytes / {abort.raise} = {
-  let k = range(0, entry.len()).fold(0 - 1, |accumulator: Int, i: Int|
-    if entry.at(i) == 46 { i } else { accumulator });
-  if k < 0 { b"" } else { entry.slice(0, k) }
-}
 
 fn rejections(
   results: List<CheckedModule>,
@@ -499,10 +507,7 @@ fn rejections(
           f"`{String::of_bytes_lossy(a.module)}` has errors, but the program has no source file for that module, so the errors cannot be reported",
         ),
     };
-    accumulator.concat(
-      a.result.rejected.map(|d: Diagnostic|
-        { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
-    )
+    accumulator.concat(a.result.rejected.map(|d: Diagnostic| placed_in(d, i)))
   })
 }
 
@@ -510,9 +515,8 @@ pub fn checked_program<[s]>(
   p: ProgramPackages,
   check_modules: CheckResults,
   tested: Bool,
-) -> Result<CheckedProgram, LoadFailure> / {shipped.names, shipped.module, shipped.report_view_used, fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
+) -> Result<CheckedProgram, LoadFailure> / {shipped.module, fs.list_dir[s], fs.kind[s], fs.read_file[s], abort.raise} = {
   let texts = pulled_texts(check_modules.shipped_module_names);
-  let files_below = shipped.names().map(Bytes::of_string);
   let mine = indexed_sources(
     p.main_package,
     p.dependencies,
@@ -527,7 +531,7 @@ pub fn checked_program<[s]>(
     p.packages,
     p.main_package.files.map(|f: SourceFile| Bytes::of_string(f.name)),
     modules,
-    files_below,
+    p.tree,
   );
   match if packaged.len() > 0 { packaged } else { rejections(results, mine, world_for(p).own) } {
     [] -> {
@@ -536,9 +540,9 @@ pub fn checked_program<[s]>(
         p.packages,
         results.fold(Map::new(), |accumulator: Map<Bytes, ModuleShape>, a: CheckedModule|
           accumulator.insert(a.module, a.result.shape)),
-        joined_cached_hashes(check_modules.modules),
+        joined_module_hashes(check_modules.modules),
         check_modules.shipped_module_names,
-        files_below,
+        p.tree,
         texts,
         tested,
         true,
@@ -550,8 +554,7 @@ pub fn checked_program<[s]>(
         results.fold(Map::new(), |accumulator: Map<Bytes, ModuleResult>, a: CheckedModule|
           accumulator.insert(a.module, a.result)),
       );
-      report_viewed(loaded.views, true);
-      let dump = view_dump(view, None);
+      let dump = view_dump(view);
       let w = world_for(p);
       let read = |e: ModuleEmbed|
         match package_location_in(w, e.module) {
@@ -579,113 +582,13 @@ pub fn checked_program<[s]>(
   }
 }
 
-pub fn shipped_for(
-  user: List<Source>,
-  packages: PackageSources,
-) -> ShippedInputs / {shipped.names, shipped.module, abort.raise} = {
-  let check_in_memory = |name: Bytes| shipped.module(String::of_bytes_lossy(name));
-  let read = |name: Bytes|
-    match check_in_memory(name) { Some(text) -> Some(imported(text)), None -> None };
-  shipped_inputs_of(
-    user,
-    packages,
-    shipped.names().map(Bytes::of_string),
-    read,
-    check_in_memory,
-    dependencies_of,
-  )
-}
+pub fn every_root(front: LoadedAnalysis) -> List<RootKey> = requested_roots(front.dump)
 
-pub fn report_viewed(
-  viewed: List<ShippedModuleSummary>,
-  pulled: Bool,
-) -> Unit / {shipped.report_view_used} =
-  if viewed.len() == 0 { () } else { shipped.report_view_used(viewed_text(viewed), pulled) }
-
-fn texts_of(shipped_sources: List<Source>) -> Map<Bytes, Bytes> =
-  shipped_sources.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, source: Source|
-    accumulator.insert(source.name, source.source_text))
-
-pub type InMemoryAnalysis = { out: AnalysisOutcome, files: List<SourceFile> }
-
-fn input_bytes(inputs: Map<Bytes, Bytes>, want: EmbedRequest) -> Option<Bytes> / {abort.raise} =
-  if want.dir || want.path.len() != 64 { None }
-  else { inputs.get(Bytes::of_hex(String::of_bytes(want.path))) }
-
-fn input_read(inputs: Map<Bytes, Bytes>, want: EmbedRequest) -> EmbedResult / {abort.raise} =
-  match input_bytes(inputs, want) {
-    Some(b) -> Ok([embed_file(b"", b)]),
-    None -> Err(b"the program was given no input file whose hash matches the requested file"),
-  }
-
-pub fn analyse_in_memory(
-  files: List<SourceFile>,
-  inputs: Map<Bytes, Bytes>,
-) -> InMemoryAnalysis / {shipped.names, shipped.module, shipped.report_view_used, abort.raise} = {
-  let packages = { root: b"", manifest: None, supplied: [] };
-  let shipping = shipped_for(sources_of(files), packages);
-  let own = { root: "", manifest: None, files: files };
-  let pulled = analyse_pulling_std_with(
-    sources_of(files),
-    shipping.sources,
-    no_rows,
-    packages,
-    embeds: embeds_wanted(b"", sources_of(files)).map(|e: EmbedRecord|
-      { ..e, read: input_read(inputs, e.want) }),
-    unread: shipping.unread,
-    data: shipping.data,
-  );
-  report_viewed(pulled.shipped_views, true);
-  { out: pulled.out, files: indexed_sources(own, [], pulled.pulled, texts_of(shipping.sources)) }
-}
-
-pub fn check_in_memory(
-  files: List<SourceFile>,
-  inputs: Map<Bytes, Bytes>,
-) -> Result<LoadedAnalysis, LoadFailure> / {shipped.names, shipped.module, shipped.report_view_used, abort.raise} = {
-  let returned = analyse_in_memory(files, inputs);
-  let own = files.fold(Map::new(), |accumulator: Map<Bytes, Bool>, f: SourceFile|
-    accumulator.insert(Bytes::of_string(f.name), true));
-  match returned.out {
-    Rejected(diagnostics) -> Err({ diagnostics: diagnostics, files: returned.files }),
-    Analysed(w) -> {
-      let dump = dump_of(Analysed(w));
-      match embed_inputs_of(dump.embeds, |e: ModuleEmbed|
-          if !own.contains(e.module) {
-            shipped_bytes(e.module, e.key, shipped_module_text, shipped_module_text)
-          } else {
-            match input_bytes(inputs, request_of_key(e.key)) {
-              Some(b) -> Ok([{ name: b"", bytes: b }]),
-              None ->
-                Err(b"the program was given no input file whose hash matches the requested file"),
-            }
-          }) {
-        Err(diagnostics) -> Err({ diagnostics: diagnostics, files: returned.files }),
-        Ok(inputs) ->
-          Ok({
-            dump: dump,
-            files: returned.files,
-            inputs: inputs,
-            read_ms: 0,
-            front_end_ms: 0,
-            store_ms: 0,
-            cached: false,
-          }),
-      }
-    },
-  }
-}
-
-pub fn every_root(front: LoadedAnalysis) -> List<RootKey> / {abort.raise} =
-  requested_roots(front.dump).keys
-
-fn named_roots(every: List<RootKey>, reached: Map<Bytes, Bool>) -> List<RootKey> =
+fn named_roots(every: List<RootKey>, reached: Set<Bytes>) -> List<RootKey> =
   every.filter(|k: RootKey| match k { Named(n) -> reached.contains(n), _ -> false })
 
-pub fn reachable_roots(
-  front: LoadedAnalysis,
-  reached: Map<Bytes, Bool>,
-) -> List<RootKey> / {abort.raise} = named_roots(every_root(front), reached)
+pub fn reachable_roots(front: LoadedAnalysis, reached: Set<Bytes>) -> List<RootKey> =
+  named_roots(every_root(front), reached)
 
 pub fn entry_roots(
   front: LoadedAnalysis,
@@ -696,379 +599,55 @@ pub fn entry_roots(
     front,
     entries.fold(
       reach(hashes, entries.map(FunctionNamed)).functions,
-      |reached: Map<Bytes, Bool>, entry: Bytes| reached.insert(entry, true),
+      |reached: Set<Bytes>, entry: Bytes| reached.insert(entry),
     ),
   )
 
 test "a program offers what its entries reach, never a test, law or clause" {
   let every = [Named(b"m.main"), Named(b"m.helper"), Named(b"m.unused"), test_key(b"m", b"t")];
-  assert_eq(named_roots(every, Map::new().insert(b"m.main", true).insert(b"m.helper", true)), [
+  assert_eq(named_roots(every, Set::empty().insert(b"m.main").insert(b"m.helper")), [
     Named(b"m.main"),
     Named(b"m.helper"),
   ])
 }
 
-pub fn load<[r]>(
+pub fn load<[r], [d]>(
   root: String,
-) -> Result<LoadedProgram, List<Diagnostic>> / {fs.list_dir[r], fs.kind[r], fs.read_file[r], shipped.read_pack, shipped.stamps, Derives, abort.raise} =
-  match read_packages[r](root) {
+  part: Option<PartRole>,
+  store: String,
+) -> Result<LoadedProgram, List<Diagnostic>> / {fs.read[d], fs.write[d], fs.list_dir[r], fs.kind[r], fs.read_file[r], Loads, abort.raise} =
+  match read_packages[r](root, part) {
     Err(u) -> Err(u.diagnostics),
-    Ok(p) -> match checked_program[r](p, fresh_check_results[r](p), true) {
-      Err(u) -> Err(u.diagnostics),
-      Ok(c) -> match unit::unit_parts(
-          c.front.dump,
-          emitted(
-            shipped_runtime(),
-            c.front.dump,
-            c.front.files.map(|f: SourceFile| f.text),
-            c.front.inputs,
-            every_root(c.front),
-            |_: Bytes| None,
-            |_: List<Record>| (),
-          ),
-        ) {
-        Err(diagnostics) -> Err(diagnostics),
-        Ok(parts) -> Ok({ front: c.front, parts: parts }),
-      },
+    Ok(p) -> {
+      let loaded = open_memo_store[d, r](p, store, |qs: CheckQueries, w: LoadInputs, run: Run|
+        reading(qs, run, || code_loaded(w, |r: LoadInputs| roots_of_modules(r.own))));
+      match written_from[r](p, loaded.value, true) { Err(u) -> Err(u.diagnostics), Ok(l) -> Ok(l) }
     },
-  }
-
-pub effect set Derives = {shipped.names, shipped.module, shipped.digests, shipped.report_view_used, shipped.definitions, shipped.runtime, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write}
-
-type DeriverModule = { name: Bytes, text: Bytes }
-
-pub fn derivation_result(
-  ask: DeriverRequest,
-  own: Map<Bytes, Bytes>,
-) -> DeriverResponse / {Derives, abort.raise} = {
-  let modules = deriver_modules(ask.module, own);
-  let deriver = deriver_key(ask.module, modules);
-  let path = "derived/" ++ String::of_bytes(hex(blake3(deriver.concat(ask.declaration))));
-  match match toolchain.read_file(path) {
-      Some(b) -> match bin::decode(b, deriver_response_bin()) { Ok(a) -> Some(a), Err(_) -> None },
-      None -> None,
-    } {
-    Some(a) -> a,
-    None -> {
-      let ran = run_derivation(ask, deriver, modules);
-      if ran.keep {
-        let _ = toolchain.write_file(path, bin::encode(ran.result, deriver_response_bin()));
-        ()
-      };
-      ran.result
-    },
-  }
-}
-
-fn deriver_key(module: Bytes, modules: List<DeriverModule>) -> Bytes / {Derives, abort.raise} =
-  blake3(
-    Bytes::concat_all([
-      blake3(shipped.definitions()),
-      shipped_runtime().identity,
-      blake3(shipped.digests()),
-      module,
-      b"\x00",
-      Bytes::concat_all(
-        modules.map(|r: DeriverModule| Bytes::concat_all([r.name, b"\x00", blake3(r.text)])),
-      ),
-    ]),
-  )
-
-fn deriver_modules(module: Bytes, own: Map<Bytes, Bytes>) -> List<DeriverModule> / {abort.raise} =
-  iterate(
-    { seen: [], frontier: [module] },
-    own.len() + 1,
-    |walk: { seen: List<DeriverModule>, frontier: List<Bytes> }| {
-      let fresh = walk.frontier.fold([], |accumulator: List<DeriverModule>, name: Bytes|
-        match if is_shipped(name) { None } else { own.get(name) } {
-          Some(text) -> if walk.seen.concat(accumulator).any(|module: DeriverModule|
-              module.name == name) { accumulator }
-          else { accumulator.push({ name: name, text: text }) },
-          None -> accumulator,
-        });
-      if fresh.len() == 0 { Stop(walk) } else {
-        Continue({
-          seen: walk.seen.concat(fresh),
-          frontier: fresh.fold([], |accumulator: List<Bytes>, module: DeriverModule| {
-            let imports = match header(module.text) {
-              Some(head) -> head.imports,
-              None -> parse(module.text).node.imports,
-            };
-            accumulator.concat(imports.map(import_path))
-          }),
-        })
-      }
-    },
-  ).seen
-
-fn derivation_source(deriver: Bytes) -> Bytes =
-  Bytes::concat_all([
-    b"import std.derive\nimport ",
-    deriver,
-    b" as deriver\n\npub fn derived(declaration: derive::Declaration) -> Result<String, derive::Refused> / {abort.raise} =\n  deriver::derive(declaration)\n",
-  ])
-
-type DerivationRun = { result: DeriverResponse, keep: Bool }
-
-fn unran(code: Bytes, message: Bytes, notes: List<Bytes>) -> DeriverResponse =
-  Failed({ code: code, message: message, notes: notes })
-
-fn diagnostic_line(d: Diagnostic) -> Bytes = Bytes::concat_all([d.code, b": ", d.message])
-
-fn run_derivation(
-  ask: DeriverRequest,
-  deriver: Bytes,
-  modules: List<DeriverModule>,
-) -> DerivationRun / {Derives, abort.raise} = {
-  let name = derivation_name(modules);
-  match deriver_library(ask.module, deriver, name, modules) {
-    Err(ran) -> ran,
-    Ok(library) ->
-      derivation_run_of(
-        ask,
-        shipped.run_root(
-          toolchain.cache() ++ "/" ++ library,
-          String::of_bytes(derived_root(name)),
-          ask.declaration,
-          unit::entered_timeout_ms,
-        ),
-      ),
-  }
-}
-
-fn derivation_name(modules: List<DeriverModule>) -> Bytes / {abort.raise} =
-  iterate(b"derivation", modules.len() + 1, |n: Bytes|
-    if modules.any(|r: DeriverModule| r.name == n) { Continue(n.concat(b"_")) } else { Stop(n) })
-
-fn derived_root(name: Bytes) -> Bytes = name.concat(b".derived")
-
-fn deriver_library(
-  module: Bytes,
-  deriver: Bytes,
-  name: Bytes,
-  modules: List<DeriverModule>,
-) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
-  let library_record = "derivers/" ++ String::of_bytes(hex(deriver));
-  match toolchain.read_file(library_record) {
-    Some(library) -> {
-      let path = String::of_bytes(library);
-      if toolchain.exists(path) { Ok(path) }
-      else { compile_deriver(module, library_record, name, modules) }
-    },
-    None -> compile_deriver(module, library_record, name, modules),
-  }
-}
-
-fn compile_deriver(
-  module: Bytes,
-  library_record: String,
-  name: Bytes,
-  modules: List<DeriverModule>,
-) -> Result<String, DerivationRun> / {Derives, abort.raise} = {
-  let files = modules.map(|r: DeriverModule|
-    {
-      path: String::of_bytes(r.name) ++ ".ply",
-      name: String::of_bytes(r.name),
-      text: r.text,
-    }).push({
-    path: String::of_bytes(name) ++ ".ply",
-    name: String::of_bytes(name),
-    text: derivation_source(module),
-  });
-  let rejected = |diagnostics: List<Diagnostic>|
-    Err({
-      result: unran(
-        b"E0160",
-        Bytes::concat_all([b"`", module, b"` cannot be run by `derive`"]),
-        [
-          b"a module run by `derive` must declare `pub fn derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`, the only effect it may perform is raising, and none of the modules it depends on may use `derive`",
-        ].concat(
-          diagnostics.map(diagnostic_line),
-        ),
-      ),
-      keep: true,
-    });
-  let unkept = |reason: Bytes, notes: List<Bytes>|
-    Err({ result: unran(b"E0155", reason, notes), keep: false });
-  match check_in_memory(files, Map::new()) {
-    Err(u) -> rejected(u.diagnostics),
-    Ok(front) -> {
-      let roots = every_root(front);
-      let emission = emitted(
-        shipped_runtime(),
-        front.dump,
-        front.files.map(|f: SourceFile| f.text),
-        front.inputs,
-        roots,
-        |_: Bytes| None,
-        |_: List<Record>| (),
-        entered: Some([Named(derived_root(name))]),
-      );
-      match unit::unit_parts(front.dump, emission) {
-        Err(diagnostics) -> rejected(diagnostics),
-        Ok(parts) -> if compilers.find[cc]() == None {
-          unkept(b"no C compiler is found to run the deriver", [])
-        } else {
-          match match unit::cache_parts(parts) {
-              Err(reason) -> Err(reason),
-              Ok(sources) -> cc::library[cc](cc::development(), sources),
-            } {
-            Err(reason) ->
-              unkept(b"the deriver's program did not compile", [Bytes::of_string(reason)]),
-            Ok(l) -> {
-              let library = cache_relative(l);
-              if toolchain.write_file(library_record, Bytes::of_string(library)) { Ok(library) }
-              else {
-                unkept(b"the deriver's program could not be saved in the toolchain's cache", [])
-              }
-            },
-          }
-        },
-      }
-    },
-  }
-}
-
-pub fn cache_relative(path: String) -> String / {toolchain.read, abort.raise} = {
-  let cache = toolchain.cache();
-  if path.starts_with(cache ++ "/") { path.slice(cache.len() + 1, path.len()) } else { path }
-}
-
-fn derivation_run_of(ask: DeriverRequest, returned: Option<Bytes>) -> DerivationRun = {
-  let failed = {
-    result: unran(
-      b"E0155",
-      Bytes::concat_all([b"the deriver `", ask.module, b"` raised or did not finish in time"]),
-      [
-        Bytes::concat_all([
-          b"a deriver has ",
-          Bytes::of_string(unit::entered_timeout_ms.to_string()),
-          b" ms of wall clock, and a deriver that raises produces no output",
-        ]),
-      ],
-    ),
-    keep: returned != None,
-  };
-  match returned.and_then(value::decode) {
-    Some(VCtor(c, [VStr(text)])) -> if value::constructor_name(c) == "Ok" {
-      { result: Generated(Bytes::of_string(text)), keep: true }
-    } else { failed },
-    Some(VCtor(c, [VRecord(fields)])) -> if value::constructor_name(c) != "Err" { failed } else {
-      match rejected_of(fields) { Some(r) -> { result: Declined(r), keep: true }, None -> failed }
-    },
-    _ -> failed,
-  }
-}
-
-fn rejected_of(fields: List<value::Field>) -> Option<Rejection> =
-  match ((
-      value::field_named(fields, "message"),
-      value::field_named(fields, "at"),
-      value::field_named(fields, "notes"),
-    )) {
-    (Some(VStr(message)), Some(VCtor(at, check_in_memory)), Some(VList(notes))) -> {
-      let texts = notes.fold(Some([]), |accumulator: Option<List<Bytes>>, n: Value|
-        match ((accumulator, n)) {
-          (Some(xs), VStr(t)) -> Some(xs.push(Bytes::of_string(t))),
-          _ -> None,
-        });
-      let place = match check_in_memory {
-        [VStr(p)] -> Some(Some(Bytes::of_string(p))),
-        [] -> Some(None),
-        _ -> None,
-      };
-      match ((texts, place)) {
-        (Some(ns), Some(p)) -> if value::constructor_name(at) == "Some"
-            || value::constructor_name(at) == "None" {
-          Some({ message: Bytes::of_string(message), at: p, notes: ns })
-        } else { None },
-        _ -> None,
-      }
-    },
-    _ -> None,
   }
 
 const bare_runtime: Bytes =
   description(serving_runtime(b"", program_natives([]).map(declared_signature)))
 
-const listed_queries: Bytes =
-  Bytes::concat_all(
-    queries().map(
-      |q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
-        Bytes::concat_all([q.definition, b" ", hex(blake3(q.definition)), b"\n"]),
-    ),
-  )
-
 fn loaded_from(
   files: List<{ path: String, body: Bytes }>,
   names: List<String> = [],
 ) -> Result<LoadedProgram, List<Diagnostic>> / {abort.raise} = {
-  let tree = fs::mem_of(files);
   handle {
-    forbid_derivers(|| load[t]("p"))
+    fs::on_mem[t](fs::mem_of(files), ||
+      in_memory_store(|| load[t, memory]("p", None, "memo"))).value
   } with {
-    fs.list_dir[t](path) -> fs::mem_list(tree, path),
-    fs.kind[t](path) -> fs::mem_kind(tree, path),
-    fs.read_file[t](path) -> fs::mem_read(tree, path),
     shipped.names() -> names.push("std.prelude"),
     shipped.module(name) -> prelude_named(name),
-    shipped.report_view_used(view, pulled) -> (),
     shipped.runtime() -> bare_runtime,
-    shipped.read_pack(path, offset, len) -> None,
-    shipped.definitions() -> listed_queries,
+    shipped.read_pack(part) -> None,
+    shipped.definitions() -> placeholder_definitions,
     shipped.stamps() -> "",
   }
 }
 
-test "a derivation request naming a declaration that is not a value returns nothing and runs no derive function" {
-  let w = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  let ask = { module: b"std.derive.map", declaration: b"no value" };
-  assert_eq(
-    forbid_derivers(|| derivation_response(w, bin::encode(ask, deriver_request_bin()))),
-    None,
-  )
-}
-
-test "`deriver_modules` returns the project's own modules that a deriver module imports, directly or through other modules, and no standard library modules" {
-  let reach = |own: Map<Bytes, Bytes>, module: Bytes|
-    deriver_modules(module, own).map(|module: DeriverModule| module.name);
-  assert_eq(reach(Map::new(), b"std.derive.map"), []);
-  let own = Map::new().insert(
-    b"app.deriver",
-    b"import std.derive\nimport std.list\nimport std.option\nimport app.helper\n",
-  ).insert(
-    b"app.helper",
-    b"import std.bytes\nimport app.deriver\n",
-  );
-  assert_eq(reach(own, b"app.deriver"), [b"app.deriver", b"app.helper"]);
-  assert_eq(reach(own.insert(b"std.derive.map", b"import std.derive\n"), b"std.derive.map"), [])
-}
-
-pub fn forbid_derivers<a | e>(
-  work: () -> a / {shipped.digests, shipped.run_root, compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, abort.raise | e},
-) -> a / {abort.raise | e} =
-  handle {
-    work()
-  } with {
-    shipped.digests() -> panic("a test's load runs no deriver"),
-    shipped.run_root(library, root, arguments, timeout_ms) ->
-      panic("a test's load runs no deriver"),
-    compilers.find[cc]() -> panic("a test's load runs no deriver"),
-    compilers.start[cc](args) -> panic("a test's load runs no deriver"),
-    compilers.wait[cc](job) -> panic("a test's load runs no deriver"),
-    toolchain.cache() -> panic("a test's load runs no deriver"),
-    toolchain.reuse_dir() -> panic("a test's load runs no deriver"),
-    toolchain.bodies_dir() -> panic("a test's load runs no deriver"),
-    toolchain.exists(path) -> panic("a test's load runs no deriver"),
-    toolchain.read_file(path) -> panic("a test's load runs no deriver"),
-    toolchain.write_file(path, bytes) -> panic("a test's load runs no deriver"),
-    toolchain.rename(from, to) -> panic("a test's load runs no deriver"),
-    toolchain.append(path, bytes) -> panic("a test's load runs no deriver"),
-    toolchain.temp_dir() -> panic("a test's load runs no deriver"),
-    toolchain.remove_tree(dir) -> panic("a test's load runs no deriver"),
-    toolchain.libraries() -> panic("a test's load runs no deriver"),
-    toolchain.run(path, args) -> panic("a test's load runs no deriver"),
-  }
+fn in_memory_store<a | e>(
+  work: () -> a / {fs.read[memory], fs.write[memory] | e},
+) -> a / {abort.raise | e} = fs::on_mem[memory](fs::mem_empty(), work).value
 
 fn prelude_named(name: String) -> Option<Bytes> =
   if name == "std.prelude" { Some(prelude_source::text) } else { None }
@@ -1186,10 +765,10 @@ test "an error in a dependency's module is reported against the dependency's own
     ]) {
     Ok(_) -> panic("the dependency rejects"),
     Err(diagnostics) -> {
-      let labelled = diagnostics.fold([], |accumulator: List<Int>, d: Diagnostic|
-        accumulator.concat(d.labels.map(|l: Label| l.module)));
+      let labelled = diagnostics.fold([], |accumulator: List<Option<Int>>, d: Diagnostic|
+        accumulator.concat(d.labels.map(|l: Label| place_module(l.place))));
       assert(labelled.len() > 0);
-      assert_eq(labelled.filter(|m: Int| m != 1), [])
+      assert_eq(labelled.filter(|m: Option<Int>| m != Some(1)), [])
     },
   }
 }
@@ -1220,56 +799,10 @@ test "a module can embed a file next to it: the loaded program records the file'
   }
 }
 
-fn definition_hash(d: Dump, name: Bytes) -> Option<Bytes> =
-  d.hashes.fold(None, |accumulator: Option<Bytes>, f: HashTableRow|
-    match f {
-      DefinitionHashRow(r) -> if r.name == name { r.definition } else { accumulator },
-      _ -> accumulator,
-    })
-
-test "a program given in memory embeds the file its `embed` names by digest, with the same result as a program read from disk" {
-  let digest = b"hello".blake3();
-  let files = [
-    {
-      path: "m.ply",
-      name: "m",
-      text: Bytes::concat_all([
-        b"fn greeting() -> Bytes = embed(\"",
-        hex(digest),
-        b"\")\n\nfn main() -> Int = greeting().len()\n",
-      ]),
-    },
-  ];
-  let over = |inputs: Map<Bytes, Bytes>|
-    handle {
-      check_in_memory(files, inputs)
-    } with {
-      shipped.names() -> [],
-      shipped.module(name) -> None,
-      shipped.report_view_used(view, pulled) -> (),
-    };
-  let read = match loaded_from(embedding_program_files) {
-    Ok(l) -> l.front.dump,
-    Err(diagnostics) -> panic(messages(diagnostics)),
-  };
-  match over(Map::new().insert(digest, b"hello")) {
-    Err(u) -> panic(messages(u.diagnostics)),
-    Ok(h) -> {
-      assert_eq(h.inputs, Map::new().insert(digest, b"hello"));
-      assert(definition_hash(h.dump, b"m.greeting") != None);
-      assert_eq(definition_hash(h.dump, b"m.greeting"), definition_hash(read, b"m.greeting"))
-    },
-  };
-  assert_eq(
-    match over(Map::new()) { Ok(_) -> [], Err(u) -> u.diagnostics.map(|d: Diagnostic| d.code) },
-    [b"E0146"],
-  )
-}
-
 test "an embedded file whose contents change between two reads during checking is rejected instead of emitted" {
   let tree = fs::mem_of(embedding_program_files);
   let loaded = handle {
-    forbid_derivers(|| load[t]("p"))
+    in_memory_store(|| load[t, memory]("p", None, "memo"))
   } with {
     var reads: Int = 0,
     fs.list_dir[t](path) -> fs::mem_list(tree, path),
@@ -1280,10 +813,9 @@ test "an embedded file whose contents change between two reads during checking i
     },
     shipped.names() -> [],
     shipped.module(name) -> None,
-    shipped.report_view_used(view, pulled) -> (),
     shipped.runtime() -> bare_runtime,
-    shipped.read_pack(path, offset, len) -> None,
-    shipped.definitions() -> listed_queries,
+    shipped.read_pack(part) -> None,
+    shipped.definitions() -> placeholder_definitions,
     shipped.stamps() -> "",
   };
   assert_eq(codes(loaded), [b"E0146"]);
@@ -1299,7 +831,7 @@ test "a standard library module that a program imports can embed a data file shi
   ]);
   let over = |data: Option<Bytes>|
     handle {
-      forbid_derivers(|| load[t]("p"))
+      in_memory_store(|| load[t, memory]("p", None, "memo"))
     } with {
       fs.list_dir[t](path) -> fs::mem_list(tree, path),
       fs.kind[t](path) -> fs::mem_kind(tree, path),
@@ -1309,10 +841,9 @@ test "a standard library module that a program imports can embed a data file shi
         Some(b"pub fn list() -> Bytes = embed(\"words/list.txt\")\n")
       } else if name == "std/words/list.txt" { data }
       else { prelude_named(name) },
-      shipped.report_view_used(view, pulled) -> (),
       shipped.runtime() -> bare_runtime,
-      shipped.read_pack(path, offset, len) -> None,
-      shipped.definitions() -> listed_queries,
+      shipped.read_pack(part) -> None,
+      shipped.definitions() -> placeholder_definitions,
       shipped.stamps() -> "",
     };
   match over(Some(b"one\ntwo\n")) {
@@ -1333,17 +864,16 @@ test "a standard library module is loaded from its shipped source, and a module 
     { path: "p/m.ply", body: b"import std.words (count)\n\nfn main() -> Int = count()\n" },
   ]);
   let loaded = handle {
-    forbid_derivers(|| load[t]("p"))
+    in_memory_store(|| load[t, memory]("p", None, "memo"))
   } with {
     fs.list_dir[t](path) -> fs::mem_list(tree, path),
     fs.kind[t](path) -> fs::mem_kind(tree, path),
     fs.read_file[t](path) -> fs::mem_read(tree, path),
     shipped.names() -> ["std.words", "std.prelude"],
     shipped.module(name) -> if name == "std.words" { Some(whole) } else { prelude_named(name) },
-    shipped.report_view_used(view, pulled) -> (),
     shipped.runtime() -> bare_runtime,
-    shipped.read_pack(path, offset, len) -> None,
-    shipped.definitions() -> listed_queries,
+    shipped.read_pack(part) -> None,
+    shipped.definitions() -> placeholder_definitions,
     shipped.stamps() -> "",
   };
   match loaded {

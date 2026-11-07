@@ -2,34 +2,39 @@ import std.bin
 import std.hash (blake3)
 import std.bytes
 import std.list
-import compiler.store.memo (memo, memo_store, Query)
-import compiler.front.exports (OwnerInterface, Hashes, ModuleOrigin, InRoot, InPackage,
-                               ShippedModule, CheckInputs, owner_interface_bin, hashes_bin,
-                               module_origin_bin)
+import compiler.store.memo (memo, Query, Queries, Product)
+import compiler.store.memo.store (memo_store)
+import compiler.store.handles (QueryOf, QueryDefinition, Written, written, fetch)
+import std.set (Set, set_bin)
+import compiler.front.exports (OwnerInterface, ModuleOrigin, InRoot, InPackage, ShippedModule,
+                               CheckInputs, owner_interface_bin, module_origin_bin)
+import compiler.check.infer.checker (StoredDeclarations)
 import compiler.front (EmbedRecord, module_embeds_wanted, shipped_wants_of, embed_record_bin)
 import compiler.front.published (no_rows, encode_rows)
 import compiler.front.facts (ModuleShape, no_shape, no_module_tables, module_shape_bin,
                              encode_tables)
 import compiler.syntax.items (Module, ImportDeclaration, header, parse, parse_started,
                               import_declaration_bin, read_without_import, homes_declaring,
-                              unimported_of)
-import compiler.expand.derive (DeriverRequest, DeriverResponse, Failed, import_path,
-                               deriver_request_bin, deriver_response_bin)
+                              home_names_in, unimported_of)
+import compiler.expand.derive (import_path)
 import compiler.front.diagnostics (ParsedSource, parse_from)
 import compiler.syntax.expressions (prelude_module)
 import compiler.front.interface (imported)
 import compiler.expand.embed (EmbedFile, embed_file, embed_file_bin, embed_key)
 import compiler.front.pkg (PackageSources, ValidatedPackages, validated_packages_bin,
                            location_placeholder, package_sources_bin)
-import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, diagnostic_bin, path_span,
-                                      source_bin)
-import compiler.syntax.parsing (Span, ParseStart, span_bin, start)
+import compiler.check.resolve.tables (Declarations, Source, ParsedModule, Diagnostic,
+                                      diagnostic_bin, path_span, source_bin, without_redefinitions)
+import compiler.syntax.parsing (Span, ParseStart, ParseOutput, span_bin, start)
 import compiler.syntax.lexer (Token)
-import compiler.store.hash.forms (CachedHashes, cached_hashes_bin)
 
 pub type PackageLocation = { package: Int, relative: Bytes }
 
 pub type ModuleKey = { module: Bytes, shipped: Bool, tested: Bool }
+
+pub type Modules = { root: Int, own: List<Bytes>, pulled: List<Bytes> }
+
+derive bin for Modules
 
 pub type InterfaceKey = { module: Bytes, shipped: Bool, full_text: Bool, name: Bytes }
 
@@ -72,30 +77,20 @@ pub const embedded_file_kind: Bytes = b"embed"
 
 pub const shipped_names_kind: Bytes = b"shipped names"
 
-pub const derived_kind: Bytes = b"derived"
-
-fn derived_read(ask: DeriverRequest) -> DeriverResponse / {memo.read, abort.raise} =
-  match memo.external(derived_kind, bin::encode(ask, deriver_request_bin())) {
-    Some(b) -> decoded(b, deriver_response_bin(), "a derivation"),
-    None ->
-      Failed({
-        code: b"E0155",
-        message: b"no derived code was generated for this `derive` declaration",
-        notes: [b"this command reads modules without running `derive` generators"],
-      }),
-  }
+pub const own_modules_kind: Bytes = b"own modules"
 
 pub fn embed_at(root: Bytes, module: Bytes, key: Bytes) -> Bytes =
   Bytes::concat_all([root, b"\x00", module, b"\x00", key])
 
 pub effect decode_cache {
-  read owner_interfaces(query: Bytes, digest: Bytes) -> Option<List<OwnerInterface>>
-  write cache_owner_interfaces(query: Bytes, digest: Bytes, entries: List<OwnerInterface>) -> Unit
   read context(digest: Bytes) -> Option<Context>
+  read declarations(digest: Bytes) -> Option<StoredDeclarations>
+  write cache_declarations(digest: Bytes, declared: StoredDeclarations) -> Unit
+  read module_declarations(digest: Bytes) -> Option<Declarations>
+  write cache_module_declarations(digest: Bytes, declared: Declarations) -> Unit
   write cache_context(digest: Bytes, context: Context) -> Unit
   read text_read(key: Bytes) -> Option<ParsedText>
   write cache_text_read(key: Bytes, read: ParsedText) -> Unit
-  write evict_text_read(key: Bytes) -> Unit
   read imported_text(digest: Bytes) -> Option<Bytes>
   write cache_imported_text(digest: Bytes, text: Bytes) -> Unit
 }
@@ -106,7 +101,39 @@ pub effect set QueryEffects = {memo.read, decode_cache.read, decode_cache.write}
 
 pub effect set RunEffects = {memo_store.read, memo_store.write, decode_cache.read, decode_cache.write}
 
+pub effect set SessionReads = {memo.read, decode_cache.read, decode_cache.write}
+
 pub type CheckQuery = Query<| {decode_cache.read, decode_cache.write}>
+
+pub type CheckDefinition = QueryDefinition<| {decode_cache.read, decode_cache.write}>
+
+pub const hash_products: Product = { kind: b"hashes", after: [] }
+
+pub const listing_products: Product = { kind: b"listings", after: [] }
+
+pub const doc_products: Product =
+  { kind: b"docs", after: [hash_products.kind, listing_products.kind] }
+
+pub const cost_products: Product =
+  { kind: b"costs", after: [hash_products.kind, code_products.kind] }
+
+pub const measure_products: Product = { kind: b"measures", after: [hash_products.kind] }
+
+pub const code_products: Product = { kind: b"code", after: [listing_products.kind] }
+
+pub const interface_products: Product = { kind: b"interfaces", after: [hash_products.kind] }
+
+pub const program_products: Product =
+  { kind: b"program", after: [hash_products.kind, listing_products.kind] }
+
+pub type CheckQueries = Queries<| {decode_cache.read, decode_cache.write}>
+
+pub fn check_queries(named: Map<Bytes, CheckQuery>) -> CheckQueries =
+  {
+    named: named,
+    apart: |work: () -> Bytes / {abort.raise, decode_cache.read, decode_cache.write}|
+      with_decode_cache(work),
+  }
 
 pub fn with_decode_cache<a | e>(
   work: () -> a / {decode_cache.read, decode_cache.write | e},
@@ -114,13 +141,18 @@ pub fn with_decode_cache<a | e>(
   handle {
     work()
   } with {
-    var entries: Map<Bytes, List<OwnerInterface>> = Map::new(),
     var contexts: Map<Bytes, Context> = Map::new(),
+    var declared: Map<Bytes, StoredDeclarations> = Map::new(),
+    var named: Map<Bytes, Declarations> = Map::new(),
     var reads: Map<Bytes, ParsedText> = Map::new(),
     var imports: Map<Bytes, Bytes> = Map::new(),
-    decode_cache.owner_interfaces(query, digest) -> entries.get(query.concat(digest)),
-    decode_cache.cache_owner_interfaces(query, digest, es) -> {
-      entries = entries.insert(query.concat(digest), es);
+    decode_cache.declarations(digest) -> declared.get(digest),
+    decode_cache.cache_declarations(digest, d) -> {
+      declared = declared.insert(digest, d);
+    },
+    decode_cache.module_declarations(digest) -> named.get(digest),
+    decode_cache.cache_module_declarations(digest, d) -> {
+      named = named.insert(digest, d);
     },
     decode_cache.context(digest) -> contexts.get(digest),
     decode_cache.cache_context(digest, c) -> {
@@ -129,9 +161,6 @@ pub fn with_decode_cache<a | e>(
     decode_cache.text_read(key) -> reads.get(key),
     decode_cache.cache_text_read(key, r) -> {
       reads = reads.insert(key, r);
-    },
-    decode_cache.evict_text_read(key) -> {
-      reads = reads.remove(key);
     },
     decode_cache.imported_text(digest) -> imports.get(digest),
     decode_cache.cache_imported_text(digest, t) -> {
@@ -144,17 +173,19 @@ pub fn text_key(source: Source) -> Bytes =
 
 pub fn read_once(
   source: Source,
-) -> ParsedText / {memo.read, decode_cache.read, decode_cache.write, abort.raise} = {
+) -> ParsedText / {decode_cache.read, decode_cache.write, abort.raise} = {
   let key = text_key(source);
   match decode_cache.text_read(key) {
     Some(r) -> r,
     None -> {
       let lexed = start(source.source_text);
       let parsed = parse_started(lexed);
+      let distinct = without_redefinitions(0, source.name, parsed.node);
+      let given = parse_from(0, source, { ..parsed, node: distinct.module });
       let r = {
         lexed: lexed,
-        raw: parsed.node,
-        given: parse_from(0, source, parsed, library: Some(derived_read)),
+        raw: distinct.module,
+        given: { ..given, diagnostics: given.diagnostics.concat(distinct.redefinitions) },
       };
       decode_cache.cache_text_read(key, r);
       r
@@ -174,42 +205,6 @@ fn imported_once(text: Bytes) -> Bytes / {decode_cache.read, decode_cache.write,
   }
 }
 
-pub fn context_once(named: ModuleKey) -> Context / {QueryEffects, abort.raise} = {
-  let input = bin::encode(named, module_key_bin());
-  let digest = memo.output_digest(context_query, input);
-  match decode_cache.context(digest) {
-    Some(c) -> c,
-    None -> {
-      let c = decoded(
-        match memo.stored_output(digest) { Some(b) -> b, None -> memo.fetch(context_query, input) },
-        context_bin(),
-        "a module's context",
-      );
-      decode_cache.cache_context(digest, c);
-      c
-    },
-  }
-}
-
-pub fn owner_interfaces_once(
-  query: Bytes,
-  input: Bytes,
-  decoding: (Bytes) -> List<OwnerInterface> / {abort.raise},
-) -> List<OwnerInterface> / {QueryEffects, abort.raise} = {
-  let digest = memo.output_digest(query, input);
-  match decode_cache.owner_interfaces(query, digest) {
-    Some(es) -> es,
-    None -> {
-      let es = decoding(match memo.stored_output(digest) {
-        Some(b) -> b,
-        None -> memo.fetch(query, input),
-      });
-      decode_cache.cache_owner_interfaces(query, digest, es);
-      es
-    },
-  }
-}
-
 pub fn decoded<a>(b: Bytes, codec: bin::BinCodec<a>, what: String) -> a / {abort.raise} =
   match bin::decode(b, codec) {
     Ok(x) -> x,
@@ -224,10 +219,16 @@ pub fn package_location_of(module: Bytes) -> Option<PackageLocation> / {memo.rea
 
 fn shipped_text(module: Bytes) -> Option<Bytes> / {memo.read} = memo.external(shipped_kind, module)
 
-fn shipped_module_exists(module: Bytes) -> Bool / {memo.read} =
+pub fn shipped_names_listed() -> List<Bytes> / {memo.read, abort.raise} =
+  match memo.external(shipped_names_kind, b"") {
+    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
+    None -> [],
+  }
+
+pub fn shipped_module_exists(module: Bytes) -> Bool / {memo.read} =
   memo.external(shipped_exists_kind, module) != None
 
-fn build_packages() -> ValidatedPackages / {memo.read, abort.raise} =
+pub fn build_packages() -> ValidatedPackages / {memo.read, abort.raise} =
   match memo.external(layout_kind, b"") {
     Some(b) -> decoded(b, validated_packages_bin(), "the packages of this build"),
     None -> no_packages,
@@ -268,48 +269,6 @@ fn target_of(
 
 pub fn shipped_for(asker_shipped: Bool, name: Bytes) -> Bool / {memo.read, abort.raise} =
   asker_shipped || package_location_of(name) == None
-
-pub fn owner_interfaces_of(
-  asker_shipped: Bool,
-  module: Bytes,
-  name: Bytes,
-) -> List<OwnerInterface> / {QueryEffects, abort.raise} =
-  owner_interfaces_once(
-    owner_interfaces_query,
-    bin::encode(
-      { module: module, shipped: shipped_for(asker_shipped, module), full_text: false, name: name },
-      interface_key_bin(),
-    ),
-    |b: Bytes|
-      decoded(b, bin::list_bin(bin::bytes_bin()), "entries").map(|e: Bytes|
-        decoded(e, owner_interface_bin(), "an entry")),
-  )
-
-pub fn owner_interface_bytes_of(
-  asker_shipped: Bool,
-  module: Bytes,
-  name: Bytes,
-) -> List<Bytes> / {memo.read, abort.raise} =
-  decoded(
-    memo.fetch(
-      owner_interfaces_query,
-      bin::encode(
-        {
-          module: module,
-          shipped: shipped_for(asker_shipped, module),
-          full_text: false,
-          name: name,
-        },
-        interface_key_bin(),
-      ),
-    ),
-    bin::list_bin(bin::bytes_bin()),
-    "entries",
-  )
-
-pub const module_query: Bytes = b"module"
-
-pub const owner_interfaces_query: Bytes = b"entry"
 
 pub type ModuleRead = {
   source: Source,
@@ -364,19 +323,14 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
         if t.shipped { shipped_module_exists(t.module) }
         else { package_location_of(t.module) != None });
       let unimported = unimported_of(
-        read_without_import(module, lexed.input, || homes_declaring(shipped_text)),
+        read_without_import(module, lexed.input, || homes_declaring(home_names)),
         shipped_module_exists,
         imported_there.map(|t: ModuleKey| t.module),
       );
       let prelude = if module == prelude_module || !shipped_module_exists(prelude_module) { [] }
       else { [prelude_module] };
       let present = imported_there;
-      let unread = if present.len() == targets.len() { [] } else {
-        match memo.external(shipped_names_kind, b"") {
-          Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
-          None -> [],
-        }
-      };
+      let unread = if present.len() == targets.len() { [] } else { shipped_names_listed() };
       let root = location_placeholder(if package < 0 { 0 } else { package });
       let embeds = if shipped { [] } else {
         module_embeds_wanted(root, source, raw).map(|e: EmbedRecord| {
@@ -421,27 +375,21 @@ pub fn module_read(query_key: ModuleKey) -> Option<ModuleRead> / {QueryEffects, 
           all_sources: whole,
           data: data,
           embeds: embeds,
-          given: [given].concat(whole.map(|text: Source| read_once(text).given)),
+          given: given,
         },
       })
     },
   }
 }
 
-pub fn module_origins_of(
-  shipped: Bool,
-  modules: List<Bytes>,
-) -> Map<Bytes, ModuleOrigin> / {memo.read, abort.raise} =
-  modules.fold(Map::new(), |accumulator: Map<Bytes, ModuleOrigin>, m: Bytes|
-    accumulator.insert(m, if shipped { ShippedModule }
-    else { module_origin_of(package_location_of(m)) }))
+pub fn home_names_query() -> QueryOf<Bytes, Set<Bytes>> =
+  { name: b"home names", input: bin::bytes_bin(), output: set_bin(bin::bytes_bin()) }
 
-pub fn module_origin_lookup(
-  places: Map<Bytes, ModuleOrigin>,
-) -> (Bytes) -> ModuleOrigin / {abort.raise} =
-  |m: Bytes| match places.get(m) { Some(x) -> x, None -> ShippedModule }
+pub fn collect_home_names(home: Bytes) -> Written / {memo.read, abort.raise} =
+  written(home_names_query(), home_names_in(shipped_text(home)))
 
-pub const imports_query: Bytes = b"imports"
+fn home_names(home: Bytes) -> Set<Bytes> / {memo.read, abort.raise} =
+  fetch(home_names_query(), home)
 
 pub type ImportOf = { named: ModuleKey, span: Span }
 
@@ -451,31 +399,30 @@ derive bin for ImportOf
 
 derive bin for ImportsOf
 
-pub fn imports_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let query_key = decoded(input, module_key_bin(), "a module's name");
+pub fn imports_query() -> QueryOf<ModuleKey, ImportsOf> =
+  { name: b"imports", input: module_key_bin(), output: imports_of_bin() }
+
+pub fn list_imports(query_key: ModuleKey) -> Written / {memo.read, abort.raise} = {
   let module = query_key.module;
   let placing = if query_key.shipped { None } else { package_location_of(module) };
   let text = if query_key.shipped { shipped_text(module) }
   else { match placing { Some(_) -> memo.external(text_kind, module), None -> None } };
-  bin::encode(
-    {
-      imports: match text {
-        None -> [],
-        Some(module_text) -> {
-          let raw = match header(module_text) { Some(m) -> m, None -> parse(module_text).node };
-          let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
-          let prefix = if query_key.shipped { b"" } else { prefix_in(build_packages(), package) };
-          raw.imports.fold([], |accumulator: List<ImportOf>, d: ImportDeclaration| {
-            let t = target_of(query_key.shipped, prefix, package, d);
-            let there = if t.shipped { shipped_module_exists(t.module) }
-            else { package_location_of(t.module) != None };
-            if there { accumulator.push({ named: t, span: path_span(d) }) } else { accumulator }
-          })
-        },
+  written(imports_query(), {
+    imports: match text {
+      None -> [],
+      Some(module_text) -> {
+        let raw = match header(module_text) { Some(m) -> m, None -> parse(module_text).node };
+        let package = match placing { Some(p) -> p.package, None -> 0 - 1 };
+        let prefix = if query_key.shipped { b"" } else { prefix_in(build_packages(), package) };
+        raw.imports.fold([], |accumulator: List<ImportOf>, d: ImportDeclaration| {
+          let t = target_of(query_key.shipped, prefix, package, d);
+          let there = if t.shipped { shipped_module_exists(t.module) }
+          else { package_location_of(t.module) != None };
+          if there { accumulator.push({ named: t, span: path_span(d) }) } else { accumulator }
+        })
       },
     },
-    imports_of_bin(),
-  )
+  })
 }
 
 pub fn absent(module: Bytes) -> ModuleResult / {abort.raise} =
@@ -489,15 +436,6 @@ pub fn absent(module: Bytes) -> ModuleResult / {abort.raise} =
     shape: no_shape(module),
     tables: encode_tables(no_module_tables),
   }
-
-pub type HashResult = {
-  hashes: Hashes,
-  owners: Map<Bytes, List<Bytes>>,
-  fixing: CachedHashes,
-  record: Bytes,
-}
-
-derive bin for HashResult
 
 pub type Context = {
   imports: List<ImportDeclaration>,
@@ -520,5 +458,3 @@ pub type Setting = {
 derive bin for Setting
 
 derive bin for Context
-
-pub const context_query: Bytes = b"context"

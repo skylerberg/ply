@@ -1,11 +1,17 @@
-import compiler.syntax.parsing (Span, Identifier, span_to)
+import compiler.syntax.parsing (Error)
+import compiler.syntax.parsing (span_bin, span_between, is_generated, generated_span)
+import compiler.syntax.expressions (expression_bin)
+import compiler.syntax.parsing (Span, Identifier, QName, Severity, severity_bin, span_to)
 import compiler.syntax.items (Module, Item, FunctionItem, ExternItem, TypeItem, EffectItem,
                               EffectSetItem, SumBody, AliasBody, VariantDefinition, Visibility,
                               Private, ImportDeclaration, WholeModule, ModuleAlias, SelectedNames,
-                              DeriveOrigin, is_pub, NominalBody, ExternBody, is_builtin)
+                              DeriveOrigin, is_pub, NominalBody, ExternBody, is_builtin,
+                              EffectSetDefinition, Opaque, opaque_bin, SchemaDefinition, is_shipped,
+                              item_span)
 import compiler.syntax.expressions (Expression)
 import std.list
 import std.bin
+import std.bytes (ascii_of_int)
 import compiler.check.types (last_dot)
 
 pub type Source = { name: Bytes, source_text: Bytes }
@@ -14,7 +20,16 @@ pub type ParsedModule = { name: Bytes, module: Module, derived: List<DeriveOrigi
 
 pub type Namespace = | ValueSpace | TypeSpace | EffectSpace | SetSpace
 
-pub type Declaration = { name: Bytes, qualified: Bytes, public: Bool, span: Span }
+pub type ClosedBy = { type_name: Bytes, opaque: Opaque }
+
+pub type Declaration = {
+  name: Bytes,
+  qualified: Bytes,
+  public: Bool,
+  span: Span,
+  closed_by: Option<ClosedBy>,
+  constant: Bool,
+}
 
 pub type Declarations = {
   values: List<Declaration>,
@@ -27,7 +42,7 @@ pub type Declarations = {
   by_set: Map<Bytes, Declaration>,
 }
 
-pub type Binding = { name: Bytes, qualified: Bytes, owner: Int, span: Span }
+pub type Binding = { name: Bytes, qualified: Bytes, owner: Bytes, span: Span }
 
 pub type Bindings = {
   values: List<Binding>,
@@ -40,33 +55,52 @@ pub type Bindings = {
   by_set: Map<Bytes, Binding>,
 }
 
-pub type ModuleBinding = { binder: Bytes, target: Int, span: Span }
+pub type ModuleBinding = { binder: Bytes, target: Bytes, span: Span }
 
 pub type Scope = {
   module: Bytes,
   modules: List<ModuleBinding>,
   selected_modules: List<ModuleBinding>,
   bound: Bindings,
+  failed: List<Bytes>,
 }
 
-pub type Label = { module: Int, start: Int, end: Int, primary: Bool, text: Bytes }
+pub fn bound_by_failed_import(scope: Scope, name: QName) -> Bool =
+  match name.module {
+    None -> scope.failed.contains(name.name.name),
+    Some(binder) -> scope.failed.contains(binder.name),
+  }
+
+pub type Place = | InSource({ module: Int, start: Int, end: Int }) | WholeFile(Int) | Unplaced
+
+pub type Label = { place: Place, primary: Bool, text: Bytes }
 
 pub type Edit = { module: Int, start: Int, end: Int, text: Bytes }
 
-pub type Fix = { title: Bytes, edits: List<Edit> }
+pub type Fix = { title: Bytes, first: Edit, rest: List<Edit> }
+
+pub type Fixes = | NoFix | Apply(Fix) | ChooseOne(Fix, Fix, List<Fix>)
 
 pub type Diagnostic = {
   code: Bytes,
-  notes: Int,
   labels: List<Label>,
   text: Bytes,
   message: Bytes,
   notes_text: List<Bytes>,
-  severity: Bytes,
-  fixes: List<Fix>,
+  severity: Severity,
+  fixes: Fixes,
 }
 
+pub fn placed_in(d: Diagnostic, module: Int) -> Diagnostic =
+  {
+    ..d,
+    labels: d.labels.map(|l: Label| { ..l, place: in_module(l.place, module) }),
+    fixes: fixes_moved(d.fixes, |e: Edit| { ..e, module: module }),
+  }
+
 derive bin for Source
+
+derive bin for Place
 
 derive bin for Label
 
@@ -74,7 +108,23 @@ derive bin for Edit
 
 derive bin for Fix
 
+derive bin for Fixes
+
 derive bin for Diagnostic
+
+derive bin for ClosedBy
+
+derive bin for Declaration
+
+derive bin for Binding
+
+derive bin for Declarations
+
+derive bin for ModuleBinding
+
+derive bin for Bindings
+
+derive bin for Scope
 
 pub type Edge = { from: Int, target: Int, span: Span }
 
@@ -89,7 +139,172 @@ pub type Resolution = {
   imports: List<List<Int>>,
   signatures: Map<Bytes, Parameters>,
   visible_modules: List<List<Int>>,
+  positions: Map<Bytes, Int>,
 }
+
+pub effect other_modules {
+  read look_up_declaration(module: Bytes, namespace: Namespace, name: Bytes) -> Option<Declaration>
+  read look_up_declarations(module: Bytes) -> Option<Declarations>
+  read look_up_effect_set(module: Bytes, name: Bytes) -> Option<EffectSetDefinition>
+  read look_up_schema(module: Bytes, name: Bytes) -> Option<SchemaDefinition>
+  read look_up_package(module: Bytes) -> Option<Int>
+  read look_up_module_scope(module: Bytes) -> Option<Scope>
+  read look_up_parameters(name: Bytes) -> Option<Parameters>
+  read list_visible_modules(module: Bytes) -> List<Bytes>
+  read list_modules() -> List<Bytes>
+  read list_shipped_modules() -> List<Bytes>
+}
+
+pub type LoadedModules = { declarations: Map<Bytes, Declarations>, packages: Map<Bytes, Int> }
+
+pub fn with_no_other_modules<a | e>(body: () -> a / {other_modules.read | e}) -> a / e =
+  with_modules({ declarations: Map::new(), packages: Map::new() }, body)
+
+pub fn with_modules<a | e>(
+  loaded: LoadedModules,
+  body: () -> a / {other_modules.read | e},
+) -> a / e =
+  handle {
+    body()
+  } with {
+    other_modules.look_up_declaration(module, namespace, name) -> match loaded.declarations.get(
+        module,
+      ) {
+      Some(d) -> lookup_declared(d, namespace, name),
+      None -> None,
+    },
+    other_modules.look_up_declarations(module) -> loaded.declarations.get(module),
+    other_modules.look_up_effect_set(module, name) -> None,
+    other_modules.look_up_schema(module, name) -> None,
+    other_modules.look_up_package(module) -> loaded.packages.get(module),
+    other_modules.look_up_module_scope(module) -> None,
+    other_modules.look_up_parameters(name) -> None,
+    other_modules.list_visible_modules(module) -> [],
+    other_modules.list_modules() -> loaded.packages.keys(),
+    other_modules.list_shipped_modules() -> loaded.packages.keys().filter(is_shipped),
+  }
+
+pub fn declared_in(
+  resolved: Resolution,
+  module: Bytes,
+  namespace: Namespace,
+  name: Bytes,
+) -> Option<Declaration> / {other_modules.read} =
+  match match resolved.positions.get(module) {
+      Some(i) -> match resolved.declarations.at(i) {
+        Some(d) -> lookup_declared(d, namespace, name),
+        None -> None,
+      },
+      None -> None,
+    } {
+    Some(d) -> Some(d),
+    None -> other_modules.look_up_declaration(module, namespace, name),
+  }
+
+pub fn declarations_named(
+  resolved: Resolution,
+  module: Bytes,
+) -> Option<Declarations> / {other_modules.read} =
+  match other_modules.look_up_declarations(module) {
+    Some(d) -> Some(d),
+    None -> match resolved.positions.get(module) {
+      Some(i) -> resolved.declarations.at(i),
+      None -> None,
+    },
+  }
+
+pub fn bound_in(
+  scope: Scope,
+  namespace: Namespace,
+  name: Bytes,
+) -> Option<Binding> / {other_modules.read} =
+  match lookup(scope.bound, namespace, name) {
+    Some(b) -> Some(b),
+    None -> match other_modules.look_up_declaration(scope.module, namespace, name) {
+      Some(d) -> Some(binding_of(d, scope.module)),
+      None -> None,
+    },
+  }
+
+pub fn implicit_binder(module: Bytes) -> Bytes = b"@".concat(module)
+
+pub fn implicit_target(binder: Bytes) -> Option<Bytes> / {abort.raise} =
+  if binder.starts_with(b"@") { Some(binder.slice(1, binder.len())) } else { None }
+
+pub fn module_binding_in(scope: Scope, binder: Bytes) -> Option<ModuleBinding> / {abort.raise} =
+  match find_module_binding(scope.modules, binder) {
+    Some(m) -> Some(m),
+    None -> match implicit_target(binder) {
+      Some(target) -> Some({ binder: binder, target: target, span: generated_span }),
+      None -> None,
+    },
+  }
+
+fn bindings_of_space(bound: Bindings, namespace: Namespace) -> List<Binding> =
+  match namespace {
+    ValueSpace -> bound.values,
+    TypeSpace -> bound.types,
+    EffectSpace -> bound.effects,
+    SetSpace -> bound.sets,
+  }
+
+pub fn scope_bindings(scope: Scope, namespace: Namespace) -> List<Binding> / {other_modules.read} = {
+  let own = match other_modules.look_up_declarations(scope.module) {
+    Some(d) ->
+      declarations_in(d, namespace).map(|declared: Declaration| binding_of(declared, scope.module)),
+    None -> [],
+  };
+  let imported = match other_modules.look_up_module_scope(scope.module) {
+    Some(s) -> bindings_of_space(s.bound, namespace),
+    None -> [],
+  };
+  own.concat(imported).fold(
+    bindings_of_space(scope.bound, namespace),
+    |found: List<Binding>, b: Binding|
+      if found.any(|x: Binding| x.name == b.name) { found } else { found.push(b) },
+  )
+}
+
+pub fn scope_modules(scope: Scope) -> List<ModuleBinding> / {other_modules.read} =
+  match other_modules.look_up_module_scope(scope.module) {
+    Some(s) -> s.modules,
+    None -> scope.modules,
+  }
+
+pub fn effect_set_declared(
+  modules: List<ParsedModule>,
+  resolved: Resolution,
+  owner: Bytes,
+  name: Bytes,
+) -> Option<EffectSetDefinition> / {other_modules.read, abort.raise} = {
+  let loaded = match resolved.positions.get(owner) {
+    Some(i) ->
+      modules.get(i).module.items.fold(None, |found: Option<EffectSetDefinition>, item: Item|
+        match item {
+          EffectSetItem(d) -> if d.name.name == name { Some(d) } else { found },
+          _ -> found,
+        }),
+    None -> None,
+  };
+  match loaded { Some(d) -> Some(d), None -> other_modules.look_up_effect_set(owner, name) }
+}
+
+pub fn parameters_named(
+  resolved: Resolution,
+  name: Bytes,
+) -> Option<Parameters> / {other_modules.read} =
+  match resolved.signatures.get(name) {
+    Some(p) -> Some(p),
+    None -> other_modules.look_up_parameters(name),
+  }
+
+pub const module_elsewhere: Int = -1
+
+pub fn module_index(resolved: Resolution, name: Bytes) -> Int =
+  match resolved.positions.get(name) { Some(i) -> i, None -> module_elsewhere }
+
+pub fn binding_of(declared: Declaration, owner: Bytes) -> Binding =
+  { name: declared.name, qualified: declared.qualified, owner: owner, span: declared.span }
 
 pub const no_declarations: Declarations =
   {
@@ -103,7 +318,7 @@ pub const no_declarations: Declarations =
     by_set: Map::new(),
   }
 
-const no_bindings: Bindings =
+pub const no_bindings: Bindings =
   {
     values: [],
     types: [],
@@ -287,8 +502,61 @@ pub fn binder_span(declaration: ImportDeclaration) -> Span / {abort.raise} =
     SelectedNames(_) -> declaration.span,
   }
 
+pub fn place_of(m: Int, span: Span) -> Place =
+  if m == module_elsewhere || is_generated(span) { Unplaced }
+  else { InSource({ module: m, start: span.start, end: span.end }) }
+
+pub fn source_span(label: Label) -> Option<{ module: Int, start: Int, end: Int }> =
+  match label.place { InSource(s) -> Some(s), _ -> None }
+
+pub fn labelled_text(source: Bytes, label: Label) -> Option<Bytes> / {abort.raise} =
+  match source_span(label) { Some(s) -> Some(source.slice(s.start, s.end)), None -> None }
+
+pub fn place_module(place: Place) -> Option<Int> =
+  match place { InSource(s) -> Some(s.module), WholeFile(m) -> Some(m), Unplaced -> None }
+
+pub fn place_text(place: Place) -> Bytes =
+  match place {
+    InSource(s) ->
+      Bytes::concat_all([
+        ascii_of_int(s.module),
+        b":",
+        ascii_of_int(s.start),
+        b":",
+        ascii_of_int(s.end),
+      ]),
+    WholeFile(m) -> ascii_of_int(m).concat(b":file"),
+    Unplaced -> b"unplaced",
+  }
+
+pub fn mapped_place(place: Place, module: Int, by: (Int) -> Int) -> Place =
+  match place {
+    InSource(s) -> InSource({ module: module, start: by(s.start), end: by(s.end) }),
+    WholeFile(_) -> WholeFile(module),
+    Unplaced -> Unplaced,
+  }
+
+pub fn in_module(place: Place, module: Int) -> Place =
+  match place {
+    InSource(s) -> InSource({ ..s, module: module }),
+    WholeFile(_) -> WholeFile(module),
+    Unplaced -> Unplaced,
+  }
+
 pub fn label_at(m: Int, span: Span, primary: Bool, text: Bytes) -> Label =
-  { module: m, start: span.start, end: span.end, primary: primary, text: text }
+  { place: place_of(m, span), primary: primary, text: text }
+
+pub fn error_unplaced(code: Bytes, message: Bytes, label: Bytes, notes: List<Bytes>) -> Diagnostic =
+  error_with_labels(code, message, [{ place: Unplaced, primary: true, text: label }], notes)
+
+pub fn error_in_file(
+  code: Bytes,
+  m: Int,
+  message: Bytes,
+  label: Bytes,
+  notes: List<Bytes>,
+) -> Diagnostic =
+  error_with_labels(code, message, [{ place: WholeFile(m), primary: true, text: label }], notes)
 
 pub fn error_with_labels(
   code: Bytes,
@@ -298,17 +566,64 @@ pub fn error_with_labels(
 ) -> Diagnostic =
   {
     code: code,
-    notes: notes.len(),
     labels: labels,
     text: b"",
     message: message,
     notes_text: notes,
-    severity: b"error",
-    fixes: [],
+    severity: Error,
+    fixes: NoFix,
   }
 
+pub fn fix_of(title: Bytes, edits: List<Edit>) -> Option<Fix> =
+  match edits { [] -> None, [first, ..rest] -> Some({ title: title, first: first, rest: rest }) }
+
 pub fn with_fix(diagnostic: Diagnostic, title: Bytes, edits: List<Edit>) -> Diagnostic =
-  { ..diagnostic, fixes: diagnostic.fixes.push({ title: title, edits: edits }) }
+  match fix_of(title, edits) {
+    Some(fix) -> { ..diagnostic, fixes: Apply(fix) },
+    None -> diagnostic,
+  }
+
+pub fn alternatives(fixes: List<Fix>) -> Fixes =
+  match fixes {
+    [] -> NoFix,
+    [only] -> Apply(only),
+    [first, second, ..rest] -> ChooseOne(first, second, rest),
+  }
+
+pub fn with_alternatives(diagnostic: Diagnostic, fixes: List<Fix>) -> Diagnostic =
+  { ..diagnostic, fixes: alternatives(fixes) }
+
+pub fn fix_edits(fix: Fix) -> List<Edit> = [fix.first].concat(fix.rest)
+
+pub fn offered_fixes(fixes: Fixes) -> List<Fix> =
+  match fixes {
+    NoFix -> [],
+    Apply(fix) -> [fix],
+    ChooseOne(first, second, rest) -> [first, second].concat(rest),
+  }
+
+fn fix_moved(fix: Fix, moved: (Edit) -> Edit) -> Fix =
+  { ..fix, first: moved(fix.first), rest: fix.rest.map(moved) }
+
+pub fn fixes_moved(fixes: Fixes, moved: (Edit) -> Edit) -> Fixes =
+  match fixes {
+    NoFix -> NoFix,
+    Apply(fix) -> Apply(fix_moved(fix, moved)),
+    ChooseOne(first, second, rest) ->
+      ChooseOne(
+        fix_moved(first, moved),
+        fix_moved(second, moved),
+        rest.map(|fix: Fix| fix_moved(fix, moved)),
+      ),
+  }
+
+pub fn fixes_kept(fixes: Fixes, allowed: (Edit) -> Bool) -> Fixes =
+  match fixes {
+    NoFix -> NoFix,
+    Apply(fix) -> if fix_edits(fix).all(allowed) { fixes } else { NoFix },
+    ChooseOne(_, _, _) ->
+      alternatives(offered_fixes(fixes).filter(|fix: Fix| fix_edits(fix).all(allowed))),
+  }
 
 pub fn insertion(m: Int, at: Int, text: Bytes) -> Edit =
   { module: m, start: at, end: at, text: text }
@@ -382,20 +697,42 @@ pub fn exported_names(declarations: Declarations) -> List<Bytes> =
 pub fn declarations_of(parsed: ParsedModule) -> Declarations =
   parsed.module.items.fold(no_declarations, |declarations: Declarations, item: Item|
     match item {
-      FunctionItem(f) -> declare(declarations, ValueSpace, parsed.name, f.name, f.visibility),
+      FunctionItem(f) ->
+        declare(
+          declarations,
+          ValueSpace,
+          parsed.name,
+          f.name,
+          f.visibility,
+          constant: f.constant != None,
+        ),
       ExternItem(f) -> if is_builtin(parsed.name, parsed.module, f) { declarations }
       else { declare(declarations, ValueSpace, parsed.name, f.name, f.visibility) },
       EffectItem(e) -> declare(declarations, EffectSpace, parsed.name, e.name, e.visibility),
       EffectSetItem(e) -> declare(declarations, SetSpace, parsed.name, e.name, e.visibility),
       TypeItem(t) -> {
-        let d2 = declare(declarations, TypeSpace, parsed.name, t.name, t.visibility);
+        let d2 = declare(
+          declarations,
+          TypeSpace,
+          parsed.name,
+          t.name,
+          t.visibility,
+          match t.opaque { Some(o) -> Some({ type_name: t.name.name, opaque: o }), None -> None },
+        );
         match t.body {
           SumBody(vs) ->
             vs.fold(d2, |accumulator: Declarations, variant: VariantDefinition|
-              declare(accumulator, ValueSpace, parsed.name, variant.name, match t.opaque {
-                Some(_) -> Private,
-                None -> t.visibility,
-              })),
+              declare(
+                accumulator,
+                ValueSpace,
+                parsed.name,
+                variant.name,
+                match t.opaque { Some(_) -> Private, None -> t.visibility },
+                match t.opaque {
+                  Some(o) -> Some({ type_name: t.name.name, opaque: o }),
+                  None -> None,
+                },
+              )),
           AliasBody(_) -> d2,
           NominalBody(_) -> d2,
           ExternBody -> d2,
@@ -404,12 +741,175 @@ pub fn declarations_of(parsed: ParsedModule) -> Declarations =
       _ -> declarations,
     })
 
+pub type DistinctModule = { module: Module, redefinitions: List<Diagnostic> }
+
+type DeclaredName = { namespace: Namespace, name: Identifier, kind: Bytes }
+
+type FirstDefinition = { span: Span, kind: Bytes, item: Span, in_type: Bool }
+
+type Clash = { declared: DeclaredName, first: FirstDefinition }
+
+type FirstDefinitions = {
+  values: Map<Bytes, FirstDefinition>,
+  types: Map<Bytes, FirstDefinition>,
+  effects: Map<Bytes, FirstDefinition>,
+  sets: Map<Bytes, FirstDefinition>,
+}
+
+type RedefinitionWalk = {
+  firsts: FirstDefinitions,
+  dropped: List<Span>,
+  redefinitions: List<Diagnostic>,
+}
+
+const no_first_definitions: FirstDefinitions =
+  { values: Map::new(), types: Map::new(), effects: Map::new(), sets: Map::new() }
+
+fn first_definitions_in(
+  firsts: FirstDefinitions,
+  namespace: Namespace,
+) -> Map<Bytes, FirstDefinition> =
+  match namespace {
+    ValueSpace -> firsts.values,
+    TypeSpace -> firsts.types,
+    EffectSpace -> firsts.effects,
+    SetSpace -> firsts.sets,
+  }
+
+fn with_first_definition(
+  firsts: FirstDefinitions,
+  declared: DeclaredName,
+  first: FirstDefinition,
+) -> FirstDefinitions =
+  match declared.namespace {
+    ValueSpace -> { ..firsts, values: firsts.values.insert(declared.name.name, first) },
+    TypeSpace -> { ..firsts, types: firsts.types.insert(declared.name.name, first) },
+    EffectSpace -> { ..firsts, effects: firsts.effects.insert(declared.name.name, first) },
+    SetSpace -> { ..firsts, sets: firsts.sets.insert(declared.name.name, first) },
+  }
+
+fn names_declared_by(module_name: Bytes, module: Module, item: Item) -> List<DeclaredName> =
+  match item {
+    FunctionItem(f) -> [{ namespace: ValueSpace, name: f.name, kind: b"a function" }],
+    ExternItem(f) -> if is_builtin(module_name, module, f) { [] }
+    else { [{ namespace: ValueSpace, name: f.name, kind: b"a function" }] },
+    EffectItem(e) -> [{ namespace: EffectSpace, name: e.name, kind: b"an effect" }],
+    EffectSetItem(e) -> [{ namespace: SetSpace, name: e.name, kind: b"an effect set" }],
+    TypeItem(t) -> {
+      let named = [{ namespace: TypeSpace, name: t.name, kind: b"a type" }];
+      match t.body {
+        SumBody(vs) ->
+          named.concat(
+            vs.map(|variant: VariantDefinition|
+              { namespace: ValueSpace, name: variant.name, kind: b"a constructor" }),
+          ),
+        AliasBody(_) -> named,
+        NominalBody(_) -> named,
+        ExternBody -> named,
+      }
+    },
+    _ -> [],
+  }
+
+fn is_type_item(item: Item) -> Bool = match item { TypeItem(_) -> true, _ -> false }
+
+fn with_first_definitions(
+  firsts: FirstDefinitions,
+  declared: List<DeclaredName>,
+  item: Item,
+) -> FirstDefinitions =
+  declared.fold(firsts, |found: FirstDefinitions, d: DeclaredName|
+    with_first_definition(found, d, {
+      span: d.name.span,
+      kind: d.kind,
+      item: item_span(item),
+      in_type: is_type_item(item),
+    }))
+
+fn redefinition(module_index: Int, module_name: Bytes, clash: Clash) -> Diagnostic =
+  error_at_and(
+    b"E0105",
+    module_index,
+    clash.declared.name.span,
+    Bytes::concat_all([
+      b"`",
+      clash.declared.name.name,
+      b"` is defined twice",
+      if module_name.len() == 0 { b"" }
+      else { Bytes::concat_all([b" in module `", module_name, b"`"]) },
+    ]),
+    Bytes::concat_all([b"redefined here as ", clash.declared.kind]),
+    module_index,
+    clash.first.span,
+    Bytes::concat_all([b"first defined here as ", clash.first.kind]),
+    [b"rename one of them"],
+  )
+
+pub fn without_redefinitions(
+  module_index: Int,
+  module_name: Bytes,
+  module: Module,
+) -> DistinctModule = {
+  let walked = module.items.fold(
+    { firsts: no_first_definitions, dropped: [], redefinitions: [] },
+    |accumulator: RedefinitionWalk, item: Item| {
+      let declared = names_declared_by(module_name, module, item);
+      let clashes = declared.fold([], |found: List<Clash>, d: DeclaredName|
+        match first_definitions_in(accumulator.firsts, d.namespace).get(d.name.name) {
+          Some(first) -> found.push({ declared: d, first: first }),
+          None -> found,
+        });
+      let reported = clashes.fold(accumulator.redefinitions, |ds: List<Diagnostic>, c: Clash|
+        ds.push(redefinition(module_index, module_name, c)));
+      if clashes.len() == 0 {
+        { ..accumulator, firsts: with_first_definitions(accumulator.firsts, declared, item) }
+      } else if is_type_item(item) && clashes.all(|c: Clash| !c.first.in_type) {
+        {
+          firsts: with_first_definitions(accumulator.firsts, declared, item),
+          dropped: accumulator.dropped.concat(clashes.map(|c: Clash| c.first.item)),
+          redefinitions: reported,
+        }
+      } else {
+        {
+          ..accumulator,
+          dropped: accumulator.dropped.push(item_span(item)),
+          redefinitions: reported,
+        }
+      }
+    },
+  );
+  {
+    module: {
+      ..module,
+      items: module.items.filter(|item: Item| !walked.dropped.contains(item_span(item))),
+    },
+    redefinitions: walked.redefinitions,
+  }
+}
+
+pub fn unplaced_declarations(declarations: Declarations) -> Declarations = {
+  let unplaced = |d: Declaration|
+    {
+      ..d,
+      span: generated_span,
+      closed_by: match d.closed_by {
+        Some(c) -> Some({ ..c, opaque: { ..c.opaque, span: generated_span } }),
+        None -> None,
+      },
+    };
+  namespaces.fold(no_declarations, |found: Declarations, namespace: Namespace|
+    declarations_in(declarations, namespace).fold(found, |d: Declarations, x: Declaration|
+      push_declared(d, namespace, unplaced(x))))
+}
+
 fn declare(
   declarations: Declarations,
   namespace: Namespace,
   module: Bytes,
   name: Identifier,
   vis: Visibility,
+  closed_by: Option<ClosedBy> = None,
+  constant: Bool = false,
 ) -> Declarations =
   match lookup_declared(declarations, namespace, name.name) {
     Some(_) -> declarations,
@@ -419,21 +919,27 @@ fn declare(
         qualified: qualify(module, name.name),
         public: is_pub(vis),
         span: name.span,
+        closed_by: closed_by,
+        constant: constant,
       }),
   }
 
-pub fn bindings_of(owner: Int, declarations: Declarations) -> Bindings =
+pub fn bindings_of(owner: Bytes, declarations: Declarations) -> Bindings =
   namespaces.fold(no_bindings, |bindings: Bindings, namespace: Namespace|
     with_space_bindings(
       bindings,
       namespace,
       declarations_in(declarations, namespace).map(|declared: Declaration|
-        { name: declared.name, qualified: declared.qualified, owner: owner, span: declared.span }),
+        binding_of(declared, owner)),
     ))
 
 pub type ParamInfo = { name: Bytes, default: Option<Expression>, imports: List<ModuleBinding> }
 
 pub type Parameters = { name: Bytes, params: List<ParamInfo> }
+
+derive bin for ParamInfo
+
+derive bin for Parameters
 
 test "a module name prefixes the names of its declarations, and its last segment is the default import name" {
   assert_eq(default_binder(b"std.db"), b"db");
@@ -443,4 +949,17 @@ test "a module name prefixes the names of its declarations, and its last segment
   assert_eq(module_of_name(b"store.orders.place"), b"store.orders");
   assert_eq(module_of_name(b"std.prelude.List::map"), b"std.prelude");
   assert_eq(module_of_name(b"place"), b"")
+}
+
+test "a diagnostic placed in a module moves its labels and the edits of its fixes there" {
+  let d = with_fix(
+    error_at(b"E0101", 0, span_between(4, 9), b"unknown", b"here", []),
+    b"rename",
+    [{ module: 0, start: 1, end: 2, text: b"x" }],
+  );
+  let placed = placed_in(d, 3);
+  assert_eq(placed.labels.map(|l: Label| l.place), [InSource({ module: 3, start: 4, end: 9 })]);
+  assert_eq(offered_fixes(placed.fixes).flat_map(|f: Fix| fix_edits(f).map(|e: Edit| e.module)), [
+    3,
+  ])
 }

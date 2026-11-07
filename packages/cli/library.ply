@@ -1,11 +1,12 @@
+import compiler.check.resolve.tables (error_unplaced)
 import diagnostic (SourceText)
-import compiler.checkout (Checkout, Part, ShippedFile, digests_of, module_names, parts_of,
-                          shipped_files)
+import compiler.checkout (Checkout, Part, ShippedFile, StandardLibraryPart, CompilerPart,
+                          module_names, part_containing, shipped_files)
 import compiler.unit (shipped)
 import compiler.front.diagnostics (diagnostic_in_module)
 import compiler.front.pkg (check_workspace)
-import compiler.syntax.parsing (ParseDiagnostic, no_module, dummy_span)
-import compiler.check.resolve.tables (Diagnostic, error_at)
+import compiler.syntax.parsing (ParseDiagnostic)
+import compiler.check.resolve.tables (Diagnostic)
 import std.fs
 import std.fs (fs, Listed, File, mem_of)
 import std.hash (blake3)
@@ -21,7 +22,7 @@ pub type WorkspaceError = { diagnostics: List<Diagnostic>, places: List<SourceTe
 pub fn workspace_error(message: String, label: Bytes) -> WorkspaceError =
   {
     diagnostics: [
-      error_at(b"E0502", no_module, dummy_span, Bytes::of_string(message), label, [
+      error_unplaced(b"E0502", Bytes::of_string(message), label, [
         b"a `ply.work` names where each package of a repository lies (`ply doc std.pkg.Workspace`)",
       ]),
     ],
@@ -89,22 +90,16 @@ pub fn enclosing_checkout(
 
 pub fn part_of(
   dir: String,
-) -> Option<Part> / {fs.resolved_kind[abs], fs.read_file[abs], abort.raise} = {
-  let at = normalize(dir);
-  match enclosing_checkout(at) {
-    None -> None,
-    Some(c) -> parts_of(c).find(|p: Part| at == p.dir || at.starts_with(p.dir ++ "/")),
-  }
-}
+) -> Option<Part> / {fs.resolved_kind[abs], fs.read_file[abs], abort.raise} =
+  match enclosing_checkout(normalize(dir)) { None -> None, Some(c) -> part_containing(c, dir) }
 
 pub fn with_shipped_files<a | e>(
   files: List<ShippedFile>,
-  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, shipped.digests | e},
+  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module | e},
 ) -> a / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise | e} = {
   let by_name = files.fold(Map::new(), |accumulator: Map<String, Bytes>, f: ShippedFile|
     accumulator.insert(f.name, f.bytes));
   let names = module_names(files);
-  let digests = digests_of(files);
   handle {
     body()
   } with {
@@ -118,12 +113,10 @@ pub fn with_shipped_files<a | e>(
     } else { fs.list_dir[shipped](dir) },
     fs.read_file[shipped](name) -> match by_name.get(name) {
       Some(bytes) -> Some(bytes),
-      None -> if name == "digests" { Some(digests) }
-      else if name.ends_with(".ply") || name.starts_with("std/") { None }
+      None -> if name.ends_with(".ply") || name.starts_with("std/") { None }
       else { fs.read_file[shipped](name) },
     },
     shipped.names() -> names,
-    shipped.digests() -> digests,
     shipped.module(name) -> match by_name.get(name ++ ".ply") {
       Some(bytes) -> Some(bytes),
       None -> by_name.get(name),
@@ -133,8 +126,8 @@ pub fn with_shipped_files<a | e>(
 
 pub fn with_checkout_library<a | e>(
   checkout: Option<Checkout>,
-  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, shipped.digests | e},
-) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, shipped.digests, fs.read[abs], abort.raise | e} =
+  body: () -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module | e},
+) -> a / {fs.list_dir[shipped], fs.read_file[shipped], shipped.names, shipped.module, fs.read[abs], abort.raise | e} =
   match checkout { None -> body(), Some(c) -> with_shipped_files(shipped_files(c), body) }
 
 const workspace_text: Bytes =
@@ -178,11 +171,11 @@ test "a `ply.work` that fails to check is rejected with the error placed at its 
 test "`part_of` returns the library part (such as `std`) whose directory contains the given directory, and `None` for any other directory" {
   let files = [{ path: "repo/ply.work", body: workspace_text }];
   let part = |dir: String| on_files(files, || part_of(dir));
-  assert_eq(part("/repo/lib/std"), Some({ dir: "/repo/lib/std", prefix: "std" }));
-  assert_eq(part("/repo/lib/std/hash/"), Some({ dir: "/repo/lib/std", prefix: "std" }));
+  assert_eq(part("/repo/lib/std"), Some({ dir: "/repo/lib/std", role: StandardLibraryPart }));
+  assert_eq(part("/repo/lib/std/hash/"), Some({ dir: "/repo/lib/std", role: StandardLibraryPart }));
   assert_eq(
     part("/repo/lib/compiler/emit"),
-    Some({ dir: "/repo/lib/compiler", prefix: "compiler" }),
+    Some({ dir: "/repo/lib/compiler", role: CompilerPart }),
   );
   assert_eq(part("/repo/lib/stdlib"), None);
   assert_eq(part("/repo/cli"), None);
@@ -230,23 +223,13 @@ const two_files: List<ShippedFile> =
     { name: "std/a/data.txt", path: "std/a/data.txt", bytes: b"data" },
   ]
 
-test "with a checkout's files, reading a file returns the checkout's copy, and the `digests` file lists the checkout's files" {
+test "with a checkout's files, reading a file returns the checkout's copy, and a module the checkout lacks is absent" {
   let files = two_files;
   let read = |name: String|
     fs::on_mem[shipped](
       fs::mem_of([{ path: "std.gone.ply", body: b"" }, { path: "stamps", body: b"s" }]),
       || with_shipped_files(files, || fs.read_file[shipped](name)),
     ).value;
-  assert_eq(
-    read("digests"),
-    Some(
-      Bytes::of_string(
-        "std.a.ply " ++ blake3(files.get(0).bytes).hex_of() ++ "\nstd/a/data.txt "
-          ++ blake3(files.get(1).bytes).hex_of()
-          ++ "\n",
-      ),
-    ),
-  );
   assert_eq(read("std.a.ply"), Some(files.get(0).bytes));
   assert_eq(read("std.gone.ply"), None);
   assert_eq(read("stamps"), Some(b"s"))

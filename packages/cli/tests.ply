@@ -1,28 +1,28 @@
+import compiler.front.checking (in_memory)
+import compiler.check.resolve.tables (labelled_text)
+import compiler.cc
+import compiler.syntax.parsing (Error)
 import args (from_argv)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.published (no_rows, analyse)
-import compiler.front.emitter_input (Analysed, Rejected, view_dump, checked_program_of)
-import compiler.front.facts (CheckedProgram)
-import compiler.front (analyse_pulling_std_with)
+import compiler.front.facts (ProgramListing)
 import compiler.front.rows (KeyRow, EmitterRoot)
 import compiler.store.hash.forms (ItemKeyed, reach)
-import compiler.check.infer.checker (TestInfo)
 import compiler.emit.keys (TestCases, root_name, root_text, test_key, test_owner)
-import compiler.check.resolve.tables (Label, error_with_labels)
+import compiler.check.resolve.tables (InSource, Label, error_with_labels)
 import diagnostic (SourceText, diagnostic_of)
 import report (indent)
 import std.json (Null, Bool, to_string)
 import std.value (VInt, VList, render_all, shown_characters)
 import std.term (plain)
 import tester
-import tester (TestRun, ListedCase, ListingFailure, options_from)
+import tester (TestRun, ListedCase, KnownFailure, options_from)
 import std.machine as entering
 import testing.keys (case_hash)
-import testing.delta (Edited, edited, derived)
+import testing.delta (Edited, edited, rehashed)
 import testing.diagnose (RankedChange)
 import changes (ChangeDiff)
 import testing.select
-import testing.select (Moved, Row, Search, Passing, decide, to_run)
+import testing.select (Row, Search, decide, to_run)
 import std.bytes
 import sim.plan
 import std.string
@@ -34,11 +34,14 @@ import tests.report (PrintedEffect, Phases, Entry, Case, RunDecision, conflictin
                      handshake_lines, simulation_line, opening_lines, phase_lines, run_total,
                      run_phase_lines, explain_lines, name_column, result_line, result_lines,
                      summary_line, secondary_lines, at_lines, seed_lines, change_text, case_json,
-                     placed_cases, fault_json, test_output, test_at)
+                     placed_cases, fault_json, test_output)
 import tests.concluded (entry_of, job_of, run_job, fault_of, replay_of)
-import tests.cases (Scope, scope_of, over_cases, scope_for_listing, run_within, expand_cases,
-                    ExpandedTests)
-import tests.run (rows_of, declared_effects, case_view)
+import tests.cases (scope_of, selection_of, expand_cases, expanded_program, ExpandedTests)
+import tests.listing (TestListing, SelectedTest, IdentifiedProgram, listing_of, listing_of_program,
+                      identified_program, run_hash, test_at, test_list_of_program)
+import compiler.front.checking.program_facts (TestList)
+import compiler.check.infer.checker (TestInfo)
+import tests.run (rows_of, case_view)
 
 const a_source_texts: List<SourceText> =
   [{ path: "m.ply", text: b"test \"two is two\" { assert_eq(1 + 1, 2) }\n" }]
@@ -53,15 +56,16 @@ fn a_key(index: Int, label: String, returned: Bool, seeded: Bool, unstable: Bool
     label: label,
     name: "m." ++ label,
     module: "m",
-    hash: Some(b"\xab".repeat(32)),
-    cache_key: Some(b"\xab".repeat(32)),
+    hash: b"\xab".repeat(32),
+    cache_key: b"\xab".repeat(32),
     seeded: seeded,
     nondet: unstable,
-    cached: if returned { Some(Passing) } else { None },
+    stored_pass: returned,
     pending_seeds: None,
   }
 
-const a_search: Search = { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [] }
+const a_search: Search =
+  { mode: "dpor", roots: [0], budget: 256, steps: 100000, path: [], profile: cc::development() }
 
 fn a_case(index: Int, name: String) -> Case =
   {
@@ -71,7 +75,7 @@ fn a_case(index: Int, name: String) -> Case =
     name: name,
     module: "m",
     nondet: false,
-    hash: Some(a_hash),
+    hash: a_hash,
     effects: "{}",
     listed: [],
     seeded: false,
@@ -94,19 +98,54 @@ const an_opening: Opening = { operations: 0, digest: "", tests_using_host: [], w
 
 const a_test_run: TestRun = tester::start_run(options_from(parsed(["test"])))
 
-fn scoped(w: CheckedProgram, argv: List<String>) -> Scope / {abort.raise} =
-  scope_of(
-    w,
-    from_argv("test", argv).filters,
-    options_from(parsed(["test"].concat(argv))).shard,
-    None,
-  )
+type ScopeSeen = { visible: List<Bytes>, filtered_out: Int }
 
-fn selected_case_indices(
-  w: CheckedProgram,
+fn scoped(
+  program: IdentifiedProgram,
+  argv: List<String>,
+  cases: Map<Bytes, Result<List<ListedCase>, KnownFailure>>,
+) -> ScopeSeen / {abort.raise} = {
+  let filters = from_argv("test", argv).filters;
+  let shard = options_from(parsed(["test"].concat(argv))).shard;
+  let list = test_list_of_program(program.program);
+  let whole = listing_of_program(program);
+  let selected = listing_of(
+    list,
+    selection_of(list, filters, shard, None),
+    |info: TestInfo|
+      match whole.tests.find(|t: SelectedTest| t.info.key == info.key) {
+        Some(t) -> t.identity,
+        None -> panic("every selected test is in the whole listing"),
+      },
+    Map::new(),
+  );
+  let listings = range(0, selected.tests.len()).fold(
+    Map::new(),
+    |found: Map<Int, Result<List<ListedCase>, KnownFailure>>, i: Int|
+      match cases.get(selected.tests.get(i).info.key) {
+        Some(listed) -> found.insert(i, listed),
+        None -> found,
+      },
+  );
+  let over = expand_cases(selected, listings);
+  let scope = scope_of(over.listing, filters, shard, None);
+  {
+    visible: scope.visible.map(|i: Int| over.listing.tests.get(i).info.key),
+    filtered_out: scope.filtered_out,
+  }
+}
+
+fn selected_cases(
+  list: TestList,
   argv: List<String>,
   named: Option<List<String>>,
-) -> List<Int> / {abort.raise} = over_cases(w, from_argv("test", argv).filters, named)
+) -> List<Bytes> / {abort.raise} =
+  selection_of(
+    list,
+    from_argv("test", argv).filters,
+    options_from(parsed(["test"].concat(argv))).shard,
+    named,
+  ).tests.filter(|t: TestInfo| t.cases).map(|t: TestInfo| t.key)
 
 fn a_program(cases: List<Case>) -> Program =
   {
@@ -114,7 +153,6 @@ fn a_program(cases: List<Case>) -> Program =
     files: ["m.ply"],
     places: a_source_texts,
     modules: [{ name: "m", file: "m.ply" }],
-    loaded_from_cache: true,
     phases: no_phases,
     reused_members: [],
     declared: cases.len(),
@@ -123,7 +161,7 @@ fn a_program(cases: List<Case>) -> Program =
     filtered_out: 0,
     warnings: [],
     options: Null,
-    cache_stamp: Some("aabbccddeeff00112233"),
+    cache_stamp: "aabbccddeeff00112233",
     unit: tester::empty_test_unit(a_test_run),
   }
 
@@ -328,12 +366,12 @@ test "a long diff is cut, and says how much was left out" {
 test "a failure's changes lead with the edits since its test last passed" {
   let d = {
     own: None,
-    changes: [edited("m.b", "b1", "b2"), derived("m.a", "a1", "a2"), edited("m.c", "c1", "c2")],
+    changes: [edited("m.b", "b1", "b2"), rehashed("m.a", "a1", "a2"), edited("m.c", "c1", "c2")],
   };
   assert_eq(fault_of(a_failed, Some(d)).changes.map(change_text), [
     "m.b (edited)",
     "m.c (edited)",
-    "m.a (derived)",
+    "m.a (rehashed)",
   ]);
   assert_eq(fault_of(a_failed, None).changes.map(change_text), ["m.a", "m.b"])
 }
@@ -395,7 +433,7 @@ test "a test that did not pass prints its reason under its result line, and that
       diagnostic: error_with_labels(
         b"E0501",
         b"assertion failed: expected 2, found 3",
-        [{ module: 0, start: 20, end: 29, primary: true, text: b"" }],
+        [{ place: InSource({ module: 0, start: 20, end: 29 }), primary: true, text: b"" }],
         [],
       ),
       values: [],
@@ -457,25 +495,15 @@ test "`--explain` prints why each test ran or was skipped, and lists the concurr
   assert(lines.contains("       one"))
 }
 
-test "`--explain` shows the cache key a passing result is stored under, and what file changed for a test whose cached result was invalidated" {
+test "`--explain` shows the cache key a passing result is stored under" {
   let p = a_program([a_case(0, "one"), a_case(1, "two")]);
-  let keys = [
-    { ..a_key(0, "one", false, false, false), cached: Some(Moved("the file `a.ply` under `cwd`")) },
-    a_key(1, "two", false, false, false),
-  ];
+  let keys = [a_key(0, "one", false, false, false), a_key(1, "two", false, false, false)];
   let lines = explain_lines(plain, p, [], a_decided(p, keys));
-  assert(lines.at_or(1, "").contains(" changed "));
-  assert(lines.at_or(1, "").contains(" · moved: the file `a.ply` under `cwd`"));
-  assert(!lines.at_or(2, "").contains("moved"));
   assert(lines.contains("   key"));
   assert(
     lines.contains(
       "     a result is cached under the test's hash and the runtime version aabbccddeeff, and under the code the test ran together with the values it read from the system",
     ),
-  );
-  let uncached = explain_lines(plain, { ..p, cache_stamp: None }, [], a_decided(p, keys));
-  assert(
-    uncached.contains("     nothing is cached: `--no-cache` reads and writes no cache entries"),
   );
   let text = to_string(
     test_output(
@@ -488,8 +516,7 @@ test "`--explain` shows the cache key a passing result is stored under, and what
       a_decided(p, keys),
     ).json,
   );
-  assert(text.contains("\"recorded_under\":\"aabbccddeeff00112233\""));
-  assert(text.contains("\"changed_input\":\"the file `a.ply` under `cwd`\""))
+  assert(text.contains("\"recorded_under\":\"aabbccddeeff00112233\""))
 }
 
 test "the JSON output contains `command`, `exit_code` and `schema_version` fields, plus the project root, durations and run reasons" {
@@ -716,7 +743,7 @@ test "`binding_lines` prints how many tests use the host, with its operation cou
   let o = { ..an_opening, operations: 7, digest: "b3:aabbccddeeff" };
   let c = { total: 3, isolated: 1, shared: 0, host: 2 };
   assert_eq(binding_lines(plain, o, c), [
-    "   2 of 3 tests use the host · each result is cached with what the test read from the host",
+    "   2 of 3 tests use the host · these tests run every time, because their effects can write",
     "   host: 7 operations · b3:aabbccddeeff",
   ]);
   assert_eq(binding_lines(plain, an_opening, c), []);
@@ -741,8 +768,8 @@ test "a failure's secondary labels are printed under it, each with its own file,
     b"E0414",
     b"these tasks are deadlocked",
     [
-      { module: 0, start: 0, end: 4, primary: true, text: b"here" },
-      { module: 0, start: 5, end: 16, primary: false, text: b"waits on `b`" },
+      { place: InSource({ module: 0, start: 0, end: 4 }), primary: true, text: b"here" },
+      { place: InSource({ module: 0, start: 5, end: 16 }), primary: false, text: b"waits on `b`" },
     ],
     [],
   );
@@ -770,31 +797,27 @@ test "a seeded test searches only the seeds not yet searched, and a test without
   })
 }
 
-fn analysed_as(name: String, source: String) -> CheckedProgram / {abort.raise} =
-  match analyse(
-      parse_all([{ name: Bytes::of_string(name), source_text: Bytes::of_string(source) }]),
-    ) {
-    Analysed(w) -> checked_program_of(w),
-    Rejected(_) -> panic("the fixture checks"),
-  }
+fn program_named(name: String, source: String) -> IdentifiedProgram / {abort.raise} =
+  identified_program(
+    in_memory([{ name: Bytes::of_string(name), source_text: Bytes::of_string(source) }]),
+  )
 
-fn analysed(source: String) -> CheckedProgram / {abort.raise} = analysed_as("", source)
+fn analysed(source: String) -> TestListing / {abort.raise} =
+  listing_of_program(program_named("m", source))
 
-fn cases_of_whole(analysis: CheckedProgram) -> List<Case> / {abort.raise} = {
-  let declared = declared_effects(analysis);
-  range(0, analysis.checked.tests.len()).fold([], |accumulator: List<Case>, i: Int|
+fn cases_of_whole(analysis: TestListing) -> List<Case> / {abort.raise} =
+  range(0, analysis.tests.len()).fold([], |accumulator: List<Case>, i: Int|
     match test_at(analysis, i) {
-      Some(t) -> accumulator.push(case_view(analysis, declared, i, t)),
+      Some(t) -> accumulator.push(case_view(analysis, i, t)),
       None -> accumulator,
     })
-}
 
-fn coloured(analysis: CheckedProgram) -> List<List<Int>> / {abort.raise} = {
+fn coloured(analysis: TestListing) -> List<List<Int>> / {abort.raise} = {
   let cases = cases_of_whole(analysis);
   classes_of(a_program(cases), cases.map(|case: Case| case.index))
 }
 
-fn texts_of_case(analysis: CheckedProgram, i: Int) -> List<String> / {abort.raise} =
+fn texts_of_case(analysis: TestListing, i: Int) -> List<String> / {abort.raise} =
   match cases_of_whole(analysis).at(i) {
     Some(c) -> c.listed.map(|printed: PrintedEffect| printed.text),
     None -> [],
@@ -836,7 +859,7 @@ test "an effect named `holds` is treated as a real resource, so two tests that w
   let w = analysed(
     "nondet effect holds {\n  write put[rows](v: Int) -> Unit\n}\ntest/nondet \"one\" { holds.put[rows](1) }\ntest/nondet \"two\" { holds.put[rows](2) }\n",
   );
-  assert_eq(texts_of_case(w, 0), ["holds.put[rows]"]);
+  assert_eq(texts_of_case(w, 0), ["m.holds.put[rows]"]);
   assert_eq(coloured(w), [[0], [1]])
 }
 
@@ -844,7 +867,7 @@ test "a test that calls `scoped.read` and also writes with `db.put` still report
   let w = analysed(
     "nondet effect db {\n  read  get[users]() -> Int\n  write put[users](v: Int) -> Unit\n}\nfn touches(n: Int) -> Int / {scoped.read[table]} = n\ntest \"hold only\" { let seen = with_scope[table](1, |x: Int| ()) { c -> c.get() }; assert_eq(touches(seen), 1) }\ntest/nondet \"hold and a real write\" { let seen = with_scope[table](1, |x: Int| ()) { c -> c.get() }; db.put[users](touches(seen)) }\ntest/nondet \"a real read\" { assert_eq(db.get[users](), 0) }\n",
   );
-  assert_eq(texts_of_case(w, 1), ["db.put[users]", "scoped.read[table]"]);
+  assert_eq(texts_of_case(w, 1), ["m.db.put[users]", "scoped.read[table]"]);
   assert_eq(coloured(w), [[0, 1], [2]])
 }
 
@@ -865,80 +888,75 @@ test "a test that uses `simulate` is run over many schedules, and a test that do
 }
 
 test "a run reports only the tests that match `--filter`, and counts the tests it excluded" {
-  let w = analysed_as(
+  let program = program_named(
     "m",
     "test \"alpha\" { assert_eq(1, 1) }\ntest \"beta\" { assert_eq(2, 2) }\ntest \"gamma\" { assert_eq(3, 3) }\n",
   );
-  let scope = scoped(w, ["--filter", "alpha"]);
-  assert_eq(scope.visible, [0]);
+  let run = |argv: List<String>| scoped(program, argv, Map::new());
+  let scope = run(["--filter", "alpha"]);
+  assert_eq(scope.visible, [b"m.alpha"]);
   assert_eq(scope.filtered_out, 2);
-  assert_eq(scope.out, []);
-  assert_eq(scoped(w, ["--filter", "m.gam", "--filter", "alpha"]).visible, [0, 2]);
-  assert_eq(scoped(w, []).visible, [0, 1, 2])
+  assert_eq(run(["--filter", "m.gam", "--filter", "alpha"]).visible, [b"m.alpha", b"m.gamma"]);
+  assert_eq(run([]).visible, [b"m.alpha", b"m.beta", b"m.gamma"])
 }
 
 test "`--shard` puts each test and each case in exactly one shard, even when `--filter` is also given" {
-  let whole = program_with_cases;
-  let over = expand_cases(
-    whole,
-    Map::new().insert(
-      1,
-      Ok(
-        range(0, 12).map(|n: Int|
-          { label: "holds " ++ n.to_string(), identity: Bytes::of_string(n.to_string()) }),
-      ),
+  let program = checked_program(cases_source);
+  let cases = Map::new().insert(
+    b"m.holds {n}",
+    Ok(
+      range(0, 12).map(|n: Int|
+        { label: "holds " ++ n.to_string(), identity: Bytes::of_string(n.to_string()) }),
     ),
   );
   let part = |k: Int, more: List<String>|
-    scoped(over.analysis, ["--shard", k.to_string() ++ "/3"].concat(more));
+    scoped(program, ["--shard", k.to_string() ++ "/3"].concat(more), cases);
   let parts = [1, 2, 3].map(|k: Int| part(k, []).visible);
-  assert(parts.all(|shard_indices: List<Int>| shard_indices.len() > 0));
-  assert(
-    range(0, 13).all(|i: Int|
-      parts.filter(|shard_indices: List<Int>| shard_indices.contains(i)).len() == 1),
+  let every = [b"m.plain"].concat(
+    range(0, 12).map(|n: Int| Bytes::of_string("m.holds " ++ n.to_string())),
   );
-  assert_eq(part(2, []).filtered_out, 13 - parts.at_or(1, []).len());
+  assert(parts.all(|keys: List<Bytes>| keys.len() > 0));
+  assert(every.all(|key: Bytes| parts.filter(|keys: List<Bytes>| keys.contains(key)).len() == 1));
+  assert_eq(part(2, []).filtered_out, every.len() - parts.at_or(1, []).len());
+  let matching = [b"m.holds 1", b"m.holds 10", b"m.holds 11"];
   assert(
     [1, 2, 3].all(|k: Int|
       part(k, ["--filter", "holds 1"]).visible
-        == parts.at_or(k - 1, []).filter(|i: Int| i == 2 || i >= 11)),
+        == parts.at_or(k - 1, []).filter(|key: Bytes| matching.contains(key))),
   );
-  assert_eq(scoped(over.analysis, ["--shard", "1/1"]).visible, range(0, 13));
-  assert_eq(selected_case_indices(whole, ["--shard", "3/3"], None), [1])
+  assert_eq(scoped(program, ["--shard", "1/1"], cases).visible, every);
+  assert_eq(selected_cases(list_with_cases, ["--shard", "3/3"], None), [b"m.holds {n}"])
 }
 
 test "a run lists a test with cases only when a filter could match one of its cases" {
-  let whole = program_with_cases;
-  let listing = |filter: String| selected_case_indices(whole, ["--filter", filter], None);
+  let listing = |filter: String| selected_cases(list_with_cases, ["--filter", filter], None);
   assert_eq(listing("std.show."), []);
-  assert_eq(listing("m."), [1]);
-  assert_eq(listing("holds 1"), [1]);
-  assert_eq(selected_case_indices(whole, [], Some(["n"])), [])
+  assert_eq(listing("m."), [b"m.holds {n}"]);
+  assert_eq(listing("holds 1"), [b"m.holds {n}"]);
+  assert_eq(selected_cases(list_with_cases, [], Some(["n"])), [])
 }
 
-const program_with_cases: CheckedProgram =
-  checked_program(
-    b"fn table() -> List<Int> = [1, 2]\nfn held(n: Int) -> Bool = n > 0\ntest \"plain\" { assert(held(1)) }\ntest \"holds {n}\" for n: Int in table() { assert(held(n)) }\n",
+const cases_source: Bytes =
+  b"fn table() -> List<Int> = [1, 2]\nfn held(n: Int) -> Bool = n > 0\ntest \"plain\" { assert(held(1)) }\ntest \"holds {n}\" for n: Int in table() { assert(held(n)) }\n"
+
+const program_with_cases: TestListing = listing_of_program(checked_program(cases_source))
+
+const list_with_cases: TestList = test_list_of_program(checked_program(cases_source).program)
+
+fn checked_program(source: Bytes) -> IdentifiedProgram / {abort.raise} =
+  identified_program(
+    in_memory([{ name: b"m", source_text: source }], [
+      {
+        name: b"std.cases",
+        source_text: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
+      },
+      { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"\n" },
+    ]),
   )
 
-fn checked_program(source: Bytes) -> CheckedProgram / {abort.raise} =
-  match analyse_pulling_std_with(
-      [{ name: b"m", source_text: source }],
-      [
-        {
-          name: b"std.cases",
-          source_text: b"pub type Table<a> = List<a>\npub fn listed<a | e>(t: List<a>, l: (a) -> String / e) -> List<{ label: String, identity: Bytes }> / e where derivable(hash, a) = t.map(|c: a| { label: l(c), identity: b\"\" })\npub fn chosen<a>(t: List<a>, at: Int, d: Bytes) -> a / {abort.raise} where derivable(hash, a) = panic(\"\")\n",
-        },
-        { name: b"std.show", source_text: b"pub fn display<a>(x: a) -> String = \"\"\n" },
-      ],
-      no_rows,
-    ).out {
-    Analysed(w) -> checked_program_of(w),
-    Rejected(_) -> panic("the fixture checks"),
-  }
-
 test "`expand_cases` turns each case into its own test keyed by its label, and the case-generating code is not run" {
-  let whole = program_with_cases;
+  let program = checked_program(cases_source);
+  let whole = listing_of_program(program);
   let over = expand_cases(
     whole,
     Map::new().insert(
@@ -946,12 +964,12 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
       Ok([{ label: "holds 1", identity: b"one" }, { label: "holds 2", identity: b"two" }]),
     ),
   );
-  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.key), [
+  assert_eq(over.listing.tests.map(|t: SelectedTest| t.info.key), [
     b"m.plain",
     b"m.holds 1",
     b"m.holds 2",
   ]);
-  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.index), [0, 1, 2]);
+  assert_eq(over.listing.tests.map(|t: SelectedTest| t.info.index), [0, 1, 2]);
   assert_eq(over.entries.map(|e: Entry| e.test), [0, 1, 1]);
   assert_eq(over.entries.map(|e: Entry| e.key), [b"m.plain", b"m.holds {n}", b"m.holds {n}"]);
   assert_eq(over.entries.map(|e: Entry| e.case), [
@@ -959,41 +977,46 @@ test "`expand_cases` turns each case into its own test keyed by its label, and t
     Some({ at: 0, identity: b"one" }),
     Some({ at: 1, identity: b"two" }),
   ]);
-  let hashes = over.analysis.frame.hashes.tests;
-  let of_whole = |key: Bytes| whole.frame.hashes.tests.get(key);
+  let hashes = hashes_by_key(over.listing);
+  let of_whole = |key: Bytes| hashes_by_key(whole).get(key);
   assert_eq(hashes.get(b"m.plain"), of_whole(b"m.plain"));
   assert_eq(hashes.get(b"m.holds 1"), match of_whole(b"m.holds {n}") {
     Some(h) -> Some(case_hash(h, b"one")),
     None -> None,
   });
   assert(hashes.get(b"m.holds 1") != hashes.get(b"m.holds 2"), None);
-  let reachable_functions = |a: CheckedProgram|
-    reach(a.frame.hashes, [ItemKeyed(b"m.holds 1")]).functions.keys();
+  let reachable_functions = |a: ProgramListing|
+    reach(a.hashes, [ItemKeyed(b"m.holds 1")]).functions;
+  let expanded = expanded_program(program.program, Map::new().insert(0, 0), over);
   assert(
-    reachable_functions(over.analysis).contains(b"m.table")
-      && reachable_functions(over.analysis).contains(b"m.held"),
+    reachable_functions(expanded.analysis).contains(b"m.table")
+      && reachable_functions(expanded.analysis).contains(b"m.held"),
   );
   assert(
-    !reachable_functions(over.run_analysis).contains(b"m.table")
-      && reachable_functions(over.run_analysis).contains(b"m.held"),
+    !reachable_functions(expanded.run_analysis).contains(b"m.table")
+      && reachable_functions(expanded.run_analysis).contains(b"m.held"),
   )
 }
 
-fn listing(labels: List<String>) -> Result<List<ListedCase>, ListingFailure> =
+fn hashes_by_key(analysis: TestListing) -> Map<Bytes, Bytes> =
+  analysis.tests.fold(Map::new(), |found: Map<Bytes, Bytes>, t: SelectedTest|
+    found.insert(t.info.key, run_hash(t)))
+
+fn listing(labels: List<String>) -> Result<List<ListedCase>, KnownFailure> =
   Ok(labels.map(|l: String| { label: l, identity: Bytes::of_string(l) }))
 
 fn entry_descriptions(over: ExpandedTests) -> List<String> =
   over.entries.map(|e: Entry|
     String::of_bytes_lossy(e.key)
-      ++ (match e.unlisted {
+      ++ (match e.known_failure {
         Some(reason) -> ": " ++ String::of_bytes_lossy(reason.failure.diagnostic.message),
         None -> "",
       }))
 
 test "tests over cases may share a label, but each case in a module needs its own label" {
   let source = b"test \"plain\" { () }\ntest \"holds {n}\" for n: Int in [1, 2] { () }\ntest \"holds {n}\" for n: Int in [3] { () }\n";
-  let whole = checked_program(source);
-  assert_eq(whole.checked.tests.map(|t: TestInfo| t.key), [
+  let whole = listing_of_program(checked_program(source));
+  assert_eq(whole.tests.map(|t: SelectedTest| t.info.key), [
     b"m.plain",
     b"m.holds {n}",
     b"m.holds {n} (2)",
@@ -1002,7 +1025,7 @@ test "tests over cases may share a label, but each case in a module needs its ow
     whole,
     Map::new().insert(1, listing(["holds 1", "holds 2"])).insert(2, listing(["holds 3"])),
   );
-  assert_eq(apart.analysis.checked.tests.map(|t: TestInfo| t.key), [
+  assert_eq(apart.listing.tests.map(|t: SelectedTest| t.info.key), [
     b"m.plain",
     b"m.holds 1",
     b"m.holds 2",
@@ -1023,13 +1046,13 @@ test "tests over cases may share a label, but each case in a module needs its ow
     "m.holds {n}: the case at position 1 of the table has the label \"plain\", which is the name of another test",
     "m.holds {n} (2)",
   ]);
-  match match clashed.entries.at(1) { Some(e) -> e.unlisted, None -> None } {
+  match match clashed.entries.at(1) { Some(e) -> e.known_failure, None -> None } {
     Some(reason) -> {
       assert_eq(reason.failure.diagnostic.code, b"E0105");
-      assert_eq(reason.failure.diagnostic.labels.map(|l: Label| source.slice(l.start, l.end)), [
-        b"\"holds {n}\"",
-        b"\"plain\"",
-      ])
+      assert_eq(
+        reason.failure.diagnostic.labels.flat_map(|l: Label| labelled_text(source, l).to_list()),
+        [b"\"holds {n}\"", b"\"plain\""],
+      )
     },
     None -> panic("the first test over cases fails as a whole"),
   };
@@ -1061,50 +1084,17 @@ test "tests over cases may share a label, but each case in a module needs its ow
   )
 }
 
-test "running a test compiles the code it uses, and listing cases compiles only the code that generates the cases" {
-  let whole = program_with_cases;
-  let over = expand_cases(
-    whole,
-    Map::new().insert(1, Ok([{ label: "holds 1", identity: b"one" }])),
-  );
-  let plain = run_within(over, [0]);
-  assert(plain.owners.contains(b"m.held") && !plain.owners.contains(b"m.table"));
-  assert_eq(plain.tests.keys(), [b"m.plain"]);
-  let case = run_within(over, [1]);
-  assert(case.owners.contains(b"m.held") && case.owners.contains(b"m.table"));
-  assert_eq(case.tests.keys(), [b"m.holds {n}"]);
-  let keyed = view_dump(whole, Some(case)).keys.map(|k: KeyRow| k.root);
-  let cases_test = test_key(b"m", b"holds {n}");
-  assert(
-    keyed.contains(root_text(root_name(cases_test)))
-      && keyed.contains(root_text(root_name(TestCases(cases_test)))),
-  );
-  assert(!keyed.contains(test_owner(b"m", b"plain")));
-  let listing = scope_for_listing(whole, [1]);
-  assert(listing.owners.contains(b"m.table") && !listing.owners.contains(b"m.held"));
-  assert_eq(listing.tests.keys(), [b"m.holds {n}"]);
-  let idle = run_within(over, []);
-  assert_eq(idle.owners.len() + idle.tests.len(), 0);
-  assert_eq(view_dump(whole, Some(idle)).keys, []);
-  let rooted = view_dump(whole, Some(idle)).emitter_roots.map(|r: EmitterRoot| r.root);
-  assert(rooted.contains(test_owner(b"m", b"plain")));
-  assert(rooted.contains(test_owner(b"m", b"holds {n}")))
-}
-
 test "a test whose cases could not be listed stays one test, and fails with the error from the listing" {
   let whole = program_with_cases;
   let reason = {
     status: "failed",
-    failure: {
-      diagnostic: diagnostic_of("error", "E0502", "division by zero", [], []),
-      values: [],
-    },
+    failure: { diagnostic: diagnostic_of(Error, b"E0502", "division by zero", [], []), values: [] },
   };
   let over = expand_cases(whole, Map::new().insert(1, Err(reason)));
-  assert_eq(over.analysis.checked.tests.map(|t: TestInfo| t.key), [b"m.plain", b"m.holds {n}"]);
-  assert_eq(over.analysis.frame.hashes.tests, whole.frame.hashes.tests);
+  assert_eq(over.listing.tests.map(|t: SelectedTest| t.info.key), [b"m.plain", b"m.holds {n}"]);
+  assert_eq(hashes_by_key(over.listing), hashes_by_key(whole));
   let p = a_program(
-    cases_of_whole(over.analysis).map(|case: Case|
+    cases_of_whole(over.listing).map(|case: Case|
       { ..case, entry: over.entries.at_or(case.index, case.entry) }),
   );
   let ended = handle {

@@ -1,3 +1,4 @@
+import std.set (Set)
 import compiler.syntax.parsing (Span, Identifier, QName, span_bin, span_between, bare)
 import compiler.syntax.patterns (Pattern, binder_names, PatternWildcard, PatternVariable,
                                  PatternLiteral, PatternRange, PatternConstructor, PatternRecord,
@@ -35,10 +36,16 @@ pub type Callee =
   | DefinedCallee(Bytes)
   | OtherCallee
 
-pub type Termination =
-  | Terminates
-  | TerminatesByDecreases
-  | Diverges({ at: Site, through: Option<Bytes>, loop: List<Site> })
+pub type Termination = | Terminates | TerminatesByDecreases | Diverges(Divergence)
+
+pub type Divergence = { at: Site, reason: DivergenceReason }
+
+pub type DivergenceReason =
+  | NoDescent(List<Site>)
+  | CallsDiverging(Bytes)
+  | CheckStopped(StoppedBy)
+
+pub type StoppedBy = | TooManyCallPatterns(Int) | LambdasNestedTooDeep(Int)
 
 pub type Site = { caller: Bytes, span: Span }
 
@@ -75,14 +82,22 @@ pub type Group = {
   resolve: (Int, QName) -> Callee / {abort.raise},
   binders: List<Map<Int, Int>>,
   implicit_callees: (Int, Span) -> List<Callee> / {abort.raise},
-  ending_of: (Bytes) -> Termination / {abort.raise},
-  summary_of: (Bytes) -> Option<Summary>,
+  ending_of: (Bytes) -> Termination / {abort.raise, termination_facts.read},
+  summary_of: (Bytes) -> Option<Summary> / {termination_facts.read},
 }
 
 pub type Verdict = { endings: List<Termination>, summaries: List<Summary> }
 
+pub effect termination_facts {
+  read look_up_summary(name: Bytes) -> Option<Summary>
+  read look_up_ending(name: Bytes) -> Option<Termination>
+}
+
 derive bin for Callee
 derive bin for Site
+derive bin for StoppedBy
+derive bin for DivergenceReason
+derive bin for Divergence
 derive bin for Termination
 derive bin for Place
 derive bin for Base
@@ -127,7 +142,7 @@ type Arc = { a: Int, b: Int, strict: Bool }
 
 type Graph = { from: Int, to: Int, arcs: List<Arc>, calls: List<Site> }
 
-pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
+pub fn verdict(g: Group) -> Verdict / {abort.raise, termination_facts.read} = {
   let results = stable_results(g);
   let seen = range(0, g.definitions.len()).map(|i: Int|
     walk_definition({ group: g, current: i, depth: 0, results: results }, g.definitions.get(i)));
@@ -140,13 +155,13 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
       None -> match seen.get(i).too_deep_at { Some(span) -> Some(site(g, i, span)), None -> None },
     });
   let own = match lost {
-    Some(s) -> Diverges({ at: s, through: None, loop: [] }),
+    Some(s) -> Diverges({ at: s, reason: CheckStopped(LambdasNestedTooDeep(max_inline_depth)) }),
     None -> match find_non_decreasing_loop(g, calls, false) {
       None -> Terminates,
-      Some(first) -> if !stating { diverges_from_loop(first) } else {
+      Some(first) -> if !stating { Diverges(first) } else {
         match find_non_decreasing_loop(g, calls, true) {
           None -> TerminatesByDecreases,
-          Some(again) -> diverges_from_loop(again),
+          Some(again) -> Diverges(again),
         }
       },
     },
@@ -154,7 +169,7 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
   let out = |member: Int|
     |e: Termination, o: ExternalCall|
       weaker(e, match (g.ending_of)(o.name) {
-        Diverges(_) -> Diverges({ at: site(g, member, o.span), through: Some(o.name), loop: [] }),
+        Diverges(_) -> Diverges({ at: site(g, member, o.span), reason: CallsDiverging(o.name) }),
         other -> other,
       });
   let resolved = match own { Diverges(_) -> Terminates, other -> other };
@@ -169,7 +184,7 @@ pub fn verdict(g: Group) -> Verdict / {abort.raise} = {
   }
 }
 
-fn stable_results(g: Group) -> List<Option<Term>> / {abort.raise} = {
+fn stable_results(g: Group) -> List<Option<Term>> / {abort.raise, termination_facts.read} = {
   let n = g.definitions.len();
   let round = |rs: List<Option<Term>>|
     range(0, n).map(|i: Int| {
@@ -189,11 +204,6 @@ fn stable_results(g: Group) -> List<Option<Term>> / {abort.raise} = {
 
 const max_result_rounds: Int = 6
 
-fn diverges_from_loop(u: NonDecreasingLoop) -> Termination =
-  Diverges({ at: u.at, through: None, loop: u.loop })
-
-type NonDecreasingLoop = { at: Site, loop: List<Site> }
-
 fn site(g: Group, member: Int, span: Span) -> Site / {abort.raise} = {
   let start = g.definitions.get(member).span.start;
   { caller: g.names.get(member), span: span_between(span.start - start, span.end - start) }
@@ -210,7 +220,7 @@ fn find_non_decreasing_loop(
   g: Group,
   calls: List<List<Call>>,
   stated: Bool,
-) -> Option<NonDecreasingLoop> / {abort.raise} = {
+) -> Option<Divergence> / {abort.raise} = {
   let measures = propagate_measures(
     calls,
     range(0, g.definitions.len()).map(|i: Int| measures_of(g, i, calls.get(i), stated)),
@@ -234,11 +244,11 @@ fn prune_graphs(measures: List<List<Measure>>, graphs: List<Graph>) -> List<Grap
     parts.get(i).fold(m, |accumulator: Map<Int, Int>, v: Int| accumulator.insert(v, i)));
   let inside = |x: Graph, r: Arc|
     component.get(node(x.from, r.a)) == component.get(node(x.to, r.b));
-  let shrinking = graphs.fold(Map::new(), |m: Map<Int, Bool>, x: Graph|
-    x.arcs.fold(m, |accumulator: Map<Int, Bool>, r: Arc|
+  let shrinking = graphs.fold(Set::empty(), |m: Set<Int>, x: Graph|
+    x.arcs.fold(m, |accumulator: Set<Int>, r: Arc|
       if r.strict && inside(x, r) {
         match component.get(node(x.from, r.a)) {
-          Some(c) -> accumulator.insert(c, true),
+          Some(c) -> accumulator.insert(c),
           None -> accumulator,
         }
       } else { accumulator }));
@@ -263,20 +273,25 @@ type GraphClosure = {
   buckets: Map<Int, List<Graph>>,
   queue: List<Graph>,
   next: Int,
-  bad: Option<NonDecreasingLoop>,
+  bad: Option<Divergence>,
 }
 
-fn search_loops(n: Int, calls: List<Graph>) -> Option<NonDecreasingLoop> / {abort.raise} = {
+fn search_loops(n: Int, calls: List<Graph>) -> Option<Divergence> / {abort.raise} = {
   let from = range(0, n).map(|i: Int| calls.filter(|x: Graph| x.from == i));
   let start = calls.fold(
     { buckets: Map::new(), queue: [], next: 0, bad: None },
     |c: GraphClosure, x: Graph| enqueue(c, n, x),
   );
-  iterate(start, max_closure_size + 2, |c: GraphClosure|
+  iterate(start, call_pattern_limit + 2, |c: GraphClosure|
     match c.bad {
       Some(_) -> Stop(c.bad),
-      None -> if c.next >= c.queue.len() { Stop(None) } else if c.queue.len() > max_closure_size {
-        Stop(Some({ at: c.queue.get(0).calls.get(0), loop: [] }))
+      None -> if c.next >= c.queue.len() { Stop(None) } else if c.queue.len() > call_pattern_limit {
+        Stop(
+          Some({
+            at: c.queue.get(0).calls.get(0),
+            reason: CheckStopped(TooManyCallPatterns(call_pattern_limit)),
+          }),
+        )
       } else {
         let x = c.queue.get(c.next);
         let grown = from.get(x.to).fold(c, |accumulator: GraphClosure, y: Graph|
@@ -297,14 +312,14 @@ fn enqueue(c: GraphClosure, n: Int, x: Graph) -> GraphClosure / {abort.raise} = 
       bad: match c.bad {
         Some(_) -> c.bad,
         None -> if x.from == x.to && idempotent(x) && !shrinks(x) {
-          Some({ at: x.calls.get(0), loop: x.calls })
+          Some({ at: x.calls.get(0), reason: NoDescent(x.calls) })
         } else { None },
       },
     }
   }
 }
 
-const max_closure_size: Int = 10000
+const call_pattern_limit: Int = 10000
 
 fn add_graph(gs: List<Graph>, x: Graph) -> List<Graph> =
   if gs.fold(false, |found: Bool, y: Graph|
@@ -804,7 +819,11 @@ fn parts(t: Term) -> Term =
     _ -> UnknownTerm,
   }
 
-fn element(context: MemberContext, scope: Scope, list: Expression) -> Term / {abort.raise} =
+fn element(
+  context: MemberContext,
+  scope: Scope,
+  list: Expression,
+) -> Term / {abort.raise, termination_facts.read} =
   match list {
     CallExpression(a) -> match builtin(context, scope, a.function) {
       Some(name) -> if a.args.len() != 1 { below(term_of_expression(context, scope, list)) }
@@ -879,7 +898,7 @@ fn iterated_result(
   scope: Scope,
   it: CallbackUse,
   args: List<Expression>,
-) -> Term / {abort.raise} =
+) -> Term / {abort.raise, termination_facts.read} =
   match it.result {
     Mapped -> match callback_lambda(context, scope, it, args, UnknownTerm) {
       Some(inside) -> match result_term(context, inside.scope, inside.body) {
@@ -905,7 +924,7 @@ fn callback_lambda(
   it: CallbackUse,
   args: List<Expression>,
   threaded: Term,
-) -> Option<{ scope: Scope, body: Expression }> / {abort.raise} =
+) -> Option<{ scope: Scope, body: Expression }> / {abort.raise, termination_facts.read} =
   match args.at(it.callback) {
     Some(LambdaExpression(l)) -> if l.params.len() != it.params.len() { None } else {
       let element = match iterated_argument(it, args) {
@@ -930,7 +949,7 @@ fn fold_result(
   scope: Scope,
   it: CallbackUse,
   args: List<Expression>,
-) -> Term / {abort.raise} =
+) -> Term / {abort.raise, termination_facts.read} =
   match it.params.fold(None, |found: Option<Int>, h: CallbackArgument|
       match h { Accumulator(k) -> Some(k), _ -> found }) {
     None -> UnknownTerm,
@@ -969,7 +988,11 @@ fn binder_of(context: MemberContext, q: QName) -> Option<Int> =
     },
   }
 
-fn term_of_expression(context: MemberContext, scope: Scope, e: Expression) -> Term / {abort.raise} =
+fn term_of_expression(
+  context: MemberContext,
+  scope: Scope,
+  e: Expression,
+) -> Term / {abort.raise, termination_facts.read} =
   match e {
     LiteralExpression(l) -> match l.literal {
       LiteralInt(k) -> Exactly({ base: None, k: k }),
@@ -1064,7 +1087,7 @@ fn block_scope(
   context: MemberContext,
   scope: Scope,
   statements: List<Statement>,
-) -> { s: Scope, falls: Option<Term> } / {abort.raise} =
+) -> { s: Scope, falls: Option<Term> } / {abort.raise, termination_facts.read} =
   statements.fold(
     { s: scope, falls: None },
     |accumulator: { s: Scope, falls: Option<Term> }, x: Statement|
@@ -1082,7 +1105,7 @@ fn field_terms(
   context: MemberContext,
   scope: Scope,
   fs: List<RecordLiteralField>,
-) -> List<{ name: Bytes, term: Term }> / {abort.raise} =
+) -> List<{ name: Bytes, term: Term }> / {abort.raise, termination_facts.read} =
   fs.map(|field: RecordLiteralField|
     { name: field.name.name, term: term_of_expression(context, scope, field.value) })
 
@@ -1152,7 +1175,7 @@ fn applied_term(
   function: Expression,
   args: List<Expression>,
   named: List<NamedArg>,
-) -> Term / {abort.raise} =
+) -> Term / {abort.raise, termination_facts.read} =
   match function {
     NameExpression(v) -> match callee_of(context, scope, v.name) {
       BuiltinCallee(name) -> if args.len() == 0 { UnknownTerm }
@@ -1257,7 +1280,7 @@ fn linear_of_expression(
   context: MemberContext,
   scope: Scope,
   e: Expression,
-) -> Option<Linear> / {abort.raise} =
+) -> Option<Linear> / {abort.raise, termination_facts.read} =
   match term_of_expression(context, scope, e) {
     Exactly(l) -> if integer(context, l) { Some(l) } else { None },
     _ -> None,
@@ -1267,7 +1290,7 @@ fn result_term(
   context: MemberContext,
   scope: Scope,
   e: Expression,
-) -> Option<Term> / {abort.raise} =
+) -> Option<Term> / {abort.raise, termination_facts.read} =
   match e {
     IfExpression(i) -> branches_of_if(context, scope, i),
     MatchExpression(m) -> branches_of_match(context, scope, m),
@@ -1297,7 +1320,7 @@ fn branches_of_if(
   context: MemberContext,
   scope: Scope,
   i: { span: Span, cond: Expression, then_branch: Expression, else_branch: Expression },
-) -> Option<Term> / {abort.raise} =
+) -> Option<Term> / {abort.raise, termination_facts.read} =
   joined(
     result_term(context, assume(context, scope, i.cond, true), i.then_branch),
     result_term(context, assume(context, scope, i.cond, false), i.else_branch),
@@ -1307,7 +1330,7 @@ fn branches_of_match(
   context: MemberContext,
   scope: Scope,
   m: { span: Span, scrutinee: Expression, arms: List<MatchArm> },
-) -> Option<Term> / {abort.raise} = {
+) -> Option<Term> / {abort.raise, termination_facts.read} = {
   let t = term_of_expression(context, scope, m.scrutinee);
   m.arms.fold(None, |accumulator: Option<Term>, arm: MatchArm| {
     let inside = bind(scope, arm.pattern, t);
@@ -1514,7 +1537,11 @@ fn bind(s: Scope, p: Pattern, t: Term) -> Scope =
     PatternInvalid(_) -> s,
   }
 
-fn statement_scope(context: MemberContext, scope: Scope, x: Statement) -> Scope / {abort.raise} =
+fn statement_scope(
+  context: MemberContext,
+  scope: Scope,
+  x: Statement,
+) -> Scope / {abort.raise, termination_facts.read} =
   match x {
     LetStatement(l) -> match l.pattern {
       PatternVariable(v) -> match l.value {
@@ -1543,7 +1570,7 @@ fn assume(
   scope: Scope,
   e: Expression,
   truth: Bool,
-) -> Scope / {abort.raise} =
+) -> Scope / {abort.raise, termination_facts.read} =
   match e {
     UnaryExpression(u) -> if u.operation == b"not" { assume(context, scope, u.operand, !truth) }
     else { scope },
@@ -1578,7 +1605,7 @@ fn pattern_facts(
   scope: Scope,
   scrutinee: Expression,
   p: Pattern,
-) -> Scope / {abort.raise} =
+) -> Scope / {abort.raise, termination_facts.read} =
   match p {
     PatternLiteral(l) -> match l.literal {
       LiteralBool(b) -> assume(context, scope, scrutinee, b),
@@ -1656,7 +1683,10 @@ fn comparison_facts(operator: Bytes, l: Linear, r: Linear, truth: Bool) -> List<
   }
 }
 
-fn walk_definition(context: MemberContext, definition: FnDefinition) -> Findings / {abort.raise} = {
+fn walk_definition(
+  context: MemberContext,
+  definition: FnDefinition,
+) -> Findings / {abort.raise, termination_facts.read} = {
   let s = entry_scope(context, definition);
   let defaults = definition.params.fold(
     { calls: [], uses: [], outside: [], too_deep_at: None },
@@ -1764,7 +1794,7 @@ fn walk(
   s: Scope,
   accumulator: Findings,
   e: Expression,
-) -> Findings / {abort.raise} =
+) -> Findings / {abort.raise, termination_facts.read} =
   match e {
     LiteralExpression(_) -> accumulator,
     HoleExpression(_) -> accumulator,
@@ -1980,7 +2010,7 @@ fn walk_statements(
   scope: Scope,
   accumulator: Findings,
   statements: List<Statement>,
-) -> { s: Scope, accumulator: Findings } / {abort.raise} =
+) -> { s: Scope, accumulator: Findings } / {abort.raise, termination_facts.read} =
   statements.fold(
     { s: scope, accumulator: accumulator },
     |st: { s: Scope, accumulator: Findings }, x: Statement|
@@ -2028,7 +2058,7 @@ fn walk_inlined_lambda(
   accumulator: Findings,
   f: { params: List<Param>, body: Expression, locals: Map<Int, Local> },
   args: List<Term>,
-) -> Findings / {abort.raise} =
+) -> Findings / {abort.raise, termination_facts.read} =
   if context.depth >= max_inline_depth { too_deep(accumulator, f.body) } else {
     let inside = range(0, f.params.len()).fold(
       { locals: f.locals, facts: s.facts },
@@ -2042,7 +2072,7 @@ fn lambda_escapes(
   scope: Scope,
   accumulator: Findings,
   f: { params: List<Param>, body: Expression, locals: Map<Int, Local> },
-) -> Findings / {abort.raise} =
+) -> Findings / {abort.raise, termination_facts.read} =
   if context.depth >= max_inline_depth { too_deep(accumulator, f.body) } else {
     walk(
       { ..context, depth: context.depth + 1 },
@@ -2066,7 +2096,7 @@ fn walk_call(
   args: List<Expression>,
   named: List<NamedArg>,
   span: Span,
-) -> Findings / {abort.raise} = {
+) -> Findings / {abort.raise, termination_facts.read} = {
   let walk_args = |a: Findings|
     named.fold(
       args.fold(a, |x: Findings, y: Expression| walk(context, scope, x, y)),
@@ -2159,7 +2189,7 @@ fn arguments(
   t: Int,
   args: List<Expression>,
   named: List<NamedArg>,
-) -> List<Term> / {abort.raise} =
+) -> List<Term> / {abort.raise, termination_facts.read} =
   actual_arguments(
     context,
     scope,
@@ -2174,7 +2204,7 @@ fn actual_arguments(
   names: List<Bytes>,
   args: List<Expression>,
   named: List<NamedArg>,
-) -> List<Term> / {abort.raise} =
+) -> List<Term> / {abort.raise, termination_facts.read} =
   range(0, names.len()).map(|i: Int|
     match args.at(i) {
       Some(x) -> term_of_expression(context, scope, x),
@@ -2191,7 +2221,7 @@ fn walk_summarized_call(
   sum: Summary,
   args: List<Expression>,
   named: List<NamedArg>,
-) -> Findings / {abort.raise} = {
+) -> Findings / {abort.raise, termination_facts.read} = {
   let terms = actual_arguments(context, scope, sum.names, args, named);
   let at_param = |i: Int, seen: Findings, x: Expression|
     match sum.params.at(i) {
@@ -2224,7 +2254,7 @@ fn walk_passed_function(
   accumulator: Findings,
   x: Expression,
   calls: List<List<Term>>,
-) -> Findings / {abort.raise} =
+) -> Findings / {abort.raise, termination_facts.read} =
   match x {
     LambdaExpression(l) ->
       calls.fold(accumulator, |seen: Findings, call: List<Term>| {
@@ -2295,7 +2325,7 @@ fn walk_iterating_call(
   args: List<Expression>,
   named: List<NamedArg>,
   it: CallbackUse,
-) -> Findings / {abort.raise} = {
+) -> Findings / {abort.raise, termination_facts.read} = {
   let others = named.fold(accumulator, |seen: Findings, n: NamedArg|
     walk(context, scope, seen, n.value));
   let element = match iterated_argument(it, args) {

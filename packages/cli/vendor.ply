@@ -1,4 +1,7 @@
-import compiler.load (Derives)
+import progress
+import compiler.check.resolve.tables (error_unplaced)
+import sources (ProjectFiles)
+import compiler.load (Loads)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
 import std.random (entropy)
@@ -7,24 +10,24 @@ import args (Flags, style_of, root_of)
 import builder (builder)
 import lock
 import paths (ResolvedPath, here)
-import program (Program, load_program)
+import program (places_of, pins_of, session)
 import report (CommandOutput, indent, ok_code, count_of, rejected, reported)
-import sources (index_path, dependency_dir)
+import sources (Project, index_path, dependency_dir)
 import std.term (Style, green)
-import compiler.front.facts (Frame)
-import compiler.check.resolve.tables (Diagnostic, error_at)
-import compiler.check.resolve.scopes (PackageDependencies)
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.front.checking.world (Modules)
+import compiler.front.pkg (LockedPackage, PackageSources, closure)
+import compiler.check.resolve.tables (Diagnostic, Source)
+import diagnostic (SourceText)
 import std.fs (fs, Listed, Dir, File)
 import std.json (Json, Array, Bool, Number, Str, object)
 import std.path (join, parent, strip_root)
 import std.list
-import compiler.syntax.parsing (no_module, dummy_span)
+import project_store
 
 fn not_vendored(path: String, reason: String) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0502",
-    no_module,
-    dummy_span,
     Bytes::of_string(reason),
     Bytes::of_string("`" ++ path ++ "` was not vendored"),
     [
@@ -124,22 +127,29 @@ fn inserted(
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.create_dir[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
+) -> CommandOutput / {project_store::Databases, time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.create_dir[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise, diverges} = {
   let s: Style = style_of(flags);
   let r = root_of(flags);
-  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
-  match loaded.frame {
-    None -> rejected(s, "vendor", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> match lock_mismatch_error(r, w, lock::committed_packages(loaded.packages)) {
-      Some(d) -> reported(s, "vendor", [d], loaded.source_texts),
-      None -> vendor_output(s, flags, r, loaded, w),
+  match progress::silently(||
+      session(flags.paths, flags.verify_dependencies, |_: Modules, _: ProgramSummary| ())) {
+    Err(refused) -> rejected(s, "vendor", refused.diagnostics, refused.places),
+    Ok(opened) -> match pins_of(opened.project) {
+      Err(refused) -> rejected(s, "vendor", refused.diagnostics, refused.places),
+      Ok(pinned) -> match lock_mismatch_error(
+          r,
+          pinned.pins,
+          lock::committed_packages(pinned.packages),
+        ) {
+        Some(d) -> reported(s, "vendor", [d], places_of(opened)),
+        None -> vendor_output(s, flags, r, opened.project, pinned.packages, places_of(opened)),
+      },
     },
   }
 }
 
 fn lock_mismatch_error(
   resolved: ResolvedPath,
-  analysis: Frame,
+  pins: List<LockedPackage>,
   committed: List<String>,
 ) -> Option<Diagnostic> / {fs.read_file[cwd], fs.read_file[abs], abort.raise} =
   match lock::read(resolved) {
@@ -148,7 +158,7 @@ fn lock_mismatch_error(
     Ok(Some(existing)) -> match lock::verify(
         resolved,
         existing,
-        lock::from_front(analysis.pins),
+        lock::from_front(pins),
         committed,
       ) {
       Ok(_) -> None,
@@ -160,12 +170,12 @@ fn vendor_output(
   style: Style,
   flags: Flags,
   resolved: ResolvedPath,
-  loaded: Program,
-  analysis: Frame,
+  project: Project,
+  packages: PackageSources,
+  places: List<SourceText>,
 ) -> CommandOutput / {builder.git[vcs], fs.create_dir[abs], fs.list_dir[abs], fs.read_file[abs], fs.write_file[abs], abort.raise} =
-  match vendor_packages(resolved, vendor_directories(analysis, loaded)) {
-    Err(reason) ->
-      reported(style, "vendor", [not_vendored(resolved.display, reason)], loaded.source_texts),
+  match vendor_packages(resolved, vendor_directories(project, packages)) {
+    Err(reason) -> reported(style, "vendor", [not_vendored(resolved.display, reason)], places),
     Ok(rows) ->
       {
         json: json_of(rows, resolved.display, ok_code),
@@ -176,24 +186,24 @@ fn vendor_output(
   }
 
 fn vendor_directories(
-  analysis: Frame,
-  loaded: Program,
-) -> List<{ requirement: String, dir: String }> / {abort.raise} =
-  range(1, loaded.packages.supplied.len() + 1).fold(
+  project: Project,
+  packages: PackageSources,
+) -> List<{ requirement: String, dir: String }> / {abort.raise} = {
+  let closed = closure(packages, project.sources.map(|s: Source| s.name)).packages;
+  range(1, packages.supplied.len() + 1).fold(
     [],
     |accumulator: List<{ requirement: String, dir: String }>, i: Int| {
-      let want = match loaded.packages.supplied.at(i - 1) {
+      let want = match packages.supplied.at(i - 1) {
         None -> "",
         Some(s) -> String::of_bytes_lossy(s.root),
       };
       accumulator.push({
         requirement: want,
-        dir: join("vendor", prefix_of(analysis.packages.get(i))),
+        dir: join("vendor", String::of_bytes_lossy(closed.get(i).prefix)),
       })
     },
   )
-
-fn prefix_of(p: PackageDependencies) -> String = String::of_bytes_lossy(p.prefix)
+}
 
 fn vendor_packages(
   resolved: ResolvedPath,

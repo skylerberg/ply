@@ -1,0 +1,200 @@
+import compiler.check.infer.checker (BodyPlan, CheckReads, Role, StoredDeclarations,
+                                     dependency_module)
+import compiler.check.resolve (ImportPackages, ResolveFailed, ResolveSucceeded, resolve_group)
+import compiler.check.resolve.defaults (ResolvedProgram)
+import compiler.check.resolve.tables (Diagnostic, EffectSpace, ParsedModule, Scope, TypeSpace,
+                                      ValueSpace, bound_in, other_modules)
+import compiler.expand.embed (EmbedRequest, EmbedResult, ModuleEmbed, embed_key, embed_requests)
+import compiler.front (embeds_inlined, may_call_embed)
+import compiler.front.diagnostics (ParsedSource, parse_from)
+import compiler.front.exports (Imported, OwnerSource, OwnerText, group_source_from, named_as_owned)
+import compiler.front.published (GroupCheck, ResolvedGroup, resolved_facts, type_check, unresolved)
+import compiler.store.hash (index_uses)
+import compiler.store.hash.forms (build_index)
+import compiler.store.hash.graph (HeldConstructor, HeldEffect, HeldName, HeldType, HeldValue, Index,
+                                  NameElsewhere, index_beside)
+import compiler.syntax.items (parse_items)
+import std.list
+
+pub type LoadedSource = {
+  source: OwnerSource,
+  role: Role,
+  tables: ImportPackages,
+  embed_read: (EmbedRequest) -> EmbedResult / {abort.raise},
+}
+
+pub type GroupInputs = { loaded: List<LoadedSource>, elsewhere: List<NameElsewhere> }
+
+pub fn source_of_group(
+  module: Bytes,
+  members: List<OwnerText>,
+  imported: List<Imported>,
+) -> OwnerSource / {abort.raise} = group_source_from(module, members, imported)
+
+type ReadSource = { parsed: ParsedSource, embeds: List<ModuleEmbed> }
+
+type LoadedRead = { read: ReadSource, loaded: LoadedSource }
+
+fn with_embeds(
+  parsed: ParsedSource,
+  at: Int,
+  bound_elsewhere: List<Bytes>,
+  read: (EmbedRequest) -> EmbedResult / {abort.raise},
+) -> ReadSource / {abort.raise} =
+  if !may_call_embed(parsed.text) { { parsed: parsed, embeds: [] } } else {
+    embeds_inlined(
+      parsed,
+      at,
+      bound_elsewhere,
+      embed_requests(parsed.module.module, bound_elsewhere).fold(
+        Map::new(),
+        |found: Map<Bytes, EmbedResult>, want: EmbedRequest|
+          found.insert(embed_key(want), read(want)),
+      ),
+    )
+  }
+
+pub fn parsed_group(source: OwnerSource, at: Int) -> ParsedSource / {abort.raise} = {
+  let raw = parse_items(source.source.source_text, source.imports);
+  parse_from(
+    at,
+    source.source,
+    { ..raw, node: named_as_owned(raw.node, source) },
+    derivations: source.derived,
+  )
+}
+
+fn grouped(
+  read: List<LoadedRead>,
+  x: ResolvedProgram,
+  index: Index,
+  inputs: GroupInputs,
+) -> ResolvedGroup / {abort.raise, other_modules.read} = {
+  let roles = read.fold(Map::new(), |found: Map<Bytes, Role>, r: LoadedRead|
+    found.insert(r.read.parsed.module.name, r.loaded.role));
+  {
+    modules: x.modules.map(|m: ParsedModule|
+      match roles.get(m.name) {
+        Some(role) -> { parsed: m, role: role },
+        None -> dependency_module(m),
+      }),
+    resolution: x.resolution,
+    index: index,
+    uses: index_uses(index).uses,
+    module_packages: x.modules.map(|m: ParsedModule|
+      match other_modules.look_up_package(m.name) {
+        Some(p) -> p,
+        None -> inputs.loaded.get(0).tables.package,
+      }),
+    embeds: read.flat_map(|r: LoadedRead| r.read.embeds),
+    texts: read.map(|r: LoadedRead| r.read.parsed.text),
+    problems: x.diagnostics,
+  }
+}
+
+fn with_scopes(n: NameElsewhere, scopes: List<Scope>) -> NameElsewhere / {other_modules.read} = {
+  let namespace = match n.held {
+    HeldName(HeldEffect) -> EffectSpace,
+    HeldName(HeldType) -> TypeSpace,
+    HeldName(HeldValue) -> ValueSpace,
+    HeldConstructor(_) -> ValueSpace,
+  };
+  {
+    ..n,
+    bare: scopes.any(|scope: Scope|
+      match bound_in(scope, namespace, n.name) { Some(b) -> b.owner == n.module, None -> false }),
+  }
+}
+
+pub fn checked_group(
+  inputs: GroupInputs,
+  body_plan: BodyPlan,
+) -> GroupCheck / {CheckReads, abort.raise} =
+  match group_to_check(inputs) {
+    Err(unchecked) -> unchecked,
+    Ok(group) -> type_check(group, body_plan, []),
+  }
+
+pub fn rejected_group(
+  inputs: GroupInputs,
+  diagnostics: List<Diagnostic>,
+  declared: StoredDeclarations,
+) -> GroupCheck / {other_modules.read, abort.raise} =
+  match group_to_check(inputs) {
+    Err(unchecked) -> unchecked,
+    Ok(group) ->
+      {
+        resolved: Some(resolved_facts(group)),
+        declared: declared,
+        checked: None,
+        diagnostics: diagnostics,
+      },
+  }
+
+type GroupReading =
+  | TextRejected(List<Diagnostic>)
+  | ReadingRejected(List<Diagnostic>)
+  | NamesResolved(ResolvedGroup)
+
+fn group_to_check(
+  inputs: GroupInputs,
+) -> Result<ResolvedGroup, GroupCheck> / {other_modules.read, abort.raise} =
+  match group_reading(inputs) {
+    TextRejected(_) -> Err(unresolved([])),
+    ReadingRejected(ds) -> Err(unresolved(ds)),
+    NamesResolved(group) -> Ok(group),
+  }
+
+fn values_bound_elsewhere(elsewhere: List<NameElsewhere>, module: Bytes) -> List<Bytes> =
+  elsewhere.filter(|n: NameElsewhere| n.module == module && n.held == HeldName(HeldValue)).map(
+    |n: NameElsewhere| n.name,
+  )
+
+pub fn resolved_group(
+  inputs: GroupInputs,
+) -> Result<ResolvedGroup, List<Diagnostic>> / {other_modules.read, abort.raise} =
+  match group_reading(inputs) {
+    TextRejected(ds) -> Err(ds),
+    ReadingRejected(ds) -> Err(ds),
+    NamesResolved(group) -> Ok(group),
+  }
+
+fn group_reading(inputs: GroupInputs) -> GroupReading / {other_modules.read, abort.raise} = {
+  let parsed = inputs.loaded.fold([], |found: List<ParsedSource>, l: LoadedSource|
+    found.push(parsed_group(l.source, found.len())));
+  let text_problems = parsed.flat_map(|p: ParsedSource| p.diagnostics);
+  if text_problems.len() > 0 { TextRejected(text_problems) } else {
+    let read = range(0, parsed.len()).map(|at: Int| {
+      let l = inputs.loaded.get(at);
+      {
+        read: with_embeds(
+          parsed.get(at),
+          at,
+          values_bound_elsewhere(inputs.elsewhere, l.source.source.name),
+          l.embed_read,
+        ),
+        loaded: l,
+      }
+    });
+    let problems = read.flat_map(|r: LoadedRead| r.read.parsed.diagnostics);
+    if problems.len() > 0 { ReadingRejected(problems) } else {
+      match resolve_group(
+          read.map(|r: LoadedRead| { module: r.read.parsed.module, tables: r.loaded.tables }),
+          inputs.elsewhere.map(|n: NameElsewhere| n.module),
+        ) {
+        ResolveFailed(ds) -> ReadingRejected(ds),
+        ResolveSucceeded(x) -> {
+          let built = build_index(x.modules, x.resolution);
+          if built.diagnostics.len() > 0 { ReadingRejected(built.diagnostics) } else {
+            let scopes = x.resolution.scopes.take(read.len());
+            let index = index_beside(
+              built.index,
+              inputs.elsewhere.map(|n: NameElsewhere| with_scopes(n, scopes)),
+            );
+            NamesResolved(grouped(read, x, index, inputs))
+          }
+        },
+      }
+    }
+  }
+}

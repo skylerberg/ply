@@ -3,10 +3,9 @@ use std::path::{Path, PathBuf};
 const CRATES: &[&str] = &["ply-compiled", "ply-core"];
 
 const EXCLUDED_FROM_DIGEST: &[&str] = &[
+    "ply-compiled/src/c/binary.rs",
     "ply-compiled/src/c/linked.rs",
     "ply-compiled/src/c/load.rs",
-    "ply-compiled/src/c/stage.rs",
-    "ply-compiled/src/c/sweep.rs",
 ];
 
 fn main() {

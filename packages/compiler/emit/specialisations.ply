@@ -1,3 +1,5 @@
+import std.set (Set)
+import std.graph (Visit, traverse)
 import compiler.syntax.parsing (Identifier)
 import compiler.emit.code (Code)
 import compiler.syntax.items (FnDefinition)
@@ -8,9 +10,10 @@ import std.list
 import compiler.emit.keys (RootKey, Named, Specialisation, InlinedLambda, RootName, root_name,
                            site_owner_text, key_types, inlined_lambdas)
 import compiler.emit.output (Need, Exact)
-import compiler.emit.representations (Definition, EmitParam, BoundLambda, has_variables)
+import compiler.emit.representations (Definition, EmitParam, BoundLambda, has_variables, EmitReads)
 import compiler.emit.typing (SiteAnnotations, unknown_type)
-import compiler.emit.lower.module_context (ModuleContext, Root, root_body)
+import compiler.emit.lower.module_context (ModuleContext, Root, root_body, definition_at,
+                                           scheme_called)
 import compiler.emit.lower (group_lowered, tail_calls, TailCall)
 import compiler.emit.lower.calling (has_handle_matching, instance_key)
 import compiler.emit.lower.handling (detaches)
@@ -32,9 +35,9 @@ pub fn specialised_lowered(
   s: ModuleContext,
   definition: FnDefinition,
   root: RootKey,
-  lambda_at: (RootKey, Int) -> Option<BoundLambda> / {abort.raise},
+  lambda_at: (RootKey, Int) -> Option<BoundLambda> / {EmitReads},
   recorded: SiteAnnotations,
-) -> Function / {abort.raise} = {
+) -> Function / {EmitReads} = {
   let args = key_types(root);
   let b = root_body(
     recorded,
@@ -79,8 +82,8 @@ fn tail_call_targets(
   s: ModuleContext,
   w: DefinitionBody,
   args: List<Type>,
-) -> TailCallTargets / {abort.raise} =
-  tail_calls(s.definitions, w.code, []).fold(
+) -> TailCallTargets / {EmitReads} =
+  tail_calls(s, w.code, []).fold(
     { key: Named(b""), out: [], grown: [] },
     |accumulator: TailCallTargets, t: TailCall|
       match instance_args(t.args, args) {
@@ -95,64 +98,41 @@ fn tail_call_targets(
   )
 
 pub fn tail_reachable_definitions(
-  module: Bytes,
-  here: List<Definition>,
-  read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
+  s: ModuleContext,
+  read_of: (Bytes) -> Option<DefinitionBody> / {EmitReads},
   from: Bytes,
-) -> Map<Bytes, Bool> / {abort.raise} =
-  iterate(
-    { seen: Map::new(), work: [from] },
-    1000000,
-    |r: { seen: Map<Bytes, Bool>, work: List<Bytes> }|
-      match r.work {
-        [] -> Stop(r),
-        [n, ..rest] -> if r.seen.contains(n) { Continue({ ..r, work: rest }) } else {
-          let next = match read_of(n) {
-            Some(w) -> tail_calls(here, w.code, []).map(|t: TailCall| t.full),
-            None -> [],
-          };
-          Continue({ seen: r.seen.insert(n, true), work: rest.concat(next) })
-        },
+) -> Set<Bytes> / {EmitReads} =
+  traverse([from], |n: Bytes|
+    {
+      value: (),
+      next: match read_of(n) {
+        Some(w) -> tail_calls(s, w.code, []).map(|t: TailCall| t.full),
+        None -> [],
       },
-  ).seen
-
-pub fn tail_loop_members(
-  module: Bytes,
-  here: List<Definition>,
-  read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
-  owner: Bytes,
-) -> List<Bytes> / {abort.raise} =
-  tail_reachable_definitions(module, here, read_of, owner).keys().filter(|d: Bytes|
-    d != owner && tail_reachable_definitions(module, here, read_of, d).contains(owner))
+    }).fold(Set::empty(), |reached: Set<Bytes>, v: Visit<Bytes, Unit>| reached.insert(v.key))
 
 pub fn tail_loop_of(
   s: ModuleContext,
   order: Map<Bytes, Int>,
-  read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
+  read_of: (Bytes) -> Option<DefinitionBody> / {EmitReads},
   key: RootKey,
-) -> List<RootKey> / {abort.raise} = {
-  let targets_by_root = iterate(
-    { pairs: Map::new(), work: [key] },
-    1000000,
-    |r: { pairs: Map<RootName, TailCallTargets>, work: List<RootKey> }|
-      match r.work {
-        [] -> Stop(r),
-        [k, ..rest] -> if r.pairs.contains(root_name(k)) { Continue({ ..r, work: rest }) } else {
-          let t = match read_of(site_owner_text(k)) {
-            Some(w) -> tail_call_targets(s, w, key_types(k)),
-            None -> { key: k, out: [], grown: [] },
-          };
-          Continue({
-            pairs: r.pairs.insert(root_name(k), { ..t, key: k }),
-            work: rest.concat(t.out),
-          })
-        },
-      },
-  ).pairs;
+) -> List<RootKey> / {EmitReads} = {
+  let targets_by_root = traverse([key], |k: RootKey| {
+    let t = match read_of(site_owner_text(k)) {
+      Some(w) -> tail_call_targets(s, w, key_types(k)),
+      None -> { key: k, out: [], grown: [] },
+    };
+    { value: { ..t, key: k }, next: t.out }
+  }).fold(
+    Map::new(),
+    |pairs: Map<RootName, TailCallTargets>, v: Visit<RootKey, TailCallTargets>|
+      if pairs.contains(root_name(v.key)) { pairs }
+      else { pairs.insert(root_name(v.key), v.value) },
+  );
   targets_by_root.fold((), |_: Unit, _: RootName, p: TailCallTargets| {
     let caller = site_owner_text(p.key);
     match p.grown.find(|callee: Bytes|
-        tail_reachable_definitions(s.module, s.definitions, read_of, callee).contains(caller)) {
+        tail_reachable_definitions(s, read_of, callee).contains(caller)) {
       None -> (),
       Some(callee) ->
         panic(
@@ -168,19 +148,18 @@ pub fn tail_loop_of(
         ),
     }
   });
-  let back = iterate(
-    Map::new().insert(root_name(key), true),
-    targets_by_root.len() + 1,
-    |seen: Map<RootName, Bool>| {
-      let more = targets_by_root.fold(
-        seen,
-        |accumulator: Map<RootName, Bool>, n: RootName, p: TailCallTargets|
-          if accumulator.contains(n)
-              || !p.out.any(|k: RootKey| accumulator.contains(root_name(k))) { accumulator }
-          else { accumulator.insert(n, true) },
-      );
-      if more.len() == seen.len() { Stop(seen) } else { Continue(more) }
-    },
+  let callers = targets_by_root.fold(
+    Map::new(),
+    |accumulator: Map<RootName, List<RootName>>, n: RootName, p: TailCallTargets|
+      p.out.fold(accumulator, |a: Map<RootName, List<RootName>>, k: RootKey| {
+        let had = match a.get(root_name(k)) { Some(found) -> found, None -> [] };
+        a.insert(root_name(k), had.push(n))
+      }),
+  );
+  let back = traverse([root_name(key)], |n: RootName|
+    { value: (), next: match callers.get(n) { Some(found) -> found, None -> [] } }).fold(
+    Set::empty(),
+    |reached: Set<RootName>, v: Visit<RootName, Unit>| reached.insert(v.key),
   );
   let members = targets_by_root.fold(
     [],
@@ -193,9 +172,13 @@ pub fn tail_loop_of(
       None -> true,
     });
   let takes_effect_variables = members.any(|k: RootKey|
-    s.definitions.any(|d: Definition|
-      qualify(s.module, d.name) == site_owner_text(k)
-        && (match d.scheme { Some(scheme) -> scheme.effect_variables.len() > 0, None -> false })));
+    match definition_at(s, site_owner_text(k)) {
+      Some(d) -> match d.definition.scheme {
+        Some(scheme) -> scheme.effect_variables.len() > 0,
+        None -> false,
+      },
+      None -> false,
+    });
   if members.len() < 2 || detached || takes_effect_variables { [key] }
   else { in_order(order, members) }
 }
@@ -213,9 +196,9 @@ fn in_order(order: Map<Bytes, Int>, keys: List<RootKey>) -> List<RootKey> = {
 fn tail_loop_member(
   s: ModuleContext,
   definitions: Map<Bytes, FnDefinition>,
-  read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
+  read_of: (Bytes) -> Option<DefinitionBody> / {EmitReads},
   key: RootKey,
-) -> Root / {abort.raise} = {
+) -> Root / {EmitReads} = {
   let full = site_owner_text(key);
   let definition = match definitions.get(full) {
     Some(d) -> d,
@@ -238,14 +221,13 @@ fn tail_loop_member(
 
 pub fn tail_loop_lowered(
   s: ModuleContext,
-  schemes: Map<Bytes, Scheme>,
   definitions: Map<Bytes, FnDefinition>,
-  read_of: (Bytes) -> Option<DefinitionBody> / {abort.raise},
+  read_of: (Bytes) -> Option<DefinitionBody> / {EmitReads},
   keys: List<RootKey>,
-) -> List<Function> / {abort.raise} = {
+) -> List<Function> / {EmitReads} = {
   let f = group_lowered(s, keys.map(|k: RootKey| tail_loop_member(s, definitions, read_of, k)));
   let open = keys.fold(0, |most: Int, k: RootKey| {
-    let w = open_variable_count(schemes, k);
+    let w = open_variable_count(k);
     if w > most { w } else { most }
   });
   [
@@ -261,8 +243,8 @@ pub fn tail_loop_lowered(
   ]
 }
 
-fn open_variable_count(schemes: Map<Bytes, Scheme>, key: RootKey) -> Int =
+fn open_variable_count(key: RootKey) -> Int / {EmitReads} =
   match key {
-    Named(full) -> match schemes.get(full) { Some(sc) -> sc.type_variables.len(), None -> 0 },
+    Named(full) -> match scheme_called(full) { Some(sc) -> sc.type_variables.len(), None -> 0 },
     _ -> 0,
   }

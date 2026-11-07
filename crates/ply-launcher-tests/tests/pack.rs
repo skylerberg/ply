@@ -33,10 +33,6 @@ fn read(bytes: &[u8]) -> Result<Option<ply_pack::Pack>, String> {
     ply_pack::Pack::of_binary(file.path())
 }
 
-fn framed(bytes: &[u8]) -> Vec<u8> {
-    zstd::stream::encode_all(bytes, 3).expect("compressed")
-}
-
 #[test]
 fn a_binary_with_a_bundle_of_files_appended_after_its_code_lets_each_bundled_file_be_read_back() {
     let pack = read(&binary(
@@ -94,32 +90,22 @@ fn a_bundle_of_files_lists_the_module_files_and_the_data_files_under_a_given_dir
 }
 
 #[test]
-fn a_cached_result_is_the_length_prefixed_record_at_an_offset_and_length_within_a_bundled_cache_file()
- {
-    let one = framed(b"one record");
-    let two = framed(b"another");
+fn a_cached_result_is_the_bytes_at_an_offset_and_length_within_a_bundled_cache_file() {
+    let one = b"one record".to_vec();
+    let two = b"another".to_vec();
     let store = [one.clone(), two.clone()].concat();
     let pack = read(&binary(
         b"",
-        &[
-            ("answers/store", &store),
-            ("answers/index", &framed(b"index")),
-        ],
+        &[("answers/store", &store), ("answers/index", b"index")],
     ))
     .expect("the pack reads")
     .expect("the binary carries one");
-    assert_eq!(
-        pack.result("store", 0, one.len()),
-        Some(b"one record".to_vec())
-    );
-    assert_eq!(
-        pack.result("store", one.len(), two.len()),
-        Some(b"another".to_vec())
-    );
-    assert_eq!(pack.result("index", 0, 0), Some(b"index".to_vec()));
-    assert_eq!(pack.result("store", 1, one.len()), None);
-    assert_eq!(pack.result("store", one.len(), two.len() + 1), None);
-    assert_eq!(pack.result("records", 0, 0), None);
+    assert_eq!(pack.store_frame(0, one.len()), Some(one.clone()));
+    assert_eq!(pack.store_frame(one.len(), two.len()), Some(two.clone()));
+    assert_eq!(pack.store_frame(one.len(), 0), Some(Vec::new()));
+    assert_eq!(pack.index(), Some(b"index".to_vec()));
+    assert_eq!(pack.store_frame(store.len(), 1), None);
+    assert_eq!(pack.store_frame(one.len(), two.len() + 1), None);
 }
 
 #[test]
@@ -177,14 +163,13 @@ fn a_bundle_digest_over_the_std_and_compiler_directories_changes_with_files_in_t
 }
 
 #[test]
-fn the_shipped_directory_name_changes_with_the_build_stage_the_file_set_name_and_the_digest() {
-    let name = ply_launcher::shipped_dir_name;
+fn a_binarys_identity_changes_with_its_stamps_its_definitions_and_its_shipped_files() {
+    let name = ply_launcher::binary_identity;
     let base = name("stamps", "definitions", &[1; 32]);
     assert_eq!(name("stamps", "definitions", &[1; 32]), base);
     assert_ne!(name("stamps", "definitions", &[2; 32]), base);
     assert_ne!(name("stamps", "other", &[1; 32]), base);
     assert_ne!(name("other", "definitions", &[1; 32]), base);
-    assert!(base.starts_with("shipped-"));
 }
 
 #[test]
@@ -231,4 +216,14 @@ fn reading_a_bundle_whose_file_list_is_not_sorted_by_path_fails_with_an_error() 
     data.extend_from_slice(b"PLYPACK1");
     let rejected = read(&data).err().expect("an unsorted table is rejected");
     assert!(rejected.contains("ascending"), "{rejected}");
+}
+
+#[test]
+fn the_evaluator_stamp_is_the_runtime_identity_that_the_pack_is_built_under() {
+    let evaluator = format!("evaluator {}", ply_compiled::c::runtime_identity());
+    assert!(
+        ply_launcher::stamps().lines().any(|line| line == evaluator),
+        "{}",
+        ply_launcher::stamps()
+    );
 }

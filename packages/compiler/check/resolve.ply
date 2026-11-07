@@ -1,16 +1,22 @@
-import compiler.syntax.parsing (Span, dummy_span, span_key)
+import compiler.syntax.parsing (Error)
+import compiler.check.resolve.tables (Resolution)
+import compiler.check.resolve.tables (other_modules, with_modules, with_no_other_modules,
+                                      no_bindings)
+import compiler.syntax.parsing (Span, Identifier, generated_span, span_key)
 import compiler.syntax.type_syntax (EffectExpression, mode_text)
 import compiler.syntax.items (Item, FunctionItem, FnDefinition, ImportDeclaration, parse,
                               dump_module)
 import std.list
+import std.bin
 import std.bytes (ascii_of_int)
 import compiler.check.resolve.tables (Source, ParsedModule, TypeSpace, ValueSpace, Binding,
                                       ModuleBinding, Scope, Label, Diagnostic, ModuleEntry,
-                                      no_declarations, lookup, find_module_binding, error_at,
-                                      declarations_of, bindings_of)
-import compiler.check.resolve.scopes (ScopeBuilder, ResolutionContext, PackageDependencies,
-                                      no_packages, index_of, bind_import, target_or_report, Cycle,
-                                      traverse, cycle_diagnostic)
+                                      error_in_file, place_text, InSource, no_declarations, lookup,
+                                      find_module_binding, error_at, declarations_of, bindings_of,
+                                      Declarations, diagnostic_bin, scope_bin)
+import compiler.check.resolve.scopes (ScopeBuilder, ImportContext, ImportEdge, module_scope,
+                                      PackageDependencies, no_packages, index_of, Cycle, traverse,
+                                      cycle_diagnostic)
 import compiler.check.resolve.sets (instantiate_laws, expand_sets, concat_diagnostics)
 import compiler.check.resolve.defaults (ResolvedProgram, fill_defaults)
 import compiler.syntax.node_ids (numbered_module, numbered_missing)
@@ -48,9 +54,13 @@ pub fn resolve_packaged(
 fn resolve_with(
   written: List<ParsedModule>,
   packages: { packages: List<PackageDependencies>, module_packages: List<Int>, std: Int, compiler: Int, other_shipped_package: Int },
-) -> ResolveOutcome / {abort.raise} = {
-  let modules = written.map(|m: ParsedModule|
-    { ..m, module: { ..m.module, items: m.module.items.map(numbered_missing) } });
+) -> ResolveOutcome / {abort.raise} = with_no_other_modules(|| resolved_with(written, packages))
+
+fn resolved_with(
+  written: List<ParsedModule>,
+  packages: { packages: List<PackageDependencies>, module_packages: List<Int>, std: Int, compiler: Int, other_shipped_package: Int },
+) -> ResolveOutcome / {abort.raise, other_modules.read} = {
+  let modules = written.map(with_every_item_numbered);
   let n = modules.len();
   let indexed = range(0, n).fold(
     { names: [], diagnostics: [] },
@@ -62,10 +72,9 @@ fn resolve_with(
           {
             ..accumulator,
             diagnostics: accumulator.diagnostics.push(
-              error_at(
+              error_in_file(
                 b"E0105",
                 i,
-                dummy_span,
                 Bytes::concat_all([b"two files claim the module name `", name, b"`"]),
                 b"loaded a second time under this name",
                 [b"one file is one module, and a module name is derived from its path"],
@@ -77,21 +86,40 @@ fn resolve_with(
     },
   );
   let declarations = modules.map(declarations_of);
-  let declared = range(0, n).map(|i: Int| bindings_of(i, declarations.get(i)));
-  let w = {
-    modules: modules,
-    names: indexed.names,
-    declarations: declarations,
-    declared: declared,
-    packages: packages.packages,
-    module_packages: packages.module_packages,
-    std: packages.std,
-    compiler: packages.compiler,
-    shipped_package_count: packages.other_shipped_package,
-  };
-  let built = range(0, n).map(|i: Int| build_scope_reporting(w, i));
+  let declared = range(0, n).map(|i: Int| bindings_of(modules.get(i).name, declarations.get(i)));
+  let positions = indexed.names.fold(Map::new(), |found: Map<Bytes, Int>, e: ModuleEntry|
+    found.insert(e.name, e.at));
+  let named = indexed.names.filter(|e: ModuleEntry| e.name.len() > 0);
+  let built = with_modules(
+    {
+      declarations: named.fold(Map::new(), |found: Map<Bytes, Declarations>, e: ModuleEntry|
+        found.insert(e.name, declarations.get(e.at))),
+      packages: named.fold(Map::new(), |found: Map<Bytes, Int>, e: ModuleEntry|
+        found.insert(e.name, packages.module_packages.get(e.at))),
+    },
+    ||
+      range(0, n).map(|i: Int|
+        module_scope(modules.get(i), declared.get(i), {
+          at: i,
+          package: packages.module_packages.get(i),
+          packages: packages.packages,
+          std: packages.std,
+          compiler: packages.compiler,
+          shipped_package_count: packages.other_shipped_package,
+          places: positions,
+        })),
+  );
   let scopes = built.map(|builder: ScopeBuilder| builder.scope);
-  let edges = built.map(|builder: ScopeBuilder| builder.edges);
+  let edges = range(0, n).map(|i: Int|
+    built.get(i).edges.map(|e: ImportEdge|
+      {
+        from: i,
+        target: match positions.get(e.target) {
+          Some(t) -> t,
+          None -> panic("an import's target is a loaded module"),
+        },
+        span: e.span,
+      }));
   let diagnostics1 = built.fold(
     indexed.diagnostics,
     |accumulator: List<Diagnostic>, builder: ScopeBuilder|
@@ -111,30 +139,144 @@ fn resolve_with(
         es.map(|e: { from: Int, target: Int, span: Span }| e.target)),
       signatures: Map::new(),
       visible_modules: [],
+      positions: positions,
     };
-    let instantiation = instantiate_laws(r, modules);
-    let sets = expand_sets(instantiation.resolution, instantiation.modules);
-    if instantiation.diagnostics.len() > 0 { ResolveFailed(instantiation.diagnostics) }
-    else if sets.diagnostics.len() > 0 { ResolveFailed(sets.diagnostics) } else {
-      let x = fill_defaults(sets.resolution, sets.modules, []);
-      if x.diagnostics.len() > 0 { ResolveFailed(x.diagnostics) } else { ResolveSucceeded(x) }
-    }
+    let x = resolution_finished(r, modules);
+    if x.diagnostics.len() > 0 { ResolveFailed(x.diagnostics) } else { ResolveSucceeded(x) }
   }
 }
 
-fn build_scope_reporting(w: ResolutionContext, i: Int) -> ScopeBuilder / {abort.raise} = {
-  let m = w.modules.get(i);
-  let start = {
-    scope: { module: m.name, modules: [], selected_modules: [], bound: w.declared.get(i) },
-    local: w.declarations.get(i),
-    imported: no_declarations,
-    edges: [],
-    diagnostics: [],
-  };
-  m.module.imports.fold(start, |builder: ScopeBuilder, declaration: ImportDeclaration| {
-    let t = target_or_report(w, i, builder, declaration);
-    match t.t { None -> t.b, Some(_) -> bind_import(w, i, t.b, declaration) }
-  })
+fn resolution_finished(
+  r: Resolution,
+  modules: List<ParsedModule>,
+) -> ResolvedProgram / {abort.raise, other_modules.read} = {
+  let instantiation = instantiate_laws(r, modules);
+  let sets = expand_sets(instantiation.resolution, instantiation.modules);
+  let x = fill_defaults(sets.resolution, sets.modules, []);
+  { ..x, diagnostics: instantiation.diagnostics.concat(sets.diagnostics).concat(x.diagnostics) }
+}
+
+pub type ImportPackages = {
+  package: Int,
+  packages: List<PackageDependencies>,
+  std: Int,
+  compiler: Int,
+  other_shipped_package: Int,
+}
+
+fn import_context(tables: ImportPackages, places: Map<Bytes, Int>) -> ImportContext =
+  {
+    at: 0,
+    package: tables.package,
+    packages: tables.packages,
+    std: tables.std,
+    compiler: tables.compiler,
+    shipped_package_count: tables.other_shipped_package,
+    places: places,
+  }
+
+pub type ModuleHeader = { problems: List<Diagnostic>, scope: Scope }
+
+derive bin for ModuleHeader
+
+pub fn empty_header(module: Bytes) -> ModuleHeader =
+  {
+    problems: [],
+    scope: { module: module, modules: [], selected_modules: [], bound: no_bindings, failed: [] },
+  }
+
+pub fn import_problems(
+  own: ParsedModule,
+  tables: ImportPackages,
+) -> ModuleHeader / {other_modules.read, abort.raise} = {
+  let built = module_scope(
+    own,
+    no_bindings,
+    import_context(tables, Map::new().insert(own.name, 0)),
+  );
+  let cycles = traverse([
+    built.edges.filter(|e: ImportEdge| e.target == own.name).map(|e: ImportEdge|
+      { from: 0, target: 0, span: e.span }),
+  ]).cycles;
+  {
+    problems: built.diagnostics.concat(cycles.map(|c: Cycle| cycle_diagnostic([own], c))).map(
+      |d: Diagnostic|
+        {
+          ..d,
+          labels: d.labels.filter(|l: Label|
+            match l.place { InSource(s) -> s.module == 0 && s.end > 0, _ -> false }),
+        },
+    ),
+    scope: built.scope,
+  }
+}
+
+fn with_every_item_numbered(m: ParsedModule) -> ParsedModule / {abort.raise} =
+  { ..m, module: { ..m.module, items: m.module.items.map(numbered_missing) } }
+
+pub type LoadedModule = { module: ParsedModule, tables: ImportPackages }
+
+pub fn resolve_group(
+  own: List<LoadedModule>,
+  mentioned: List<Bytes>,
+) -> ResolveOutcome / {abort.raise, other_modules.read} = {
+  let loaded = own.map(|m: LoadedModule| with_every_item_numbered(m.module));
+  let names = loaded.map(|m: ParsedModule| m.name);
+  let built = range(0, own.len()).map(|i: Int| {
+    let m = loaded.get(i);
+    module_scope(m, bindings_of(m.name, declarations_of(m)), {
+      ..import_context(own.get(i).tables, Map::new()),
+      at: i,
+    })
+  });
+  {
+    let targets = built.map(|b: ScopeBuilder| b.edges.map(|e: ImportEdge| e.target));
+    let elsewhere = targets.flat_map(|ts: List<Bytes>| ts).concat(mentioned).unique().filter(
+      |m: Bytes| !names.contains(m) && m.len() > 0,
+    );
+    let first = loaded.get(0);
+    let modules = elsewhere.fold(loaded, |found: List<ParsedModule>, name: Bytes|
+      found.push({
+        name: name,
+        module: { ..first.module, doc: None, imports: [], items: [] },
+        derived: [],
+      }));
+    let places = range(0, modules.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
+      found.insert(modules.get(i).name, i));
+    let declarations = modules.map(declarations_of);
+    let declared = range(0, modules.len()).map(|i: Int|
+      bindings_of(modules.get(i).name, declarations.get(i)));
+    let imported = targets.map(|ts: List<Bytes>|
+      ts.fold([], |found: List<Int>, t: Bytes|
+        match places.get(t) { Some(i) -> found.push(i), None -> found }));
+    let edges = range(0, own.len()).map(|i: Int|
+      imported.get(i).filter(|t: Int| t < own.len()).map(|t: Int|
+        { from: i, target: t, span: generated_span }));
+    let x = resolution_finished(
+      {
+        names: range(0, modules.len()).map(|i: Int| { name: modules.get(i).name, at: i }),
+        scopes: range(0, modules.len()).map(|i: Int|
+          if i < own.len() { built.get(i).scope } else {
+            {
+              module: modules.get(i).name,
+              modules: [],
+              selected_modules: [],
+              bound: declared.get(i),
+              failed: [],
+            }
+          }),
+        declarations: declarations,
+        declared: declared,
+        order: range(own.len(), modules.len()).concat(traverse(edges).order),
+        imports: imported.concat(elsewhere.map(|_: Bytes| [])),
+        signatures: Map::new(),
+        visible_modules: [],
+        positions: places,
+      },
+      modules,
+    );
+    ResolveSucceeded(x)
+  }
 }
 
 fn dump_module_binding(tag: Bytes, binding: ModuleBinding) -> Bytes =
@@ -143,7 +285,7 @@ fn dump_module_binding(tag: Bytes, binding: ModuleBinding) -> Bytes =
     b";",
     binding.binder,
     b";",
-    ascii_of_int(binding.target),
+    binding.target,
     b";",
     span_key(binding.span),
     b";",
@@ -157,7 +299,7 @@ fn dump_binding(tag: Bytes, binding: Binding) -> Bytes =
     b";",
     binding.qualified,
     b";",
-    ascii_of_int(binding.owner),
+    binding.owner,
     b";",
     span_key(binding.span),
     b";",
@@ -192,11 +334,7 @@ fn dump_order(order: List<Int>) -> Bytes / {abort.raise} =
 fn dump_label(label: Label) -> Bytes =
   Bytes::concat_all([
     b"=",
-    ascii_of_int(label.module),
-    b":",
-    ascii_of_int(label.start),
-    b":",
-    ascii_of_int(label.end),
+    place_text(label.place),
     b":",
     if label.primary { b"1" } else { b"0" },
     b";",
@@ -205,17 +343,7 @@ fn dump_label(label: Label) -> Bytes =
 fn dump_diagnostic(diagnostic: Diagnostic) -> Bytes = {
   let primary = diagnostic.labels.fold(None, |accumulator: Option<Label>, l: Label|
     match accumulator { Some(_) -> accumulator, None -> if l.primary { Some(l) } else { None } });
-  let head = match primary {
-    Some(l) ->
-      Bytes::concat_all([
-        ascii_of_int(l.module),
-        b":",
-        ascii_of_int(l.start),
-        b":",
-        ascii_of_int(l.end),
-      ]),
-    None -> b"0:0:0",
-  };
+  let head = match primary { Some(l) -> place_text(l.place), None -> b"0:0:0" };
   Bytes::concat_all([
     b"!",
     diagnostic.code,
@@ -224,7 +352,7 @@ fn dump_diagnostic(diagnostic: Diagnostic) -> Bytes = {
     b":",
     ascii_of_int(diagnostic.labels.len()),
     b":",
-    ascii_of_int(diagnostic.notes),
+    ascii_of_int(diagnostic.notes_text.len()),
     b";",
     Bytes::concat_all(diagnostic.labels.map(dump_label)),
   ])
@@ -267,7 +395,7 @@ pub fn resolve_dump(sources: List<Source>) -> String / {abort.raise} = {
 
 pub fn has_error(diagnostics: List<Diagnostic>) -> Bool =
   diagnostics.fold(false, |accumulator: Bool, diagnostic: Diagnostic|
-    accumulator || diagnostic.severity == b"error")
+    accumulator || diagnostic.severity == Error)
 
 test "two modules resolve each name to the definition it names, wherever it is written" {
   let dump = resolve_dump([
@@ -275,8 +403,9 @@ test "two modules resolve each name to the definition it names, wherever it is w
     { name: b"app", source_text: b"import base (one)\nfn two() -> Int = one() + one()" },
   ]);
   assert(
-    ["S;base;0;", "V;two;app.two;1;", "V;one;base.one;0;13:16;", "O;0,1;"].all(|fact: String|
-      dump.contains(fact)),
+    ["S;base;base;", "V;two;app.two;app;", "V;one;base.one;base;13:16;", "O;0,1;"].all(
+      |fact: String| dump.contains(fact),
+    ),
     Some(dump),
   )
 }
@@ -628,7 +757,7 @@ fn written_beside(source: Bytes, others: List<Source>) -> List<Written> / {abort
     ResolveFailed(_) -> panic("a source the test wrote does not resolve"),
     ResolveSucceeded(y) -> {
       let at = range(0, y.modules.len()).find(|i: Int| y.modules.get(i).name == b"m").unwrap_or(0);
-      written(y.resolution, at, numbered_module(parse(source).node))
+      with_no_other_modules(|| written(y.resolution, at, numbered_module(parse(source).node)))
     },
   }
 

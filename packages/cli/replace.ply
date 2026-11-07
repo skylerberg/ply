@@ -1,3 +1,7 @@
+import progress
+import std.set (Set)
+import compiler.check.resolve.tables (error_unplaced)
+import sources (ProjectFiles)
 import compiler.cc (toolchain)
 import std.random (entropy)
 import std.time (time)
@@ -5,18 +9,20 @@ import std.process (process)
 import builder (builder)
 import args (Flags, no_flags, style_of)
 import paths
-import paths (RootedPath, displayed, write_file)
+import paths (RootedPath, WorkingDirectory, Absolute, displayed, write_file)
 import diagnostic (all_to_json, all_to_text, errors_of, errors_text)
-import program (Program, load_program, reanalysed, no_program, program_view)
-import compiler.load (Derives, report_viewed)
+import program (places_of, session, session_over)
+import compiler.load (Loads)
+import compiler.front.checking.view
+import compiler.front.checking.world (Modules)
+import compiler.front.checking.groups (ProgramSummary)
+import diagnostic (SourceText)
 import compiler.unit (shipped)
 import report (CommandOutput, schema_version, ok_code, compile_error, rejected)
 import show (DefinitionSource, locate)
-import sources (File)
+import sources (File, Project)
 import std.term (Style, plain)
-import compiler.front.facts (CheckedProgram)
-import compiler.front (PulledAnalysis)
-import compiler.front.emitter_input (Rejected, Analysed)
+import compiler.front.facts (ProgramListing)
 import compiler.syntax.fmt (replace_item)
 import compiler.store.hash.forms (HashOutput, by_name)
 import compiler.store.hash (no_hashes)
@@ -24,7 +30,8 @@ import compiler.check.resolve.tables (Source, Diagnostic, error_at)
 import std.fs (fs)
 import std.json (Json, Null, Str, Bool, Number, object)
 import std.string
-import compiler.syntax.parsing (no_module, dummy_span, span_between)
+import compiler.syntax.parsing (span_between)
+import project_store
 
 pub nondet effect edit {
   read replacement_text[r](replacement: Option<String>) -> Result<String, String>
@@ -54,20 +61,11 @@ fn backticked(names: List<String>) -> String =
   String::join(names.map(|n: String| "`" ++ n ++ "`"), ", ")
 
 fn unreadable(reason: String) -> Diagnostic =
-  error_at(
-    b"E0502",
-    no_module,
-    dummy_span,
-    Bytes::of_string(reason),
-    b"the replacement could not be read",
-    [],
-  )
+  error_unplaced(b"E0502", Bytes::of_string(reason), b"the replacement could not be read", [])
 
 fn unwritable(path: String) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0502",
-    no_module,
-    dummy_span,
     Bytes::of_string("could not write `" ++ path ++ "`"),
     b"the file could not be written",
     [],
@@ -93,19 +91,16 @@ fn not_the_same(shown: DefinitionSource, message: String) -> Diagnostic =
     [b"nothing was written"],
   )
 
-fn names_map(xs: List<{ name: Bytes, hash: Bytes }>, into: Map<Bytes, Bool>) -> Map<Bytes, Bool> =
-  xs.fold(into, |accumulator: Map<Bytes, Bool>, x: { name: Bytes, hash: Bytes }|
-    accumulator.insert(x.name, true))
+fn with_names(xs: List<{ name: Bytes, hash: Bytes }>, into: Set<Bytes>) -> Set<Bytes> =
+  xs.fold(into, |accumulator: Set<Bytes>, x: { name: Bytes, hash: Bytes }|
+    accumulator.insert(x.name))
 
-fn declared(h: HashOutput) -> Map<Bytes, Bool> =
-  names_map(h.declarations, names_map(h.definitions, Map::new()))
+fn declared(h: HashOutput) -> Set<Bytes> =
+  with_names(h.declarations, with_names(h.definitions, Set::empty()))
 
-fn absent_from(these: Map<Bytes, Bool>, those: Map<Bytes, Bool>) -> List<String> =
-  these.fold([], |accumulator: List<String>, key: Bytes, present: Bool|
-    match those.get(key) {
-      Some(_) -> accumulator,
-      None -> accumulator.push(String::of_bytes_lossy(key)),
-    })
+fn absent_from(these: Set<Bytes>, those: Set<Bytes>) -> List<String> =
+  these.fold([], |accumulator: List<String>, key: Bytes|
+    if those.contains(key) { accumulator } else { accumulator.push(String::of_bytes_lossy(key)) })
 
 fn what_changed(added: List<String>, removed: List<String>) -> String =
   if added.len() == 0 { "removes " ++ backticked(removed) }
@@ -126,7 +121,7 @@ fn differing_names(
     else { accumulator })
 
 pub fn changed_names(before: HashOutput, after: HashOutput, name: Bytes) -> List<String> = {
-  let own = differing_names(by_name(before.own), by_name(after.own), name, []);
+  let own = differing_names(by_name(before.definitions), by_name(after.definitions), name, []);
   if !contains_name(before.definitions, name) { own }
   else { differing_names(by_name(before.declarations), by_name(after.declarations), b"", own) }
 }
@@ -145,48 +140,55 @@ pub fn difference(before: HashOutput, after: HashOutput, name: String) -> Option
   }
 }
 
-fn replaced_sources(program: Program, at: Int, text: Bytes) -> List<Source> =
-  range(0, program.files.len()).map(|i: Int|
-    match program.files.at(i) {
-      None -> { name: b"", source_text: b"" },
-      Some(f) ->
-        { name: Bytes::of_string(f.module), source_text: if i == at { text } else { f.text } },
-    })
+type Replacing = {
+  paths: List<paths::ResolvedPath>,
+  project: Project,
+  places: List<SourceText>,
+  before: HashOutput,
+}
+
+fn with_file_text(project: Project, at: Int, text: Bytes) -> Project / {abort.raise} =
+  {
+    ..project,
+    files: range(0, project.files.len()).map(|i: Int|
+      if i == at { { ..project.files.get(i), text: text } } else { project.files.get(i) }),
+    sources: range(0, project.sources.len()).map(|i: Int|
+      if i == at { { ..project.sources.get(i), source_text: text } }
+      else { project.sources.get(i) }),
+  }
 
 fn still_the_same(
-  program: Program,
-  analysis: CheckedProgram,
+  at: Replacing,
   shown: DefinitionSource,
   text: Bytes,
-) -> Option<Diagnostic> / {abort.raise, shipped.report_view_used} = {
-  let before: HashOutput = analysis.frame.hashes;
-  let out: PulledAnalysis = reanalysed(
-    program,
-    analysis.frame,
-    replaced_sources(program, shown.at.module, text),
-    Bytes::of_string(shown.name),
-  );
-  report_viewed(out.shipped_views, false);
-  match out.out {
-    Rejected(ds) ->
+) -> Option<Diagnostic> / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise} =
+  match progress::silently(||
+      session_over(
+        at.paths,
+        with_file_text(at.project, shown.at.module, text),
+        time.elapsed_ms(),
+        false,
+        |m: Modules, _: ProgramSummary| view::listed(m).hashes,
+      )) {
+    Err(r) ->
       Some(
         not_the_same(
           shown,
-          "with `" ++ shown.name ++ "` replaced, the program does not check: " ++ errors_text(ds),
+          "with `" ++ shown.name ++ "` replaced, the program does not check: "
+            ++ errors_text(r.diagnostics),
         ),
       ),
-    Analysed(after) -> match difference(before, after.hashes, shown.name) {
+    Ok(after) -> match difference(at.before, after.value, shown.name) {
       None -> None,
       Some(message) -> Some(not_the_same(shown, message)),
     },
   }
-}
 
-fn file_of(program: Program, shown: DefinitionSource) -> Option<File> =
-  program.files.at(shown.at.module)
+fn file_of(project: Project, shown: DefinitionSource) -> Option<File> =
+  project.files.at(shown.at.module)
 
 fn output_lines(
-  p: Program,
+  p: Project,
   flags: Flags,
   shown: Option<DefinitionSource>,
   changed: Bool,
@@ -210,13 +212,14 @@ fn file_json(shown: Option<DefinitionSource>) -> Json =
 pub fn replace_output(
   style: Style,
   flags: Flags,
-  program: Program,
+  project: Project,
+  places: List<SourceText>,
   shown: Option<DefinitionSource>,
   changed: Bool,
   diagnostics: List<Diagnostic>,
 ) -> CommandOutput / {abort.raise} = {
   let code = if diagnostics.len() == 0 { ok_code } else { compile_error };
-  let lines = if diagnostics.len() > 0 { [] } else { output_lines(program, flags, shown, changed) };
+  let lines = if diagnostics.len() > 0 { [] } else { output_lines(project, flags, shown, changed) };
   {
     json: object([
       { key: "command", value: Str("replace") },
@@ -226,57 +229,65 @@ pub fn replace_output(
       { key: "name", value: name_json(shown) },
       { key: "file", value: file_json(shown) },
       { key: "changed", value: Bool(changed) },
-      { key: "diagnostics", value: all_to_json(diagnostics, program.source_texts) },
+      { key: "diagnostics", value: all_to_json(diagnostics, places) },
     ]),
     lines: lines,
-    errs: all_to_text(style, diagnostics, program.source_texts),
+    errs: all_to_text(style, diagnostics, places),
     code: code,
   }
 }
 
+fn opened_output(
+  style: Style,
+  flags: Flags,
+  at: Replacing,
+  shown: Option<DefinitionSource>,
+  changed: Bool,
+  diagnostics: List<Diagnostic>,
+) -> CommandOutput / {abort.raise} =
+  replace_output(style, flags, at.project, at.places, shown, changed, diagnostics)
+
 fn stopped(
   style: Style,
   flags: Flags,
-  program: Program,
+  at: Replacing,
   shown: DefinitionSource,
   diagnostic: Diagnostic,
 ) -> CommandOutput / {abort.raise} =
-  replace_output(style, flags, program, Some(shown), false, [diagnostic])
+  opened_output(style, flags, at, Some(shown), false, [diagnostic])
 
 fn written(
   style: Style,
   flags: Flags,
-  program: Program,
+  at: Replacing,
   shown: DefinitionSource,
   file: File,
   text: Bytes,
 ) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], abort.raise} =
-  if flags.check { replace_output(style, flags, program, Some(shown), true, []) }
-  else if write_file(file.at, text) { replace_output(style, flags, program, Some(shown), true, []) }
-  else { stopped(style, flags, program, shown, unwritable(displayed(file.at))) }
+  if flags.check { opened_output(style, flags, at, Some(shown), true, []) }
+  else if write_file(file.at, text) { opened_output(style, flags, at, Some(shown), true, []) }
+  else { stopped(style, flags, at, shown, unwritable(displayed(file.at))) }
 
 fn replaced(
   style: Style,
   flags: Flags,
-  program: Program,
-  analysis: CheckedProgram,
+  at: Replacing,
   shown: DefinitionSource,
   file: File,
   read_replacement: String,
-) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], abort.raise, shipped.report_view_used} =
+) -> CommandOutput / {project_store::Databases, fs.write_file[cwd], fs.write_file[abs], shipped.read_pack, toolchain.reuse_dir, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise} =
   match replace_item(
       shown.text,
       Bytes::of_string(shown.unqualified_name),
       Bytes::of_string(read_replacement),
     ) {
     Err(reason) ->
-      stopped(style, flags, program, shown, not_one_item(shown, String::of_bytes_lossy(reason))),
-    Ok(text) -> if text == shown.text {
-      replace_output(style, flags, program, Some(shown), false, [])
-    } else {
-      match still_the_same(program, analysis, shown, text) {
-        Some(d) -> stopped(style, flags, program, shown, d),
-        None -> written(style, flags, program, shown, file, text),
+      stopped(style, flags, at, shown, not_one_item(shown, String::of_bytes_lossy(reason))),
+    Ok(text) -> if text == shown.text { opened_output(style, flags, at, Some(shown), false, []) }
+    else {
+      match still_the_same(at, shown, text) {
+        Some(d) -> stopped(style, flags, at, shown, d),
+        None -> written(style, flags, at, shown, file, text),
       }
     },
   }
@@ -284,16 +295,15 @@ fn replaced(
 fn rewritten(
   style: Style,
   flags: Flags,
-  program: Program,
-  analysis: CheckedProgram,
+  at: Replacing,
   shown: DefinitionSource,
-) -> CommandOutput / {fs.write_file[cwd], fs.write_file[abs], edit.replacement_text[replace], abort.raise, shipped.report_view_used} =
-  match file_of(program, shown) {
+) -> CommandOutput / {project_store::Databases, fs.write_file[cwd], fs.write_file[abs], edit.replacement_text[replace], shipped.read_pack, toolchain.reuse_dir, ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise} =
+  match file_of(at.project, shown) {
     None ->
       stopped(
         style,
         flags,
-        program,
+        at,
         shown,
         not_the_same(
           shown,
@@ -301,38 +311,41 @@ fn rewritten(
         ),
       ),
     Some(file) -> match edit.replacement_text[replace](flags.out) {
-      Err(reason) -> stopped(style, flags, program, shown, unreadable(reason)),
-      Ok(read_replacement) ->
-        replaced(style, flags, program, analysis, shown, file, read_replacement),
+      Err(reason) -> stopped(style, flags, at, shown, unreadable(reason)),
+      Ok(read_replacement) -> replaced(style, flags, at, shown, file, read_replacement),
     },
   }
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], edit.replacement_text[replace], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
+) -> CommandOutput / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.write_file[cwd], fs.write_file[abs], fs.list_dir[shipped], fs.read_file[shipped], edit.replacement_text[replace], time.elapsed_ms, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise, diverges} = {
   let s = style_of(flags);
-  match program_view(loaded) {
-    None -> rejected(s, "replace", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> match locate(loaded, w, flags.query) {
-      Err(d) -> replace_output(s, flags, loaded, None, false, [d]),
-      Ok(shown) -> rewritten(s, flags, loaded, w, shown),
+  match progress::silently(||
+      session(flags.paths, flags.verify_dependencies, |m: Modules, _: ProgramSummary|
+        view::listed(m))) {
+    Err(r) -> rejected(s, "replace", r.diagnostics, r.places),
+    Ok(opened) -> {
+      let at = {
+        paths: opened.paths,
+        project: opened.project,
+        places: places_of(opened),
+        before: opened.value.hashes,
+      };
+      match locate(at.places, opened.value, flags.query) {
+        Err(d) -> opened_output(s, flags, at, None, false, [d]),
+        Ok(shown) -> rewritten(s, flags, at, shown),
+      }
     },
   }
 }
 
 fn hashes_of(
   definitions: List<{ name: Bytes, hash: Bytes }>,
-  own: List<{ name: Bytes, hash: Bytes }>,
   declarations: List<{ name: Bytes, hash: Bytes }>,
-) -> HashOutput = { ..no_hashes, definitions: definitions, own: own, declarations: declarations }
+) -> HashOutput = { ..no_hashes, definitions: definitions, declarations: declarations }
 
 fn two_definitions(two: Bytes) -> HashOutput =
-  hashes_of(
-    [{ name: b"m.one", hash: b"aa" }, { name: b"m.two", hash: two }],
-    [{ name: b"m.one", hash: b"aa" }, { name: b"m.two", hash: two }],
-    [],
-  )
+  hashes_of([{ name: b"m.one", hash: b"aa" }, { name: b"m.two", hash: two }], [])
 
 const example_definition: DefinitionSource =
   {
@@ -350,18 +363,25 @@ fn flags_of(check: Bool) -> Flags = { ..no_flags, check: check }
 fn a_file(rooted: RootedPath) -> File =
   { path: "m.ply", module: "m", text: example_definition.text, at: rooted }
 
-fn a_program(rooted: RootedPath) -> Program = { ..no_program, files: [a_file(rooted)] }
+fn a_replacing(rooted: RootedPath) -> Replacing =
+  { paths: [], project: a_program(rooted), places: [], before: no_hashes }
+
+fn a_program(rooted: RootedPath) -> Project =
+  {
+    files: [a_file(rooted)],
+    sources: [],
+    diagnostics: [],
+    manifest: None,
+    packages: [],
+    root_key: "",
+  }
 
 test "`difference` returns `None` when two programs differ only in the definition `m.two`" {
   assert_eq(difference(two_definitions(b"bb"), two_definitions(b"cc"), "m.two"), None)
 }
 
 test "a replacement that changes another definition's hash reports that definition by name" {
-  let after = hashes_of(
-    [{ name: b"m.one", hash: b"zz" }, { name: b"m.two", hash: b"cc" }],
-    [{ name: b"m.one", hash: b"zz" }, { name: b"m.two", hash: b"cc" }],
-    [],
-  );
+  let after = hashes_of([{ name: b"m.one", hash: b"zz" }, { name: b"m.two", hash: b"cc" }], []);
   assert_eq(
     difference(two_definitions(b"bb"), after, "m.two"),
     Some("the replacement of `m.two` also changes `m.one`"),
@@ -369,11 +389,7 @@ test "a replacement that changes another definition's hash reports that definiti
 }
 
 test "a replacement that renames a definition says what it added and what it took away" {
-  let renamed = hashes_of(
-    [{ name: b"m.one", hash: b"aa" }, { name: b"m.twice", hash: b"bb" }],
-    [{ name: b"m.one", hash: b"aa" }, { name: b"m.twice", hash: b"bb" }],
-    [],
-  );
+  let renamed = hashes_of([{ name: b"m.one", hash: b"aa" }, { name: b"m.twice", hash: b"bb" }], []);
   assert_eq(
     difference(two_definitions(b"bb"), renamed, "m.two"),
     Some("the replacement of `m.two` adds `m.twice` and removes `m.two`"),
@@ -381,16 +397,16 @@ test "a replacement that renames a definition says what it added and what it too
 }
 
 test "replacing a `fn` can change the hash of a type that uses it, but replacing a type reports no other changed names" {
-  let as_fn = hashes_of([{ name: b"m.two", hash: b"bb" }], [], [{ name: b"m.Shape", hash: b"dd" }]);
-  let after = hashes_of([{ name: b"m.two", hash: b"cc" }], [], [{ name: b"m.Shape", hash: b"ee" }]);
+  let as_fn = hashes_of([{ name: b"m.two", hash: b"bb" }], [{ name: b"m.Shape", hash: b"dd" }]);
+  let after = hashes_of([{ name: b"m.two", hash: b"cc" }], [{ name: b"m.Shape", hash: b"ee" }]);
   assert_eq(changed_names(as_fn, after, b"m.two"), ["m.Shape"]);
-  let as_type = hashes_of([], [], [{ name: b"m.Shape", hash: b"dd" }]);
-  let moved = hashes_of([], [], [{ name: b"m.Shape", hash: b"ee" }]);
+  let as_type = hashes_of([], [{ name: b"m.Shape", hash: b"dd" }]);
+  let moved = hashes_of([], [{ name: b"m.Shape", hash: b"ee" }]);
   assert_eq(changed_names(as_type, moved, b"m.Shape"), [])
 }
 
 test "a replace run prints a line saying whether it replaced, would replace or left the definition unchanged, and prints nothing if no definition was found" {
-  let p = a_program({ label: "cwd", path: "m.ply" });
+  let p = a_program({ label: WorkingDirectory, path: "m.ply" });
   assert_eq(output_lines(p, flags_of(false), Some(example_definition), false), [
     "m.two in m.ply is unchanged",
   ]);
@@ -404,23 +420,23 @@ test "a replace run prints a line saying whether it replaced, would replace or l
 }
 
 test "a replace run names the file at the path it was read from, whether the path is under the working directory or absolute" {
-  let under = a_program({ label: "cwd", path: "app/m.ply" });
+  let under = a_program({ label: WorkingDirectory, path: "app/m.ply" });
   assert_eq(output_lines(under, flags_of(false), Some(example_definition), true), [
     "replaced m.two in app/m.ply",
   ]);
-  let outside_it = a_program({ label: "abs", path: "srv/app/m.ply" });
+  let outside_it = a_program({ label: Absolute, path: "srv/app/m.ply" });
   assert_eq(output_lines(outside_it, flags_of(true), Some(example_definition), true), [
     "would replace /srv/app/m.ply",
   ])
 }
 
 test "a replacement is written to the same path, through the same file system handler, that the file was read with" {
-  let at: RootedPath = { label: "abs", path: "srv/app/m.ply" };
+  let at: RootedPath = { label: Absolute, path: "srv/app/m.ply" };
   let result = handle {
     written(
       plain,
       flags_of(false),
-      a_program(at),
+      a_replacing(at),
       example_definition,
       a_file(at),
       b"fn two() -> Int = 1 + 1\n",
@@ -437,7 +453,8 @@ test "a rejection exits 2, writes no line, and renders the diagnostic to the err
   let result = replace_output(
     plain,
     flags_of(false),
-    a_program({ label: "cwd", path: "m.ply" }),
+    a_program({ label: WorkingDirectory, path: "m.ply" }),
+    [],
     Some(example_definition),
     false,
     [not_the_same(example_definition, "the replacement of `m.two` adds `m.twice`")],

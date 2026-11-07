@@ -16,71 +16,83 @@ import sim.plan (Seed, PartialOrderReduction, seed_text)
 import sim.recording (Interleaving, Step, Passed, Failed, VariableAccess)
 import sim.search (Exact, Cause, RunFailed, InvalidRecording, Diverged, explore_with_state)
 import std.list
+import compiler.check.resolve.tables (InSource, Place)
 
-pub type ClaimToDischarge = { claim: Int, obligation: Obligation, resolved: StaticResult }
+pub type ClaimToDischarge<a> = {
+  claim: Int,
+  obligation: Obligation,
+  resolved: StaticResult,
+  reported_as: a,
+}
 
-pub type Batch = { claim_index: Int, points: List<List<Value>>, mode: JudgeMode }
+pub type Batch<t> = { claim_index: Int, points: List<List<Value>>, mode: JudgeMode, subject: t }
+
+pub type JudgedBatch<t> = { batch: Batch<t>, judgements: List<Judgement> }
 
 pub type JudgeMode = | WholeClaim | WitnessSearch | GuardFilter
 
-pub type RuntimeRequest = | JudgePoints(List<Batch>) | RunInterleaving(Int, List<Value>, Seed, Int)
-
-pub type RuntimeReply = | Judgements(List<List<Judgement>>) | Interleaved(LawRun)
+pub type InterleavingRun = { claim_index: Int, point: List<Value>, seed: Seed, steps: Int }
 
 pub type LawRun = { interleaving: Interleaving<Judgement>, observed: Bool }
 
-pub fn discharged<| e>(
-  claims: List<ClaimToDischarge>,
+pub type Runtime<t | e> = {
+  judge: (List<Batch<t>>) -> List<JudgedBatch<t>> / e,
+  interleave: (InterleavingRun) -> LawRun / e,
+}
+
+pub type Decided<a> = { claim: a, outcome: Outcome }
+
+pub fn discharged<a | e>(
+  claims: List<ClaimToDischarge<a>>,
   world: ProverInput,
   sim: plan::Plan,
-  ask: (RuntimeRequest) -> RuntimeReply / e,
-  report_outcome: (Int, Outcome) -> Unit / e,
-) -> List<Outcome> / {abort.raise | e} = {
-  let works = claims.map(|a: ClaimToDischarge| plan_claim(a, world));
-  range(0, works.len()).fold((), |_: Unit, i: Int|
-    match ((works.at(i), claims.at(i))) {
-      (Some(Finished(o)), Some(a)) -> report_outcome(a.claim, o),
-      _ -> (),
-    });
-  let batches = range(0, works.len()).fold([], |accumulator: List<Batch>, i: Int|
-    match ((works.at(i), claims.at(i))) {
-      (Some(NeedsPoints(p)), Some(a)) ->
-        accumulator.push({
-          claim_index: a.claim,
-          points: p.points,
-          mode: match p.kind {
-            LawPoints -> GuardFilter,
-            WitnessPoints(_) -> WitnessSearch,
-            _ -> WholeClaim,
-          },
-        }),
-      _ -> accumulator,
-    });
-  let results = if batches.len() == 0 { [] }
-  else { match ask(JudgePoints(batches)) { Judgements(js) -> js, _ -> [] } };
-  range(0, works.len()).fold(
-    { outcomes: [], next: 0 },
-    |accumulator: { outcomes: List<Outcome>, next: Int }, i: Int|
-      match ((works.at(i), claims.at(i))) {
-        (Some(Finished(o)), _) -> { ..accumulator, outcomes: accumulator.outcomes.push(o) },
-        (Some(NeedsPoints(p)), Some(a)) -> {
-          let js = match results.at(accumulator.next) { Some(x) -> x, None -> [] };
-          let outcome = match p.kind {
-            LawPoints -> match admitted_points(a.obligation, p, js) {
-              Err(o) -> o,
-              Ok(points) -> search_interleavings(a, p, points, sim, ask),
-            },
-            WitnessPoints(c) -> witness_outcome(a.obligation, p, js, c),
-            EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
-            CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
-          };
-          report_outcome(a.claim, outcome);
-          { outcomes: accumulator.outcomes.push(outcome), next: accumulator.next + 1 }
-        },
-        _ -> accumulator,
+  runtime: Runtime<PlannedClaim<a> | e>,
+) -> List<Decided<a>> / {abort.raise | e} = {
+  let planned = claims.fold(
+    { finished: [], needing: [] },
+    |found: { finished: List<Decided<a>>, needing: List<PlannedClaim<a>> }, c: ClaimToDischarge<a>|
+      match plan_claim(c, world) {
+        Finished(o) ->
+          { ..found, finished: found.finished.push({ claim: c.reported_as, outcome: o }) },
+        NeedsPoints(p) -> { ..found, needing: found.needing.push({ claim: c, plan: p }) },
       },
-  ).outcomes
+  );
+  let needing = planned.needing;
+  let batches = needing.map(|n: PlannedClaim<a>|
+    {
+      claim_index: n.claim.claim,
+      points: n.plan.points,
+      mode: match n.plan.kind {
+        LawPoints -> GuardFilter,
+        WitnessPoints(_) -> WitnessSearch,
+        EveryPoint(_) -> WholeClaim,
+        CounterexampleSearch(_) -> WholeClaim,
+      },
+      subject: n,
+    });
+  let judged_batches = if batches.len() == 0 { [] } else { (runtime.judge)(batches) };
+  planned.finished.concat(
+    judged_batches.map(|j: JudgedBatch<PlannedClaim<a>>| {
+      let a = j.batch.subject.claim;
+      let p = j.batch.subject.plan;
+      let js = j.judgements;
+      {
+        claim: a.reported_as,
+        outcome: match p.kind {
+          LawPoints -> match admitted_points(a.obligation, p, js) {
+            Err(o) -> o,
+            Ok(points) -> search_interleavings(a, p, points, sim, runtime.interleave),
+          },
+          WitnessPoints(c) -> witness_outcome(a.obligation, p, js, c),
+          EveryPoint(witness) -> enumeration_outcome(a.obligation, p, js, witness),
+          CounterexampleSearch(stopped) -> search_outcome(a.obligation, p, js, stopped),
+        },
+      }
+    }),
+  )
 }
+
+pub type PlannedClaim<a> = { claim: ClaimToDischarge<a>, plan: PointPlan }
 
 type PointPurpose =
   | EveryPoint(Option<Certificate>)
@@ -99,7 +111,7 @@ type ClaimWork = | Finished(Outcome) | NeedsPoints(PointPlan)
 fn certificate_of(s: StaticProof, ran: Bool) -> Certificate =
   { rules: s.rules, steps: s.steps, guard_satisfiable: true, sorts: s.sorts, ran: ran }
 
-fn guard_span(obligation: Obligation) -> { module: Int, start: Int, end: Int } =
+pub fn guard_place(obligation: Obligation) -> Place =
   match obligation.guards.at(0) { Some(g) -> g, None -> obligation.at }
 
 fn open_reason(s: FailedAttempt) -> Reason =
@@ -118,7 +130,7 @@ fn every_point(domain: Domain) -> Option<List<List<Value>>> / {abort.raise} =
       Some(points) -> match point_at(domain, i) { Some(vs) -> Some(points.push(vs)), None -> None },
     })
 
-fn plan_claim(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort.raise} = {
+fn plan_claim<a>(claim: ClaimToDischarge<a>, world: ProverInput) -> ClaimWork / {abort.raise} = {
   let o = claim.obligation;
   match o.strategy {
     Interleave(points) -> match points {
@@ -136,12 +148,12 @@ fn plan_claim(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort
     Bounded -> match claim.resolved {
       Certified(s) -> Finished(Proved(certificate_of(s, false))),
       Unwitnessed(s) -> Finished(Proved(certificate_of(s, false))),
-      GuardRefuted -> Finished(Vacuous({ guard: guard_span(o) })),
+      GuardRefuted -> Finished(Vacuous),
       Undecided(stopped) -> Finished(Unproved(open_reason(stopped))),
     },
     Static(after) -> match claim.resolved {
       Certified(s) -> Finished(Proved(certificate_of(s, false))),
-      GuardRefuted -> Finished(Vacuous({ guard: guard_span(o) })),
+      GuardRefuted -> Finished(Vacuous),
       _ -> match after {
         Unhandled(row) -> Finished(Unproved(UnhandledEffect(Some(row)))),
         Run(Every(domain, name)) -> match every_point(domain) {
@@ -162,7 +174,7 @@ fn plan_claim(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort
   }
 }
 
-fn plan_search(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abort.raise} = {
+fn plan_search<a>(claim: ClaimToDischarge<a>, world: ProverInput) -> ClaimWork / {abort.raise} = {
   let o = claim.obligation;
   let points = if o.binders.fold(false, |any: Bool, b: Binder| any || !b.constructible) { [] }
   else { candidates(o.binders.map(|b: Binder| b.ty), world.declarations, o.literals) };
@@ -173,7 +185,7 @@ fn plan_search(claim: ClaimToDischarge, world: ProverInput) -> ClaimWork / {abor
     Undecided(stopped) -> if points.len() == 0 { Finished(Unproved(open_reason(stopped))) }
     else { NeedsPoints({ kind: CounterexampleSearch(stopped), points: points, domain: None }) },
     Certified(s) -> Finished(Proved(certificate_of(s, false))),
-    GuardRefuted -> Finished(Vacuous({ guard: guard_span(o) })),
+    GuardRefuted -> Finished(Vacuous),
   }
 }
 
@@ -242,7 +254,7 @@ fn enumeration_outcome(
   let w = first_decisive(obligation, p, js);
   match w.stop {
     Some(o) -> o,
-    None -> if w.held == 0 { Vacuous({ guard: guard_span(obligation) }) } else {
+    None -> if w.held == 0 { Vacuous } else {
       match witness {
         Some(c) -> Proved(c),
         None -> {
@@ -325,12 +337,12 @@ type Totals = {
 
 type SimulationCount = { entered: Int, observed: Bool }
 
-fn search_interleavings<| e>(
-  claim: ClaimToDischarge,
+fn search_interleavings<a | e>(
+  claim: ClaimToDischarge<a>,
   p: PointPlan,
   points: List<List<Value>>,
   plan_search: plan::Plan,
-  ask: (RuntimeRequest) -> RuntimeReply / e,
+  interleave: (InterleavingRun) -> LawRun / e,
 ) -> Outcome / {abort.raise | e} = {
   let sim = plan::normalized(plan_search);
   let start = {
@@ -353,18 +365,21 @@ fn search_interleavings<| e>(
             sim,
             Exact,
             { entered: 0, observed: true },
-            |w: SimulationCount, seed: Seed|
-              match ask(RunInterleaving(claim.claim, values, seed, sim.steps)) {
-                Interleaved(r) ->
-                  {
-                    run: r.interleaving,
-                    state: {
-                      entered: if r.observed { w.entered + 1 } else { w.entered },
-                      observed: w.observed && r.observed,
-                    },
-                  },
-                Judgements(_) -> { run: unexpected_response_run, state: w },
-              },
+            |w: SimulationCount, seed: Seed| {
+              let r = interleave({
+                claim_index: claim.claim,
+                point: values,
+                seed: seed,
+                steps: sim.steps,
+              });
+              {
+                run: r.interleaving,
+                state: {
+                  entered: if r.observed { w.entered + 1 } else { w.entered },
+                  observed: w.observed && r.observed,
+                },
+              }
+            },
           );
           let e = admitted_points.explored.exploration;
           let totals = {
@@ -390,20 +405,6 @@ fn search_interleavings<| e>(
     None -> law_outcome(claim.obligation, p, points.len(), sim, ran.totals),
   }
 }
-
-const unexpected_response_run: Interleaving<Judgement> =
-  {
-    steps: [],
-    verdict: Failed(
-      PointFaulted({
-        code: "E0505",
-        message: "the runtime replied to a request for one simulated run with judgements of sample points",
-        notes: [],
-        values: [],
-      }),
-    ),
-    virtual_time: 0,
-  }
 
 fn law_failed(
   obligation: Obligation,
@@ -460,7 +461,7 @@ fn law_outcome(
   sim: plan::Plan,
   t: Totals,
 ) -> Outcome =
-  if admitted_points == 0 { Vacuous({ guard: guard_span(obligation) }) }
+  if admitted_points == 0 { Vacuous }
   else if !proves(sim, t) { Unproved(Unsearched(t.evaluations)) } else {
     let d = match p.domain { Some(x) -> x, None -> { name: "", points: 0 } };
     Proved({
@@ -487,11 +488,12 @@ fn claim_of(binders: List<Binder>, strategy: Strategy) -> Obligation =
     run_key: "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
     owner: "m.claim",
     kind: Law(Some("claim")),
-    at: { module: 0, start: 1, end: 2 },
+    module: 0,
+    at: InSource({ module: 0, start: 1, end: 2 }),
     binders: binders,
     result: None,
     variables: [],
-    guards: [{ module: 0, start: 3, end: 4 }],
+    guards: [InSource({ module: 0, start: 3, end: 4 })],
     literals: [],
     effects: None,
     frame: NoWrites,
@@ -513,41 +515,58 @@ const bool_claim: Obligation =
     None -> panic("finite"),
   }
 
+fn runtime_of<| e>(
+  judge: keep (Batch<PlannedClaim<Int>>) -> List<Judgement> / e,
+  interleave: keep (InterleavingRun) -> LawRun / e,
+) -> Runtime<PlannedClaim<Int> | e> =
+  {
+    judge: |bs: List<Batch<PlannedClaim<Int>>>|
+      bs.map(|b: Batch<PlannedClaim<Int>>| { batch: b, judgements: judge(b) }),
+    interleave: interleave,
+  }
+
 fn runtime_from_rule<| e>(
   rule: keep (JudgeMode, List<Value>) -> Judgement / e,
-) -> (RuntimeRequest) -> RuntimeReply / e =
-  |ask: RuntimeRequest|
-    match ask {
-      JudgePoints(bs) ->
-        Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| rule(b.mode, p)))),
-      RunInterleaving(_, _, _, _) ->
-        Interleaved({
-          interleaving: { steps: [], verdict: Passed, virtual_time: 0 },
-          observed: false,
-        }),
-    }
+) -> Runtime<PlannedClaim<Int> | e> =
+  runtime_of(
+    |b: Batch<PlannedClaim<Int>>| b.points.map(|p: List<Value>| rule(b.mode, p)),
+    |run: InterleavingRun|
+      { interleaving: { steps: [], verdict: Passed, virtual_time: 0 }, observed: false },
+  )
 
-fn no_runtime() -> (RuntimeRequest) -> RuntimeReply / {abort.raise} =
-  |ask: RuntimeRequest|
-    panic("a claim that already has a result must not send a request to the runtime")
+fn no_runtime() -> Runtime<PlannedClaim<Int> | {abort.raise}> =
+  runtime_of(
+    |b: Batch<PlannedClaim<Int>>|
+      panic("a claim that already has a result must not send a request to the runtime"),
+    |run: InterleavingRun|
+      panic("a claim that already has a result must not send a request to the runtime"),
+  )
+
+fn reported_outcomes<| e>(
+  claims: List<ClaimToDischarge<Int>>,
+  sim: plan::Plan,
+  runtime: Runtime<PlannedClaim<Int> | e>,
+) -> Map<Int, Outcome> / {abort.raise | e} =
+  discharged(claims, empty_prover_input, sim, runtime).fold(
+    Map::new(),
+    |outcomes: Map<Int, Outcome>, d: Decided<Int>| outcomes.insert(d.claim, d.outcome),
+  )
 
 fn run_one<| e>(
   obligation: Obligation,
   resolved: StaticResult,
   sim: plan::Plan,
-  ask: (RuntimeRequest) -> RuntimeReply / e,
+  runtime: Runtime<PlannedClaim<Int> | e>,
 ) -> Outcome / {abort.raise | e} =
-  match discharged(
-      [{ claim: 0, obligation: obligation, resolved: resolved }],
-      empty_prover_input,
+  match reported_outcomes(
+      [{ claim: 0, obligation: obligation, resolved: resolved, reported_as: 0 }],
       sim,
-      ask,
-      |_claim: Int, _outcome: Outcome| (),
-    ).at(
+      runtime,
+    ).get(
       0,
     ) {
     Some(x) -> x,
-    None -> panic("checking one claim must return exactly one outcome"),
+    None -> panic("checking one claim must report its outcome"),
   }
 
 fn int_of(vs: List<Value>) -> Int / {abort.raise} =
@@ -571,10 +590,7 @@ test "a claim proved by the static prover is accepted without calling the runtim
     run_one(o, Certified(ground_static_proof), plan::default_plan, no_runtime()),
     Proved(certificate(false)),
   );
-  assert_eq(
-    run_one(o, GuardRefuted, plan::default_plan, no_runtime()),
-    Vacuous({ guard: { module: 0, start: 3, end: 4 } }),
-  )
+  assert_eq(run_one(o, GuardRefuted, plan::default_plan, no_runtime()), Vacuous)
 }
 
 test "a claim the prover cannot close is reported open, even when every tested point passes" {
@@ -695,10 +711,7 @@ test "checking a domain stops at the first point where the claim fails, and is v
     _ -> panic("not refuted"),
   };
   let rejecting = runtime_from_rule(|mode: JudgeMode, p: List<Value>| PointRejected);
-  assert_eq(
-    run_one(bool_claim, undecided, plan::default_plan, rejecting),
-    Vacuous({ guard: { module: 0, start: 3, end: 4 } }),
-  );
+  assert_eq(run_one(bool_claim, undecided, plan::default_plan, rejecting), Vacuous);
   let raising = runtime_from_rule(|mode: JudgeMode, p: List<Value>|
     PointRaised({ message: "no", values: [] }));
   assert(match run_one(bool_claim, undecided, plan::default_plan, raising) {
@@ -746,72 +759,62 @@ test "a cost bound is either proved statically or left open with the reason, and
 }
 
 test "one runtime request checks the inputs of all claims that need it, each claim in the mode its proof state calls for" {
-  let ask = |a: RuntimeRequest|
-    match a {
-      JudgePoints(bs) -> {
-        assert_eq(bs.map(|batch: Batch| (batch.claim_index, batch.points.len(), batch.mode)), [
-          (4, 3, WholeClaim),
-          (7, 2, WholeClaim),
-          (9, 3, WitnessSearch),
-        ]);
-        Judgements(bs.map(|batch: Batch| batch.points.map(|p: List<Value>| PointPassed)))
-      },
-      RunInterleaving(_, _, _, _) -> panic("nothing to search"),
-    };
-  let outcomes = discharged(
+  let runtime: Runtime<PlannedClaim<Int> | {abort.raise}> = {
+    judge: |bs: List<Batch<PlannedClaim<Int>>>| {
+      assert_eq(
+        bs.map(|batch: Batch<PlannedClaim<Int>>|
+          (batch.claim_index, batch.points.len(), batch.mode)),
+        [(4, 3, WholeClaim), (7, 2, WholeClaim), (9, 3, WitnessSearch)],
+      );
+      bs.map(|batch: Batch<PlannedClaim<Int>>|
+        { batch: batch, judgements: batch.points.map(|p: List<Value>| PointPassed) })
+    },
+    interleave: |run: InterleavingRun| panic("nothing to search"),
+  };
+  let outcomes = reported_outcomes(
     [
-      { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided },
+      { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided, reported_as: 4 },
       {
         claim: 5,
         obligation: open_claim([int_binder("x")]),
         resolved: Certified(ground_static_proof),
+        reported_as: 5,
       },
-      { claim: 7, obligation: bool_claim, resolved: undecided },
+      { claim: 7, obligation: bool_claim, resolved: undecided, reported_as: 7 },
       {
         claim: 9,
         obligation: open_claim([int_binder("x")]),
         resolved: Unwitnessed(ground_static_proof),
+        reported_as: 9,
+      },
+    ],
+    plan::default_plan,
+    runtime,
+  );
+  assert_eq(
+    [4, 5, 7, 9].map(|claim: Int|
+      match outcomes.get(claim) { Some(o) -> Some(is_proved(o)), None -> None }),
+    [Some(false), Some(true), Some(true), Some(true)],
+  )
+}
+
+test "each claim is decided once, and claims resolved statically come before those the runtime decides" {
+  let passing = runtime_from_rule(|_mode: JudgeMode, _point: List<Value>| PointPassed);
+  let decided = discharged(
+    [
+      { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided, reported_as: 4 },
+      {
+        claim: 5,
+        obligation: open_claim([int_binder("x")]),
+        resolved: Certified(ground_static_proof),
+        reported_as: 5,
       },
     ],
     empty_prover_input,
     plan::default_plan,
-    ask,
-    |_claim: Int, _outcome: Outcome| (),
+    passing,
   );
-  assert_eq(outcomes.map(is_proved), [false, true, true, true])
-}
-
-effect events {
-  write heard(what: String) -> Unit
-}
-
-test "each claim is reported once when decided, and claims resolved statically are reported before the runtime is called" {
-  let order = handle {
-    discharged(
-      [
-        { claim: 4, obligation: open_claim([int_binder("x")]), resolved: undecided },
-        {
-          claim: 5,
-          obligation: open_claim([int_binder("x")]),
-          resolved: Certified(ground_static_proof),
-        },
-      ],
-      empty_prover_input,
-      plan::default_plan,
-      |a: RuntimeRequest| {
-        events.heard("asked");
-        runtime_from_rule(|_mode: JudgeMode, _point: List<Value>| PointPassed)(a)
-      },
-      |claim: Int, _outcome: Outcome| events.heard(claim.to_string()),
-    )
-  } with {
-    var notes: List<String> = [],
-    events.heard(what) -> {
-      notes = notes.push(what);
-    },
-    return _outcomes -> notes,
-  };
-  assert_eq(order, ["5", "asked", "4"])
+  assert_eq(decided.map(|d: Decided<Int>| d.claim), [5, 4])
 }
 
 fn lost_update_run(
@@ -852,7 +855,7 @@ fn lost_update_run(
             runnable: enabled,
             choice: choice,
             accesses: [VariableAccess({ handler: 0, index: 0, write: !reading })],
-            site: { definition: Some("transfer"), span: { module: 0, start: 0, end: 0 } },
+            site: { definition: Some("transfer"), span: None },
             vector_clock: [],
           }),
         })
@@ -869,13 +872,11 @@ fn lost_update_run(
 fn law_runtime<| e>(
   run: keep (Seed) -> Interleaving<Judgement> / e,
   observed: Bool,
-) -> (RuntimeRequest) -> RuntimeReply / e =
-  |ask: RuntimeRequest|
-    match ask {
-      JudgePoints(bs) -> Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| PointPassed))),
-      RunInterleaving(_, _, seed, _) ->
-        Interleaved({ interleaving: run(seed), observed: observed }),
-    }
+) -> Runtime<PlannedClaim<Int> | e> =
+  runtime_of(
+    |b: Batch<PlannedClaim<Int>>| b.points.map(|p: List<Value>| PointPassed),
+    |subject: InterleavingRun| { interleaving: run(subject.seed), observed: observed },
+  )
 
 const ground_law: Obligation =
   match finite([], []) {
@@ -1009,16 +1010,13 @@ test "a law whose body raises an error is left unproved, and a Ply fault while r
 }
 
 test "a law whose guard rejects every point of its domain is vacuous" {
-  let rejecting = |ask: RuntimeRequest|
-    match ask {
-      JudgePoints(bs) -> {
-        assert_eq(bs.map(|b: Batch| b.mode), [GuardFilter]);
-        Judgements(bs.map(|b: Batch| b.points.map(|p: List<Value>| PointRejected)))
-      },
-      RunInterleaving(_, _, _, _) -> panic("nothing kept, so nothing to search"),
-    };
-  assert_eq(
-    run_one(bool_law, undecided, dpor_plan(64), rejecting),
-    Vacuous({ guard: { module: 0, start: 3, end: 4 } }),
-  )
+  let rejecting: Runtime<PlannedClaim<Int> | {abort.raise}> = {
+    judge: |bs: List<Batch<PlannedClaim<Int>>>| {
+      assert_eq(bs.map(|b: Batch<PlannedClaim<Int>>| b.mode), [GuardFilter]);
+      bs.map(|b: Batch<PlannedClaim<Int>>|
+        { batch: b, judgements: b.points.map(|p: List<Value>| PointRejected) })
+    },
+    interleave: |run: InterleavingRun| panic("nothing kept, so nothing to search"),
+  };
+  assert_eq(run_one(bool_law, undecided, dpor_plan(64), rejecting), Vacuous)
 }

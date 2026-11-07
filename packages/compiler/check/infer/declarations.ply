@@ -1,4 +1,11 @@
-import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, is_bare)
+import compiler.check.resolve.tables (bound_by_failed_import)
+import compiler.check.resolve.tables (module_elsewhere, other_modules, scope_bindings)
+import compiler.check.borrowing (mode_facts)
+import compiler.check.termination (termination_facts)
+import compiler.check.infer.checker (elsewhere)
+import compiler.check.infer.checker (type_declared, record_declared, alias_declared, stated_of,
+                                     ordered_in)
+import compiler.syntax.parsing (Span, Identifier, QName, generated_span, is_bare)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
                                     UnitTypeExpression, InvalidTypeExpression, EffectsExpression,
@@ -8,7 +15,7 @@ import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, FnDefini
                               TypeDefinition, AliasBody, SumBody, VariantDefinition,
                               OperationDefinition, Constraint, Deriver, OrderingDeriver,
                               NumericDeriver, IntegerDeriver, is_predicate, NominalBody, ExternBody,
-                              constraint_written)
+                              constraint_written, host_handler_of)
 import compiler.syntax.expressions (Param)
 import compiler.check.types (NamedResource, SingletonResource, ResourceVariable, AnyResource,
                              Effect, Effects, Type, VariableType, NamedType, FunctionType,
@@ -27,11 +34,11 @@ import std.string
 import compiler.check.borrowing (parameter_mode)
 import compiler.check.infer.checker (Location, DeclaredAlias, DeclaredExtern, DeclaredRecord,
                                      DeclaredSum, TypeDeclaration, RecordDeclaration, OperationInfo,
-                                     EffectInfo, Signature, Assumption, OpenScope, ScopedValueKind,
-                                     ScopedLabel, Tasks, RigidParam, MapKeySite, Checker,
-                                     DefinitionConstraint, ConstraintSite, insert_constraint,
-                                     dedup_constraints, WithType, WithVariable, WithEffects,
-                                     WithName, WithTypes, WithEffect, scoped_effect,
+                                     EffectInfo, Signature, SignatureParam, Assumption, OpenScope,
+                                     ScopedValueKind, ScopedLabel, Tasks, RigidParam, MapKeySite,
+                                     Checker, DefinitionConstraint, ConstraintSite,
+                                     insert_constraint, dedup_constraints, WithType, WithVariable,
+                                     WithEffects, WithName, WithTypes, WithEffect, scoped_effect,
                                      is_scoped_effect, location_of, module_name, scope_of,
                                      report_error_at, report_error_at_and, supplied, new_type,
                                      new_type_variable, new_effects, new_effect_variable, resolve,
@@ -75,16 +82,18 @@ fn type_param(checker: Checker, identifier: Identifier) -> { checker: Checker, t
 pub fn convert_type(
   checker: Checker,
   ty: TypeExpression,
-) -> { checker: Checker, ty: Type } / {abort.raise} =
+) -> { checker: Checker, ty: Type } / {abort.raise, elsewhere.read, other_modules.read} =
   convert_type_within(checker, ty, alias_depth_limit(checker))
 
-fn alias_depth_limit(checker: Checker) -> Int = checker.types.len() - checker.alias_stack.len()
+const deepest_alias: Int = 1 << 16
+
+fn alias_depth_limit(checker: Checker) -> Int = deepest_alias - checker.alias_stack.len()
 
 fn convert_type_within(
   checker: Checker,
   ty: TypeExpression,
   room: Int,
-) -> { checker: Checker, ty: Type } / {abort.raise} =
+) -> { checker: Checker, ty: Type } / {abort.raise, elsewhere.read, other_modules.read} =
   match ty {
     VariableTypeExpression(id) -> type_param(checker, id),
     UnitTypeExpression(_) -> { checker: checker, ty: unit_type },
@@ -121,7 +130,7 @@ fn convert_label_and_effects_arguments(
   checker: Checker,
   labels: List<Identifier>,
   written: List<EffectsExpression>,
-) -> { checker: Checker, over: LabelAndEffectsArguments } / {abort.raise} = {
+) -> { checker: Checker, over: LabelAndEffectsArguments } / {abort.raise, elsewhere.read, other_modules.read} = {
   let converted = written.fold(
     { checker: checker, effect_arguments: [] },
     |accumulator: { checker: Checker, effect_arguments: List<Effects> }, effects: EffectsExpression| {
@@ -177,14 +186,14 @@ fn bind_declaration_params(
 fn convert_types(
   checker: Checker,
   types: List<TypeExpression>,
-) -> { checker: Checker, types: List<Type> } / {abort.raise} =
+) -> { checker: Checker, types: List<Type> } / {abort.raise, elsewhere.read, other_modules.read} =
   convert_types_within(checker, types, alias_depth_limit(checker))
 
 fn convert_types_within(
   checker: Checker,
   types: List<TypeExpression>,
   room: Int,
-) -> { checker: Checker, types: List<Type> } / {abort.raise} =
+) -> { checker: Checker, types: List<Type> } / {abort.raise, elsewhere.read, other_modules.read} =
   types.fold(
     { checker: checker, types: [] },
     |accumulator: { checker: Checker, types: List<Type> }, ty: TypeExpression| {
@@ -248,7 +257,7 @@ fn convert_constructor(
   effect_arguments: List<EffectsExpression>,
   span: Span,
   room: Int,
-) -> { checker: Checker, ty: Type } / {abort.raise} =
+) -> { checker: Checker, ty: Type } / {abort.raise, elsewhere.read, other_modules.read} =
   if is_bare(name) && args.len() == 0 && labels.len() == 0 && effect_arguments.len() == 0
       && checker.type_params.contains(name.name.name) {
     {
@@ -286,7 +295,7 @@ fn convert_constructor(
         match g.name {
           None -> if is_bare(name) { new_type(unknown_type(g.checker, name)) }
           else { new_type(g.checker) },
-          Some(qualified) -> match g.checker.types.get(qualified) {
+          Some(qualified) -> match type_declared(g.checker, qualified) {
             None -> new_type(g.checker),
             Some(declaration) -> if converted.types.len() != declaration.params.len() {
               new_type(
@@ -402,14 +411,25 @@ fn convert_constructor(
                     } else { sites };
                   let memo = declaration.params.len() == 0 && declaration.labels.len() == 0
                     && declaration.effect_params.len() == 0;
-                  match if memo { g.checker.aliases.get(qualified) } else { None } {
+                  match if memo || declaration.owner == module_elsewhere {
+                      alias_declared(g.checker, qualified)
+                    } else { None } {
                     Some(m) -> {
                       let assumed = assumed_for(g.checker, OrderingDeriver);
+                      let given = applied_args(converted.types, over.labels, over.effect_arguments);
+                      let at_args = |t: Type| apply_arguments(t, m.params, m.effect_params, given);
                       let keys = m.keys.map(|s: MapKeySite|
-                        { ..s, scope: g.checker.scope, assumed: assumed });
+                        {
+                          ..s,
+                          scope: g.checker.scope,
+                          assumed: assumed,
+                          key: at_args(s.key),
+                          whole: at_args(s.whole),
+                          carrier: match s.carrier { Some(c) -> Some(at_args(c)), None -> None },
+                        });
                       {
                         checker: { ..g.checker, map_keys: placed(g.checker.map_keys.concat(keys)) },
-                        ty: m.t,
+                        ty: at_args(m.t),
                       }
                     },
                     None -> {
@@ -458,6 +478,8 @@ fn convert_constructor(
                             o.checker.aliases.insert(qualified, {
                               t: o.ty,
                               keys: sites_from(o.checker.map_keys, before),
+                              params: [],
+                              effect_params: [],
                             })
                           } else { o.checker.aliases },
                         },
@@ -474,6 +496,72 @@ fn convert_constructor(
     }
   }
 
+pub fn with_declared_aliases(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise, elsewhere.read, other_modules.read} =
+  parsed.module.items.fold(checker, |c: Checker, item: Item|
+    match item {
+      TypeItem(definition) -> {
+        let qualified = qualify(parsed.name, definition.name.name);
+        match type_declared(c, qualified) {
+          Some(declaration) -> match declaration.declared {
+            DeclaredAlias(body) ->
+              declared_alias(c, qualified, declaration, body, alias_depth_limit(c)),
+            _ -> c,
+          },
+          None -> c,
+        }
+      },
+      _ -> c,
+    })
+
+fn declared_alias(
+  checker: Checker,
+  qualified: Bytes,
+  declaration: TypeDeclaration,
+  body: TypeExpression,
+  room: Int,
+) -> Checker / {abort.raise, elsewhere.read, other_modules.read} = {
+  let bound: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> } = declaration.params.fold(
+    { checker: checker, vars: [], params: Map::new() },
+    |accumulator: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> }, p: Bytes| {
+      let o: WithVariable = new_type_variable(accumulator.checker);
+      {
+        checker: o.checker,
+        vars: accumulator.vars.push(o.var),
+        params: accumulator.params.insert(p, VariableType(o.var)),
+      }
+    },
+  );
+  let own = bind_declaration_params(
+    {
+      ..bound.checker,
+      type_params: bound.params,
+      alias_stack: checker.alias_stack.push(qualified),
+      module: declaration.owner,
+    },
+    declaration,
+  );
+  let before = checker.map_keys.len();
+  let o: WithType = convert_type_within(own.checker, body, room - 1);
+  {
+    ..o.checker,
+    type_params: checker.type_params,
+    effect_params: checker.effect_params,
+    label_params: checker.label_params,
+    alias_stack: checker.alias_stack,
+    module: checker.module,
+    map_keys: checker.map_keys,
+    aliases: o.checker.aliases.insert(qualified, {
+      t: o.ty,
+      keys: sites_from(o.checker.map_keys, before),
+      params: bound.vars.concat(own.labels),
+      effect_params: own.effect_params,
+    }),
+  }
+}
+
 fn declared_record(
   checker: Checker,
   named: Identifier,
@@ -481,8 +569,8 @@ fn declared_record(
   declaration: TypeDeclaration,
   body: TypeExpression,
   room: Int,
-) -> { checker: Checker, record: Option<RecordDeclaration> } / {abort.raise} =
-  match checker.nominals.get(qualified) {
+) -> { checker: Checker, record: Option<RecordDeclaration> } / {abort.raise, elsewhere.read, other_modules.read} =
+  match record_declared(checker, qualified) {
     Some(r) -> { checker: checker, record: Some(r) },
     None -> if checker.alias_stack.contains(qualified) {
       {
@@ -572,12 +660,15 @@ fn declared_record(
     },
   }
 
-pub fn collect_nominals(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+pub fn collect_nominals(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise, elsewhere.read, other_modules.read} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item {
       TypeItem(definition) -> {
         let qualified = qualify(parsed.name, definition.name.name);
-        match c.types.get(qualified) {
+        match type_declared(c, qualified) {
           Some(declaration) -> match declaration.declared {
             DeclaredRecord(body) ->
               declared_record(
@@ -596,38 +687,35 @@ pub fn collect_nominals(checker: Checker, parsed: ParsedModule) -> Checker / {ab
       _ -> c,
     })
 
-fn unknown_type(checker: Checker, qualified_name: QName) -> Checker / {abort.raise} =
-  match checker.derived {
-    Some(_) -> unresolved_in_derived(checker, qualified_name, b"type"),
-    None -> {
-      let n = qualified_name.name.name;
-      let notes = [b"declare it with `type`, or check the spelling"];
-      let exported = if is_bare(qualified_name) {
-        match exporter(checker, TypeSpace, n) {
-          Some(i) ->
-            notes.push(
-              Bytes::concat_all([
-                b"module `",
-                module_name(checker, i),
-                b"` exports it: `import ",
-                module_name(checker, i),
-                b" (",
-                n,
-                b")`",
-              ]),
-            ),
-          None -> notes,
-        }
-      } else { notes };
-      report_error_at(
-        checker,
-        b"E0102",
-        qualified_name.span,
-        Bytes::concat_all([b"unknown type `", n, b"`"]),
-        b"not found",
-        exported,
-      )
-    },
+fn unknown_type(
+  checker: Checker,
+  qualified_name: QName,
+) -> Checker / {abort.raise, other_modules.read} =
+  if bound_by_failed_import(scope_of(checker), qualified_name) { checker } else {
+    match checker.derived {
+      Some(_) -> unresolved_in_derived(checker, qualified_name, b"type"),
+      None -> {
+        let n = qualified_name.name.name;
+        let notes = [b"declare it with `type`, or check the spelling"];
+        let exported = if is_bare(qualified_name) {
+          match exporter(checker, TypeSpace, n) {
+            Some(i) ->
+              notes.push(
+                Bytes::concat_all([b"module `", i, b"` exports it: `import ", i, b" (", n, b")`"]),
+              ),
+            None -> notes,
+          }
+        } else { notes };
+        report_error_at(
+          checker,
+          b"E0102",
+          qualified_name.span,
+          Bytes::concat_all([b"unknown type `", n, b"`"]),
+          b"not found",
+          exported,
+        )
+      },
+    }
   }
 
 fn effect_param(checker: Checker, identifier: Identifier) -> { checker: Checker, v: Option<Int> } =
@@ -656,7 +744,7 @@ fn effect_param(checker: Checker, identifier: Identifier) -> { checker: Checker,
 fn convert_effects(
   checker: Checker,
   effects: EffectsExpression,
-) -> { checker: Checker, effects: Effects } / {abort.raise} = {
+) -> { checker: Checker, effects: Effects } / {abort.raise, elsewhere.read, other_modules.read} = {
   let o = convert_bounded_effects(checker, effects);
   { checker: reject_marks(o.checker, effects), effects: o.r }
 }
@@ -664,7 +752,7 @@ fn convert_effects(
 fn convert_bounded_effects(
   checker: Checker,
   effects: EffectsExpression,
-) -> { checker: Checker, r: Effects, bounded: List<Effect> } / {abort.raise} = {
+) -> { checker: Checker, r: Effects, bounded: List<Effect> } / {abort.raise, elsewhere.read, other_modules.read} = {
   let converted = effects.listed.fold(
     { checker: checker, listed: [], bounded: [] },
     |accumulator: { checker: Checker, listed: List<Effect>, bounded: List<Effect> }, entry: EffectExpression| {
@@ -743,7 +831,7 @@ fn reject_any_label(
 pub fn convert_effect(
   checker: Checker,
   a: EffectExpression,
-) -> { checker: Checker, entry: Option<Effect> } / {abort.raise} =
+) -> { checker: Checker, entry: Option<Effect> } / {abort.raise, elsewhere.read, other_modules.read} =
   if is_rejected_effect(checker, a.span) { { checker: checker, entry: None } } else {
     let e: WithName = effect_name(checker, a.effect_name);
     match e.name {
@@ -879,7 +967,7 @@ pub fn operation_named(info: EffectInfo, name: Bytes) -> Option<OperationInfo> =
 pub fn effect_name(
   checker: Checker,
   qualified_name: QName,
-) -> { checker: Checker, name: Option<Bytes> } / {abort.raise} =
+) -> { checker: Checker, name: Option<Bytes> } / {abort.raise, elsewhere.read, other_modules.read} =
   if is_bare(qualified_name) && is_scoped_effect(qualified_name.name.name) {
     { checker: checker, name: Some(qualified_name.name.name) }
   } else {
@@ -897,7 +985,10 @@ pub fn effect_name(
     }
   }
 
-fn unknown_effect(checker: Checker, qualified_name: QName) -> Checker / {abort.raise} = {
+fn unknown_effect(
+  checker: Checker,
+  qualified_name: QName,
+) -> Checker / {abort.raise, other_modules.read} = {
   let n = qualified_name.name.name;
   let message = Bytes::concat_all([b"unknown effect `", n, b"`"]);
   if is_bare(qualified_name)
@@ -914,7 +1005,7 @@ fn unknown_effect(checker: Checker, qualified_name: QName) -> Checker / {abort.r
       b"`a.b(c)` is an effect operation; parentheses make it a field access",
     ])
   } else {
-    let known = scope_of(checker).bound.effects.map(|binding: Binding| binding.name);
+    let known = scope_bindings(scope_of(checker), EffectSpace).map(|binding: Binding| binding.name);
     let first = if known.len() == 0 { b"declare it with `effect <name> { .. }`" }
     else { b"effects in scope: ".concat(backticked(known, b", ")) };
     let notes = match exporter(checker, EffectSpace, n) {
@@ -923,11 +1014,11 @@ fn unknown_effect(checker: Checker, qualified_name: QName) -> Checker / {abort.r
           first,
           Bytes::concat_all([
             b"module `",
-            module_name(checker, i),
+            i,
             b"` declares it: `import ",
-            module_name(checker, i),
+            i,
             b"` and write `",
-            default_binder(module_name(checker, i)),
+            default_binder(i),
             b"::",
             n,
             b"`",
@@ -960,9 +1051,9 @@ fn record_type(
   checker: Checker,
   parsed: ParsedModule,
   definition: TypeDefinition,
-) -> Checker / {abort.raise} = {
+) -> Checker / {abort.raise, elsewhere.read} = {
   let name = qualify(parsed.name, definition.name.name);
-  match checker.types.get(name) {
+  match type_declared(checker, name) {
     Some(existing) ->
       duplicate(checker, definition.name, { module: existing.owner, span: existing.span }, b"type"),
     None -> match builtin_type_arity(definition.name.name) {
@@ -991,6 +1082,7 @@ fn record_type(
             effect_params: identifier_names(definition.generics.effects),
             constraints: dedup_constraints(s.constraints),
             declared: declared,
+            home: parsed.name,
             opaque: definition.opaque,
             owner: checker.module,
             span: definition.span,
@@ -1073,7 +1165,10 @@ fn declared_constraints(
     },
   )
 
-pub fn collect_types(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+pub fn collect_types(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise, elsewhere.read} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item { TypeItem(d) -> record_type(c, parsed, d), _ -> c })
 
@@ -1179,7 +1274,10 @@ const operation_scoped_notes: List<Bytes> =
     b"take the effects as an effect variable of the operation, `write put<| e>(f: () -> Int / e) -> Unit`, so no handler clause can store the function",
   ]
 
-pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+pub fn collect_effects(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise, elsewhere.read, other_modules.read} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item {
       EffectItem(definition) -> {
@@ -1219,7 +1317,7 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                   if accumulator.operations.fold(false, |b: Bool, op_info: OperationInfo|
                       b || op_info.name == operation.name.name) {
                     let first_span = accumulator.operations.fold(
-                      dummy_span,
+                      generated_span,
                       |span: Span, op_info: OperationInfo|
                         if op_info.name == operation.name.name { op_info.at.span } else { span },
                     );
@@ -1298,9 +1396,14 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
                 name: name,
                 module: parsed.name,
                 simple_name: definition.name.name,
+                visibility: definition.visibility,
                 nondet: definition.is_nondet,
                 operations: collected.operations,
                 at: location_of(collected.checker, definition.span),
+                host: match host_handler_of(parsed.module, definition.name.name) {
+                  Some(by) -> Some(qualify(parsed.name, by)),
+                  None -> None,
+                },
               })
             },
           }
@@ -1309,7 +1412,10 @@ pub fn collect_effects(checker: Checker, parsed: ParsedModule) -> Checker / {abo
       _ -> c,
     })
 
-pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker / {abort.raise} =
+pub fn collect_constructors(
+  checker: Checker,
+  parsed: ParsedModule,
+) -> Checker / {abort.raise, elsewhere.read, other_modules.read} =
   parsed.module.items.fold(checker, |c: Checker, item: Item|
     match item {
       TypeItem(definition) -> match definition.body {
@@ -1318,7 +1424,7 @@ pub fn collect_constructors(checker: Checker, parsed: ParsedModule) -> Checker /
         ExternBody -> c,
         SumBody(variants) -> {
           let type_name = qualify(parsed.name, definition.name.name);
-          match c.types.get(type_name) {
+          match type_declared(c, type_name) {
             None -> c,
             Some(declaration) -> {
               let type_variables: { checker: Checker, vars: List<Int>, params: Map<Bytes, Type> } = declaration.params.fold(
@@ -1718,7 +1824,7 @@ pub fn member_scheme(
 pub fn written_signature(
   outer: Checker,
   definition: FnDefinition,
-) -> { checker: Checker, sig: Signature } / {abort.raise} = {
+) -> { checker: Checker, sig: Signature } / {abort.raise, elsewhere.read, other_modules.read} = {
   let checker: Checker = {
     ..outer,
     scope: outer.scope + 1,
@@ -1755,19 +1861,19 @@ pub fn written_signature(
   );
   let checked: Checker = check_where(assumed, definition);
   let params = definition.params.fold(
-    { checker: checked, types: [] },
-    |accumulator: { checker: Checker, types: List<Type> }, p: Param|
+    { checker: checked, params: [] },
+    |accumulator: { checker: Checker, params: List<SignatureParam> }, p: Param|
       match p.ty {
         Some(t) -> {
           let o: WithType = convert_type(accumulator.checker, t);
           {
             checker: check_scoped_placement(o.checker, t, o.ty, true),
-            types: accumulator.types.push(o.ty),
+            params: accumulator.params.push({ param: p, ty: o.ty }),
           }
         },
         None -> {
           let o: WithType = new_type(accumulator.checker);
-          { checker: o.checker, types: accumulator.types.push(o.ty) }
+          { checker: o.checker, params: accumulator.params.push({ param: p, ty: o.ty }) }
         },
       },
   );
@@ -1797,13 +1903,13 @@ pub fn written_signature(
       effect_params: c.effect_params,
       label_params: c.label_params,
       fn_type: owning_function_type(
-        params.types,
-        range(0, definition.params.len()).filter(|i: Int| definition.params.get(i).keep),
+        params.params.map(|p: SignatureParam| p.ty),
+        range(0, params.params.len()).filter(|i: Int| params.params.get(i).param.keep),
         false,
         return_type.ty,
         effects.effects,
       ),
-      params: params.types,
+      params: params.params,
       return_type: return_type.ty,
       declared: declared.r,
       published_effects: effects.effects,
@@ -1875,18 +1981,16 @@ pub fn own_parts(
   carrying: Map<Bytes, List<Int>>,
   t: Type,
   out: List<OrderedPart>,
-) -> List<OrderedPart> = {
+) -> List<OrderedPart> / {elsewhere.read} = {
   let carried = |name: Bytes, args: List<Type>|
-    if carrying.len() == 0 { out } else {
-      match carrying.get(name) {
-        None -> out,
-        Some(ps) ->
-          ps.fold(out, |accumulator: List<OrderedPart>, j: Int|
-            match args.at(j) {
-              Some(a) -> accumulator.push({ key: a, container: Some(t) }),
-              None -> accumulator,
-            }),
-      }
+    match ordered_in(carrying, name) {
+      None -> out,
+      Some(ps) ->
+        ps.fold(out, |accumulator: List<OrderedPart>, j: Int|
+          match args.at(j) {
+            Some(a) -> accumulator.push({ key: a, container: Some(t) }),
+            None -> accumulator,
+          }),
     };
   match t {
     NamedType(c) -> match map_parts(t) {
@@ -1903,16 +2007,16 @@ pub fn note_type_constraints(
   span: Span,
   name: Bytes,
   args: List<Type>,
-) -> Checker / {abort.raise} =
+) -> Checker / {abort.raise, elsewhere.read} =
   if checker.declaring_type != b"" { checker } else {
-    match checker.stated.get(name) {
+    match stated_of(checker, name) {
       None -> checker,
       Some(cs) ->
         cs.fold(checker, |c: Checker, dc: DefinitionConstraint|
           match args.at(dc.param) {
             None -> c,
             Some(ty) ->
-              note_type_constraint(c, span, dc.deriver, ty, name, match c.types.get(name) {
+              note_type_constraint(c, span, dc.deriver, ty, name, match type_declared(c, name) {
                 Some(declaration) ->
                   declaration.constraints.any(|w: DefinitionConstraint|
                     w.param == dc.param && w.deriver == dc.deriver),
@@ -1929,8 +2033,8 @@ pub fn note_type_constraint(
   ty: Type,
   callee: Bytes,
   written: Bool,
-) -> Checker / {abort.raise} = {
-  let callee_at = match checker.types.get(callee) {
+) -> Checker / {abort.raise, elsewhere.read} = {
+  let callee_at = match type_declared(checker, callee) {
     Some(declaration) -> { module: declaration.owner, span: declaration.span },
     None -> { module: checker.module, span: span },
   };
@@ -1953,9 +2057,13 @@ pub fn note_type_constraint(
   }
 }
 
-fn note_alias_constraints(checker: Checker, name: Bytes, args: List<Type>) -> Checker =
+fn note_alias_constraints(
+  checker: Checker,
+  name: Bytes,
+  args: List<Type>,
+) -> Checker / {elsewhere.read} =
   if checker.declaring_type == b"" { checker } else {
-    match checker.stated.get(name) {
+    match stated_of(checker, name) {
       None -> checker,
       Some(cs) ->
         cs.fold(checker, |c: Checker, dc: DefinitionConstraint|

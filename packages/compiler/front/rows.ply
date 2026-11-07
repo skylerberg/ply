@@ -1,18 +1,21 @@
-import compiler.syntax.parsing (Span, Identifier, QName, is_bare, no_module, span_bin)
+import compiler.syntax.parsing (Span, Identifier, QName, is_bare, span_bin, generated_span)
 import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, EffectSetItem, SumBody,
                               VariantDefinition, SpecKind, ImportDeclaration, spec_kind_bin)
-import compiler.syntax.type_syntax (EffectExpression)
+import compiler.syntax.type_syntax (EffectExpression, Mode, mode_bin)
 import compiler.check.typed (ConstantData, constant_data_bin)
+import compiler.check.known (mentions_secret)
 import compiler.check.types (Effect, NamedResource, SingletonResource, Scheme, Type, effects_insert,
                              effect_bin, scheme_bin, TypeTable, type_table_bin)
-import compiler.check.resolve.tables (ParsedModule, Diagnostic, Resolution, EffectSpace, qualify,
-                                      lookup)
-import compiler.check.resolve.scopes (find)
-import compiler.store.hash.graph (DefinitionEntry, TestEntry, LawEntry)
-import compiler.store.hash.forms (HashLayout)
-import compiler.check.infer.checker (Location, DefinitionConstraint, EffectInfo, is_prelude_effect,
-                                     Raise, raise_bin)
+import compiler.check.resolve.tables (ParsedModule, Diagnostic, Resolution, qualify,
+                                      implicit_target, Place, place_of, place_bin)
+import compiler.store.hash.graph (DefinitionEntry, TestEntry, LawEntry, HeldKind, HeldType,
+                                  HeldEffect, HeldValue)
+import compiler.store.hash.forms (HashLayout, FramedBody)
+import compiler.check.infer.checker (Location, DefinitionConstraint, is_prelude_effect, Raise,
+                                     raise_bin, RecordedFacts, recorded_facts_bin, BodyRecord,
+                                     body_record_bin, DefinitionInfo, WaitingClause)
 import compiler.check.termination (Termination, Summary, termination_bin, summary_bin)
+import compiler.emit.keys (RootKey, root_key_bin)
 import compiler.front.pkg (LockedPackage)
 import compiler.check.resolve.scopes (PackageDependencies)
 import std.bin
@@ -22,14 +25,7 @@ import compiler.expand.embed (ModuleEmbed, ItemEmbeds, embed_requests, requests_
 import compiler.syntax.items (parse, Derivation, derivation_bin)
 import compiler.syntax.lexer (is_identifier_start)
 
-pub fn span_at(module: Int, span: Span) -> ModuleSpan =
-  {
-    module: if span.start == 0 && span.end == 0 { no_module } else { module },
-    start: span.start,
-    end: span.end,
-  }
-
-pub fn location_span(location: Location) -> ModuleSpan = span_at(location.module, location.span)
+pub fn location_place(location: Location) -> Place = place_of(location.module, location.span)
 
 pub type WrittenFunction = {
   public: Bool,
@@ -75,9 +71,9 @@ pub type FunctionOutline = {
   span: Span,
 }
 
-pub type TestOutline = { name: Bytes, label_span: Span, cases: Bool }
+pub type TestOutline = { name: Bytes, cases: Bool }
 
-pub type LawOutline = { name: Bytes, literals: List<Bytes> }
+pub type LawOutline = { name: Bytes, guarded: Bool, literals: List<Bytes> }
 
 pub type TypeOutline = { name: Bytes, public: Bool, arity: Int, span: Span }
 
@@ -101,6 +97,24 @@ pub type Outline = {
   derived: List<Derivation>,
 }
 
+fn unplaced_item(item: OutlineItem) -> OutlineItem =
+  match item {
+    OutlinedFunction(f) ->
+      OutlinedFunction({
+        ..f,
+        params: f.params.map(|p: SpannedName| { ..p, span: generated_span }),
+        name_span: generated_span,
+        span: generated_span,
+      }),
+    OutlinedTest(_) -> item,
+    OutlinedLaw(_) -> item,
+    OutlinedType(t) -> OutlinedType({ ..t, span: generated_span }),
+    OutlinedEffect(e) -> OutlinedEffect({ ..e, span: generated_span }),
+  }
+
+pub fn unplaced_outline(o: Outline) -> Outline =
+  { ..o, items: o.items.map(unplaced_item), cuts: o.cuts.map(|c: Cut| { ..c, start: 0, end: 0 }) }
+
 pub type ModuleDerivations = { module: Bytes, derivations: List<Derivation> }
 
 derive bin for ModuleDerivations
@@ -119,42 +133,27 @@ derive bin for OutlineItem
 
 derive bin for Outline
 
-fn has_effect(effects: List<EffectInfo>, name: Bytes) -> Bool =
-  effects.fold(false, |accumulator: Bool, effect_info: EffectInfo|
-    accumulator || effect_info.name == name)
-
 fn bare_prelude(qualified_name: QName) -> Option<Bytes> =
   if is_bare(qualified_name) && is_prelude_effect(qualified_name.name.name) {
     Some(qualified_name.name.name)
   } else { None }
 
-fn set_effect(
-  resolved: Resolution,
-  effects: List<EffectInfo>,
-  module: Int,
-  qualified_name: QName,
-) -> Option<Bytes> / {abort.raise} =
+fn set_effect(qualified_name: QName) -> Option<Bytes> / {abort.raise} =
   if is_bare(qualified_name) && qualified_name.name.name == b"scoped" {
     Some(qualified_name.name.name)
   } else {
-    let found = if is_bare(qualified_name) {
-      lookup(resolved.scopes.get(module).bound, EffectSpace, qualified_name.name.name)
-    } else { find(resolved, module, EffectSpace, qualified_name) };
-    match found {
-      Some(b) -> if has_effect(effects, b.qualified) { Some(b.qualified) }
-      else { bare_prelude(qualified_name) },
+    match qualified_name.module {
+      Some(binder) -> match implicit_target(binder.name) {
+        Some(module) -> Some(qualify(module, qualified_name.name.name)),
+        None -> None,
+      },
       None -> bare_prelude(qualified_name),
     }
   }
 
-fn set_effects(
-  resolved: Resolution,
-  effects: List<EffectInfo>,
-  module: Int,
-  written: List<EffectExpression>,
-) -> List<Effect> / {abort.raise} =
+fn set_effects(written: List<EffectExpression>) -> List<Effect> / {abort.raise} =
   written.fold([], |accumulator: List<Effect>, entry: EffectExpression|
-    match set_effect(resolved, effects, module, entry.effect_name) {
+    match set_effect(entry.effect_name) {
       Some(eff) ->
         effects_insert(accumulator, {
           effect: eff,
@@ -208,19 +207,14 @@ pub fn module_of(path: String) -> Result<String, String> / {abort.raise} = {
   }
 }
 
-pub fn effect_sets_of(
-  resolved: Resolution,
-  effects: List<EffectInfo>,
-  module: Int,
-  parsed: ParsedModule,
-) -> List<EffectSetRow> / {abort.raise} =
+pub fn effect_sets_of(parsed: ParsedModule) -> List<EffectSetRow> / {abort.raise} =
   parsed.module.items.fold([], |accumulator: List<EffectSetRow>, item: Item|
     match item {
       EffectSetItem(d) ->
         accumulator.push({
           name: d.name.name,
           includes: d.includes.map(|qualified_name: QName| qualified_name.name.name),
-          listed: set_effects(resolved, effects, module, d.expansion),
+          listed: set_effects(d.expansion),
         }),
       _ -> accumulator,
     })
@@ -278,16 +272,16 @@ pub fn skeleton_of_outlines(outlines: List<Outline>) -> HashLayout =
     { nodes: [], order: [], tests: [], laws: [] },
     |accumulator: HashLayout, o: Outline|
       o.items.fold(accumulator, |a: HashLayout, item: OutlineItem| {
-        let node = |name: Bytes, declaration: Bool|
+        let node = |name: Bytes, kind: HeldKind|
           {
             ..a,
-            nodes: a.nodes.push({ name: qualify(o.name, name), declaration: declaration }),
+            nodes: a.nodes.push({ name: qualify(o.name, name), kind: kind }),
             order: a.order.push(DefinitionEntry(a.nodes.len())),
           };
         match item {
-          OutlinedFunction(f) -> node(f.name, false),
-          OutlinedType(t) -> node(t.name, true),
-          OutlinedEffect(e) -> node(e.name, true),
+          OutlinedFunction(f) -> node(f.name, HeldValue),
+          OutlinedType(t) -> node(t.name, HeldType),
+          OutlinedEffect(e) -> node(e.name, HeldEffect),
           OutlinedTest(t) ->
             {
               ..a,
@@ -314,10 +308,10 @@ derive bin for Cut
 pub type KeyRow = { root: Bytes, key: Bytes }
 
 pub type EmitterRoot = {
-  root: Bytes,
+  key: RootKey,
   arity: Int,
   pure: Bool,
-  at: ModuleSpan,
+  at: Place,
   params: List<Widths>,
   result: Widths,
   witnesses: List<Int>,
@@ -349,32 +343,31 @@ pub type EffectHash = { name: Bytes, hash: Bytes }
 
 pub type KnownDefinitionRow = {
   name: Bytes,
-  hash: Bytes,
-  effect_hashes: List<EffectHash>,
-  effects: Bytes,
-  performed_effects: Bytes,
-  repeated_effects: Bytes,
+  effects: List<Effect>,
+  performed: List<Effect>,
+  repeated: List<Effect>,
   repeats: List<Int>,
   ending: Termination,
   summary: Summary,
   raises: List<Raise>,
-  facts: Bytes,
+  facts: BodyRecord,
   scheme: Scheme,
   value: Option<ConstantData>,
 }
 
 pub type KnownTestRow = {
   key: Bytes,
-  hash: Bytes,
-  effect_hashes: List<EffectHash>,
-  effects: Bytes,
+  effects: List<Effect>,
   owner: Bytes,
-  body_facts: Bytes,
+  body_facts: RecordedFacts,
 }
+
+pub type KnownLawRow = { owner: Bytes, body_facts: RecordedFacts }
 
 pub type Rows = {
   definitions: List<KnownDefinitionRow>,
   tests: List<KnownTestRow>,
+  laws: List<KnownLawRow>,
   types: TypeTable,
 }
 
@@ -391,11 +384,15 @@ pub fn constant_values(rows: Rows) -> Map<Bytes, ConstantData> =
 
 derive bin for KnownTestRow
 
+derive bin for KnownLawRow
+
 derive bin for Rows
 
-pub type ModuleSpan = { module: Int, start: Int, end: Int }
+derive bin for FieldWidths
 
-derive bin for ModuleSpan
+derive bin for Widths
+
+derive bin for EmitterRoot
 
 pub type ModuleRow = {
   name: Bytes,
@@ -407,9 +404,9 @@ pub type ModuleRow = {
   cuts: List<Cut>,
 }
 
-pub type ParamRow = { name: Bytes, at: ModuleSpan }
+pub type ParamRow = { name: Bytes, at: Place }
 
-pub type SpecRow = { kind: Bytes, index: Int, effects: List<Effect>, at: ModuleSpan }
+pub type SpecRow = { kind: SpecKind, index: Int, effects: List<Effect>, at: Place }
 
 pub type DefinitionRow = {
   name: Bytes,
@@ -423,7 +420,7 @@ pub type DefinitionRow = {
   effect_aliases: List<Bytes>,
   params: List<ParamRow>,
   spec: List<SpecRow>,
-  at: ModuleSpan,
+  at: Place,
   literals: List<Bytes>,
 }
 
@@ -433,7 +430,7 @@ pub type TypeRow = {
   simple_name: Bytes,
   public: Bool,
   arity: Int,
-  at: ModuleSpan,
+  at: Place,
 }
 
 pub type TestRow = {
@@ -443,11 +440,11 @@ pub type TestRow = {
   index: Int,
   nondet: Bool,
   effects: List<Effect>,
-  at: ModuleSpan,
-  name_at: ModuleSpan,
+  at: Place,
+  name_at: Place,
 }
 
-pub type BinderRow = { name: Bytes, at: ModuleSpan, ty: Type }
+pub type BinderRow = { name: Bytes, at: Place, ty: Type }
 
 pub type LawRow = {
   key: Bytes,
@@ -457,19 +454,19 @@ pub type LawRow = {
   binders: List<BinderRow>,
   has_guard: Bool,
   effects: List<Effect>,
-  at: ModuleSpan,
+  at: Place,
   literals: List<Bytes>,
 }
 
 pub type OperationRow = {
   name: Bytes,
-  mode: Bytes,
+  mode: Mode,
   resource_param: Bool,
   params: List<Type>,
   retained_parameters: List<Int>,
   return_type: Type,
   scheme: Option<Scheme>,
-  at: ModuleSpan,
+  at: Place,
   carries: List<Widths>,
 }
 
@@ -480,10 +477,69 @@ pub type EffectRow = {
   public: Bool,
   nondet: Bool,
   operations: List<OperationRow>,
-  at: ModuleSpan,
+  at: Place,
   host: Option<Bytes>,
-  waits: List<Bytes>,
 }
+
+pub type DeclaredEffect = {
+  name: Bytes,
+  simple_name: Bytes,
+  nondet: Bool,
+  at: Place,
+  operations: List<DeclaredOperation>,
+  host: Option<Bytes>,
+}
+
+pub type DeclaredOperation = {
+  name: Bytes,
+  mode: Mode,
+  resource_param: Bool,
+  at: Place,
+  secrets: Bool,
+  waits: Bool,
+}
+
+derive bin for DeclaredOperation
+derive bin for DeclaredEffect
+
+pub fn declared_effects(
+  rows: List<EffectRow>,
+  definitions: List<DefinitionInfo>,
+) -> List<DeclaredEffect> =
+  rows.map(|e: EffectRow| {
+    let waiting = waiting_operations(e, definitions);
+    {
+      name: e.name,
+      simple_name: e.simple_name,
+      nondet: e.nondet,
+      at: e.at,
+      operations: e.operations.map(|o: OperationRow|
+        {
+          name: o.name,
+          mode: o.mode,
+          resource_param: o.resource_param,
+          at: o.at,
+          secrets: o.params.any(|t: Type| mentions_secret(t)),
+          waits: waiting.contains(o.name),
+        }),
+      host: e.host,
+    }
+  })
+
+fn waiting_operations(e: EffectRow, definitions: List<DefinitionInfo>) -> List<Bytes> =
+  match e.host {
+    None -> [],
+    Some(handler) ->
+      definitions.fold([], |found: List<Bytes>, d: DefinitionInfo|
+        if d.name != handler { found } else {
+          d.waits.fold(found, |operations: List<Bytes>, w: WaitingClause|
+            if w.effect == e.name { operations.push(w.operation) } else { operations })
+        }),
+  }
+
+pub type ReleaseScheme = { name: Bytes, scheme: Scheme }
+
+derive bin for ReleaseScheme
 
 pub type ConstructorRow = {
   name: Bytes,
@@ -494,20 +550,18 @@ pub type ConstructorRow = {
   arity: Int,
   fields: List<Type>,
   scheme: Scheme,
-  at: ModuleSpan,
+  at: Place,
 }
 
 pub type HashRow = {
   name: Bytes,
   definition: Option<Bytes>,
-  own: Option<Bytes>,
   declaration: Option<Bytes>,
   specs: List<Bytes>,
-  spec_texts: List<Bytes>,
   dependencies: List<Bytes>,
 }
 
-pub type ItemHashRow = { key: Bytes, hash: Bytes, text: Bytes, dependencies: List<Bytes> }
+pub type ItemHashRow = { key: Bytes, hash: Bytes, dependencies: List<Bytes> }
 
 pub type HashTableRow =
   | DefinitionHashRow(HashRow)
@@ -516,7 +570,7 @@ pub type HashTableRow =
 
 pub type OrdinalRow = { module: Bytes, items: List<Bytes> }
 
-pub type BodyRow = { name: Bytes, body: Bytes }
+pub type BodyRow = { name: Bytes, body: FramedBody }
 
 pub type Dump = {
   diagnostics: List<Diagnostic>,
@@ -547,7 +601,6 @@ pub type Dump = {
 pub fn normalized_diagnostic(diagnostic: Diagnostic) -> Diagnostic =
   {
     code: diagnostic.code,
-    notes: diagnostic.notes_text.len(),
     labels: diagnostic.labels,
     text: b"",
     message: diagnostic.message,
@@ -560,7 +613,7 @@ test "`requests_by_item` groups a module's embed requests by function or test na
   let m = parse(
     b"fn a() -> Bytes = embed(\"x\")\nfn b() -> Bytes = embed(\"x\")\nfn c() -> List<Int> = embed_dir(\"d\").map(|f: { name: String, bytes: Bytes }| 1)\ntest \"t\" { assert(embed(\"y\").len() > 0) }\n",
   ).node;
-  assert_eq(requests_in(requests_by_item(m)), embed_requests(m));
+  assert_eq(requests_in(requests_by_item(m)), embed_requests(m, []));
   assert_eq(requests_by_item(m).map(|i: ItemEmbeds| i.name), [
     Some(b"a"),
     Some(b"b"),

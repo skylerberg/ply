@@ -1,42 +1,37 @@
+import std.set (Set)
+import std.fs (fs)
+import compiler.codes (internal_error_code, replay_mismatch_code)
+import compiler.cc
+import compiler.syntax.parsing (Error, Warning)
 import args (matches_filters)
-import std.fs
-import std.fs (fs, mem_empty)
 import std.hash (blake3)
-import compiler.prelude_source
 import machine
-import compiler.front.facts (CheckedProgram)
-import compiler.front.rows (Outline)
-import compiler.unit (shipped)
-import compiler.store.hash.forms (ModuleHashes, ItemKeyed, by_name, reach)
-import compiler.store.hash.encoding (hex)
-import compiler.front.checking.world (QueryEffects)
-import compiler.front.checking.groups (queries)
-import compiler.front.emitter_input (Analysed, checked_program_of)
-import compiler.load (analyse_in_memory, fresh_check_results, forbid_derivers, read_packages)
+import compiler.front.facts (ProgramListing, one_module, decode_tables)
+import compiler.store.hash.forms (ItemKeyed, by_name, reach)
+import compiler.front.checking (in_memory)
 import results
 import store.tables
 import store.fake (run_in_memory)
-import compiler.check.resolve.tables (Diagnostic, Label, Source)
+import compiler.check.resolve.tables (Diagnostic, Label)
 import compiler.check.types
-import diagnostic (RuntimeDiagnostic, diagnostic_of, with_notes)
-import coverage (coverage)
-import program (TimedLoad)
+import diagnostic (RuntimeDiagnostic, SourceText, diagnostic_of, with_notes)
+import coverage (Coverage)
 import std.json (Bool)
 import tester
 import tester (result_cache, ExecutionResult, InterleavingFailure, BindingReport, LastPass, Options,
-               TestRun, TestUnit, Usage, joined_trace, sum_usage, no_usage)
+               TestRun, TestUnit, Usage, StartedTest, TestJournal, KnownFailure, joined_trace,
+               sum_usage, no_usage)
 import std.machine as entering
-import changes (Compared, ChangeDiff, compared, delta_of, change_diffs, texts_of,
-                stored_baseline_texts)
+import changes (Compared, ChangeDiff, compared, delta_of, change_diffs, stored_baseline_texts)
 import changes
-import views
-import testing.conclude (Conclusion, Hashes, StaleIndex, UnobservedSearch, is_written)
+import testing.conclude (Conclusion, StaleIndex, StoreUpdate, UnobservedSearch, is_written)
 import testing.conclude
 import testing.delta (Delta)
 import testing.diagnose (changes_of)
 import testing.select
-import testing.select (StoredResult, Moved, Row, Search, Passing, keyed_per_root, digest_of,
-                       pass_keys_by_test, key_of, pending_roots, seed_keys)
+import testing.select (Pass, Row, Search, keyed_per_root, digest_of, pass_keys_by_test, key_of,
+                       pending_roots, seed_keys)
+import testing.reads (RecordedRead, Checkable, Unchecked, UsedBinding, trace_of)
 import std.bytes
 import sim.plan
 import sim.plan (Seed)
@@ -46,31 +41,33 @@ import std.string
 import std.text (shell_join)
 import signature (effect_texts)
 import std.option
-import compiler.syntax.parsing (no_module)
 import std.term (Style)
 import tests.report (Entry, RunDecision, cached_count, Program, Cost, SearchSummary, Outcome, Site,
                      finished_line, display_name_at, Failed, Fault, RunReport, no_time_spent,
-                     case_of, test_at, canonical)
-
-pub fn test_hash_at(analysis: CheckedProgram, i: Int) -> Option<Bytes> =
-  match test_at(analysis, i) { Some(t) -> analysis.frame.hashes.tests.get(t.key), None -> None }
-
-pub fn hash_at(analysis: CheckedProgram, i: Int) -> Option<String> / {abort.raise} =
-  match test_hash_at(analysis, i) { Some(h) -> Some(h.hex_of()), None -> None }
+                     case_of, canonical, SourceSpan, source_place)
+import tests.listing (hash_at, identified_program, listing_of_program, sources_named, test_at)
+import tests.listing (TestListing, SelectedTest, run_hash)
 
 pub fn uses_simulation(effects: List<types::Effect>) -> Bool =
   effects.fold(false, |found: Bool, a: types::Effect| found || a.effect == b"sim")
 
 pub fn entry_of(index: Int, key: Bytes) -> Entry =
-  { test: index, key: key, case: None, unlisted: None }
+  { test: index, key: key, case: None, known_failure: None }
 
 pub type Reporting = { style: Style, width: Int, to_stderr: Bool }
+
+pub type Journaling = {
+  journal: TestJournal,
+  started: (Int) -> StartedTest / {abort.raise},
+  stored: (JobResult) -> StoreUpdate / {abort.raise},
+}
 
 type SearchOptions = {
   plan: plan::Plan,
   measuring: Bool,
   lanes: Option<Int>,
-  reporting: Option<Reporting>,
+  reporting: Reporting,
+  journaling: Journaling,
 }
 
 type Job = { unit: TestUnit, test: Int, name: String, entry: Entry, search: Option<plan::Plan> }
@@ -115,55 +112,128 @@ pub fn job_of(
       },
   }
 
+pub fn journaling_of(
+  analysis: TestListing,
+  concluding: List<conclude::Test>,
+  era: Bytes,
+  chosen: conclude::RunSelection,
+  journal: TestJournal,
+) -> Journaling = {
+  let declared = concluding.fold(
+    Map::new(),
+    |found: Map<Int, conclude::Test>, t: conclude::Test| found.insert(t.index, t),
+  );
+  {
+    journal: journal,
+    started: |i: Int| {
+      let t = analysis.tests.get(i);
+      { key: t.info.key, hash: run_hash(t) }
+    },
+    stored: |done: JobResult|
+      match declared.get(done.test) {
+        Some(t) -> conclude::stored_by(conclusion_of(done), t, era, chosen),
+        None -> conclude::nothing_stored,
+      },
+  }
+}
+
+pub fn crashes_of(analysis: TestListing, interrupted: List<StartedTest>) -> Map<Int, KnownFailure> =
+  if interrupted.len() == 0 { Map::new() } else {
+    range(0, analysis.tests.len()).fold(Map::new(), |found: Map<Int, KnownFailure>, i: Int|
+      match test_at(analysis, i) {
+        None -> found,
+        Some(listed) -> {
+          let t = listed.info;
+          let hash = run_hash(listed);
+          if interrupted.any(|s: StartedTest| s.key == t.key && s.hash == hash) {
+            found.insert(
+              i,
+              tester::crashed(
+                t,
+                interrupted.filter(|s: StartedTest| s.key != t.key).map(|s: StartedTest| s.key),
+              ),
+            )
+          } else { found }
+        },
+      })
+  }
+
+pub fn with_crash(j: Job, crashes: Map<Int, KnownFailure>) -> Job =
+  match crashes.get(j.test) {
+    Some(f) -> { ..j, entry: { ..j.entry, known_failure: Some(f) } },
+    None -> j,
+  }
+
+effect journal {
+  read started(at: TestJournal, running: StartedTest) -> Unit
+  read finished(at: TestJournal, key: Bytes, update: StoreUpdate) -> Unit
+}
+
 pub fn run_class(
   jobs: List<Job>,
   search_options: SearchOptions,
-) -> List<JobResult> / {entering::machine.enter, entering::machine.report, abort.raise} = {
+) -> List<JobResult> / {entering::machine.enter, entering::machine.report, fs.write[cwd], fs.write[abs], abort.raise} = {
   let lanes = machine::split_into_lanes(jobs, search_options.lanes);
-  machine::merge_lanes(
-    run_lanes(lanes, search_options.measuring, search_options.reporting, 0, lanes.len(), 64),
-  )
+  handle {
+    machine::merge_lanes(run_lanes(lanes, search_options, 0, lanes.len(), 64))
+  } with {
+    journal.started(at, running) -> results::journal_started(at, running),
+    journal.finished(at, key, update) -> results::journal_finished(at, key, update),
+  }
+}
+
+fn journaled_run(
+  j: Job,
+  measuring: Bool,
+  journaling: Journaling,
+) -> JobResult / {entering::machine.enter, journal.started, journal.finished, abort.raise} = {
+  let started = (journaling.started)(j.test);
+  journal.started(journaling.journal, started);
+  let done = run_job(j, measuring);
+  journal.finished(journaling.journal, started.key, (journaling.stored)(done));
+  done
 }
 
 fn reported(
   done: JobResult,
   j: Job,
-  reporting: Option<Reporting>,
+  reporting: Reporting,
 ) -> JobResult / {entering::machine.report} = {
-  match reporting {
-    Some(r) ->
-      entering::machine.report(
-        finished_line(r.style, j.name, done.status, done.usage.duration_us, r.width),
-        r.to_stderr,
-      ),
-    None -> (),
-  };
+  entering::machine.report(
+    finished_line(reporting.style, j.name, done.status, done.usage.duration_us, reporting.width),
+    reporting.to_stderr,
+  );
   done
 }
 
 fn run_lanes(
   lanes: List<List<Job>>,
-  measuring: Bool,
-  reporting: Option<Reporting>,
+  options: SearchOptions,
   lo: Int,
   hi: Int,
   depth_left: Int,
-) -> List<List<JobResult>> / {entering::machine.enter, entering::machine.report, abort.raise} =
+) -> List<List<JobResult>> / {entering::machine.enter, entering::machine.report, journal.started, journal.finished, abort.raise} =
   if hi - lo <= 0 { [] } else if hi - lo == 1 || depth_left <= 0 {
     range(lo, hi).fold([], |lanes_done: List<List<JobResult>>, i: Int|
       match lanes.at(i) {
         Some(lane) ->
           lanes_done.push(
             lane.fold([], |out: List<JobResult>, j: Job|
-              out.push(reported(run_job(j, measuring), j, reporting))),
+              out.push(
+                reported(
+                  journaled_run(j, options.measuring, options.journaling),
+                  j,
+                  options.reporting,
+                ),
+              )),
           ),
         None -> lanes_done,
       })
   } else {
     let mid = lo + (hi - lo) / 2;
     let halves = parallel {
-      run_lanes(lanes, measuring, reporting, lo, mid, depth_left - 1),
-      run_lanes(lanes, measuring, reporting, mid, hi, depth_left - 1),
+      run_lanes(lanes, options, lo, mid, depth_left - 1),
+      run_lanes(lanes, options, mid, hi, depth_left - 1),
     };
     halves._0.concat(halves._1)
   }
@@ -171,7 +241,7 @@ fn run_lanes(
 type SearchTotals = { usage: Usage, trace: Option<Bytes>, unobserved: Bool }
 
 pub fn run_job(j: Job, measuring: Bool) -> JobResult / {entering::machine.enter, abort.raise} =
-  match j.entry.unlisted {
+  match j.entry.known_failure {
     Some(reason) ->
       {
         test: j.test,
@@ -244,14 +314,8 @@ fn reproduce(seed: Seed) -> String / {abort.raise} =
   "reproduce with `--sim once --seed " ++ plan::seed_text(seed)
     ++ "`, and report it with the test's source"
 
-fn spanned(span: { module: Int, start: Int, end: Int }, text: String) -> Label =
-  {
-    module: span.module,
-    start: span.start,
-    end: span.end,
-    primary: true,
-    text: Bytes::of_string(text),
-  }
+fn spanned(span: Option<SourceSpan>, text: String) -> Label =
+  { place: source_place(span), primary: true, text: Bytes::of_string(text) }
 
 fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abort.raise} =
   match search::run_failure(fl) {
@@ -260,8 +324,8 @@ fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abor
       let d = match fl.cause {
         Diverged(x) ->
           diagnostic_of(
-            "error",
-            "E0415",
+            Error,
+            replay_mismatch_code,
             "replaying seed " ++ plan::seed_text(x.seed)
               ++ " did not reproduce the recorded schedule",
             [spanned(x.span, "this scheduling point")],
@@ -273,16 +337,16 @@ fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abor
           ),
         InvalidRecording(x) ->
           diagnostic_of(
-            "error",
-            "E0505",
+            Error,
+            internal_error_code,
             "the scheduler recorded a step that is not a valid scheduling decision",
             [spanned(x.span, "this step")],
             [x.what, reproduce(x.seed)],
           ),
         _ ->
           diagnostic_of(
-            "error",
-            "E0505",
+            Error,
+            internal_error_code,
             "a simulated search stopped at a failure, but the outcome contains no failure",
             [],
             [],
@@ -292,27 +356,51 @@ fn search_failure(fl: Failure<InterleavingFailure>) -> RuntimeDiagnostic / {abor
     },
   }
 
-pub fn hashes_of(analysis: CheckedProgram, era: Bytes) -> Hashes =
+pub type Reachable = { functions: List<Bytes>, declarations: List<Bytes> }
+
+pub type Hashes = {
+  definitions: Map<Bytes, Bytes>,
+  declarations: Map<Bytes, Bytes>,
+  closure: (List<Bytes>) -> Reachable / {abort.raise},
+}
+
+pub fn hashes_of(analysis: ProgramListing) -> Hashes =
   {
-    definitions: by_name(analysis.frame.hashes.definitions),
-    declarations: by_name(analysis.frame.hashes.declarations),
-    era: era,
+    definitions: by_name(analysis.hashes.definitions),
+    declarations: by_name(analysis.hashes.declarations),
     closure: |keys: List<Bytes>| {
-      let reachable = reach(analysis.frame.hashes, keys.map(|k: Bytes| ItemKeyed(k)));
-      { functions: reachable.functions.keys(), declarations: reachable.declarations.keys() }
+      let reachable = reach(analysis.hashes, keys.map(|k: Bytes| ItemKeyed(k)));
+      { functions: reachable.functions.elements(), declarations: reachable.declarations.elements() }
     },
   }
 
-pub fn conclude_tests(analysis: CheckedProgram, program: Program) -> List<conclude::Test> =
-  range(0, analysis.checked.tests.len()).fold([], |accumulator: List<conclude::Test>, i: Int|
+pub fn no_hashes() -> Hashes =
+  {
+    definitions: Map::new(),
+    declarations: Map::new(),
+    closure: |keys: List<Bytes>| { functions: [], declarations: [] },
+  }
+
+pub fn changes_of_test(h: Hashes, seen: Set<Bytes>, key: Bytes) -> List<Bytes> / {abort.raise} =
+  (h.closure)([key]).functions.filter(|name: Bytes|
+    !name.starts_with(b"std.prelude.")
+      && (match h.definitions.get(name) {
+        Some(hash) -> !seen.contains(hash),
+        None -> false,
+      })).sort(
+  )
+
+pub fn conclude_tests(analysis: TestListing, program: Program) -> List<conclude::Test> =
+  range(0, analysis.tests.len()).fold([], |accumulator: List<conclude::Test>, i: Int|
     match test_at(analysis, i) {
-      Some(t) -> {
+      Some(listed) -> {
+        let t = listed.info;
         let entry = match case_of(program, i) { Some(c) -> Some(c.entry), None -> None };
         accumulator.push({
           index: i,
           key: t.key,
           seeded: uses_simulation(t.effects),
-          hash: test_hash_at(analysis, i),
+          hash: run_hash(listed),
           start: match entry { Some(e) -> e.key, None -> t.key },
           case: match entry { Some(e) -> e.case != None, None -> false },
         })
@@ -320,15 +408,17 @@ pub fn conclude_tests(analysis: CheckedProgram, program: Program) -> List<conclu
       None -> accumulator,
     })
 
-pub fn seen_of(h: Hashes) -> Map<Bytes, Bool> / {result_cache.known} = {
-  let hashes = h.definitions.values();
-  let results = result_cache.known(hashes);
-  range(0, hashes.len()).fold(Map::new(), |accumulator: Map<Bytes, Bool>, i: Int|
-    match ((hashes.at(i), results.at(i))) {
-      (Some(hash), Some(known)) -> accumulator.insert(hash, known),
-      _ -> accumulator,
-    })
-}
+pub fn seen_of(h: Hashes, failed: List<Bytes>) -> Set<Bytes> / {result_cache.known, abort.raise} =
+  if failed.len() == 0 { Set::empty() } else {
+    let hashes = (h.closure)(failed).functions.fold([], |found: List<Bytes>, name: Bytes|
+      match h.definitions.get(name) { Some(hash) -> found.push(hash), None -> found });
+    let results = result_cache.known(hashes);
+    range(0, hashes.len()).fold(Set::empty(), |accumulator: Set<Bytes>, i: Int|
+      match ((hashes.at(i), results.at(i))) {
+        (Some(hash), Some(known)) -> if known { accumulator.insert(hash) } else { accumulator },
+        _ -> accumulator,
+      })
+  }
 
 pub fn conclusion_of(done: JobResult) -> conclude::TestResult<RuntimeDiagnostic> =
   {
@@ -390,18 +480,13 @@ fn exploration_of(done: Map<Int, JobResult>, index: Int) -> Option<Exploration> 
   }
 
 fn site_of(x: search::RaceSite) -> Site =
-  {
-    task: "@" ++ x.task.to_string(),
-    definition: x.definition,
-    access: x.access,
-    at: if x.span.module == no_module { None } else { Some(x.span) },
-  }
+  { task: "@" ++ x.task.to_string(), definition: x.definition, access: x.access, at: x.span }
 
-pub fn job_outcome(analysis: CheckedProgram, done: JobResult) -> Outcome / {abort.raise} =
+pub fn job_outcome(analysis: TestListing, done: JobResult) -> Outcome / {abort.raise} =
   {
     index: done.test,
     name: match test_at(analysis, done.test) {
-      Some(t) -> String::of_bytes_lossy(t.name),
+      Some(t) -> String::of_bytes_lossy(t.info.name),
       None -> "",
     },
     hash: hash_at(analysis, done.test),
@@ -414,7 +499,7 @@ pub fn job_outcome(analysis: CheckedProgram, done: JobResult) -> Outcome / {abor
   }
 
 fn outcome_of(
-  analysis: CheckedProgram,
+  analysis: TestListing,
   done: Map<Int, JobResult>,
   outcome: conclude::Outcome<RuntimeDiagnostic>,
 ) -> Outcome / {abort.raise} = {
@@ -422,7 +507,7 @@ fn outcome_of(
   {
     index: outcome.index,
     name: match test_at(analysis, outcome.index) {
-      Some(t) -> String::of_bytes_lossy(t.name),
+      Some(t) -> String::of_bytes_lossy(t.info.name),
       None -> "",
     },
     hash: hash_at(analysis, outcome.index),
@@ -439,12 +524,12 @@ fn outcome_of(
 }
 
 fn failed_of(
-  analysis: CheckedProgram,
+  analysis: TestListing,
   h: Hashes,
   done: Map<Int, JobResult>,
   failed: conclude::TestFailure<RuntimeDiagnostic>,
 ) -> Failed / {abort.raise} = {
-  let t = test_at(analysis, failed.index);
+  let t = test_at(analysis, failed.index).map(|x: SelectedTest| x.info);
   let e = exploration_of(done, failed.index);
   let key = String::of_bytes_lossy(failed.key);
   {
@@ -486,7 +571,7 @@ fn failed_of(
 }
 
 fn escapes_of(
-  analysis: CheckedProgram,
+  analysis: TestListing,
   c: Conclusion<RuntimeDiagnostic>,
   done: Map<Int, JobResult>,
 ) -> List<Diagnostic> = {
@@ -495,7 +580,10 @@ fn escapes_of(
       Some(d) ->
         d.usage.used_host
           && (match d.trace {
-            Some(trace) -> !String::contains("\n" ++ String::of_bytes_lossy(trace), "\nbinding\t"),
+            Some(trace) -> match trace_of(trace) {
+              Checkable(reads) -> !reads.any(|r: RecordedRead| r.read == UsedBinding),
+              Unchecked(_) -> false,
+            },
             None -> false,
           }),
       None -> false,
@@ -507,11 +595,11 @@ fn escapes_of(
       if !wrote || !unbound(outcome.index) { accumulator } else {
         accumulator.push(
           diagnostic_of(
-            "error",
-            "E0505",
+            Error,
+            internal_error_code,
             "`"
               ++ (match test_at(analysis, outcome.index) {
-                Some(t) -> String::of_bytes_lossy(t.name),
+                Some(t) -> String::of_bytes_lossy(t.info.name),
                 None -> "",
               })
               ++ "` performed real system operations, but its passing result was cached without the list of operations the run used",
@@ -532,8 +620,8 @@ fn notice_of(n: conclude::Notice) -> Diagnostic =
   match n {
     StaleIndex(x) ->
       diagnostic_of(
-        "warning",
-        "E0505",
+        Warning,
+        internal_error_code,
         "a saved simulation result refers to test number " ++ x.index.to_string()
           ++ ", but the module defines only "
           ++ x.declared.to_string(),
@@ -542,8 +630,8 @@ fn notice_of(n: conclude::Notice) -> Diagnostic =
       ),
     UnobservedSearch(key) ->
       diagnostic_of(
-        "warning",
-        "E0505",
+        Warning,
+        internal_error_code,
         "`" ++ String::of_bytes_lossy(key)
           ++ "` uses a simulation seed, but the run did not report which schedules it tried",
         [],
@@ -557,8 +645,9 @@ fn notice_of(n: conclude::Notice) -> Diagnostic =
 pub fn run_report_of(
   options: Options,
   program: Program,
-  analysis: CheckedProgram,
+  analysis: TestListing,
   h: Hashes,
+  covered: Option<Coverage>,
   decided: RunDecision,
   hosted: BindingReport,
   c: Conclusion<RuntimeDiagnostic>,
@@ -588,7 +677,6 @@ pub fn run_report_of(
       name: b.name,
       fragment: b.fragment,
       entered: done.fold(0, |n: Int, i: Int, d: JobResult| n + d.usage.entries),
-      units: b.units,
       load_nanos: b.load_nanos,
     }),
     results: c.outcomes.map(|outcome: conclude::Outcome<RuntimeDiagnostic>|
@@ -605,148 +693,124 @@ pub fn run_report_of(
     simulation: c.simulation,
     unbound_pass_diagnostics: escapes_of(analysis, c, done),
     warnings: teardown.concat(c.notices.map(notice_of)).concat(extra_warnings),
-    coverage: if options.coverage { Some(coverage(analysis)) } else { None },
+    coverage: covered,
     spent: no_time_spent,
   }
 }
 
-type Selection = { cases: List<select::Case>, returning: List<List<Bytes>> }
+type ModuleRollup = { key: Bytes, at: List<Int> }
 
-pub fn cases_of(
+fn module_rollups(
+  rows: List<Row>,
+  keys: List<Bytes>,
+  search: Search,
+) -> List<ModuleRollup> / {abort.raise} =
+  List::group_by(
+    range(0, rows.len()).filter(|i: Int|
+      !rows.get(i).nondet && !keyed_per_root(rows.get(i), search)),
+    |i: Int| rows.get(i).module,
+  ).values(
+  ).map(|at: List<Int>|
+    {
+      key: blake3(Bytes::concat_all(at.map(|i: Int| keys.get(i)).push(b"a module's tests"))),
+      at: at,
+    })
+
+pub type DecidedCases = { cases: List<select::Case>, rolled: List<Pass> }
+
+test "a module's rollup covers its plain tests, leaves out `test/nondet`, and moves with any identity" {
+  let row = |name: String, module: String, always: Bool|
+    {
+      index: 0,
+      label: name,
+      name: name,
+      module: module,
+      hash: b"h",
+      seeded: false,
+      nondet: always,
+    };
+  let rows = [row("a", "m", false), row("b", "m", false), row("c", "n", true)];
+  let search = { mode: "", roots: [], budget: 0, steps: 0, path: [], profile: cc::development() };
+  let rollups_of = |keys: List<Bytes>| module_rollups(rows, keys, search);
+  let keys = [b"one", b"two", b"three"];
+  assert_eq(rollups_of(keys).map(|m: ModuleRollup| m.at), [[0, 1]]);
+  assert(
+    rollups_of(keys).map(|m: ModuleRollup| m.key)
+      != rollups_of([b"one", b"moved", b"three"]).map(|m: ModuleRollup| m.key),
+  )
+}
+
+pub fn cases_of<| e>(
   rows: List<Row>,
   search: Search,
-  bypassed: Bool,
-  options: Options,
-  supplied: machine::RunConfiguration,
-  loaded: Map<Bytes, Bytes>,
-) -> Selection / {result_cache.passes, entering::machine.changed_read, fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let ask = |keys: List<Bytes>|
-    if bypassed { keys.map(|k: Bytes| None) } else { result_cache.passes(keys) };
-  let digest = digest_of(search);
-  let keys = rows.map(|r: Row| key_of(r, digest));
-  let recorded = ask(
-    keys.fold([], |accumulator: List<Bytes>, k: Option<Bytes>|
-      match k { Some(key) -> accumulator.push(key), None -> accumulator }),
-  );
+  passes_holding: (Map<Bytes, List<RecordedRead>>) -> Map<Bytes, List<RecordedRead>> / {abort.raise | e},
+) -> DecidedCases / {result_cache.passes, abort.raise | e} = {
+  let keys = rows.map(|r: Row| key_of(r, search));
+  let rollups = module_rollups(rows, keys, search);
+  let rollup_passes = passes_holding(result_cache.passes(rollups.map(|m: ModuleRollup| m.key)));
+  let whole = rollups.fold(Set::empty(), |found: Set<Int>, m: ModuleRollup|
+    if !rollup_passes.contains(m.key) { found }
+    else { m.at.fold(found, |in_whole: Set<Int>, i: Int| in_whole.insert(i)) });
+  let tests = range(0, rows.len());
   let rooted = rows.map(|r: Row|
-    match r.hash {
-      Some(h) -> if keyed_per_root(r, search) { Some(seed_keys(h, search.roots, [])) }
-      else { None },
-      None -> None,
-    });
-  let seeded = rooted.map(|ks: Option<List<Bytes>>|
-    match ks { Some(xs) -> Some(ask(xs)), None -> None });
-  let now = views::shipped_state_of(
-    views::views_in(
-      traces_of(
-        seeded.fold(recorded, |accumulator: List<Option<Bytes>>, o: Option<List<Option<Bytes>>>|
-          match o { Some(xs) -> accumulator.concat(xs), None -> accumulator }),
+    if keyed_per_root(r, search) { Some(seed_keys(r.hash, search.roots, [], search.profile)) }
+    else { None });
+  let stored = passes_holding(
+    result_cache.passes(
+      tests.filter(|i: Int| !whole.contains(i)).map(|i: Int| keys.get(i)).concat(
+        rooted.fold([], |found: List<Bytes>, ks: Option<List<Bytes>>|
+          match ks { Some(xs) -> found.concat(xs), None -> found }),
       ),
     ),
-    |m: Bytes| views::read_shipped_text(loaded, m),
   );
-  let results = recorded.map(|trace: Option<Bytes>| pass_status(now, trace, options, supplied));
-  let stored_results = keys.fold(
-    { at: 0, out: [] },
-    |st: { at: Int, out: List<Option<StoredResult>> }, k: Option<Bytes>|
-      match k {
-        None -> { ..st, out: st.out.push(None) },
-        Some(_) -> { at: st.at + 1, out: st.out.push(results.at_or(st.at, None)) },
-      },
-  ).out;
-  let pending_seed_roots = seeded.map(|o: Option<List<Option<Bytes>>>|
-    match o {
-      Some(xs) ->
-        Some(
-          pending_roots(
-            search.roots,
-            xs.map(|trace: Option<Bytes>| pass_status(now, trace, options, supplied)),
-          ),
-        ),
-      None -> None,
-    });
+  let stored_at = |i: Int| if whole.contains(i) { Some([]) } else { stored.get(keys.get(i)) };
   {
-    cases: range(0, rows.len()).map(|i: Int|
-      select::case_of(
-        rows.at_or(i, no_row),
-        keys.at_or(i, None),
-        stored_results.at_or(i, None),
-        pending_seed_roots.at_or(i, None),
-      )),
-    returning: range(0, rows.len()).map(|i: Int|
-      match ((keys.at_or(i, None), stored_results.at_or(i, None))) {
-        (Some(key), Some(Passing)) -> [key],
-        (Some(_), None) -> match ((rooted.at_or(i, None), pending_seed_roots.at_or(i, None))) {
-          (Some(ks), Some([])) -> ks,
-          _ -> [],
-        },
-        _ -> [],
-      }),
+    cases: tests.map(|i: Int|
+      select::case_of(rows.get(i), keys.get(i), stored_at(i) != None, match rooted.get(i) {
+        Some(xs) -> Some(pending_roots(search.roots, xs.map(|k: Bytes| stored.contains(k)))),
+        None -> None,
+      })),
+    rolled: rollups.filter(|m: ModuleRollup|
+      m.at.any(|i: Int| !whole.contains(i)) && m.at.all(|i: Int| stored_at(i) == Some([]))).map(
+      |m: ModuleRollup| { key: m.key, reads: [] },
+    ),
   }
 }
 
-pub fn traces_of(passes: List<Option<Bytes>>) -> List<Bytes> =
-  passes.fold([], |accumulator: List<Bytes>, h: Option<Bytes>|
-    match h { Some(trace) -> accumulator.push(trace), None -> accumulator })
-
-pub fn pass_status(
-  now: views::ShippedState,
-  stored_trace: Option<Bytes>,
-  options: Options,
-  supplied: machine::RunConfiguration,
-) -> Option<StoredResult> / {entering::machine.changed_read} =
-  match stored_trace {
-    None -> None,
-    Some(trace) -> if trace == b"" { Some(Passing) } else {
-      let split = views::split(trace);
-      match tester::stale_read(options, supplied, split.rest) {
-        Some(what) -> Some(Moved(what)),
-        None -> match views::stale_view(now, split.shipped_views) {
-          None -> Some(Passing),
-          Some(what) -> Some(Moved(what)),
-        },
-      }
-    },
-  }
-
-const no_row: Row =
-  { index: 0, label: "", name: "", module: "", hash: None, seeded: false, nondet: false }
-
 pub fn diagnosed_all(
-  bypassed: Bool,
-  timed: TimedLoad,
-  analysis: CheckedProgram,
+  view: Option<{ whole: ProgramListing, places: List<SourceText> }>,
   c: Conclusion<RuntimeDiagnostic>,
   failures: List<Failed>,
 ) -> { faults: List<Fault>, diffs: List<ChangeDiff> } / {result_cache.baselines, result_cache.texts, abort.raise} = {
-  let records = if bypassed || failures.len() == 0 { failures.map(|f: Failed| None) } else {
+  let records = if failures.len() == 0 { failures.map(|f: Failed| None) } else {
     result_cache.baselines(c.failures.map(|f: conclude::TestFailure<RuntimeDiagnostic>| f.key))
   };
-  if records.all(|r: Option<LastPass>| r == None) {
-    { faults: failures.map(|f: Failed| fault_of(f, None)), diffs: [] }
-  } else {
-    let tree = changes::program_of(timed.program, analysis);
-    let sides = range(0, failures.len()).map(|i: Int|
-      match ((failures.at(i), records.at(i))) {
-        (Some(f), Some(Some(record))) -> Some(compared(tree, f.key, f.test_hash, record)),
-        _ -> None,
-      });
-    let then = stored_baseline_texts(
-      sides.fold([], |accumulator: List<Compared>, x: Option<Compared>|
-        match x { Some(c) -> accumulator.push(c), None -> accumulator }),
-    );
-    let deltas = sides.map(|x: Option<Compared>|
-      match x { Some(c) -> Some(delta_of(tree, c, then)), None -> None });
-    {
-      faults: range(0, failures.len()).flat_map(|i: Int|
-        match failures.at(i) { Some(f) -> [fault_of(f, deltas.at_or(i, None))], None -> [] }),
-      diffs: change_diffs(
-        tree,
-        deltas.fold([], |accumulator: List<Delta>, d: Option<Delta>|
-          match d { Some(x) -> accumulator.push(x), None -> accumulator }),
-        then,
-      ),
-    }
+  match if records.all(|r: Option<LastPass>| r == None) { None } else { view } {
+    None -> { faults: failures.map(|f: Failed| fault_of(f, None)), diffs: [] },
+    Some(v) -> {
+      let tree = changes::program_of(v.places, v.whole);
+      let sides = range(0, failures.len()).map(|i: Int|
+        match ((failures.at(i), records.at(i))) {
+          (Some(f), Some(Some(record))) -> Some(compared(tree, f.key, f.test_hash, record)),
+          _ -> None,
+        });
+      let then = stored_baseline_texts(
+        sides.fold([], |accumulator: List<Compared>, x: Option<Compared>|
+          match x { Some(c) -> accumulator.push(c), None -> accumulator }),
+      );
+      let deltas = sides.map(|x: Option<Compared>|
+        match x { Some(c) -> Some(delta_of(tree, c, then)), None -> None });
+      {
+        faults: range(0, failures.len()).flat_map(|i: Int|
+          match failures.at(i) { Some(f) -> [fault_of(f, deltas.at_or(i, None))], None -> [] }),
+        diffs: change_diffs(
+          tree,
+          deltas.fold([], |accumulator: List<Delta>, d: Option<Delta>|
+            match d { Some(x) -> accumulator.push(x), None -> accumulator }),
+          then,
+        ),
+      }
+    },
   }
 }
 
@@ -770,24 +834,6 @@ pub fn fault_of(failed: Failed, delta: Option<Delta>) -> Fault =
 
 pub fn replay_of(seed: String, name: String) -> Option<String> =
   shell_join(["ply", "test", "--seed", seed, "--filter", name])
-
-pub fn store_history(
-  analysis: CheckedProgram,
-  sources: List<Source>,
-  modules: List<ModuleHashes>,
-  filing: conclude::Filing,
-) -> Unit / {result_cache.unstored, result_cache.history, abort.raise} =
-  if filing.records.len() == 0 { () } else {
-    let unrecorded = result_cache.unstored(
-      filing.reachable.functions.concat(filing.reachable.declarations).concat(
-        filing.records.map(|e: { key: Bytes, record: conclude::PassRecord }| e.record.test),
-      ),
-    );
-    result_cache.history(
-      if unrecorded.len() == 0 { [] } else { texts_of(analysis, sources, unrecorded) },
-      modules,
-    )
-  }
 
 test "a replay is one command whatever the test is called" {
   assert_eq(
@@ -834,114 +880,14 @@ test "a search stopped early shows its count as `>= N`, and the reduction ratio 
   )
 }
 
-fn loaded_from(
-  files: List<{ path: String, body: Bytes }>,
-) -> { modules: List<ModuleHashes>, whole: CheckedProgram, sources: List<Source> } / {abort.raise} = {
-  let tree = fs::mem_of(files);
-  let listed = Bytes::concat_all(
-    queries().map(
-      |q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
-        Bytes::concat_all([q.definition, b" ", hex(blake3(q.definition)), b"\n"]),
+test "the outcome of a failed test includes the diagnostic it failed with" {
+  let view = listing_of_program(
+    identified_program(
+      in_memory([{ name: b"m", source_text: b"test \"red\" { assert_eq(1, 2) }\n" }]),
     ),
   );
-  handle {
-    match read_packages[t]("p") {
-      Err(_) -> panic("the program is read"),
-      Ok(p) -> match analyse_in_memory(p.main_package.files, Map::new()).out {
-        Analysed(w) -> {
-          let whole = checked_program_of(w);
-          let texts = files.fold(
-            Map::new(),
-            |m: Map<Bytes, Bytes>, f: { path: String, body: Bytes }|
-              m.insert(Bytes::of_string(f.path.slice(2, f.path.len() - 4)), f.body),
-          );
-          {
-            modules: forbid_derivers(|| fresh_check_results[t](p)).modules,
-            whole: whole,
-            sources: whole.frame.outlines.map(|o: Outline|
-              { name: o.name, source_text: texts.get(o.name).unwrap_or(b"") }),
-          }
-        },
-        _ -> panic("the program checks"),
-      },
-    }
-  } with {
-    fs.list_dir[t](path) -> fs::mem_list(tree, path),
-    fs.kind[t](path) -> fs::mem_kind(tree, path),
-    fs.read_file[t](path) -> fs::mem_read(tree, path),
-    shipped.names() -> ["std.prelude"],
-    shipped.module(name) -> if name == "std.prelude" { Some(prelude_source::text) } else { None },
-    shipped.report_view_used(view, pulled) -> (),
-    shipped.read_pack(path, offset, len) -> None,
-    shipped.definitions() -> listed,
-    shipped.stamps() -> "",
-    shipped.runtime() -> panic("the program names no library deriver"),
-  }
-}
-
-fn store_passing(
-  program: { modules: List<ModuleHashes>, whole: CheckedProgram, sources: List<Source> },
-) -> Unit / {fs.read[mem], fs.write[mem], abort.raise} = {
-  let view = program.whole;
-  let tests = range(0, view.checked.tests.len()).fold(
-    [],
-    |accumulator: List<conclude::Test>, i: Int|
-      match test_at(view, i) {
-        Some(t) ->
-          accumulator.push({
-            index: i,
-            key: t.key,
-            seeded: false,
-            hash: test_hash_at(view, i),
-            start: t.key,
-            case: false,
-          }),
-        None -> accumulator,
-      },
-  );
-  let ran: List<conclude::TestResult<RuntimeDiagnostic>> = tests.map(|t: conclude::Test|
-    {
-      index: t.index,
-      status: "passed",
-      failure: None,
-      host: false,
-      trace: Some(b""),
-      searched: None,
-      seeds: 0,
-    });
-  let c = conclude::conclude_run(
-    tests,
-    hashes_of(view, results::snapshot_digest_of(program.modules)),
-    {
-      groups: [tests.map(|t: conclude::Test| t.index)],
-      recorded: tests.fold(Map::new(), |accumulator: Map<Int, List<Bytes>>, t: conclude::Test|
-        match t.hash { Some(h) -> accumulator.insert(t.index, [h]), None -> accumulator }),
-      codes: Map::new(),
-      reasons: Map::new(),
-      out_of_scope: [],
-    },
-    Map::new(),
-    ran,
-  );
-  handle {
-    store_history(view, program.sources, program.modules, c.store_update)
-  } with {
-    var store = tables::open_cache[mem]("cache", { runtime_digest: "runtime", code: "code" }),
-    result_cache.unstored(hashes) -> results::unstored_in(store, hashes),
-    result_cache.history(texts, modules) -> {
-      store = results::store_pass(store, texts, modules);
-    },
-    return u -> {
-      let _flushed = tables::flush_cache[mem](results::put_filing[mem, mem](store, c.store_update));
-      u
-    },
-  }
-}
-
-test "the outcome of a failed test includes the diagnostic it failed with" {
-  let view = loaded_from([{ path: "p/m.ply", body: b"test \"red\" { assert_eq(1, 2) }\n" }]).whole;
   let raised = {
-    diagnostic: diagnostic_of("error", "E0501", "assertion failed", [], []),
+    diagnostic: diagnostic_of(Error, b"E0501", "assertion failed", [], []),
     values: [],
   };
   let failed = {
@@ -953,35 +899,4 @@ test "the outcome of a failed test includes the diagnostic it failed with" {
     searched: None,
   };
   assert_eq(job_outcome(view, failed).diagnostic, Some(raised))
-}
-
-test "after one definition is edited, storing the run adds one module entry and only the changed source texts to the cache" {
-  let program = |body: Bytes|
-    loaded_from([
-      { path: "p/low.ply", body: b"pub fn twice(n: Int) -> Int = n * 2\n" },
-      {
-        path: "p/app.ply",
-        body: Bytes::concat_all([
-          b"import low\nfn base(n: Int) -> Int = ",
-          body,
-          b"\nfn top(n: Int) -> Int = base(n) + low::twice(n)\ntest \"tops\" { assert(top(1) > 0) }\n",
-        ]),
-      },
-    ]);
-  let before = program(b"n + 1");
-  let after = program(b"n + 2");
-  let counted = run_in_memory(mem_empty(), || {
-    let table_counts = ||
-      tables::counts(tables::open_cache[mem]("cache", { runtime_digest: "runtime", code: "code" }));
-    store_passing(before);
-    let first = table_counts();
-    store_passing(after);
-    { first: first, second: table_counts() }
-  }).value;
-  assert_eq(counted.first.modules, before.modules.len());
-  assert_eq(counted.first.snapshots, 1);
-  assert(counted.first.texts > 0);
-  assert_eq(counted.second.modules - counted.first.modules, 1);
-  assert_eq(counted.second.snapshots - counted.first.snapshots, 1);
-  assert_eq(counted.second.texts - counted.first.texts, 3)
 }

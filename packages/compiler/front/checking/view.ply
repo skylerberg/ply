@@ -1,0 +1,154 @@
+import std.set (Set)
+import std.bin
+import std.list
+import compiler.store.memo (memo)
+import compiler.store.handles (fetch)
+import compiler.front.facts (OneModule, ProgramListing, decode_tables, one_module, program_listing)
+import compiler.front.checking.program_facts (ProgramRollup, ProgramSites, TestList, keys_of,
+                                              own_key, pulled_key, program_imports_query,
+                                              program_rollup_query, program_sites_query,
+                                              test_list_query)
+import compiler.front.rows (Outline)
+import compiler.store.hash.forms (ModuleHashes)
+import compiler.front.pages (Pages)
+import compiler.front.checking (CheckedModule, InMemory, cycles_among, documented_all, hashed_all,
+                                module_hashes, module_of, session_over)
+import compiler.front.checking.groups (CheckGroupKey, ModuleListing, ProgramSummary, group_facts_of,
+                                       module_groups, module_record_query, module_listing_query,
+                                       module_contents_query, owners_result_of,
+                                       program_summary_query, modules_declaring)
+import compiler.front.checking.world (ModuleKey, Modules)
+import compiler.check.resolve.tables (placed_in)
+import compiler.check.resolve.tables (Diagnostic, Label)
+import compiler.check.infer.checker (CachedFacts, DefinitionInfo)
+import compiler.check.infer (EmitFacts)
+import compiler.front.owner_checks (MemberResult, member_facts)
+import compiler.check.types (Effect)
+
+pub fn summary(own: List<Bytes>) -> ProgramSummary / {memo.read, abort.raise} =
+  fetch(program_summary_query(), own)
+
+fn placed_at(diagnostics: List<Diagnostic>, slot: Int) -> List<Diagnostic> =
+  diagnostics.map(|d: Diagnostic| placed_in(d, slot))
+
+pub fn rejections(
+  own: List<Bytes>,
+  read: ProgramSummary,
+) -> List<Diagnostic> / {memo.read, abort.raise} = {
+  let cycles = if read.cycle { cycles_among(own) } else { [] };
+  own.map(own_key).concat(read.pulled.map(pulled_key)).fold(
+    { slot: 0, found: [] },
+    |placing: { slot: Int, found: List<Diagnostic> }, key: ModuleKey| {
+      let reported = if read.cycle { cycles.filter(|a: CheckedModule| a.module == key.module) }
+      else if read.rejected.contains(key.module) { [module_of(key)] }
+      else { [] };
+      {
+        slot: placing.slot + 1,
+        found: reported.fold(placing.found, |found: List<Diagnostic>, a: CheckedModule|
+          found.concat(placed_at(a.result.rejected.concat(a.result.warnings), placing.slot))),
+      }
+    },
+  ).found
+}
+
+fn listing_of(key: ModuleKey) -> ModuleListing / {memo.read, abort.raise} =
+  fetch(module_listing_query(), key)
+
+pub fn warnings(
+  root: List<Bytes>,
+  read: ProgramSummary,
+) -> List<Diagnostic> / {memo.read, abort.raise} =
+  range(0, root.len()).fold([], |found: List<Diagnostic>, i: Int|
+    if read.warned.contains(root.get(i)) {
+      found.concat(placed_at(listing_of(own_key(root.get(i))).warnings, i))
+    } else { found })
+
+pub type CheckedOwner = { facts: EmitFacts, cached: List<CachedFacts> }
+
+pub fn checked_owners(key: ModuleKey) -> List<CheckedOwner> / {memo.read, abort.raise} =
+  module_groups(key).flat_map(|g: CheckGroupKey|
+    group_facts_of(g).members.map(|m: MemberResult| {
+      let read = member_facts(m);
+      { facts: read.facts, cached: read.cached }
+    }))
+
+pub fn performed_by(modules: Modules) -> List<Effect> / {memo.read, abort.raise} =
+  modules.own.take(modules.root).fold([], |found: List<Effect>, m: Bytes|
+    found.concat(
+      decode_tables(listing_of(own_key(m)).tables).definitions.flat_map(|d: DefinitionInfo|
+        d.effects),
+    )).unique(
+  )
+
+pub fn outlines(modules: Modules) -> List<Outline> / {memo.read, abort.raise} =
+  keys_of(modules).map(|k: ModuleKey| owners_result_of(k).shape.outline)
+
+pub fn listed(modules: Modules) -> ProgramListing / {memo.read, abort.raise} = {
+  let listings = keys_of(modules).map(listing_of);
+  program_listing(
+    modules.root,
+    modules.own.len(),
+    listings.map(|l: ModuleListing| l.shape),
+    listings.map(|l: ModuleListing| decode_tables(l.tables)),
+    hashed_all(modules.own, modules.pulled, false),
+    modules.pulled.fold(Set::empty(), |names: Set<Bytes>, m: Bytes| names.insert(m)),
+  )
+}
+
+pub type ListedOutcome = | ListingRejected(List<Diagnostic>) | Listed(ProgramListing)
+
+pub fn listed_over(program: InMemory) -> ListedOutcome / {abort.raise} =
+  session_over(program, |own: List<Bytes>| {
+    let read = summary(own);
+    match rejections(own, read) {
+      [] -> Listed(listed({ root: own.len(), own: own, pulled: read.pulled })),
+      diagnostics -> ListingRejected(diagnostics),
+    }
+  }).value
+
+pub fn listing_from(
+  modules: Modules,
+  results: List<CheckedModule>,
+  hashes: List<ModuleHashes>,
+) -> ProgramListing / {abort.raise} =
+  program_listing(
+    modules.root,
+    modules.own.len(),
+    results.map(|a: CheckedModule| a.result.shape),
+    results.map(|a: CheckedModule| decode_tables(a.result.tables)),
+    hashes,
+    modules.pulled.fold(Set::empty(), |names: Set<Bytes>, m: Bytes| names.insert(m)),
+  )
+
+pub type LaterReading = { rollup: ProgramRollup, sites: ProgramSites, imports: List<List<Int>> }
+
+pub fn later_reading(modules: Modules) -> LaterReading / {memo.read, abort.raise} =
+  {
+    rollup: program_rollup(modules),
+    sites: fetch(program_sites_query(), modules),
+    imports: program_imports(modules),
+  }
+
+pub fn program_imports(modules: Modules) -> List<List<Int>> / {memo.read, abort.raise} =
+  fetch(program_imports_query(), modules)
+
+pub fn program_rollup(modules: Modules) -> ProgramRollup / {memo.read, abort.raise} =
+  fetch(program_rollup_query(), modules)
+
+pub fn test_list(modules: Modules) -> TestList / {memo.read, abort.raise} =
+  fetch(test_list_query(), modules)
+
+pub fn module_records(modules: Modules) -> List<Bytes> / {memo.read, abort.raise} =
+  keys_of(modules).map(|k: ModuleKey| fetch(module_record_query(), k))
+
+pub type ModuleVersion = { one: OneModule, hashes: ModuleHashes }
+
+pub fn module_version(key: ModuleKey) -> ModuleVersion / {memo.read, abort.raise} = {
+  let listing = listing_of(key);
+  { one: one_module(listing.shape, decode_tables(listing.tables)), hashes: module_hashes(key) }
+}
+
+pub fn declarers(name: Bytes) -> List<Bytes> / {memo.read, abort.raise} =
+  modules_declaring(false, name)
+
+pub fn pages(keys: List<ModuleKey>) -> List<Pages> / {memo.read, abort.raise} = documented_all(keys)

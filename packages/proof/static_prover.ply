@@ -1,10 +1,13 @@
+import compiler.front.checking (lowered_over)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.published (ClaimClause, analyse)
+import compiler.emit.emit_harness (accepted_session)
+import compiler.check.infer.checker (elsewhere)
+import compiler.emit.representations (code_facts)
+import compiler.front.published (ClaimClause, LoweringTargets)
 import compiler.front.facts (Analysis)
 import compiler.front.rows (module_imports)
 import compiler.syntax.items (CostClause, EnsuresClause, RequiresClause, SpaceClause)
-import compiler.check.resolve.tables (ParsedModule)
+import compiler.check.resolve.tables (ParsedModule, Place, WholeFile)
 import context (Context, Claims, claims_from_analysis, context, constructor, signature, group_of,
                 is_recursive, terminates)
 import decide (Certified, Diagnosis, StaticResult, Undecided, GuardRefuted, Unwitnessed, Proved,
@@ -20,12 +23,14 @@ import obligation (Builds, Cost, Ensures, Law, Space)
 import rules (CostBound, SpaceBound, Rule, Cited)
 import sort (canonical)
 import prover_input (Bounded, NotEnumerable, Measure, Obligation, TrustedLaw, ProverInput,
-                     Interleave, Run, Every, measures_in, measures_input, fallback_of,
-                     prover_input_of)
+                     Interleave, Run, Every, measures_in, measures_input, fallback_of, Claimed,
+                     claimed_session, claimed_input, written_before)
 import prover_input
 import std.list
+import std.set (Set)
+import std.graph (reachable)
 
-pub type LocatedLemma = { module: Int, start: Int, lemma: Lemma }
+pub type LocatedLemma = { module: Int, at: Place, lemma: Lemma }
 
 pub type Prover = {
   context: Context,
@@ -40,16 +45,14 @@ pub type Prover = {
 pub fn prover_of(claims: Claims, w: ProverInput, budget: Int) -> Prover / {abort.raise} = {
   let context = context(claims, w);
   let limits = { ..default_limits, steps: budget };
-  let shown = w.measures.fold(Map::new(), |m: Map<String, Bool>, x: Measure|
-    match check_measure(context, x, limits) { Ok([]) -> m.insert(x.owner, true), _ -> m });
+  let shown = w.measures.fold(Set::empty(), |m: Set<String>, x: Measure|
+    match check_measure(context, x, limits) { Ok([]) -> m.insert(x.owner), _ -> m });
   let measured = {
     context: {
       ..context,
-      measured: shown.keys().fold(Map::new(), |m: Map<String, Bool>, name: String|
-        if group_of(context, name).fold(true, |all: Bool, member: String|
-            all && (shown.contains(member) || !has_measure(context, member))) {
-          m.insert(name, true)
-        } else { m }),
+      measured: shown.filter(|name: String|
+        group_of(context, name).fold(true, |all: Bool, member: String|
+          all && (shown.contains(member) || !has_measure(context, member)))),
     },
     claims: claims,
     limits: limits,
@@ -107,7 +110,11 @@ pub fn prover_of(claims: Claims, w: ProverInput, budget: Int) -> Prover / {abort
           Some(l.body),
           |name: String| signature(p.context, name) != None && constructor(p.context, name) == None,
         ) {
-        Some(lemma) -> { ..p, proved: p.proved.push({ module: t.module, start: 0, lemma: lemma }) },
+        Some(lemma) ->
+          {
+            ..p,
+            proved: p.proved.push({ module: t.module, at: WholeFile(t.module), lemma: lemma }),
+          },
         None -> p,
       },
     });
@@ -123,10 +130,7 @@ pub fn prover_of(claims: Claims, w: ProverInput, budget: Int) -> Prover / {abort
             let decided = { ..p, decided: p.decided.insert(o.key, d) };
             match d.decision {
               Proved(_) ->
-                {
-                  ..decided,
-                  proved: p.proved.push({ module: o.at.module, start: o.at.start, lemma: l }),
-                },
+                { ..decided, proved: p.proved.push({ module: o.module, at: o.at, lemma: l }) },
               _ -> decided,
             }
           },
@@ -199,9 +203,9 @@ fn lemma_at(p: Prover, o: Obligation) -> Option<Lemma> =
 fn import_order(os: List<Obligation>, imports: List<List<Int>>) -> List<Obligation> = {
   let depth = |m: Int| match imports.at(m) { Some(xs) -> xs.len(), None -> 0 };
   let ahead = |x: Obligation, o: Obligation|
-    depth(x.at.module) < depth(o.at.module)
-      || (depth(x.at.module) == depth(o.at.module)
-      && (x.at.module < o.at.module || (x.at.module == o.at.module && x.at.start <= o.at.start)));
+    depth(x.module) < depth(o.module)
+      || (depth(x.module) == depth(o.module)
+      && (x.module < o.module || (x.module == o.module && !written_before(o.at, x.at))));
   os.fold([], |accumulator: List<Obligation>, o: Obligation|
     accumulator.filter(|x: Obligation| ahead(x, o)).push(o).concat(
       accumulator.filter(|x: Obligation| !ahead(x, o)),
@@ -209,9 +213,9 @@ fn import_order(os: List<Obligation>, imports: List<List<Int>>) -> List<Obligati
 }
 
 fn lemmas_for(p: Prover, o: Obligation) -> List<Lemma> = {
-  let imported = match p.imports.at(o.at.module) { Some(xs) -> xs, None -> [] };
+  let imported = match p.imports.at(o.module) { Some(xs) -> xs, None -> [] };
   p.proved.filter(|x: LocatedLemma|
-    (x.module == o.at.module && x.start < o.at.start) || imported.contains(x.module)).map(
+    (x.module == o.module && written_before(x.at, o.at)) || imported.contains(x.module)).map(
     |x: LocatedLemma| x.lemma,
   )
 }
@@ -221,14 +225,20 @@ pub type UnprovedMeasure = { measure: Measure, reason: List<String>, descends: B
 pub fn unproved_measures(
   analysis: Analysis,
   owned: (Bytes) -> Bool,
+  targets: Option<LoweringTargets> = None,
+  named: Option<List<Bytes>> = None,
 ) -> List<UnprovedMeasure> / {abort.raise} = {
-  let measures = measures_in(analysis, owned);
+  let stated = measures_in(analysis, owned);
+  let measures = match named {
+    None -> stated,
+    Some(names) -> stated.filter(|m: Measure| names.contains(Bytes::of_string(m.owner))),
+  };
   if measures.len() == 0 { [] } else {
     let w = measures_input(analysis, measures);
     let modules = w.measures.fold([], |accumulator: List<Int>, m: Measure|
       if accumulator.fold(false, |seen: Bool, k: Int| seen || k == m.at.module) { accumulator }
       else { accumulator.push(m.at.module) });
-    let context = context(claims_for(analysis, modules, owned), w);
+    let context = context(claims_for(analysis, modules, owned, targets), w);
     let limits = { ..default_limits, steps: default_prove_budget };
     w.measures.fold([], |accumulator: List<UnprovedMeasure>, m: Measure| {
       let ends = match context.claims.definitions.get(m.owner) {
@@ -305,15 +315,16 @@ pub fn claims_for(
   analysis: Analysis,
   wanted: List<Int>,
   owned: (Bytes) -> Bool = |m: Bytes| true,
+  targets: Option<LoweringTargets> = None,
 ) -> Claims / {abort.raise} =
-  claims_from_analysis(analysis, import_closure(analysis.modules, wanted), owned)
+  claims_from_analysis(analysis, import_closure(analysis.modules, wanted), owned, targets)
 
 pub fn modules_of(analysis: Analysis, os: List<Obligation>) -> List<Int> =
   os.fold([], |accumulator: List<Int>, obligation: Obligation|
-    if obligation.at.module >= analysis.modules.len() { range(0, analysis.modules.len()) }
-    else if accumulator.fold(false, |seen: Bool, m: Int| seen || m == obligation.at.module) {
+    if obligation.module >= analysis.modules.len() { range(0, analysis.modules.len()) }
+    else if accumulator.fold(false, |seen: Bool, m: Int| seen || m == obligation.module) {
       accumulator
-    } else { accumulator.push(obligation.at.module) })
+    } else { accumulator.push(obligation.module) })
 
 fn name_at(modules: List<ParsedModule>, i: Int) -> Bytes =
   match modules.at(i) { Some(m) -> m.name, None -> b"" }
@@ -321,36 +332,10 @@ fn name_at(modules: List<ParsedModule>, i: Int) -> Bytes =
 fn import_closure(modules: List<ParsedModule>, from: List<Int>) -> List<Int> / {abort.raise} = {
   let index = range(0, modules.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, i: Int|
     accumulator.insert(name_at(modules, i), i));
-  let seen = iterate(
-    {
-      seen: from.fold(Map::new(), |accumulator: Map<Int, Bool>, i: Int|
-        accumulator.insert(i, true)),
-      stack: from,
-    },
-    modules.len() + from.len() + 1,
-    |s: { seen: Map<Int, Bool>, stack: List<Int> }|
-      match s.stack.at(s.stack.len() - 1) {
-        None -> Stop(s.seen),
-        Some(i) -> {
-          let rest = range(0, s.stack.len() - 1).fold([], |accumulator: List<Int>, k: Int|
-            match s.stack.at(k) { Some(x) -> accumulator.push(x), None -> accumulator });
-          let imported = match modules.at(i) { Some(m) -> module_imports(m), None -> [] };
-          Continue(
-            imported.fold(
-              { seen: s.seen, stack: rest },
-              |accumulator: { seen: Map<Int, Bool>, stack: List<Int> }, name: Bytes|
-                match index.get(name) {
-                  Some(j) -> if accumulator.seen.contains(j) { accumulator } else {
-                    { seen: accumulator.seen.insert(j, true), stack: accumulator.stack.push(j) }
-                  },
-                  None -> accumulator,
-                },
-            ),
-          )
-        },
-      },
-  );
-  range(0, modules.len()).filter(|i: Int| seen.contains(i))
+  let imports = modules.map(|m: ParsedModule|
+    module_imports(m).fold([], |accumulator: List<Int>, name: Bytes|
+      match index.get(name) { Some(j) -> accumulator.push(j), None -> accumulator }));
+  reachable({ out: imports }, from)
 }
 
 pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
@@ -429,7 +414,10 @@ pub fn goal_of(p: Prover, obligation: Obligation) -> Option<Goal> = {
   }
 }
 
-pub fn diagnosis_of(p: Prover, obligation: Obligation) -> Option<Diagnosis> / {abort.raise} =
+pub fn diagnosis_of(
+  p: Prover,
+  obligation: Obligation,
+) -> Option<Diagnosis> / {elsewhere.read, code_facts.read, abort.raise} =
   match obligation.strategy {
     Interleave(_) -> None,
     Bounded -> match obligation.kind {
@@ -456,7 +444,10 @@ pub fn static_result_for(obligation: Obligation, d: Option<Diagnosis>) -> Static
     _ -> match d { Some(x) -> to_static_result(x, obligation.variables), None -> not_attempted },
   }
 
-pub fn static_result(p: Prover, obligation: Obligation) -> StaticResult / {abort.raise} =
+pub fn static_result(
+  p: Prover,
+  obligation: Obligation,
+) -> StaticResult / {elsewhere.read, code_facts.read, abort.raise} =
   match obligation.strategy {
     Interleave(_) -> not_attempted,
     _ -> static_result_for(obligation, diagnosis_of(p, obligation)),
@@ -466,7 +457,7 @@ fn check_space_bound(
   context: Context,
   definition: String,
   index: Int,
-) -> Diagnosis / {abort.raise} = {
+) -> Diagnosis / {elsewhere.read, code_facts.read, abort.raise} = {
   let open = |reason: String|
     { decision: Unknown({ reason: Open, steps: 0 }), blockers: [BoundUnshown(reason)] };
   match context.claims.definitions.get(definition) {
@@ -544,11 +535,13 @@ fn check_cost_bound(context: Context, definition: String, index: Int) -> Diagnos
   }
 }
 
-fn analysis_of(sources: List<{ name: Bytes, source_text: Bytes }>) -> Analysis / {abort.raise} =
-  match analyse(parse_all(sources)) {
-    Rejected(_) -> panic("the fixture failed to check"),
-    Analysed(w) -> w,
-  }
+fn with_fixture<a>(
+  sources: List<{ name: Bytes, source_text: Bytes }>,
+  body: (Claimed) -> a / {elsewhere.read, code_facts.read, abort.raise},
+) -> a / {abort.raise} = {
+  let fixture = claimed_session(sources);
+  lowered_over(fixture.program, || body(fixture))
+}
 
 fn index_of(analysis: Analysis, name: Bytes) -> Int =
   range(0, analysis.modules.len()).fold(-1, |found: Int, i: Int|
@@ -556,8 +549,8 @@ fn index_of(analysis: Analysis, name: Bytes) -> Int =
 
 fn claimed(cs: Claims) -> List<Bytes> = cs.definitions.keys().map(Bytes::of_string)
 
-fn obligation_for(analysis: Analysis, owner: String) -> Obligation / {abort.raise} =
-  match prover_input_of(analysis, prover_input::every).world.obligations.fold(
+fn obligation_for(claimed: Claimed, owner: String) -> Obligation / {abort.raise} =
+  match claimed_input(claimed, prover_input::every).world.obligations.fold(
       None,
       |found: Option<Obligation>, o: Obligation| if o.owner == owner { Some(o) } else { found },
     ) {
@@ -574,7 +567,7 @@ test "the claims asked for are a module's and everything it imports, and nothing
     },
     { name: b"side", source_text: b"fn zero(x: Int) -> Int ensures result == 0 = x - x\n" },
   ];
-  let w = analysis_of(sources);
+  let w = accepted_session(sources).analysis;
   let names = claimed(claims_for(w, [index_of(w, b"app")]));
   assert(names.fold(false, |f: Bool, n: Bytes| f || n == b"base.one"));
   assert(names.fold(false, |f: Bool, n: Bytes| f || n == b"app.two"));
@@ -588,14 +581,19 @@ test "an obligation is resolved by what the prover decides, and only when its st
       source_text: b"fn same(x: Int) -> Int ensures result == x = x\nfn bump(x: Int) -> Int requires x < 10 ensures result > x = x + 1\nfn never(x: Int) -> Int requires x > 0 && x < 0 ensures result == 0 = x\n",
     },
   ];
-  let w = analysis_of(sources);
-  let p = prover_of(claims_for(w, [0]), prover_input_of(w, prover_input::every).world, 10000);
-  assert(match static_result(p, obligation_for(w, "m.same")) { Certified(_) -> true, _ -> false });
-  let bump = obligation_for(w, "m.bump");
-  assert(match static_result(p, bump) { Unwitnessed(_) -> true, _ -> false });
-  assert(static_result(p, obligation_for(w, "m.never")) == GuardRefuted);
-  assert(static_result(p, { ..bump, strategy: Interleave(NotEnumerable) }) == not_attempted);
-  assert(diagnosis_of(p, { ..bump, strategy: Interleave(NotEnumerable) }) == None)
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let p = prover_of(claims_for(w, [0]), claimed_input(fixture, prover_input::every).world, 10000);
+    assert(match static_result(p, obligation_for(fixture, "m.same")) {
+      Certified(_) -> true,
+      _ -> false,
+    });
+    let bump = obligation_for(fixture, "m.bump");
+    assert(match static_result(p, bump) { Unwitnessed(_) -> true, _ -> false });
+    assert(static_result(p, obligation_for(fixture, "m.never")) == GuardRefuted);
+    assert(static_result(p, { ..bump, strategy: Interleave(NotEnumerable) }) == not_attempted);
+    assert(diagnosis_of(p, { ..bump, strategy: Interleave(NotEnumerable) }) == None)
+  })
 }
 
 test "the static prover certifies a `cost` bound when the definition's body proves it, and otherwise reports the claim as undecided and says why" {
@@ -605,23 +603,25 @@ test "the static prover certifies a `cost` bound when the definition's body prov
       source_text: b"fn total(xs: List<Int>) -> Int cost xs.len() = xs.fold(0, |a: Int, x: Int| a + x)\nfn wrong(xs: List<Int>) -> Int cost 1 = xs.fold(0, |a: Int, x: Int| a + x)\n",
     },
   ];
-  let w = analysis_of(sources);
-  let p = prover_of(claims_for(w, [0]), prover_input_of(w, prover_input::every).world, 10000);
-  assert(match static_result(p, obligation_for(w, "m.total")) {
-    Certified(s) -> s.rules == [CostBound({ definition: "m.total" })],
-    _ -> false,
-  });
-  assert_eq(
-    static_result(p, obligation_for(w, "m.wrong")),
-    Undecided({
-      budget_exhausted: false,
-      blockers: [
-        BoundUnshown(
-          "the definition's step count cannot be shown to be at most a constant times the bound for every input size, including size zero",
-        ),
-      ],
-    }),
-  )
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let p = prover_of(claims_for(w, [0]), claimed_input(fixture, prover_input::every).world, 10000);
+    assert(match static_result(p, obligation_for(fixture, "m.total")) {
+      Certified(s) -> s.rules == [CostBound({ definition: "m.total" })],
+      _ -> false,
+    });
+    assert_eq(
+      static_result(p, obligation_for(fixture, "m.wrong")),
+      Undecided({
+        budget_exhausted: false,
+        blockers: [
+          BoundUnshown(
+            "the definition's step count cannot be shown to be at most a constant times the bound for every input size, including size zero",
+          ),
+        ],
+      }),
+    )
+  })
 }
 
 test "a `space` bound is proved when the function body shows it, and otherwise stays undecided with a reason" {
@@ -631,23 +631,25 @@ test "a `space` bound is proved when the function body shows it, and otherwise s
       source_text: b"fn total(xs: List<Int>) -> Int space 0 = xs.fold(0, |a: Int, x: Int| a + x)\nfn wrong(xs: List<Int>) -> List<Int> space 0 = xs.map(|x: Int| x)\n",
     },
   ];
-  let w = analysis_of(sources);
-  let p = prover_of(claims_for(w, [0]), prover_input_of(w, prover_input::every).world, 10000);
-  assert(match static_result(p, obligation_for(w, "m.total")) {
-    Certified(s) -> s.rules == [SpaceBound({ definition: "m.total" })],
-    _ -> false,
-  });
-  assert_eq(
-    static_result(p, obligation_for(w, "m.wrong")),
-    Undecided({
-      budget_exhausted: false,
-      blockers: [
-        BoundUnshown(
-          "the definition's space cannot be shown to be at most a constant times the bound for every input size, including size zero",
-        ),
-      ],
-    }),
-  )
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let p = prover_of(claims_for(w, [0]), claimed_input(fixture, prover_input::every).world, 10000);
+    assert(match static_result(p, obligation_for(fixture, "m.total")) {
+      Certified(s) -> s.rules == [SpaceBound({ definition: "m.total" })],
+      _ -> false,
+    });
+    assert_eq(
+      static_result(p, obligation_for(fixture, "m.wrong")),
+      Undecided({
+        budget_exhausted: false,
+        blockers: [
+          BoundUnshown(
+            "the definition's space cannot be shown to be at most a constant times the bound for every input size, including size zero",
+          ),
+        ],
+      }),
+    )
+  })
 }
 
 test "a claim about an imported module relies only on that module's contracts, but a `transparent` function is replaced by its body" {
@@ -661,18 +663,23 @@ test "a claim about an imported module relies only on that module's contracts, b
       source_text: b"import base\nfn quad(x: Int) -> Int ensures result == x = base::same(x)\nfn also(x: Int) -> Int ensures result == x = base::kept(x)\n",
     },
   ];
-  let w = analysis_of(sources);
-  let mine = |m: Bytes| m == b"app";
-  let p = prover_of(
-    claims_for(w, [index_of(w, b"app")], mine),
-    prover_input_of(w, mine).world,
-    10000,
-  );
-  assert(match static_result(p, obligation_for(w, "app.quad")) {
-    Certified(_) -> true,
-    _ -> false,
-  });
-  assert(match static_result(p, obligation_for(w, "app.also")) { Certified(_) -> false, _ -> true })
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let mine = |m: Bytes| m == b"app";
+    let p = prover_of(
+      claims_for(w, [index_of(w, b"app")], mine),
+      claimed_input(fixture, mine).world,
+      10000,
+    );
+    assert(match static_result(p, obligation_for(fixture, "app.quad")) {
+      Certified(_) -> true,
+      _ -> false,
+    });
+    assert(match static_result(p, obligation_for(fixture, "app.also")) {
+      Certified(_) -> false,
+      _ -> true,
+    })
+  })
 }
 
 test "a proved `law` can be cited as a lemma by claims in modules that import its module" {
@@ -686,21 +693,23 @@ test "a proved `law` can be cited as a lemma by claims in modules that import it
       source_text: b"import base\nlaw \"a push counts one more\" forall (xs: List<Int>, x: Int) { base::count(xs.push(x)) == xs.len() + 1 }\n",
     },
   ];
-  let w = analysis_of(sources);
-  let p = prover_of(
-    claims_for(w, range(0, w.modules.len())),
-    prover_input_of(w, prover_input::every).world,
-    10000,
-  );
-  assert(match static_result(p, obligation_for(w, "base.counting counts")) {
-    Certified(_) -> true,
-    _ -> false,
-  });
-  assert(match static_result(p, obligation_for(w, "app.a push counts one more")) {
-    Certified(c) ->
-      c.rules.fold(false, |f: Bool, r: Rule|
-        f || r == Cited({ law: "base.counting counts", label: "counting counts" })),
-    _ -> false,
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let p = prover_of(
+      claims_for(w, range(0, w.modules.len())),
+      claimed_input(fixture, prover_input::every).world,
+      10000,
+    );
+    assert(match static_result(p, obligation_for(fixture, "base.counting counts")) {
+      Certified(_) -> true,
+      _ -> false,
+    });
+    assert(match static_result(p, obligation_for(fixture, "app.a push counts one more")) {
+      Certified(c) ->
+        c.rules.fold(false, |f: Bool, r: Rule|
+          f || r == Cited({ law: "base.counting counts", label: "counting counts" })),
+      _ -> false,
+    })
   })
 }
 
@@ -715,20 +724,22 @@ test "a `law` about an imported function that has an `ensures` clause fails to p
       source_text: b"import base\nlaw \"same answers\" forall (n: Int) { base::same(n) == n }\nfn again(n: Int) -> Int ensures result == n = base::same(n)\n",
     },
   ];
-  let w = analysis_of(sources);
-  let mine = |m: Bytes| m == b"app";
-  let p = prover_of(
-    claims_for(w, [index_of(w, b"app")], mine),
-    prover_input_of(w, mine).world,
-    10000,
-  );
-  assert(match static_result(p, obligation_for(w, "app.same answers")) {
-    Certified(_) -> false,
-    _ -> true,
-  });
-  assert(match static_result(p, obligation_for(w, "app.again")) {
-    Certified(_) -> true,
-    _ -> false,
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let mine = |m: Bytes| m == b"app";
+    let p = prover_of(
+      claims_for(w, [index_of(w, b"app")], mine),
+      claimed_input(fixture, mine).world,
+      10000,
+    );
+    assert(match static_result(p, obligation_for(fixture, "app.same answers")) {
+      Certified(_) -> false,
+      _ -> true,
+    });
+    assert(match static_result(p, obligation_for(fixture, "app.again")) {
+      Certified(_) -> true,
+      _ -> false,
+    })
   })
 }
 
@@ -743,15 +754,17 @@ test "a `law` from an imported module can be cited as a lemma even when only the
       source_text: b"import base\nlaw \"a push counts one more\" forall (xs: List<Int>, x: Int) { base::count(xs.push(x)) == xs.len() + 1 }\n",
     },
   ];
-  let w = analysis_of(sources);
-  let mine = |m: Bytes| m == b"app";
-  let p = prover_of(
-    claims_for(w, [index_of(w, b"app")], mine),
-    prover_input_of(w, mine).world,
-    10000,
-  );
-  assert(match static_result(p, obligation_for(w, "app.a push counts one more")) {
-    Certified(_) -> true,
-    _ -> false,
+  with_fixture(sources, |fixture: Claimed| {
+    let w = fixture.analysis;
+    let mine = |m: Bytes| m == b"app";
+    let p = prover_of(
+      claims_for(w, [index_of(w, b"app")], mine),
+      claimed_input(fixture, mine).world,
+      10000,
+    );
+    assert(match static_result(p, obligation_for(fixture, "app.a push counts one more")) {
+      Certified(_) -> true,
+      _ -> false,
+    })
   })
 }

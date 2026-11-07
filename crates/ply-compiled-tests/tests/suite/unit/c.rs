@@ -1,5 +1,4 @@
 mod stage;
-mod sweep;
 
 use crate::units::{self, def};
 use ply_compiled::c::exports::HelperShape;
@@ -146,12 +145,14 @@ fn helpers_recorded_in_a_unit_export_table_bind_by_name_to_the_runtime_helper_ad
 
 #[test]
 fn an_exports_table_decodes_to_the_values_a_unit_wrote_and_encodes_back_to_the_same_text() {
-    let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nfields 1\nop\nentered m.main\n";
+    let said = "helpers 0\nconstants 1\nm.table 4\nmodules 3\nfields 1\nop\nentered m.main\n\
+                site m.main\nsite m.pick\n";
     let read = ply_compiled::c::Exports::decode(said).expect("the table reads");
     assert_eq!(read.constants, [("m.table".to_string(), 4)]);
     assert_eq!(read.modules, 3);
     assert_eq!(read.fields, [ply_core::Symbol::new("op")]);
     assert_eq!(read.entered, ["m.main"]);
+    assert_eq!(read.sites, ["m.main", "m.pick"].map(ply_core::Symbol::new));
     assert_eq!(read.encode(), said);
 }
 

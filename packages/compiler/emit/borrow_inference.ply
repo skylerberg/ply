@@ -1,8 +1,9 @@
+import std.set (Set)
 import std.bytes (ascii_of_int)
 import std.graph
 import compiler.check.types (Type, NamedType, VariableType, option_type, string_type)
 import compiler.check.resolve.tables (qualify)
-import compiler.syntax.parsing (Span, dummy_span, span_between)
+import compiler.syntax.parsing (Span, generated_span, span_between)
 import compiler.emit.keys
 import compiler.emit.keys (RootKey, Named, Specialisation, Generated, EntryPoint, Callee, Root,
                            Generic, TypeOperation, Equal, Order, NumericFunction, Reflect, Show,
@@ -142,7 +143,13 @@ pub fn infer_signatures(
   given: Map<RootName, OwnershipSignature>,
   declared: Map<RootName, List<Int>>,
 ) -> InferenceResult / {abort.raise} = {
-  let published = with_declared_borrows(given, declared, lendings);
+  let inferred_here = Set::of_list(lendings.map(|l: InferenceTarget| l.definition));
+  let elsewhere = given.fold(
+    Map::new(),
+    |m: Map<RootName, OwnershipSignature>, n: RootName, h: OwnershipSignature|
+      if inferred_here.contains(n) { m } else { m.insert(n, h) },
+  );
+  let published = with_declared_borrows(elsewhere, declared, lendings);
   let at = range(0, lendings.len()).fold(Map::new(), |m: Map<RootName, Int>, k: Int|
     match lendings.at(k) { Some(l) -> m.insert(l.definition, k), None -> m });
   let out = lendings.map(|l: InferenceTarget|
@@ -171,6 +178,19 @@ pub fn infer_signatures(
     },
   )
 }
+
+pub fn called_definitions(lendings: List<InferenceTarget>) -> List<RootName> =
+  lendings.fold([], |found: List<RootName>, l: InferenceTarget| {
+    let generics = generics_of(l.member);
+    values_folded(l.member.body, found, |names: List<RootName>, v: Rvalue|
+      match v {
+        Call(c) -> match callee_definition(generics, c.callee) {
+          Some(d) -> if names.contains(d) { names } else { names.push(d) },
+          None -> names,
+        },
+        _ -> names,
+      })
+  })
 
 fn with_declared_borrows(
   published: Map<RootName, OwnershipSignature>,
@@ -684,7 +704,7 @@ fn member_walk(s: WalkContext, f: Function) -> Walk = stack_placed_walk(s, f).wa
 
 fn stack_placed_walk(s: WalkContext, f: Function) -> { walk: Walk, framed: Map<Int, Bool> } = {
   let start = range(0, f.params.len()).fold(
-    { origins: Map::new(), captured: Map::new(), uses: [], at: dummy_span },
+    { origins: Map::new(), captured: Map::new(), uses: [], at: generated_span },
     |w: Walk, k: Int|
       match f.params.at(k) {
         Some(p) -> defined(w, p, { sources: Map::new().insert(k, true), fresh: false }),
@@ -1639,7 +1659,12 @@ test "a closure allocated on the stack is passed to a call as a borrowed value, 
           member: {
             ..f.member,
             lambdas: [
-              Closure({ body: lambda, captures: 1, at: dummy_span, words: no_closure_evidence }),
+              Closure({
+                body: lambda,
+                captures: 1,
+                at: generated_span,
+                words: no_closure_evidence,
+              }),
             ],
           },
         },
@@ -2065,7 +2090,7 @@ test "a function generated for a type borrows the values it only reads, and a ge
   assert_eq(
     infer_group_signatures([
       definition_of(b"gone", [p], AsInt, [
-        Do({ value: written(Drop, [VariableOperand(p)]), at: dummy_span, unwind: [] }),
+        Do({ value: written(Drop, [VariableOperand(p)]), at: generated_span, unwind: [] }),
         Return(IntOperand(0)),
       ]),
     ]),
@@ -2184,7 +2209,9 @@ test "a body is compiled against its own inferred ownership and each callee's, a
   };
   let rooted = {
     ..f,
-    lambdas: [Closure({ body: closure, captures: 0, at: dummy_span, words: no_closure_evidence })],
+    lambdas: [
+      Closure({ body: closure, captures: 0, at: generated_span, words: no_closure_evidence }),
+    ],
     links: {
       ..no_links,
       generics: [

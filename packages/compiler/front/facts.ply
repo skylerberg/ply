@@ -1,3 +1,5 @@
+import std.set (Set)
+import compiler.check.infer.checker (StoredDeclarations)
 import compiler.syntax.parsing (Span, Identifier, span_key, is_bare, span_bin)
 import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, TestItem, LawItem,
                               SchemaItem, EffectSetItem, SpecClause, RequiresClause, EnsuresClause,
@@ -15,19 +17,19 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
                                     LetStatement, LetElseStatement, ExpressionStatement,
                                     AssignmentStatement, HandlerStateVariable, RecordLiteralField,
                                     expression_span, TaggedLiteralExpression, TaggedLiteral, Hole,
-                                    TaggedPart, tagged_parts, tagged_part_bin, prelude_module,
-                                    prelude_hosts)
+                                    TaggedPart, tagged_parts, tagged_part_bin, prelude_module)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralString, LiteralBytes)
 import compiler.check.types (unit_type, TypeTable, InternedType, interned_type_bin, intern_types,
                              types_of)
 import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, Resolution, qualify,
-                                      import_module_name)
+                                      import_module_name, place_of)
 import compiler.check.resolve.scopes (post_order)
 import compiler.store.hash.graph (Index, tagged_target, denotation, DenotesFunction,
                                   DenotesConstructor, DenotesNothing, qualified_effect_name,
                                   qualified_type_name)
-import compiler.store.hash.forms (HashOutput, CachedHashes, by_name, reachable_functions, Subject,
-                                  FunctionNamed, DeclarationNamed, ItemKeyed, hashes_from_cache)
+import compiler.store.hash.forms (HashOutput, OwnHashes, reachable_functions, Subject,
+                                  FunctionNamed, DeclarationNamed, ItemKeyed, hash_output,
+                                  ModuleHashes, joined_module_hashes, of_key)
 import compiler.store.hash (UseNode)
 import compiler.store.hash.encoding (hex)
 import compiler.check.typed (TypedBody)
@@ -43,9 +45,9 @@ import compiler.check.infer.solved (prelude_tables)
 import compiler.emit.keys (test_owner, law_owner)
 import compiler.front.diagnostics (diagnostic_in_module)
 import compiler.front.pkg (PackageSources, Closure, Package, LockedPackage, closure, pins_of)
+import compiler.checkout (PartRole, StandardLibraryPart, CompilerPart)
 import compiler.check.resolve.scopes (PackageDependencies)
 import std.bin
-import std.hash (blake3)
 import std.pkg (Manifest)
 import std.list
 import compiler.expand.rewrite.shared (tagged_in, expressions_matching)
@@ -57,7 +59,7 @@ import compiler.expand.embed (ModuleEmbed, ItemEmbeds, item_embeds_bin, requests
 import compiler.syntax.items (is_std, is_compiler, is_shipped, is_explicit_import)
 import compiler.syntax.node_ids (numbered_missing)
 import std.bytes (ascii_of_int)
-import compiler.front.rows (span_at, OutlinedEffect, OutlinedFunction, OutlinedLaw, OutlinedTest,
+import compiler.front.rows (OutlinedEffect, OutlinedFunction, OutlinedLaw, OutlinedTest,
                             OutlinedType, OutlineItem, Outline, outline_bin, EffectSetRow,
                             effect_sets_of, module_items, imported_names, skeleton_of_outlines,
                             is_declared_in, Cut, TypeRow)
@@ -95,12 +97,15 @@ fn outline_of(
               span: d.span,
             }),
           ),
-        TestItem(d) ->
-          accumulator.push(
-            OutlinedTest({ name: d.name, label_span: d.label_span, cases: d.cases != None }),
-          ),
+        TestItem(d) -> accumulator.push(OutlinedTest({ name: d.name, cases: d.cases != None })),
         LawItem(d) ->
-          accumulator.push(OutlinedLaw({ name: d.name, literals: claim_literals(modules, d) })),
+          accumulator.push(
+            OutlinedLaw({
+              name: d.name,
+              guarded: d.guard != None,
+              literals: claim_literals(modules, d),
+            }),
+          ),
         TypeItem(d) ->
           accumulator.push(
             OutlinedType({
@@ -144,45 +149,16 @@ pub fn read_outline(parsed: ParsedModule) -> Outline / {abort.raise} =
     [parsed],
   )
 
-pub fn outlines_of(w: Analysis) -> List<Outline> / {abort.raise} =
+pub fn outlines_of(w: GroupAnalysis) -> List<Outline> / {abort.raise} =
   range(0, w.modules.len()).map(|i: Int| {
     let parsed = w.modules.get(i);
     outline_of(
       parsed,
-      effect_sets_of(w.r, w.checked.effects, i, parsed),
+      effect_sets_of(parsed),
       match w.stub_cuts.get(parsed.name) { Some(c) -> c, None -> cuts_of(parsed) },
       w.modules,
     )
   })
-
-pub fn effect_visibility(outlines: List<Outline>) -> Map<Bytes, Bool> =
-  outlines.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: Outline|
-    o.items.fold(accumulator, |a: Map<Bytes, Bool>, item: OutlineItem|
-      match item { OutlinedEffect(e) -> a.insert(qualify(o.name, e.name), e.public), _ -> a }))
-
-pub fn effect_hosts(outlines: List<Outline>) -> Map<Bytes, Bytes> =
-  outlines.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, o: Outline| {
-    let declared = o.items.fold(accumulator, |a: Map<Bytes, Bytes>, item: OutlineItem|
-      match item {
-        OutlinedEffect(e) -> match e.host {
-          Some(by) -> a.insert(qualify(o.name, e.name), qualify(o.name, by)),
-          None -> a,
-        },
-        _ -> a,
-      });
-    prelude_hosts.fold(
-      declared,
-      |a: Map<Bytes, Bytes>, h: { effect: Bytes, module: Bytes, by: Bytes }|
-        if h.module == o.name
-            && o.items.any(|item: OutlineItem|
-              match item { OutlinedFunction(f) -> f.name == h.by, _ -> false }) {
-          a.insert(h.effect, qualify(o.name, h.by))
-        } else { a },
-    )
-  })
-
-pub fn effect_public_of(m: Map<Bytes, Bool>, effect_info: EffectInfo) -> Bool =
-  match m.get(effect_info.name) { Some(b) -> b, None -> true }
 
 pub fn type_rows(outlines: List<Outline>) -> List<TypeRow> / {abort.raise} =
   range(0, outlines.len()).fold([], |accumulator: List<TypeRow>, i: Int| {
@@ -196,16 +172,11 @@ pub fn type_rows(outlines: List<Outline>) -> List<TypeRow> / {abort.raise} =
             simple_name: t.name,
             public: t.public,
             arity: t.arity,
-            at: span_at(i, t.span),
+            at: place_of(i, t.span),
           }),
         _ -> a,
       })
   })
-
-pub fn test_label_spans(outlines: List<Outline>) -> List<Location> / {abort.raise} =
-  range(0, outlines.len()).fold([], |accumulator: List<Location>, i: Int|
-    outlines.get(i).items.fold(accumulator, |a: List<Location>, item: OutlineItem|
-      match item { OutlinedTest(t) -> a.push({ module: i, span: t.label_span }), _ -> a }))
 
 fn int_literal(k: Int) -> Bytes = b"int ".concat(ascii_of_int(k))
 
@@ -292,9 +263,9 @@ fn lits(accumulator: List<Bytes>, expression: Expression) -> List<Bytes> / {abor
 pub fn literals_of(written: List<Expression>) -> List<Bytes> / {abort.raise} =
   written.fold([], |accumulator: List<Bytes>, expression: Expression| lits(accumulator, expression))
 
-pub fn schema_definitions(modules: List<ParsedModule>) -> Map<Bytes, Bool> =
-  modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, parsed: ParsedModule|
-    schemas_declared(parsed).fold(accumulator, |a: Map<Bytes, Bool>, n: Bytes| a.insert(n, true)))
+pub fn schema_definitions(modules: List<ParsedModule>) -> Set<Bytes> =
+  modules.fold(Set::empty(), |accumulator: Set<Bytes>, parsed: ParsedModule|
+    schemas_declared(parsed).fold(accumulator, |a: Set<Bytes>, n: Bytes| a.insert(n)))
 
 fn schemas_declared(parsed: ParsedModule) -> List<Bytes> =
   parsed.module.items.fold([], |accumulator: List<Bytes>, item: Item|
@@ -458,7 +429,7 @@ pub type ModuleShape = {
   embeds: List<ModuleEmbed>,
   embed_items: List<ItemEmbeds>,
   tagged: List<TaggedSite>,
-  statements: List<StatementSite>,
+  statements: List<StatementSite<Bytes>>,
   consts: List<TypedConst>,
 }
 
@@ -554,7 +525,7 @@ fn moved_shape(s: ModuleShape, from: Int, to: Int) -> ModuleShape =
   {
     ..s,
     tagged: s.tagged.map(|x: TaggedSite| { ..x, module: moved_module(x.module, from, to) }),
-    statements: s.statements.map(|x: StatementSite|
+    statements: s.statements.map(|x: StatementSite<Bytes>|
       { ..x, module: moved_module(x.module, from, to) }),
     consts: s.consts.map(|x: TypedConst| { ..x, module: moved_module(x.module, from, to) }),
   }
@@ -566,7 +537,8 @@ fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> M
   {
     ..t,
     definitions: t.definitions.map(|d: DefinitionInfo| { ..d, at: at(d.at) }),
-    tests: t.tests.map(|x: TestInfo| { ..x, at: at(x.at), index: x.index + tests }),
+    tests: t.tests.map(|x: TestInfo|
+      { ..x, at: at(x.at), label: at(x.label), index: x.index + tests }),
     laws: t.laws.map(|l: LawInfo| { ..l, at: at(l.at), index: l.index + laws }),
     effects: t.effects.map(|x: EffectInfo|
       {
@@ -582,7 +554,7 @@ fn moved_tables(t: ModuleTables, from: Int, to: Int, tests: Int, laws: Int) -> M
   }
 }
 
-pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
+pub fn module_facts(w: GroupAnalysis, i: Int) -> ModuleFacts / {abort.raise} = {
   let name = w.modules.get(i).name;
   let parsed = w.modules.get(i);
   let mine = |module: Int| module == i;
@@ -595,7 +567,7 @@ pub fn module_facts(w: Analysis, i: Int) -> ModuleFacts / {abort.raise} = {
       {
         outline: outline_of(
           parsed,
-          effect_sets_of(w.r, c.effects, i, parsed),
+          effect_sets_of(parsed),
           match w.stub_cuts.get(name) { Some(cuts) -> cuts, None -> cuts_of(parsed) },
           w.modules,
         ),
@@ -656,8 +628,8 @@ fn first_index(xs: List<Int>) -> Int = match xs { [x, ..] -> x, [] -> 0 }
 fn reachable_shipped_functions(
   shapes: List<ModuleShape>,
   hashes: HashOutput,
-  shipped: Map<Bytes, Bool>,
-) -> Map<Bytes, Bool> / {abort.raise} = {
+  shipped: Set<Bytes>,
+) -> Set<Bytes> / {abort.raise} = {
   let roots = shapes.fold([], |accumulator: List<Subject>, s: ModuleShape| {
     let o = s.outline;
     if shipped.contains(o.name) {
@@ -686,7 +658,7 @@ fn reachable_shipped_functions(
   reachable_functions(hashes, roots)
 }
 
-fn survives_cut(o: Outline, reachable: Map<Bytes, Bool>, item: OutlineItem) -> Bool =
+fn survives_cut(o: Outline, reachable: Set<Bytes>, item: OutlineItem) -> Bool =
   match item {
     OutlinedFunction(x) -> reachable.contains(qualify(o.name, x.name)),
     OutlinedTest(_) -> false,
@@ -694,7 +666,7 @@ fn survives_cut(o: Outline, reachable: Map<Bytes, Bool>, item: OutlineItem) -> B
     _ -> true,
   }
 
-fn cut_shape(s: ModuleShape, reachable: Map<Bytes, Bool>) -> ModuleShape = {
+fn cut_shape(s: ModuleShape, reachable: Set<Bytes>) -> ModuleShape = {
   let o = s.outline;
   let gone = o.items.fold(Map::new(), |accumulator: Map<Bytes, Int>, item: OutlineItem|
     match item {
@@ -723,11 +695,7 @@ fn cut_shape(s: ModuleShape, reachable: Map<Bytes, Bool>) -> ModuleShape = {
   }
 }
 
-fn cut_tables(
-  t: ModuleTables,
-  o: Outline,
-  reachable: Map<Bytes, Bool>,
-) -> ModuleTables / {abort.raise} = {
+fn cut_tables(t: ModuleTables, o: Outline, reachable: Set<Bytes>) -> ModuleTables / {abort.raise} = {
   {
     ..t,
     definitions: t.definitions.filter(|d: DefinitionInfo| reachable.contains(d.name)),
@@ -742,14 +710,12 @@ fn cut_tables(
   }
 }
 
-fn test_and_law_owners(outlines: List<Outline>) -> Map<Bytes, Bool> / {abort.raise} =
-  outlines.fold(Map::new(), |accumulator: Map<Bytes, Bool>, o: Outline|
-    o.items.fold(accumulator, |m: Map<Bytes, Bool>, item: OutlineItem|
-      match item {
-        OutlinedTest(t) -> m.insert(test_owner(o.name, t.name), true),
-        OutlinedLaw(l) -> m.insert(law_owner(o.name, l.name), true),
-        _ -> m,
-      }))
+fn test_and_law_owners(placed: List<ModuleTables>) -> Set<Bytes> / {abort.raise} =
+  placed.fold(Set::empty(), |accumulator: Set<Bytes>, t: ModuleTables| {
+    let tested = t.tests.fold(accumulator, |m: Set<Bytes>, x: TestInfo|
+      m.insert(test_owner(x.module, x.name)));
+    t.laws.fold(tested, |m: Set<Bytes>, x: LawInfo| m.insert(law_owner(x.module, x.name)))
+  })
 
 fn in_check_order<a>(
   checked: List<ModuleTables>,
@@ -780,12 +746,12 @@ fn untested_shape(s: ModuleShape) -> ModuleShape = {
         match item { OutlinedTest(_) -> false, OutlinedLaw(_) -> false, _ -> true }),
     },
     tagged: s.tagged.filter(|x: TaggedSite| within_any(spans, x.span)),
-    statements: s.statements.filter(|x: StatementSite| within_any(spans, x.span)),
+    statements: s.statements.filter(|x: StatementSite<Bytes>| within_any(spans, x.span)),
   }
 }
 
-fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} = {
-  let apart = test_and_law_owners([o]);
+fn untested_tables(t: ModuleTables) -> ModuleTables / {abort.raise} = {
+  let apart = test_and_law_owners([t]);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ..t,
@@ -794,59 +760,6 @@ fn untested_tables(t: ModuleTables, o: Outline) -> ModuleTables / {abort.raise} 
     facts: facts_filtered(t.facts, |module: Int, owner: Bytes| of_definitions(owner)),
     cached: t.cached.filter(|k: CachedFacts| of_definitions(k.name)),
   }
-}
-
-fn views_read(
-  shapes: List<ModuleShape>,
-  hashes: HashOutput,
-  read: Map<Bytes, Bool>,
-  texts: Map<Bytes, Bytes>,
-) -> List<ShippedModuleSummary> / {abort.raise} = {
-  let definitions = by_name(hashes.definitions);
-  let declarations = by_name(hashes.declarations);
-  let hash_of = |table: Map<Bytes, Bytes>, name: Bytes|
-    match table.get(name) { Some(hash) -> hash, None -> b"" };
-  shapes.fold([], |accumulator: List<ShippedModuleSummary>, s: ModuleShape| {
-    let o = s.outline;
-    match texts.get(o.name) {
-      None -> accumulator,
-      Some(text) -> {
-        let declared = o.items.fold([], |a: List<Bytes>, item: OutlineItem| {
-          let line = |name: Bytes|
-            a.push(
-              Bytes::concat_all([
-                b"declared ",
-                qualify(o.name, name),
-                b" ",
-                hash_of(declarations, qualify(o.name, name)),
-              ]),
-            );
-          match item { OutlinedType(x) -> line(x.name), OutlinedEffect(x) -> line(x.name), _ -> a }
-        });
-        let shape = declared.concat(s.imports.map(|m: Bytes| b"imports ".concat(m))).concat(
-          o.set_texts.map(|t: Bytes| b"set ".concat(t)),
-        );
-        accumulator.push({
-          module: o.name,
-          text: hex(blake3(text)),
-          form: hex(blake3(Bytes::join(shape, b"\n"))),
-          definitions: o.items.fold(
-            [],
-            |a: List<{ name: Bytes, hash: Bytes }>, item: OutlineItem|
-              match item {
-                OutlinedFunction(x) -> {
-                  let name = qualify(o.name, x.name);
-                  if read.contains(name) {
-                    a.push({ name: name, hash: hex(hash_of(definitions, name)) })
-                  } else { a }
-                },
-                _ -> a,
-              },
-          ),
-        })
-      },
-    }
-  })
 }
 
 pub type Frame = {
@@ -862,18 +775,15 @@ pub type Frame = {
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
   embed_items: Map<Bytes, List<ItemEmbeds>>,
-  tagged: List<TaggedSite>,
-  statements: List<StatementSite>,
-  consts: List<TypedConst>,
 }
 
 pub type CheckedProgram = { frame: Frame, checked: CheckOutput }
 
-pub type TableReads = { reads: List<TablesRead>, reachable: Map<Bytes, Bool> }
+pub type TableReads = { reads: List<TablesRead>, reachable: Set<Bytes> }
 
 pub type TablesRead = { outline: Outline, untested: Bool, trimmed: Bool }
 
-pub const no_reads: TableReads = { reads: [], reachable: Map::new() }
+pub const no_reads: TableReads = { reads: [], reachable: Set::empty() }
 
 pub fn functions_of(frame: Frame) -> Int =
   frame.outlines.fold(0, |n: Int, o: Outline|
@@ -889,7 +799,7 @@ pub fn tests_of(frame: Frame, own: Int) -> Int =
 
 pub fn framed_program(
   shapes: List<ModuleShape>,
-  fixing: CachedHashes,
+  hashed: OwnHashes,
   shipped: Map<Bytes, Bytes>,
   tested: Bool,
   prune_unreachable: Bool,
@@ -899,24 +809,12 @@ pub fn framed_program(
   pins: List<LockedPackage>,
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
-) -> { frame: Frame, reads: TableReads, views: List<ShippedModuleSummary> } / {abort.raise} = {
+) -> { frame: Frame, reads: TableReads } / {abort.raise} = {
   let untested = |s: ModuleShape| !tested && !shipped.contains(s.outline.name);
   let read = shapes.map(|s: ModuleShape| if untested(s) { untested_shape(s) } else { s });
-  let cutting = prune_unreachable
-    && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
-  let whole = hashes_from_cache(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), fixing);
-  let reach = if cutting {
-    reachable_shipped_functions(
-      read,
-      whole,
-      shipped.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes, _: Bytes| m.insert(n, true)),
-    )
-  } else { Map::new() };
-  let cut = |s: ModuleShape| cutting && shipped.contains(s.outline.name);
-  let merged = merged_shapes(
-    read.map(|s: ModuleShape| if cut(s) { cut_shape(s, reach) } else { s }),
-  );
-  let hashes = hashes_from_cache(skeleton_of_outlines(merged.outlines), fixing);
+  let cut = shapes_cut(read, hashed, shipped_names(shipped), prune_unreachable);
+  let merged = cut.merged;
+  let hashes = cut.hashes;
   {
     frame: {
       outlines: merged.outlines,
@@ -936,16 +834,115 @@ pub fn framed_program(
           if s.embed_items.len() == 0 { accumulator }
           else { accumulator.insert(s.outline.name, s.embed_items) },
       ),
-      tagged: root_tagged(module_packages, hashes, merged.tagged),
-      statements: root_statements(module_packages, hashes, merged.statements),
-      consts: root_consts(module_packages, merged.consts),
     },
     reads: {
       reads: shapes.map(|s: ModuleShape|
-        { outline: s.outline, untested: untested(s), trimmed: cut(s) }),
-      reachable: reach,
+        { outline: s.outline, untested: untested(s), trimmed: (cut.is_cut)(s) }),
+      reachable: cut.reachable,
     },
-    views: if cutting { views_read(read, whole, reach, shipped) } else { [] },
+  }
+}
+
+fn shipped_names(shipped: Map<Bytes, Bytes>) -> Set<Bytes> =
+  shipped.fold(Set::empty(), |m: Set<Bytes>, n: Bytes, _: Bytes| m.insert(n))
+
+type CutShapes = {
+  reachable: Set<Bytes>,
+  is_cut: (ModuleShape) -> Bool,
+  merged: MergedShapes,
+  hashes: HashOutput,
+}
+
+fn shapes_cut(
+  read: List<ModuleShape>,
+  hashed: OwnHashes,
+  shipped: Set<Bytes>,
+  prune_unreachable: Bool,
+) -> CutShapes / {abort.raise} = {
+  let cutting = prune_unreachable
+    && read.fold(false, |b: Bool, s: ModuleShape| b || shipped.contains(s.outline.name));
+  let reach = if cutting {
+    reachable_shipped_functions(
+      read,
+      hash_output(skeleton_of_outlines(read.map(|s: ModuleShape| s.outline)), hashed),
+      shipped,
+    )
+  } else { Set::empty() };
+  let is_cut = |s: ModuleShape| cutting && shipped.contains(s.outline.name);
+  let merged = merged_shapes(
+    read.map(|s: ModuleShape| if is_cut(s) { cut_shape(s, reach) } else { s }),
+  );
+  {
+    reachable: reach,
+    is_cut: is_cut,
+    merged: merged,
+    hashes: hash_output(skeleton_of_outlines(merged.outlines), hashed),
+  }
+}
+
+pub type ProgramListing = {
+  root: Int,
+  own: Int,
+  outlines: List<Outline>,
+  order: List<Bytes>,
+  imports: List<List<Bytes>>,
+  hashes: HashOutput,
+  modules: List<ModuleHashes>,
+  embeds: List<ModuleEmbed>,
+  checked: CheckOutput,
+  tests: List<HashedTest>,
+}
+
+pub type HashedTest = { info: TestInfo, hash: Bytes }
+
+fn hashed_tests(checked: CheckOutput, hashes: HashOutput) -> List<HashedTest> / {abort.raise} =
+  checked.tests.map(|info: TestInfo| { info: info, hash: of_key(hashes.tests, info.key) })
+
+pub type OneModule = { outlines: List<Outline>, checked: CheckOutput }
+
+pub fn one_module(shape: ModuleShape, tables: ModuleTables) -> OneModule / {abort.raise} = {
+  let merged = merged_shapes([shape]);
+  {
+    outlines: merged.outlines,
+    checked: checked_tables(
+      merged.outlines,
+      merged.order,
+      {
+        reads: [{ outline: shape.outline, untested: false, trimmed: false }],
+        reachable: Set::empty(),
+      },
+      [tables],
+    ),
+  }
+}
+
+pub fn program_listing(
+  root: Int,
+  own: Int,
+  shapes: List<ModuleShape>,
+  tables: List<ModuleTables>,
+  modules: List<ModuleHashes>,
+  pulled: Set<Bytes>,
+) -> ProgramListing / {abort.raise} = {
+  let cut = shapes_cut(shapes, joined_module_hashes(modules), pulled, true);
+  let reads = {
+    reads: shapes.map(|s: ModuleShape|
+      { outline: s.outline, untested: false, trimmed: (cut.is_cut)(s) }),
+    reachable: cut.reachable,
+  };
+  let checked = checked_tables(cut.merged.outlines, cut.merged.order, reads, tables);
+  {
+    root: root,
+    own: own,
+    outlines: cut.merged.outlines,
+    order: cut.merged.order,
+    imports: cut.merged.imports,
+    hashes: cut.hashes,
+    modules: modules,
+    embeds: shapes.fold([], |accumulator: List<ModuleEmbed>, s: ModuleShape|
+      accumulator.concat(s.embeds)),
+    checked: checked,
+    tests: hashed_tests(checked, cut.hashes),
   }
 }
 
@@ -953,13 +950,20 @@ pub fn checked_program_over(
   frame: Frame,
   reads: TableReads,
   tables: List<ModuleTables>,
-) -> CheckedProgram / {abort.raise} = {
+) -> CheckedProgram / {abort.raise} =
+  { frame: frame, checked: checked_tables(frame.outlines, frame.order, reads, tables) }
+
+fn checked_tables(
+  outlines: List<Outline>,
+  order: List<Bytes>,
+  reads: TableReads,
+  tables: List<ModuleTables>,
+) -> CheckOutput / {abort.raise} = {
   let placed = range(0, tables.len()).fold(
     { out: [], tests: 0, laws: 0 },
     |accumulator: { out: List<ModuleTables>, tests: Int, laws: Int }, k: Int| {
       let r = reads.reads.get(k);
-      let plain = if r.untested { untested_tables(tables.get(k), r.outline) }
-      else { tables.get(k) };
+      let plain = if r.untested { untested_tables(tables.get(k)) } else { tables.get(k) };
       let t = if r.trimmed { cut_tables(plain, r.outline, reads.reachable) } else { plain };
       {
         out: accumulator.out.push(moved_tables(t, 0, k, accumulator.tests, accumulator.laws)),
@@ -968,12 +972,41 @@ pub fn checked_program_over(
       }
     },
   ).out;
-  { frame: frame, checked: merged_tables(prelude_tables, frame.outlines, frame.order, placed) }
+  merged_tables(prelude_tables, outlines, order, placed)
+}
+
+pub type PlacedTables = { module: Int, tables: ModuleTables }
+
+pub fn checked_of_parts(
+  order: List<Int>,
+  parts: Map<Int, List<PlacedTables>>,
+) -> CheckOutput / {abort.raise} = {
+  let placed = range(0, order.len()).fold(
+    { out: [], tests: 0, laws: 0 },
+    |accumulator: { out: List<PlacedTables>, tests: Int, laws: Int }, module: Int|
+      parts.get(module).unwrap_or([]).fold(
+        accumulator,
+        |a: { out: List<PlacedTables>, tests: Int, laws: Int }, p: PlacedTables|
+          {
+            out: a.out.push({
+              module: p.module,
+              tables: moved_tables(p.tables, 0, p.module, a.tests, a.laws),
+            }),
+            tests: a.tests + p.tables.tests.len(),
+            laws: a.laws + p.tables.laws.len(),
+          },
+      ),
+  ).out;
+  tables_merged(
+    order.flat_map(|module: Int|
+      placed.filter(|p: PlacedTables| p.module == module).map(|p: PlacedTables| p.tables)),
+    placed.map(|p: PlacedTables| p.tables),
+  )
 }
 
 pub fn assembled_program(
   facts: List<ModuleFacts>,
-  fixing: CachedHashes,
+  hashed: OwnHashes,
   shipped: Map<Bytes, Bytes>,
   tested: Bool,
   prune_unreachable: Bool,
@@ -983,10 +1016,10 @@ pub fn assembled_program(
   pins: List<LockedPackage>,
   module_packages: List<Int>,
   embeds: List<ModuleEmbed>,
-) -> { view: CheckedProgram, views: List<ShippedModuleSummary> } / {abort.raise} = {
+) -> CheckedProgram / {abort.raise} = {
   let f = framed_program(
     facts.map(|x: ModuleFacts| x.shape),
-    fixing,
+    hashed,
     shipped,
     tested,
     prune_unreachable,
@@ -997,45 +1030,36 @@ pub fn assembled_program(
     module_packages,
     embeds,
   );
-  {
-    view: checked_program_over(f.frame, f.reads, facts.map(|x: ModuleFacts| x.tables)),
-    views: f.views,
-  }
+  checked_program_over(f.frame, f.reads, facts.map(|x: ModuleFacts| x.tables))
 }
 
 pub fn pulled_next(
   read: List<Bytes>,
   written: Map<Bytes, List<Bytes>>,
-  listed: Map<Bytes, Bool>,
+  listed: Set<Bytes>,
   requested_modules: List<Bytes>,
 ) -> List<Bytes> = {
-  let present = read.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
-    accumulator.insert(n, true));
-  let wants = |accumulator: Map<Bytes, Bool>, w: Bytes|
-    if is_shipped(w) && !present.contains(w) && listed.contains(w) { accumulator.insert(w, true) }
+  let present = read.fold(Set::empty(), |accumulator: Set<Bytes>, n: Bytes| accumulator.insert(n));
+  let wants = |accumulator: Set<Bytes>, w: Bytes|
+    if is_shipped(w) && !present.contains(w) && listed.contains(w) { accumulator.insert(w) }
     else { accumulator };
   read.fold(
-    requested_modules.fold(Map::new(), wants),
-    |accumulator: Map<Bytes, Bool>, n: Bytes|
+    requested_modules.fold(Set::empty(), wants),
+    |accumulator: Set<Bytes>, n: Bytes|
       List::fold(match written.get(n) { Some(ws) -> ws, None -> [] }, accumulator, wants),
-  ).keys(
+  ).elements(
   )
 }
 
-pub type AssembledLoad = {
-  frame: Frame,
-  reads: TableReads,
-  views: List<ShippedModuleSummary>,
-  pulled: List<Bytes>,
-}
+pub type AssembledLoad = { frame: Frame, reads: TableReads, pulled: List<Bytes> }
 
 pub fn assembled_load(
   own: List<Bytes>,
   packages: PackageSources,
   shapes: Map<Bytes, ModuleShape>,
-  fixing: CachedHashes,
+  hashed: OwnHashes,
   pulled: List<Bytes>,
-  listed: List<Bytes>,
+  tree: ToolchainTree,
   texts: Map<Bytes, Bytes>,
   tested: Bool,
   prune_unreachable: Bool,
@@ -1047,10 +1071,10 @@ pub fn assembled_load(
   let read = names.map(|n: Bytes| match shapes.get(n) { Some(s) -> s, None -> no_shape(n) });
   let embeds = read.fold([], |accumulator: List<ModuleEmbed>, s: ModuleShape|
     accumulator.concat(s.embeds));
-  let tables = package_tables(names, own.len(), clo, toolchain_tree(own, listed));
+  let tables = package_tables(names, own.len(), clo, tree);
   let program = framed_program(
     read,
-    fixing,
+    hashed,
     pulled.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, n: Bytes|
       match texts.get(n) { Some(t) -> accumulator.insert(n, t), None -> accumulator }),
     tested,
@@ -1062,7 +1086,7 @@ pub fn assembled_load(
     tables.module_packages,
     embeds,
   );
-  { frame: program.frame, reads: program.reads, views: program.views, pulled: pulled }
+  { frame: program.frame, reads: program.reads, pulled: pulled }
 }
 
 fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {abort.raise} = {
@@ -1074,9 +1098,17 @@ fn order_of(names: List<Bytes>, imports: List<List<Bytes>>) -> List<Bytes> / {ab
   post_order(edges).map(|i: Int| names.get(i))
 }
 
-fn merged_shapes(
-  shapes: List<ModuleShape>,
-) -> { outlines: List<Outline>, order: List<Bytes>, imports: List<List<Bytes>>, unimported: List<List<Bytes>>, tagged: List<TaggedSite>, statements: List<StatementSite>, consts: List<TypedConst> } / {abort.raise} = {
+type MergedShapes = {
+  outlines: List<Outline>,
+  order: List<Bytes>,
+  imports: List<List<Bytes>>,
+  unimported: List<List<Bytes>>,
+  tagged: List<TaggedSite>,
+  statements: List<StatementSite<Bytes>>,
+  consts: List<TypedConst>,
+}
+
+fn merged_shapes(shapes: List<ModuleShape>) -> MergedShapes / {abort.raise} = {
   let placed = range(0, shapes.len()).map(|k: Int| moved_shape(shapes.get(k), 0, k));
   let imports = placed.map(|s: ModuleShape| s.imports);
   {
@@ -1088,7 +1120,7 @@ fn merged_shapes(
     unimported: placed.map(|s: ModuleShape| s.unimported),
     tagged: placed.fold([], |accumulator: List<TaggedSite>, s: ModuleShape|
       accumulator.concat(s.tagged)),
-    statements: placed.fold([], |accumulator: List<StatementSite>, s: ModuleShape|
+    statements: placed.fold([], |accumulator: List<StatementSite<Bytes>>, s: ModuleShape|
       accumulator.concat(s.statements)),
     consts: placed.fold([], |accumulator: List<TypedConst>, s: ModuleShape|
       accumulator.concat(s.consts)),
@@ -1103,9 +1135,38 @@ fn merged_tables(
 ) -> CheckOutput / {abort.raise} = {
   let at_name = range(0, outlines.len()).fold(Map::new(), |accumulator: Map<Bytes, Int>, k: Int|
     accumulator.insert(outlines.get(k).name, k));
-  let checked_order = order.fold([], |accumulator: List<ModuleTables>, n: Bytes|
-    match at_name.get(n) { Some(k) -> accumulator.push(placed.get(k)), None -> accumulator });
-  let apart = test_and_law_owners(outlines);
+  let merged = tables_merged(
+    order.fold([], |accumulator: List<ModuleTables>, n: Bytes|
+      match at_name.get(n) { Some(k) -> accumulator.push(placed.get(k)), None -> accumulator }),
+    placed,
+  );
+  {
+    ..merged,
+    effects: prelude.effects.concat(merged.effects),
+    constructors: prelude.constructors.concat(merged.constructors),
+  }
+}
+
+pub fn definitions_by_module(
+  checked_order: List<Bytes>,
+  definitions: List<DefinitionInfo>,
+) -> List<DefinitionInfo> = {
+  let by_module = definitions.fold(
+    Map::new(),
+    |found: Map<Bytes, List<DefinitionInfo>>, d: DefinitionInfo|
+      found.insert(d.module, match found.get(d.module) { Some(ds) -> ds.push(d), None -> [d] }),
+  );
+  let placed = checked_order.fold(Set::empty(), |found: Set<Bytes>, m: Bytes| found.insert(m));
+  checked_order.flat_map(|m: Bytes| match by_module.get(m) { Some(ds) -> ds, None -> [] }).concat(
+    definitions.filter(|d: DefinitionInfo| !placed.contains(d.module)),
+  )
+}
+
+fn tables_merged(
+  checked_order: List<ModuleTables>,
+  placed: List<ModuleTables>,
+) -> CheckOutput / {abort.raise} = {
+  let apart = test_and_law_owners(placed);
   let of_definitions = |owner: Bytes| !apart.contains(owner);
   {
     ok: true,
@@ -1116,16 +1177,11 @@ fn merged_tables(
     tests: placed.fold([], |accumulator: List<TestInfo>, t: ModuleTables|
       accumulator.concat(t.tests)),
     laws: placed.fold([], |accumulator: List<LawInfo>, t: ModuleTables| accumulator.concat(t.laws)),
-    effects: checked_order.fold(
-      prelude.effects,
-      |accumulator: List<EffectInfo>, t: ModuleTables| accumulator.concat(t.effects),
-    ),
-    constructors: checked_order.fold(
-      prelude.constructors,
-      |accumulator: List<ConstructorInfo>, t: ModuleTables| accumulator.concat(t.constructors),
-    ),
+    effects: checked_order.fold([], |accumulator: List<EffectInfo>, t: ModuleTables|
+      accumulator.concat(t.effects)),
+    constructors: checked_order.fold([], |accumulator: List<ConstructorInfo>, t: ModuleTables|
+      accumulator.concat(t.constructors)),
     seeded: [],
-    cached_tests: [],
     facts: {
       pure: checked_order.fold([], |accumulator: List<Bytes>, t: ModuleTables|
         accumulator.concat(t.facts.pure)),
@@ -1160,10 +1216,8 @@ fn exposes_body(definition: FnDefinition) -> Bool =
     || (match definition.transparent { Some(_) -> true, None -> false })
 
 pub fn cuts_of(parsed: ParsedModule) -> List<Cut> = {
-  let generated = parsed.derived.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, d: DeriveOrigin| accumulator.insert(span_key(d.span), true),
-  );
+  let generated = parsed.derived.fold(Set::empty(), |accumulator: Set<Bytes>, d: DeriveOrigin|
+    accumulator.insert(span_key(d.span)));
   parsed.module.items.fold([], |accumulator: List<Cut>, item: Item|
     match item {
       FunctionItem(d) -> if generated.contains(span_key(d.span)) || exposes_body(d) { accumulator }
@@ -1216,7 +1270,68 @@ pub type Analysis = {
   embeds: List<ModuleEmbed>,
   embed_items: Map<Bytes, List<ItemEmbeds>>,
   bodies: List<CheckedBody>,
+  declared: StoredDeclarations,
 }
+
+pub type GroupAnalysis = {
+  modules: List<ParsedModule>,
+  r: Resolution,
+  unimported: List<List<Bytes>>,
+  checked: CheckOutput,
+  index: Index,
+  warnings: List<Diagnostic>,
+  uses: List<UseNode>,
+  manifest: Option<Manifest>,
+  packages: List<PackageDependencies>,
+  locked_packages: List<LockedPackage>,
+  module_packages: List<Int>,
+  stub_cuts: Map<Bytes, List<Cut>>,
+  embeds: List<ModuleEmbed>,
+  embed_items: Map<Bytes, List<ItemEmbeds>>,
+  bodies: List<CheckedBody>,
+  declared: StoredDeclarations,
+}
+
+pub fn group_part(a: Analysis) -> GroupAnalysis =
+  {
+    modules: a.modules,
+    r: a.r,
+    unimported: a.unimported,
+    checked: a.checked,
+    index: a.index,
+    warnings: a.warnings,
+    uses: a.uses,
+    manifest: a.manifest,
+    packages: a.packages,
+    locked_packages: a.locked_packages,
+    module_packages: a.module_packages,
+    stub_cuts: a.stub_cuts,
+    embeds: a.embeds,
+    embed_items: a.embed_items,
+    bodies: a.bodies,
+    declared: a.declared,
+  }
+
+pub fn hashed_analysis(g: GroupAnalysis, hashes: HashOutput) -> Analysis =
+  {
+    modules: g.modules,
+    r: g.r,
+    unimported: g.unimported,
+    checked: g.checked,
+    index: g.index,
+    hashes: hashes,
+    warnings: g.warnings,
+    uses: g.uses,
+    manifest: g.manifest,
+    packages: g.packages,
+    locked_packages: g.locked_packages,
+    module_packages: g.module_packages,
+    stub_cuts: g.stub_cuts,
+    embeds: g.embeds,
+    embed_items: g.embed_items,
+    bodies: g.bodies,
+    declared: g.declared,
+  }
 
 pub type TaggedSite = {
   module: Int,
@@ -1224,12 +1339,11 @@ pub type TaggedSite = {
   tag: Bytes,
   parts: List<TaggedPart>,
   callee: Bytes,
-  hash: Bytes,
 }
 
 derive bin for TaggedSite
 
-pub fn tagged_of(w: Analysis, i: Int) -> List<TaggedSite> / {abort.raise} =
+pub fn tagged_of(w: GroupAnalysis, i: Int) -> List<TaggedSite> / {abort.raise} =
   tagged_in(w.modules.get(i).module).fold([], |sites: List<TaggedSite>, t: TaggedLiteral|
     match tagged_target(w.index, i, t) {
       None -> sites,
@@ -1240,27 +1354,14 @@ pub fn tagged_of(w: Analysis, i: Int) -> List<TaggedSite> / {abort.raise} =
           tag: t.tag.name,
           parts: tagged_parts(t),
           callee: callee,
-          hash: b"",
         }),
     })
-
-pub fn root_tagged(
-  module_packages: List<Int>,
-  hashes: HashOutput,
-  sites: List<TaggedSite>,
-) -> List<TaggedSite> = {
-  let hashed = by_name(hashes.definitions);
-  sites.fold([], |accumulator: List<TaggedSite>, t: TaggedSite|
-    if module_packages.at(t.module) != Some(0) { accumulator } else {
-      accumulator.push({ ..t, hash: match hashed.get(t.callee) { Some(h) -> h, None -> b"" } })
-    })
-}
 
 pub type TypedConst = { module: Int, name: Bytes, type_name: Bytes }
 
 derive bin for TypedConst
 
-pub fn typed_consts_of(w: Analysis, i: Int) -> List<TypedConst> / {abort.raise} =
+pub fn typed_consts_of(w: GroupAnalysis, i: Int) -> List<TypedConst> / {abort.raise} =
   w.modules.get(i).module.items.fold([], |accumulator: List<TypedConst>, item: Item|
     match item {
       FunctionItem(d) -> match ((d.constant, d.return_type)) {
@@ -1278,26 +1379,23 @@ pub fn typed_consts_of(w: Analysis, i: Int) -> List<TypedConst> / {abort.raise} 
       _ -> accumulator,
     })
 
-pub fn root_consts(module_packages: List<Int>, consts: List<TypedConst>) -> List<TypedConst> =
-  consts.filter(|c: TypedConst| module_packages.at(c.module) == Some(0))
-
-pub type Argument =
+pub type Argument<reference> =
   | TextArgument(Bytes)
-  | CallArgument({ callee: Bytes, hash: Bytes, args: List<Argument> })
+  | CallArgument({ callee: reference, args: List<Argument<reference>> })
   | RowArgument(List<RowField>)
-  | TaggedArgument({ callee: Bytes, hash: Bytes, parts: List<Bytes>, holes: List<Argument> })
-  | ListArgument(List<Argument>)
+  | TaggedArgument({ callee: reference, parts: List<Bytes>, holes: List<Argument<reference>> })
+  | ListArgument(List<Argument<reference>>)
   | ConstructorArgument({ type_name: Bytes, name: Bytes })
   | OtherArgument
 
 derive bin for Argument
 
-pub type StatementSite = {
+pub type StatementSite<reference> = {
   module: Int,
   span: Span,
   callee: Bytes,
   label: Bytes,
-  args: List<Argument>,
+  args: List<Argument<reference>>,
 }
 
 derive bin for StatementSite
@@ -1307,7 +1405,7 @@ pub const statement_modules: List<Bytes> = [b"std.db", b"std.sqlite"]
 fn of_statement_module(callee: Bytes) -> Bool =
   statement_modules.fold(false, |b: Bool, m: Bytes| b || callee.starts_with(m.concat(b".")))
 
-type ArgumentScope = { index: Index, hashes: Map<Bytes, Bytes>, rows: Map<Bytes, List<RowField>> }
+type ArgumentScope = { index: Index, rows: Map<Bytes, List<RowField>> }
 
 pub type RowRead =
   | ScalarRead(Bytes)
@@ -1354,66 +1452,34 @@ fn row_read_of(read: codec::ColumnRead) -> RowRead =
     codec::ByJson(_) -> JsonRead,
   }
 
-pub fn statements_of(w: Analysis, i: Int) -> List<StatementSite> / {abort.raise} = {
+pub fn statements_of(w: GroupAnalysis, i: Int) -> List<StatementSite<Bytes>> / {abort.raise} = {
   let name = w.modules.get(i).name;
   let imported = w.r.imports.get(i).map(|t: Int| w.modules.get(t).name);
   if statement_modules.contains(name)
       || !statement_modules.fold(false, |b: Bool, m: Bytes| b || imported.contains(m)) { [] }
-  else { sites_in(w, i, of_statement_module, Map::new()) }
+  else { sites_in(w, i, of_statement_module) }
 }
 
 pub fn sites_in(
-  w: Analysis,
+  w: GroupAnalysis,
   i: Int,
   picked: (Bytes) -> Bool,
-  hashes: Map<Bytes, Bytes>,
-) -> List<StatementSite> / {abort.raise} = {
-  let reading = { index: w.index, hashes: hashes, rows: derived_rows(w.modules) };
+) -> List<StatementSite<Bytes>> / {abort.raise} = {
+  let reading = { index: w.index, rows: derived_rows(w.modules) };
   let calls = expressions_matching(w.modules.get(i).module, |e: Expression|
     match e { PerformExpression(_) -> true, CallExpression(a) -> a.labels.len() > 0, _ -> false });
-  calls.fold([], |sites: List<StatementSite>, e: Expression|
+  calls.fold([], |sites: List<StatementSite<Bytes>>, e: Expression|
     match statement_site(reading, i, e) {
       Some(site) -> if picked(site.callee) { sites.push(site) } else { sites },
       None -> sites,
     })
 }
 
-pub fn root_statements(
-  module_packages: List<Int>,
-  hashes: HashOutput,
-  sites: List<StatementSite>,
-) -> List<StatementSite> / {abort.raise} = {
-  let hashed = by_name(hashes.definitions);
-  sites.fold([], |accumulator: List<StatementSite>, x: StatementSite|
-    if module_packages.at(x.module) != Some(0) { accumulator }
-    else { accumulator.push({ ..x, args: x.args.map(|a: Argument| hashed_argument(hashed, a)) }) })
-}
-
-fn hashed_argument(hashed: Map<Bytes, Bytes>, a: Argument) -> Argument / {abort.raise} = {
-  let hash_of = |name: Bytes| match hashed.get(name) { Some(h) -> h, None -> b"" };
-  match a {
-    CallArgument(c) ->
-      CallArgument({
-        ..c,
-        hash: hash_of(c.callee),
-        args: c.args.map(|x: Argument| hashed_argument(hashed, x)),
-      }),
-    TaggedArgument(t) ->
-      TaggedArgument({
-        ..t,
-        hash: hash_of(t.callee),
-        holes: t.holes.map(|x: Argument| hashed_argument(hashed, x)),
-      }),
-    ListArgument(xs) -> ListArgument(xs.map(|x: Argument| hashed_argument(hashed, x))),
-    other -> other,
-  }
-}
-
 fn statement_site(
   reading: ArgumentScope,
   module: Int,
   e: Expression,
-) -> Option<StatementSite> / {abort.raise} = {
+) -> Option<StatementSite<Bytes>> / {abort.raise} = {
   let args = |xs: List<Expression>| xs.map(|x: Expression| argument(reading, module, x));
   match e {
     PerformExpression(p) -> match ((
@@ -1448,8 +1514,7 @@ fn statement_site(
   }
 }
 
-fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {abort.raise} = {
-  let hash_of = |name: Bytes| match reading.hashes.get(name) { Some(h) -> h, None -> b"" };
+fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument<Bytes> / {abort.raise} =
   match e {
     LiteralExpression(l) -> match l.literal {
       LiteralString(s) -> TextArgument(s),
@@ -1476,7 +1541,6 @@ fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {a
             None ->
               CallArgument({
                 callee: callee,
-                hash: hash_of(callee),
                 args: a.args.map(|x: Expression| argument(reading, module, x)),
               }),
           },
@@ -1491,7 +1555,6 @@ fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {a
       Some(callee) ->
         TaggedArgument({
           callee: callee,
-          hash: hash_of(callee),
           parts: tagged_parts(t).map(|part: TaggedPart| part.text),
           holes: t.holes.map(|h: Hole| argument(reading, module, h.value)),
         }),
@@ -1499,7 +1562,6 @@ fn argument(reading: ArgumentScope, module: Int, e: Expression) -> Argument / {a
     },
     _ -> OtherArgument,
   }
-}
 
 pub const std_package: PackageDependencies = { prefix: b"std", dependencies: [] }
 
@@ -1551,20 +1613,12 @@ pub fn is_shipped_module(
 
 pub type ToolchainTree = | NoTree | StdTree | CompilerTree
 
-pub fn toolchain_tree(own: List<Bytes>, listed: List<Bytes>) -> ToolchainTree = {
-  let whole = |under: (Bytes) -> Bool|
-    named_under(own, under) && listed.any(under)
-      && listed.fold(true, |b: Bool, n: Bytes| b && (!under(n) || own.contains(n)));
-  if whole(is_std) { StdTree } else if whole(is_compiler) { CompilerTree } else { NoTree }
-}
-
-pub fn tree_named(own: List<Bytes>) -> ToolchainTree =
-  if named_under(own, is_std) { StdTree }
-  else if named_under(own, is_compiler) { CompilerTree }
-  else { NoTree }
-
-fn named_under(own: List<Bytes>, under: (Bytes) -> Bool) -> Bool =
-  own.len() > 0 && own.fold(true, |b: Bool, n: Bytes| b && under(n))
+pub fn toolchain_tree(part: Option<PartRole>) -> ToolchainTree =
+  match part {
+    Some(StandardLibraryPart) -> StdTree,
+    Some(CompilerPart) -> CompilerTree,
+    None -> NoTree,
+  }
 
 pub fn home_of(modules: List<ParsedModule>, of: SchemaInstance) -> Option<Int> =
   match of.module {
@@ -1579,10 +1633,3 @@ pub fn home_of(modules: List<ParsedModule>, of: SchemaInstance) -> Option<Int> =
           },
         }),
   }
-
-pub type ShippedModuleSummary = {
-  module: Bytes,
-  text: Bytes,
-  form: Bytes,
-  definitions: List<{ name: Bytes, hash: Bytes }>,
-}

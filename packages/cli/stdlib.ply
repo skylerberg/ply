@@ -1,3 +1,5 @@
+import compiler.codes (internal_error_code)
+import compiler.check.resolve.tables (error_unplaced)
 import builder (builder)
 import args (Flags, style_of)
 import diagnostic (all_to_json, all_to_text, errors_of)
@@ -10,13 +12,12 @@ import doc (summary_of)
 import std.term (Style, plain)
 import compiler.store.hash.encoding (hex)
 import compiler.unit (shipped, identity_of)
-import compiler.checkout (shipped_store_dir)
 import compiler.front (ShippedData, parse_shipped, shipped_data_wanted)
 import compiler.front.checking (CheckedModule)
-import compiler.load (Derives)
+import compiler.load (Loads)
 import compiler.syntax.items (Item, FunctionItem, ExternItem, TypeItem, EffectItem, TestItem,
                               is_std)
-import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic, error_at)
+import compiler.check.resolve.tables (Source, ParsedModule, Diagnostic)
 import std.fs (fs)
 import std.hash (blake3)
 import std.json (Json, Str, Bool, Number, Array, object)
@@ -25,7 +26,9 @@ import std.string
 import std.text
 import hosts (indented)
 import compiler.store.packs
-import compiler.syntax.parsing (no_module, dummy_span)
+import compiler.store.database
+import compiler.store.database (StoreProblem)
+import compiler.store.fact_store (Opening, recent_reads)
 import std.path (strip_root)
 import std.process (process)
 import std.time (time)
@@ -246,10 +249,8 @@ pub fn unknown_module(query: String, names: List<String>, data: List<String>) ->
   let ticked = |entries: List<String>| String::join(entries.map(|n: String| "`" ++ n ++ "`"), ", ");
   let also = if data.len() == 0 { [] }
   else { [Bytes::of_string("and the data files its modules embed: " ++ ticked(data))] };
-  error_at(
+  error_unplaced(
     b"E0106",
-    no_module,
-    dummy_span,
     Bytes::of_string("no module named `" ++ query ++ "` ships with this compiler"),
     b"not found",
     [Bytes::of_string("the standard library contains: " ++ ticked(names))].concat(also).concat([
@@ -303,25 +304,34 @@ pub fn shipped_results_digest() -> CommandOutput / {shipped.definitions, abort.r
 
 pub fn pack_shipped_results(
   dir: String,
-  reused: String,
   phases: Bool,
-) -> CommandOutput / {fs.list_dir[shipped], fs.read_file[shipped], fs.read[abs], fs.write[abs], process.err[proc], time.elapsed_ms, Derives, abort.raise} = {
+) -> CommandOutput / {fs.list_dir[shipped], fs.read_file[shipped], fs.read[abs], fs.write[abs], process.err[proc], time.elapsed_ms, abort.raise} = {
   let names = shipped_modules().map(|s: Source| s.name);
-  let work = strip_root(shipped_store_dir(reused));
-  let started = time.elapsed_ms();
-  let check_outcome = module_queries::shipped_results[abs](work, names);
-  timed(phases, "checked the shipped modules", started);
-  match check_outcome.rejected {
-    [] -> packed_results(dir, work, names.len(), check_outcome.keys, phases),
-    rejected -> stopped(plain, shipped_rejected(rejected)),
-  }
+  database::with_opening[abs](strip_root(database::database_in(dir)), |opening: Opening| {
+    let started = time.elapsed_ms();
+    let check_outcome = module_queries::shipped_results[abs](opening, names);
+    timed(phases, "checked the shipped modules", started);
+    with_store_problems(
+      match check_outcome.value.rejected {
+        [] -> packed_results(dir, opening, names.len(), check_outcome.value, phases),
+        rejected -> stopped(plain, shipped_rejected(rejected)),
+      },
+      check_outcome.problems,
+    )
+  })
 }
 
+fn with_store_problems(output: CommandOutput, problems: List<StoreProblem>) -> CommandOutput =
+  {
+    ..output,
+    errs: output.errs.concat(
+      problems.map(|problem: StoreProblem| "warning: " ++ database::problem_message(problem)),
+    ),
+  }
+
 fn shipped_rejected(rejected: List<CheckedModule>) -> Diagnostic =
-  error_at(
-    b"E0505",
-    no_module,
-    dummy_span,
+  error_unplaced(
+    internal_error_code,
     Bytes::concat_all([
       b"shipped modules do not check: ",
       Bytes::join(rejected.map(|a: CheckedModule| a.module), b", "),
@@ -336,14 +346,14 @@ fn shipped_rejected(rejected: List<CheckedModule>) -> Diagnostic =
 
 fn packed_results(
   dir: String,
-  work: String,
+  opening: Opening,
   modules: Int,
-  keys: List<Bytes>,
+  results: module_queries::ShippedResults,
   phases: Bool,
-) -> CommandOutput / {fs.read[abs], fs.write[abs], fs.read_file[shipped], process.err[proc], time.elapsed_ms, abort.raise} = {
+) -> CommandOutput / {fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, process.err[proc], time.elapsed_ms, abort.raise} = {
   let returned = time.elapsed_ms();
-  let pack = module_queries::write_shipped_pack[abs](work, keys);
-  timed(phases, "compressed the pack", returned);
+  let pack = module_queries::write_shipped_pack[abs](opening, results);
+  timed(phases, "built the pack", returned);
   let packed = time.elapsed_ms();
   let to = strip_root(dir) ++ "/pack";
   let claimed = fs.create_dir[abs](to) && fs.write_file[abs](strip_root(dir) ++ "/standing", b"");
@@ -353,10 +363,8 @@ fn packed_results(
   if !wrote {
     stopped(
       plain,
-      error_at(
+      error_unplaced(
         b"E0502",
-        no_module,
-        dummy_span,
         Bytes::of_string("could not write `" ++ dir ++ "/pack`"),
         b"the shipped modules were checked but not packed",
         [],

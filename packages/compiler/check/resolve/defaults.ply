@@ -1,5 +1,6 @@
-import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, is_bare, span_to, starts_upper,
-                                synthetic_span, synthetic_span_at, role_constant_read,
+import compiler.check.resolve.tables (other_modules, declared_in, Binding)
+import compiler.syntax.parsing (Span, Identifier, QName, generated_span, is_bare, span_to,
+                                starts_upper, synthetic_span, synthetic_span_at, role_constant_read,
                                 role_member_field, role_member_receiver)
 import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, FnDefinition, SpecClause,
                               Binder, parse, is_pub)
@@ -18,11 +19,13 @@ import compiler.syntax.expressions (Expression, LiteralExpression, NameExpressio
 import compiler.syntax.calls (slotted, ordered_arguments, Slot, FromDefault, UnmatchedReason,
                               NoSuchParameter, FilledByPosition)
 import std.list
+import std.graph
 import compiler.check.known (none_constructor)
 import compiler.check.resolve.tables (ParsedModule, ValueSpace, EffectSpace, ModuleBinding, Scope,
                                       Diagnostic, Resolution, lookup_declared, find_module_binding,
                                       qualify, error_at, list_names, ParamInfo, Parameters)
-import compiler.check.resolve.scopes (find, method_binder)
+import compiler.syntax.expressions (expression_nodes_folded)
+import compiler.check.resolve.scopes (find, method_binder, method_binder_module)
 import compiler.check.resolve.sets (add_module_binding, concat_diagnostics)
 import compiler.check.resolve.bindings (item_binders)
 
@@ -34,7 +37,6 @@ type Qualifier = {
   imports: List<ModuleBinding>,
   diagnostics: List<Diagnostic>,
   rejected: Bool,
-  constants: Map<Bytes, Bool>,
 }
 
 fn rejected(qualifier: Qualifier, span: Span) -> Qualifier =
@@ -65,16 +67,15 @@ fn constant_read(span: Span, name: QName) -> Expression =
     labels: [],
   })
 
+fn binding_constant(r: Resolution, b: Binding) -> Bool / {other_modules.read} =
+  match declared_in(r, b.owner, ValueSpace, b.name) { Some(d) -> d.constant, None -> false }
+
 fn names_constant(
   r: Resolution,
-  constants: Map<Bytes, Bool>,
   module: Int,
   name: QName,
-) -> Bool / {abort.raise} =
-  match find(r, module, ValueSpace, name) {
-    Some(b) -> constants.contains(b.qualified),
-    None -> false,
-  }
+) -> Bool / {abort.raise, other_modules.read} =
+  match find(r, module, ValueSpace, name) { Some(b) -> binding_constant(r, b), None -> false }
 
 type QualifyResult = { q: Qualifier, e: Expression }
 
@@ -82,11 +83,11 @@ fn qualify_expression(
   resolved: Resolution,
   qualifier: Qualifier,
   expression: Expression,
-) -> QualifyResult / {abort.raise} =
+) -> QualifyResult / {abort.raise, other_modules.read} =
   match expression {
     HoleExpression(_) -> { q: qualifier, e: expression },
     NameExpression(v) -> if !is_bare(v.name) {
-      if names_constant(resolved, qualifier.constants, qualifier.owner, v.name) {
+      if names_constant(resolved, qualifier.owner, v.name) {
         { q: qualifier, e: constant_read(v.span, v.name) }
       } else { { q: qualifier, e: expression } }
     } else {
@@ -117,7 +118,7 @@ fn qualify_expression(
         },
         None -> match find(resolved, qualifier.owner, ValueSpace, v.name) {
           None -> { q: qualifier, e: expression },
-          Some(b) -> if b.owner == qualifier.owner && qualifier.public
+          Some(b) -> if b.owner == resolved.scopes.get(qualifier.owner).module && qualifier.public
               && !declaration_public(resolved, qualifier.owner, v.name.name.name) {
             {
               q: {
@@ -142,10 +143,11 @@ fn qualify_expression(
               e: expression,
             }
           } else {
-            let module = method_binder(resolved.scopes.get(b.owner).module);
+            let module = method_binder(b.owner);
             let imports = match find_module_binding(qualifier.imports, module) {
               Some(_) -> qualifier.imports,
-              None -> qualifier.imports.push({ binder: module, target: b.owner, span: dummy_span }),
+              None ->
+                qualifier.imports.push({ binder: module, target: b.owner, span: generated_span }),
             };
             let name = {
               module: Some({ name: module, span: v.name.span }),
@@ -154,7 +156,7 @@ fn qualify_expression(
             };
             {
               q: { ..qualifier, imports: imports },
-              e: if qualifier.constants.contains(b.qualified) { constant_read(v.span, name) }
+              e: if binding_constant(resolved, b) { constant_read(v.span, name) }
               else { NameExpression({ span: v.span, name: name }) },
             }
           },
@@ -311,7 +313,7 @@ fn qualify_expressions(
   resolved: Resolution,
   qualifier: Qualifier,
   expressions: List<Expression>,
-) -> { q: Qualifier, xs: List<Expression> } / {abort.raise} =
+) -> { q: Qualifier, xs: List<Expression> } / {abort.raise, other_modules.read} =
   expressions.fold(
     { q: qualifier, xs: [] },
     |accumulator: { q: Qualifier, xs: List<Expression> }, expression: Expression| {
@@ -324,7 +326,7 @@ fn qualify_fields(
   resolved: Resolution,
   qualifier: Qualifier,
   fields: List<RecordLiteralField>,
-) -> { q: Qualifier, xs: List<RecordLiteralField> } / {abort.raise} =
+) -> { q: Qualifier, xs: List<RecordLiteralField> } / {abort.raise, other_modules.read} =
   fields.fold(
     { q: qualifier, xs: [] },
     |accumulator: { q: Qualifier, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
@@ -333,31 +335,53 @@ fn qualify_fields(
     },
   )
 
-fn declaration_public(resolved: Resolution, owner: Int, name: Bytes) -> Bool / {abort.raise} =
-  match lookup_declared(resolved.declarations.get(owner), ValueSpace, name) {
+fn declaration_public(
+  resolved: Resolution,
+  owner: Int,
+  name: Bytes,
+) -> Bool / {abort.raise, other_modules.read} =
+  match declared_in(resolved, resolved.scopes.get(owner).module, ValueSpace, name) {
     Some(d) -> d.public,
     None -> false,
   }
 
+pub fn names_in_defaults(p: Parameters) -> List<{ module: Bytes, name: Bytes }> =
+  p.params.fold([], |found: List<{ module: Bytes, name: Bytes }>, info: ParamInfo|
+    match info.default {
+      Some(d) ->
+        expression_nodes_folded(
+          d,
+          found,
+          |names: List<{ module: Bytes, name: Bytes }>, x: Expression|
+            match x {
+              NameExpression(v) -> match v.name.module {
+                Some(b) -> match method_binder_module(b.name) {
+                  Some(home) -> names.push({ module: home, name: v.name.name.name }),
+                  None -> names,
+                },
+                None -> names,
+              },
+              _ -> names,
+            },
+        ),
+      None -> found,
+    })
+
 type SignatureCollection = {
   sigs: List<Parameters>,
-  owner_imports: List<{ module: Int, binder: Bytes, target: Int }>,
+  owner_imports: List<{ module: Int, binder: Bytes, target: Bytes }>,
   diagnostics: List<Diagnostic>,
 }
 
 fn collect_signatures(
   resolved: Resolution,
   modules: List<ParsedModule>,
-  constants: Map<Bytes, Bool>,
-) -> SignatureCollection / {abort.raise} =
+) -> SignatureCollection / {abort.raise, other_modules.read} =
   range(0, modules.len()).fold(
     { sigs: [], owner_imports: [], diagnostics: [] },
     |accumulator: SignatureCollection, m: Int|
       modules.get(m).module.items.fold(accumulator, |c: SignatureCollection, item: Item|
-        match item {
-          FunctionItem(f) -> collect_signature(resolved, modules, m, c, f, constants),
-          _ -> c,
-        }),
+        match item { FunctionItem(f) -> collect_signature(resolved, modules, m, c, f), _ -> c }),
   )
 
 fn collect_signature(
@@ -366,8 +390,7 @@ fn collect_signature(
   m: Int,
   c: SignatureCollection,
   definition: FnDefinition,
-  constants: Map<Bytes, Bool>,
-) -> SignatureCollection / {abort.raise} = {
+) -> SignatureCollection / {abort.raise, other_modules.read} = {
   let binders = if definition.params.any(|param: Param| param.default != None) {
     item_binders(resolved, m, FunctionItem(definition))
   } else { Map::new() };
@@ -392,7 +415,6 @@ fn collect_signature(
               imports: [],
               diagnostics: accumulator.c.diagnostics,
               rejected: false,
-              constants: constants,
             },
             d,
           );
@@ -408,7 +430,7 @@ fn collect_signature(
           } else {
             let owner_imports = o.q.imports.fold(
               accumulator.c.owner_imports,
-              |oi: List<{ module: Int, binder: Bytes, target: Int }>, binding: ModuleBinding|
+              |oi: List<{ module: Int, binder: Bytes, target: Bytes }>, binding: ModuleBinding|
                 oi.push({ module: m, binder: binding.binder, target: binding.target }),
             );
             {
@@ -442,11 +464,11 @@ fn builtin_signature(name: Bytes) -> Option<Parameters> =
           name: b"message",
           default: Some(
             NameExpression({
-              span: dummy_span,
+              span: generated_span,
               name: {
                 module: None,
-                name: { name: none_constructor, span: dummy_span },
-                span: dummy_span,
+                name: { name: none_constructor, span: generated_span },
+                span: generated_span,
               },
             }),
           ),
@@ -465,13 +487,17 @@ type Filler = {
 
 type FillResult = { filler: Filler, expression: Expression }
 
-type FillContext = { r: Resolution, index: Map<Bytes, Parameters>, constants: Map<Bytes, Bool> }
+type FillContext = { r: Resolution, index: Map<Bytes, Parameters> }
 
 fn is_local(filler: Filler, name: QName) -> Bool =
   is_bare(name) && filler.binders.contains(name.name.span.site)
 
-fn reads_constant(f: FillContext, filler: Filler, name: QName) -> Bool / {abort.raise} =
-  !is_local(filler, name) && names_constant(f.r, f.constants, filler.module, name)
+fn reads_constant(
+  f: FillContext,
+  filler: Filler,
+  name: QName,
+) -> Bool / {abort.raise, other_modules.read} =
+  !is_local(filler, name) && names_constant(f.r, filler.module, name)
 
 type Perform = {
   span: Span,
@@ -505,7 +531,7 @@ fn fill_expression(
   f: FillContext,
   filler: Filler,
   expression: Expression,
-) -> FillResult / {abort.raise} = {
+) -> FillResult / {abort.raise, other_modules.read} = {
   let o = fill_children(f, filler, expression);
   match o.expression { CallExpression(a) -> fill_call(f, o.filler, a), _ -> o }
 }
@@ -514,7 +540,7 @@ fn fill_children(
   f: FillContext,
   filler: Filler,
   expression: Expression,
-) -> FillResult / {abort.raise} =
+) -> FillResult / {abort.raise, other_modules.read} =
   match expression {
     LiteralExpression(_) -> { filler: filler, expression: expression },
     TaggedLiteralExpression(t) -> {
@@ -810,7 +836,7 @@ fn fill_expressions(
   f: FillContext,
   filler: Filler,
   expressions: List<Expression>,
-) -> { filler: Filler, xs: List<Expression> } / {abort.raise} =
+) -> { filler: Filler, xs: List<Expression> } / {abort.raise, other_modules.read} =
   expressions.fold(
     { filler: filler, xs: [] },
     |accumulator: { filler: Filler, xs: List<Expression> }, expression: Expression| {
@@ -823,7 +849,7 @@ fn fill_fields(
   f: FillContext,
   filler: Filler,
   fields: List<RecordLiteralField>,
-) -> { filler: Filler, xs: List<RecordLiteralField> } / {abort.raise} =
+) -> { filler: Filler, xs: List<RecordLiteralField> } / {abort.raise, other_modules.read} =
   fields.fold(
     { filler: filler, xs: [] },
     |accumulator: { filler: Filler, xs: List<RecordLiteralField> }, field: RecordLiteralField| {
@@ -836,12 +862,15 @@ fn signature_of(
   f: FillContext,
   filler: Filler,
   function: Expression,
-) -> Option<Parameters> / {abort.raise} =
+) -> Option<Parameters> / {abort.raise, other_modules.read} =
   match function {
     NameExpression(v) -> if is_bare(v.name) && starts_upper(v.name.name.name) { None }
     else if is_bare(v.name) && filler.binders.contains(v.name.name.span.site) { None } else {
       match find(f.r, filler.module, ValueSpace, v.name) {
-        Some(b) -> f.index.get(b.qualified),
+        Some(b) -> match f.index.get(b.qualified) {
+          Some(p) -> Some(p),
+          None -> other_modules.look_up_parameters(b.qualified),
+        },
         None -> if is_bare(v.name) { builtin_signature(v.name.name.name) } else { None },
       }
     },
@@ -902,7 +931,11 @@ fn as_perform(
     _ -> None,
   }
 
-fn fill_call(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.raise} =
+fn fill_call(
+  f: FillContext,
+  filler: Filler,
+  call: Call,
+) -> FillResult / {abort.raise, other_modules.read} =
   match call.function {
     FieldExpression(on) -> match as_perform(filler, call, on.base, on.field) {
       Some(p) -> p,
@@ -911,7 +944,11 @@ fn fill_call(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.
     _ -> fill_by_signature(f, filler, call),
   }
 
-fn fill_by_signature(f: FillContext, filler: Filler, call: Call) -> FillResult / {abort.raise} =
+fn fill_by_signature(
+  f: FillContext,
+  filler: Filler,
+  call: Call,
+) -> FillResult / {abort.raise, other_modules.read} =
   match signature_of(f, filler, call.function) {
     None -> {
       let diagnostics = call.named.fold(
@@ -1042,7 +1079,7 @@ fn fill_params(
   f: FillContext,
   filler: Filler,
   params: List<Param>,
-) -> { filler: Filler, xs: List<Param> } / {abort.raise} =
+) -> { filler: Filler, xs: List<Param> } / {abort.raise, other_modules.read} =
   params.fold(
     { filler: filler, xs: [] },
     |accumulator: { filler: Filler, xs: List<Param> }, param: Param|
@@ -1059,7 +1096,7 @@ fn fill_item(
   f: FillContext,
   filler: Filler,
   item: Item,
-) -> { filler: Filler, it: Item } / {abort.raise} =
+) -> { filler: Filler, it: Item } / {abort.raise, other_modules.read} =
   match item {
     FunctionItem(d) -> {
       let params = fill_params(f, filler, d.params);
@@ -1139,27 +1176,15 @@ pub type ResolvedProgram = {
   diagnostics: List<Diagnostic>,
 }
 
-fn constants_of(modules: List<ParsedModule>) -> Map<Bytes, Bool> =
-  modules.fold(Map::new(), |found: Map<Bytes, Bool>, m: ParsedModule|
-    m.module.items.fold(found, |accumulator: Map<Bytes, Bool>, item: Item|
-      match item {
-        FunctionItem(d) -> match d.constant {
-          Some(_) -> accumulator.insert(qualify(m.name, d.name.name), true),
-          None -> accumulator,
-        },
-        _ -> accumulator,
-      }))
-
 pub fn fill_defaults(
   r: Resolution,
   modules: List<ParsedModule>,
   diagnostics: List<Diagnostic>,
-) -> ResolvedProgram / {abort.raise} = {
-  let constants = constants_of(modules);
-  let c = collect_signatures(r, modules, constants);
+) -> ResolvedProgram / {abort.raise, other_modules.read} = {
+  let c = collect_signatures(r, modules);
   let r2 = c.owner_imports.fold(
     r,
-    |accumulator: Resolution, oi: { module: Int, binder: Bytes, target: Int }|
+    |accumulator: Resolution, oi: { module: Int, binder: Bytes, target: Bytes }|
       add_module_binding(accumulator, oi.module, oi.binder, oi.target),
   );
   let f = {
@@ -1169,7 +1194,6 @@ pub fn fill_defaults(
         Some(_) -> accumulator,
         None -> accumulator.insert(signature.name, signature),
       }),
-    constants: constants,
   };
   let walked = range(0, modules.len()).fold(
     { resolution: r2, modules: [], diagnostics: concat_diagnostics(diagnostics, c.diagnostics) },
@@ -1225,20 +1249,7 @@ pub fn fill_defaults(
 }
 
 fn transitive_imports(imports: List<List<Int>>, m: Int) -> List<Int> / {abort.raise} =
-  iterate({ seen: [m], work: [m] }, 1000000, |s: { seen: List<Int>, work: List<Int> }|
-    match s.work {
-      [] -> Stop(s.seen),
-      [k, ..rest] ->
-        Continue(
-          List::fold(
-            match imports.at(k) { Some(ts) -> ts, None -> [] },
-            { seen: s.seen, work: rest },
-            |accumulator: { seen: List<Int>, work: List<Int> }, t: Int|
-              if accumulator.seen.contains(t) { accumulator }
-              else { { seen: accumulator.seen.push(t), work: accumulator.work.push(t) } },
-          ),
-        ),
-    })
+  graph::breadth_first({ out: imports }, [m])
 
 pub fn make_all_visible(r: Resolution) -> Resolution =
   { ..r, visible_modules: r.scopes.map(|_: Scope| range(0, r.scopes.len())) }

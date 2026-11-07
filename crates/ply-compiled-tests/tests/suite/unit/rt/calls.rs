@@ -1,12 +1,15 @@
 use crate::bare::{context_of, helper};
-use ply_compiled::heap::{HEADER, IMMORTAL, Word};
-use ply_compiled::rt::{Ctx, FAILED};
+use ply_compiled::heap::{HEADER, Heap, IMMORTAL, Word};
+use ply_compiled::rt::{Ctx, FAILED, Root, Tables};
+use ply_core::{SourceId, Span, Symbol};
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
 
 type Alloc = unsafe extern "C" fn(*mut Ctx, Word) -> Word;
 type Free = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type Keep = unsafe extern "C" fn(*mut Ctx, Word, Word);
 type ConstFailed = unsafe extern "C" fn(*mut Ctx);
+type FailedCall = unsafe extern "C" fn(*mut Ctx, Word, Word, Word);
 type Definition = unsafe extern "C" fn(*mut Ctx, *const Word) -> Word;
 
 const BOX: Word = HEADER as Word + 8;
@@ -131,5 +134,51 @@ fn a_failure_that_is_no_raise_stands_as_it_is() {
     unsafe { helper::<ConstFailed>("rt_const_failed")(c) };
     assert_eq!(ctx.failed, FAILED);
     ctx.failed = 0;
+    ctx.end();
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+fn rooted_at(start: u32) -> Ctx {
+    let mut ctx = Ctx::new(Arc::new(Tables {
+        fields: Vec::new(),
+        memo: Box::new([]),
+        functions: Vec::new(),
+        immortals: Mutex::new(Heap::persistent()),
+        roots: vec![Root {
+            id: 7,
+            name: Symbol::new("m.f"),
+            span: Span::new(SourceId(0), start, start + 50),
+        }],
+    }));
+    ctx.begin();
+    ctx
+}
+
+#[test]
+fn a_failure_labels_each_call_it_returns_through_once_and_places_its_raise_at_the_first_it_can() {
+    let mut ctx = rooted_at(100);
+    let c: *mut Ctx = &mut ctx;
+    let through = helper::<FailedCall>("rt_failed_call");
+    unsafe { through(c, 7, 3, 9) };
+    assert!(
+        ctx.diagnostic.is_none(),
+        "a call that did not fail records nothing"
+    );
+    assert_eq!(unsafe { failing(c, std::ptr::null()) }, 0);
+    for (start, end) in [(3, 9), (20, 25), (20, 25), (3, 9)] {
+        unsafe { through(c, 7, start, end) };
+    }
+    unsafe { through(c, 8, 1, 2) };
+    let said = ctx.take_failure().expect("a diagnostic");
+    let labels: Vec<(Span, bool, &str)> = (said.labels.iter())
+        .map(|l| (l.span, l.primary, l.message.as_str()))
+        .collect();
+    assert_eq!(
+        labels,
+        vec![
+            (Span::new(SourceId(0), 103, 109), true, "here"),
+            (Span::new(SourceId(0), 120, 125), false, "called here"),
+        ]
+    );
     ctx.end();
 }

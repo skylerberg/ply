@@ -1,9 +1,7 @@
 import compiler.front.diagnostics (parse_all)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.published (ClaimClause, analyse)
+import compiler.front.published (ClaimClause)
 import compiler.syntax.items (SpecKind, CostClause, SpaceClause, parse)
 import compiler.syntax.expressions (prelude_module)
-import compiler.check.resolve.tables (Diagnostic)
 import compiler.emit.code (Code, Node, CodeLiteral, CodeVariable, NDefinition, NConstructor,
                            NBuiltin, CodeUnary, CodeBinary, CodeApply, CodeKnownLambda, CodeIf,
                            CodeBlock, CodeList, CodeRecord, CodeMatch, CodePerform, CodeLabel,
@@ -14,7 +12,8 @@ import compiler.emit.code (Code, Node, CodeLiteral, CodeVariable, NDefinition, N
                            CodePatternField, Capture, read_name)
 import compiler.check.infer.checker (Builtin, builtins)
 import compiler.check.infer.definitions (externs_of)
-import compiler.syntax.parsing (dummy_span)
+import compiler.syntax.parsing (generated_span)
+import std.graph (Visit, traverse)
 import compiler.check.callbacks (CallbackUse, Mapped, Filtered, Updated, callback_use,
                                  prelude_callback_use)
 import compiler.syntax.patterns (LiteralInt)
@@ -26,7 +25,7 @@ import domain (FunctionSort, NamedSort)
 import std.list
 import compiler.prelude_source
 import std.result
-import prover_input (prover_input_of)
+import prover_input (Claimed, claimed_session, claimed_input)
 import compiler.check.typed (binding_key)
 
 pub type Monomial = Map<Int, Int>
@@ -55,7 +54,6 @@ type Env = {
   slots: List<Slot>,
   own: String,
   known: Map<String, Result<Polynomial, String>>,
-  first_order: Map<String, Bool>,
   empty_list_parameter: Option<Int>,
   found: List<IndexBound>,
   missed: Option<IndexBound>,
@@ -253,7 +251,6 @@ pub fn is_length(name: String) -> Bool =
     || name == "Columns::len"
 
 pub fn steps(context: Context, definition: String) -> Result<Polynomial, String> / {abort.raise} = {
-  let first_order = first_order_builtins;
   let reach = reachable(context, definition);
   let known = iterate(
     Map::new(),
@@ -268,7 +265,7 @@ pub fn steps(context: Context, definition: String) -> Result<Polynomial, String>
           ready.fold(known, |k: Map<String, Result<Polynomial, String>>, n: String|
             k.insert(n, if by_entry(context, n, CostClause) {
               Err("`" ++ n ++ "` has no `cost` clause, so its steps cannot be bounded")
-            } else { steps_of(context, first_order, n, k) })),
+            } else { steps_of(context, n, k) })),
         )
       }
     },
@@ -287,7 +284,7 @@ pub fn steps(context: Context, definition: String) -> Result<Polynomial, String>
 }
 
 pub fn definition_using_keyed_type(context: Context, definitions: List<String>) -> Option<String> =
-  if context.keyed_types.len() == 0 { None } else {
+  if context.keyed_types.is_empty() { None } else {
     definitions.fold(None, |found: Option<String>, n: String|
       match found {
         Some(_) -> found,
@@ -314,11 +311,13 @@ pub fn definition_using_keyed_type(context: Context, definitions: List<String>) 
 pub const natives: List<Builtin> =
   builtins.concat(externs_of(prelude_module, parse(prelude_source::text).node))
 
-pub const first_order_builtins: Map<String, Bool> =
-  natives.fold(Map::new(), |m: Map<String, Bool>, b: Builtin|
+pub type BuiltinOrder = | FirstOrder | HigherOrder
+
+pub const builtin_orders: Map<String, BuiltinOrder> =
+  natives.fold(Map::new(), |m: Map<String, BuiltinOrder>, b: Builtin|
     m.insert(String::of_bytes_lossy(b.name), match b.scheme.ty {
-      FunctionType(f) -> !f.params.fold(false, |any: Bool, t: Type| any || calls_back(t)),
-      _ -> true,
+      FunctionType(f) -> if f.params.any(calls_back) { HigherOrder } else { FirstOrder },
+      _ -> FirstOrder,
     }))
 
 fn calls_back(t: Type) -> Bool =
@@ -339,28 +338,12 @@ pub fn callees(context: Context, definition: String) -> List<String> =
   }
 
 pub fn reachable(context: Context, definition: String) -> List<String> / {abort.raise} =
-  iterate(
-    { seen: [definition], frontier: [definition] },
-    context.claims.definitions.keys().len() + 1,
-    |s: { seen: List<String>, frontier: List<String> }|
-      if s.frontier.len() == 0 { Stop(s.seen) } else {
-        let next = s.frontier.fold(
-          { seen: s.seen, frontier: [] },
-          |accumulator: { seen: List<String>, frontier: List<String> }, n: String|
-            callees(context, n).fold(
-              accumulator,
-              |a: { seen: List<String>, frontier: List<String> }, c: String|
-                if a.seen.fold(false, |hit: Bool, x: String| hit || x == c) { a }
-                else { { seen: a.seen.push(c), frontier: a.frontier.push(c) } },
-            ),
-        );
-        Continue(next)
-      },
+  traverse([definition], |n: String| { value: (), next: callees(context, n) }).map(
+    |v: Visit<String, Unit>| v.key,
   )
 
 fn steps_of(
   context: Context,
-  first_order: Map<String, Bool>,
   definition: String,
   known: Map<String, Result<Polynomial, String>>,
 ) -> Result<Polynomial, String> / {abort.raise} =
@@ -381,7 +364,6 @@ fn steps_of(
             }),
           own: definition,
           known: known,
-          first_order: first_order,
           empty_list_parameter: None,
           found: [],
           missed: None,
@@ -1149,9 +1131,9 @@ fn first_order(
   one: CostSummary,
   size_at: (Int) -> Option<Polynomial>,
 ) -> Result<CostSummary, String> =
-  if env.first_order.get(name) == None {
+  if builtin_orders.get(name) == None {
     Err("`" ++ name ++ "` has no body here, so its steps are unknown")
-  } else if env.first_order.get(name) == Some(false) {
+  } else if builtin_orders.get(name) == Some(HigherOrder) {
     Err("`" ++ name ++ "` calls a function argument, so its steps cannot be bounded")
   } else if is_length(name) || name == "List::set" || name == "Map::remove"
       || name == "String::chars"
@@ -1203,23 +1185,13 @@ fn context_of(source: Bytes) -> Context / {abort.raise} =
 pub fn context_owning(
   sources: List<{ name: Bytes, source_text: Bytes }>,
   owned: (Bytes) -> Bool,
-) -> Context / {abort.raise} =
-  match analyse(parse_all(sources)) {
-    Rejected(ds) ->
-      panic(
-        "the fixture checks: "
-          ++ String::of_bytes_lossy(
-            Bytes::concat_all(
-              ds.map(|d: Diagnostic| Bytes::concat_all([d.code, b" ", d.message, b"; "])),
-            ),
-          ),
-      ),
-    Analysed(w) ->
-      context(
-        claims_from_analysis(w, range(0, w.modules.len()), owned),
-        prover_input_of(w, owned).world,
-      ),
-  }
+) -> Context / {abort.raise} = fixture_context(claimed_session(sources), owned)
+
+pub fn fixture_context(fixture: Claimed, owned: (Bytes) -> Bool) -> Context / {abort.raise} =
+  context(
+    claims_from_analysis(fixture.analysis, range(0, fixture.analysis.modules.len()), owned),
+    claimed_input(fixture, owned).world,
+  )
 
 fn cost_clause_proved(source: Bytes, definition: String) -> Result<Bool, String> / {abort.raise} =
   shown_in(context_of(source), "m." ++ definition)
@@ -1432,7 +1404,7 @@ test "a call to the prelude's `map` costs what its bound states, and the list it
   assert_eq(shown_in(costed(b"xs.len()"), "m.f"), Ok(false))
 }
 
-fn coded(n: Node) -> Code = { node: n, span: dummy_span, ty: int_type }
+fn coded(n: Node) -> Code = { node: n, span: generated_span, ty: int_type }
 
 fn called(f: Node, arg: Code) -> Code =
   coded(CodeApply({ function: coded(f), args: [arg], effects: no_effects }))

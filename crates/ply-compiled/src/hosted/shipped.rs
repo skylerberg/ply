@@ -1,20 +1,21 @@
 use super::{Deterministic, granted, text_at};
 use crate::c::{MachineNative, runtime_native};
-use crate::entry::{self, Opened};
 use crate::native::{Addr, I64, TakenBytes};
-use crate::rt::{Ctx, borrowed};
+use crate::rt::Ctx;
 use ply_host::native::{found, int, parts};
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::OnceLock;
 
 pub trait Ships: Send + Sync {
     fn names(&self) -> Vec<String>;
     fn module(&self, name: &str) -> Option<&'static [u8]>;
-    fn result(&self, path: &str, offset: usize, len: usize) -> Option<Vec<u8>>;
-    fn digests(&self) -> String;
+    fn read_pack(&self, part: PackPart) -> Option<Vec<u8>>;
     fn stamps(&self) -> String;
     fn definitions(&self) -> String;
+}
+
+pub enum PackPart {
+    WholeIndex,
+    StoreFrame { offset: usize, len: usize },
 }
 
 static SHIPS: OnceLock<Box<dyn Ships>> = OnceLock::new();
@@ -38,10 +39,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
             rt_shipped_answer as unsafe extern "C" fn(_, _, _, _, _) -> _,
         ),
         runtime_native(
-            "shipped_digests",
-            rt_shipped_digests as unsafe extern "C" fn(_) -> _,
-        ),
-        runtime_native(
             "shipped_version",
             rt_shipped_version as unsafe extern "C" fn(_) -> _,
         ),
@@ -60,10 +57,6 @@ pub(super) fn natives() -> Vec<MachineNative> {
         runtime_native(
             "shipped_definitions",
             rt_shipped_definitions as unsafe extern "C" fn(_) -> _,
-        ),
-        runtime_native(
-            "shipped_entered",
-            rt_shipped_entered as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
     ]
 }
@@ -120,17 +113,16 @@ pub unsafe extern "C" fn rt_shipped_answer(
         let Some(path) = text_at(c, p, n) else {
             return TakenBytes(0);
         };
-        let frame = match (usize::try_from(offset.0), usize::try_from(len.0)) {
-            (Ok(offset), Ok(len)) => ships.result(&path, offset, len),
+        let part = match (
+            path.as_str(),
+            usize::try_from(offset.0),
+            usize::try_from(len.0),
+        ) {
+            ("index", _, _) => Some(PackPart::WholeIndex),
+            ("store", Ok(offset), Ok(len)) => Some(PackPart::StoreFrame { offset, len }),
             _ => None,
         };
-        c.given(found(frame))
-    })
-}
-
-pub unsafe extern "C" fn rt_shipped_digests(ctx: *mut Ctx) -> TakenBytes {
-    shipping(ctx, "shipped_digests", |c, ships| {
-        c.given(ships.digests().into_bytes())
+        c.given(found(part.and_then(|part| ships.read_pack(part))))
     })
 }
 
@@ -166,50 +158,4 @@ pub unsafe extern "C" fn rt_shipped_definitions(ctx: *mut Ctx) -> TakenBytes {
     shipping(ctx, "shipped_definitions", |c, ships| {
         c.given(ships.definitions().into_bytes())
     })
-}
-
-#[allow(clippy::too_many_arguments)]
-pub unsafe extern "C" fn rt_shipped_entered(
-    ctx: *mut Ctx,
-    lp: Addr,
-    ln: I64,
-    rp: Addr,
-    rn: I64,
-    ap: Addr,
-    an: I64,
-    timeout_ms: I64,
-) -> TakenBytes {
-    shipping(ctx, "shipped_entered", |c, _| {
-        let (Some(library), Some(root)) = (text_at(c, lp, ln), text_at(c, rp, rn)) else {
-            return TakenBytes(0);
-        };
-        let opened = match open_cached(Path::new(&library)) {
-            Ok(opened) => opened,
-            Err(reason) => {
-                c.fail(ply_core::Diagnostic::error(
-                    ply_core::codes::INTERNAL_ERROR,
-                    format!("an entered unit does not load: {reason}"),
-                ));
-                return TakenBytes(0);
-            }
-        };
-        let arguments = unsafe { borrowed(ap, an) }.to_vec();
-        let timeout_ms = u64::try_from(timeout_ms.0).unwrap_or(0);
-        let returned = entry::run_to_result(&opened, &root, arguments, timeout_ms);
-        c.given(found(returned.ok()))
-    })
-}
-
-fn open_cached(library: &Path) -> Result<Arc<Opened>, String> {
-    type LibraryCache = Mutex<HashMap<PathBuf, Arc<Opened>>>;
-    static UNITS: OnceLock<LibraryCache> = OnceLock::new();
-    let units = UNITS.get_or_init(|| Mutex::new(HashMap::new()));
-    if let Some(opened) = units.lock().unwrap_or_else(|e| e.into_inner()).get(library) {
-        return Ok(Arc::clone(opened));
-    }
-    let opened = Opened::open(library)?;
-    let mut held = units.lock().unwrap_or_else(|e| e.into_inner());
-    Ok(Arc::clone(
-        held.entry(library.to_path_buf()).or_insert(opened),
-    ))
 }

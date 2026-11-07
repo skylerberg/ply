@@ -1,92 +1,97 @@
+import std.set (Set)
+import compiler.codes (cache_unreadable_code)
 import std.bin
 import std.fs (fs, mem_empty)
 import std.hash (blake3)
 import std.random (entropy)
 import std.time (time)
 import std.bytes
-import compiler.store.hash.forms (CachedNode, ModuleHashes, ModuleRecord, NodeRef, RecordedGraph,
-                                  module_record, record_digest, recorded_graph,
-                                  recorded_reachable_hashes)
+import compiler.store.hash.forms (DefinitionHash, ModuleHashes, ModuleRecord, NodeRef,
+                                  RecordedGraph, module_record, record_digest, recorded_graph,
+                                  recorded_reachable_hashes, FramedBody, ChosenCalls)
 import compiler.check.resolve.tables (Diagnostic)
+import compiler.store.hash.graph (HeldValue)
 import project_store
+import project_store (InWorkingDirectory, AtAbsolutePath, Databases, databases)
+import compiler.store.database (database_in, open_database)
+import compiler.store.fact_store (Opening, recent_reads)
 import paths
+import paths (WorkingDirectory, Absolute)
 import store.tables
 import store.fake (run_in_memory)
-import testing.conclude (Filing, PassRecord)
+import testing.conclude (StoreUpdate, PassRecord)
 import testing.select (Pass)
-import claims (proof_store, AcceptResult)
+import testing.reads (RecordedRead, ReadPath, UnderRoot, WholeFile, recorded_read_bin)
+import claims (proof_store, AcceptResult, ClaimsEntry)
 import std.env (env)
 import proof.obligation (ClaimSnapshot)
-import tester (result_cache, LastPass, StoreResult)
+import tester (result_cache, LastPass, ListingRequest, CasesListed, ListedCase, StartedTest,
+               TestJournal, listed_case_bin)
 import sources
 import std.path (strip_root)
 import semantics (semantics)
-
-pub type Upstream = { root: String, publish: Bool }
 
 pub type OpenStore = { place: project_store::StoreLocation, cache: tables::Cache }
 
 pub fn store_for(
   paths: List<paths::ResolvedPath>,
-  no_cache: Bool,
-) -> Option<OpenStore> / {semantics.cached, fs.read[cwd], fs.read[abs], env.variable, env.working_directory, fs.read_file[shipped], abort.raise} =
-  if no_cache { None }
-  else { Some(open_store(paths, upstream_of_env(), project_store::shipped_stamps())) }
-
-fn upstream_of_env() -> Option<Upstream> / {env.variable, env.working_directory} =
-  match env.variable("PLY_CACHE_UPSTREAM") {
-    None -> None,
-    Some(root) -> if root == "" { None } else {
-      {
-        let absolute = if root.starts_with("/") { root }
-        else { env.working_directory() ++ "/" ++ root };
-        Some({ root: absolute, publish: env.variable("PLY_CACHE_UPSTREAM_READONLY") == None })
-      }
-    },
-  }
+) -> OpenStore / {Databases, semantics.cached, fs.read[cwd], fs.read[abs], fs.read_file[shipped], abort.raise} =
+  open_store(paths, project_store::shipped_stamps())
 
 pub fn open_store(
   paths: List<paths::ResolvedPath>,
-  upstream: Option<Upstream>,
   stamps: tables::Stamps,
-) -> OpenStore / {fs.read[cwd], fs.read[abs], abort.raise} = {
+) -> OpenStore / {Databases, fs.read[cwd], fs.read[abs], abort.raise} = {
   let place = project_store::store_location_of(paths, stamps);
-  let c = if place.label == "cwd" { tables::open_cache[cwd](place.dir, stamps) }
-  else { tables::open_cache[abs](place.dir, stamps) };
+  let database = project_store::database_place_of(place);
+  let opening = databases.open(database);
   {
     place: place,
-    cache: match upstream {
-      Some(up) -> tables::with_upstream[abs](c, strip_root(up.root), up.publish),
-      None -> c,
+    cache: match database {
+      InWorkingDirectory(_) -> tables::open_cache[cwd](opening, stamps),
+      AtAbsolutePath(_) -> tables::open_cache[abs](opening, stamps),
     },
   }
 }
 
 type StoreRead<a> = { value: a, cache: tables::Cache }
 
-fn read_pass_traces<[r], [u]>(
+fn encoded_reads(reads: List<RecordedRead>) -> Bytes / {abort.raise} =
+  bin::encode(reads, bin::list_bin(recorded_read_bin()))
+
+fn decoded_reads(stored: Option<Bytes>) -> Option<List<RecordedRead>> / {abort.raise} =
+  match stored {
+    None -> None,
+    Some(b) -> match bin::decode(b, bin::list_bin(recorded_read_bin())) {
+      Ok(reads) -> Some(reads),
+      Err(_) -> None,
+    },
+  }
+
+fn stored_reads(
   c0: tables::Cache,
   keys: List<Bytes>,
-) -> StoreRead<List<Option<Bytes>>> / {fs.read[r], fs.read[u], abort.raise} =
-  keys.fold({ value: [], cache: c0 }, |accumulator: StoreRead<List<Option<Bytes>>>, key: Bytes| {
-    let got = tables::pass_trace[r, u](accumulator.cache, key);
-    { value: accumulator.value.push(got.value), cache: got.cache }
-  })
+  stored_trace: (tables::Cache, Bytes) -> tables::ReadResult<Bytes> / {abort.raise},
+) -> StoreRead<Map<Bytes, List<RecordedRead>>> / {abort.raise} =
+  keys.fold(
+    { value: Map::new(), cache: c0 },
+    |accumulator: StoreRead<Map<Bytes, List<RecordedRead>>>, key: Bytes| {
+      let got = stored_trace(accumulator.cache, key);
+      {
+        value: match decoded_reads(got.value) {
+          Some(reads) -> accumulator.value.insert(key, reads),
+          None -> accumulator.value,
+        },
+        cache: got.cache,
+      }
+    },
+  )
 
-fn code_passes_over<[r], [u]>(
-  c0: tables::Cache,
-  keys: List<Bytes>,
-) -> StoreRead<List<Option<Bytes>>> / {fs.read[r], fs.read[u], abort.raise} =
-  keys.fold({ value: [], cache: c0 }, |accumulator: StoreRead<List<Option<Bytes>>>, key: Bytes| {
-    let got = tables::code_pass_trace[r, u](accumulator.cache, key);
-    { value: accumulator.value.push(got.value), cache: got.cache }
-  })
-
-fn snapshot_over<[r]>(
+fn snapshot_over(
   c0: tables::Cache,
   digest: Bytes,
-) -> StoreRead<Option<RecordedGraph>> / {fs.read[r], abort.raise} = {
-  let got = tables::snapshot[r](c0, digest);
+) -> StoreRead<Option<RecordedGraph>> / {abort.raise} = {
+  let got = tables::snapshot(c0, digest);
   match got.value {
     None -> { value: None, cache: got.cache },
     Some(modules) -> {
@@ -96,7 +101,7 @@ fn snapshot_over<[r]>(
           match accumulator.value {
             None -> accumulator,
             Some(rs) -> {
-              let got = tables::module_record[r](accumulator.cache, m);
+              let got = tables::module_record(accumulator.cache, m);
               {
                 value: match got.value { Some(x) -> Some(rs.push(x)), None -> None },
                 cache: got.cache,
@@ -112,14 +117,14 @@ fn snapshot_over<[r]>(
   }
 }
 
-fn last_passes_over<[r]>(
+fn last_passes_over(
   c0: tables::Cache,
   keys: List<Bytes>,
-) -> StoreRead<List<Option<LastPass>>> / {fs.read[r], abort.raise} = {
+) -> StoreRead<List<Option<LastPass>>> / {abort.raise} = {
   let records = keys.fold(
     { value: [], cache: c0 },
     |accumulator: StoreRead<List<Option<tables::PassRecord>>>, key: Bytes| {
-      let got = tables::pass_record[r](accumulator.cache, key);
+      let got = tables::pass_record(accumulator.cache, key);
       { value: accumulator.value.push(got.value), cache: got.cache }
     },
   );
@@ -128,7 +133,7 @@ fn last_passes_over<[r]>(
     |accumulator: StoreRead<Map<Bytes, Option<RecordedGraph>>>, recorded_pass: Option<tables::PassRecord>|
       match recorded_pass {
         Some(p) -> if accumulator.value.contains(p.era) { accumulator } else {
-          let got = snapshot_over[r](accumulator.cache, p.era);
+          let got = snapshot_over(accumulator.cache, p.era);
           { value: accumulator.value.insert(p.era, got.value), cache: got.cache }
         },
         None -> accumulator,
@@ -150,12 +155,12 @@ fn last_passes_over<[r]>(
   }
 }
 
-fn read_texts<[r]>(
+fn read_texts(
   c0: tables::Cache,
   hashes: List<Bytes>,
-) -> StoreRead<List<Option<Bytes>>> / {fs.read[r], abort.raise} =
+) -> StoreRead<List<Option<Bytes>>> / {abort.raise} =
   hashes.fold({ value: [], cache: c0 }, |accumulator: StoreRead<List<Option<Bytes>>>, h: Bytes| {
-    let got = tables::text[r](accumulator.cache, h);
+    let got = tables::text(accumulator.cache, h);
     { value: accumulator.value.push(got.value), cache: got.cache }
   })
 
@@ -166,189 +171,337 @@ pub fn store_pass(
   c0: tables::Cache,
   texts: List<{ hash: Bytes, text: Bytes }>,
   modules: List<ModuleHashes>,
+  snapshot: List<Bytes>,
 ) -> tables::Cache / {abort.raise} = {
-  let store_state = texts.fold(c0, |c: tables::Cache, t: { hash: Bytes, text: Bytes }|
+  let with_texts = texts.fold(c0, |c: tables::Cache, t: { hash: Bytes, text: Bytes }|
     tables::put_text(c, t.hash, t.text));
-  if modules.len() == 0 { store_state } else {
-    let record_evidence = modules.fold(store_state, |c: tables::Cache, m: ModuleHashes|
-      if tables::has_module_record(c, m.record) { c }
-      else { tables::put_module_record(c, module_record(m.cached)) });
-    tables::put_snapshot(record_evidence, snapshot_of(modules))
-  }
+  let with_records = modules.fold(with_texts, |c: tables::Cache, m: ModuleHashes|
+    if tables::has_module_record(c, m.record) { c }
+    else { tables::put_module_record(c, module_record(m.own)) });
+  if snapshot.len() == 0 { with_records }
+  else { tables::put_snapshot(with_records, snapshot.sort()) }
 }
 
-fn snapshot_of(modules: List<ModuleHashes>) -> List<Bytes> =
-  modules.map(|m: ModuleHashes| m.record).sort()
+pub fn snapshot_digest_of(records: List<Bytes>) -> Bytes = tables::snapshot_digest(records.sort())
 
-pub fn snapshot_digest_of(modules: List<ModuleHashes>) -> Bytes =
-  tables::snapshot_digest(snapshot_of(modules))
-
-pub fn put_filing<[r], [u]>(
+pub fn put_update(
   c0: tables::Cache,
-  f: Filing,
-) -> tables::Cache / {fs.read[r], fs.read[u], abort.raise} = {
+  f: StoreUpdate,
+  seen: List<Bytes>,
+) -> tables::Cache / {abort.raise} = {
   let c1 = f.code_passes.fold(
     f.passes.fold(c0, |c: tables::Cache, p: Pass| {
-      let store_state = tables::pass_trace[r, u](c, p.key);
-      if store_state.value == Some(p.trace) { store_state.cache }
-      else { tables::put_passed(store_state.cache, p.key, p.trace) }
+      let stored = encoded_reads(p.reads);
+      let store_state = tables::pass_trace(c, p.key);
+      if store_state.value == Some(stored) { store_state.cache }
+      else { tables::put_passed(store_state.cache, p.key, stored) }
     }),
     |c: tables::Cache, p: Pass| {
-      let store_state = tables::code_pass_trace[r, u](c, p.key);
-      if store_state.value == Some(p.trace) { store_state.cache }
-      else { tables::put_passed_code(store_state.cache, p.key, p.trace) }
+      let stored = encoded_reads(p.reads);
+      let store_state = tables::code_pass_trace(c, p.key);
+      if store_state.value == Some(stored) { store_state.cache }
+      else { tables::put_passed_code(store_state.cache, p.key, stored) }
     },
   );
   let c2 = f.records.fold(c1, |c: tables::Cache, e: { key: Bytes, record: PassRecord }|
-    tables::put_pass_record[r](c, e.key, {
-      test_hash: e.record.test,
-      era: e.record.era,
-      walk_start: e.record.start,
-      case: e.record.case,
-    }));
-  f.seen.fold(c2, |c: tables::Cache, hash: Bytes|
+    tables::put_code_record(
+      tables::put_pass_record(c, e.key, {
+        test_hash: e.record.test,
+        era: e.record.era,
+        walk_start: e.record.start,
+        case: e.record.case,
+        passes: e.record.passes,
+      }),
+      e.key,
+      e.record.codes,
+    ));
+  seen.fold(c2, |c: tables::Cache, hash: Bytes|
     if tables::knows_definition(c, hash) { c } else { tables::observe_definition(c, hash) })
 }
 
-fn flush_filing<[r]>(
+fn flush_update<[r]>(
   cache: tables::Cache,
-  f: Filing,
-) -> tables::Cache / {fs.read[r], fs.write[r], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  tables::flush_shared[r, abs](put_filing[r, abs](cache, f))
+  f: StoreUpdate,
+  seen: List<Bytes>,
+) -> tables::Cache / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} =
+  tables::flush_cache[r](put_update(cache, f, seen))
 
-fn without_warnings(k: OpenStore) -> OpenStore =
+pub fn without_warnings(k: OpenStore) -> OpenStore =
   { ..k, cache: { ..k.cache, store: { ..k.cache.store, warnings: [] } } }
 
 fn cache_warnings(cache: tables::Cache) -> List<Diagnostic> =
   project_store::diagnostics_of(tables::warnings(cache))
 
+type JournalHeader = { runtime_digest: String, code: String }
+
+type JournalRow = { slot: Bytes, payload: Bytes }
+
+type JournalMark = { key: Bytes, hash: Bytes }
+
+type JournalRows = { key: Bytes, rows: List<JournalRow> }
+
+type JournalEntry = | Began(JournalHeader) | Started(JournalMark) | Finished(JournalRows)
+
+derive bin for JournalHeader
+derive bin for JournalRow
+derive bin for JournalMark
+derive bin for JournalRows
+derive bin for JournalEntry
+
+fn journal_of(k: OpenStore) -> TestJournal =
+  { label: k.place.label, path: k.place.dir ++ "/test-journal", base: k.cache }
+
+fn header_of(stamps: tables::Stamps) -> JournalHeader =
+  { runtime_digest: stamps.runtime_digest, code: stamps.code }
+
+fn framed(entry: JournalEntry) -> Bytes / {abort.raise} =
+  bin::put_bytes(b"", bin::encode(entry, journal_entry_bin()))
+
+fn journal_entries(bytes: Bytes) -> List<JournalEntry> / {abort.raise} =
+  iterate({ at: 0, found: [] }, bytes.len() + 1, |s: { at: Int, found: List<JournalEntry> }|
+    if s.at >= bytes.len() { Stop(s.found) } else {
+      match bin::take_bytes(bytes, s.at) {
+        Err(_) -> Stop(s.found),
+        Ok(frame) -> match bin::decode(frame.value, journal_entry_bin()) {
+          Err(_) -> Stop(s.found),
+          Ok(entry) -> Continue({ at: frame.at, found: s.found.push(entry) }),
+        },
+      }
+    })
+
+type Recovery = { rows: List<JournalRow>, interrupted: List<StartedTest> }
+
+fn recovery_of(entries: List<JournalEntry>, stamps: tables::Stamps) -> Recovery =
+  match entries.at(0) {
+    Some(Began(header)) -> if header != header_of(stamps) { { rows: [], interrupted: [] } } else {
+      let finished = entries.fold(Set::empty(), |found: Set<Bytes>, e: JournalEntry|
+        match e { Finished(f) -> found.insert(f.key), _ -> found });
+      entries.fold({ rows: [], interrupted: [] }, |r: Recovery, e: JournalEntry|
+        match e {
+          Finished(f) -> { ..r, rows: r.rows.concat(f.rows) },
+          Started(m) -> if finished.contains(m.key)
+              || r.interrupted.any(|t: StartedTest| t.key == m.key) { r }
+          else { { ..r, interrupted: r.interrupted.push({ key: m.key, hash: m.hash }) } },
+          Began(_) -> r,
+        })
+    },
+    _ -> { rows: [], interrupted: [] },
+  }
+
+fn read_journal<[r]>(j: TestJournal) -> List<JournalEntry> / {fs.read[r], abort.raise} =
+  match fs.read_file[r](j.path) { Some(bytes) -> journal_entries(bytes), None -> [] }
+
+fn begun_journal<[r]>(
+  k: OpenStore,
+  j: TestJournal,
+) -> { store: OpenStore, interrupted: List<StartedTest> } / {fs.read[r], fs.write[r], recent_reads.read, recent_reads.write, abort.raise} = {
+  let found = recovery_of(read_journal[r](j), k.cache.stamps);
+  let cache = if found.rows.len() == 0 { k.cache }
+  else { tables::flush_cache[r](tables::with_written_rows(k.cache, found.rows)) };
+  let _ = fs.create_dir[r](k.place.dir);
+  let _ = fs.write_file[r](j.path, framed(Began(header_of(k.cache.stamps))));
+  { store: { ..k, cache: cache }, interrupted: found.interrupted }
+}
+
+fn appended(
+  journal: TestJournal,
+  entry: JournalEntry,
+) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} = {
+  let _ = match journal.label {
+    WorkingDirectory -> fs.append[cwd](journal.path, framed(entry)),
+    Absolute -> fs.append[abs](journal.path, framed(entry)),
+  };
+  ()
+}
+
+fn ended_journal(journal: TestJournal) -> Unit / {fs.write[cwd], fs.write[abs]} = {
+  let _ = match journal.label {
+    WorkingDirectory -> fs.remove[cwd](journal.path),
+    Absolute -> fs.remove[abs](journal.path),
+  };
+  ()
+}
+
+fn finished_rows(journal: TestJournal, update: StoreUpdate) -> List<JournalRow> / {abort.raise} =
+  tables::rows_written(journal.base, |c: tables::Cache| put_update(c, update, []))
+
 pub fn with_result_cache<a | e>(
-  opened_store: Option<OpenStore>,
-  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.history, result_cache.store_filing | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  opened_store: OpenStore,
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.journal | e},
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} = {
+  let begun = match opened_store.place.label {
+    WorkingDirectory -> begun_journal[cwd](opened_store, journal_of(opened_store)),
+    Absolute -> begun_journal[abs](opened_store, journal_of(opened_store)),
+  };
+  let journal = journal_of(begun.store);
+  let result = journaled(begun.store, begun.interrupted, journal, go);
+  ended_journal(journal);
+  result
+}
+
+pub fn journal_started(
+  at: TestJournal,
+  running: StartedTest,
+) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} =
+  appended(at, Started({ key: running.key, hash: running.hash }))
+
+pub fn journal_finished(
+  at: TestJournal,
+  key: Bytes,
+  update: StoreUpdate,
+) -> Unit / {fs.write[cwd], fs.write[abs], abort.raise} =
+  appended(at, Finished({ key: key, rows: finished_rows(at, update) }))
+
+fn journaled<a | e>(
+  opened_store: OpenStore,
+  interrupted: List<StartedTest>,
+  journal: TestJournal,
+  go: () -> a / {result_cache.open_warnings, result_cache.passes, result_cache.code_passes, result_cache.known, result_cache.baselines, result_cache.texts, result_cache.unstored, result_cache.has_records, result_cache.history, result_cache.store_results, result_cache.listings, result_cache.keep_listings, result_cache.interrupted, result_cache.journal | e},
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} =
   handle {
     go()
   } with {
     var store_state = opened_store,
-    result_cache.open_warnings() -> match store_state {
-      None -> [],
-      Some(k) -> {
-        store_state = Some(without_warnings(k));
-        cache_warnings(k.cache)
-      },
+    result_cache.interrupted() -> interrupted,
+    result_cache.journal() -> journal,
+    result_cache.open_warnings() -> {
+      let warnings = cache_warnings(store_state.cache);
+      store_state = without_warnings(store_state);
+      warnings
     },
-    result_cache.passes(keys) -> match store_state {
-      None -> keys.map(|key: Bytes| None),
-      Some(k) -> {
-        let o = if k.place.label == "cwd" { read_pass_traces[cwd, abs](k.cache, keys) }
-        else { read_pass_traces[abs, abs](k.cache, keys) };
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.passes(keys) -> {
+      let o = stored_reads(store_state.cache, keys, tables::pass_trace);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.code_passes(keys) -> match store_state {
-      None -> keys.map(|key: Bytes| None),
-      Some(k) -> {
-        let o = if k.place.label == "cwd" { code_passes_over[cwd, abs](k.cache, keys) }
-        else { code_passes_over[abs, abs](k.cache, keys) };
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.code_passes(keys) -> {
+      let o = stored_reads(store_state.cache, keys, tables::code_pass_trace);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.known(hashes) -> match store_state {
-      None -> hashes.map(|h: Bytes| false),
-      Some(k) -> hashes.map(|h: Bytes| tables::knows_definition(k.cache, h)),
+    result_cache.known(hashes) ->
+      hashes.map(|h: Bytes| tables::knows_definition(store_state.cache, h)),
+    result_cache.baselines(keys) -> {
+      let o = last_passes_over(store_state.cache, keys);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.baselines(keys) -> match store_state {
-      None -> keys.map(|key: Bytes| None),
-      Some(k) -> {
-        let o = if k.place.label == "cwd" { last_passes_over[cwd](k.cache, keys) }
-        else { last_passes_over[abs](k.cache, keys) };
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.texts(hashes) -> {
+      let o = read_texts(store_state.cache, hashes);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.texts(hashes) -> match store_state {
-      None -> hashes.map(|h: Bytes| None),
-      Some(k) -> {
-        let o = if k.place.label == "cwd" { read_texts[cwd](k.cache, hashes) }
-        else { read_texts[abs](k.cache, hashes) };
-        store_state = Some({ ..k, cache: o.cache });
-        o.value
-      },
+    result_cache.unstored(hashes) -> unstored_in(store_state.cache, hashes),
+    result_cache.has_records(records) ->
+      records.map(|r: Bytes| tables::has_module_record(store_state.cache, r)),
+    result_cache.history(texts, modules, snapshot) -> {
+      store_state = {
+        ..store_state,
+        cache: store_pass(store_state.cache, texts, modules, snapshot),
+      };
     },
-    result_cache.unstored(hashes) -> match store_state {
-      None -> [],
-      Some(k) -> unstored_in(k.cache, hashes),
+    result_cache.store_results(f, seen) -> {
+      let c = match store_state.place.label {
+        WorkingDirectory -> flush_update[cwd](store_state.cache, f, seen),
+        Absolute -> flush_update[abs](store_state.cache, f, seen),
+      };
+      store_state = without_warnings({ ..store_state, cache: c });
+      cache_warnings(c)
     },
-    result_cache.history(texts, modules) -> match store_state {
-      None -> (),
-      Some(k) -> {
-        store_state = Some({ ..k, cache: store_pass(k.cache, texts, modules) });
-      },
+    result_cache.listings(requests) -> {
+      let o = listings_over(store_state.cache, requests);
+      store_state = { ..store_state, cache: o.cache };
+      o.value
     },
-    result_cache.store_filing(f) -> match store_state {
-      None -> { unflushed: None, warnings: [] },
-      Some(k) -> {
-        let c = if k.place.label == "cwd" { flush_filing[cwd](k.cache, f) }
-        else { flush_filing[abs](k.cache, f) };
-        store_state = Some(without_warnings({ ..k, cache: c }));
-        { unflushed: None, warnings: cache_warnings(c) }
-      },
+    result_cache.keep_listings(listed) -> {
+      store_state = {
+        ..store_state,
+        cache: listed.fold(store_state.cache, |c: tables::Cache, l: CasesListed|
+          tables::put_case_listing(c, l.test, {
+            listing: l.listing,
+            cases: bin::encode(l.cases, bin::list_bin(listed_case_bin())),
+          })),
+      };
     },
   }
 
-fn cached_over<[r]>(
-  cache: tables::Cache,
-  keys: List<String>,
-) -> List<Option<Bytes>> / {fs.read[r], fs.read[abs], abort.raise} =
-  keys.map(|key: String| tables::evidence_shared[r, abs](cache, Bytes::of_hex(key)).value)
+fn listings_over(
+  c0: tables::Cache,
+  requests: List<ListingRequest>,
+) -> StoreRead<List<Option<List<ListedCase>>>> / {abort.raise} =
+  requests.fold(
+    { value: [], cache: c0 },
+    |read: StoreRead<List<Option<List<ListedCase>>>>, r: ListingRequest| {
+      let got = tables::case_listing(read.cache, r.test);
+      let cases = match got.value {
+        Some(l) -> if l.listing != r.listing { None } else {
+          match bin::decode(l.cases, bin::list_bin(listed_case_bin())) {
+            Ok(listed) -> Some(listed),
+            Err(_) -> None,
+          }
+        },
+        None -> None,
+      };
+      { value: read.value.push(cases), cache: got.cache }
+    },
+  )
 
-fn cached_of(
-  opened_store: Option<OpenStore>,
-  keys: List<String>,
-) -> List<Option<Bytes>> / {fs.read[cwd], fs.read[abs], abort.raise} =
-  match opened_store {
-    None -> keys.map(|k: String| None),
-    Some(k) -> if k.place.label == "cwd" { cached_over[cwd](k.cache, keys) }
-    else { cached_over[abs](k.cache, keys) },
-  }
+fn cached_over(cache: tables::Cache, keys: List<String>) -> List<Option<Bytes>> / {abort.raise} =
+  keys.map(|key: String| tables::evidence(cache, Bytes::of_hex(key)).value)
 
-type StoreWrite = { store: Option<OpenStore>, diagnostics: List<Diagnostic> }
+type StoreWrite = { store: OpenStore, diagnostics: List<Diagnostic> }
 
 fn after_write(k: OpenStore, cache: tables::Cache) -> StoreWrite =
   {
-    store: Some({ ..k, cache: { ..cache, store: { ..cache.store, warnings: [] } } }),
+    store: { ..k, cache: { ..cache, store: { ..cache.store, warnings: [] } } },
     diagnostics: project_store::diagnostics_of(tables::warnings(cache)),
   }
 
 fn flushed(
   k: OpenStore,
   cache: tables::Cache,
-) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  after_write(k, if k.place.label == "cwd" { tables::flush_shared[cwd, abs](cache) }
-  else { tables::flush_shared[abs, abs](cache) })
+) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} =
+  after_write(k, match k.place.label {
+    WorkingDirectory -> tables::flush_cache[cwd](cache),
+    Absolute -> tables::flush_cache[abs](cache),
+  })
 
 fn record_evidence(
-  opened_store: Option<OpenStore>,
+  k: OpenStore,
   entries: List<{ key: String, evidence: Bytes }>,
-) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  match opened_store {
-    None -> { store: None, diagnostics: [] },
-    Some(k) ->
-      flushed(
-        k,
-        entries.fold(k.cache, |cache: tables::Cache, e: { key: String, evidence: Bytes }|
-          tables::put_evidence(cache, Bytes::of_hex(e.key), e.evidence)),
-      ),
+) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} =
+  flushed(
+    k,
+    entries.fold(k.cache, |cache: tables::Cache, e: { key: String, evidence: Bytes }|
+      tables::put_evidence(cache, Bytes::of_hex(e.key), e.evidence)),
+  )
+
+fn claims_of(k: OpenStore, module: Bytes, identity: Bytes) -> Option<Bytes> / {abort.raise} =
+  match tables::module_claims(k.cache, module).value {
+    Some(c) -> if c.identity == identity { Some(c.claims) } else { None },
+    None -> None,
   }
 
-fn baselines_over<[r]>(
+fn record_claims(
+  k: OpenStore,
+  entries: List<ClaimsEntry>,
+) -> StoreWrite / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} =
+  flushed(
+    k,
+    entries.fold(k.cache, |cache: tables::Cache, e: ClaimsEntry|
+      tables::put_module_claims(cache, e.module, {
+        identity: e.identity,
+        claims: e.claims,
+        evidence: e.evidence,
+      })),
+  )
+
+fn baselines_of(
   cache: tables::Cache,
   names: List<String>,
-) -> List<{ name: String, record: ClaimSnapshot }> / {fs.read[r], abort.raise} =
+) -> List<{ name: String, record: ClaimSnapshot }> / {abort.raise} =
   names.fold([], |accumulator: List<{ name: String, record: ClaimSnapshot }>, name: String|
-    match tables::review[r](cache, Bytes::of_string(name)).value {
+    match tables::review(cache, Bytes::of_string(name)).value {
       None -> accumulator,
       Some(rv) ->
         accumulator.push({
@@ -357,74 +510,72 @@ fn baselines_over<[r]>(
         }),
     })
 
-fn baselines_of(
-  opened_store: Option<OpenStore>,
-  names: List<String>,
-) -> List<{ name: String, record: ClaimSnapshot }> / {fs.read[cwd], fs.read[abs], abort.raise} =
-  match opened_store {
-    None -> [],
-    Some(k) -> if k.place.label == "cwd" { baselines_over[cwd](k.cache, names) }
-    else { baselines_over[abs](k.cache, names) },
-  }
-
 fn accepted_of(
-  opened_store: Option<OpenStore>,
+  k: OpenStore,
   records: List<{ name: String, record: ClaimSnapshot }>,
-) -> { store: Option<OpenStore>, accepted: AcceptResult } / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, abort.raise} =
-  match opened_store {
-    None -> { store: None, accepted: { definitions: records.len(), stored: false, warnings: [] } },
-    Some(k) -> {
-      let w = flushed(
-        k,
-        records.fold(k.cache, |cache: tables::Cache, r: { name: String, record: ClaimSnapshot }|
-          tables::put_review(cache, Bytes::of_string(r.name), {
-            definition: Bytes::of_hex(r.record.definition_hash),
-            specs: r.record.specs.map(Bytes::of_hex),
-          })),
-      );
-      {
-        store: w.store,
-        accepted: {
-          definitions: records.len(),
-          stored: !w.diagnostics.fold(false, |hit: Bool, diagnostic: Diagnostic|
-            hit || diagnostic.code == b"W0601"),
-          warnings: w.diagnostics,
-        },
-      }
+) -> { store: OpenStore, accepted: AcceptResult } / {fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write, abort.raise} = {
+  let w = flushed(
+    k,
+    records.fold(k.cache, |cache: tables::Cache, r: { name: String, record: ClaimSnapshot }|
+      tables::put_review(cache, Bytes::of_string(r.name), {
+        definition: Bytes::of_hex(r.record.definition_hash),
+        specs: r.record.specs.map(Bytes::of_hex),
+      })),
+  );
+  {
+    store: w.store,
+    accepted: {
+      definitions: records.len(),
+      stored: !w.diagnostics.fold(false, |hit: Bool, diagnostic: Diagnostic|
+        hit || diagnostic.code == cache_unreadable_code),
+      warnings: w.diagnostics,
     },
   }
+}
 
 pub fn with_evidence<a | e>(
-  opened_store: Option<OpenStore>,
-  go: () -> a / {proof_store.cached, proof_store.record | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  opened_store: OpenStore,
+  go: () -> a / {proof_store.cached, proof_store.record, proof_store.module_claims, proof_store.record_claims | e},
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} =
   handle {
     go()
   } with {
     var store_state = opened_store,
-    proof_store.cached(keys) -> cached_of(store_state, keys),
+    proof_store.cached(keys) -> cached_over(store_state.cache, keys),
     proof_store.record(entries) -> {
       let w = record_evidence(store_state, entries);
+      store_state = w.store;
+      w.diagnostics
+    },
+    proof_store.module_claims(module, identity) -> claims_of(store_state, module, identity),
+    proof_store.record_claims(entries) -> {
+      let w = record_claims(store_state, entries);
       store_state = w.store;
       w.diagnostics
     },
   }
 
 pub fn with_review<a | e>(
-  opened_store: Option<OpenStore>,
-  go: () -> a / {proof_store.cached, proof_store.record, proof_store.baselines, proof_store.accepted | e},
-) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms | e} =
+  opened_store: OpenStore,
+  go: () -> a / {proof_store.cached, proof_store.record, proof_store.module_claims, proof_store.record_claims, proof_store.baselines, proof_store.accepted | e},
+) -> a / {abort.raise, fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], recent_reads.read, recent_reads.write | e} =
   handle {
     go()
   } with {
     var store_state = opened_store,
-    proof_store.cached(keys) -> cached_of(store_state, keys),
+    proof_store.cached(keys) -> cached_over(store_state.cache, keys),
     proof_store.record(entries) -> {
       let w = record_evidence(store_state, entries);
       store_state = w.store;
       w.diagnostics
     },
-    proof_store.baselines(names) -> baselines_of(store_state, names),
+    proof_store.module_claims(module, identity) -> claims_of(store_state, module, identity),
+    proof_store.record_claims(entries) -> {
+      let w = record_claims(store_state, entries);
+      store_state = w.store;
+      w.diagnostics
+    },
+    proof_store.baselines(names) -> baselines_of(store_state.cache, names),
     proof_store.accepted(records) -> {
       let a = accepted_of(store_state, records);
       store_state = a.store;
@@ -434,94 +585,110 @@ pub fn with_review<a | e>(
 
 fn hashed(s: String) -> Bytes = blake3(Bytes::of_string(s))
 
-fn fixed(name: Bytes, edges: List<NodeRef>) -> CachedNode =
+const no_form: FramedBody = { calls: ChosenCalls([]), form: b"" }
+
+fn defined(name: Bytes, uses: List<NodeRef>) -> DefinitionHash =
   {
     name: name,
-    declaration: false,
+    kind: HeldValue,
     hash: blake3(name),
-    own: None,
-    specs: [],
-    spec_texts: [],
-    spec_checks: [],
-    contract: b"",
-    check: b"",
-    body: b"",
-    edges: edges,
-    effects: [],
+    body: no_form,
+    contract: blake3(name),
     clauses: [],
+    uses: uses,
+    clause_uses: [],
+    contract_uses: [],
+    transparent: false,
+    shapes: { body: blake3(name), text: no_form, clauses: [], contract: blake3(name) },
   }
 
 const a_module: ModuleHashes = {
-  let fixing = {
-    nodes: [fixed(b"m.f", [{ name: b"m.g", declaration: false }]), fixed(b"m.g", [])],
+  let own = {
+    definitions: [defined(b"m.f", [{ name: b"m.g", kind: HeldValue }]), defined(b"m.g", [])],
     tests: [
       {
         key: b"m.t",
         hash: hashed("t"),
-        body: b"",
-        text: b"",
-        refs: [{ name: b"m.f", declaration: false }],
-        runs: [],
-        listing: [],
+        shape: hashed("t"),
+        body: no_form,
+        uses: [{ name: b"m.f", kind: HeldValue }],
+        listing: None,
       },
     ],
     laws: [],
   };
-  { record: record_digest(module_record(fixing)), cached: fixing }
+  { record: record_digest(module_record(own)), own: own }
 }
 
-const a_filing: Filing =
+const a_file_read: List<RecordedRead> =
+  [
+    {
+      read: ReadPath({ how: WholeFile, place: UnderRoot({ root: b"cwd", path: b"a" }), own: [] }),
+      digest: b"d",
+    },
+  ]
+
+const an_update: StoreUpdate =
   {
-    passes: [{ key: hashed("t key"), trace: b"file\tcwd\ta\td\n" }],
-    code_passes: [{ key: hashed("t code"), trace: b"" }],
+    passes: [{ key: hashed("t key"), reads: a_file_read }],
+    code_passes: [{ key: hashed("t code"), reads: [] }],
     records: [
       {
         key: b"m.t",
         record: {
           test: hashed("t"),
-          era: snapshot_digest_of([a_module]),
+          era: snapshot_digest_of([a_module.record]),
           start: b"m.t",
           case: false,
+          passes: [hashed("t key")],
+          codes: [hashed("t code")],
         },
       },
     ],
-    seen: [hashed("f")],
-    reachable: { functions: [], declarations: [] },
   }
 
 const some_stamps: tables::Stamps = { runtime_digest: "runtime", code: "code" }
 
+fn cache_database() -> Opening / {fs.write[mem]} = open_database[mem](database_in("cache"))
+
 const original_definition: { hash: Bytes, text: Bytes } =
-  { hash: hashed("old f"), text: b"fn f() -> Int = 1\n" }
+  { hash: blake3(b"m.f"), text: b"fn f() -> Int = 1\n" }
 
 fn read_back(
-  f: Filing,
-) -> { passes: List<Option<Bytes>>, codes: List<Option<Bytes>>, moved: List<Option<Bytes>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
+  f: StoreUpdate,
+  seen: List<Bytes>,
+) -> { passes: Map<Bytes, List<RecordedRead>>, codes: Map<Bytes, List<RecordedRead>>, moved: List<Map<Bytes, List<RecordedRead>>>, seen: List<Bool>, baselines: List<Option<LastPass>>, texts: List<Option<Bytes>> } / {abort.raise} =
   run_in_memory(mem_empty(), || {
-    let c0 = store_pass(tables::open_cache[mem]("cache", some_stamps), [original_definition], [
-      a_module,
-    ]);
-    let c1 = tables::flush_cache[mem](put_filing[mem, mem](c0, f));
-    let r = tables::open_cache[mem]("cache", some_stamps);
-    let moved = tables::open_cache[mem]("cache", { ..some_stamps, runtime_digest: "another" });
+    let c0 = store_pass(
+      tables::open_cache[mem](cache_database(), some_stamps),
+      [original_definition],
+      [a_module],
+      [a_module.record],
+    );
+    let c1 = tables::flush_cache[mem](put_update(c0, f, seen));
+    let r = tables::open_cache[mem](cache_database(), some_stamps);
+    let moved = tables::open_cache[mem](cache_database(), {
+      ..some_stamps,
+      runtime_digest: "another",
+    });
     {
-      passes: read_pass_traces[mem, mem](r, [hashed("t key"), hashed("other")]).value,
-      codes: code_passes_over[mem, mem](r, [hashed("t code"), hashed("t key")]).value,
-      moved: code_passes_over[mem, mem](moved, [hashed("t code")]).value.fold(
-        read_pass_traces[mem, mem](moved, [hashed("t key")]).value,
-        |accumulator: List<Option<Bytes>>, o: Option<Bytes>| accumulator.push(o),
-      ),
-      seen: [hashed("f"), hashed("g")].map(|h: Bytes| tables::knows_definition(r, h)),
-      baselines: last_passes_over[mem](r, [b"m.t", b"m.u"]).value,
-      texts: read_texts[mem](r, [original_definition.hash, hashed("missing")]).value,
+      passes: stored_reads(r, [hashed("t key"), hashed("other")], tables::pass_trace).value,
+      codes: stored_reads(r, [hashed("t code"), hashed("t key")], tables::code_pass_trace).value,
+      moved: [
+        stored_reads(moved, [hashed("t key")], tables::pass_trace).value,
+        stored_reads(moved, [hashed("t code")], tables::code_pass_trace).value,
+      ],
+      seen: [blake3(b"m.f"), hashed("g")].map(|h: Bytes| tables::knows_definition(r, h)),
+      baselines: last_passes_over(r, [b"m.t", b"m.u"]).value,
+      texts: read_texts(r, [original_definition.hash, hashed("missing")]).value,
     }
   }).value
 
 test "a stored run reads back its passing results, baselines and whether each test ran, and each baseline reads back with its definition text" {
-  let back = read_back(a_filing);
-  assert_eq(back.passes, [Some(b"file\tcwd\ta\td\n"), None]);
-  assert_eq(back.codes, [Some(b""), None]);
-  assert_eq(back.moved, [None, Some(b"")]);
+  let back = read_back(an_update, [blake3(b"m.f")]);
+  assert_eq(back.passes, Map::new().insert(hashed("t key"), a_file_read));
+  assert_eq(back.codes, Map::new().insert(hashed("t code"), []));
+  assert_eq(back.moved, [Map::new(), Map::new().insert(hashed("t code"), [])]);
   assert_eq(back.seen, [true, false]);
   assert_eq(back.baselines, [
     Some({
@@ -538,8 +705,8 @@ test "a stored run reads back its passing results, baselines and whether each te
 
 test "a baseline is not returned when the module record it was made from is missing from the cache" {
   let back = run_in_memory(mem_empty(), || {
-    let c = put_filing[mem, mem](tables::open_cache[mem]("cache", some_stamps), a_filing);
-    last_passes_over[mem](tables::put_snapshot(c, [a_module.record]), [b"m.t"]).value
+    let c = put_update(tables::open_cache[mem](cache_database(), some_stamps), an_update, []);
+    last_passes_over(tables::put_snapshot(c, [a_module.record]), [b"m.t"]).value
   }).value;
   assert_eq(back, [None])
 }
@@ -547,30 +714,80 @@ test "a baseline is not returned when the module record it was made from is miss
 test "opening the cache under a different runtime digest drops the stored baselines and passing results but still returns the definition texts" {
   let back = run_in_memory(mem_empty(), || {
     let recorded = store_pass(
-      tables::open_cache[mem]("cache", some_stamps),
+      tables::open_cache[mem](cache_database(), some_stamps),
       [original_definition],
       [a_module],
+      [a_module.record],
     );
-    let c1 = tables::flush_cache[mem](put_filing[mem, mem](recorded, a_filing));
-    let moved = tables::open_cache[mem]("cache", { ..some_stamps, runtime_digest: "another" });
+    let c1 = tables::flush_cache[mem](put_update(recorded, an_update, []));
+    let moved = tables::open_cache[mem](cache_database(), {
+      ..some_stamps,
+      runtime_digest: "another",
+    });
     {
-      baselines: last_passes_over[mem](moved, [b"m.t"]).value,
-      texts: read_texts[mem](moved, [original_definition.hash]).value,
+      baselines: last_passes_over(moved, [b"m.t"]).value,
+      texts: read_texts(moved, [original_definition.hash]).value,
     }
   }).value;
   assert_eq(back.baselines, [None]);
   assert_eq(back.texts, [Some(original_definition.text)])
 }
 
+test "a journal names the tests it saw start but not finish, returns the rows of the finished ones, ignores a torn last entry, and counts for nothing under other stamps" {
+  let row = { slot: b"\x05" ++ hashed("pass"), payload: b"" };
+  let journal = Bytes::concat_all([
+    framed(Began(header_of(some_stamps))),
+    framed(Started({ key: b"m.passes", hash: b"p" })),
+    framed(Started({ key: b"m.crashes", hash: b"c" })),
+    framed(Finished({ key: b"m.passes", rows: [row] })),
+  ]);
+  let torn = framed(Finished({ key: b"m.crashes", rows: [] }));
+  let read = recovery_of(journal_entries(journal ++ torn.slice(0, torn.len() - 1)), some_stamps);
+  assert_eq(read.interrupted, [{ key: b"m.crashes", hash: b"c" }]);
+  assert_eq(read.rows, [row]);
+  assert_eq(recovery_of(journal_entries(journal), { ..some_stamps, code: "another" }), {
+    rows: [],
+    interrupted: [],
+  })
+}
+
+test "a run after a crash stores the passes its journal finished, returns the tests it left running, and starts a new journal" {
+  let back = run_in_memory(mem_empty(), || {
+    let opened = {
+      place: { label: WorkingDirectory, dir: "cache", root: "", stamps: some_stamps },
+      cache: tables::open_cache[mem](cache_database(), some_stamps),
+    };
+    let j = journal_of(opened);
+    let rows = tables::rows_written(opened.cache, |c: tables::Cache| put_update(c, an_update, []));
+    let _ = fs.create_dir[mem]("cache");
+    let _ = fs.write_file[mem](
+      j.path,
+      Bytes::concat_all([
+        framed(Began(header_of(some_stamps))),
+        framed(Started({ key: b"m.t", hash: b"" })),
+        framed(Finished({ key: b"m.t", rows: rows })),
+        framed(Started({ key: b"m.crashes", hash: b"c" })),
+      ]),
+    );
+    let begun = begun_journal[mem](opened, j);
+    {
+      interrupted: begun.interrupted,
+      passes: stored_reads(
+        tables::open_cache[mem](cache_database(), some_stamps),
+        [hashed("t key")],
+        tables::pass_trace,
+      ).value,
+      left: recovery_of(read_journal[mem](j), some_stamps),
+    }
+  }).value;
+  assert_eq(back.interrupted, [{ key: b"m.crashes", hash: b"c" }]);
+  assert_eq(back.passes, Map::new().insert(hashed("t key"), a_file_read));
+  assert_eq(back.left, { rows: [], interrupted: [] })
+}
+
 test "storing a run with no results reads back no passing results, no ran-test flags and no baselines" {
-  let back = read_back({
-    passes: [],
-    code_passes: [],
-    records: [],
-    seen: [],
-    reachable: { functions: [], declarations: [] },
-  });
-  assert_eq(back.passes, [None, None]);
+  let back = read_back({ passes: [], code_passes: [], records: [] }, []);
+  assert_eq(back.passes, Map::new());
   assert_eq(back.seen, [false, false]);
   assert_eq(back.baselines, [None, None])
 }

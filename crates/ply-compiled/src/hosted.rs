@@ -364,7 +364,6 @@ pub unsafe extern "C" fn rt_observed(
         4 => None,
         5 => return recorder.shipped(path),
         6 => return recorder.ran_program(),
-        7 | 8 => return recorder.reached(path, kind.0 == 7),
         _ => {
             handed(c, "observed", "a kind of read", None::<()>);
             return;

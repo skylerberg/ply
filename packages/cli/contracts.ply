@@ -1,20 +1,26 @@
+import progress
+import compiler.codes (unsatisfied_registry_dependency_code)
+import compiler.check.resolve.tables (error_unplaced)
 import args (Flags, style_of, root_of)
 import std.cli (Parsed)
 import std.env (env)
-import paths (ResolvedPath, here)
+import paths (ResolvedPath, Absolute, here)
 import registry (BaseUrl, base_of, registry_unreachable, unset, rejected_package, url_variable)
 import remote (FetchedClosure, fetch_closure, index_of)
 import report (CommandOutput, indent, ok_code, count_of, reported)
-import sources (shipping_for)
+import sources (DependencyPackage, File, Project)
 import std.term (Style, bold, green, yellow)
 import builder (builder)
-import compiler.front.published (no_rows)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.facts (Analysis)
-import compiler.front (EmbedRecord, ShippedInputs, analyse_pulling_std_with)
-import compiler.store.hash (Contract, public_contracts)
-import compiler.front.pkg (PackageSources, SuppliedPackage, is_dotted_path)
-import compiler.check.resolve.tables (Diagnostic, Source, error_at)
+import compiler.store.hash (Contract)
+import compiler.store.hash.forms (definition_key)
+import compiler.store.hash.graph (HeldType, HeldValue)
+import compiler.load (Loads)
+import compiler.front.checking (LoadInputs)
+import compiler.front.checking.interfaces (PublishedModule, published_module)
+import compiler.front.checking.view
+import program (ProgramStore, in_program_store)
+import compiler.front.pkg (SuppliedPackage, is_dotted_path)
+import compiler.check.resolve.tables (Diagnostic, Source)
 import std.fs (fs)
 import std.json (Json, Array, Bool, Number, Str, object)
 import std.net (net)
@@ -22,7 +28,6 @@ import std.pkg (Index, Manifest, Release, Version, parse_version, prefix_of, ren
                 release_at)
 import std.list
 import std.option
-import compiler.syntax.parsing (no_module, dummy_span)
 
 fn version_text(version: Version) -> String =
   "{ major: " ++ version.major.to_string() ++ ", minor: " ++ version.minor.to_string()
@@ -46,82 +51,93 @@ fn consumer_manifest(manifest: Manifest) -> Bytes =
       ++ ", source: Registry }], entry: None }\n",
   )
 
-pub type Consumer = {
-  packages: PackageSources,
-  whole: Analysis,
-  modules: List<Bytes>,
-  shipping: ShippedInputs,
-}
-
-pub fn analyse_as_consumer(
-  root: Bytes,
+fn consumer_project(
+  root: String,
   manifest: Manifest,
-  own: SuppliedPackage,
-  dependencies: List<SuppliedPackage>,
-  embeds: List<EmbedRecord>,
-) -> Result<Consumer, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], abort.raise} = {
-  let packages: PackageSources = {
+  packages: List<DependencyPackage>,
+) -> Project =
+  {
+    files: [],
+    sources: [],
+    diagnostics: [],
+    manifest: Some({
+      path: "ply.pkg",
+      module: "",
+      text: consumer_manifest(manifest),
+      at: { label: Absolute, path: root ++ "/ply.pkg" },
+    }),
+    packages: packages,
+    root_key: root,
+  }
+
+pub fn package_of_supplied(s: SuppliedPackage) -> DependencyPackage = {
+  let root = String::of_bytes_lossy(s.root);
+  {
     root: root,
-    manifest: Some(consumer_manifest(manifest)),
-    supplied: dependencies.fold([own], |accumulator: List<SuppliedPackage>, s: SuppliedPackage|
-      accumulator.push(s)),
-  };
-  let shipping = shipping_for([], packages);
-  match analyse_pulling_std_with(
-      [],
-      shipping.sources,
-      no_rows,
-      packages,
-      embeds,
-      unread: shipping.unread,
-      data: shipping.data,
-    ).out {
-    Rejected(ds) -> Err(ds),
-    Analysed(w) -> {
-      let prefix = Bytes::of_string(prefix_of(manifest));
-      Ok({
-        packages: packages,
-        whole: w,
-        modules: own.modules.map(|s: Source| Bytes::concat_all([prefix, b".", s.name])),
-        shipping: shipping,
-      })
-    },
+    dir: root,
+    manifest: s.manifest,
+    files: s.modules.map(|m: Source| {
+      let module = String::of_bytes_lossy(m.name);
+      {
+        path: module,
+        module: module,
+        text: m.source_text,
+        at: { label: Absolute, path: root ++ "/" ++ module },
+      }
+    }),
   }
 }
 
-pub fn consumer_contracts(c: Consumer) -> List<Contract> / {abort.raise} = {
-  let mine = c.modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, m: Bytes|
-    accumulator.insert(m, true));
-  public_contracts(c.whole.index, c.whole.hashes, |m: Bytes| mine.contains(m))
+pub fn consumed_modules(
+  store: Option<ResolvedPath>,
+  root: String,
+  manifest: Manifest,
+  own: DependencyPackage,
+  dependencies: List<DependencyPackage>,
+) -> Result<List<PublishedModule>, List<Diagnostic>> / {ProgramStore, abort.raise} = {
+  let prefix = prefix_of(manifest);
+  let names = own.files.map(|f: File| Bytes::of_string(prefix ++ "." ++ f.module));
+  progress::silently(||
+    in_program_store(
+      { project: consumer_project(root, manifest, [own].concat(dependencies)), store: store },
+      |w: LoadInputs|
+        match view::rejections(w.own, view::summary(w.own)) {
+          [] ->
+            Ok(
+              names.map(|name: Bytes|
+                match published_module({ module: name, shipped: false, tested: false }) {
+                  Some(m) -> m,
+                  None -> panic("a module the consumer's check accepted has no interface"),
+                }),
+            ),
+          rejected -> Err(rejected),
+        },
+    )).value
 }
+
+pub fn contracts_in(modules: List<PublishedModule>) -> List<Contract> =
+  modules.fold([], |found: List<Contract>, m: PublishedModule| found.concat(m.contracts))
 
 pub type ContractChanges = { added: List<String>, changed: List<String>, removed: List<String> }
 
+fn key_of(c: Contract) -> Bytes = definition_key(c.reference.name, c.reference.kind)
+
 fn by_key(cs: List<Contract>) -> Map<Bytes, Contract> =
   cs.fold(Map::new(), |accumulator: Map<Bytes, Contract>, c: Contract|
-    accumulator.insert(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name), c))
+    accumulator.insert(key_of(c), c))
 
-fn shown_name(c: Contract) -> String = String::of_bytes_lossy(c.name)
+fn shown_name(c: Contract) -> String = String::of_bytes_lossy(c.reference.name)
 
 pub fn contract_changes(was: List<Contract>, now: List<Contract>) -> ContractChanges = {
   let before = by_key(was);
   let after = by_key(now);
   {
-    added: now.filter(|c: Contract|
-      !before.contains(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name))).map(
-      shown_name,
-    ),
+    added: now.filter(|c: Contract| !before.contains(key_of(c))).map(shown_name),
     changed: now.filter(|c: Contract|
-      match before.get(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name)) {
-        Some(b) -> b.hash != c.hash,
-        None -> false,
-      }).map(
+      match before.get(key_of(c)) { Some(b) -> b.hash != c.hash, None -> false }).map(
       shown_name,
     ),
-    removed: was.filter(|c: Contract|
-      !after.contains(Bytes::concat(if c.declaration { b"t " } else { b"v " }, c.name))).map(
-      shown_name,
-    ),
+    removed: was.filter(|c: Contract| !after.contains(key_of(c))).map(shown_name),
   }
 }
 
@@ -181,10 +197,8 @@ pub fn bump_error(
   let actual_bump = bump_between(was, now);
   if rank(actual_bump) >= rank(need) { None } else {
     Some(
-      error_at(
+      error_unplaced(
         b"E0150",
-        no_module,
-        dummy_span,
         Bytes::of_string(
           "`" ++ name ++ "` " ++ render_version(now) ++ " is a " ++ version_bump_name(actual_bump)
             ++ " of "
@@ -221,10 +235,8 @@ fn version_of(text: String) -> Result<Version, Diagnostic> / {abort.raise} =
   }
 
 pub fn unpublished(name: String, version: Version) -> Diagnostic =
-  error_at(
-    b"E0143",
-    no_module,
-    dummy_span,
+  error_unplaced(
+    unsatisfied_registry_dependency_code,
     Bytes::of_string("the registry holds no `" ++ name ++ "` " ++ render_version(version)),
     b"no such published version",
     [],
@@ -232,24 +244,24 @@ pub fn unpublished(name: String, version: Version) -> Diagnostic =
 
 pub fn published_contracts(
   base: BaseUrl,
-  root: String,
+  at: ResolvedPath,
   name: String,
   index: Index,
   version: Version,
-) -> Result<List<Contract>, List<Diagnostic>> / {fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
+) -> Result<List<Contract>, List<Diagnostic>> / {ProgramStore, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} =
   match release_at(index, version) {
     None -> Err([unpublished(name, version)]),
-    Some(r) -> match fetch_closure(base, root, name, r) {
+    Some(r) -> match fetch_closure(base, at.absolute, name, r) {
       Err(d) -> Err([d]),
-      Ok(c) -> match analyse_as_consumer(
-          Bytes::of_string(root),
+      Ok(c) -> match consumed_modules(
+          Some(at),
+          at.absolute,
           c.manifest,
-          c.own,
-          c.dependencies,
-          [],
+          package_of_supplied(c.own),
+          c.dependencies.map(package_of_supplied),
         ) {
         Err(ds) -> Err(ds),
-        Ok(x) -> Ok(consumer_contracts(x)),
+        Ok(modules) -> Ok(contracts_in(modules)),
       },
     },
   }
@@ -257,7 +269,7 @@ pub fn published_contracts(
 pub fn run(
   flags: Flags,
   opts: Options,
-) -> CommandOutput / {env.variable, fs.list_dir[shipped], fs.read_file[shipped], net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.read_file[abs], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
+) -> CommandOutput / {env.variable, ProgramStore, net.connect[registry], net.connect_tls[registry], net.handshake[registry], net.send[registry], net.recv[registry], net.close[registry], fs.create_dir[abs], fs.write_file[abs], abort.raise, diverges} = {
   let s = style_of(flags);
   if !is_dotted_path(opts.name) {
     reported(
@@ -283,10 +295,10 @@ pub fn run(
           Ok(base) -> match index_of(base, opts.name) {
             Err(d) -> reported(s, "contracts", [d], []),
             Ok(index) -> {
-              let root = root_of(flags).absolute;
-              match published_contracts(base, root, opts.name, index, from) {
+              let at = root_of(flags);
+              match published_contracts(base, at, opts.name, index, from) {
                 Err(ds) -> reported(s, "contracts", ds, []),
-                Ok(was) -> match published_contracts(base, root, opts.name, index, to) {
+                Ok(was) -> match published_contracts(base, at, opts.name, index, to) {
                   Err(ds) -> reported(s, "contracts", ds, []),
                   Ok(now) -> contracts_output(s, opts, from, to, contract_changes(was, now)),
                 },
@@ -346,13 +358,13 @@ fn contracts_output(
 }
 
 fn contract_of(name: String, hash: Bytes) -> Contract =
-  { name: Bytes::of_string(name), declaration: false, hash: hash }
+  { reference: { name: Bytes::of_string(name), kind: HeldValue }, hash: hash }
 
 test "`contract_changes` lists the definitions added, changed and removed between two contracts, by name and namespace" {
   let was = [
     contract_of("m.a", b"1"),
     contract_of("m.b", b"2"),
-    { ..contract_of("m.T", b"3"), declaration: true },
+    { ..contract_of("m.T", b"3"), reference: { name: b"m.T", kind: HeldType } },
   ];
   let now = [
     contract_of("m.a", b"1"),

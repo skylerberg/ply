@@ -34,6 +34,39 @@ pub fn with_digests(read: EmbedBytesResult) -> EmbedResult =
     Err(reason) -> Err(reason),
   }
 
+pub effect embed_snapshot {
+  read held(key: Bytes) -> Option<EmbedBytesResult>
+  write hold(key: Bytes, read: EmbedBytesResult) -> Unit
+}
+
+pub effect set EmbedSnapshot = {embed_snapshot.read, embed_snapshot.write}
+
+pub fn with_embed_snapshot<a | e>(
+  body: () -> a / {embed_snapshot.read, embed_snapshot.write | e},
+) -> a / e =
+  handle {
+    body()
+  } with {
+    var reads: Map<Bytes, EmbedBytesResult> = Map::new(),
+    embed_snapshot.held(key) -> reads.get(key),
+    embed_snapshot.hold(key, read) -> {
+      reads = reads.insert(key, read);
+    },
+  }
+
+pub fn snapshot_embed<| e>(
+  key: Bytes,
+  read: () -> EmbedBytesResult / e,
+) -> EmbedBytesResult / {embed_snapshot.read, embed_snapshot.write | e} =
+  match embed_snapshot.held(key) {
+    Some(found) -> found,
+    None -> {
+      let found = read();
+      embed_snapshot.hold(key, found);
+      found
+    },
+  }
+
 pub type EmbedRequest = { path: Bytes, dir: Bool }
 
 derive bin for EmbedRequest
@@ -67,13 +100,13 @@ pub fn inline_embeds_by_name(
 ) -> { module: Module, diagnostics: List<ParseDiagnostic> } =
   match tables.get(name) {
     None -> { module: module, diagnostics: [] },
-    Some(t) -> inline_embeds(module, t, []),
+    Some(t) -> inline_embeds(module, [], t, []),
   }
 
 type EmbedCall = { want: EmbedRequest, span: Span, literal: Bool }
 
-fn own_names(module: Module) -> List<Bytes> = {
-  let declared = module.items.fold([], |accumulator: List<Bytes>, item: Item|
+fn own_names(module: Module, bound_elsewhere: List<Bytes>) -> List<Bytes> = {
+  let declared = module.items.fold(bound_elsewhere, |accumulator: List<Bytes>, item: Item|
     match item { FunctionItem(d) -> accumulator.push(d.name.name), _ -> accumulator });
   module.imports.fold(declared, |accumulator: List<Bytes>, declaration: ImportDeclaration|
     match declaration.kind {
@@ -111,8 +144,8 @@ fn embed_call(own: List<Bytes>, expression: Expression) -> Option<EmbedCall> =
     _ -> None,
   }
 
-pub fn embed_requests(module: Module) -> List<EmbedRequest> = {
-  let own = own_names(module);
+pub fn embed_requests(module: Module, bound_elsewhere: List<Bytes>) -> List<EmbedRequest> = {
+  let own = own_names(module, bound_elsewhere);
   let found = walk_module(
     module,
     { local_names: own, read: Map::new(), diagnostics: [], wants: [] },
@@ -132,7 +165,7 @@ pub type ItemEmbeds = { name: Option<Bytes>, wants: List<EmbedRequest> }
 derive bin for ItemEmbeds
 
 pub fn requests_by_item(module: Module) -> List<ItemEmbeds> = {
-  let own = own_names(module);
+  let own = own_names(module, []);
   module.items.fold([], |accumulator: List<ItemEmbeds>, item: Item| {
     let o = walk_item(
       { local_names: own, read: Map::new(), diagnostics: [], wants: [] },
@@ -153,12 +186,18 @@ pub fn requests_by_item(module: Module) -> List<ItemEmbeds> = {
 
 pub fn inline_embeds(
   module: Module,
+  bound_elsewhere: List<Bytes>,
   read: Map<Bytes, EmbedResult>,
   diagnostics: List<ParseDiagnostic>,
 ) -> { module: Module, diagnostics: List<ParseDiagnostic> } = {
   let walked = walk_module(
     module,
-    { local_names: own_names(module), read: read, diagnostics: diagnostics, wants: [] },
+    {
+      local_names: own_names(module, bound_elsewhere),
+      read: read,
+      diagnostics: diagnostics,
+      wants: [],
+    },
     true,
   );
   { module: walked.module, diagnostics: walked.state.diagnostics }

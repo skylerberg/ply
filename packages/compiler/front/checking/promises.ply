@@ -1,0 +1,636 @@
+import std.set (Set)
+import std.bin
+import std.list
+import std.graph (Visit, traverse)
+import compiler.store.memo (memo)
+import compiler.store.handles (QueryOf, Written, written, fetch, product_definition)
+import compiler.check.infer.checker (Checked, CheckReads, DefinitionInfo, EffectInfo, TypeFacts,
+                                     elsewhere, StoredDeclarations, declarations_joined,
+                                     no_stored_declarations, builtin_constructors, prelude_effects)
+import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
+import compiler.emit.representations (type_names, lowering)
+import compiler.front.facts (Analysis, PlacedTables, checked_of_parts, hashed_analysis,
+                             definitions_by_module)
+import compiler.front.published (group_analysis)
+import compiler.front.owner_checks (MemberResult, rejected_in, tables_in)
+import compiler.front.rows (OutlineItem, OutlinedFunction)
+import compiler.front.exports (item_at_bin, Imported, ItemAt, Mention, NameInModule, OwnerSource,
+                               OwnerText, group_imports, item_layout, named_node)
+import compiler.emit.costs (cost_input_of, CostedFunction, GroupWalk, ParamSharing, ReturnOwnership,
+                            FreshReturn, WalkedBody, demands_of, group_walk_bin, module_costs,
+                            module_demands_bin, parameters_bin, parameters_of, report_bin,
+                            return_ownership_bin, walked_group, ModuleDemands, Parameters, Report)
+import compiler.syntax.items (Item, FunctionItem, TestItem, LawItem, item_span)
+import compiler.check.resolve.tables (Diagnostic, ParsedModule, placed_in, qualify)
+import compiler.check.infer (item_owner)
+import compiler.store.hash (unreached)
+import compiler.store.hash.forms (OwnHashes, DefinitionHash, TestHash, LawHash, NodeRef,
+                                  hash_layout, hash_output, no_own_hashes, joined_own_hashes,
+                                  test_uses, Identities, Identified, LawRun, LawProof,
+                                  joined_identities)
+import compiler.store.hash.graph (HeldValue)
+import compiler.front.checking.identity (module_identities)
+import compiler.front.checking.units (with_code_reads)
+import compiler.program.group_check (LoadedSource, resolved_group)
+import compiler.front.checking.world (ModuleKey, InterfaceKey, QueryEffects, SessionReads, decoded,
+                                      interface_key_bin, module_key_bin, own_modules_kind,
+                                      package_location_of, shipped_for, CheckDefinition,
+                                      cost_products, measure_products)
+import compiler.front.checking.groups (UnitKey, GroupSource, OwnerFacts, OwnerKey, OwnersResult,
+                                       from_groups, with_performed_effects, known_of_types,
+                                       declared_of, unit_key_bin, check_group_key_bin, layout_of,
+                                       placed_facts, group_keys, no_bodies, owner_facts,
+                                       owner_hash_query, owner_key_bin, owners_result_of,
+                                       with_group_read, GroupRead, module_owners, unit_key_of,
+                                       group_key_of, group_of, group_hashes_of, GroupDeclarations,
+                                       stored_declarations_of, context_once, GroupOutput,
+                                       CurrentGroup, ObsoleteGroup, group_output_bin,
+                                       current_output, is_current_unit, module_key_of,
+                                       TextPositions, GroupPositions, FilePositions, owner_key_at,
+                                       states_measure)
+import compiler.front.checking.program_facts (own_key)
+
+pub fn cost_walk_query() -> QueryOf<UnitKey, GroupOutput<GroupWalk>> =
+  { name: b"cost walk", input: unit_key_bin(), output: group_output_bin(group_walk_bin()) }
+
+pub fn cost_return_query() -> QueryOf<InterfaceKey, ReturnOwnership> =
+  { name: b"cost return", input: interface_key_bin(), output: return_ownership_bin() }
+
+pub fn cost_demands_query() -> QueryOf<ModuleKey, ModuleDemands> =
+  { name: b"cost demands", input: module_key_bin(), output: module_demands_bin() }
+
+pub fn cost_parameters_query() -> QueryOf<Unit, Parameters> =
+  { name: b"cost parameters", input: bin::unit_bin(), output: parameters_bin() }
+
+pub fn module_parameters_query() -> QueryOf<ModuleKey, Parameters> =
+  { name: b"module parameters", input: module_key_bin(), output: parameters_bin() }
+
+pub fn module_costs_query() -> QueryOf<ModuleKey, Report> =
+  { name: b"module costs", input: module_key_bin(), output: report_bin() }
+
+pub const measure_name: Bytes = b"measure"
+
+pub fn measures_query() -> QueryOf<ModuleKey, List<MeasureEntry>> =
+  { name: b"measures", input: module_key_bin(), output: bin::list_bin(measure_entry_bin()) }
+
+fn in_root(module: Bytes) -> Bool / {memo.read, abort.raise} =
+  match package_location_of(module) { Some(p) -> p.package == 0, None -> false }
+
+fn root_modules() -> List<Bytes> / {memo.read, abort.raise} =
+  (match memo.external(own_modules_kind, b"") {
+    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the program's modules"),
+    None -> [],
+  }).filter(
+    in_root,
+  )
+
+type LoadedOwners = { named: ModuleKey, owners: List<Bytes> }
+
+fn module_of_unit(u: UnitKey) -> ModuleKey =
+  { module: u.module, shipped: u.shipped, tested: u.tested }
+
+fn loaded_unit(u: UnitKey) -> LoadedOwners = { named: module_of_unit(u), owners: u.owners }
+
+fn functions_of(read: OwnersResult, wanted: (OutlineItem) -> Bool) -> Set<Bytes> =
+  read.shape.outline.items.fold(Set::empty(), |found: Set<Bytes>, item: OutlineItem|
+    match item {
+      OutlinedFunction(f) -> if !wanted(item) { found } else {
+        List::fold(
+          match read.declared.get(f.name) { Some(owners) -> owners, None -> [] },
+          found,
+          |m: Set<Bytes>, o: Bytes| m.insert(o),
+        )
+      },
+      _ -> found,
+    })
+
+fn any_function(_: OutlineItem) -> Bool = true
+
+fn is_test_or_law(owner: Bytes) -> Bool = owner.starts_with(b"test ") || owner.starts_with(b"law ")
+
+fn walked_units(named: ModuleKey, read: OwnersResult) -> List<UnitKey> / {memo.read, abort.raise} = {
+  let bodied = functions_of(read, any_function);
+  group_keys(named).filter(|u: UnitKey|
+    u.owners.any(|o: Bytes| bodied.contains(o) || is_test_or_law(o)))
+}
+
+fn unit_members(u: LoadedOwners) -> List<OwnerFacts> / {memo.read, abort.raise} =
+  u.owners.map(|o: Bytes| owner_facts(u.named, o))
+
+fn imports_for_unit(
+  u: LoadedOwners,
+  members: List<OwnerFacts>,
+) -> List<Imported> / {SessionReads, abort.raise} = {
+  let context = context_once(u.named);
+  group_imports(
+    u.named.module,
+    members.map(|f: OwnerFacts| f.text),
+    members.fold([], |accumulator: List<Mention>, f: OwnerFacts| accumulator.concat(f.mentions)),
+    context.imports,
+    context.targets,
+  )
+}
+
+fn unit_roots(m: ParsedModule, source: OwnerSource) -> Set<Bytes> / {abort.raise} =
+  m.module.items.fold(Set::empty(), |roots: Set<Bytes>, item: Item| {
+    let start = item_span(item).start;
+    let inside = source.items.any(|x: ItemAt| x.to <= start && start < x.to + x.len);
+    if !inside { roots } else {
+      match item {
+        FunctionItem(_) -> roots.insert(item_owner(m.name, item)),
+        TestItem(_) -> roots.insert(item_owner(m.name, item)),
+        LawItem(_) -> roots.insert(item_owner(m.name, item)),
+        _ -> roots,
+      }
+    }
+  })
+
+fn returned_by(name: Bytes) -> ReturnOwnership / {memo.read, abort.raise} = {
+  let m = named_node(name);
+  fetch(cost_return_query(), { module: m.module, shipped: false, full_text: false, name: m.name })
+}
+
+pub fn cost_walk_result(u: UnitKey) -> Written / {QueryEffects, abort.raise} =
+  written(cost_walk_query(), if !is_current_unit(u) { ObsoleteGroup }
+  else { CurrentGroup(walked_unit(u)) })
+
+fn walked_unit(u: UnitKey) -> GroupWalk / {QueryEffects, abort.raise} = {
+  let read = stored_analysis([loaded_unit(u)], in_group);
+  let source = read.loaded.get(0);
+  let unwalked = |reason: Bytes| { unfinished: [reason], bodies: [], declared: [] };
+  match read.outcome {
+    Rejected(diagnostics) ->
+      unwalked(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"; ")),
+    Analysed(w) -> handle {
+      with_code_reads(u.tested, ||
+        walked_group(
+          { ..cost_input_of(w), walked: [0], roots: Some(unit_roots(w.modules.get(0), source)) },
+          returned_by,
+        ))
+    } with {
+      lowering.fail(reason) -> unwalked(reason),
+    },
+  }
+}
+
+fn walk_of(u: UnitKey) -> GroupWalk / {memo.read, abort.raise} =
+  current_output(cost_walk_query(), u)
+
+pub fn cost_return_result(key: InterfaceKey) -> Written / {memo.read, abort.raise} = {
+  let definition = qualify(key.module, key.name);
+  written(
+    cost_return_query(),
+    declared_of(key.module, key.shipped, key.full_text, key.name).fold(
+      FreshReturn,
+      |found: ReturnOwnership, o: Bytes|
+        match walk_of(
+            unit_key_of({
+              module: key.module,
+              shipped: key.shipped,
+              tested: key.full_text,
+              owner: o,
+            }),
+          ).bodies.find(|b: WalkedBody| b.item_kind == CostedFunction(definition)) {
+          Some(b) -> b.returned,
+          None -> found,
+        },
+    ),
+  )
+}
+
+pub fn cost_demands_result(named: ModuleKey) -> Written / {memo.read, abort.raise} =
+  written(
+    cost_demands_query(),
+    demands_of(walked_units(named, owners_result_of(named)).map(walk_of)),
+  )
+
+pub fn cost_parameters_result(_: Unit) -> Written / {memo.read, abort.raise} =
+  written(
+    cost_parameters_query(),
+    parameters_of(root_modules().map(|m: Bytes| fetch(cost_demands_query(), own_key(m)))),
+  )
+
+pub fn module_parameters_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
+  let all = fetch(cost_parameters_query(), ());
+  written(module_parameters_query(), {
+    ..all,
+    table: all.table.fold(
+      Map::new(),
+      |own_slots: Map<Bytes, Map<Int, ParamSharing>>, name: Bytes, slots: Map<Int, ParamSharing>|
+        if named_node(name).module == named.module { own_slots.insert(name, slots) }
+        else { own_slots },
+    ),
+  })
+}
+
+pub fn module_costs_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
+  let read = owners_result_of(named);
+  let facts = placed_facts(named, layout_of(named));
+  let text_of = |o: Bytes|
+    match facts.get(o) {
+      Some(f) -> f.text,
+      None -> panic("a unit names a declaration that its module does not hold"),
+    };
+  written(
+    module_costs_query(),
+    module_costs(
+      walked_units(named, read).map(|u: UnitKey|
+        { items: item_layout(u.owners.map(text_of)), walk: walk_of(u) }),
+      fetch(module_parameters_query(), named),
+    ),
+  )
+}
+
+fn owners_of_function(name: Bytes) -> List<OwnerKey> / {memo.read, abort.raise} = {
+  let m = named_node(name);
+  let shipped = shipped_for(false, m.module);
+  declared_of(m.module, shipped, false, m.name).map(|o: Bytes|
+    { module: m.module, shipped: shipped, tested: false, owner: o })
+}
+
+fn hashed_nodes(o: OwnerKey) -> List<DefinitionHash> / {memo.read, abort.raise} =
+  fetch(owner_hash_query(), o).definitions
+
+fn states_contract(o: OwnerKey) -> Bool / {memo.read, abort.raise} =
+  hashed_nodes(o).any(|n: DefinitionHash| n.clauses.len() > 0 || n.transparent)
+
+fn references_of(o: OwnerKey) -> List<NodeRef> / {memo.read, abort.raise} =
+  if is_test_or_law(o.owner) {
+    let own = group_hashes_of(unit_key_of(o));
+    own.tests.flat_map(test_uses).concat(own.laws.flat_map(|l: LawHash| l.uses))
+  } else { hashed_nodes(o).flat_map(|n: DefinitionHash| n.uses.concat(n.clause_uses)) }
+
+fn functions_used_by(o: OwnerKey) -> List<OwnerKey> / {memo.read, abort.raise} =
+  references_of(o).fold([], |accumulator: List<OwnerKey>, r: NodeRef|
+    if r.kind != HeldValue { accumulator } else { accumulator.concat(owners_of_function(r.name)) })
+
+type Need = | NeedsContract | NeedsBody
+
+type Wanted = { owner: OwnerKey, need: Need }
+
+fn wanted_as(need: Need, owners: List<OwnerKey>) -> List<Wanted> =
+  owners.map(|o: OwnerKey| { owner: o, need: need })
+
+fn loaded(w: Wanted) -> Bool / {memo.read, abort.raise} =
+  in_root(w.owner.module) || w.need == NeedsBody || states_contract(w.owner)
+
+fn wanted_expanded(w: Wanted) -> { value: Bool, next: List<Wanted> } / {memo.read, abort.raise} =
+  if !loaded(w) { { value: false, next: [] } } else {
+    {
+      value: true,
+      next: wanted_as(
+        if in_root(w.owner.module) { NeedsContract } else { NeedsBody },
+        functions_used_by(w.owner),
+      ),
+    }
+  }
+
+fn bodies_reached(start: List<OwnerKey>) -> Map<NameInModule, OwnerKey> / {memo.read, abort.raise} =
+  traverse(wanted_as(NeedsContract, start), wanted_expanded).fold(
+    Map::new(),
+    |found: Map<NameInModule, OwnerKey>, v: Visit<Wanted, Bool>|
+      if !v.value { found }
+      else { found.insert({ module: v.key.owner.module, name: v.key.owner.owner }, v.key.owner) },
+  )
+
+fn with_loaded_owner(found: Map<Bytes, LoadedOwners>, o: OwnerKey) -> Map<Bytes, LoadedOwners> =
+  found.insert(o.module, match found.get(o.module) {
+    Some(g) -> { ..g, owners: g.owners.push(o.owner) },
+    None -> { named: module_key_of(o), owners: [o.owner] },
+  })
+
+fn groups_reached(u: UnitKey) -> List<LoadedOwners> / {memo.read, abort.raise} = {
+  let named = module_of_unit(u);
+  let reached = bodies_reached(u.owners.map(|o: Bytes| owner_key_at(named, o)));
+  let by_module = reached.values().fold(Map::new(), with_loaded_owner);
+  let beside = match by_module.get(u.module) {
+    Some(g) -> g.owners.filter(|o: Bytes| !u.owners.contains(o)),
+    None -> [],
+  };
+  [{ ..loaded_unit(u), owners: u.owners.concat(beside) }].concat(
+    by_module.values().filter(|g: LoadedOwners| g.named.module != u.module),
+  )
+}
+
+fn source_of_unit(
+  u: LoadedOwners,
+  positions: (ModuleKey) -> TextPositions / {memo.read, abort.raise},
+) -> GroupSource / {SessionReads, abort.raise} = {
+  let members = unit_members(u);
+  {
+    named: u.named,
+    members: members,
+    imported: imports_for_unit(u, members),
+    positions: positions(u.named),
+  }
+}
+
+fn in_group(_: ModuleKey) -> TextPositions = GroupPositions
+
+fn in_file(named: ModuleKey) -> TextPositions / {memo.read, abort.raise} =
+  FilePositions(layout_of(named))
+
+fn with_stored_tables(
+  a: Analysis,
+  mentioned: List<NameInModule>,
+) -> Analysis / {CheckReads, abort.raise} = {
+  let known = known_of_types(
+    mentioned.map(|m: NameInModule| qualify(m.module, m.name)).concat(
+      a.checked.definitions.flat_map(|d: DefinitionInfo| type_names(d.scheme.ty)),
+    ),
+  );
+  let read = mentioned.fold(
+    { definitions: a.checked.definitions, effects: a.checked.effects },
+    |found: { definitions: List<DefinitionInfo>, effects: List<EffectInfo> }, m: NameInModule| {
+      let name = qualify(m.module, m.name);
+      {
+        definitions: match elsewhere.look_up_definition(name) {
+          Some(facts) -> match facts.implementation {
+            Checked(d, _) -> found.definitions.push(d),
+            _ -> found.definitions,
+          },
+          None -> found.definitions,
+        },
+        effects: match elsewhere.look_up_effect(name) {
+          Some(e) -> found.effects.push(e),
+          None -> found.effects,
+        },
+      }
+    },
+  );
+  {
+    ..a,
+    checked: {
+      ..a.checked,
+      definitions: definitions_by_module(
+        a.r.order.map(|i: Int| a.modules.get(i).name),
+        read.definitions,
+      ),
+      effects: prelude_effects.concat(read.effects).unique(),
+      constructors: builtin_constructors().concat(a.checked.constructors).concat(
+        known.constructors,
+      ).unique(
+      ),
+      instances: a.checked.instances.concat(known.instances).unique(),
+      numeric_types: a.checked.numeric_types.concat(known.numeric).unique(),
+    },
+    declared: {
+      ..a.declared,
+      types: known.opaque.fold(
+        a.declared.types,
+        |found: Map<Bytes, TypeFacts>, n: Bytes, f: TypeFacts|
+          if found.contains(n) { found } else { found.insert(n, f) },
+      ),
+    },
+  }
+}
+
+pub type MeasureProgram = { outcome: AnalysisOutcome, measured: List<Bytes>, owned: List<Bytes> }
+
+type GroupsAnalysed = { outcome: AnalysisOutcome, loaded: List<OwnerSource> }
+
+type StoredTables = {
+  parts: Map<Int, List<PlacedTables>>,
+  rejected: List<Diagnostic>,
+  declared: StoredDeclarations,
+  own: OwnHashes,
+  seen: Set<Bytes>,
+  hashed: Set<Bytes>,
+}
+
+fn with_stored_owner(
+  found: StoredTables,
+  module: Int,
+  u: LoadedOwners,
+  loaded: OwnerSource,
+  owner: Bytes,
+) -> StoredTables / {SessionReads, abort.raise} = {
+  let at = owner_key_at(u.named, owner);
+  let checked_in = group_key_of(at);
+  let unit = unit_key_of(at);
+  let result = group_of(checked_in);
+  let stored = item_layout(checked_in.owners.map(|o: Bytes| owner_facts(u.named, o).text));
+  let seen = bin::encode(checked_in, check_group_key_bin());
+  let first = !found.seen.contains(seen);
+  let hashed = bin::encode(unit, unit_key_bin());
+  {
+    parts: found.parts.insert(
+      module,
+      found.parts.get(module).unwrap_or([]).concat(
+        result.members.filter(|m: MemberResult| m.owner == owner).map(|m: MemberResult|
+          { module: module, tables: tables_in(m, stored, loaded.items) }),
+      ),
+    ),
+    rejected: if !first { found.rejected } else {
+      found.rejected.concat(
+        rejected_in(result.rejected, stored, loaded.items).map(|d: Diagnostic|
+          placed_in(d, module)),
+      )
+    },
+    declared: declarations_joined(found.declared, stored_declarations_of(at, GroupDeclarations)),
+    own: if found.hashed.contains(hashed) { found.own }
+    else { joined_own_hashes([found.own, group_hashes_of(unit)]) },
+    seen: found.seen.insert(seen),
+    hashed: found.hashed.insert(hashed),
+  }
+}
+
+fn stored_tables(
+  groups: List<LoadedOwners>,
+  loaded: List<OwnerSource>,
+) -> StoredTables / {SessionReads, abort.raise} =
+  range(0, groups.len()).fold(
+    {
+      parts: Map::new(),
+      rejected: [],
+      declared: no_stored_declarations,
+      own: no_own_hashes,
+      seen: Set::empty(),
+      hashed: Set::empty(),
+    },
+    |found: StoredTables, i: Int|
+      groups.get(i).owners.fold(found, |f: StoredTables, o: Bytes|
+        with_stored_owner(f, i, groups.get(i), loaded.get(i), o)),
+  )
+
+fn stored_analysis(
+  groups: List<LoadedOwners>,
+  positions: (ModuleKey) -> TextPositions / {memo.read, abort.raise},
+) -> GroupsAnalysed / {SessionReads, abort.raise} = {
+  let sources = groups.map(|u: LoadedOwners| source_of_unit(u, positions));
+  with_group_read(sources, from_groups, no_bodies, |group: GroupRead| {
+    let loaded = group.inputs.loaded.map(|l: LoadedSource| l.source);
+    {
+      outcome: match resolved_group(group.inputs) {
+        Err(ds) -> Rejected(ds),
+        Ok(resolved) -> if resolved.problems.len() > 0 { Rejected(resolved.problems) } else {
+          let read = stored_tables(groups, loaded);
+          if read.rejected.len() > 0 { Rejected(read.rejected) } else {
+            let analysed = group_analysis(
+              resolved,
+              checked_of_parts(resolved.resolution.order, read.parts),
+              [],
+              read.declared,
+              unreached(resolved.uses),
+              range(0, resolved.modules.len()).map(|i: Int|
+                match groups.at(i) {
+                  Some(g) -> owners_result_of(g.named).shape.unimported,
+                  None -> [],
+                }),
+            );
+            Analysed(
+              with_stored_tables(
+                hashed_analysis(
+                  { ..analysed, packages: group.inputs.loaded.get(0).tables.packages },
+                  hash_output(hash_layout(resolved.index), read.own),
+                ),
+                with_performed_effects(group.mentioned),
+              ),
+            )
+          }
+        },
+      },
+      loaded: loaded,
+    }
+  })
+}
+
+pub type ClaimIdentities = { opened: Set<Bytes>, identities: Identities }
+
+pub type ClaimsOutcome =
+  | ClaimsRejected(List<Diagnostic>)
+  | ClaimsAnalysed(Analysis, ClaimIdentities)
+
+pub type ClaimsProgram = { outcome: ClaimsOutcome, modules: List<Bytes> }
+
+type OpenedGroups = { groups: List<LoadedOwners>, others: List<LoadedOwners>, modules: Set<Bytes> }
+
+fn opened_groups(open: List<ModuleKey>) -> OpenedGroups / {SessionReads, abort.raise} = {
+  let whole = open.map(|m: ModuleKey| { named: m, owners: module_owners(m) });
+  let opened = open.fold(Set::empty(), |found: Set<Bytes>, m: ModuleKey| found.insert(m.module));
+  let reached = bodies_reached(
+    whole.flat_map(|u: LoadedOwners| u.owners.map(|o: Bytes| owner_key_at(u.named, o))),
+  );
+  let others = reached.values().filter(|o: OwnerKey| !opened.contains(o.module)).fold(
+    Map::new(),
+    with_loaded_owner,
+  ).values(
+  );
+  { groups: whole.concat(others), others: others, modules: opened }
+}
+
+pub fn program_analysed(open: List<ModuleKey>) -> AnalysisOutcome / {SessionReads, abort.raise} =
+  stored_analysis(opened_groups(open).groups, in_file).outcome
+
+pub fn claims_analysed(open: List<ModuleKey>) -> ClaimsProgram / {SessionReads, abort.raise} = {
+  let opened = opened_groups(open);
+  let groups = opened.groups;
+  let analysed = stored_analysis(groups, in_file);
+  {
+    outcome: match analysed.outcome {
+      Rejected(diagnostics) -> ClaimsRejected(diagnostics),
+      Analysed(w) ->
+        ClaimsAnalysed(w, {
+          opened: opened.modules,
+          identities: joined_identities(
+            open.map(|m: ModuleKey| module_identities(m, |_: Identified| true)).concat(
+              opened.others.map(|g: LoadedOwners| module_identities(g.named, is_law)),
+            ),
+          ),
+        }),
+    },
+    modules: groups.map(|g: LoadedOwners| g.named.module),
+  }
+}
+
+fn is_law(subject: Identified) -> Bool =
+  match subject { LawRun(_) -> true, LawProof(_) -> true, _ -> false }
+
+pub fn measure_program(u: UnitKey) -> MeasureProgram / {QueryEffects, abort.raise} = {
+  let groups = groups_reached(u);
+  {
+    outcome: stored_analysis(groups, in_group).outcome,
+    measured: measured_in(u, owners_result_of(module_of_unit(u))),
+    owned: groups.map(|g: LoadedOwners| g.named.module).filter(|m: Bytes|
+      m == u.module || in_root(m)),
+  }
+}
+
+fn measured_in(u: UnitKey, read: OwnersResult) -> List<Bytes> =
+  read.shape.outline.items.fold([], |found: List<Bytes>, item: OutlineItem|
+    match item {
+      OutlinedFunction(f) -> if !f.measured { found } else {
+        let owners = match read.declared.get(f.name) { Some(os) -> os, None -> [] };
+        if owners.any(|o: Bytes| u.owners.contains(o)) { found.push(qualify(u.module, f.name)) }
+        else { found }
+      },
+      _ -> found,
+    })
+
+pub type MeasureEntry = { unit: UnitKey, items: List<ItemAt> }
+
+derive bin for MeasureEntry
+
+pub fn measures_result(named: ModuleKey) -> Written / {memo.read, abort.raise} = {
+  let read = owners_result_of(named);
+  let measured = functions_of(read, states_measure);
+  written(measures_query(), if measured.is_empty() { [] } else {
+    let facts = placed_facts(named, layout_of(named));
+    group_keys(named).filter(|u: UnitKey| u.owners.any(|o: Bytes| measured.contains(o))).map(
+      |u: UnitKey|
+        {
+          unit: u,
+          items: item_layout(
+            u.owners.fold([], |texts: List<OwnerText>, o: Bytes|
+              match facts.get(o) { Some(f) -> texts.push(f.text), None -> texts }),
+          ),
+        },
+    )
+  })
+}
+
+pub fn promise_queries() -> List<CheckDefinition> =
+  [
+    product_definition(
+      cost_walk_query(),
+      b"compiler.front.checking.promises.cost_walk_result",
+      cost_walk_result,
+      cost_products,
+    ),
+    product_definition(
+      cost_return_query(),
+      b"compiler.front.checking.promises.cost_return_result",
+      cost_return_result,
+      cost_products,
+    ),
+    product_definition(
+      cost_demands_query(),
+      b"compiler.front.checking.promises.cost_demands_result",
+      cost_demands_result,
+      cost_products,
+    ),
+    product_definition(
+      cost_parameters_query(),
+      b"compiler.front.checking.promises.cost_parameters_result",
+      cost_parameters_result,
+      cost_products,
+    ),
+    product_definition(
+      module_parameters_query(),
+      b"compiler.front.checking.promises.module_parameters_result",
+      module_parameters_result,
+      cost_products,
+    ),
+    product_definition(
+      module_costs_query(),
+      b"compiler.front.checking.promises.module_costs_result",
+      module_costs_result,
+      cost_products,
+    ),
+    product_definition(
+      measures_query(),
+      b"compiler.front.checking.promises.measures_result",
+      measures_result,
+      measure_products,
+    ),
+  ]

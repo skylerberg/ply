@@ -1,19 +1,20 @@
+import compiler.front.checking (in_memory)
 import compiler.prelude_source
 import compiler.syntax.expressions (prelude_module)
 import compiler.check.resolve.tables (Diagnostic, qualify)
-import compiler.check.infer.definitions (Extern, program_natives)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.published (analyse)
 import compiler.front.facts (Analysis)
 import compiler.front.emitter_input (Analysed, Rejected)
 import compiler.emit.keys (RootKey, Named, RootName, root_name, root_text, site_owner_text)
 import compiler.emit.lower (root_lowered, group_lowered)
 import compiler.emit.specialisations (tail_loop_of)
-import compiler.emit.emit_harness (recorded_in)
+import compiler.emit.emit_harness (recorded_in, Program, program_in, over_program)
 import compiler.emit.lower.module_context (ModuleContext, Root, module_context_in)
 import compiler.emit.borrow_inference (OwnershipSignature, InferenceTarget, inference_targets_of,
-                                       declared_borrows, infer_signatures, ownership_text,
-                                       reset_params, with_conventions)
+                                       infer_signatures, ownership_text, reset_params,
+                                       with_conventions)
+import compiler.emit (declared_borrows_of)
+import compiler.emit.representations (EmitReads)
 import compiler.emit.typed_ir (with_ownerships, Instruction, Block, Function, Member,
                                ParamOwnership, Reset, If, Case, Match, Loop, Handle, OwnedParam,
                                BorrowedParam, Let, Do, Call, Lambda, Closure, Arg, Convention)
@@ -47,42 +48,41 @@ const corpus: Bytes =
     b"fn later(f: keep (Int) -> Int) -> () -> Int = || f(1)\n",
   ])
 
-fn analysed(source: Bytes) -> Analysis / {abort.raise} = analysed_as(b"m", source)
+fn analysed(source: Bytes) -> Program / {abort.raise} = analysed_as(b"m", source)
 
-fn analysed_as(name: Bytes, source: Bytes) -> Analysis / {abort.raise} =
-  match analyse(parse_all([{ name: name, source_text: source }])) {
-    Rejected(diagnostics) ->
-      panic(String::of_bytes_lossy(Bytes::join(diagnostics.map(|d: Diagnostic| d.message), b"\n"))),
-    Analysed(a) -> a,
+fn analysed_as(name: Bytes, source: Bytes) -> Program / {abort.raise} =
+  match program_in(source, name, in_memory([{ name: name, source_text: source }])) {
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
+    Ok(p) -> p,
   }
 
 fn emitter_input(
-  a: Analysis,
+  a: Program,
   module: Bytes,
   names: List<Bytes>,
 ) -> { setting: ModuleContext, roots: List<Root> } / {abort.raise} =
-  match module_context_in(a, module) {
+  match module_context_in(a.analysis, module) {
     Err(reason) -> panic(String::of_bytes_lossy(reason)),
     Ok(read) ->
       {
-        setting: { ..read.setting, builtins: program_natives([]).map(|e: Extern| e.name) },
+        setting: read.setting,
         roots: read.roots.filter(|r: Root|
           names.len() == 0 || names.contains(site_owner_text(r.key))),
       },
   }
 
 fn lowered_functions(
-  a: Analysis,
+  a: Program,
   s: ModuleContext,
   roots: List<Root>,
-) -> List<Function> / {abort.raise} = {
+) -> List<Function> / {EmitReads} = {
   let named = roots.fold(Map::new(), |m: Map<RootName, Root>, r: Root|
     m.insert(root_name(r.key), r));
   let order = range(0, roots.len()).fold(Map::new(), |m: Map<Bytes, Int>, i: Int|
     m.insert(site_owner_text(roots.get(i).key), i));
   let read_of = |full: Bytes|
     match named.get(root_name(Named(full))) {
-      Some(r) -> Some({ code: r.code, recorded: recorded_in(a, full) }),
+      Some(r) -> Some({ code: r.code, recorded: recorded_in(a.analysis, full) }),
       None -> None,
     };
   roots.fold([], |accumulator: List<Function>, r: Root| {
@@ -101,16 +101,22 @@ fn lowered_functions(
 }
 
 fn inference_inputs(
-  a: Analysis,
+  a: Program,
   module: Bytes,
   names: List<Bytes>,
 ) -> List<InferenceTarget> / {abort.raise} = {
-  let s = emitter_input(a, module, names);
-  inference_targets_of(declared_of(s.setting), lowered_functions(a, s.setting, s.roots))
+  let l = lowered_and_declared(a, emitter_input(a, module, names));
+  inference_targets_of(l.declared, l.functions)
 }
 
-fn declared_of(s: ModuleContext) -> Map<RootName, List<Int>> =
-  declared_borrows(Map::new(), s.module, s.definitions)
+fn lowered_and_declared(
+  a: Program,
+  s: { setting: ModuleContext, roots: List<Root> },
+) -> { functions: List<Function>, declared: Map<RootName, List<Int>> } / {abort.raise} =
+  over_program(a, || {
+    let functions = lowered_functions(a, s.setting, s.roots);
+    { functions: functions, declared: declared_borrows_of(functions) }
+  })
 
 fn inferred_ownership(
   source: Bytes,
@@ -212,12 +218,12 @@ test "inferred borrowing loses no memory reuse: each function reuses as many val
 
 test "every function body gets reference counts using the parameter ownership inferred for it and its callees, and passes the ownership check" {
   let a = analysed(corpus);
-  let s = emitter_input(a, b"m", []);
-  let functions = lowered_functions(a, s.setting, s.roots);
+  let l = lowered_and_declared(a, emitter_input(a, b"m", []));
+  let functions = l.functions;
   let inferred = infer_signatures(
-    inference_targets_of(declared_of(s.setting), functions),
+    inference_targets_of(l.declared, functions),
     Map::new(),
-    declared_of(s.setting),
+    l.declared,
   ).signatures;
   assert_eq(
     functions.fold([], |accumulator: List<{ root: Bytes, reason: Bytes }>, f: Function|
@@ -233,12 +239,13 @@ test "a group of functions that tail call each other passes the ownership check 
   let a = analysed(corpus);
   let names = [b"m.hop", b"m.skip"];
   let s = emitter_input(a, b"m", names);
+  let l = lowered_and_declared(a, s);
   let inferred = infer_signatures(
-    inference_targets_of(declared_of(s.setting), lowered_functions(a, s.setting, s.roots)),
+    inference_targets_of(l.declared, l.functions),
     Map::new(),
-    declared_of(s.setting),
+    l.declared,
   ).signatures;
-  let group = group_lowered(s.setting, s.roots);
+  let group = over_program(a, || group_lowered(s.setting, s.roots));
   let checked = |params: (RootName) -> List<ParamOwnership>|
     ownership_fault(
       insert_reference_counts({
@@ -317,12 +324,12 @@ fn calls_in(b: Block) -> List<FunctionCall> =
 
 test "a call to a specialisation whose effect evidence is passed as one array follows the ownership signature of the called definition" {
   let a = analysed(evidence_array_corpus);
-  let s = emitter_input(a, b"m", []);
-  let functions = lowered_functions(a, s.setting, s.roots);
+  let l = lowered_and_declared(a, emitter_input(a, b"m", []));
+  let functions = l.functions;
   let inferred = infer_signatures(
-    inference_targets_of(declared_of(s.setting), functions),
+    inference_targets_of(l.declared, functions),
     Map::new(),
-    declared_of(s.setting),
+    l.declared,
   ).signatures;
   let function_named = |name: Bytes|
     match functions.find(|f: Function| root_name(f.key) == root_name(Named(name))) {

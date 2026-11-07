@@ -1,4 +1,4 @@
-import compiler.syntax.parsing (Span)
+import compiler.syntax.parsing (Span, Identifier)
 import compiler.syntax.patterns (SourceLiteral)
 import compiler.check.types (Type, Effects, Effect)
 import compiler.check.typed (BodyPart, TypedPattern, TypedParam, TypedFieldPattern, TypedWild,
@@ -39,9 +39,11 @@ pub type WalkedNode =
 
 pub type WalkedReading =
   | WalkedLocal({ name: Bytes, binder: Int })
-  | WalkedDefinition({ full: Bytes, key: Bytes, args: List<Type>, effect_arguments: List<Effects>, quantified: List<Int>, labels: List<Type> })
+  | WalkedDefinition({ full: Bytes, key: Bytes, args: List<Type>, effect_arguments: List<EffectArgument>, labels: List<Type> })
   | WalkedConstructor({ sum: Bytes, name: Bytes, case: Int, args: List<Type> })
   | WalkedBuiltin({ name: Bytes, args: List<Type>, effect_arguments: List<Effects> })
+
+pub type EffectArgument = { quantified: Int, effects: Effects }
 
 pub type WalkedThunk = { body: WalkedExpression, effects: Effects }
 
@@ -277,13 +279,13 @@ pub fn parallel_of(
   }
 
 pub fn params_typed(
-  names: List<{ name: Bytes, span: Span }>,
+  binders: List<Identifier>,
   types: List<Type>,
 ) -> Option<List<TypedParam<Type>>> =
-  match names.zip_strict(types) {
+  match binders.zip_strict(types) {
     Some(ps) ->
       Some(
-        ps.map(|p: { first: { name: Bytes, span: Span }, second: Type }|
+        ps.map(|p: { first: Identifier, second: Type }|
           { name: p.first.name, ty: p.second, span: p.first.span }),
       ),
     None -> None,
@@ -291,7 +293,7 @@ pub fn params_typed(
 
 pub fn clause_of(
   head: { effect: Bytes, operation: Bytes, resource: Option<Bytes>, every_label: Bool },
-  params: Option<List<TypedParam<Type>>>,
+  params: List<TypedParam<Type>>,
   label: Option<TypedParam<Type>>,
   resume: Option<TypedParam<Type>>,
   body: Option<WalkedExpression>,
@@ -299,14 +301,14 @@ pub fn clause_of(
   resumed: Effects,
   span: Span,
 ) -> Option<WalkedClause> =
-  match ((params, body)) {
-    (Some(ps), Some(b)) ->
+  match body {
+    Some(b) ->
       Some({
         effect: head.effect,
         operation: head.operation,
         resource: head.resource,
         every_label: head.every_label,
-        params: ps,
+        params: params,
         label: label,
         continuation: resume,
         body: b,
@@ -314,7 +316,7 @@ pub fn clause_of(
         continuation_effects: resumed,
         span: span,
       }),
-    _ -> None,
+    None -> None,
   }
 
 pub fn return_of(
@@ -495,18 +497,21 @@ pub fn defaults_filled(
     )
   }
 
-pub type Resolver = {
-  ty: (Type) -> Type / {abort.raise},
-  witness: (Type) -> Option<Bytes> / {abort.raise},
-  effects: (Effects) -> Effects / {abort.raise},
-  entry: (Effect) -> Effect / {abort.raise},
-  read: (WalkedReading) -> Option<NameRead<Type>> / {abort.raise},
-  copied_fields: (Type, List<Bytes>) -> Option<List<Bytes>> / {abort.raise},
+pub type Resolver<| e> = {
+  ty: (Type) -> Type / {abort.raise | e},
+  witness: (Type) -> Option<Bytes> / {abort.raise | e},
+  effects: (Effects) -> Effects / {abort.raise | e},
+  entry: (Effect) -> Effect / {abort.raise | e},
+  read: (WalkedReading) -> Option<NameRead<Type>> / {abort.raise | e},
+  copied_fields: (Type, List<Bytes>) -> Option<List<Bytes>> / {abort.raise | e},
   span: (Span) -> Span,
   released: (Int) -> List<TypedRelease>,
 }
 
-pub fn resolved(e: WalkedExpression, s: Resolver) -> Option<TypedExpression<Type>> / {abort.raise} =
+pub fn resolved<| e>(
+  e: WalkedExpression,
+  s: Resolver<| e>,
+) -> Option<TypedExpression<Type>> / {abort.raise | e} =
   match resolved_node(e.node, s) {
     Some(n) ->
       Some({
@@ -518,29 +523,32 @@ pub fn resolved(e: WalkedExpression, s: Resolver) -> Option<TypedExpression<Type
     None -> None,
   }
 
-fn resolved_all(
+fn resolved_all<| e>(
   xs: List<WalkedExpression>,
-  s: Resolver,
-) -> Option<List<TypedExpression<Type>>> / {abort.raise} =
+  s: Resolver<| e>,
+) -> Option<List<TypedExpression<Type>>> / {abort.raise | e} =
   xs.fold(Some([]), |accumulator: Option<List<TypedExpression<Type>>>, x: WalkedExpression|
     match accumulator {
       Some(ys) -> match resolved(x, s) { Some(y) -> Some(ys.push(y)), None -> None },
       None -> None,
     })
 
-fn resolved_param(p: TypedParam<Type>, s: Resolver) -> TypedParam<Type> / {abort.raise} =
+fn resolved_param<| e>(
+  p: TypedParam<Type>,
+  s: Resolver<| e>,
+) -> TypedParam<Type> / {abort.raise | e} =
   { name: p.name, ty: (s.ty)(p.ty), span: (s.span)(p.span) }
 
-fn resolved_param_opt(
+fn resolved_param_opt<| e>(
   p: Option<TypedParam<Type>>,
-  s: Resolver,
-) -> Option<TypedParam<Type>> / {abort.raise} =
+  s: Resolver<| e>,
+) -> Option<TypedParam<Type>> / {abort.raise | e} =
   match p { Some(q) -> Some(resolved_param(q, s)), None -> None }
 
-fn resolved_fields(
+fn resolved_fields<| e>(
   fs: List<WalkedField>,
-  s: Resolver,
-) -> Option<List<TypedField<Type>>> / {abort.raise} =
+  s: Resolver<| e>,
+) -> Option<List<TypedField<Type>>> / {abort.raise | e} =
   fs.fold(Some([]), |accumulator: Option<List<TypedField<Type>>>, f: WalkedField|
     match accumulator {
       Some(ys) -> match resolved(f.value, s) {
@@ -550,13 +558,19 @@ fn resolved_fields(
       None -> None,
     })
 
-fn resolved_thunk(t: WalkedThunk, s: Resolver) -> Option<TypedThunk<Type>> / {abort.raise} =
+fn resolved_thunk<| e>(
+  t: WalkedThunk,
+  s: Resolver<| e>,
+) -> Option<TypedThunk<Type>> / {abort.raise | e} =
   match resolved(t.body, s) {
     Some(b) -> Some({ body: b, effects: (s.effects)(t.effects) }),
     None -> None,
   }
 
-fn resolved_pattern(p: TypedPattern<Type>, s: Resolver) -> TypedPattern<Type> / {abort.raise} =
+fn resolved_pattern<| e>(
+  p: TypedPattern<Type>,
+  s: Resolver<| e>,
+) -> TypedPattern<Type> / {abort.raise | e} =
   match p {
     TypedWild(w) -> TypedWild({ span: (s.span)(w.span), ty: (s.ty)(w.ty) }),
     TypedBinder(v) -> TypedBinder({ name: v.name, ty: (s.ty)(v.ty), span: (s.span)(v.span) }),
@@ -580,10 +594,10 @@ fn resolved_pattern(p: TypedPattern<Type>, s: Resolver) -> TypedPattern<Type> / 
     TypedOr(alts) -> TypedOr(alts.map(|x: TypedPattern<Type>| resolved_pattern(x, s))),
   }
 
-fn resolved_statement(
+fn resolved_statement<| e>(
   statement: WalkedStatement,
-  s: Resolver,
-) -> Option<TypedStatement<Type>> / {abort.raise} =
+  s: Resolver<| e>,
+) -> Option<TypedStatement<Type>> / {abort.raise | e} =
   match statement {
     WalkedLet(l) -> match resolved(l.value, s) {
       Some(v) ->
@@ -611,7 +625,10 @@ fn resolved_statement(
     },
   }
 
-fn resolved_clause(c: WalkedClause, s: Resolver) -> Option<TypedClause<Type>> / {abort.raise} =
+fn resolved_clause<| e>(
+  c: WalkedClause,
+  s: Resolver<| e>,
+) -> Option<TypedClause<Type>> / {abort.raise | e} =
   match resolved(c.body, s) {
     Some(b) ->
       Some({
@@ -630,7 +647,10 @@ fn resolved_clause(c: WalkedClause, s: Resolver) -> Option<TypedClause<Type>> / 
     None -> None,
   }
 
-fn resolved_node(node: WalkedNode, s: Resolver) -> Option<TypedNode<Type>> / {abort.raise} =
+fn resolved_node<| e>(
+  node: WalkedNode,
+  s: Resolver<| e>,
+) -> Option<TypedNode<Type>> / {abort.raise | e} =
   match node {
     WalkedLiteral(l) -> Some(TypedLiteral(l)),
     WalkedRead(read) -> match (s.read)(read) { Some(r) -> Some(TypedRead(r)), None -> None },

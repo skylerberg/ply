@@ -1,3 +1,4 @@
+import compiler.store.hash.graph (NodeElsewhere)
 import compiler.syntax.parsing (Span, Identifier, QName, is_bare, bare, starts_upper)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression,
@@ -26,7 +27,8 @@ import compiler.syntax.items (FnDefinition, TypeDefinition, AliasBody, SumBody, 
                               Binder, Constraint, RequiresClause, EnsuresClause, CostClause,
                               SpaceClause, SpecClause, schema_of, ReturnsFresh, ReturnsParam,
                               NominalBody, ExternBody, InstanceDefinition, HostInstance,
-                              numeric_operations, numeric_by, member_of, member_name)
+                              numeric_operations, numeric_by, member_of, member_name,
+                              case_run_chooser, case_run_table_type)
 import compiler.check.resolve.bindings (item_locals, body_binders)
 import compiler.syntax.items (FunctionItem, TestItem, LawItem, result_name)
 import compiler.check.member (CallsFunction)
@@ -43,11 +45,11 @@ import compiler.store.hash.encoding (CallSite, last_index_of, width_index, float
                                      decimal_parts, BinderPosition, PositionedBinder, Choice, Known,
                                      CallResolution, Pending)
 import compiler.store.hash.stored
-import compiler.store.hash.stored (Reference, Itself, Note, CallNote, RunNote, EffectSlot, FreeName,
-                                   Literal, IntLiteral, FixedLiteral, WideLiteral, BoolLiteral,
-                                   StringLiteral, BytesLiteral, EmbeddedLiteral, FloatLiteral,
-                                   DecimalLiteral, CharLiteral, UnitLiteral, Named, Local, Defined,
-                                   Constructed, Unbound, Value, Label, LabelParameter, LabelName,
+import compiler.store.hash.stored (Note, CallNote, RunNote, FreeName, Literal, IntLiteral,
+                                   FixedLiteral, WideLiteral, BoolLiteral, StringLiteral,
+                                   BytesLiteral, EmbeddedLiteral, FloatLiteral, DecimalLiteral,
+                                   CharLiteral, UnitLiteral, Named, Local, Defined, Constructed,
+                                   Unbound, Value, Label, LabelParameter, LabelName,
                                    EffectReference, Declared, EffectUnbound, TypeName,
                                    TypeParameter, TypeDefined, TypeUnbound, Applied, AppliedOver,
                                    Function, Fields, UnitType, TypeField, EffectVariable,
@@ -64,26 +66,25 @@ import compiler.store.hash.stored (Reference, Itself, Note, CallNote, RunNote, E
                                    ParameterReturned, FunctionForm, Variant, TypeBody, Alias, Sum,
                                    Nominal, Extern, InstanceFunction, Numeric, TypeForm, Operation,
                                    EffectForm, TestForm, LawForm, SpecForm, Form, FunctionOf,
-                                   TypeOf, EffectOf, TestOf, LawOf, SpecOf, Template, reference_bin,
-                                   effect_bin, parameter_constraint_bin, operation_bin,
-                                   type_field_bin)
+                                   TypeOf, EffectOf, TestOf, LawOf, SpecOf, Template,
+                                   parameter_constraint_bin, operation_bin, type_field_bin)
 import std.bin
 
 pub type TemplateValue = Value<Int, BinderPosition>
 
-pub type TemplateType = stored::Type<Int, EffectSlot>
+pub type TemplateType = stored::Type<Int>
 
-pub type TemplateEffects = Effects<Int, EffectSlot>
+pub type TemplateEffects = Effects<Int>
 
 pub type TemplatePattern = stored::Pattern<Int, BinderPosition>
 
-pub type TemplateExpression = stored::Expression<Int, EffectSlot, BinderPosition, Note>
+pub type TemplateExpression = stored::Expression<Int, BinderPosition, Note>
 
-pub type TemplateStatement = stored::Statement<Int, EffectSlot, BinderPosition, Note>
+pub type TemplateStatement = stored::Statement<Int, BinderPosition, Note>
 
-type TemplateEntry = Entry<Int, EffectSlot, BinderPosition, Note>
+type TemplateEntry = Entry<Int, BinderPosition, Note>
 
-type TemplateField = stored::RecordField<Int, EffectSlot, BinderPosition, Note>
+type TemplateField = stored::RecordField<Int, BinderPosition, Note>
 
 pub type Encoder = {
   index: Index,
@@ -136,6 +137,7 @@ pub fn node_template(
     NodeFn(definition) -> FunctionOf(function_form(encoder, definition)),
     NodeType(definition) -> TypeOf(type_form(encoder, definition)),
     NodeEffect(definition) -> EffectOf(effect_form(encoder, definition)),
+    NodeElsewhere(_) -> panic("a name held elsewhere has no form here"),
   }
 }
 
@@ -253,6 +255,9 @@ pub const emitted_code: EmittedCode =
 pub fn emitted_calls_for(name: Bytes) -> List<Bytes> =
   if emitted_code.builtins.contains(name) { emitted_code.calls } else { [] }
 
+pub fn lowered_calls_for(name: Bytes) -> List<Bytes> =
+  if name == b"fold" { [b"first_leaf", b"node_max", b"leaf_above"] } else { [] }
+
 pub fn container_named(name: Bytes) -> Bool = name == list_name || name == map_name
 
 pub fn marshalling_calls_for(module: Bytes, name: Bytes) -> List<Bytes> =
@@ -342,19 +347,9 @@ fn constructor_named(
     _ -> Unbound({ module: qualifier(qualified_name), name: qualified_name.name.name }),
   }
 
-fn effect_of(
-  encoder: Encoder,
-  qualified_name: QName,
-) -> EffectReference<Int, EffectSlot> / {abort.raise} =
+fn effect_of(encoder: Encoder, qualified_name: QName) -> EffectReference<Int> / {abort.raise} =
   match effect_target(encoder.index, encoder.module, qualified_name) {
-    Some(node) ->
-      Declared(node, {
-        node: node,
-        template_bytes: match encoder.index.effect_sketches.get(node) {
-          Some(sketch) -> sketch,
-          None -> b"",
-        },
-      }),
+    Some(node) -> Declared(node),
     None -> EffectUnbound({ module: qualifier(qualified_name), name: qualified_name.name.name }),
   }
 
@@ -455,7 +450,7 @@ pub fn type_template(encoder: Encoder, written: TypeExpression) -> TemplateType 
         by_name(
           record.fields.map(|field: { name: Identifier, ty: TypeExpression }|
             { name: field.name.name, field_type: type_template(encoder, field.ty) }),
-          |field: TypeField<Int, EffectSlot>| field.name,
+          |field: TypeField<Int>| field.name,
         ),
       ),
     UnitTypeExpression(_) -> UnitType,
@@ -464,19 +459,16 @@ pub fn type_template(encoder: Encoder, written: TypeExpression) -> TemplateType 
 
 fn by_name<a>(members: List<a>, name: (a) -> Bytes) -> List<a> / {abort.raise} =
   sorted_by_key(
-    members.map(|member: a|
-      { key: bin::encode(name(member), bin::bytes_bin()), tie: b"", value: member }),
+    members.map(|member: a| { key: bin::encode(name(member), bin::bytes_bin()), value: member }),
   )
 
-type SortKeyed<a> = { key: Bytes, tie: Bytes, value: a }
+type SortKeyed<a> = { key: Bytes, value: a }
 
 fn sorted_by_key<a>(members: List<SortKeyed<a>>) -> List<a> =
   members.sort_by(|first: SortKeyed<a>, second: SortKeyed<a>|
-    match compare_values(first.key, second.key) {
-      Less -> true,
-      Greater -> false,
-      Equal -> match compare_values(first.tie, second.tie) { Greater -> false, _ -> true },
-    }).map(|member: SortKeyed<a>| member.value)
+    match compare_values(first.key, second.key) { Greater -> false, _ -> true }).map(
+    |member: SortKeyed<a>| member.value,
+  )
 
 fn optional_effects(
   encoder: Encoder,
@@ -489,12 +481,8 @@ fn encoded_effects(
   written: EffectsExpression,
 ) -> TemplateEffects / {abort.raise} =
   {
-    listed: sorted_by_key(
-      written.listed.map(|written_effect: EffectExpression| {
-        let template = encoded_effect(encoder, written_effect);
-        { key: blank_encoding(template), tie: effect_tie_breaker(template), value: template }
-      }),
-    ),
+    listed: written.listed.map(|written_effect: EffectExpression|
+      encoded_effect(encoder, written_effect)),
     variable: match written.variable {
       None -> None,
       Some(tail) -> match last_index_of(encoder.effect_params, tail.name) {
@@ -505,10 +493,7 @@ fn encoded_effects(
     bounded: written.variable_bounded,
   }
 
-fn encoded_effect(
-  encoder: Encoder,
-  written: EffectExpression,
-) -> Effect<Int, EffectSlot> / {abort.raise} = {
+fn encoded_effect(encoder: Encoder, written: EffectExpression) -> Effect<Int> / {abort.raise} = {
   let performed = effect_of(encoder, written.effect_name);
   let label = optional_label(encoder, effect_label(written));
   match written.operation {
@@ -516,19 +501,6 @@ fn encoded_effect(
     Some(operation) -> OfOperation(performed, operation.name, label, written.bounded),
   }
 }
-
-pub fn blank_encoding(encoded_effect: Effect<Int, EffectSlot>) -> Bytes / {abort.raise} =
-  bin::encode(
-    encoded_effect.map(reference: |_: Int| Itself, slot: |_: EffectSlot| 0),
-    effect_bin(reference_bin(), bin::int_bin()),
-  )
-
-pub fn effect_tie_breaker(encoded_effect: Effect<Int, EffectSlot>) -> Bytes =
-  match encoded_effect {
-    Moded(Declared(_, slot), _, _, _) -> slot.template_bytes,
-    OfOperation(Declared(_, slot), _, _, _) -> slot.template_bytes,
-    _ -> b"",
-  }
 
 fn literal(written: SourceLiteral) -> Literal / {abort.raise} =
   match written {
@@ -835,7 +807,7 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
       let scrutinee = expression(encoder, matched.scrutinee);
       let arms = matched.arms.fold(
         { encoder: scrutinee.encoder, form: [] },
-        |accumulator: Built<List<Arm<Int, EffectSlot, BinderPosition, Note>>>, arm: MatchArm| {
+        |accumulator: Built<List<Arm<Int, BinderPosition, Note>>>, arm: MatchArm| {
           let bound = pattern(accumulator.encoder, arm.pattern);
           let guard = optional_expression(bound.encoder, arm.guard);
           let body = expression(guard.encoder, arm.body);
@@ -896,7 +868,7 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
     HandleExpression(handler) -> {
       let variables = handler.handler_variables.fold(
         { encoder: encoder, form: [] },
-        |accumulator: Built<List<stored::HandlerVariable<Int, EffectSlot, BinderPosition, Note>>>, variable: HandlerStateVariable| {
+        |accumulator: Built<List<stored::HandlerVariable<Int, BinderPosition, Note>>>, variable: HandlerStateVariable| {
           let first = expression(accumulator.encoder, variable.init);
           {
             encoder: bind(first.encoder, variable.name),
@@ -952,7 +924,7 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
     } else {
       let holes = tagged.holes.fold(
         { encoder: encoder, form: [] },
-        |accumulator: Built<List<FilledHole<Int, EffectSlot, BinderPosition, Note>>>, hole: Hole| {
+        |accumulator: Built<List<FilledHole<Int, BinderPosition, Note>>>, hole: Hole| {
           let built = expression(accumulator.encoder, hole.value);
           {
             encoder: built.encoder,
@@ -993,10 +965,10 @@ fn expression(encoder: Encoder, written: Expression) -> Built<TemplateExpression
 fn handled_clauses(
   encoder: Encoder,
   clauses: List<HandleClause>,
-) -> Built<List<HandlerClause<Int, EffectSlot, BinderPosition, Note>>> / {abort.raise} =
+) -> Built<List<HandlerClause<Int, BinderPosition, Note>>> / {abort.raise} =
   clauses.fold(
     { encoder: encoder, form: [] },
-    |accumulator: Built<List<HandlerClause<Int, EffectSlot, BinderPosition, Note>>>, clause: HandleClause| {
+    |accumulator: Built<List<HandlerClause<Int, BinderPosition, Note>>>, clause: HandleClause| {
       let bound = bind_all(accumulator.encoder, clause.params);
       let resumed = match clause.resume {
         None -> bound,
@@ -1207,7 +1179,7 @@ fn constraints(
         Some(level) -> accumulator.push({ level: level, deriver: constraint.deriver }),
         None -> accumulator,
       }).map(|constrained: ParameterConstraint|
-      { key: bin::encode(constrained, parameter_constraint_bin()), tie: b"", value: constrained }),
+      { key: bin::encode(constrained, parameter_constraint_bin()), value: constrained }),
   ).fold([], |accumulator: List<ParameterConstraint>, constrained: ParameterConstraint|
     if accumulator.last() == Some(constrained) { accumulator }
     else { accumulator.push(constrained) })
@@ -1240,12 +1212,12 @@ fn returning(definition: FnDefinition) -> Returning / {abort.raise} =
 fn function_form(
   encoder: Encoder,
   definition: FnDefinition,
-) -> FunctionForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} = {
+) -> FunctionForm<Int, BinderPosition, Note> / {abort.raise} = {
   let generics = definition.generics;
   let generic = with_generics(encoder, generics.types, generics.effects, generics.labels);
   let parameters = definition.params.fold(
     { encoder: generic, form: [] },
-    |accumulator: Built<List<stored::Parameter<Int, EffectSlot, BinderPosition, Note>>>, parameter: Param| {
+    |accumulator: Built<List<stored::Parameter<Int, BinderPosition, Note>>>, parameter: Param| {
       let default_value = optional_expression(accumulator.encoder, parameter.default);
       {
         encoder: default_value.encoder,
@@ -1286,7 +1258,7 @@ fn function_form(
 fn type_form(
   encoder: Encoder,
   definition: TypeDefinition,
-) -> TypeForm<Int, EffectSlot, BinderPosition> / {abort.raise} = {
+) -> TypeForm<Int, BinderPosition> / {abort.raise} = {
   let generics = definition.generics;
   let inner = with_generics(encoder, generics.types, generics.effects, generics.labels);
   let unqualified = |name: Identifier| { module: None, name: name, span: name.span };
@@ -1342,14 +1314,14 @@ fn type_form(
 fn effect_form(
   encoder: Encoder,
   definition: EffectDefinition,
-) -> EffectForm<Int, EffectSlot, BinderPosition> / {abort.raise} =
+) -> EffectForm<Int, BinderPosition> / {abort.raise} =
   {
     name: definition.name.name,
     nondet: definition.is_nondet,
     operations: by_name(
       definition.operations.map(|operation: OperationDefinition|
         operation_form(encoder, operation)),
-      |operation: Operation<Int, EffectSlot>| operation.name,
+      |operation: Operation<Int>| operation.name,
     ),
     host_function: match encoder.index.items.get(encoder.module).instances.get(
         definition.name.name,
@@ -1372,7 +1344,7 @@ fn effect_form(
 fn operation_form(
   encoder: Encoder,
   operation: OperationDefinition,
-) -> Operation<Int, EffectSlot> / {abort.raise} = {
+) -> Operation<Int> / {abort.raise} = {
   let inner = {
     ..encoder,
     type_params: encoder.type_params.concat(
@@ -1421,7 +1393,7 @@ fn with_marshalling_calls(t: TemplateType, own: Int, written: List<Int>) -> Temp
       ),
     Fields(fields) ->
       Fields(
-        fields.map(|f: TypeField<Int, EffectSlot>|
+        fields.map(|f: TypeField<Int>|
           { ..f, field_type: with_marshalling_calls(f.field_type, own, written) }),
       ),
     UnitType -> UnitType,
@@ -1430,7 +1402,7 @@ fn with_marshalling_calls(t: TemplateType, own: Int, written: List<Int>) -> Temp
 fn test_form(
   encoder: Encoder,
   definition: TestDefinition,
-) -> TestForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} =
+) -> TestForm<Int, BinderPosition, Note> / {abort.raise} =
   match definition.cases {
     None ->
       {
@@ -1441,7 +1413,10 @@ fn test_form(
     Some(cases) ->
       {
         nondet: definition.is_nondet,
-        cases: Some(type_template(encoder, cases.ty)),
+        cases: Some({
+          table_type: type_template(encoder, case_run_table_type(cases)),
+          chosen: value_of(encoder, case_run_chooser(cases)),
+        }),
         body: expression(bind(encoder, cases.binder), definition.body).form,
       },
   }
@@ -1449,7 +1424,7 @@ fn test_form(
 fn law_form(
   encoder: Encoder,
   definition: LawDefinition,
-) -> LawForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} = {
+) -> LawForm<Int, BinderPosition, Note> / {abort.raise} = {
   let bound = bind_all(encoder, definition.binders.map(|binder: Binder| binder.name));
   let guard = optional_expression(bound, definition.guard);
   {
@@ -1468,7 +1443,7 @@ fn spec_form(
   encoder: Encoder,
   owner: FnDefinition,
   clause: SpecClause,
-) -> SpecForm<Int, EffectSlot, BinderPosition, Note> / {abort.raise} = {
+) -> SpecForm<Int, BinderPosition, Note> / {abort.raise} = {
   let generics = owner.generics;
   let bound = bind_all(
     with_generics(encoder, generics.types, generics.effects, generics.labels),
@@ -1558,9 +1533,4 @@ pub fn renumbered(
   template: Template,
   renumber: (Int) -> Int / {abort.raise},
 ) -> Template / {abort.raise} =
-  template.map(
-    reference: renumber,
-    slot: |slot: EffectSlot| { ..slot, node: renumber(slot.node) },
-    level: |spot: BinderPosition| spot,
-    note: |note: Note| note,
-  )
+  template.map(reference: renumber, level: |spot: BinderPosition| spot, note: |note: Note| note)

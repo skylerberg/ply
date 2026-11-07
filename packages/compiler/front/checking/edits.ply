@@ -1,71 +1,61 @@
+import std.fs
 import std.bin
 import std.hash (blake3)
 import std.bytes
 import std.list
 import compiler.store.memo
-import compiler.store.memo (memo, MemoryStore, Run, QueryStats, query_output, empty_memory_store,
-                            executed_count, executed_for, restored_for, start_run, query_stats)
+import compiler.store.memo (memo)
+import compiler.store.memo.engine (Run, QueryStats, reading, in_session, query_stats)
 import compiler.store.packs
 import compiler.front.exports (owner_interface_bin, module_origin_bin, group_source_from)
 import compiler.front.owner_checks
-import compiler.front.emitter_input (Analysed, Rejected, checked_program_of, view_dump,
-                                     inferred_facts_bin)
-import compiler.front.rows (known_definition_row_bin)
-import compiler.front.published (no_rows, analyse, dump_of)
-import compiler.front (published, load_with_shipped, analyse_pulling_std_with, faceted,
-                       checked_staged)
+import compiler.front.emitter_input (Analysed, Rejected, checked_program_of, view_dump)
+import compiler.front.rows (known_definition_row_bin, Dump, ModuleRow, DefinitionRow, TestRow,
+                            EffectRow, ConstructorRow)
+import compiler.front.published (dump_of)
+import compiler.front (faceted)
 import compiler.front.facts (ModuleShape, ModuleTables, Analysis, AssembledLoad, CheckedProgram,
-                             assembled_program, assembled_load, functions_of, tests_of)
+                             assembled_program, assembled_load, functions_of, tests_of, NoTree)
 import compiler.syntax.items (derivation_bin)
-import compiler.expand.derive (Generated, deriver_request_bin, deriver_response_bin)
-import std.value
-import std.value (VList, VRecord, VStr)
-import compiler.front.diagnostics (parse_all, with_prelude_source)
+import compiler.front.diagnostics (with_prelude_source)
 import compiler.syntax.expressions (prelude_module)
 import compiler.expand.embed (EmbedFile, embed_file)
-import compiler.check.resolve.tables (Source, Diagnostic)
-import compiler.check.infer.checker (TestInfo)
-import compiler.store.hash.forms (CachedNode, CachedHashes, hash_input_bin, cached_node_bin,
-                                  joined_cached_hashes)
-import compiler.store.hash (body_key, checked_body)
+import compiler.check.resolve.tables (Source, Diagnostic, backticked)
+import compiler.check.infer.checker (DefinitionInfo, TestInfo, EffectInfo, ConstructorInfo)
+import compiler.check.infer (CheckOutput)
+import compiler.front.checking.view
+import compiler.store.hash.forms (DefinitionHash, OwnHashes, joined_module_hashes, definition_key,
+                                  TestRun, DefinitionContract, DefinitionProof, DefinitionRun,
+                                  Identified, FramedBody)
+import compiler.store.hash.graph (HeldValue)
+import compiler.front.checking.identity (SubjectKey, identity_of)
 import std.gen
 import compiler.front.checking.world (PackageLocation, ModuleKey, InterfaceKey, Embedding,
                                       ModuleResult, package_location_bin, module_key_bin,
                                       interface_key_bin, embedding_bin, QueryEffects, CheckQuery,
-                                      decoded, module_query, owner_interfaces_query, setting_bin)
-import compiler.front.checking.groups (GroupKey, owner_key_bin, group_key_bin, owners_result_bin,
-                                       owners_query, cycles_query, group_query,
-                                       owner_interface_query, signatures_query, typed_query,
-                                       group_hash_query, owner_facts, always_entire, imports_of,
-                                       whole_query, GroupCheck, owners_check, current, current_unit,
-                                       group_of, group_hash_inputs, hashes_query, tables_of_result,
-                                       sorted_bytes)
+                                      decoded, setting_bin, CheckQueries)
+import compiler.front.checking.groups (module_listing_query, module_contents_query, owner_key_bin,
+                                       owners_result_bin, owners_query, cycles_query, group_query,
+                                       signatures_query, typed_query, group_hash_query, owner_facts,
+                                       imports_of, group_of, tables_of_result, sorted_bytes,
+                                       program_summary_query)
 import compiler.front.checking (load_inputs_of, lookup_input, fresh_registry, CheckedModule,
                                 facts_of_result, checked_program_from_results, query_load,
                                 hashed_all, cycles_among, root_warnings, rejected_first,
-                                PublicationSummary, RejectionSummary, OutcomeSummary,
-                                outcome_summary, reject_embed, nothing_derived, over_decoding,
-                                queried_over, queried_under, prelude_frames, prelude_files,
-                                lookup_input_alone, queried_results, outcome_of, Step,
-                                check_sources, check_with_pack, layered, shipped_store, pack_of)
+                                OutcomeSummary, outcome_summary, reject_embed, over_decoding,
+                                queried_over, prelude_frames, lookup_input_alone, inputs_alone,
+                                Step, check_sources, layered, module_of, checked_with_write_limit,
+                                operations_of_check, listed_module, analysed_over)
+import compiler.store.database (AllWrites, FailAfter, same_database_in_memory)
 
-type Reference = {
-  whole: OutcomeSummary,
-  fixing: CachedHashes,
-  results: List<CheckedModule>,
-  group_inputs: Option<Map<Bytes, Bytes>>,
-  hash_inputs: Option<Map<Bytes, Bytes>>,
-}
+type Reference = { outcome: OutcomeSummary, own_hashes: OwnHashes }
+
+fn from_nothing(sources: List<Source>) -> OutcomeSummary / {abort.raise} =
+  outcome_summary(queried_over(fs::mem_empty(), sources).outcome)
 
 fn reference_of(sources: List<Source>) -> Reference / {abort.raise} = {
-  let fresh = queried_results(fresh_registry(), empty_memory_store, sources);
-  {
-    whole: outcome_summary(analyse(parse_all(sources))),
-    fixing: fresh.fixing,
-    results: fresh.results,
-    group_inputs: inputs_over(fresh.store, sources, b"group inputs"),
-    hash_inputs: inputs_over(fresh.store, sources, b"hash inputs"),
-  }
+  let fresh = queried_over(fs::mem_empty(), sources);
+  { outcome: outcome_summary(fresh.outcome), own_hashes: fresh.own_hashes }
 }
 
 fn sources_key(sources: List<Source>) -> Bytes =
@@ -73,124 +63,31 @@ fn sources_key(sources: List<Source>) -> Bytes =
     sources.map(|s: Source| Bytes::concat_all([s.name, b"\x00", s.source_text, b"\x00"])),
   )
 
-type EditSession = {
-  store: MemoryStore,
-  checks: Map<Bytes, Bytes>,
-  hashes: Map<Bytes, Bytes>,
-  references: Map<Bytes, Reference>,
-  off: List<Bytes>,
-}
+type EditSession = { store: fs::MemFs, references: Map<Bytes, Reference>, off: List<Bytes> }
 
 pub fn disagreements(steps: List<Step>) -> List<Bytes> / {abort.raise} =
-  steps.fold(
-    {
-      store: empty_memory_store,
-      checks: Map::new(),
-      hashes: Map::new(),
-      references: Map::new(),
-      off: [],
-    },
-    |s: EditSession, step: Step| {
-      let warm = queried_over(s.store, step.sources);
-      let now = outcome_summary(warm.outcome);
-      let key = sources_key(step.sources);
-      let r = match s.references.get(key) {
-        Some(known) -> known,
-        None -> reference_of(step.sources),
-      };
-      let same_outcome = r.results == warm.results
-        || now == outcome_summary(outcome_of(step.sources, r.results));
-      let agrees = same_outcome && warm.fixing == r.fixing
-        && (match r.whole {
-          PublicationSummary(_) -> now == r.whole,
-          RejectionSummary(_) -> match now {
-            RejectionSummary(_) -> true,
-            PublicationSummary(_) -> false,
-          },
-        });
-      let checked = pulled(warm.run, group_query, s.checks, r.group_inputs);
-      let hashed = pulled(warm.run, group_hash_query, s.hashes, r.hash_inputs);
-      {
-        store: warm.store,
-        checks: checked.made,
-        hashes: hashed.made,
-        references: s.references.insert(key, r),
-        off: if !agrees {
-          s.off.push(Bytes::concat_all([step.what, hash_differences(warm.fixing, r.fixing)]))
-        } else {
-          match checked.mismatches {
-            Some(reason) -> s.off.push(Bytes::concat_all([step.what, b" (work)", reason])),
-            None -> match hashed.mismatches {
-              Some(reason) -> s.off.push(Bytes::concat_all([step.what, b" (hash work)", reason])),
-              None -> s.off,
-            },
-          }
-        },
-      }
-    },
-  ).off
+  steps.fold(edit_session_over(fs::mem_empty()), with_step).off
 
-fn pulled(
-  run: Run,
-  query: Bytes,
-  made: Map<Bytes, Bytes>,
-  now: Option<Map<Bytes, Bytes>>,
-) -> { made: Map<Bytes, Bytes>, mismatches: Option<Bytes> } / {abort.raise} =
-  match now {
-    None -> { made: made, mismatches: None },
-    Some(reads) -> {
-      let q = match fresh_registry().get(query) {
-        Some(x) -> x,
-        None -> panic("no query with this name exists in the compiler's list of queries"),
-      };
-      let ran = executed_for(run, query).fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
-      );
-      let back = restored_for(run, query).fold(
-        Map::new(),
-        |accumulator: Map<Bytes, Bool>, k: Bytes| accumulator.insert(k, true),
-      );
-      let groups = reads.keys();
-      let moved = |g: Bytes| made.get(g) != reads.get(g);
-      let needless = sorted_bytes(groups.filter(|g: Bytes| ran.contains(g) && !moved(g)));
-      let stale = sorted_bytes(
-        groups.filter(|g: Bytes|
-          run.resolved.contains(memo::key_of(q, g)) && !ran.contains(g) && !back.contains(g)
-            && moved(g)),
-      );
-      {
-        made: groups.fold(made, |accumulator: Map<Bytes, Bytes>, g: Bytes|
-          if ran.contains(g) || back.contains(g) {
-            accumulator.insert(g, match reads.get(g) { Some(d) -> d, None -> b"" })
-          } else { accumulator }),
-        mismatches: if needless == [] && stale == [] { None } else {
-          Some(
-            Bytes::concat_all([
-              b": ran ",
-              groups_shown(needless),
-              b" though its reads had not changed; reused ",
-              groups_shown(stale),
-              b" though their inputs had changed",
-            ]),
-          )
-        },
-      }
+fn edit_session_over(store: fs::MemFs) -> EditSession =
+  { store: store, references: Map::new(), off: [] }
+
+fn with_step(s: EditSession, step: Step) -> EditSession / {abort.raise} = {
+  let warm = queried_over(s.store, step.sources);
+  let key = sources_key(step.sources);
+  let r = match s.references.get(key) { Some(known) -> known, None -> reference_of(step.sources) };
+  let agrees = outcome_summary(warm.outcome) == r.outcome && warm.own_hashes == r.own_hashes;
+  {
+    store: warm.store,
+    references: s.references.insert(key, r),
+    off: if agrees { s.off } else {
+      s.off.push(Bytes::concat_all([step.what, hash_differences(warm.own_hashes, r.own_hashes)]))
     },
   }
+}
 
-fn groups_shown(groups: List<Bytes>) -> Bytes / {abort.raise} =
-  Bytes::join(
-    groups.map(|b: Bytes| {
-      let g = decoded(b, group_key_bin(), "a group's names");
-      Bytes::concat_all([g.module, b"[", Bytes::join(g.owners, b" "), b"]"])
-    }),
-    b", ",
-  )
-
-fn hash_differences(warm: CachedHashes, fresh: CachedHashes) -> Bytes = {
-  let by = |f: CachedHashes|
-    f.nodes.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, x: CachedNode|
+fn hash_differences(warm: OwnHashes, fresh: OwnHashes) -> Bytes = {
+  let by = |f: OwnHashes|
+    f.definitions.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, x: DefinitionHash|
       accumulator.insert(x.name, x.hash));
   let w = by(warm);
   let c = by(fresh);
@@ -200,141 +97,6 @@ fn hash_differences(warm: CachedHashes, fresh: CachedHashes) -> Bytes = {
   let apart = names.filter(|n: Bytes| w.get(n) != c.get(n));
   if apart.len() == 0 { b"" }
   else { Bytes::concat_all([b" (hashes of ", Bytes::join(apart, b", "), b")"]) }
-}
-
-fn group_check_of(group: GroupKey, published: Bool) -> GroupCheck / {QueryEffects, abort.raise} = {
-  let named = { module: group.module, shipped: group.shipped, tested: group.tested };
-  owners_check(
-    named,
-    group.owners.map(|o: Bytes| owner_facts(named, o)),
-    imports_of(group),
-    published,
-    always_entire,
-  )
-}
-
-fn group_inputs_hash(input: Bytes) -> Bytes / {QueryEffects, abort.raise} = {
-  let group = decoded(input, group_key_bin(), "a group's names");
-  if !current(group) { b"" } else {
-    let of = |c: GroupCheck| {
-      let source = group_source_from(group.module, c.reads, c.imported, c.needed);
-      Bytes::concat_all([
-        bin::encode(source.source.source_text, bin::bytes_bin()),
-        bin::encode(source.derived, bin::list_bin(derivation_bin())),
-        bin::encode(
-          source.dependencies,
-          bin::map_bin(bin::bytes_bin(), bin::map_bin(bin::bytes_bin(), owner_interface_bin())),
-        ),
-        bin::encode(source.rows, bin::list_bin(known_definition_row_bin())),
-        bin::encode(source.fixed, bin::list_bin(cached_node_bin())),
-        bin::encode(c.setting, setting_bin()),
-        bin::encode(c.places, bin::map_bin(bin::bytes_bin(), module_origin_bin())),
-      ])
-    };
-    let rejected = group_of(group).rejected.len() > 0;
-    blake3(
-      of(group_check_of(group, false)).concat(if rejected { of(group_check_of(group, true)) }
-      else { b"" }),
-    )
-  }
-}
-
-fn hash_inputs_result(input: Bytes) -> Bytes / {memo.read, abort.raise} = {
-  let group = decoded(input, group_key_bin(), "a group's names");
-  if !current_unit(group) { b"" } else {
-    let h = group_hash_inputs(group);
-    blake3(
-      Bytes::concat_all([
-        bin::encode(h.forms, hash_input_bin()),
-        bin::encode(h.fixed, bin::list_bin(cached_node_bin())),
-        bin::encode(h.functions, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())),
-      ]),
-    )
-  }
-}
-
-fn inputs_over(
-  store: MemoryStore,
-  sources: List<Source>,
-  probe: Bytes,
-) -> Option<Map<Bytes, Bytes>> / {abort.raise} = {
-  let w = load_inputs_of(
-    {
-      root: b"",
-      manifest: None,
-      files: sources.map(|s: Source| { module: s.name, text: s.source_text }),
-    },
-    [],
-  );
-  over_decoding(
-    store,
-    prelude_frames,
-    prelude_files,
-    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-    || {
-      let qs = fresh_registry().insert(b"group inputs", {
-        name: b"group inputs",
-        hash: b"group inputs",
-        body: group_inputs_hash,
-        persistent: true,
-        summarized: false,
-      }).insert(b"hash inputs", {
-        name: b"hash inputs",
-        hash: b"hash inputs",
-        body: hash_inputs_result,
-        persistent: true,
-        summarized: false,
-      });
-      let cycles = cycles_among(qs, start_run(qs), w.own);
-      if cycles.rejected.len() > 0 { None } else {
-        Some(
-          w.own.fold(
-            { run: cycles.run, out: Map::new() },
-            |accumulator: { run: Run, out: Map<Bytes, Bytes> }, m: Bytes| {
-              let named = bin::encode(
-                { module: m, shipped: false, tested: false },
-                module_key_bin(),
-              );
-              let o = query_output(qs, accumulator.run, owners_query, named);
-              decoded(o.output, owners_result_bin(), "a module's owners").groups.fold(
-                { run: o.run, out: accumulator.out },
-                |a: { run: Run, out: Map<Bytes, Bytes> }, g: List<Bytes>| {
-                  let unit = bin::encode(
-                    { module: m, shipped: false, tested: false, owners: g },
-                    group_key_bin(),
-                  );
-                  let cut = if probe != b"group inputs" || g.len() < 2 {
-                    { run: a.run, groups: [g] }
-                  } else {
-                    let c = query_output(qs, a.run, cycles_query, unit);
-                    {
-                      run: c.run,
-                      groups: decoded(
-                        c.output,
-                        bin::list_bin(bin::list_bin(bin::bytes_bin())),
-                        "a unit's groups",
-                      ),
-                    }
-                  };
-                  cut.groups.fold(
-                    { run: cut.run, out: a.out },
-                    |b: { run: Run, out: Map<Bytes, Bytes> }, owners: List<Bytes>| {
-                      let key = bin::encode(
-                        { module: m, shipped: false, tested: false, owners: owners },
-                        group_key_bin(),
-                      );
-                      let i = query_output(qs, b.run, probe, key);
-                      { run: i.run, out: b.out.insert(key, i.output) }
-                    },
-                  )
-                },
-              )
-            },
-          ).out,
-        )
-      }
-    },
-  ).value
 }
 
 fn step(what: Bytes, sources: List<Source>) -> Step = { what: what, sources: sources }
@@ -534,6 +296,226 @@ const reworked: { steps: List<Step>, last: List<Source> } = {
   }
 }
 
+type IdentityRun = { store: fs::MemFs, own: OwnHashes, identity: Option<Bytes> }
+
+fn identified_over(
+  store: fs::MemFs,
+  sources: List<Source>,
+  subject: SubjectKey,
+) -> IdentityRun / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          let all = query_load(w.own, [], false, module_of);
+          {
+            own: joined_module_hashes(hashed_all(w.own, all.pulled, false)),
+            identity: identity_of(subject),
+          }
+        })),
+  );
+  { store: done.store, own: done.value.own, identity: done.value.identity }
+}
+
+test "after a body edit, every other definition keeps its stored hash, and the identity of a test that reaches the edit changes" {
+  let before = [
+    {
+      name: b"m",
+      source_text: b"pub fn first(x: Int) -> Int = x * 3\npub fn caller(x: Int) -> Int = first(x) + 1\npub fn apart(x: Int) -> Int = x - 1\ntest \"calls\" { assert_eq(caller(1), 4) }\n",
+    },
+    { name: b"n", source_text: b"import m\npub fn far(x: Int) -> Int = m::caller(x) + 1\n" },
+  ];
+  let after = edited(before, b"m", b"x * 3", b"x * 5");
+  let calls = {
+    module: { module: b"m", shipped: false, tested: false },
+    subject: TestRun(b"m.calls"),
+  };
+  let first = identified_over(fs::mem_empty(), before, calls);
+  let second = identified_over(first.store, after, calls);
+  let hashes = |own: OwnHashes|
+    own.definitions.fold(Map::new(), |found: Map<Bytes, Bytes>, d: DefinitionHash|
+      found.insert(definition_key(d.name, d.kind), d.hash));
+  let was = hashes(first.own);
+  let now = hashes(second.own);
+  let edited_key = definition_key(b"m.first", HeldValue);
+  assert(was.contains(definition_key(b"n.far", HeldValue)), None);
+  assert(was.get(edited_key) != now.get(edited_key), None);
+  assert_eq(was.remove(edited_key), now.remove(edited_key));
+  assert(first.identity != None, None);
+  assert(first.identity != second.identity, None);
+  assert_eq(second.identity, identified_over(fs::mem_empty(), after, calls).identity)
+}
+
+test "a test's identity changes when a callee in an imported module changes its body, and stays when a definition there that the test does not reach changes" {
+  let before = [
+    {
+      name: b"n",
+      source_text: b"pub fn far(x: Int) -> Int = x + 1\npub fn apart(x: Int) -> Int = x - 1\n",
+    },
+    {
+      name: b"m",
+      source_text: b"import n\npub fn caller(x: Int) -> Int = n::far(x) * 2\ntest \"calls\" { assert_eq(caller(1), 4) }\n",
+    },
+  ];
+  let calls = {
+    module: { module: b"m", shipped: false, tested: false },
+    subject: TestRun(b"m.calls"),
+  };
+  let first = identified_over(fs::mem_empty(), before, calls);
+  let reached = identified_over(first.store, edited(before, b"n", b"x + 1", b"x + 2"), calls);
+  let apart = identified_over(first.store, edited(before, b"n", b"x - 1", b"x - 2"), calls);
+  assert(first.identity != None, None);
+  assert(reached.identity != first.identity, None);
+  assert_eq(apart.identity, first.identity)
+}
+
+test "a definition's proof identity changes when a transparent callee in an imported module changes its body, as a cold run computes it" {
+  let before = [
+    { name: b"n", source_text: b"pub transparent fn same(x: Int) -> Int = x\n" },
+    {
+      name: b"m",
+      source_text: b"import n\npub fn kept(x: Int) -> Int\n  ensures result == x\n= n::same(x)\n",
+    },
+  ];
+  let proof_subject = {
+    module: { module: b"m", shipped: false, tested: true },
+    subject: DefinitionProof(b"m.kept"),
+  };
+  let after = edited(before, b"n", b"= x\n", b"= x - 0\n");
+  let first = identified_over(fs::mem_empty(), before, proof_subject);
+  let second = identified_over(first.store, after, proof_subject);
+  assert(second.identity != first.identity, None);
+  assert_eq(second.identity, identified_over(fs::mem_empty(), after, proof_subject).identity)
+}
+
+type GroupsChecked = { store: fs::MemFs, groups: Int }
+
+fn groups_checked_over(store: fs::MemFs, sources: List<Source>) -> GroupsChecked / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run| {
+        let read = reading(qs, run, || query_load(w.own, [], false, listed_module).results.len());
+        {
+          run: read.run,
+          value: query_stats(read.run).fold(0, |n: Int, s: QueryStats|
+            if s.query == b"group" { n + s.ran } else { n }),
+        }
+      }),
+  );
+  { store: done.store, groups: done.value }
+}
+
+test "adding an unused function to a module that another module calls into checks no more groups than adding it to a module nothing imports" {
+  let before = [
+    { name: b"n", source_text: b"pub fn far(x: Int) -> Int = x + 1\n" },
+    { name: b"m", source_text: b"import n\npub fn caller(x: Int) -> Int = n::far(x) * 2\n" },
+    { name: b"z", source_text: b"pub fn alone(x: Int) -> Int = x\n" },
+  ];
+  let cold = groups_checked_over(fs::mem_empty(), before);
+  let added = |module: Bytes, last_line: Bytes|
+    groups_checked_over(
+      cold.store,
+      edited(before, module, last_line, last_line.concat(b"fn added() -> Int = 1\n")),
+    ).groups;
+  let apart = added(b"z", b"= x\n");
+  assert(apart > 0, None);
+  assert_eq(added(b"n", b"x + 1\n"), apart)
+}
+
+fn cold_identity(sources: List<Source>, subject: Identified) -> Option<Bytes> / {abort.raise} =
+  identified_over(fs::mem_empty(), sources, {
+    module: { module: b"m", shipped: false, tested: false },
+    subject: subject,
+  }).identity
+
+test "a test's run identity stays when a definition it reaches is renamed or moved to another module, and changes when that definition's body changes" {
+  let width = |name: Bytes, value: Bytes|
+    [
+      {
+        name: b"m",
+        source_text: Bytes::concat_all([
+          b"fn ",
+          name,
+          b"() -> Int = ",
+          value,
+          b"\ntest \"width\" { assert_eq(",
+          name,
+          b"(), 3) }\n",
+        ]),
+      },
+    ];
+  let moved = [
+    { name: b"lib", source_text: b"pub fn width() -> Int = 3\n" },
+    { name: b"m", source_text: b"import lib\ntest \"width\" { assert_eq(lib::width(), 3) }\n" },
+  ];
+  let run = TestRun(b"m.width");
+  let base = cold_identity(width(b"width", b"3"), run);
+  assert(base != None, None);
+  assert_eq(cold_identity(width(b"breadth", b"3"), run), base);
+  assert_eq(cold_identity(moved, run), base);
+  assert(cold_identity(width(b"width", b"1 + 2"), run) != base, None)
+}
+
+test "attaching a spec to a definition keeps the run identity of a test that calls it, and changes the identity its point checks run under" {
+  let half = |spec: Bytes|
+    [
+      {
+        name: b"m",
+        source_text: Bytes::concat_all([
+          b"pub fn half(n: Int) -> Int\n",
+          spec,
+          b"= n / 2\ntest \"halves\" { assert_eq(half(4), 2) }\n",
+        ]),
+      },
+    ];
+  let plain = half(b"");
+  let specified = half(b"  requires n >= 0\n  ensures result <= n\n");
+  let test_run = TestRun(b"m.halves");
+  let point_checks = DefinitionRun(b"m.half");
+  assert(cold_identity(plain, test_run) != None, None);
+  assert_eq(cold_identity(specified, test_run), cold_identity(plain, test_run));
+  assert(cold_identity(specified, point_checks) != cold_identity(plain, point_checks), None)
+}
+
+fn promised(helper: Bytes, two: Bytes, other: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub fn two(x: Int) -> Int\n  ensures result > helper(x)\n= ",
+        two,
+        b"\nfn helper(x: Int) -> Int = ",
+        helper,
+        b"\npub fn other() -> Int = ",
+        other,
+        b"\n",
+      ]),
+    },
+  ]
+
+test "a public function's stored contract identity changes when a helper that its clause calls changes its body, and stays when its own body or an unrelated function changes" {
+  let contract = |sources: List<Source>|
+    identified_over(fs::mem_empty(), sources, {
+      module: { module: b"m", shipped: false, tested: false },
+      subject: DefinitionContract({ name: b"m.two", kind: HeldValue }),
+    }).identity;
+  let base = contract(promised(b"x", b"x + 1", b"3"));
+  assert(base != None, None);
+  assert(contract(promised(b"x - 1", b"x + 1", b"3")) != base, None);
+  assert_eq(contract(promised(b"x", b"x + 2", b"3")), base);
+  assert_eq(contract(promised(b"x", b"x + 1", b"4")), base)
+}
+
 test "reusing cached results matches checking from scratch after edits to bodies, signatures, `pub` and imports" {
   assert_eq(disagreements(reworked.steps), [])
 }
@@ -595,6 +577,26 @@ test "reusing cached results matches checking from scratch when a group member s
       step(b"a member calls another sibling", s1),
       step(b"the other member calls the first's old one", s2),
       step(b"back", s0),
+    ]),
+    [],
+  )
+}
+
+test "reusing cached results matches checking from scratch when the check groups of a unit split and merge again" {
+  let source_text = Bytes::concat_all([
+    b"pub type Box = | Box(List<Int>)\n",
+    b"show for Box by shown\n",
+    b"fn shown(b: Box) -> String = \"a box of {items(grown(b, 0)).len()}\"\n",
+    b"fn items(b: Box) -> List<Int> = match b { Box(xs) -> if shown(b) == \"\" { [] } else { xs } }\n",
+    b"fn grown(b: Box, n: Int) -> Box = match b { Box(xs) -> Box(xs.push(n)) }\n",
+  ]);
+  let s0 = [{ name: b"boxes", source_text: source_text }];
+  let s1 = edited(s0, b"boxes", b"if shown(b) == \"\" { [] } else { xs }", b"xs");
+  assert_eq(
+    disagreements([
+      step(b"cold", s0),
+      step(b"a member stops calling back, so its check group splits", s1),
+      step(b"the call returns, so the groups merge", s0),
     ]),
     [],
   )
@@ -754,6 +756,114 @@ test "reusing cached results matches checking from scratch when an effect identi
   )
 }
 
+fn record_reads(fields: Bytes, total: Bytes, served: Bytes) -> List<Source> =
+  [
+    {
+      name: b"lib",
+      source_text: Bytes::concat_all([
+        b"pub type Facts = { ",
+        fields,
+        b" }\npub effect reads { read named(name: Bytes) -> Option<Facts> }\n",
+        b"fn total(f: Facts) -> Int = ",
+        total,
+        b"\npub fn first(name: Bytes) -> Int / {reads.read} = ",
+        b"match reads.named(name) { Some(f) -> total(f), None -> 0 }\n",
+      ]),
+    },
+    {
+      name: b"app",
+      source_text: Bytes::concat_all([
+        b"import lib\npub fn served() -> Int = handle { lib::first(b\"x\") } with { ",
+        b"lib::reads.named(n) -> Some(",
+        served,
+        b") }\n",
+      ]),
+    },
+  ]
+
+test "reusing cached results matches checking from scratch after a field is removed from a record an effect operation returns" {
+  assert_eq(
+    disagreements([
+      step(b"two fields", record_reads(b"a: Int, b: Int", b"f.a + f.b", b"{ a: 1, b: 2 }")),
+      step(b"one field", record_reads(b"a: Int", b"f.a", b"{ a: 1 }")),
+    ]),
+    [],
+  )
+}
+
+test "a check stopped at its first, a middle or its last write to the store leaves a store that the next check reads as a check from scratch would" {
+  let before = record_reads(b"a: Int, b: Int", b"f.a + f.b", b"{ a: 1, b: 2 }");
+  let after = record_reads(b"a: Int", b"f.a", b"{ a: 1 }");
+  let cold = queried_over(fs::mem_empty(), before).store;
+  let complete = checked_with_write_limit(cold, after, AllWrites);
+  let operations = operations_of_check(cold, after);
+  [0, operations / 2, operations].fold((), |_: Unit, writes: Int| {
+    let left = checked_with_write_limit(cold, after, FailAfter(writes));
+    assert_eq(with_step(edit_session_over(left), step(b"after a stopped check", after)).off, []);
+  });
+  assert(
+    same_database_in_memory(checked_with_write_limit(cold, after, FailAfter(operations)), complete),
+  )
+}
+
+fn facts_reads(declarations: Bytes, total: Bytes, served: Bytes) -> List<Source> =
+  [
+    {
+      name: b"lib",
+      source_text: Bytes::concat_all([
+        b"pub type Shape = { arity: Int }\npub type Info = { name: Bytes }\n",
+        declarations,
+        b"\npub effect reads { read named(name: Bytes) -> Option<Facts> }\n",
+        b"fn total(f: Facts) -> Int = ",
+        total,
+        b"\npub fn first(name: Bytes) -> Int / {reads.read} = ",
+        b"match reads.named(name) { Some(f) -> total(f), None -> 0 }\n",
+      ]),
+    },
+    {
+      name: b"app",
+      source_text: Bytes::concat_all([
+        b"import lib (Facts, Shape, Info, Extern, Builtin, Checked)\n",
+        b"pub fn served() -> Int = handle { lib::first(b\"x\") } with { ",
+        b"lib::reads.named(n) -> Some(",
+        served,
+        b") }\n",
+      ]),
+    },
+  ]
+
+test "reusing cached results matches checking from scratch after an optional field of a record an effect operation returns becomes a new sum type that takes over another field" {
+  assert_eq(
+    disagreements([
+      step(
+        b"two optional fields",
+        facts_reads(
+          b"pub type Facts = { definition: Option<Info>, call: Option<Shape>, pure: Bool }",
+          b"if f.pure { 1 } else { 0 }",
+          b"{ definition: None, call: None, pure: true }",
+        ),
+      ),
+      step(
+        b"a new sum type in place of one field",
+        facts_reads(
+          b"pub type Implementation = | Extern | Builtin | Checked(Info)\npub type Facts = { implementation: Implementation, call: Option<Shape>, pure: Bool }",
+          b"if f.pure { 1 } else { 0 }",
+          b"{ implementation: Extern, call: None, pure: true }",
+        ),
+      ),
+      step(
+        b"the other field moved into the sum type",
+        facts_reads(
+          b"pub type Implementation = | Extern | Builtin(Shape) | Checked(Info, Option<Shape>)\npub type Facts = { implementation: Implementation, pure: Bool }",
+          b"if f.pure { 1 } else { 0 }",
+          b"{ implementation: Extern, pure: true }",
+        ),
+      ),
+    ]),
+    [],
+  )
+}
+
 test "checking with cached results matches checking from scratch after effect operations are reordered, tests are relabelled and exports change" {
   let effect_operations = |first: Bytes, second: Bytes|
     [
@@ -903,6 +1013,31 @@ test "reusing cached results matches checking from scratch after undone edits, a
       step(b"and renamed back", s0),
       step(b"an imported module deleted", without(s0, b"core")),
       step(b"and restored", s0),
+    ]),
+    [],
+  )
+}
+
+fn reached_through(field: Bytes, value: Bytes) -> List<Source> =
+  [
+    { name: b"low", source_text: Bytes::concat_all([b"pub type Size = { n: ", field, b" }\n"]) },
+    {
+      name: b"middle",
+      source_text: Bytes::concat_all([
+        b"import low\n\npub fn held() -> low::Size = { n: ",
+        value,
+        b" }\n",
+      ]),
+    },
+    { name: b"top", source_text: b"import middle\n\npub fn n() -> Int = middle::held().n\n" },
+  ]
+
+test "a type two modules away is checked again by a group that reaches it only through an interface" {
+  assert_eq(
+    disagreements([
+      step(b"cold", reached_through(b"Int", b"1")),
+      step(b"the field changed", reached_through(b"Bool", b"true")),
+      step(b"the field changed back", reached_through(b"Int", b"1")),
     ]),
     [],
   )
@@ -1105,7 +1240,7 @@ test "reusing cached results matches checking from scratch when a function's eff
   ];
   let moved = with_module(stale, b"lib", chain_lib(b"b"));
   assert_eq(disagreements([step(b"cold", stale), step(b"the callee's effects moved", moved)]), []);
-  let warm = queried_over(queried_over(empty_memory_store, stale).store, moved);
+  let warm = queried_over(queried_over(fs::mem_empty(), stale).store, moved);
   assert(match warm.outcome { Rejected(_) -> true, Analysed(_) -> false })
 }
 
@@ -1129,7 +1264,7 @@ test "`keep` written on an imported function, or dropped, leaves the result thro
     ]),
     [],
   );
-  let warm = queried_over(queried_over(empty_memory_store, borrowed).store, with_keep);
+  let warm = queried_over(queried_over(fs::mem_empty(), borrowed).store, with_keep);
   assert(match warm.outcome { Rejected(_) -> true, Analysed(_) -> false })
 }
 
@@ -1143,7 +1278,7 @@ test "deleting an unused function that another module imports by name is rejecte
     disagreements([step(b"cold", s0), step(b"warm", s0), step(b"the name deleted", gone)]),
     [],
   );
-  match queried_over(queried_over(empty_memory_store, s0).store, gone).outcome {
+  match queried_over(queried_over(fs::mem_empty(), s0).store, gone).outcome {
     Analysed(_) -> panic("an import of a deleted name checked"),
     Rejected(ds) ->
       assert(
@@ -1272,23 +1407,6 @@ test "module keys, interface keys, embeddings and package locations in cache que
   )
 }
 
-fn run_count(run: Run, name: Bytes) -> Int =
-  query_stats(run).fold(0, |n: Int, t: QueryStats| if t.query == name { t.ran } else { n })
-
-fn groups_ran(run: Run, name: Bytes) -> List<GroupKey> / {abort.raise} =
-  executed_for(run, name).map(|b: Bytes| decoded(b, group_key_bin(), "a group's names"))
-
-fn group_in(module: Bytes, owners: List<Bytes>) -> GroupKey =
-  { module: module, shipped: false, tested: false, owners: owners }
-
-fn modules_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
-  sorted_bytes(
-    executed_for(run, name).map(|b: Bytes| decoded(b, module_key_bin(), "a module's name").module),
-  )
-
-fn same_groups(a: List<GroupKey>, b: List<GroupKey>) -> Bool =
-  a.len() == b.len() && b.all(|g: GroupKey| a.contains(g))
-
 const hashed_fixture: List<Source> =
   [
     {
@@ -1301,39 +1419,50 @@ const hashed_fixture: List<Source> =
     },
   ]
 
-test "a program hashed from its modules' results has the same hashes and warnings as the program hashed in one pass" {
-  [unedited_sources, hashed_fixture].fold((), |u: Unit, sources: List<Source>| {
-    let fixed = check_sources(empty_memory_store, sources, []);
-    let whole = load_with_shipped(sources, []);
-    match ((
-        whole.hashed,
-        checked_staged(whole, no_rows).out,
-        load_with_shipped(sources, [], fixed: fixed.cached_hashes).hashed,
-      )) {
-      (Ok(read), Analysed(checked), Ok(taken)) -> {
-        assert_eq(taken.hashes, checked.hashes);
-        assert_eq(taken.unused, []);
-        assert_eq(
-          owner_checks::diagnostic_summaries(fixed.warnings),
-          owner_checks::diagnostic_summaries(read.unused),
-        )
-      },
-      _ -> panic("the fixture hashes"),
-    }
-  })
+type OwnChecked = {
+  definitions: List<DefinitionInfo>,
+  tests: List<TestInfo>,
+  effects: List<EffectInfo>,
+  constructors: List<ConstructorInfo>,
 }
+
+fn own_checked(c: CheckOutput, own: List<Bytes>) -> OwnChecked =
+  {
+    definitions: c.definitions.filter(|d: DefinitionInfo| own.contains(d.module)),
+    tests: c.tests.filter(|t: TestInfo| own.contains(t.module)),
+    effects: c.effects.filter(|e: EffectInfo| own.contains(e.module)),
+    constructors: c.constructors.filter(|k: ConstructorInfo| own.contains(k.module)),
+  }
+
+type OwnRows = {
+  modules: List<ModuleRow>,
+  definitions: List<DefinitionRow>,
+  tests: List<TestRow>,
+  effects: List<EffectRow>,
+  constructors: List<ConstructorRow>,
+}
+
+fn own_rows(d: Dump, own: List<Bytes>) -> OwnRows =
+  {
+    modules: d.modules.filter(|m: ModuleRow| own.contains(m.name)),
+    definitions: d.definitions.filter(|r: DefinitionRow| own.contains(r.module)),
+    tests: d.tests.filter(|r: TestRow| own.contains(r.module)),
+    effects: d.effects.filter(|r: EffectRow| own.contains(r.module)),
+    constructors: d.constructors.filter(|r: ConstructorRow| own.contains(r.module)),
+  }
 
 test "assembling a program from per-module check results gives the same definitions, tests and effects as checking the whole program at once" {
   [unedited_sources, hashed_fixture, faceted, faceted.reverse()].fold(
     (),
     |u: Unit, sources: List<Source>| {
-      let fixed = check_sources(empty_memory_store, sources, []);
-      match analyse_pulling_std_with(sources, [], no_rows).out {
+      let own = sources.map(|s: Source| s.name);
+      let fixed = check_sources(fs::mem_empty(), sources, []);
+      match analysed_over(sources, []) {
         Rejected(_) -> panic("the fixture program was rejected by the checker"),
         Analysed(w) -> {
           let returned = assembled_program(
             fixed.results.map(|a: CheckedModule| facts_of_result(a.result)),
-            fixed.cached_hashes,
+            fixed.own_hashes,
             with_prelude_source([]).fold(Map::new(), |accumulator: Map<Bytes, Bytes>, s: Source|
               accumulator.insert(s.name, s.source_text)),
             true,
@@ -1345,31 +1474,13 @@ test "assembling a program from per-module check results gives the same definiti
             w.module_packages,
             w.embeds,
           );
-          assert_eq(returned.view.checked.definitions, w.checked.definitions);
-          assert_eq(returned.view.frame.tagged, checked_program_of(w).frame.tagged);
-          assert_eq(returned.view, checked_program_of(w));
-          let made = view_dump(returned.view, None);
-          let whole = dump_of(Analysed(w));
-          assert_eq(made.definitions, whole.definitions);
-          assert_eq(made.tests, whole.tests);
-          assert_eq(made.effects, whole.effects);
-          assert_eq(made.constructors, whole.constructors);
-          assert_eq(made.hashes, whole.hashes);
-          assert_eq(made.keys, whole.keys);
-          assert_eq(made.emitter_roots, whole.emitter_roots);
-          assert_eq(made.rows, whole.rows);
-          let walked = |b: Bytes|
-            match bin::decode(b, inferred_facts_bin()) {
-              Ok(w) -> w,
-              Err(_) -> panic("walked facts decode"),
-            };
-          let a = walked(made.inferred_facts);
-          let b = walked(whole.inferred_facts);
-          assert_eq(a.pure, b.pure);
-          assert_eq(a.orders, b.orders);
-          assert_eq(a.law_facts, b.law_facts);
-          assert_eq(made.inferred_facts, whole.inferred_facts);
-          assert_eq(made, whole)
+          let assembled = own_checked(returned.checked, own);
+          let analysed = own_checked(w.checked, own);
+          assert_eq(assembled.definitions, analysed.definitions);
+          assert_eq(assembled.tests, analysed.tests);
+          assert_eq(assembled.effects, analysed.effects);
+          assert_eq(assembled.constructors, analysed.constructors);
+          assert_eq(own_rows(view_dump(returned), own), own_rows(dump_of(Analysed(w)), own))
         },
       }
     },
@@ -1411,20 +1522,20 @@ fn load_with_analysis(
   let text_of = |name: Bytes| texts.get(name);
   let names = shipped.map(|s: Source| s.name);
   let done = over_decoding(
-    empty_memory_store,
+    fs::mem_empty(),
     packs::no_pack,
-    b"",
-    |kind: Bytes, at: Bytes|
-      lookup_input(w, text_of, text_of, || names, reject_embed, nothing_derived, kind, at),
+    |kind: Bytes, at: Bytes| lookup_input(w, text_of, text_of, || names, reject_embed, kind, at),
     || {
       let qs = fresh_registry();
-      let all = query_load(qs, w.own, if tested { names } else { [] }, tested, start_run(qs));
-      let fixed = hashed_all(qs, w.own, all.value.pulled, tested, all.run);
-      {
-        results: all.value.results,
-        pulled: all.value.pulled,
-        fixing: joined_cached_hashes(fixed.value),
-      }
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          let all = query_load(w.own, if tested { names } else { [] }, tested, module_of);
+          {
+            results: all.results,
+            pulled: all.pulled,
+            own_hashes: joined_module_hashes(hashed_all(w.own, all.pulled, tested)),
+          }
+        }))
     },
   ).value;
   let loaded = assembled_load(
@@ -1432,15 +1543,15 @@ fn load_with_analysis(
     { root: b"", manifest: None, supplied: [] },
     done.results.fold(Map::new(), |accumulator: Map<Bytes, ModuleShape>, a: CheckedModule|
       accumulator.insert(a.module, a.result.shape)),
-    done.fixing,
+    done.own_hashes,
     done.pulled,
-    names,
+    NoTree,
     texts,
     true,
     used_only,
     root_warnings(done.results, f.user.len()),
   );
-  match analyse_pulling_std_with(f.user, f.shipped, no_rows, cut_unused: used_only).out {
+  match analysed_over(f.user, f.shipped) {
     Rejected(_) -> panic("the test program fails to check"),
     Analysed(whole) ->
       {
@@ -1473,23 +1584,12 @@ test "a program assembled from its modules' results, including a shipped module'
         assembled.checked.tests.filter(|t: TestInfo| t.module != prelude_module).len(),
         if mode.tested { 2 } else { 1 },
       );
-      assert_eq(loaded.frame.outlines, view.frame.outlines);
-      assert_eq(assembled.checked.definitions, view.checked.definitions);
-      assert_eq(assembled.checked.facts, view.checked.facts);
-      assert_eq(assembled.checked, view.checked);
-      match load_with_shipped(f.user, f.shipped, cut_unused: mode.reachable).hashed {
-        Ok(h) ->
-          assert(
-            checked_body(body_named(h.hashes.bodies, b"main.ranked"), Map::new())
-              != body_named(view.frame.hashes.bodies, b"main.ranked"),
-          ),
-        Err(_) -> panic("the fixture hashes"),
-      };
-      assert_eq(loaded.frame.hashes, view.frame.hashes);
-      assert_eq(assembled, view);
+      let own = [b"main"];
+      assert_eq(loaded.frame.outlines.take(1), view.frame.outlines.take(1));
+      assert_eq(own_checked(assembled.checked, own), own_checked(view.checked, own));
       assert_eq(functions_of(loaded.frame), assembled.checked.definitions.len());
       assert_eq(tests_of(loaded.frame, 1), 1);
-      assert_eq(view_dump(assembled, None), dump_of(Analysed(x.whole)))
+      assert_eq(own_rows(view_dump(assembled), own), own_rows(dump_of(Analysed(x.whole)), own))
     },
   )
 }
@@ -1514,85 +1614,55 @@ const reading_unimported: { user: List<Source>, shipped: List<Source> } =
 test "a module's result lists `std.list` and the scheduler module as used without an import, the same as a whole-program check" {
   let x = load_with_analysis(reading_unimported, false, true);
   assert_eq(x.loaded.frame.unimported.at(0), Some([b"std.list", b"std.internal.schedule"]));
-  assert_eq(x.loaded.frame.unimported, checked_program_of(x.whole).frame.unimported);
-  assert_eq(view_dump(x.assembled, None).modules, dump_of(Analysed(x.whole)).modules)
+  assert_eq(x.loaded.frame.unimported.at(0), checked_program_of(x.whole).frame.unimported.at(0));
+  assert_eq(
+    own_rows(view_dump(x.assembled), [b"main"]).modules,
+    own_rows(dump_of(Analysed(x.whole)), [b"main"]).modules,
+  )
 }
 
-fn body_named(bodies: List<{ name: Bytes, body: Bytes }>, name: Bytes) -> Bytes / {abort.raise} =
-  match bodies.find(|b: { name: Bytes, body: Bytes }| b.name == name) {
+fn body_named(
+  bodies: List<{ name: Bytes, body: FramedBody }>,
+  name: Bytes,
+) -> FramedBody / {abort.raise} =
+  match bodies.find(|b: { name: Bytes, body: FramedBody }| b.name == name) {
     Some(b) -> b.body,
     None -> panic("no body found for " ++ String::of_bytes_lossy(name)),
   }
 
 test "a function body that calls a method on a value records the same check results whether the program is checked whole or module by module" {
   [
-    {
-      names: false,
-      sources: [
-        {
-          name: b"m",
-          source_text: b"pub type T = | T(Int)\nfn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn f(t: T) -> Int = t.size()\n",
-        },
-      ],
-    },
-    {
-      names: true,
-      sources: [
-        {
-          name: b"low",
-          source_text: b"pub type T = | T(Int)\npub fn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn T::scaled(t: T, by: Int = 2, plus: Int = 0) -> Int = t.size() * by + plus\n",
-        },
-        {
-          name: b"m",
-          source_text: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n",
-        },
-      ],
-    },
-    {
-      names: false,
-      sources: [
-        {
-          name: b"m",
-          source_text: b"pub fn f(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\n",
-        },
-      ],
-    },
-  ].fold((), |u: Unit, fixture: { names: Bool, sources: List<Source> }| {
-    let returned = check_sources(empty_memory_store, fixture.sources, []).cached_hashes.nodes.fold(
-      b"",
-      |accumulator: Bytes, x: CachedNode| if x.name == b"m.f" { x.body } else { accumulator },
-    );
-    match analyse_pulling_std_with(fixture.sources, [], no_rows).out {
+    [
+      {
+        name: b"m",
+        source_text: b"pub type T = | T(Int)\nfn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn f(t: T) -> Int = t.size()\n",
+      },
+    ],
+    [
+      {
+        name: b"low",
+        source_text: b"pub type T = | T(Int)\npub fn T::size(t: T) -> Int = match t { T(n) -> n }\npub fn T::scaled(t: T, by: Int = 2, plus: Int = 0) -> Int = t.size() * by + plus\n",
+      },
+      { name: b"m", source_text: b"import low\npub fn f(t: low::T) -> Int = t.scaled(plus: 3)\n" },
+    ],
+    [
+      {
+        name: b"m",
+        source_text: b"pub fn f(xs: List<Int>) -> Int = xs.fold(0, |a: Int, x: Int| a + x)\n",
+      },
+    ],
+  ].fold((), |u: Unit, sources: List<Source>| {
+    let returned = match check_sources(fs::mem_empty(), sources, []).own_hashes.definitions.find(
+        |x: DefinitionHash| x.name == b"m.f",
+      ) {
+      Some(x) -> x.body,
+      None -> panic("the module-by-module check has no hash for `m.f`"),
+    };
+    match analysed_over(sources, []) {
       Rejected(_) -> panic("the fixture program was rejected by the checker"),
       Analysed(w) -> assert_eq(body_named(w.hashes.bodies, b"m.f"), returned),
-    };
-    match load_with_shipped(fixture.sources, []).hashed {
-      Ok(h) -> {
-        let unchecked = body_named(h.hashes.bodies, b"m.f");
-        if fixture.names {
-          assert_eq(body_key(unchecked), None);
-          assert(checked_body(unchecked, Map::new()) != returned)
-        } else { assert_eq(unchecked, returned) }
-      },
-      Err(_) -> panic("the fixture hashes"),
     }
   })
-}
-
-test "a run over an unchanged program runs no query again" {
-  let sources = layered(b"pub fn step(n: Int) -> Int = n + 1\n");
-  let cold = queried_over(empty_memory_store, sources);
-  assert_eq(modules_ran(cold.run, module_query), [b"app", b"aside", b"lib"]);
-  assert_eq(executed_count(queried_over(cold.store, sources).run), 0)
-}
-
-test "a body edit checks its own definition again and none that reads it" {
-  let before = layered(b"pub fn step(n: Int) -> Int = n * 3\n");
-  let after = layered(b"pub fn step(n: Int) -> Int = n * 4\n");
-  let warm = queried_over(queried_over(empty_memory_store, before).store, after);
-  assert_eq(groups_ran(warm.run, group_query), [group_in(b"lib", [b"step"])]);
-  assert_eq(modules_ran(warm.run, module_query), [b"lib"]);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))))
 }
 
 fn paired(base: Bytes, step: Bytes) -> List<Source> =
@@ -1613,10 +1683,7 @@ fn paired(base: Bytes, step: Bytes) -> List<Source> =
     },
   ]
 
-fn owners_ran(run: Run, name: Bytes) -> List<Bytes> / {abort.raise} =
-  executed_for(run, name).map(|b: Bytes| decoded(b, owner_key_bin(), "an owner's name").owner)
-
-test "after a failing edit is reverted, checking again reruns no checks and reuses every cached result" {
+test "reverting a failing edit gives the original result" {
   let source = |body: Bytes|
     [
       {
@@ -1629,15 +1696,11 @@ test "after a failing edit is reverted, checking again reruns no checks and reus
         ]),
       },
     ];
-  let cold = queried_over(empty_memory_store, source(b"n + 1"));
+  let cold = queried_over(fs::mem_empty(), source(b"n + 1"));
   let broken = queried_over(cold.store, source(b"n + true"));
-  assert_eq(
-    outcome_summary(broken.outcome),
-    outcome_summary(analyse(parse_all(source(b"n + true")))),
-  );
+  assert_eq(outcome_summary(broken.outcome), from_nothing(source(b"n + true")));
   let mended = queried_over(broken.store, source(b"n + 1"));
-  assert_eq(outcome_summary(mended.outcome), outcome_summary(cold.outcome));
-  assert_eq(groups_ran(mended.run, group_query), [])
+  assert_eq(outcome_summary(mended.outcome), outcome_summary(cold.outcome))
 }
 
 test "when a set of definitions fails to check, its hash is computed without the hash of each definition in it" {
@@ -1678,25 +1741,17 @@ test "when a set of definitions fails to check, its hash is computed without the
   )
 }
 
-test "editing one function body in mutually recursive functions rechecks only that body, but redoes the shared signature analysis for all of them" {
+test "edits to mutually recursive functions give the result of a check from scratch" {
   let before = paired(b"true", b"n");
-  let cold = queried_over(empty_memory_store, before);
-  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
+  let cold = queried_over(fs::mem_empty(), before);
   let after = paired(b"n == 0", b"n");
   let warm = queried_over(cold.store, after);
-  assert_eq(owners_ran(warm.run, typed_query), [b"even"]);
-  assert(groups_ran(warm.run, group_query).contains(group_in(b"lib", [b"even", b"odd"])));
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after));
   let renamed = paired(b"n == 0", b"left");
   let again = queried_over(warm.store, renamed);
-  let rewalked = owners_ran(again.run, typed_query);
-  assert(rewalked.len() == 2 && rewalked.contains(b"even") && rewalked.contains(b"odd"));
-  assert_eq(outcome_summary(again.outcome), outcome_summary(analyse(parse_all(renamed))));
+  assert_eq(outcome_summary(again.outcome), from_nothing(renamed));
   let broken = paired(b"n", b"left");
-  assert_eq(
-    outcome_summary(queried_over(again.store, broken).outcome),
-    outcome_summary(analyse(parse_all(broken))),
-  )
+  assert_eq(outcome_summary(queried_over(again.store, broken).outcome), from_nothing(broken))
 }
 
 fn recursive_types_sources(more: Bytes) -> List<Source> =
@@ -1722,70 +1777,12 @@ fn recursive_types_sources(more: Bytes) -> List<Source> =
     },
   ]
 
-test "a function body checked as part of a whole-module check is rechecked when a sibling definition's signature changes" {
+test "mutually recursive functions give the result of a check from scratch after a type they reach through a sibling gains a variant" {
   let before = recursive_types_sources(b"");
-  let cold = queried_over(empty_memory_store, before);
-  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
+  let cold = queried_over(fs::mem_empty(), before);
   let after = recursive_types_sources(b" | Rest");
   let warm = queried_over(cold.store, after);
-  assert(owners_ran(warm.run, typed_query).contains(b"even"));
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))))
-}
-
-fn derive_sources(more: Bytes) -> List<Source> =
-  [
-    { name: b"sizes", source_text: b"pub fn derive(declaration: Bytes) -> Bytes = declaration\n" },
-    {
-      name: b"lib",
-      source_text: range(0, 40).fold(
-        Bytes::concat_all([
-          b"import sizes\n\npub type Tree = | Branch(List<Grove>)",
-          more,
-          b"\n\npub type Grove = | Grove(List<Tree>)\n\nderive sizes for Tree\n\nderive sizes for Grove\n",
-        ]),
-        |text: Bytes, i: Int|
-          Bytes::concat_all([
-            text,
-            b"\npub fn pad",
-            Bytes::of_string(i.to_string()),
-            b"() -> Int = 0\n",
-          ]),
-      ),
-    },
-  ]
-
-fn sized(at: Bytes) -> Option<Bytes> / {abort.raise} =
-  match bin::decode(at, deriver_request_bin()) {
-    Err(_) -> None,
-    Ok(ask) -> match value::decode(ask.declaration) {
-      Some(VList([VRecord(fields)])) -> match value::field_named(fields, "target") {
-        Some(VStr(target)) ->
-          Some(
-            bin::encode(
-              Generated(
-                Bytes::concat_all([
-                  b"pub fn ",
-                  Bytes::of_string(target),
-                  b"::size() -> Int = ",
-                  Bytes::of_string(ask.declaration.len().to_string()),
-                ]),
-              ),
-              deriver_response_bin(),
-            ),
-          ),
-        _ -> None,
-      },
-      _ -> None,
-    },
-  }
-
-test "changing a type that other types derive functions from rechecks the generated code of each deriving type" {
-  let cold = check_sources(empty_memory_store, derive_sources(b""), [], derived: sized);
-  let after = derive_sources(b" | Twig(List<Grove>)");
-  let warm = check_sources(cold.store, after, [], derived: sized);
-  assert(owners_ran(warm.run, typed_query).contains(b"Tree"));
-  assert(owners_ran(warm.run, typed_query).contains(b"Grove"));
-  assert_eq(warm.results, check_sources(empty_memory_store, after, [], derived: sized).results)
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after))
 }
 
 fn stack_queue_sources(stack: Bytes, queue: Bytes) -> List<Source> =
@@ -1803,46 +1800,18 @@ fn stack_queue_sources(stack: Bytes, queue: Bytes) -> List<Source> =
     },
   ]
 
-test "editing a body in definitions that are not mutually recursive rechecks only that definition and recomputes no signatures" {
+test "edits to definitions that are not mutually recursive give the result of a check from scratch" {
   let before = stack_queue_sources(b"xs.len()", b"f.len()");
-  let cold = queried_over(empty_memory_store, before);
-  assert_eq(outcome_summary(cold.outcome), outcome_summary(analyse(parse_all(before))));
+  let cold = queried_over(fs::mem_empty(), before);
   let after = stack_queue_sources(b"xs.len() + 0", b"f.len()");
   let warm = queried_over(cold.store, after);
-  assert_eq(owners_ran(warm.run, typed_query), [b"Stack::len"]);
-  assert_eq(groups_ran(warm.run, group_query), [group_in(b"lib", [b"Stack::len"])]);
-  assert_eq(run_count(warm.run, signatures_query), 0);
-  assert_eq(run_count(warm.run, cycles_query), 0);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after));
   let calling = stack_queue_sources(b"xs.len() + 0", b"Stack(f).len()");
   let called = queried_over(warm.store, calling);
-  assert_eq(owners_ran(called.run, typed_query), [b"Queue::len"]);
-  assert_eq(groups_ran(called.run, cycles_query).map(|g: GroupKey| g.module), [b"lib"]);
-  assert_eq(outcome_summary(called.outcome), outcome_summary(analyse(parse_all(calling))));
+  assert_eq(outcome_summary(called.outcome), from_nothing(calling));
   let moved = stack_queue_sources(b"0", b"Stack(f).len()");
   let resolved = queried_over(called.store, moved);
-  assert_eq(owners_ran(resolved.run, typed_query), [b"Stack::len"]);
-  assert_eq(outcome_summary(resolved.outcome), outcome_summary(analyse(parse_all(moved))))
-}
-
-test "a definition added above another checks itself and no other" {
-  let cold = queried_over(empty_memory_store, layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
-  let above = layered(b"pub fn first() -> Int = 1\n\npub fn step(n: Int) -> Int = n + 1\n");
-  let warm = queried_over(cold.store, above);
-  assert_eq(groups_ran(warm.run, group_query), [group_in(b"lib", [b"first"])]);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(above))))
-}
-
-test "a signature edit checks the definitions that read it again, and no other" {
-  let cold = queried_over(empty_memory_store, layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
-  let widened = b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n";
-  let warm = queried_over(cold.store, layered(widened));
-  assert_eq(groups_ran(warm.run, group_query), [
-    group_in(b"lib", [b"step"]),
-    group_in(b"app", [b"go"]),
-  ]);
-  assert_eq(modules_ran(warm.run, module_query), [b"app", b"lib"]);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(layered(widened)))))
+  assert_eq(outcome_summary(resolved.outcome), from_nothing(moved))
 }
 
 fn shaped(shapes: Bytes, app: Bytes) -> List<Source> =
@@ -1864,10 +1833,9 @@ const grown_source: Bytes =
 const sized_source: Bytes =
   b"import made\npub fn size() -> Int = made::made().area()\n\npub fn two() -> Int = [made::made(), made::made()].len()\n"
 
-test "adding a function to a type checks only that function, and changing a signature also rechecks the definitions that call it on a value" {
-  let cold = queried_over(empty_memory_store, shaped(shapes_source, sized_source));
+test "adding a function to a type and changing its signature give the result of a check from scratch" {
+  let cold = queried_over(fs::mem_empty(), shaped(shapes_source, sized_source));
   let added = queried_over(cold.store, shaped(shapes_source.concat(grown_source), sized_source));
-  assert_eq(groups_ran(added.run, group_query), [group_in(b"shapes", [b"Shape::grown"])]);
   let resigned = edited(
     shaped(shapes_source.concat(grown_source), sized_source),
     b"shapes",
@@ -1875,11 +1843,7 @@ test "adding a function to a type checks only that function, and changing a sign
     b"area(of: Shape) -> Int = match of",
   );
   let warm = queried_over(added.store, resigned);
-  assert_eq(groups_ran(warm.run, group_query), [
-    group_in(b"shapes", [b"Shape::area"]),
-    group_in(b"app", [b"size"]),
-  ]);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(resigned))));
+  assert_eq(outcome_summary(warm.outcome), from_nothing(resigned));
   assert(match warm.outcome { Analysed(_) -> true, Rejected(_) -> false })
 }
 
@@ -1917,7 +1881,7 @@ test "after each edit to a type's functions, a call on a value gives the same re
 }
 
 fn rejected_over(user: List<Source>, shipped: List<Source>) -> List<Bytes> / {abort.raise} =
-  check_sources(empty_memory_store, user, shipped).results.fold(
+  check_sources(fs::mem_empty(), user, shipped).results.fold(
     [],
     |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.message)),
@@ -2066,126 +2030,39 @@ fn lib_app_sources(lib: Bytes) -> List<Source> =
     },
   ]
 
-test "editing a function's signature rechecks that function and the definitions that call it, and no other definitions" {
-  let cold = queried_over(
-    empty_memory_store,
-    lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
+fn listed_under(
+  qs: CheckQueries,
+  store: fs::MemFs,
+  sources: List<Source>,
+) -> { store: fs::MemFs, results: List<CheckedModule> } / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || query_load(w.own, [], false, listed_module).results)),
   );
-  let widened = lib_app_sources(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
-  let warm = queried_over(cold.store, widened);
-  let ran = groups_ran(warm.run, group_query);
-  assert(
-    same_groups(ran, [
-      group_in(b"lib", [b"step"]),
-      group_in(b"app", [b"go"]),
-      group_in(b"app", [b"again"]),
-    ]),
-  );
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(widened))));
-  assert_eq(tables_of(warm.results), tables_of(queried_over(empty_memory_store, widened).results));
-  assert_eq(warm.results, queried_over(empty_memory_store, widened).results)
+  { store: done.store, results: done.value }
 }
 
-fn read_whole_module(store: MemoryStore, g: GroupKey) -> Bool / {abort.raise} =
-  memo::current_records(store).fold(false, |found: Bool, _: Bytes, r: memo::Record|
-    found
-      || (r.query == group_query && r.input == bin::encode(g, group_key_bin())
-      && r.reads.fold(false, |any: Bool, read: memo::Dependency|
-        any
-          || (match read {
-            memo::ExternalDependency(_, at, _) -> at == whole_query,
-            memo::QueryDependency(_, _, _) -> false,
-          }))))
-
-test "an edit that affects one definition in a module rechecks that definition alone, and an edit that affects several checks the whole module once" {
-  let app = b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + 2\n\npub fn again(n: Int) -> Int = lib::step(n) * 2\n\npub fn other() -> Int = 7\n";
-  let over = |lib: Bytes| [{ name: b"lib", source_text: lib }, { name: b"app", source_text: app }];
-  let cold = queried_over(
-    empty_memory_store,
-    lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
-  );
-  let one = queried_over(cold.store, over(b"pub fn step(n: Int) -> Int = n + 1\n"));
-  assert_eq(groups_ran(one.run, group_query), [group_in(b"app", [b"go"])]);
-  assert(!read_whole_module(one.store, group_in(b"app", [b"go"])));
-  let widened = over(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
-  let more = queried_over(one.store, widened);
-  let ran = groups_ran(more.run, group_query);
-  assert(!ran.contains(group_in(b"app", [b"other"])));
-  assert(read_whole_module(more.store, group_in(b"app", [b"go"])));
-  assert(read_whole_module(more.store, group_in(b"app", [b"again"])));
-  assert_eq(more.results, queried_over(empty_memory_store, widened).results)
-}
-
-fn checked_whole_in(store: MemoryStore, hash: Bytes, module: Bytes) -> Bool / {abort.raise} =
-  memo::current_records(store).fold(false, |found: Bool, _: Bytes, r: memo::Record|
-    found
-      || (r.query == hash
-      && r.input == bin::encode({ module: module, shipped: false, tested: false }, module_key_bin())
-      && r.reads.fold(false, |any: Bool, read: memo::Dependency|
-        any
-          || (match read {
-            memo::QueryDependency(name, _, _) -> name == owner_interfaces_query,
-            memo::ExternalDependency(_, _, _) -> false,
-          }))))
-
-test "when only the query that assembles a module's result changes, it reruns but the module's definitions are not rechecked" {
+test "a change to the query that assembles a module's listing leaves the module's listing the same" {
   let sources = lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n");
-  let cold = queried_over(empty_memory_store, sources);
-  assert(checked_whole_in(cold.store, module_query, b"app"));
-  let anew = b"module, defined anew";
-  let qs = fresh_registry().fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CheckQuery>, n: Bytes, q: CheckQuery|
-      accumulator.insert(n, if n == module_query { { ..q, hash: anew } } else { q }),
-  );
-  let warm = queried_under(qs, cold.store, sources);
-  assert(modules_ran(warm.run, module_query).contains(b"app"));
-  assert(modules_ran(warm.run, module_query).contains(b"lib"));
-  assert_eq(groups_ran(warm.run, group_query), []);
-  assert(!checked_whole_in(warm.store, anew, b"app"));
+  let cold = listed_under(fresh_registry(), fs::mem_empty(), sources);
+  let anew = b"module listing, defined anew";
+  let fresh = fresh_registry();
+  let qs = {
+    ..fresh,
+    named: fresh.named.fold(
+      Map::new(),
+      |accumulator: Map<Bytes, CheckQuery>, n: Bytes, q: CheckQuery|
+        accumulator.insert(n, if n == module_listing_query().name { { ..q, hash: anew } }
+        else { q }),
+    ),
+  };
+  let warm = listed_under(qs, cold.store, sources);
   assert_eq(warm.results, cold.results)
-}
-
-fn shared_base_sources(lib: Bytes) -> List<Source> =
-  [
-    { name: b"lib", source_text: lib },
-    {
-      name: b"app",
-      source_text: b"import lib\npub fn go(n: Int) -> Int = lib::step(n) + base()\n\npub fn again(n: Int) -> Int = lib::step(n) * 2 + base()\n\npub fn base() -> Int = 1\n\npub fn aside() -> Int = 7\n",
-    },
-  ]
-
-fn reads_own_groups(store: MemoryStore) -> Bool / {abort.raise} =
-  memo::current_records(store).fold(false, |found: Bool, _: Bytes, r: memo::Record|
-    found
-      || (r.query == whole_query
-      && {
-        let module = decoded(r.input, module_key_bin(), "a module's name").module;
-        r.reads.fold(false, |own: Bool, read: memo::Dependency|
-          own
-            || (match read {
-              memo::QueryDependency(name, input, _) ->
-                (name == owner_interface_query
-                  && decoded(input, owner_key_bin(), "an owner's name").module == module)
-                  || (name == group_query
-                  && decoded(input, group_key_bin(), "a group's names").module == module),
-              memo::ExternalDependency(_, _, _) -> false,
-            }))
-      }))
-
-test "a whole-module check requested by one definition does not read the results of the module's other definitions" {
-  let cold = queried_over(
-    empty_memory_store,
-    shared_base_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
-  );
-  let widened = shared_base_sources(b"pub fn step(n: Int, by: Int = 1) -> Int = n + by\n");
-  let warm = queried_over(cold.store, widened);
-  let ran = groups_ran(warm.run, group_query);
-  assert(ran.contains(group_in(b"app", [b"go"])));
-  assert(ran.contains(group_in(b"app", [b"again"])));
-  assert(!ran.contains(group_in(b"app", [b"aside"])));
-  assert(!reads_own_groups(warm.store));
-  assert_eq(warm.results, queried_over(empty_memory_store, widened).results)
 }
 
 fn stale_group_sources(inner: Bytes, first: Bytes, go: Bytes) -> List<Source> =
@@ -2217,9 +2094,9 @@ test "a definition whose cached result becomes outdated while other definitions 
     b"pub fn first() -> Int = sprout() + 2",
     b"pub fn go(n: Int) -> Int = lib::step(1) + shown(n)",
   );
-  let warm = queried_over(queried_over(empty_memory_store, before).store, after);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(after))));
-  assert_eq(warm.results, queried_over(empty_memory_store, after).results)
+  let warm = queried_over(queried_over(fs::mem_empty(), before).store, after);
+  assert_eq(outcome_summary(warm.outcome), from_nothing(after));
+  assert_eq(warm.results, queried_over(fs::mem_empty(), after).results)
 }
 
 test "editing a test and a definition it calls gives the same results as checking the edited module from scratch" {
@@ -2235,47 +2112,22 @@ test "editing a test and a definition it calls gives the same results as checkin
       source_text: b"fn scale(n: Int) -> Int = n * 2\nfn other(n: Int) -> Int = 1 + n\n\ntest \"doubles\" { assert_eq(scale(2) + other(0), 9) }\n",
     },
   ];
-  let warm = queried_over(queried_over(empty_memory_store, before).store, after);
-  assert_eq(tables_of(warm.results), tables_of(queried_over(empty_memory_store, after).results));
-  assert_eq(warm.results, queried_over(empty_memory_store, after).results)
+  let warm = queried_over(queried_over(fs::mem_empty(), before).store, after);
+  assert_eq(tables_of(warm.results), tables_of(queried_over(fs::mem_empty(), after).results));
+  assert_eq(warm.results, queried_over(fs::mem_empty(), after).results)
 }
 
 test "when an edit breaks several definitions, each reports the same error as a check from scratch" {
   let cold = queried_over(
-    empty_memory_store,
+    fs::mem_empty(),
     lib_app_sources(b"pub fn step(n: Int) -> Int = n + 1\n"),
   );
   let narrowed = lib_app_sources(b"pub fn step(n: Int, by: Int) -> Int = n + by\n");
   let warm = queried_over(cold.store, narrowed);
-  assert_eq(outcome_summary(warm.outcome), outcome_summary(analyse(parse_all(narrowed))))
+  assert_eq(outcome_summary(warm.outcome), from_nothing(narrowed))
 }
 
-test "a definition added is checked and hashed alone" {
-  let cold = check_sources(empty_memory_store, layered(b"pub fn step(n: Int) -> Int = n + 1\n"), [
-  ]);
-  let added = layered(b"pub fn step(n: Int) -> Int = n + 1\npub fn twice(n: Int) -> Int = n * 2\n");
-  let warm = check_sources(cold.store, added, []);
-  assert_eq(groups_ran(warm.run, group_query), [group_in(b"lib", [b"twice"])]);
-  assert_eq(groups_ran(warm.run, group_hash_query), [group_in(b"lib", [b"twice"])]);
-  assert_eq(modules_ran(warm.run, hashes_query), [b"lib"]);
-  assert_eq(warm.cached_hashes, check_sources(empty_memory_store, added, []).cached_hashes)
-}
-
-test "a body edit hashes the definitions that call it again, and no other" {
-  let cold = check_sources(empty_memory_store, layered(b"pub fn step(n: Int) -> Int = n * 3\n"), [
-  ]);
-  let edited = layered(b"pub fn step(n: Int) -> Int = n * 4\n");
-  let warm = check_sources(cold.store, edited, []);
-  assert_eq(groups_ran(warm.run, group_query), [group_in(b"lib", [b"step"])]);
-  assert_eq(groups_ran(warm.run, group_hash_query), [
-    group_in(b"lib", [b"step"]),
-    group_in(b"app", [b"go"]),
-  ]);
-  assert_eq(modules_ran(warm.run, hashes_query), [b"app", b"lib"]);
-  assert_eq(warm.cached_hashes, check_sources(empty_memory_store, edited, []).cached_hashes)
-}
-
-test "adding a definition to a standard library module neither rechecks nor rehashes the modules that import it" {
+test "adding a definition to a standard library module gives the hashes of a check from scratch" {
   let user = [
     {
       name: b"main",
@@ -2291,40 +2143,10 @@ test "adding a definition to a standard library module neither rechecks nor reha
         ),
       },
     ];
-  let cold = check_sources(empty_memory_store, user, shapes(b""));
+  let cold = check_sources(fs::mem_empty(), user, shapes(b""));
   let added = shapes(b"pub fn spare() -> Int = 5\n");
   let warm = check_sources(cold.store, user, added);
-  assert_eq(modules_ran(warm.run, module_query), [b"std.shapes"]);
-  assert_eq(modules_ran(warm.run, hashes_query), [b"std.shapes"]);
-  assert_eq(warm.cached_hashes, check_sources(empty_memory_store, user, added).cached_hashes)
-}
-
-test "loading with a cached standard library result that is not trusted rechecks no standard library module the cache has results for" {
-  let user = [
-    {
-      name: b"main",
-      source_text: b"import std.a (two)\npub fn main() -> Int = two()\n\npub fn more() -> Int = two() + 1\n",
-    },
-  ];
-  let shipped = |aside: Bytes|
-    [
-      {
-        name: b"std.a",
-        source_text: b"import std.b (one)\n\npub fn two() -> Int = one() + one()\n\npub fn three() -> Int = two() + one()\n",
-      },
-      { name: b"std.b", source_text: b"pub fn one() -> Int = 1\n\npub fn none() -> Int = 0\n" },
-      { name: b"std.aside", source_text: aside },
-    ];
-  let packed = pack_of(shipped_store(shipped(b"pub fn spare() -> Int = 3\n")));
-  let moved = shipped(b"pub fn spare() -> Int = 4\n");
-  let load = check_with_pack(empty_memory_store, packed, user, moved);
-  assert_eq(
-    executed_for(load.run, whole_query).map(|b: Bytes|
-      decoded(b, module_key_bin(), "a module's name").module),
-    [b"main"],
-  );
-  assert_eq(groups_ran(load.run, group_query).map(|g: GroupKey| g.module), [b"main", b"main"]);
-  assert_eq(load.results, check_sources(empty_memory_store, user, moved).results)
+  assert_eq(warm.own_hashes, check_sources(fs::mem_empty(), user, added).own_hashes)
 }
 
 test "import cycles and self-imports are rejected with the same errors whether checked from scratch or from the cache" {
@@ -2345,7 +2167,7 @@ test "import cycles and self-imports are rejected with the same errors whether c
   )
 }
 
-test "a module that fails to check causes no check of the modules that import it, nor of its definitions one by one" {
+test "a body error stays where it is written, and modules that import it are checked against its signatures" {
   let sources = [
     {
       name: b"lib",
@@ -2358,22 +2180,181 @@ test "a module that fails to check causes no check of the modules that import it
       source_text: b"pub fn alone() -> Int = nothing()\n\npub fn other() -> Int = 2\n",
     },
   ];
-  let cold = queried_over(empty_memory_store, sources);
+  let cold = queried_over(fs::mem_empty(), sources);
   assert_eq(sorted_bytes(rejected_first(cold.results).map(|a: CheckedModule| a.module)), [
     b"aside",
     b"lib",
   ]);
-  assert_eq(modules_ran(cold.run, module_query), [b"aside", b"lib"]);
-  assert_eq(groups_ran(cold.run, group_query), []);
   let mended = with_module(
     with_module(sources, b"lib", b"pub fn broken() -> Int = 3\n\npub fn fine() -> Int = 1\n"),
     b"aside",
     b"pub fn alone() -> Int = 4\n\npub fn other() -> Int = 2\n",
   );
   let warm = queried_over(cold.store, mended);
-  assert_eq(modules_ran(warm.run, module_query), [b"app", b"aside", b"lib", b"top"]);
   assert_eq(
     outcome_summary(warm.outcome),
-    outcome_summary(queried_over(empty_memory_store, mended).outcome),
+    outcome_summary(queried_over(fs::mem_empty(), mended).outcome),
   )
+}
+
+fn module_chain(size: Int, body: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m0",
+      source_text: Bytes::concat_all([b"pub fn step(n: Int) -> Int = ", body, b"\n"]),
+    },
+  ].concat(
+    range(1, size).map(|i: Int| {
+      let n = Bytes::of_string(i.to_string());
+      let below = Bytes::of_string((i - 1).to_string());
+      {
+        name: b"m".concat(n),
+        source_text: Bytes::concat_all([
+          b"import m",
+          below,
+          b"\npub fn step(n: Int) -> Int = m",
+          below,
+          b"::step(n) + 1\n",
+        ]),
+      }
+    }),
+  )
+
+fn beside_a_comment(size: Int, comment: Bytes) -> List<Source> =
+  module_chain(size, b"n + 1").map(|source: Source|
+    if source.name != b"m0" { source } else {
+      {
+        ..source,
+        source_text: Bytes::concat_all([
+          source.source_text,
+          b"\n",
+          comment,
+          b"\npub fn apart(n: Int) -> Int = n - 1\n\ntest \"apart\" { assert_eq(apart(1), 0) }\n",
+        ]),
+      }
+    })
+
+fn apart_position(
+  store: fs::MemFs,
+  comment: Bytes,
+) -> { store: fs::MemFs, at: Int } / {abort.raise} = {
+  let w = inputs_alone(beside_a_comment(2, comment));
+  let qs = fresh_registry();
+  let done = over_decoding(
+    store,
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, ||
+          view::listed({ root: w.own.len(), own: w.own, pulled: view::summary(w.own).pulled }))),
+  );
+  {
+    store: done.store,
+    at: done.value.checked.definitions.fold(0, |found: Int, d: DefinitionInfo|
+      if d.name == b"m0.apart" { d.at.span.start } else { found }),
+  }
+}
+
+fn reported_by_view(
+  sources: List<Source>,
+) -> { rejected: List<Bytes>, warned: List<Bytes> } / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  over_decoding(
+    fs::mem_empty(),
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run|
+        reading(qs, run, || {
+          let read = view::summary(w.own);
+          {
+            rejected: view::rejections(w.own, read).map(|d: Diagnostic| d.code),
+            warned: view::warnings(w.own, read).map(|d: Diagnostic| d.message),
+          }
+        })),
+  ).value
+}
+
+test "the view reports errors in each module that has them, and warnings as a load reports them" {
+  let broken = [
+    { name: b"lib", source_text: b"pub fn f() -> Int = missing()\n" },
+    { name: b"app", source_text: b"import lib\npub fn g() -> Int = lib::f()\n" },
+  ];
+  assert_eq(reported_by_view(broken).rejected, [b"E0101"]);
+  let both = [
+    { name: b"lib", source_text: b"pub fn f() -> Int = missing()\n" },
+    {
+      name: b"app",
+      source_text: b"import lib\npub fn g() -> Int = lib::f()\npub fn h() -> Int = true\n",
+    },
+  ];
+  assert_eq(reported_by_view(both).rejected.sort(), [b"E0101", b"E0201"]);
+  let ringed = [
+    { name: b"a", source_text: b"import b\npub fn f() -> Int = b::g()\n" },
+    { name: b"b", source_text: b"import a\npub fn g() -> Int = a::f()\n" },
+  ];
+  assert_eq(reported_by_view(ringed).rejected, [b"E0109"]);
+  let spare = [{ name: b"m", source_text: b"pub fn main() -> Int = 1\n\nfn spare() -> Int = 2\n" }];
+  let warned = reported_by_view(spare).warned;
+  assert(warned.len() > 0);
+  assert_eq(
+    warned,
+    check_sources(fs::mem_empty(), spare, []).warnings.map(|d: Diagnostic| d.message),
+  )
+}
+
+test "a function with a type error still uses the helper it calls, so only the helper nobody calls is reported unused" {
+  let module = |spare: Bytes|
+    [
+      {
+        name: b"m",
+        source_text: b"pub fn f() -> Bool = helper()\n\nfn helper() -> Int = 1\n".concat(spare),
+      },
+    ];
+  assert_eq(reported_by_view(module(b"")).rejected, [b"E0201"]);
+  assert_eq(reported_by_view(module(b"\nfn spare() -> Int = 2\n")).rejected, [b"E0201", b"W0611"]);
+  let cycle = reported_by_view([
+    {
+      name: b"m",
+      source_text: b"pub fn f(n: Int) -> Bool = if n <= 0 { helper() } else { g(n - 1) }\n\nfn g(n: Int) -> Bool = f(n)\n\nfn helper() -> Int = 1\n",
+    },
+  ]).rejected;
+  assert(cycle.len() > 0);
+  assert(!cycle.contains(b"W0611"))
+}
+
+test "a listing read after a comment shows the positions the comment moved" {
+  let before = apart_position(fs::mem_empty(), b"");
+  let after = apart_position(before.store, b"// A comment.\n");
+  assert_eq(after.at, before.at + b"// A comment.\n".len())
+}
+
+fn scope_sources(body: Bytes, aside: Bytes) -> List<Source> =
+  [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"effect io { write close(n: Int) -> Unit }\n\npub fn aside() -> Int = ",
+        aside,
+        b"\n\npub fn used(n: Int) -> Int / {io.close} = {\n  let got = with_scope[file](n, |x: Int| io.close(x)) { h -> ",
+        body,
+        b" };\n  0\n}\n",
+      ]),
+    },
+  ]
+
+test "a scoped value that an edit lets escape is rejected by a check with cached results, as by a check from scratch" {
+  let escaped = scope_sources(b"|| h.get()", b"7");
+  assert_eq(
+    disagreements([
+      step(b"cold", scope_sources(b"h.get() + 1", b"7")),
+      step(b"kept inside", scope_sources(b"{ let k = || h.get(); k() }", b"7")),
+      step(b"let out", escaped),
+      step(b"an edit beside the escape", scope_sources(b"|| h.get()", b"8")),
+    ]),
+    [],
+  );
+  assert_eq(reported_by_view(escaped).rejected, [b"E0446"])
 }

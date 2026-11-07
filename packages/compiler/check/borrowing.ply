@@ -1,3 +1,4 @@
+import std.bin
 import compiler.syntax.parsing (Span)
 import compiler.syntax.expressions (Param)
 import compiler.syntax.items (FnDefinition)
@@ -19,6 +20,10 @@ pub type ParameterMode = { name: Bytes, borrowed: Bool, keep: Bool }
 
 pub type ParameterModes = { name: Bytes, params: List<ParameterMode> }
 
+derive bin for ParameterMode
+
+derive bin for ParameterModes
+
 pub fn parameter_mode(p: Param) -> ParameterMode =
   {
     name: p.name.name,
@@ -26,7 +31,11 @@ pub fn parameter_mode(p: Param) -> ParameterMode =
     keep: p.keep,
   }
 
-pub type Callees = { takes: (Bytes) -> Option<ParameterModes> / {abort.raise} }
+pub effect mode_facts {
+  read look_up_modes(name: Bytes) -> Option<ParameterModes>
+}
+
+pub type Callees = { takes: (Bytes) -> Option<ParameterModes> / {abort.raise, mode_facts.read} }
 
 type EscapeKind =
   | Returned
@@ -61,7 +70,7 @@ pub fn escape_diagnostics(
   definition: FnDefinition,
   body: WalkedExpression,
   callees: Callees,
-) -> List<Diagnostic> / {abort.raise} =
+) -> List<Diagnostic> / {abort.raise, mode_facts.read} =
   if !has_borrowed_parameter(definition) { [] } else {
     let borrowed = definition.params.filter(|p: Param| parameter_mode(p).borrowed).map(
       |p: Param| p.name.name,
@@ -203,15 +212,18 @@ fn add_escape(seen: Findings, borrowed: List<Borrow>, place: EscapeKind) -> Find
   if borrowed.len() == 0 { seen }
   else { { ..seen, escapes: seen.escapes.push({ borrowed: borrowed, place: place }) } }
 
-fn walk_discarded(s: Scope, seen: Findings, e: WalkedExpression) -> Findings / {abort.raise} =
-  walk(s, seen, e).seen
+fn walk_discarded(
+  s: Scope,
+  seen: Findings,
+  e: WalkedExpression,
+) -> Findings / {abort.raise, mode_facts.read} = walk(s, seen, e).seen
 
 fn walk_escaping(
   s: Scope,
   seen: Findings,
   e: WalkedExpression,
   place: EscapeKind,
-) -> Findings / {abort.raise} = {
+) -> Findings / {abort.raise, mode_facts.read} = {
   let v = walk(s, seen, e);
   add_escape(v.seen, v.borrowed, place)
 }
@@ -221,11 +233,15 @@ fn walk_all_escaping(
   seen: Findings,
   xs: List<WalkedExpression>,
   place: EscapeKind,
-) -> Findings / {abort.raise} =
+) -> Findings / {abort.raise, mode_facts.read} =
   xs.fold(seen, |accumulator: Findings, x: WalkedExpression|
     walk_escaping(s, accumulator, x, place))
 
-fn walk(s: Scope, seen: Findings, e: WalkedExpression) -> ValueSummary / {abort.raise} =
+fn walk(
+  s: Scope,
+  seen: Findings,
+  e: WalkedExpression,
+) -> ValueSummary / {abort.raise, mode_facts.read} =
   match e.node {
     WalkedLiteral(_) -> no_borrows(seen),
     WalkedDefault(_) -> no_borrows(seen),
@@ -296,7 +312,7 @@ fn walk_call(
   span: Span,
   function: WalkedExpression,
   args: List<WalkedExpression>,
-) -> ValueSummary / {abort.raise} =
+) -> ValueSummary / {abort.raise, mode_facts.read} =
   match function.node {
     WalkedRead(WalkedLocal(x)) -> match s.locals.get(x.binder) {
       Some(l) ->
@@ -328,7 +344,7 @@ fn walk_arguments(
   seen: Findings,
   takes: Option<ParameterModes>,
   args: List<WalkedExpression>,
-) -> Findings / {abort.raise} =
+) -> Findings / {abort.raise, mode_facts.read} =
   match takes {
     None -> walk_all_escaping(s, seen, args, PassedToFunctionValue),
     Some(t) ->
@@ -348,7 +364,7 @@ fn walk_argument(
   t: ParameterModes,
   at: Int,
   arg: WalkedExpression,
-) -> Findings / {abort.raise} =
+) -> Findings / {abort.raise, mode_facts.read} =
   match t.params.at(at) {
     Some(p) -> if p.borrowed {
       let v = walk(s, seen, arg);
@@ -369,7 +385,7 @@ fn walk_statements(
   s: Scope,
   seen: Findings,
   statements: List<WalkedStatement>,
-) -> StatementsSummary / {abort.raise} =
+) -> StatementsSummary / {abort.raise, mode_facts.read} =
   statements.fold({ s: s, v: no_borrows(seen) }, |st: StatementsSummary, x: WalkedStatement|
     match x {
       WalkedLet(l) -> {
@@ -393,7 +409,7 @@ fn walk_handle(
   return_clause: Option<WalkedReturn>,
   clauses: List<WalkedClause>,
   handler_variables: List<WalkedHandlerVariable>,
-) -> ValueSummary / {abort.raise} = {
+) -> ValueSummary / {abort.raise, mode_facts.read} = {
   let inits = handler_variables.fold(seen, |accumulator: Findings, v: WalkedHandlerVariable|
     walk_escaping(s, accumulator, v.init, Stored));
   let b = walk(s, { ..inits, read_parameters: [] }, body);
@@ -434,7 +450,7 @@ fn handle_returns(
   resumed: (WalkedClause, TypedParam<Type>, List<Bytes>) -> Scope,
   known: List<Bytes>,
   room: Int,
-) -> List<Bytes> / {abort.raise} =
+) -> List<Bytes> / {abort.raise, mode_facts.read} =
   if room <= 0 { known } else {
     let next = clauses.fold(known, |accumulator: List<Bytes>, c: WalkedClause|
       match c.continuation {

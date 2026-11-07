@@ -1,28 +1,36 @@
+import std.set (Set)
 import compiler.syntax.parsing (Span, span_key)
 import std.bytes (ascii_of_int)
 import compiler.emit.typed_ir (Function, Block, Instruction, Let, Do, If, Case, Match, Miss, Loop,
                                Next, Done, Return, Restart, Jump, Fail, Handle, Rvalue, Native,
                                Take, Get, IntOperand, Lambda, Closure)
 import compiler.emit.lower (root_observed)
-import compiler.emit.lower.base (read_note, capture_note, enter_note)
+import compiler.emit.lower.base (read_note, capture_note, field_read_note, enter_note)
 import compiler.emit.lower.module_context (ModuleContext, Root)
 import compiler.emit.own (insert_reference_counts)
+import compiler.emit.representations (EmitReads)
 
-pub type Moves = { reads: Map<Bytes, Bool>, captures: Map<Bytes, Bool>, taken: Map<Bytes, Bool> }
+pub type MoveState = | MovedOnEveryPath | NotMoved
+
+pub type Moves = {
+  reads: Map<Bytes, MoveState>,
+  captures: Map<Bytes, MoveState>,
+  taken: Map<Bytes, MoveState>,
+}
 
 pub const no_moves: Moves = { reads: Map::new(), captures: Map::new(), taken: Map::new() }
 
-pub fn read_moved(m: Moves, at: Span) -> Bool = m.reads.get(span_key(at)) == Some(true)
+pub fn read_moved(m: Moves, at: Span) -> Bool = m.reads.get(span_key(at)) == Some(MovedOnEveryPath)
 
 pub fn capture_moved(m: Moves, at: Span, source: Int) -> Bool =
-  m.captures.get(capture_key(at, source)) == Some(true)
+  m.captures.get(capture_key(at, source)) == Some(MovedOnEveryPath)
 
-pub fn field_moved(m: Moves, at: Span) -> Bool = m.taken.get(span_key(at)) == Some(true)
+pub fn field_moved(m: Moves, at: Span) -> Bool = m.taken.get(span_key(at)) == Some(MovedOnEveryPath)
 
 fn capture_key(at: Span, source: Int) -> Bytes =
   Bytes::concat_all([span_key(at), b"#", ascii_of_int(source)])
 
-pub fn root_moves(setting: ModuleContext, r: Root) -> Moves / {abort.raise} =
+pub fn root_moves(setting: ModuleContext, r: Root) -> Moves / {EmitReads} =
   moves_of(insert_reference_counts(root_observed(setting, r)))
 
 pub fn moves_of(f: Function) -> Moves =
@@ -33,22 +41,23 @@ fn moves_of_closure(f: Function, m: Moves) -> Moves =
   f.lambdas.fold(block_moves(f.body, m), |accumulator: Moves, l: Lambda|
     match l { Closure(c) -> moves_of_closure(c.body, accumulator) })
 
-type Live = Map<Bytes, Bool>
+type Live = Set<Bytes>
 
 type Exits = { miss: Live, next: Live, after_loop: Live }
 
 type BackwardState = { live: Live, moves: Moves }
 
 fn block_moves(b: Block, m: Moves) -> Moves = {
-  let none: Live = Map::new();
+  let none: Live = Set::empty();
   scan_backward(b, { live: none, moves: m }, { miss: none, next: none, after_loop: none }).moves
 }
 
-fn union(a: Live, b: Live) -> Live =
-  b.fold(a, |accumulator: Live, k: Bytes, _: Bool| accumulator.insert(k, true))
+fn union(a: Live, b: Live) -> Live = b.fold(a, |accumulator: Live, k: Bytes| accumulator.insert(k))
 
-fn record_move(map: Map<Bytes, Bool>, key: Bytes, moved: Bool) -> Map<Bytes, Bool> =
-  map.insert(key, match map.get(key) { Some(was) -> was && moved, None -> moved })
+fn record_move(map: Map<Bytes, MoveState>, key: Bytes, now: MoveState) -> Map<Bytes, MoveState> =
+  map.insert(key, match map.get(key) { Some(NotMoved) -> NotMoved, _ -> now })
+
+fn move_state(moved: Bool) -> MoveState = if moved { MovedOnEveryPath } else { NotMoved }
 
 fn scan_backward(b: Block, after: BackwardState, ex: Exits) -> BackwardState =
   b.fold_right(after, |i: Instruction, w: BackwardState|
@@ -56,8 +65,8 @@ fn scan_backward(b: Block, after: BackwardState, ex: Exits) -> BackwardState =
       Do(d) -> note(d.value, d.at, w),
       Let(l) -> {
         let fields = match l.value {
-          Take(_) -> record_move(w.moves.taken, span_key(l.at), true),
-          Get(_) -> record_move(w.moves.taken, span_key(l.at), false),
+          Take(_) -> record_move(w.moves.taken, span_key(l.at), MovedOnEveryPath),
+          Get(_) -> record_move(w.moves.taken, span_key(l.at), NotMoved),
           _ -> w.moves.taken,
         };
         { ..w, moves: { ..w.moves, taken: fields } }
@@ -80,22 +89,22 @@ fn scan_backward(b: Block, after: BackwardState, ex: Exits) -> BackwardState =
       Miss -> { ..w, live: ex.miss },
       Loop(l) -> {
         let inner = |head: Live, moves: Moves|
-          scan_backward(l.body, { live: Map::new(), moves: moves }, {
+          scan_backward(l.body, { live: Set::empty(), moves: moves }, {
             ..ex,
             next: head,
             after_loop: w.live,
           });
-        let once = inner(Map::new(), w.moves);
+        let once = inner(Set::empty(), w.moves);
         let twice = inner(once.live, once.moves);
         let thrice = inner(union(once.live, twice.live), twice.moves);
         { live: union(twice.live, thrice.live), moves: thrice.moves }
       },
       Next(_) -> { ..w, live: ex.next },
       Done(_) -> { ..w, live: ex.after_loop },
-      Return(_) -> { ..w, live: Map::new() },
-      Restart(_) -> { ..w, live: Map::new() },
-      Jump(_) -> { ..w, live: Map::new() },
-      Fail(_) -> { ..w, live: Map::new() },
+      Return(_) -> { ..w, live: Set::empty() },
+      Restart(_) -> { ..w, live: Set::empty() },
+      Jump(_) -> { ..w, live: Set::empty() },
+      Fail(_) -> { ..w, live: Set::empty() },
       Handle(h) -> scan_backward(h.body, w, ex),
       _ -> w,
     })
@@ -104,19 +113,37 @@ fn note(v: Rvalue, at: Span, w: BackwardState) -> BackwardState =
   match v {
     Native(n) -> match n.args {
       [IntOperand(slot), IntOperand(site)] -> {
-        let key = frame_key(site).concat(ascii_of_int(slot));
-        let moved = !w.live.contains(key);
+        let used = frame_key(site).concat(ascii_of_int(slot));
+        let whole = used.concat(b"!");
+        let last_use = !w.live.contains(used);
+        let read_whole = w.live.insert(used).insert(whole);
         if n.name == read_note {
           {
-            live: w.live.insert(key, true),
-            moves: { ..w.moves, reads: record_move(w.moves.reads, span_key(at), moved) },
+            live: read_whole,
+            moves: {
+              ..w.moves,
+              reads: record_move(w.moves.reads, span_key(at), move_state(last_use)),
+            },
           }
         } else if n.name == capture_note {
           {
-            live: w.live.insert(key, true),
+            live: read_whole,
             moves: {
               ..w.moves,
-              captures: record_move(w.moves.captures, capture_key(at, slot), moved),
+              captures: record_move(w.moves.captures, capture_key(at, slot), move_state(last_use)),
+            },
+          }
+        } else if n.name.starts_with(field_read_note) {
+          let field = used.concat(n.name);
+          {
+            live: w.live.insert(used).insert(field),
+            moves: {
+              ..w.moves,
+              reads: record_move(
+                w.moves.reads,
+                span_key(at),
+                move_state(!w.live.contains(whole) && !w.live.contains(field)),
+              ),
             },
           }
         } else { w }
@@ -125,8 +152,8 @@ fn note(v: Rvalue, at: Span, w: BackwardState) -> BackwardState =
         let frame = frame_key(site);
         {
           ..w,
-          live: w.live.fold(Map::new(), |retained_live: Live, k: Bytes, _: Bool|
-            if k.starts_with(frame) { retained_live } else { retained_live.insert(k, true) }),
+          live: w.live.fold(Set::empty(), |retained_live: Live, k: Bytes|
+            if k.starts_with(frame) { retained_live } else { retained_live.insert(k) }),
         }
       },
       _ -> w,

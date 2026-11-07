@@ -1,4 +1,5 @@
-import compiler.syntax.parsing (Span, dummy_span, synthetic_span, role_parallel_branch)
+import std.set (Set)
+import compiler.syntax.parsing (Span, generated_span, synthetic_span, role_parallel_branch)
 import compiler.syntax.patterns (SourceLiteral, LiteralInt, LiteralFixed, LiteralWide, LiteralBool,
                                  LiteralString, LiteralBytes, LiteralEmbedded, LiteralFloat,
                                  LiteralDecimal, LiteralChar, LiteralUnit, LiteralInvalid)
@@ -18,7 +19,7 @@ import compiler.check.typed (TypedExpression, pattern_binders, TypedLiteral, Typ
                              typed_expression_nodes_folded, NumericWitness, ConcreteWitness,
                              ParamWitness, StatedWitness, witness_param_name, TypedRelease,
                              NodeHolder, ReleaseAfter, ReleaseBefore, ReleaseUnwinding,
-                             ReleaseMissing, ReleaseFailing, binding_key, holder_key)
+                             ReleaseMissing, ReleaseFailing, binding_key, holder_key, refutable)
 import compiler.expand.rewrite (witness_code, declared_witness_name, numeric_operator_code)
 import std.derive.children
 import std.list
@@ -434,27 +435,29 @@ fn find(frame: Frame, name: Bytes) -> Option<Int> =
 type Stack = {
   frames: List<Frame>,
   labels: List<Bytes>,
-  released: Map<Int, Bool>,
+  released: Set<Int>,
   binders: Map<Int, Binder>,
   rekey: Map<Bytes, Int>,
   handler_variables: List<HandlerVariable>,
   failure_reasons: List<Bytes>,
 }
 
-type HandlerVariable = { name: Bytes, at: Int, ty: Type, depth: Int }
+type HandlerVariable = { name: Bytes, at: Int, ty: Type, depth: Int, continuations: Continuations }
+
+type Continuations = | NoContinuations | BindsContinuations
 
 type Binder = { name: Bytes, depth: Int, slot: Int, ty: Type }
 
-fn released_in(body: TypedExpression<Type>) -> Map<Int, Bool> =
+fn released_in(body: TypedExpression<Type>) -> Set<Int> =
   typed_expression_nodes_folded(
     body,
-    Map::new(),
-    |accumulator: Map<Int, Bool>, e: TypedExpression<Type>|
-      e.releases.fold(accumulator, |m: Map<Int, Bool>, r: TypedRelease|
+    Set::empty(),
+    |accumulator: Set<Int>, e: TypedExpression<Type>|
+      e.releases.fold(accumulator, |m: Set<Int>, r: TypedRelease|
         match r.place {
           ReleaseFailing(_) -> if r.holder == NodeHolder(e.span.site) { m }
-          else { m.insert(holder_key(r.holder), true) },
-          _ -> m.insert(holder_key(r.holder), true),
+          else { m.insert(holder_key(r.holder)) },
+          _ -> m.insert(holder_key(r.holder)),
         }),
   )
 
@@ -546,7 +549,7 @@ pub fn is_label_binder(name: Bytes) -> Bool = name.starts_with(b"[")
 
 fn label_code(stack: Stack, name: Bytes) -> Option<Lowered> =
   if !stack.labels.contains(name) { None }
-  else { Some(read_local(stack, label_binder(name), label_type, dummy_span)) }
+  else { Some(read_local(stack, label_binder(name), label_type, generated_span)) }
 
 const label_type: Type = int_type
 
@@ -563,7 +566,11 @@ fn label_args(stack: Stack, labels: List<FilledLabel>) -> LoweredSequence =
     match named {
       None ->
         {
-          codes: accumulator.codes.push({ node: CodeLabel(b""), span: dummy_span, ty: label_type }),
+          codes: accumulator.codes.push({
+            node: CodeLabel(b""),
+            span: generated_span,
+            ty: label_type,
+          }),
           stack: failing(
             accumulator.stack,
             b"a label refers to a parameter the body does not have",
@@ -573,7 +580,11 @@ fn label_args(stack: Stack, labels: List<FilledLabel>) -> LoweredSequence =
         Some(o) -> { codes: accumulator.codes.push(o.code), stack: o.stack },
         None ->
           {
-            codes: accumulator.codes.push({ node: CodeLabel(n), span: dummy_span, ty: label_type }),
+            codes: accumulator.codes.push({
+              node: CodeLabel(n),
+              span: generated_span,
+              ty: label_type,
+            }),
             stack: accumulator.stack,
           },
       },
@@ -640,7 +651,7 @@ fn at(e: TypedExpression<Type>, node: Node) -> Code = { node: node, span: e.span
 
 fn lower_in(e: TypedExpression<Type>, stack: Stack) -> Lowered / {abort.raise} = {
   let o = lower_node(e, stack);
-  if stack.released.len() == 0 { o } else { released_around(e, o) }
+  if stack.released.is_empty() { o } else { released_around(e, o) }
 }
 
 fn lower_seq(
@@ -1149,7 +1160,7 @@ fn lower_lambda(
         ty: value,
         effects: effects,
       }),
-      span: dummy_span,
+      span: generated_span,
       ty: FunctionType(value),
     },
     stack: pop_frame(b.stack),
@@ -1230,6 +1241,9 @@ fn handled(
     }
   };
   let outer_held = b.stack.handler_variables;
+  let continuations = if clauses.any(|c: TypedClause<Type>| c.continuation != None) {
+    BindsContinuations
+  } else { NoContinuations };
   let with_handler_variables = |st: Stack|
     {
       ..st,
@@ -1241,6 +1255,7 @@ fn handled(
             at: accumulator.len() - outer_held.len(),
             ty: v.ty,
             depth: st.frames.len() - 1,
+            continuations: continuations,
           }),
       ),
     };
@@ -1348,6 +1363,72 @@ fn handler_variable(stack: Stack, name: Bytes) -> Option<HandlerVariable> =
 fn handler_variable_read(h: HandlerVariable, span: Span) -> Code =
   { ..internal_builtin_call(b"?handler_var", [int_code(h.at)], h.ty), span: span }
 
+fn handler_variable_assigned(
+  h: HandlerVariable,
+  assignment: { name: Bytes, value: TypedExpression<Type>, span: Span },
+  accumulator: BlockAccumulator,
+) -> BlockAccumulator / {abort.raise} =
+  if h.continuations == BindsContinuations || may_observe_variable(assignment.value, h.name) {
+    let o = lower_in(assignment.value, accumulator.stack);
+    {
+      statements: accumulator.statements.push(
+        CodeDo({
+          code: {
+            ..internal_builtin_call(b"?handler_set", [int_code(h.at), o.code], unit_type),
+            span: assignment.span,
+          },
+        }),
+      ),
+      stack: o.stack,
+    }
+  } else {
+    let depth = depth_of(accumulator.stack);
+    let taken = CodeLet({
+      name: h.name,
+      slot: top_frame(accumulator.stack).names.len(),
+      value: {
+        ..internal_builtin_call(b"?handler_take", [int_code(h.at)], h.ty),
+        span: assignment.span,
+      },
+    });
+    let o = lower_in(assignment.value, bind_in_stack(accumulator.stack, h.name));
+    let refilled = {
+      ..internal_builtin_call(b"?handler_init", [int_code(h.at), o.code], unit_type),
+      span: assignment.span,
+    };
+    {
+      statements: accumulator.statements.push(
+        CodeDo({
+          code: {
+            node: CodeBlock({ statements: [taken], tail: Some(refilled) }),
+            span: assignment.span,
+            ty: unit_type,
+          },
+        }),
+      ),
+      stack: unscope_stack(o.stack, depth),
+    }
+  }
+
+fn may_observe_variable(value: TypedExpression<Type>, name: Bytes) -> Bool =
+  typed_expression_nodes_folded(value, false, |found: Bool, x: TypedExpression<Type>|
+    found || x.releases.len() > 0
+      || (match x.node {
+        TypedCall(c) -> c.effects.listed.len() > 0 || c.effects.variable != None,
+        TypedPerform(_) -> true,
+        TypedUnary(u) -> u.witness != None,
+        TypedBinary(b) -> b.witness != None || b.operation == b"div" || b.operation == b"rem",
+        TypedBlock(b) ->
+          b.statements.any(|s: TypedStatement<Type>|
+            match s {
+              TypedLet(l) -> refutable(l.pattern),
+              TypedLetElse(_) -> true,
+              TypedDo(_) -> false,
+              TypedAssign(a) -> a.name == name,
+            }),
+        _ -> false,
+      }))
+
 fn snapshotted(
   e: TypedExpression<Type>,
   stack: Stack,
@@ -1391,7 +1472,8 @@ fn snapshotted(
     }
   }
 
-fn int_code(n: Int) -> Code = { node: CodeLiteral(LiteralInt(n)), span: dummy_span, ty: int_type }
+fn int_code(n: Int) -> Code =
+  { node: CodeLiteral(LiteralInt(n)), span: generated_span, ty: int_type }
 
 fn open_witness(witness: Option<Bytes>, ty: Type) -> Option<Bytes> =
   match ty { VariableType(_) -> witness, _ -> None }
@@ -1414,7 +1496,7 @@ fn witness_args(stack: Stack, witnesses: List<NumericWitness>, at: Span) -> Lowe
               [
                 {
                   node: CodeLiteral(LiteralString(constructor)),
-                  span: dummy_span,
+                  span: generated_span,
                   ty: string_type,
                 },
               ],
@@ -1429,13 +1511,13 @@ fn internal_builtin_call(name: Bytes, args: List<Code>, ty: Type) -> Code =
     node: CodeApply({
       function: {
         node: NBuiltin({ name: name, args: [], effect_arguments: [] }),
-        span: dummy_span,
+        span: generated_span,
         ty: function_type(args.map(|a: Code| a.ty), ty, no_effects),
       },
       args: args,
       effects: no_effects,
     }),
-    span: dummy_span,
+    span: generated_span,
     ty: ty,
   }
 
@@ -1561,34 +1643,20 @@ fn lower_from(
       let o = lower_in(x, accumulator.stack);
       next({ statements: accumulator.statements.push(CodeDo({ code: o.code })), stack: o.stack })
     },
-    Some(TypedAssign(a)) -> {
-      let o = lower_in(a.value, accumulator.stack);
-      match handler_variable(o.stack, a.name) {
-        Some(h) ->
-          next({
-            statements: accumulator.statements.push(
-              CodeDo({
-                code: {
-                  ..internal_builtin_call(b"?handler_set", [int_code(h.at), o.code], unit_type),
-                  span: a.span,
-                },
-              }),
-            ),
-            stack: o.stack,
-          }),
-        None ->
-          next({
-            ..accumulator,
-            stack: failing(
-              o.stack,
-              Bytes::concat_all([
-                b"an assignment to `",
-                a.name,
-                b"`, which is not a variable of any clause of the handler",
-              ]),
-            ),
-          }),
-      }
+    Some(TypedAssign(a)) -> match handler_variable(accumulator.stack, a.name) {
+      Some(h) -> next(handler_variable_assigned(h, a, accumulator)),
+      None ->
+        next({
+          ..accumulator,
+          stack: failing(
+            lower_in(a.value, accumulator.stack).stack,
+            Bytes::concat_all([
+              b"an assignment to `",
+              a.name,
+              b"`, which is not a variable of any clause of the handler",
+            ]),
+          ),
+        }),
     },
   }
 }
@@ -1597,7 +1665,7 @@ fn finish_block(accumulator: BlockAccumulator, depth: Int, t: LoweredGuard, ty: 
   {
     code: {
       node: CodeBlock({ statements: accumulator.statements, tail: t.code }),
-      span: dummy_span,
+      span: generated_span,
       ty: ty,
     },
     stack: unscope_stack(t.stack, depth),
@@ -1772,11 +1840,11 @@ fn value_after_calls(name: Bytes, slot: Int, value: Code, calls: List<Code>) -> 
       ),
       tail: Some({
         node: CodeVariable({ name: name, slot: slot }),
-        span: dummy_span,
+        span: generated_span,
         ty: value.ty,
       }),
     }),
-    span: dummy_span,
+    span: generated_span,
     ty: value.ty,
   }
 
@@ -1784,7 +1852,7 @@ fn preceded(calls: List<Code>, code: Code) -> Code =
   if calls.len() == 0 { code } else {
     {
       node: CodeBlock({ statements: calls.map(|x: Code| CodeDo({ code: x })), tail: Some(code) }),
-      span: dummy_span,
+      span: generated_span,
       ty: code.ty,
     }
   }
@@ -1819,14 +1887,14 @@ fn release_slot_reads(s: Stack, rs: List<TypedRelease>) -> LoweredSequence =
             ..accumulator,
             codes: accumulator.codes.push({
               node: CodeVariable({ name: b.name, slot: b.slot }),
-              span: dummy_span,
+              span: generated_span,
               ty: b.ty,
             }),
           }
         } else if b.depth < top
             && range(b.depth + 1, top + 1).all(|i: Int|
               find(frame_at(accumulator.stack, i), b.name) == None) {
-          let l = read_local(accumulator.stack, b.name, b.ty, dummy_span);
+          let l = read_local(accumulator.stack, b.name, b.ty, generated_span);
           { codes: accumulator.codes.push(l.code), stack: l.stack }
         } else { accumulator }
       },

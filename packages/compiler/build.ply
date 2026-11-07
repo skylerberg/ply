@@ -1,15 +1,13 @@
+import compiler.check.resolve.tables (source_span)
 import compiler.cc
-import compiler.cc (compilers, memory, toolchain, Memory, LiveObjects, WrittenPart)
-import compiler.load (CheckedProgram, SourceFile, check_results, checked_program, entry_hash_of,
-                      entry_roots, read_packages)
+import compiler.cc (compilers, memory, toolchain, GeneratedC)
+import compiler.load (SourceFile, program_written, read_packages)
+import compiler.checkout (PartRole)
+import compiler.store.database
 import compiler.front.published (entry_header)
 import compiler.check.resolve.tables (Diagnostic, Label)
-import compiler.unit (Emission, LevelTally, shipped, shipped_runtime, results_store, emitted,
-                      emitter_identity, unit_parts, cache_parts, program_key, programs_dir,
-                      read_cached_file, write_cached_file)
-import compiler.store.records (Record, record_store, with_record_store)
-import compiler.emit.keys (RootKey, Named)
-import std.bytes (u64_le)
+import compiler.unit (shipped, generated_c)
+import compiler.emit.keys (Named)
 import std.fs (fs)
 import std.list
 import std.process (process)
@@ -26,8 +24,11 @@ fn line_column(text: Bytes, at: Int) -> String / {abort.raise} = {
 
 fn location(diagnostic: Diagnostic, files: List<SourceFile>) -> String / {abort.raise} =
   match diagnostic.labels.filter(|label: Label| label.primary) {
-    [label, ..] -> match files.at(label.module) {
-      Some(f) -> f.path ++ ":" ++ line_column(f.text, label.start) ++ ": ",
+    [label, ..] -> match source_span(label) {
+      Some(s) -> match files.at(s.module) {
+        Some(f) -> f.path ++ ":" ++ line_column(f.text, s.start) ++ ": ",
+        None -> "",
+      },
       None -> "",
     },
     [] -> "",
@@ -47,11 +48,7 @@ fn report_diagnostics(
       ),
     ))
 
-fn texts(files: List<SourceFile>) -> List<Bytes> = files.map(|f: SourceFile| f.text)
-
 fn ms(from: Int, to: Int) -> String = Int::to_string(to - from) ++ "ms"
-
-fn mb(bytes: Int) -> String = Int::to_string(bytes / 1000000) ++ "MB"
 
 pub fn timed(
   phases: Bool,
@@ -60,174 +57,41 @@ pub fn timed(
 ) -> Unit / {process.err[proc], time.elapsed_ms} =
   if phases { process.err[proc]("phases: " ++ step ++ " " ++ ms(since, time.elapsed_ms())) }
 
-fn memory_report(m: Memory) -> String = mb(m.live) ++ " live, " ++ mb(m.reserved) ++ " held"
+pub type Built = { front: Bytes, c: GeneratedC }
 
-fn census_report(entry: String, live: List<LiveObjects>) -> List<String> =
-  live.take(20).map(|l: LiveObjects|
-    "phases: " ++ entry ++ " objects still in memory after code generation: " ++ l.what
-      ++ ", count "
-      ++ Int::to_string(l.objects)
-      ++ " objects, "
-      ++ mb(l.bytes))
-
-pub fn level_report(entry: String, r: LevelTally) -> String =
-  "phases: " ++ entry ++ " place " ++ Int::to_string(r.place) ++ ": " ++ Int::to_string(r.roots)
-    ++ " roots, "
-    ++ Int::to_string(r.cached)
-    ++ " kept, "
-    ++ Int::to_string(r.emitter_requests)
-    ++ " asked, "
-    ++ Int::to_string(r.steps)
-    ++ " steps, "
-    ++ ms(r.began, r.ended)
-
-pub type Built = { front: Bytes, sources: List<cc::Source> }
-
-fn encoded_output(made: Built) -> Bytes =
-  Bytes::concat_all([u64_le(made.front.len()), made.front, cc::manifest(made.sources)])
-
-fn decoded_output(bytes: Bytes) -> Option<Built> / {toolchain.read, abort.raise} =
-  match bytes.u64_at(0) {
-    Some(n) -> if 8 + n > bytes.len() { None } else {
-      match cc::parse_manifest(bytes.slice(8 + n, bytes.len())) {
-        Some(sources) -> if cc::sources_cached(sources) {
-          Some({ front: bytes.slice(8, 8 + n), sources: sources })
-        } else { None },
-        None -> None,
-      }
-    },
-    None -> None,
-  }
-
-pub effect set Builds = {shipped.read_pack, shipped.names, shipped.module, shipped.digests, shipped.report_view_used, shipped.definitions, shipped.stamps, shipped.runtime, shipped.run_root, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, memory.read, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
+pub effect set Builds = {shipped.read_pack, shipped.names, shipped.module, shipped.definitions, shipped.stamps, shipped.runtime, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], fs.read[abs], fs.write[abs], compilers.read[cc], compilers.write[cc], toolchain.read, toolchain.write, memory.read, entropy.next, time.now_ms, time.elapsed_ms, process.err[proc], abort.raise}
 
 pub fn build_program(
   root: String,
+  part: Option<PartRole>,
   entry: String,
   memo: String,
-  cache_results: Bool,
   phases: Bool,
 ) -> Option<Built> / {Builds} = {
   let started = time.elapsed_ms();
-  let definitions = shipped.definitions();
-  let cache = toolchain.cache();
-  let programs = strip_root(cache ++ "/" ++ programs_dir);
-  match read_packages[abs](strip_root(root)) {
+  match read_packages[abs](strip_root(root), part) {
     Err(u) -> {
       report_diagnostics(u.diagnostics, u.files);
       None
     },
     Ok(p) -> {
-      let store = if memo == "" { "" } else { strip_root(memo) };
-      let key = match entry_hash_of[abs, abs](p, store, Bytes::of_string(entry)) {
-        Some(h) -> Some(program_key(h, shipped_runtime(), definitions)),
-        None -> None,
-      };
-      let reading = time.elapsed_ms();
-      let cached = match key {
-        Some(k) -> match read_cached_file[abs](programs, k) {
-          Some(b) -> decoded_output(b),
-          None -> None,
+      let name = Bytes::of_string(entry);
+      let outcome = program_written[abs, abs](p, strip_root(memo), [Named(name)]);
+      outcome.problems.fold((), |_: Unit, problem: database::StoreProblem|
+        process.err[proc]("warning: " ++ database::problem_message(problem)));
+      match outcome.value {
+        Err(u) -> {
+          report_diagnostics(u.diagnostics, u.files);
+          None
         },
-        None -> None,
-      };
-      match cached {
-        Some(made) -> {
-          if phases {
-            process.err[proc](
-              "phases: " ++ entry ++ " responded " ++ ms(started, reading)
-                ++ ", and reused the cached output of an earlier build",
-            )
-          };
-          Some(made)
-        },
-        None -> match checked_program[abs](p, check_results[abs, abs](p, store), false) {
-          Err(u) -> {
-            report_diagnostics(u.diagnostics, u.files);
+        Ok(written) -> match entry_header(written.front.dump, name) {
+          None -> {
+            process.err[proc]("the program defines no `" ++ entry ++ "` to enter");
             None
           },
-          Ok(checked) -> match entry_header(checked.front.dump, Bytes::of_string(entry)) {
-            None -> {
-              process.err[proc]("the program defines no `" ++ entry ++ "` to enter");
-              None
-            },
-            Some(carried) -> {
-              let f = checked.front;
-              let checking = time.elapsed_ms();
-              let offered = entry_roots(checked.front, checked.hashes, [Bytes::of_string(entry)]);
-              let places = if phases {
-                Some({
-                  now: || time.elapsed_ms(),
-                  outcome: |r: LevelTally|
-                    process.err[proc](
-                      level_report(entry, r) ++ ", " ++ memory_report(memory.heap()),
-                    ),
-                })
-              } else { None };
-              let made_unit = if cache_results {
-                with_record_store[abs, ans](
-                  results_store(
-                    strip_root(cache ++ "/bodies"),
-                    shipped_runtime(),
-                    emitter_identity(definitions),
-                  ),
-                  ||
-                    emit_unit(
-                      checked,
-                      Bytes::of_string(entry),
-                      offered,
-                      places,
-                      |k: Bytes| record_store.get[ans](k),
-                      |rs: List<Record>| record_store.put[ans](rs),
-                      Some(|digest: String| cc::is_source_cached(digest)),
-                    ),
-                )
-              } else {
-                emit_unit(
-                  checked,
-                  Bytes::of_string(entry),
-                  offered,
-                  places,
-                  |_: Bytes| None,
-                  |_: List<Record>| (),
-                  None,
-                )
-              };
-              let emitting = time.elapsed_ms();
-              if phases {
-                census_report(entry, memory.census()).fold((), |_: Unit, line: String|
-                  process.err[proc](line))
-              };
-              match unit_parts(f.dump, made_unit) {
-                Err(diagnostics) -> report_failure(UnitRejected(diagnostics), f.files),
-                Ok(parts) -> match cache_parts(parts) {
-                  Err(reason) -> report_failure(CompileFailed(reason), f.files),
-                  Ok(part_sources) -> {
-                    let made = { front: carried, sources: part_sources };
-                    match key {
-                      Some(k) -> write_cached_file[abs](programs, k, encoded_output(made)),
-                      None -> (),
-                    };
-                    if phases {
-                      process.err[proc](
-                        "phases: " ++ entry ++ " responded " ++ ms(started, reading) ++ ", checked "
-                          ++ ms(reading, checking)
-                          ++ ", emitted "
-                          ++ ms(checking, emitting)
-                          ++ ", written "
-                          ++ ms(emitting, time.elapsed_ms())
-                          ++ ", "
-                          ++ parts.filter(|w: WrittenPart| w.text == None).len().to_string()
-                          ++ " of "
-                          ++ parts.len().to_string()
-                          ++ " generated C files already cached",
-                      )
-                    };
-                    Some(made)
-                  },
-                },
-              }
-            },
+          Some(carried) -> {
+            timed(phases, entry ++ " checked and lowered", started);
+            Some({ front: carried, c: generated_c(written.parts) })
           },
         },
       }
@@ -250,41 +114,4 @@ test "`timed` prints a step's elapsed time when it finishes if timing output is 
     };
   assert_eq(told(true), ["phases: built `ply` 25ms"]);
   assert_eq(told(false), [])
-}
-
-type BuildFailure = | UnitRejected(List<Diagnostic>) | CompileFailed(String)
-
-fn report_failure(
-  s: BuildFailure,
-  files: List<SourceFile>,
-) -> Option<Built> / {process.err[proc], abort.raise} = {
-  match s {
-    UnitRejected(diagnostics) -> report_diagnostics(diagnostics, files),
-    CompileFailed(reason) -> process.err[proc](reason),
-  };
-  None
-}
-
-fn emit_unit<| e>(
-  checked: CheckedProgram,
-  entry: Bytes,
-  offered: List<RootKey>,
-  places: Option<{ now: () -> Int / e, outcome: (LevelTally) -> Unit / e }>,
-  read: (Bytes) -> Option<Bytes> / e,
-  keep: (List<Record>) -> Unit / e,
-  source_cached: Option<(String) -> Bool / e>,
-) -> Result<Emission, Bytes> / {shipped.runtime, abort.raise | e} = {
-  let f = checked.front;
-  emitted(
-    shipped_runtime(),
-    f.dump,
-    texts(f.files),
-    f.inputs,
-    offered,
-    read,
-    keep,
-    places,
-    Some([Named(entry)]),
-    source_cached,
-  )
 }

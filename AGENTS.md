@@ -136,7 +136,9 @@ Critical Path project: Ply (pass `--project "Ply"` to `cpath`).
 - A pull request bootstraps a new `ply` only when it changes the runtime's Rust code, `ply.work`, the
   bootstrap, the compiler, the CLI, a package listed in their manifests, or a file outside those packages that one
   of them embeds. `std.prelude` is an example of such a file: the checker reads the builtins from
-  its text (`compiler.prelude_source`). Other pull requests run their tests with the newest `ply`
+  its text (`compiler.prelude_source`). A change to a standard library module that a deriver
+  imports bootstraps too, because `ply` runs the derivers it was built with. Other pull requests run
+  their tests with the newest `ply`
   built on main, and that `ply` reads the rest of the standard library from the checkout's sources.
   Main bootstraps whenever anything in the standard library changes, so a change to the library
   reaches the `ply` binary only after it merges.

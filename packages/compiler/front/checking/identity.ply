@@ -1,0 +1,128 @@
+import std.bin
+import compiler.store.memo (memo)
+import compiler.store.handles (QueryOf, KeyedPartOf, Written, written, with_keyed_part, fetch,
+                               fetch_part, fetch_keyed_part, product_definition)
+import compiler.store.hash.forms (Identified, identified_bin, NodeRef, node_ref_bin, ReadIdentities,
+                                  read_identities_bin, DefinitionIdentities, SubjectIdentity,
+                                  Identities, Origin, InsidePackage, OutsidePackage, TestIdentities,
+                                  world_identities, identities_of, identities_of_test,
+                                  DefinitionElsewhere, HashedElsewhere, RejectedElsewhere)
+import compiler.front.exports (named_node)
+import compiler.front.checking.world (ModuleKey, module_key_bin, CheckDefinition, shipped_for,
+                                      package_location_of, hash_products)
+import compiler.front.checking.groups (module_own_hashes, declared_of, group_key_of, summary_part)
+import compiler.front.owner_checks
+
+pub type SubjectKey = { module: ModuleKey, subject: Identified }
+
+pub fn identities_query() -> QueryOf<ModuleKey, List<Identified>> =
+  { name: b"identities", input: module_key_bin(), output: bin::list_bin(identified_bin()) }
+
+fn subject_part() -> KeyedPartOf<ModuleKey, List<Identified>, Identified, Bytes> =
+  { query: identities_query(), name: b"subject", key: identified_bin(), output: bin::bytes_bin() }
+
+fn definition_part() -> KeyedPartOf<ModuleKey, List<Identified>, NodeRef, ReadIdentities> =
+  {
+    query: identities_query(),
+    name: b"definition",
+    key: node_ref_bin(),
+    output: read_identities_bin(),
+  }
+
+pub fn identity_of(key: SubjectKey) -> Option<Bytes> / {memo.read, abort.raise} =
+  fetch_keyed_part(subject_part(), key.module, key.subject)
+
+pub fn test_identity_of(
+  module: ModuleKey,
+  test_key: Bytes,
+) -> TestIdentities / {memo.read, abort.raise} =
+  identities_of_test(test_key, |subject: Identified|
+    identity_of({ module: module, subject: subject }))
+
+pub fn listed_identities(
+  module: ModuleKey,
+  wanted: (Identified) -> Bool,
+) -> List<SubjectIdentity> / {memo.read, abort.raise} =
+  fetch(identities_query(), module).filter(wanted).map(|subject: Identified|
+    match identity_of({ module: module, subject: subject }) {
+      Some(identity) -> { subject: subject, identity: identity },
+      None ->
+        panic(
+          "the identities of the module `" ++ String::of_bytes_lossy(module.module)
+            ++ "` list a subject whose identity they did not write",
+        ),
+    })
+
+pub fn module_identities(
+  module: ModuleKey,
+  wanted: (Identified) -> Bool,
+) -> Identities / {memo.read, abort.raise} = identities_of(listed_identities(module, wanted))
+
+fn package_of(key: ModuleKey) -> Option<Int> / {memo.read, abort.raise} =
+  if key.shipped { None }
+  else { match package_location_of(key.module) { Some(p) -> Some(p.package), None -> None } }
+
+fn module_reached(from: ModuleKey, reference: NodeRef) -> ModuleKey / {memo.read, abort.raise} = {
+  let module = named_node(reference.name).module;
+  if module == from.module { from }
+  else { { module: module, shipped: shipped_for(from.shipped, module), tested: false } }
+}
+
+fn defined_elsewhere(
+  from: ModuleKey,
+  reference: NodeRef,
+) -> DefinitionElsewhere / {memo.read, abort.raise} = {
+  let at = module_reached(from, reference);
+  let hashed = if at.module == from.module { None }
+  else { fetch_keyed_part(definition_part(), at, reference) };
+  match hashed {
+    Some(found) -> HashedElsewhere(found),
+    None -> if is_rejected(at, reference) { RejectedElsewhere } else {
+      panic(
+        "internal error: `" ++ String::of_bytes_lossy(reference.name)
+          ++ "` is checked, but its module's identities do not hold it",
+      )
+    },
+  }
+}
+
+fn is_rejected(at: ModuleKey, reference: NodeRef) -> Bool / {memo.read, abort.raise} =
+  declared_of(at.module, at.shipped, at.tested, named_node(reference.name).name).any(
+    |owner: Bytes|
+      owner_checks::is_rejected(
+        fetch_part(
+          summary_part(),
+          group_key_of({ module: at.module, shipped: at.shipped, tested: at.tested, owner: owner }),
+        ).state,
+      ),
+  )
+
+pub fn identities_result(key: ModuleKey) -> Written / {memo.read, abort.raise} = {
+  let package = package_of(key);
+  let boundary = |_: Origin, reference: NodeRef| {
+    let at = module_reached(key, reference);
+    if at.module == key.module || package_of(at) == package { InsidePackage }
+    else { OutsidePackage }
+  };
+  let world = world_identities(
+    module_own_hashes(key),
+    |reference: NodeRef| defined_elsewhere(key, reference),
+    boundary,
+  );
+  let with_subjects = world.subjects.fold(
+    written(identities_query(), world.subjects.map(|s: SubjectIdentity| s.subject)),
+    |w: Written, s: SubjectIdentity| with_keyed_part(w, subject_part(), s.subject, s.identity),
+  );
+  world.definitions.fold(with_subjects, |w: Written, d: DefinitionIdentities|
+    with_keyed_part(w, definition_part(), d.reference, d.identities))
+}
+
+pub fn identity_queries() -> List<CheckDefinition> =
+  [
+    product_definition(
+      identities_query(),
+      b"compiler.front.checking.identity.identities_result",
+      identities_result,
+      hash_products,
+    ),
+  ]

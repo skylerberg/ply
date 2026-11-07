@@ -1,4 +1,7 @@
-import compiler.check.resolve.tables (Diagnostic, Label, Fix, Edit)
+import compiler.syntax.parsing (Error, Warning, Note, Severity, severity_word)
+import compiler.check.resolve.tables (Diagnostic, Label, Fix, Fixes, NoFix, Apply, ChooseOne, Edit,
+                                      InSource, Place, WholeFile, Unplaced, fix_edits,
+                                      offered_fixes)
 import std.json (Json, Member, Object, Null, Str, Bool, Number, Array, object)
 import compiler.syntax.lexer
 import std.bytes
@@ -6,7 +9,6 @@ import std.value (Value, VBytes, VInt, VList, filled, render, render_all, shown_
 import std.term (Style, plain, dim, red, yellow, ansi)
 import std.list (somes)
 import std.string
-import compiler.syntax.parsing (no_module)
 
 pub type SourceText = { path: String, text: Bytes }
 
@@ -23,33 +25,28 @@ pub fn shown(raised: RuntimeDiagnostic) -> Diagnostic / {abort.raise} = {
 }
 
 pub fn diagnostic_of(
-  severity: String,
-  code: String,
+  severity: Severity,
+  code: Bytes,
   message: String,
   labels: List<Label>,
   notes: List<String>,
 ) -> Diagnostic =
   {
-    code: Bytes::of_string(code),
-    notes: notes.len(),
+    code: code,
     labels: labels,
     text: b"",
     message: Bytes::of_string(message),
     notes_text: notes.map(Bytes::of_string),
-    severity: Bytes::of_string(severity),
-    fixes: [],
+    severity: severity,
+    fixes: NoFix,
   }
 
 pub fn with_notes(diagnostic: Diagnostic, notes: List<String>) -> Diagnostic =
   {
     ..diagnostic,
-    notes: diagnostic.notes + notes.len(),
     notes_text: notes.fold(diagnostic.notes_text, |accumulator: List<Bytes>, n: String|
       accumulator.push(Bytes::of_string(n))),
   }
-
-fn source_at(places: List<SourceText>, module: Int) -> Option<SourceText> =
-  if module == no_module { None } else { places.at(module) }
 
 pub type Position = { line: Int, column: Int, offset: Int }
 
@@ -83,26 +80,34 @@ fn position_json(spot: Position) -> Json =
   ])
 
 fn label_json(places: List<SourceText>, label: Label) -> Option<Json> / {abort.raise} =
-  match source_at(places, label.module) {
-    None -> None,
-    Some(p) -> match slice_of(p.text, label.start, label.end) {
+  match label.place {
+    Unplaced -> None,
+    WholeFile(m) -> match places.at(m) {
       None -> None,
-      Some(text) ->
-        Some(
-          object([
-            { key: "file", value: Str(p.path) },
-            { key: "start", value: position_json(position_of(p.text, label.start)) },
-            { key: "end", value: position_json(position_of(p.text, label.end)) },
-            { key: "message", value: Str(String::of_bytes_lossy(label.text)) },
-            { key: "primary", value: Bool(label.primary) },
-            { key: "snippet", value: Str(String::of_bytes_lossy(text)) },
-          ]),
-        ),
+      Some(p) -> Some(spot_json(p, label, position_of(p.text, 0), position_of(p.text, 0), b"")),
+    },
+    InSource(s) -> match places.at(s.module) {
+      None -> None,
+      Some(p) -> match slice_of(p.text, s.start, s.end) {
+        None -> None,
+        Some(text) ->
+          Some(spot_json(p, label, position_of(p.text, s.start), position_of(p.text, s.end), text)),
+      },
     },
   }
 
+fn spot_json(p: SourceText, label: Label, start: Position, end: Position, text: Bytes) -> Json =
+  object([
+    { key: "file", value: Str(p.path) },
+    { key: "start", value: position_json(start) },
+    { key: "end", value: position_json(end) },
+    { key: "message", value: Str(String::of_bytes_lossy(label.text)) },
+    { key: "primary", value: Bool(label.primary) },
+    { key: "snippet", value: Str(String::of_bytes_lossy(text)) },
+  ])
+
 fn edit_json(places: List<SourceText>, e: Edit) -> Option<Json> / {abort.raise} =
-  match source_at(places, e.module) {
+  match places.at(e.module) {
     None -> None,
     Some(p) -> match slice_of(p.text, e.start, e.end) {
       None -> None,
@@ -121,7 +126,7 @@ fn edit_json(places: List<SourceText>, e: Edit) -> Option<Json> / {abort.raise} 
 fn fix_json(places: List<SourceText>, f: Fix) -> Json / {abort.raise} =
   object([
     { key: "title", value: Str(String::of_bytes_lossy(f.title)) },
-    { key: "edits", value: Array(somes(f.edits.map(|e: Edit| edit_json(places, e)))) },
+    { key: "edits", value: Array(somes(fix_edits(f).map(|e: Edit| edit_json(places, e)))) },
   ])
 
 pub fn to_json(diagnostic: Diagnostic, places: List<SourceText>) -> Json / {abort.raise} =
@@ -137,7 +142,7 @@ pub fn values_json(values: List<Value>) -> Json = Array(values.map(|v: Value| St
 
 fn members(diagnostic: Diagnostic, places: List<SourceText>) -> List<Member> / {abort.raise} =
   [
-    { key: "severity", value: Str(String::of_bytes_lossy(diagnostic.severity)) },
+    { key: "severity", value: Str(severity_word(diagnostic.severity)) },
     { key: "code", value: Str(String::of_bytes_lossy(diagnostic.code)) },
     { key: "message", value: Str(String::of_bytes_lossy(diagnostic.message)) },
     {
@@ -148,8 +153,15 @@ fn members(diagnostic: Diagnostic, places: List<SourceText>) -> List<Member> / {
       key: "notes",
       value: Array(diagnostic.notes_text.map(|n: Bytes| Str(String::of_bytes_lossy(n)))),
     },
-    { key: "fixes", value: Array(diagnostic.fixes.map(|f: Fix| fix_json(places, f))) },
+    {
+      key: "fixes",
+      value: Array(offered_fixes(diagnostic.fixes).map(|f: Fix| fix_json(places, f))),
+    },
+    { key: "fix_choice", value: Str(fix_choice(diagnostic.fixes)) },
   ]
+
+fn fix_choice(fixes: Fixes) -> String =
+  match fixes { NoFix -> "none", Apply(_) -> "apply", ChooseOne(_, _, _) -> "choose_one" }
 
 pub fn all_to_json(
   diagnostics: List<Diagnostic>,
@@ -157,15 +169,44 @@ pub fn all_to_json(
 ) -> Json / {abort.raise} =
   Array(diagnostics.map(|diagnostic: Diagnostic| to_json(diagnostic, places)))
 
-pub fn editor_location_json(
+pub fn primary_of(diagnostic: Diagnostic) -> Option<Label> =
+  diagnostic.labels.fold(None, |accumulator: Option<Label>, label: Label|
+    match accumulator {
+      Some(_) -> accumulator,
+      None -> if label.primary { Some(label) } else { None },
+    })
+
+pub fn location_text(places: List<SourceText>, at: Place) -> Option<String> / {abort.raise} =
+  match at {
+    InSource(s) -> match places.at(s.module) {
+      None -> None,
+      Some(p) -> {
+        let spot: Position = position_of(p.text, s.start);
+        Some(p.path ++ ":" ++ spot.line.to_string() ++ ":" ++ spot.column.to_string())
+      },
+    },
+    WholeFile(m) -> match places.at(m) { None -> None, Some(p) -> Some(p.path) },
+    Unplaced -> None,
+  }
+
+pub fn editor_location_json(places: List<SourceText>, at: Place) -> Json / {abort.raise} =
+  match at {
+    InSource(s) -> span_location_json(places, s.module, s.start, s.end),
+    WholeFile(m) -> span_location_json(places, m, 0, 0),
+    Unplaced -> Null,
+  }
+
+fn span_location_json(
   places: List<SourceText>,
-  a: { module: Int, start: Int, end: Int },
+  module: Int,
+  start: Int,
+  end: Int,
 ) -> Json / {abort.raise} =
-  match source_at(places, a.module) {
+  match places.at(module) {
     None -> Null,
     Some(place) -> {
-      let from: Position = position_of(place.text, a.start);
-      let to: Position = position_of(place.text, a.end);
+      let from: Position = position_of(place.text, start);
+      let to: Position = position_of(place.text, end);
       object([
         { key: "file", value: Str(place.path) },
         { key: "line", value: Number(Decimal::of_int(from.line)) },
@@ -176,17 +217,15 @@ pub fn editor_location_json(
     },
   }
 
-fn severity_title(severity: Bytes) -> String =
-  if severity == b"error" { "Error" }
-  else if severity == b"warning" { "Warning" }
-  else if severity == b"note" { "Note" }
-  else { String::of_bytes_lossy(severity) }
+fn severity_title(severity: Severity) -> String =
+  match severity { Error -> "Error", Warning -> "Warning", Note -> "Note" }
 
-fn colored(style: Style, severity: Bytes, text: String) -> String =
-  if severity == b"error" { red(style, text) }
-  else if severity == b"warning" { yellow(style, text) }
-  else if severity == b"note" { dim(style, text) }
-  else { text }
+fn colored(style: Style, severity: Severity, text: String) -> String =
+  match severity {
+    Error -> red(style, text),
+    Warning -> yellow(style, text),
+    Note -> dim(style, text),
+  }
 
 pub fn end_of_line(text: Bytes, from: Int) -> Int / {abort.raise} =
   match text.index_of_from(b"\n", from) { Some(i) -> i, None -> text.len() }
@@ -206,31 +245,43 @@ fn carets(text: Bytes, start: Int, end: Int) -> String / {abort.raise} = {
 
 fn snippet_lines(
   style: Style,
-  severity: Bytes,
+  severity: Severity,
   place: SourceText,
   label: Label,
+  start: Int,
+  end: Int,
 ) -> List<String> / {abort.raise} = {
-  let at = position_of(place.text, label.start);
+  let at = position_of(place.text, start);
   let label_text = String::of_bytes_lossy(label.text);
   let tail = if label_text == "" { "" } else { " " ++ label_text };
   [
     "  --> " ++ place.path ++ ":" ++ at.line.to_string() ++ ":" ++ at.column.to_string(),
-    "   | " ++ line_text(place.text, label.start),
-    "   | " ++ colored(style, severity, carets(place.text, label.start, label.end)) ++ tail,
+    "   | " ++ line_text(place.text, start),
+    "   | " ++ colored(style, severity, carets(place.text, start, end)) ++ tail,
   ]
 }
 
 fn label_lines(
   style: Style,
-  severity: Bytes,
+  severity: Severity,
   places: List<SourceText>,
   label: Label,
 ) -> List<String> / {abort.raise} =
-  match source_at(places, label.module) {
-    None -> [],
-    Some(p) -> match slice_of(p.text, label.start, label.end) {
+  match label.place {
+    Unplaced -> [],
+    WholeFile(m) -> match places.at(m) {
       None -> [],
-      Some(_) -> snippet_lines(style, severity, p, label),
+      Some(p) -> {
+        let label_text = String::of_bytes_lossy(label.text);
+        ["  --> " ++ p.path ++ (if label_text == "" { "" } else { ": " ++ label_text })]
+      },
+    },
+    InSource(s) -> match places.at(s.module) {
+      None -> [],
+      Some(p) -> match slice_of(p.text, s.start, s.end) {
+        None -> [],
+        Some(_) -> snippet_lines(style, severity, p, label, s.start, s.end),
+      },
     },
   }
 
@@ -249,7 +300,7 @@ pub fn to_text(
     accumulator.concat(label_lines(style, diagnostic.severity, places, label)));
   let with_notes = diagnostic.notes_text.fold(labelled, |accumulator: List<String>, n: Bytes|
     accumulator.push("  = " ++ String::of_bytes_lossy(n)));
-  diagnostic.fixes.fold(with_notes, |accumulator: List<String>, f: Fix|
+  offered_fixes(diagnostic.fixes).fold(with_notes, |accumulator: List<String>, f: Fix|
     accumulator.push("  = fix: " ++ String::of_bytes_lossy(f.title)))
 }
 
@@ -262,7 +313,7 @@ pub fn all_to_text(
     accumulator.concat(to_text(style, diagnostic, places)))
 
 pub fn errors_of(diagnostics: List<Diagnostic>) -> List<Diagnostic> =
-  diagnostics.filter(|diagnostic: Diagnostic| diagnostic.severity == b"error")
+  diagnostics.filter(|diagnostic: Diagnostic| diagnostic.severity == Error)
 
 pub fn errors_text(diagnostics: List<Diagnostic>) -> String =
   String::join(
@@ -288,32 +339,35 @@ const two_places: List<SourceText> =
 fn as_bytes(lines: List<String>) -> List<Bytes> = lines.map(|l: String| Bytes::of_string(l))
 
 fn a_diagnostic_of(
-  severity: Bytes,
+  severity: Severity,
   code: Bytes,
   message: Bytes,
   labels: List<Label>,
   notes: List<Bytes>,
-  fixes: List<Fix>,
 ) -> Diagnostic =
   {
     code: code,
-    notes: notes.len(),
     labels: labels,
     text: b"",
     message: message,
     notes_text: notes,
     severity: severity,
-    fixes: fixes,
+    fixes: NoFix,
   }
 
 const mismatch: Diagnostic =
   a_diagnostic_of(
-    b"error",
+    Error,
     b"E0201",
     b"type mismatch: function body type",
-    [{ module: 0, start: 16, end: 19, primary: true, text: b"expected `Int`, found `String`" }],
+    [
+      {
+        place: InSource({ module: 0, start: 16, end: 19 }),
+        primary: true,
+        text: b"expected `Int`, found `String`",
+      },
+    ],
     [b"the body must return the written type"],
-    [],
   )
 
 test "`position_of` numbers lines and columns from 1, and counts a column in characters rather than bytes" {
@@ -346,17 +400,17 @@ test "the JSON is one object per diagnostic, with each label's start and end pos
       },
       { key: "notes", value: Array([Str("the body must return the written type")]) },
       { key: "fixes", value: Array([]) },
+      { key: "fix_choice", value: Str("none") },
     ]),
   )
 }
 
 test "`to_json` omits a label whose module does not exist or whose range is past the end of the text" {
   let outside = a_diagnostic_of(
-    b"error",
+    Error,
     b"E0201",
     b"type mismatch: function body type",
-    [{ module: no_module, start: 0, end: 0, primary: true, text: b"nowhere" }],
-    [],
+    [{ place: Unplaced, primary: true, text: b"nowhere" }],
     [],
   );
   match to_json(outside, one_place) {
@@ -364,12 +418,17 @@ test "`to_json` omits a label whose module does not exist or whose range is past
     _ -> panic("a diagnostic renders as an object"),
   };
   let past = a_diagnostic_of(
-    b"error",
+    Error,
     b"E0201",
     b"type mismatch: function body type",
-    [{ module: 0, start: 900, end: 901, primary: true, text: b"past the end" }],
+    [
+      {
+        place: InSource({ module: 0, start: 900, end: 901 }),
+        primary: true,
+        text: b"past the end",
+      },
+    ],
     [b"the body must return the written type"],
-    [],
   );
   assert_eq(to_text(plain, past, one_place), [
     "Error[E0201]: type mismatch: function body type",
@@ -379,11 +438,10 @@ test "`to_json` omits a label whose module does not exist or whose range is past
 
 test "a span that cuts a character in half is still shown, on the line where the span starts" {
   let split = a_diagnostic_of(
-    b"error",
+    Error,
     b"E0201",
     b"type mismatch",
-    [{ module: 1, start: 4, end: 6, primary: true, text: b"here" }],
-    [],
+    [{ place: InSource({ module: 1, start: 4, end: 6 }), primary: true, text: b"here" }],
     [],
   );
   assert_eq(as_bytes(to_text(plain, split, two_places)), [
@@ -415,14 +473,14 @@ test "ANSI colour only adds escape codes around the text and leaves the layout o
 }
 
 test "an empty span still gets one caret, and a suggested fix prints as its own `fix:` line" {
-  let insertion = a_diagnostic_of(
-    b"warning",
-    b"E0126",
-    b"this needs a type",
-    [{ module: 0, start: 5, end: 5, primary: true, text: b"" }],
-    [],
-    [{ title: b"add the type", edits: [{ module: 0, start: 5, end: 5, text: b": Int" }] }],
-  );
+  let insertion = {
+    ..a_diagnostic_of(Warning, b"E0126", b"this needs a type", [{ place: InSource({ module: 0, start: 5, end: 5 }), primary: true, text: b"" }], []),
+    fixes: Apply({
+      title: b"add the type",
+      first: { module: 0, start: 5, end: 5, text: b": Int" },
+      rest: [],
+    }),
+  };
   assert_eq(to_text(plain, insertion, one_place), [
     "Warning[E0126]: this needs a type",
     "  --> m.ply:1:6",
@@ -440,14 +498,14 @@ test "an empty span still gets one caret, and a suggested fix prints as its own 
 }
 
 test "`errors_of` returns only the error diagnostics and leaves out warnings" {
-  let warning = a_diagnostic_of(b"warning", b"W0611", b"never used", [], [], []);
+  let warning = a_diagnostic_of(Warning, b"W0611", b"never used", [], []);
   assert_eq(errors_of([mismatch, warning]).len(), 1)
 }
 
 test "`shown` substitutes a runtime error's values into its message text" {
   let slot = String::of_bytes(b"\x010\x02");
   let d = shown({
-    diagnostic: a_diagnostic_of(b"error", b"E0501", Bytes::of_string("found " ++ slot), [], [], []),
+    diagnostic: a_diagnostic_of(Error, b"E0501", Bytes::of_string("found " ++ slot), [], []),
     values: [VInt(7)],
   });
   assert_eq(d.message, b"found 7")
@@ -457,7 +515,7 @@ test "a runtime error's JSON lists each value in full under `values`, while its 
   let slot = String::of_bytes(b"\x010\x02");
   let long = VList(range(0, shown_characters).map(|i: Int| VInt(i)));
   let raised = {
-    diagnostic: a_diagnostic_of(b"error", b"E0501", Bytes::of_string("found " ++ slot), [], [], []),
+    diagnostic: a_diagnostic_of(Error, b"E0501", Bytes::of_string("found " ++ slot), [], []),
     values: [long],
   };
   match runtime_diagnostic_json(raised, one_place) {

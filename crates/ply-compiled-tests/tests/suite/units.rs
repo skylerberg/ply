@@ -155,6 +155,7 @@ pub fn exports_of(defs: &[Def]) -> Laid {
             modules: 1,
             fields: Vec::new(),
             entered: Vec::new(),
+            sites: Vec::new(),
         },
         lambdas: Vec::new(),
         taken: defs
@@ -270,7 +271,7 @@ pub fn opened(
     let mut exports = exports_of(defs);
     adjust(&mut exports);
     let lib = library(dir, &text(defs, &exports))?;
-    Some(ply_compiled::c::load_from_path(&lib).map_err(|e| format!("{e:#}")))
+    Some(ply_compiled::c::load_libraries(&[lib]).map_err(|e| format!("{e:#}")))
 }
 
 pub fn entered(

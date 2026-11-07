@@ -1,30 +1,95 @@
+import compiler.codes (cache_unreadable_code)
+import compiler.syntax.parsing (Warning)
 import std.fs (fs)
 import std.hash (blake3)
 import compiler.store.hash.encoding (hex)
-import compiler.check.resolve.tables (Diagnostic)
+import compiler.check.resolve.tables (Diagnostic, NoFix)
 import compiler.unit (identity_of, unit_roots)
 import paths
+import paths (PathLabel, WorkingDirectory, Absolute)
 import semantics (semantics)
-import store.engine (Warning, Unreadable, Corrupt, OtherVersion)
+import store.engine (Warning, Unreadable, Corrupt, OtherVersion, problem_warning)
 import store.tables (Stamps)
+import compiler.store.database
+import compiler.store.database (StoreProblem)
+import compiler.store.fact_store (Opening, recent_reads, with_recent_reads)
 
-pub type StoreLocation = { label: String, dir: String, root: String, stamps: Stamps }
+pub type StoreLocation = { label: PathLabel, dir: String, root: String, stamps: Stamps }
+
+pub fn cache_dir_in(resolved: paths::ResolvedPath) -> String =
+  paths::in_root(resolved, ".ply-cache").path
+
+pub type DatabasePlace = | InWorkingDirectory(String) | AtAbsolutePath(String)
+
+fn database_place_in(label: PathLabel, cache_dir: String) -> DatabasePlace =
+  match label {
+    WorkingDirectory -> InWorkingDirectory(database::database_in(cache_dir)),
+    Absolute -> AtAbsolutePath(database::database_in(cache_dir)),
+  }
+
+pub fn database_place(resolved: paths::ResolvedPath) -> DatabasePlace =
+  database_place_in(resolved.label, cache_dir_in(resolved))
+
+pub fn database_place_of(location: StoreLocation) -> DatabasePlace =
+  database_place_in(location.label, location.dir)
+
+pub effect databases {
+  write open(place: DatabasePlace) -> Opening
+}
+
+pub effect set Databases = {databases.open, recent_reads.read, recent_reads.write}
+
+type OpenDatabase = { place: DatabasePlace, opening: Opening }
+
+fn opened_at(place: DatabasePlace) -> Opening / {fs.write[cwd], fs.write[abs]} =
+  match place {
+    InWorkingDirectory(dir) -> database::open_database[cwd](dir),
+    AtAbsolutePath(dir) -> database::open_database[abs](dir),
+  }
+
+fn closed(held: OpenDatabase) -> Unit / {fs.write[cwd], fs.write[abs]} =
+  match held.place {
+    InWorkingDirectory(_) -> database::close_database[cwd](held.opening),
+    AtAbsolutePath(_) -> database::close_database[abs](held.opening),
+  }
+
+pub fn with_databases<a | e>(
+  body: () -> a / {databases.open, recent_reads.read, recent_reads.write | e},
+) -> a / {fs.write[cwd], fs.write[abs] | e} =
+  with_recent_reads(||
+    handle {
+      body()
+    } with {
+      var opened: List<OpenDatabase> = [],
+      databases.open(place) -> match opened.find(|o: OpenDatabase| o.place == place) {
+        Some(o) -> o.opening,
+        None -> {
+          let opening = opened_at(place);
+          opened = opened.push({ place: place, opening: opening });
+          opening
+        },
+      },
+      return value -> {
+        opened.fold((), |_: Unit, o: OpenDatabase| closed(o));
+        value
+      },
+    })
 
 pub fn store_location_of(paths: List<paths::ResolvedPath>, stamps: Stamps) -> StoreLocation =
   match paths.at(0) {
     Some(r) ->
       {
         label: r.label,
-        dir: paths::in_root(r, ".ply-cache").path,
-        root: if r.label == "cwd" { r.root_path } else { "/" ++ r.root_path },
+        dir: cache_dir_in(r),
+        root: match r.label { WorkingDirectory -> r.root_path, Absolute -> "/" ++ r.root_path },
         stamps: stamps,
       },
-    None -> { label: "cwd", dir: ".ply-cache", root: ".", stamps: stamps },
+    None -> { label: WorkingDirectory, dir: ".ply-cache", root: ".", stamps: stamps },
   }
 
 const verdict_roots: List<Bytes> =
   unit_roots.fold(
-    [b"tests.run.selected", b"prove.run", b"review.run"],
+    [b"tests.run.run_plan", b"prove.run", b"review.run"],
     |accumulator: List<Bytes>, r: Bytes| accumulator.push(r),
   )
 
@@ -33,8 +98,7 @@ const code_roots: List<Bytes> =
     b"tests.concluded.run_job",
     b"testing.conclude.conclude_run",
     b"compiler.unit.produce",
-    b"compiler.unit.unit_parts",
-    b"units.emitted_of",
+    b"units.code_of",
     b"tests.cases.codes_of",
   ]
 
@@ -82,31 +146,33 @@ pub fn stamps_from_text(text: String) -> Stamps =
 fn warning(code: Bytes, message: String, notes: List<String>) -> Diagnostic =
   {
     code: code,
-    notes: notes.len(),
     labels: [],
     text: b"",
     message: Bytes::of_string(message),
     notes_text: notes.map(Bytes::of_string),
-    severity: b"warning",
-    fixes: [],
+    severity: Warning,
+    fixes: NoFix,
   }
 
 pub fn diagnostics_of(ws: List<Warning>) -> List<Diagnostic> =
   ws.map(|w: Warning|
     match w.kind {
       Unreadable ->
-        warning(b"W0601", w.message, [
+        warning(cache_unreadable_code, w.message, [
           "this run is unaffected; the next one will do this work again",
         ]),
       Corrupt ->
         warning(b"W0602", "the cache is corrupt: " ++ w.message, [
-          "anything that needed the corrupt data is recomputed, and `ply cache compact` rewrites the data file",
+          "anything that needed the corrupt data is recomputed, and the next write replaces it",
         ]),
       OtherVersion ->
         warning(b"W0603", w.message, [
           "the cache is rebuilt, and this run saves its results into the new cache",
         ]),
     })
+
+pub fn problem_diagnostics(problems: List<StoreProblem>) -> List<Diagnostic> =
+  diagnostics_of(problems.map(problem_warning))
 
 fn definitions_with(moved: Bytes) -> Bytes / {abort.raise} = {
   let roots = code_roots.fold(verdict_roots, |accumulator: List<Bytes>, r: Bytes|
@@ -125,7 +191,7 @@ test "the runtime digest changes when a definition that decides test results cha
   let launched = { runtime_digest: "runtime", code: "" };
   let now = full_stamps(launched, definitions_with(b""), "s");
   assert_eq(full_stamps(launched, definitions_with(b"other.unrelated"), "s"), now);
-  let deciding = full_stamps(launched, definitions_with(b"tests.run.selected"), "s");
+  let deciding = full_stamps(launched, definitions_with(b"tests.run.run_plan"), "s");
   assert(
     deciding.runtime_digest != now.runtime_digest,
     Some("a verdict's root moved and its stamp did not"),
@@ -146,13 +212,17 @@ test "the runtime digest changes when a definition that decides test results cha
 test "changing the code emitter changes the runtime digest but not the code digest" {
   let launched = { runtime_digest: "runtime", code: "" };
   let now = full_stamps(launched, definitions_with(b""), "s");
-  let emitter = full_stamps(launched, definitions_with(b"compiler.unit.emitted"), "s");
+  let emitter = full_stamps(
+    launched,
+    definitions_with(b"compiler.front.checking.units.lower_unit"),
+    "s",
+  );
   assert(
     emitter.runtime_digest != now.runtime_digest,
     Some("the emitter moved and the passes' stamp did not"),
   );
   assert_eq(emitter.code, now.code);
-  assert_eq(full_stamps(launched, definitions_with(b"tests.run.selected"), "s").code, now.code);
+  assert_eq(full_stamps(launched, definitions_with(b"tests.run.run_plan"), "s").code, now.code);
   let running = full_stamps(launched, definitions_with(b"tests.concluded.run_job"), "s");
   assert(running.code != now.code, Some("what decides a verdict moved and the stamp did not"));
   let concluding = full_stamps(launched, definitions_with(b"testing.conclude.conclude_run"), "s");

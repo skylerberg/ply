@@ -2,16 +2,15 @@ import compiler.build
 import compiler.build (Built, timed)
 import compiler.cc
 import compiler.cc (Profile, Toolchain, compilers, memory, toolchain)
-import compiler.checkout (ShippedFile, digests_of, module_names, shipped_files, shipped_store_dir)
+import compiler.checkout (ShippedFile, module_names, part_containing, shipped_files)
 import compiler.emit.abi (runtime_of)
 import compiler.front.interface (length_prefixed)
+import compiler.front.published (HashedName, reach_identities)
 import compiler.front.pkg (check_workspace)
-import compiler.load (cache_relative)
 import compiler.native
 import compiler.native (PackFile)
 import compiler.store.packs
 import compiler.unit (shipped, identity_of)
-import std.bin
 import std.bytes
 import std.env (env)
 import std.fs
@@ -38,33 +37,21 @@ type Options = {
   out: String,
 }
 
-type Target = {
-  files: List<ShippedFile>,
-  description: Bytes,
-  identity: Bytes,
-  definitions: Bytes,
-  tool: String,
-  work: String,
-}
+type Target = { files: List<ShippedFile>, description: Bytes, identity: Bytes, definitions: Bytes }
 
 type CacheKeys = { shipped: Bytes, linking: Bytes }
 
-type CachedFile = { path: String, bytes: Bytes }
-
-derive bin for CachedFile
-
 effect set Installs = {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], time.elapsed_ms, process.err[proc], entropy.next, abort.raise}
 
-effect set Bootstraps = {Installs, compilers.read[cc], compilers.write[cc], shipped.report_view_used, fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], memory.read, time.now_ms}
+effect set Bootstraps = {Installs, compilers.read[cc], compilers.write[cc], fs.list_dir[abs], fs.kind[abs], fs.read_file[abs], memory.read, time.now_ms}
 
 fn on_target<a | e>(
   target: Target,
-  body: () -> a / {shipped.names, shipped.module, shipped.digests, shipped.read_pack, shipped.stamps, shipped.runtime, shipped.definitions, shipped.run_root | e},
-) -> a / {toolchain.cache, toolchain.write_file, toolchain.run, abort.raise | e} = {
+  body: () -> a / {shipped.names, shipped.module, shipped.read_pack, shipped.stamps, shipped.runtime, shipped.definitions | e},
+) -> a / {abort.raise | e} = {
   let by_name = target.files.fold(Map::new(), |accumulator: Map<String, Bytes>, f: ShippedFile|
     accumulator.insert(f.name, f.bytes));
   let names = module_names(target.files);
-  let digests = digests_of(target.files);
   handle {
     body()
   } with {
@@ -73,57 +60,87 @@ fn on_target<a | e>(
       Some(bytes) -> Some(bytes),
       None -> by_name.get(name),
     },
-    shipped.digests() -> digests,
-    shipped.read_pack(_path, _offset, _len) -> None,
+    shipped.read_pack(_part) -> None,
     shipped.stamps() -> "evaluator " ++ String::of_bytes_lossy(target.identity) ++ "\n",
     shipped.runtime() -> target.description,
     shipped.definitions() -> target.definitions,
-    shipped.run_root(library, root, arguments, timeout_ms) ->
-      entered(target, library, root, arguments, timeout_ms),
   }
 }
 
-fn entered(
-  target: Target,
-  library: String,
-  root: String,
-  arguments: Bytes,
-  timeout_ms: Int,
-) -> Option<Bytes> / {toolchain.cache, toolchain.write_file, toolchain.run, abort.raise} = {
-  let held = target.work ++ "/" ++ blake3(arguments).hex_of() ++ ".arguments";
-  if !toolchain.write_file(held, arguments) { None } else {
-    let ran = toolchain.run(target.tool, [
-      library,
-      root,
-      toolchain.cache() ++ "/" ++ held,
-      timeout_ms.to_string(),
-    ]);
-    if ran.code == 0 { Some(ran.out) } else { None }
+fn listed_names(value: Option<Json>) -> List<Bytes> =
+  match value {
+    Some(Array(items)) ->
+      items.fold([], |names: List<Bytes>, item: Json|
+        match item { Str(text) -> names.push(Bytes::of_string(text)), _ -> names }),
+    _ -> [],
   }
-}
 
-fn definition_line(row: Json) -> Option<{ name: String, hash: String }> =
+fn with_listed_rows(
+  rows: List<Json>,
+  marker: Bytes,
+  into: Map<Bytes, HashedName>,
+) -> Map<Bytes, HashedName> =
+  rows.fold(into, |found: Map<Bytes, HashedName>, row: Json|
+    match row {
+      Object(members) -> match ((members.get("name"), members.get("hash"))) {
+        (Some(Str(text)), Some(Str(hash))) -> {
+          let name = Bytes::of_string(text);
+          let own = marker.concat(Bytes::of_string(hash));
+          let dependencies = listed_names(members.get("dependencies"));
+          found.insert(name, match found.get(name) {
+            Some(held) ->
+              {
+                ..held,
+                own: held.own.push(own),
+                dependencies: held.dependencies.concat(dependencies),
+              },
+            None -> { name: name, own: [own], dependencies: dependencies },
+          })
+        },
+        _ -> found,
+      },
+      _ -> found,
+    })
+
+fn hashed_without_dependencies(row: Json) -> Bool =
   match row {
-    Object(members) -> match ((members.get("name"), members.get("hash"))) {
-      (Some(Str(name)), Some(Str(hash))) -> Some({ name: name, hash: hash }),
-      _ -> None,
+    Object(members) -> match ((members.get("hash"), members.get("dependencies"))) {
+      (Some(Str(_)), Some(Array(_))) -> false,
+      (Some(Str(_)), _) -> true,
+      _ -> false,
     },
-    _ -> None,
+    _ -> false,
   }
 
 fn definitions_of(listing: Bytes) -> Result<Bytes, String> / {abort.raise} =
   match json::parse(listing) {
     Ok(Object(members)) -> match members.get("definitions") {
-      Some(Array(rows)) -> {
-        let held = rows.fold(Map::new(), |accumulator: Map<String, String>, row: Json|
-          match definition_line(row) {
-            Some(d) -> accumulator.insert(d.name, d.hash),
-            None -> accumulator,
-          });
+      Some(Array(rows)) -> if rows.any(hashed_without_dependencies) {
+        Err(
+          "the listing of definitions holds no dependencies: list them with `ply hash --json --dependencies`",
+        )
+      } else {
+        let declared = match members.get("declarations") {
+          Some(Array(declarations)) -> with_listed_rows(declarations, b"t", Map::new()),
+          _ -> Map::new(),
+        };
+        let defined = with_listed_rows(rows, b"d", Map::new());
+        let identities = reach_identities(
+          with_listed_rows(rows, b"d", declared).fold(
+            [],
+            |all: List<HashedName>, _: Bytes, row: HashedName| all.push(row),
+          ),
+        );
         Ok(
           Bytes::concat_all(
-            held.fold([], |lines: List<Bytes>, name: String, hash: String|
-              lines.push(Bytes::of_string(name ++ " " ++ hash ++ "\n"))),
+            defined.fold([], |lines: List<Bytes>, name: Bytes, _: HashedName|
+              match identities.get(name) {
+                Some(identity) ->
+                  lines.push(
+                    Bytes::concat_all([name, b" ", Bytes::of_string(identity.hex_of()), b"\n"]),
+                  ),
+                None -> lines,
+              }),
           ),
         )
       },
@@ -184,7 +201,7 @@ fn runtime_tool(
       work,
     ) {
     Err(reason) -> Err("the runtime's library at `" ++ library ++ "` does not link: " ++ reason),
-    Ok(exe) -> Ok(cache_relative(exe)),
+    Ok(exe) -> Ok(cc::cache_relative(exe)),
   }
 
 fn link_executable(
@@ -203,7 +220,7 @@ fn append_pack(
   exe: String,
   pack: Bytes,
 ) -> Result<String, String> / {toolchain.read, toolchain.write, abort.raise} =
-  if toolchain.append(cache_relative(exe), pack) { Ok(exe) }
+  if toolchain.append(cc::cache_relative(exe), pack) { Ok(exe) }
   else { Err("the standard library files could not be added to the end of `" ++ exe ++ "`") }
 
 fn build_pack(files: List<ShippedFile>, front: Bytes, more: List<PackFile>) -> Bytes =
@@ -277,9 +294,6 @@ fn chunked_read(path: String, step: Int) -> Option<Bytes> / {fs.read[abs], abort
     None -> None,
   }
 
-fn read_if_present(path: String) -> Option<Bytes> / {toolchain.read} =
-  if toolchain.exists(path) { toolchain.read_file(path) } else { None }
-
 const shipped_results_roots: List<Bytes> = [b"bootstrap.build_shipped_results"]
 
 fn shipped_results_cache_key(
@@ -297,45 +311,55 @@ fn shipped_results_cache_key(
       length_prefixed(gathering),
     ]),
   );
-  key.hex_of() ++ ".answers"
+  key.hex_of()
 }
 
-fn encode_shipped_results(shipped_results: List<PackFile>) -> Bytes / {abort.raise} =
-  bin::encode(
-    shipped_results.map(|f: PackFile| { path: f.path, bytes: f.bytes }),
-    bin::list_bin(cached_file_bin()),
-  )
+const pack_key_file: String = "key"
 
-fn decode_shipped_results(bytes: Bytes) -> Option<List<PackFile>> / {abort.raise} =
-  match bin::decode(bytes, bin::list_bin(cached_file_bin())) {
-    Ok(files) -> Some(files.map(|f: CachedFile| { path: f.path, bytes: f.bytes })),
-    Err(_) -> None,
+fn pack_path(answers: String, name: String) -> String / {abort.raise} =
+  strip_root(answers ++ "/pack/" ++ name)
+
+fn read_pack_files(answers: String) -> Option<List<PackFile>> / {fs.read[abs], abort.raise} =
+  match ((
+      chunked_read(pack_path(answers, packs::store_file), chunk_size),
+      fs.read_file[abs](pack_path(answers, packs::index_file)),
+    )) {
+    (Some(store), Some(index)) ->
+      Some([
+        { path: "answers/" ++ packs::store_file, bytes: store },
+        { path: "answers/" ++ packs::index_file, bytes: index },
+      ]),
+    _ -> None,
   }
+
+fn kept_pack(answers: String, key: String) -> Option<List<PackFile>> / {fs.read[abs], abort.raise} =
+  if fs.read_file[abs](pack_path(answers, pack_key_file)) == Some(Bytes::of_string(key)) {
+    read_pack_files(answers)
+  } else { None }
+
+fn written_key(answers: String, key: String) -> Bool / {fs.write[abs], abort.raise} =
+  fs.write_file[abs](pack_path(answers, pack_key_file), Bytes::of_string(key))
 
 fn build_shipped_results(
   ply: String,
-  work: String,
-) -> Result<List<PackFile>, String> / {toolchain.read, toolchain.write, fs.read[abs], abort.raise} = {
-  let dir = toolchain.cache() ++ "/" ++ work ++ "/answers";
-  let ran = toolchain.run(cache_relative(ply), ["std", "--answers", dir]);
-  let at = |name: String| strip_root(dir ++ "/pack/" ++ name);
-  if ran.code != 0 { Err("the new `ply` did not check the shipped modules") } else {
-    match ((
-        chunked_read(at(packs::store_file), chunk_size),
-        fs.read_file[abs](at(packs::index_file)),
-      )) {
-      (Some(store), Some(index)) ->
-        Ok([
-          { path: "answers/" ++ packs::store_file, bytes: store },
-          { path: "answers/" ++ packs::index_file, bytes: index },
-        ]),
-      _ -> Err("the new `ply` did not write check results for the standard library modules"),
+  answers: String,
+) -> Result<List<PackFile>, String> / {toolchain.read, toolchain.write, fs.read[abs], fs.write[abs], abort.raise} = {
+  fs.remove[abs](pack_path(answers, pack_key_file));
+  if fs.read_file[abs](pack_path(answers, pack_key_file)) != None {
+    Err("the key of the standard library's stored check results could not be removed")
+  } else if toolchain.run(cc::cache_relative(ply), ["std", "--answers", answers]).code != 0 {
+    Err("the new `ply` did not check the shipped modules")
+  } else {
+    match read_pack_files(answers) {
+      Some(files) -> Ok(files),
+      None -> Err("the new `ply` did not write check results for the standard library modules"),
     }
   }
 }
 
 fn shipped_results(
   exe: String,
+  answers: String,
   target: Target,
   front: Bytes,
   keys: CacheKeys,
@@ -347,7 +371,7 @@ fn shipped_results(
     match append_pack(returning, build_pack(target.files, front, [])) {
       Err(reason) -> Err(reason),
       Ok(_) -> {
-        let results_run = toolchain.run(cache_relative(returning), ["std", "--answering"]);
+        let results_run = toolchain.run(cc::cache_relative(returning), ["std", "--answering"]);
         let cached_results = if results_run.code != 0 { None } else {
           Some(
             shipped_results_cache_key(
@@ -358,22 +382,15 @@ fn shipped_results(
             ),
           )
         };
-        let had = match cached_results {
-          None -> None,
-          Some(at) -> match read_if_present(at) {
-            Some(bytes) -> decode_shipped_results(bytes),
-            None -> None,
-          },
-        };
+        let had = match cached_results { None -> None, Some(key) -> kept_pack(answers, key) };
         match had {
           Some(a) -> Ok({ returned: a, taken: true }),
-          None -> match build_shipped_results(returning, target.work) {
+          None -> match build_shipped_results(returning, answers) {
             Err(reason) -> Err(reason),
             Ok(files) -> match cached_results {
               None -> Ok({ returned: files, taken: false }),
-              Some(at) -> if toolchain.write_file(at, encode_shipped_results(files)) {
-                Ok({ returned: files, taken: false })
-              } else { Err("what the new `ply` returned could not be cached") },
+              Some(key) -> if written_key(answers, key) { Ok({ returned: files, taken: false }) }
+              else { Err("what the new `ply` returned could not be kept") },
             },
           },
         }
@@ -406,7 +423,13 @@ fn precompile_and_install(
   phases: Bool,
 ) -> Result<Unit, String> / {Installs} = {
   let at = time.elapsed_ms();
-  match shipped_results(exe, target, built.front, keys) {
+  match shipped_results(
+      exe,
+      join(options.root, ".ply-cache/bootstrap/answers"),
+      target,
+      built.front,
+      keys,
+    ) {
     Err(reason) -> Err(reason),
     Ok(a) -> {
       timed(
@@ -458,24 +481,35 @@ fn bootstrap_ply(
               description: described.out,
               identity: runtime.identity,
               definitions: definitions,
-              tool: tool,
-              work: work,
             };
             timed(phases, "read the runtime library's description", started);
             let at = time.elapsed_ms();
+            let cli = join(options.root, options.parts.cli);
             match on_target(target, ||
                 build::build_program(
-                  join(options.root, options.parts.cli),
+                  cli,
+                  match part_containing({ root: options.root, parts: options.parts }, cli) {
+                    Some(part) -> Some(part.role),
+                    None -> None,
+                  },
                   options.parts.entry,
-                  shipped_store_dir(toolchain.reuse_dir()),
-                  true,
+                  join(options.root, ".ply-cache/bootstrap/memo"),
                   phases,
                 )) {
               None -> Err("`ply`'s C was not built"),
               Some(built) -> {
                 timed(phases, "built `ply`", at);
                 let compiling = time.elapsed_ms();
-                let objects = cc::objects[cc](t, built.sources, native::native_flags, work);
+                let objects = cc::products_in[abs](
+                  strip_root(options.root) ++ "/.ply-cache/c",
+                  ||
+                    cc::objects[cc](
+                      t,
+                      options.profile.name ++ "/ply",
+                      built.c,
+                      native::native_flags,
+                    ),
+                );
                 compiled_timed(phases, objects, compiling);
                 let linking = time.elapsed_ms();
                 match link_executable(t, objects, options.library, work) {
@@ -506,7 +540,7 @@ fn bootstrap(
     Err(reason) -> Err(reason),
     Ok(parts) -> match profile_named(profile) {
       Err(reason) -> Err(reason),
-      Ok(p) -> match fs.read_file[abs](strip_root(hashes)) {
+      Ok(p) -> match chunked_read(strip_root(hashes), chunk_size) {
         None -> Err("the listing of definitions at `" ++ hashes ++ "` could not be read"),
         Some(listing) -> match definitions_of(listing) {
           Err(reason) -> Err(reason),
@@ -559,76 +593,65 @@ const a_target: Target =
     files: two_files,
     description: b"the checkout's runtime",
     identity: b"rt",
-    definitions: b"compiler.unit.emitted aa\n",
-    tool: "tool",
-    work: "work",
+    definitions: b"compiler.unit.produce aa\n",
   }
 
 test "inside `on_target` the program sees the checkout's files and runtime, and no pack of results" {
-  let seen = handle {
-    on_target(a_target, ||
-      {
-        names: shipped.names(),
-        module: shipped.module("std.a"),
-        data: shipped.module("std/a/data.txt"),
-        absent: shipped.module("std.absent"),
-        results: shipped.read_pack("answers/store", 0, 0),
-        runtime: shipped.runtime(),
-        definitions: shipped.definitions(),
-        stamps: shipped.stamps(),
-      })
-  } with {
-    toolchain.cache() -> "/cache",
-    toolchain.write_file(_path, _bytes) -> false,
-    toolchain.run(_path, _args) -> { code: 1, out: b"" },
-  };
+  let seen = on_target(a_target, ||
+    {
+      names: shipped.names(),
+      module: shipped.module("std.a"),
+      data: shipped.module("std/a/data.txt"),
+      absent: shipped.module("std.absent"),
+      results: shipped.read_pack(packs::WholeIndex),
+      runtime: shipped.runtime(),
+      definitions: shipped.definitions(),
+      stamps: shipped.stamps(),
+    });
   assert_eq(seen.names, ["std.a"]);
   assert_eq(seen.module, Some(b"pub fn a() -> Int = 1\n"));
   assert_eq(seen.data, Some(b"data"));
   assert_eq(seen.absent, None);
   assert_eq(seen.results, None);
   assert_eq(seen.runtime, b"the checkout's runtime");
-  assert_eq(seen.definitions, b"compiler.unit.emitted aa\n");
+  assert_eq(seen.definitions, b"compiler.unit.produce aa\n");
   assert_eq(seen.stamps, "evaluator rt\n")
 }
 
-test "a unit is entered by the runtime's tool, which is handed its arguments in a file and whose failure is no result" {
-  let ask = |code: Int|
-    handle {
-      on_target(a_target, || shipped.run_root("/cache/unit.so", "m.root", b"args", 5))
-    } with {
-      var wrote = [],
-      var ran = [],
-      toolchain.cache() -> "/cache",
-      toolchain.write_file(path, bytes) -> {
-        wrote = wrote.push(path);
-        bytes == b"args"
-      },
-      toolchain.run(path, args) -> {
-        ran = ran.push(path).concat(args);
-        { code: code, out: b"result" }
-      },
-      return result -> { result: result, wrote: wrote, ran: ran },
-    };
-  let held = "work/" ++ blake3(b"args").hex_of() ++ ".arguments";
-  let good = ask(0);
-  assert_eq(good.result, Some(b"result"));
-  assert_eq(good.wrote, [held]);
-  assert_eq(good.ran, ["tool", "/cache/unit.so", "m.root", "/cache/" ++ held, "5"]);
-  assert_eq(ask(1).result, None)
-}
-
-test "a listing of definitions reads as name and hash lines, in one order however it was listed" {
-  let row = |name: String, hash: String|
-    "{\"name\":\"" ++ name ++ "\",\"module\":\"m\",\"hash\":\"" ++ hash ++ "\"}";
-  let read = |rows: List<String>|
-    definitions_of(
-      Bytes::of_string("{\"definitions\":[" ++ String::join(rows, ",") ++ "],\"tests\":[]}"),
-    );
-  let lines = Ok(b"m.a 01\nm.b 02\n");
-  assert_eq(read([row("m.a", "01"), row("m.b", "02")]), lines);
-  assert_eq(read([row("m.b", "02"), row("m.a", "01")]), lines);
-  assert_eq(read(["{\"name\":\"m.c\",\"hash\":null}", row("m.a", "01")]), Ok(b"m.a 01\n"));
+test "each listed definition is named by a digest of everything it reaches, in name order" {
+  let row = |name: String, hash: String, dependencies: List<String>|
+    "{\"name\":\"" ++ name ++ "\",\"hash\":\"" ++ hash ++ "\",\"dependencies\":["
+      ++ String::join(dependencies.map(|c: String| "\"" ++ c ++ "\""), ",")
+      ++ "]}";
+  let read = |b_hash: String, t_hash: String| {
+    let listing = "{\"definitions\":[" ++ row("m.b", b_hash, []) ++ ","
+      ++ row("m.a", "01", ["m.b", "m.T"])
+      ++ "],\"declarations\":[{\"name\":\"m.T\",\"hash\":\""
+      ++ t_hash
+      ++ "\"}],\"tests\":[]}";
+    match definitions_of(Bytes::of_string(listing)) {
+      Ok(lines) -> lines.split(b"\n").filter(|l: Bytes| l.len() > 0),
+      Err(reason) -> panic(reason),
+    }
+  };
+  let first = read("02", "09");
+  assert_eq(first.map(|l: Bytes| l.slice(0, 4)), [b"m.a ", b"m.b "]);
+  assert(
+    read("03", "09").get(0) != first.get(0),
+    Some("a callee's change left its caller's entry alone"),
+  );
+  assert(
+    read("02", "08").get(0) != first.get(0),
+    Some("a type's change left its user's entry alone"),
+  );
+  assert_eq(read("02", "09"), first);
+  assert(
+    definitions_of(b"{\"definitions\":[{\"name\":\"m.a\",\"hash\":\"01\"}],\"tests\":[]}")
+      == Err(
+        "the listing of definitions holds no dependencies: list them with `ply hash --json --dependencies`",
+      ),
+    None,
+  );
   assert(definitions_of(b"{}") == Err("the listing of definitions holds none"), None);
   assert(definitions_of(b"not json") == Err("the listing of definitions does not read"), None)
 }
@@ -687,9 +710,8 @@ test "`chunked_digest` of a file hashes the hashes of its chunks, whatever the c
   assert_eq(over("lib/absent", 4), None)
 }
 
-test "`shipped_results_cache_key` returns a key ending in `.answers`, equal for equal arguments and different when the shipped, linking, returning or gathering argument differs" {
+test "`shipped_results_cache_key` is equal for equal arguments and different when the shipped, linking, returning or gathering argument differs" {
   let results_key = shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering");
-  assert(results_key.ends_with(".answers"));
   assert_eq(
     shipped_results_cache_key(b"shipped", b"linking", b"returning", b"gathering"),
     results_key,
@@ -704,14 +726,17 @@ test "`shipped_results_cache_key` returns a key ending in `.answers`, equal for 
   assert(shipped_results_cache_key(b"shipped", b"linking", b"returning", b"moved") != results_key)
 }
 
-test "`decode_shipped_results` returns the stored results that `encode_shipped_results` produced, and `None` for truncated, extended or too-short bytes" {
-  let shipped_results = [
+test "a kept pack is reused only when the key beside it is the key asked for" {
+  let tree = fs::mem_of([
+    { path: "answers/pack/store", body: b"frames" },
+    { path: "answers/pack/index", body: b"index" },
+    { path: "answers/pack/key", body: b"one" },
+  ]);
+  let reused = |key: String| fs::on_mem[abs](tree, || kept_pack("/answers", key)).value;
+  let files = [
     { path: "answers/store", bytes: b"frames" },
-    { path: "answers/index", bytes: b"" },
+    { path: "answers/index", bytes: b"index" },
   ];
-  let encoded = encode_shipped_results(shipped_results);
-  assert_eq(decode_shipped_results(encoded), Some(shipped_results));
-  assert_eq(decode_shipped_results(encoded.slice(0, encoded.len() - 1)), None);
-  assert_eq(decode_shipped_results(encoded.concat(b"x")), None);
-  assert_eq(decode_shipped_results(b"short"), None)
+  assert_eq(reused("one"), Some(files));
+  assert_eq(reused("two"), None)
 }

@@ -283,7 +283,7 @@ pub unsafe extern "C" fn rt_toolchain_cache(ctx: *mut Ctx) -> TakenBytes {
 
 pub unsafe extern "C" fn rt_toolchain_reused(ctx: *mut Ctx) -> TakenBytes {
     run_if_toolchain_allowed(ctx, "toolchain_reused", Deterministic, TakenBytes(0), |c| {
-        let dir = crate::c::stage::stage_dir(crate::c::sweep::REUSED);
+        let dir = crate::c::binary::binary_dir().join("reused");
         c.given(dir.display().to_string().into_bytes())
     })
 }
@@ -299,11 +299,7 @@ pub unsafe extern "C" fn rt_toolchain_holds(ctx: *mut Ctx, p: Addr, n: I64) -> I
         let Some(at) = cache_path_from_text(c, p, n) else {
             return I64(0);
         };
-        let held = at.is_file();
-        if held {
-            crate::c::sweep::used(&at);
-        }
-        I64(i64::from(held))
+        I64(i64::from(at.is_file()))
     })
 }
 

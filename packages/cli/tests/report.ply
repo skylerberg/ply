@@ -1,3 +1,6 @@
+import compiler.front.checking (analysed_over)
+import std.set (Set)
+import compiler.check.resolve.tables (InSource, Place, Unplaced)
 import args (Flags)
 import std.list (dedup)
 import std.cli (Parsed, has, parse_nat, value, values_of)
@@ -5,36 +8,35 @@ import surface
 import machine
 import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.facts (CheckedProgram)
-import compiler.front.published (analyse)
-import compiler.front.rows (ModuleSpan)
+import compiler.front.facts (ProgramListing)
+import compiler.front.rows (location_place)
 import compiler.check.infer.checker (TestInfo)
 import compiler.check.resolve.tables (Diagnostic, Label, error_with_labels)
 import compiler.check.types
 import compiler.check.types (AnyResource, NamedResource, SingletonResource, ResourceVariable)
 import compiler.syntax.type_syntax
 import compiler.syntax.type_syntax (ReadMode, WriteMode)
-import diagnostic (SourceText, RuntimeDiagnostic, editor_location_json, runtime_diagnostic_json,
-                   shown, all_to_json, all_to_text)
+import diagnostic (SourceText, RuntimeDiagnostic, editor_location_json, location_text, primary_of,
+                   runtime_diagnostic_json, shown, all_to_json, all_to_text)
 import coverage (Coverage)
+import tests.listing (TestListing, test_at)
+import program (short_of)
 import report (CommandOutput, indent, ok_code, compile_error, count_of, rejected, warned_lines)
 import std.json (Json, Object, Null, Str, Bool, Number, Array, Member, object, to_string, int,
                  string_or_null, strings, int_or_null, strings_or_null)
 import std.term (Style, plain, bold, dim, green, red, yellow, ansi, has_colors)
-import tester (SelectedCase, BindingReport, Options, TestUnit, ListingFailure)
+import tester (SelectedCase, BindingReport, Options, TestUnit, KnownFailure)
 import changes (ChangeDiff)
 import testing.schedule (Effect, Counts, ScheduledTest, counts, group_by_conflict, isolation_of,
                          isolation_word, parallelism, cross_test_effects)
 import testing.delta (kind_word)
 import testing.diagnose (RankedChange)
-import testing.select (Cached, Changed, Decision, New, PreviousFailure, Reason, SameCode, Search,
-                       Unhashed, pass_keys_by_test, to_run, reason_word)
+import testing.select (Cached, Decision, New, Nondet, Reason, SameCode, Search, pass_keys_by_test,
+                       to_run, reason_word)
 import std.bytes
 import std.string
 import std.fmt (fixed_point)
-import claims (location_text)
 import signature (effect_texts)
-import proof.context (set_of)
 import proof.obligation (plural)
 import std.option
 
@@ -50,7 +52,7 @@ pub type Entry = {
   test: Int,
   key: Bytes,
   case: Option<SelectedCase>,
-  unlisted: Option<ListingFailure>,
+  known_failure: Option<KnownFailure>,
 }
 
 pub type Case = {
@@ -60,7 +62,7 @@ pub type Case = {
   name: String,
   module: String,
   nondet: Bool,
-  hash: Option<String>,
+  hash: String,
   effects: String,
   listed: List<PrintedEffect>,
   seeded: Bool,
@@ -72,7 +74,7 @@ pub type RunDecision = {
   reasons: Map<Int, Reason>,
   pending_seed_counts: Map<Int, Int>,
   runs: List<Int>,
-  running: Map<Int, Bool>,
+  running: Set<Int>,
   at: Map<Int, Int>,
   classes: List<Group>,
   parallelism: Parallelism,
@@ -82,9 +84,6 @@ fn reason_of(decided: RunDecision, index: Int) -> Reason =
   match decided.reasons.get(index) { Some(reason) -> reason, None -> Cached }
 
 fn runs_test(decided: RunDecision, index: Int) -> Bool = decided.running.contains(index)
-
-fn changed_read_of(decided: RunDecision, index: Int) -> Option<String> =
-  match reason_of(decided, index) { Changed(what) -> Some(what), _ -> None }
 
 fn selected_count(program: Program, decided: RunDecision) -> Int =
   program.cases.filter(|case: Case| runs_test(decided, case.index)).len()
@@ -100,14 +99,14 @@ fn group_of(decided: RunDecision, index: Int) -> Option<Int> = decided.at.get(in
 fn pending_seeds(decided: RunDecision, index: Int) -> Int =
   match decided.pending_seed_counts.get(index) { Some(count) -> count, None -> 0 }
 
-pub fn group_of_class(analysis: CheckedProgram, class: List<Int>) -> Group / {abort.raise} =
+pub fn group_of_class(analysis: TestListing, class: List<Int>) -> Group / {abort.raise} =
   {
     tests: class,
     effects: outside_effects_text(
       canonical(
         class.fold([], |accumulator: List<types::Effect>, i: Int|
           match test_at(analysis, i) {
-            Some(t) -> accumulator.concat(t.effects),
+            Some(t) -> accumulator.concat(t.info.effects),
             None -> accumulator,
           }),
       ),
@@ -126,9 +125,9 @@ pub fn conflicting_effects_text(case: Case) -> String =
   "{" ++ String::join(shared_texts(case), ", ") ++ "}"
 
 pub fn classes_of(program: Program, runs: List<Int>) -> List<List<Int>> / {abort.raise} =
-  group_by_conflict(scheduled_of(program, set_of(runs)))
+  group_by_conflict(scheduled_of(program, Set::of_list(runs)))
 
-fn scheduled_of(program: Program, running: Map<Int, Bool>) -> List<ScheduledTest> =
+fn scheduled_of(program: Program, running: Set<Int>) -> List<ScheduledTest> =
   program.cases.filter(|case: Case| running.contains(case.index)).map(|case: Case|
     { index: case.index, contended_effects: cross_test_effects(effects_of(case)) })
 
@@ -147,7 +146,7 @@ pub fn run_decision_of(
   classes: List<List<Int>>,
 ) -> RunDecision / {abort.raise} = {
   let runs = to_run(decisions).filter(|i: Int| case_of(program, i) != None);
-  let running = set_of(runs);
+  let running = Set::of_list(runs);
   {
     search: search,
     sim: sim,
@@ -194,7 +193,6 @@ pub type Program = {
   files: List<String>,
   places: List<SourceText>,
   modules: List<ModuleView>,
-  loaded_from_cache: Bool,
   phases: Phases,
   reused_members: List<Member>,
   declared: Int,
@@ -203,17 +201,11 @@ pub type Program = {
   filtered_out: Int,
   warnings: List<Diagnostic>,
   options: Json,
-  cache_stamp: Option<String>,
+  cache_stamp: String,
   unit: TestUnit,
 }
 
-pub type Backend = {
-  name: String,
-  fragment: Int,
-  entered: Int,
-  units: Option<Int>,
-  load_nanos: Option<Int>,
-}
+pub type Backend = { name: String, fragment: Int, entered: Int, load_nanos: Option<Int> }
 
 pub type Cost = { explored: Int, bounded: Bool, rendered: String }
 
@@ -241,7 +233,12 @@ pub type Outcome = {
   performs: Int,
 }
 
-pub type Site = { task: String, definition: Option<String>, access: String, at: Option<ModuleSpan> }
+pub type SourceSpan = { module: Int, start: Int, end: Int }
+
+pub type Site = { task: String, definition: Option<String>, access: String, at: Option<SourceSpan> }
+
+pub fn source_place(span: Option<SourceSpan>) -> Place =
+  match span { Some(s) -> InSource(s), None -> Unplaced }
 
 pub type Race = { left: Site, right: Site, step: Int }
 
@@ -358,51 +355,22 @@ fn milliseconds_json(us: Int) -> Json =
 pub fn display_of(program: Program, case: Case) -> String =
   if program.modules.len() > 1 { case.key } else { case.name }
 
-fn short_of(hash: Option<String>) -> String / {abort.raise} =
-  match hash { Some(h) -> h.slice(0, 12), None -> "-".repeat(12) }
-
-fn dim_place(
-  style: Style,
-  places: List<SourceText>,
-  a: Option<ModuleSpan>,
-) -> String / {abort.raise} =
-  match a {
-    None -> "",
-    Some(spot) -> match location_text(places, spot) {
-      Some(text) -> "   " ++ dim(style, text),
-      None -> "",
-    },
-  }
-
-pub fn primary_of(diagnostic: Diagnostic) -> Option<Label> =
-  diagnostic.labels.fold(None, |accumulator: Option<Label>, label: Label|
-    match accumulator {
-      Some(_) -> accumulator,
-      None -> if label.primary { Some(label) } else { None },
-    })
-
-fn label_at(label: Label) -> ModuleSpan =
-  { module: label.module, start: label.start, end: label.end }
+fn dim_place(style: Style, places: List<SourceText>, at: Place) -> String / {abort.raise} =
+  match location_text(places, at) { Some(text) -> "   " ++ dim(style, text), None -> "" }
 
 fn location_json(places: List<SourceText>, diagnostic: Diagnostic) -> Json / {abort.raise} =
-  match primary_of(diagnostic) {
-    None -> Null,
-    Some(l) -> editor_location_json(places, label_at(l)),
-  }
+  match primary_of(diagnostic) { None -> Null, Some(l) -> editor_location_json(places, l.place) }
 
 fn reason_key(reason: String) -> String = String::join(reason.split(" "), "_")
 
-fn reason_text(reason: String) -> String =
-  if reason == "new" { "this hash has never passed, so nothing is known about it" }
-  else if reason == "changed" {
-    "something the test read when it last passed has changed since, so that result can no longer be trusted"
-  } else if reason == "previous failure" {
-    "the last cached result is a failure, and a failure is never reused"
-  } else if reason == "cached" {
-    "this exact hash already passed; re-running cannot reveal anything new"
-  } else if reason == "same code" {
-    "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new"
-  } else { "no hash was produced, so no cached result can be trusted" }
+fn reason_text(reason: Reason) -> String =
+  match reason {
+    New -> "this hash has never passed, so nothing is known about it",
+    Cached -> "this exact hash already passed; re-running cannot reveal anything new",
+    SameCode ->
+      "this hash is new, but the code it compiles to already passed; re-running cannot reveal anything new",
+    Nondet -> "a `test/nondet` test runs every time, because its effects can write",
+  }
 
 pub fn isolated_as(host_case_indices: List<Int>, case: Case) -> String =
   isolation_word(isolation_of(host_use_of(host_case_indices, case)))
@@ -453,7 +421,7 @@ pub fn binding_lines(style: Style, o: Opening, c: Counts) -> List<String> / {abo
       indent ++ bold(style, c.host.to_string()) ++ " of " ++ c.total.to_string()
         ++ bold(style, " tests use the host")
         ++ " · "
-        ++ dim(style, "each result is cached with what the test read from the host"),
+        ++ dim(style, "these tests run every time, because their effects can write"),
       indent ++ dim(style, "host: " ++ count_of(o.operations, "operation") ++ " · " ++ o.digest),
     ]
   }
@@ -474,17 +442,12 @@ pub fn simulation_line(style: Style, report: RunReport) -> List<String> / {abort
   }
 
 fn compiled_line(style: Style, b: Backend) -> List<String> =
-  match b.units {
+  match b.load_nanos {
     None -> [],
-    Some(units) ->
+    Some(nanos) ->
       [
         indent
-          ++ dim(
-            style,
-            "loaded " ++ units.to_string() ++ " unit(s) in "
-              ++ ns_as_ms_tenths(match b.load_nanos { Some(n) -> n, None -> 0 })
-              ++ "ms",
-          ),
+          ++ dim(style, "loaded the compiled test library in " ++ ns_as_ms_tenths(nanos) ++ "ms"),
       ],
   }
 
@@ -503,17 +466,12 @@ fn backend_lines(style: Style, report: RunReport) -> List<String> =
       ),
   }
 
-fn bypass_lines(style: Style, flags: Flags) -> List<String> =
-  if !flags.no_cache { [] }
-  else { [indent ++ dim(style, "--no-cache: results were neither read nor recorded")] }
-
-fn filtered_lines(style: Style, program: Program) -> List<String> / {abort.raise} =
-  if program.filtered_out == 0 { [] }
-  else { [indent ++ dim(style, "--filter skipped " ++ count_of(program.filtered_out, "test"))] }
+fn filtered_lines(style: Style, filtered_out: Int) -> List<String> / {abort.raise} =
+  if filtered_out == 0 { [] }
+  else { [indent ++ dim(style, "--filter skipped " ++ count_of(filtered_out, "test"))] }
 
 fn head_lines(
   style: Style,
-  flags: Flags,
   program: Program,
   decided: RunDecision,
   o: Opening,
@@ -524,9 +482,7 @@ fn head_lines(
   ).concat(
     binding_lines(style, o, c),
   ).concat(
-    bypass_lines(style, flags),
-  ).concat(
-    filtered_lines(style, program),
+    filtered_lines(style, program.filtered_out),
   )
 }
 
@@ -537,7 +493,7 @@ pub fn opening_lines(
   decided: RunDecision,
   o: Opening,
 ) -> List<String> / {abort.raise} =
-  head_lines(style, flags, program, decided, o).concat(if flags.explain {
+  head_lines(style, program, decided, o).concat(if flags.explain {
     explain_lines(style, program, o.tests_using_host, decided)
   } else { [] }).concat(if decided.classes.len() == 0 { [] } else { [""] })
 
@@ -635,36 +591,31 @@ fn case_line(
     ++ dim(
       style,
       "isolation: " ++ isolation ++ explain_effects(isolation, case)
-        ++ (if case.seeded { " · searched" } else { "" })
-        ++ (match changed_read_of(decided, case.index) {
-          Some(what) -> " · moved: " ++ what,
-          None -> "",
-        }),
+        ++ (if case.seeded { " · searched" } else { "" }),
     )
 }
 
 fn key_lines(style: Style, program: Program) -> List<String> / {abort.raise} = {
-  let recorded = match program.cache_stamp {
-    Some(stamp) ->
-      "a result is cached under the test's hash and the runtime version " ++ short_of(Some(stamp))
-        ++ ", and under the code the test ran together with the values it read from the system",
-    None -> "nothing is cached: `--no-cache` reads and writes no cache entries",
-  };
+  let recorded = "a result is cached under the test's hash and the runtime version "
+    ++ short_of(program.cache_stamp)
+    ++ ", and under the code the test ran together with the values it read from the system";
   ["", indent ++ dim(style, "key"), indent ++ "  " ++ dim(style, recorded)]
 }
 
-fn reasons_seen(program: Program, decided: RunDecision) -> List<String> =
-  program.cases.fold([], |accumulator: List<String>, case: Case| {
-    let reason = reason_word(reason_of(decided, case.index));
-    if accumulator.contains(reason) { accumulator } else { accumulator.push(reason) }
+fn reasons_seen(program: Program, decided: RunDecision) -> List<Reason> =
+  program.cases.fold([], |accumulator: List<Reason>, case: Case| {
+    let reason = reason_of(decided, case.index);
+    if accumulator.any(|seen: Reason| reason_word(seen) == reason_word(reason)) { accumulator }
+    else { accumulator.push(reason) }
   })
 
 fn reason_lines(style: Style, program: Program, decided: RunDecision) -> List<String> = {
   let seen = reasons_seen(program, decided);
   if seen.len() == 0 { [] } else {
     ["", indent ++ dim(style, "why")].concat(
-      seen.map(|reason: String|
-        indent ++ "  " ++ reason.pad_right(16, " ") ++ " " ++ dim(style, reason_text(reason))),
+      seen.map(|reason: Reason|
+        indent ++ "  " ++ reason_word(reason).pad_right(16, " ") ++ " "
+          ++ dim(style, reason_text(reason))),
     )
   }
 }
@@ -928,7 +879,7 @@ pub fn secondary_lines(
   diagnostic: Diagnostic,
 ) -> List<String> / {abort.raise} =
   diagnostic.labels.filter(|label: Label| !label.primary).map(|label: Label|
-    "    " ++ String::of_bytes_lossy(label.text) ++ dim_place(style, places, Some(label_at(label))))
+    "    " ++ String::of_bytes_lossy(label.text) ++ dim_place(style, places, label.place))
 
 pub fn at_lines(
   style: Style,
@@ -937,7 +888,7 @@ pub fn at_lines(
 ) -> List<String> / {abort.raise} =
   match primary_of(diagnostic) {
     None -> [],
-    Some(l) -> match location_text(places, label_at(l)) {
+    Some(l) -> match location_text(places, l.place) {
       None -> [],
       Some(text) -> ["    at " ++ dim(style, text)],
     },
@@ -953,7 +904,7 @@ fn site_line(
     ++ (match site.definition { Some(d) -> d, None -> "-" })
     ++ "   "
     ++ site.access
-    ++ dim_place(style, places, site.at)
+    ++ dim_place(style, places, source_place(site.at))
 
 fn race_lines(
   style: Style,
@@ -1033,13 +984,16 @@ fn painted(style: Style, line: String) -> String =
   else if line.starts_with("@@") { dim(style, line) }
   else { line }
 
+fn changed_place(d: ChangeDiff) -> Place =
+  match d.at { Some(l) -> location_place(l), None -> Unplaced }
+
 fn diff_lines(
   style: Style,
   places: List<SourceText>,
   d: ChangeDiff,
 ) -> List<String> / {abort.raise} = {
   let head = "  " ++ bold(style, d.name) ++ " (" ++ kind_word(d.change) ++ ")"
-    ++ dim_place(style, places, d.at);
+    ++ dim_place(style, places, changed_place(d));
   let body = match d.diff {
     None -> ["    " ++ dim(style, "its text from when the test last passed is not stored")],
     Some(text) -> {
@@ -1145,12 +1099,11 @@ pub fn case_json(report: RunReport, case: Case, decided: RunDecision) -> Json / 
       { key: "key", value: Str(case.key) },
       { key: "name", value: Str(case.name) },
       { key: "module", value: Str(case.module) },
-      { key: "hash", value: string_or_null(case.hash) },
+      { key: "hash", value: Str(case.hash) },
       { key: "nondet", value: Bool(case.nondet) },
       { key: "selected", value: Bool(runs_test(decided, case.index)) },
       { key: "reason", value: Str(reason_key(reason_word(reason_of(decided, case.index)))) },
-      { key: "why", value: Str(reason_text(reason_word(reason_of(decided, case.index)))) },
-      { key: "changed_input", value: string_or_null(changed_read_of(decided, case.index)) },
+      { key: "why", value: Str(reason_text(reason_of(decided, case.index))) },
       { key: "group", value: int_or_null(group_of(decided, case.index)) },
       { key: "outside_effects", value: Str(case.effects) },
       { key: "isolation", value: Str(isolated_as(report.tests_using_host, case)) },
@@ -1221,7 +1174,6 @@ pub fn placed_cases(cases: List<Case>) -> Map<Int, Int> =
 fn outcome_json(program: Program, outcome: Outcome, d: RunDecision) -> Json / {abort.raise} = {
   let named = case_of(program, outcome.index);
   object([
-    { key: "index", value: int(outcome.index) },
     { key: "key", value: match named { Some(c) -> Str(c.key), None -> Null } },
     { key: "name", value: Str(match named { Some(c) -> c.name, None -> outcome.name }) },
     { key: "module", value: match named { Some(c) -> Str(c.module), None -> Null } },
@@ -1242,7 +1194,7 @@ fn outcome_json(program: Program, outcome: Outcome, d: RunDecision) -> Json / {a
   ])
 }
 
-fn span_json(a: Option<ModuleSpan>) -> Json =
+fn span_json(a: Option<SourceSpan>) -> Json =
   match a {
     None -> Null,
     Some(at) ->
@@ -1309,10 +1261,7 @@ fn diff_json(program: Program, d: ChangeDiff) -> Json / {abort.raise} =
   object([
     { key: "name", value: Str(d.name) },
     { key: "change", value: Str(kind_word(d.change)) },
-    {
-      key: "location",
-      value: match d.at { Some(at) -> editor_location_json(program.places, at), None -> Null },
-    },
+    { key: "location", value: editor_location_json(program.places, changed_place(d)) },
     { key: "diff", value: string_or_null(d.diff) },
   ])
 
@@ -1326,7 +1275,7 @@ fn parallelism_json(v: Parallelism) -> Json =
     { key: "shared_groups", value: int(v.shared_groups) },
   ])
 
-pub fn phases_json(phases: Phases) -> Json =
+fn phases_json(phases: Phases) -> Json =
   object([
     { key: "read", value: milliseconds_json(phases.read_us) },
     { key: "front", value: milliseconds_json(phases.front_end_us) },
@@ -1346,7 +1295,7 @@ fn selection_json(
     { key: "cached", value: int(cached_count(program, decided)) },
     { key: "same_code", value: int(by_code_count(program, decided)) },
     { key: "filtered_out", value: int(program.filtered_out) },
-    { key: "recorded_under", value: string_or_null(program.cache_stamp) },
+    { key: "recorded_under", value: Str(program.cache_stamp) },
     {
       key: "groups",
       value: Array(range(0, decided.classes.len()).map(|i: Int| group_json(decided, i))),
@@ -1389,7 +1338,6 @@ fn backend_json(report: RunReport) -> Json =
         { key: "name", value: Str(b.name) },
         { key: "fragment", value: int(b.fragment) },
         { key: "load_nanos", value: int_or_null(b.load_nanos) },
-        { key: "units", value: int_or_null(b.units) },
         { key: "entered", value: int(b.entered) },
       ]),
   }
@@ -1416,12 +1364,7 @@ fn document(
       {
         key: "front_end",
         value: object(
-          [
-            { key: "incremental", value: Bool(program.loaded_from_cache) },
-            { key: "phases", value: phases_json(program.phases) },
-          ].concat(
-            program.reused_members,
-          ),
+          [{ key: "phases", value: phases_json(program.phases) }].concat(program.reused_members),
         ),
       },
       { key: "phases", value: run_phases_json(program.phases, report.spent) },
@@ -1437,7 +1380,6 @@ fn document(
         ),
       },
       { key: "filters", value: Array(flags.filters.map(|f: String| Str(f))) },
-      { key: "no_cache", value: Bool(flags.no_cache) },
       { key: "hosts", value: report.hosts },
       { key: "workers", value: int(report.workers) },
       { key: "options", value: with_sim(program.options, decided.sim) },
@@ -1538,8 +1480,6 @@ pub fn unbound(style: Style, rejection: Rejection) -> CommandOutput / {abort.rai
   }
 }
 
-pub fn test_at(analysis: CheckedProgram, i: Int) -> Option<TestInfo> = analysis.checked.tests.at(i)
-
 fn resource_rank(r: types::Resource) -> Int =
   match r {
     NamedResource(_) -> 0,
@@ -1586,10 +1526,8 @@ test "a test's status mark is a word in plain output and a single symbol in styl
 }
 
 test "a reason is written as separate words in the report line and with underscores in the JSON document" {
-  assert_eq(reason_key(reason_word(PreviousFailure)), "previous_failure");
   assert_eq(reason_key(reason_word(New)), "new");
-  assert_eq(reason_word(Changed("the file `a.ply`")), "changed");
-  assert_eq(reason_word(Unhashed), "unhashed")
+  assert_eq(reason_key(reason_word(SameCode)), "same_code")
 }
 
 test "a search report gives the interleavings explored, and how many a search ignoring time or pruning would have explored" {
@@ -1635,17 +1573,8 @@ test "a bounded naive count makes the ratio a lower bound" {
 }
 
 test "every reason has an explanation of its own" {
-  let lines = [New, Changed(""), PreviousFailure, Cached, SameCode, Unhashed].map(
-    |r: Reason| reason_word(r),
-  ).map(
-    reason_text,
-  );
-  assert_eq(
-    range(0, 6).filter(|i: Int|
-      range(0, 6).filter(|j: Int| lines.at_or(i, "") == lines.at_or(j, "")).len() == 1).len(
-    ),
-    6,
-  )
+  let lines = [New, Cached, SameCode, Nondet].map(reason_text);
+  assert(lines.all(|line: String| lines.filter(|other: String| other == line).len() == 1))
 }
 
 test "a failed load exits with code 2 and prints its errors with their count" {
@@ -1666,23 +1595,21 @@ test "a binding that does not match the program is a start-up failure naming no 
   ])
 }
 
-test "a program cannot declare an effect named `scoped` or `sim`, because the test scheduler reserves those names" {
+test "a program cannot declare an effect named `scoped`, which `with_scope` reserves, while its own `sim` is a separate effect from the scheduler's" {
   let rejected = |name: String|
-    match analyse(
-        parse_all([
-          {
-            name: b"",
-            source_text: Bytes::of_string(
-              "effect " ++ name ++ " {\n  write put[users](v: Int) -> Unit\n}\ntest \"claim\" { "
-                ++ name
-                ++ ".put[users](1) }\n",
-            ),
-          },
-        ]),
-      ) {
+    match analysed_over([
+        {
+          name: b"m",
+          source_text: Bytes::of_string(
+            "effect " ++ name ++ " {\n  write put[users](v: Int) -> Unit\n}\ntest \"claim\" { "
+              ++ name
+              ++ ".put[users](1) }\n",
+          ),
+        },
+      ]) {
       Analysed(_) -> false,
       Rejected(_) -> true,
     };
   assert(rejected("scoped"));
-  assert(rejected("sim"))
+  assert(!rejected("sim"))
 }

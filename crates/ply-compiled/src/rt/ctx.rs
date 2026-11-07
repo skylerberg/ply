@@ -549,6 +549,30 @@ impl Ctx {
         d
     }
 
+    pub(crate) fn failed_through_call(&mut self, site: Span) {
+        if site == Span::DUMMY {
+            return;
+        }
+        let Some(d) = self.diagnostic.as_mut() else {
+            return;
+        };
+        if d.labels.iter().any(|l| l.span == site) {
+            return;
+        }
+        match d
+            .labels
+            .iter_mut()
+            .find(|l| l.primary && l.span == Span::DUMMY)
+        {
+            Some(unplaced) => unplaced.span = site,
+            None => d.labels.push(ply_core::Label {
+                span: site,
+                message: "called here".to_string(),
+                primary: false,
+            }),
+        }
+    }
+
     pub fn take_failure(&mut self) -> Option<Diagnostic> {
         match self.pending.take() {
             Some(Unhandled::Raised { effect, op, args }) => {

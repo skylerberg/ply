@@ -1,25 +1,24 @@
+import compiler.check.resolve.tables (error_unplaced)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.facts (CheckedProgram)
 import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
-import compiler.front.published (analyse)
 import compiler.front.rows (module_of)
 import compiler.check.infer.checker (DefinitionInfo)
-import compiler.check.resolve.tables (Diagnostic, error_at)
+import compiler.front.checking.view
+import compiler.front.checking.world (Modules)
+import compiler.store.memo (memo)
+import compiler.check.resolve.tables (Diagnostic)
 import compiler.check.types (Type, NamedType, FunctionType, RecordType, field_get, effects_text,
                              type_text, without_raises)
 import report (count_of)
 import std.list
 import std.string
 import proof.prover_input (whole_of)
-import compiler.syntax.parsing (no_module, dummy_span)
 
 fn flag(name: String) -> String = "`--config-schema " ++ name ++ "`"
 
 fn flag_error(message: String, notes: List<Bytes>) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0440",
-    no_module,
-    dummy_span,
     Bytes::of_string(message),
     b"this argument is the run's configuration",
     notes,
@@ -77,8 +76,8 @@ fn unfit_reason(definition_info: DefinitionInfo) -> Option<String> / {abort.rais
     _ -> Some("it is not a function, and a schema is created by calling a function"),
   }
 
-fn unknown_schema(view: CheckedProgram, name: String) -> Diagnostic / {abort.raise} = {
-  let found = view.checked.definitions.filter(|definition_info: DefinitionInfo|
+fn unknown_schema(definitions: List<DefinitionInfo>, name: String) -> Diagnostic / {abort.raise} = {
+  let found = definitions.filter(|definition_info: DefinitionInfo|
     unfit_reason(definition_info) == None).map(|definition_info: DefinitionInfo|
     String::of_bytes_lossy(definition_info.name)).sort(
   );
@@ -107,13 +106,13 @@ fn find_definition(definitions: List<DefinitionInfo>, name: String) -> Option<De
     })
 
 pub fn resolve_schema(
-  view: CheckedProgram,
+  definitions: List<DefinitionInfo>,
   name: String,
 ) -> Result<String, Diagnostic> / {abort.raise} =
   match check_name(name) {
     Err(d) -> Err(d),
-    Ok(_) -> match find_definition(view.checked.definitions, name) {
-      None -> Err(unknown_schema(view, name)),
+    Ok(_) -> match find_definition(definitions, name) {
+      None -> Err(unknown_schema(definitions, name)),
       Some(d) -> match unfit_reason(d) {
         Some(reason) -> Err(not_a_schema(name, reason)),
         None -> Ok(name),
@@ -122,12 +121,21 @@ pub fn resolve_schema(
   }
 
 pub fn schema_error(
-  view: CheckedProgram,
+  definitions: List<DefinitionInfo>,
   named: Option<String>,
 ) -> Option<Diagnostic> / {abort.raise} =
   match named {
     None -> None,
-    Some(name) -> match resolve_schema(view, name) { Ok(_) -> None, Err(d) -> Some(d) },
+    Some(name) -> match resolve_schema(definitions, name) { Ok(_) -> None, Err(d) -> Some(d) },
+  }
+
+pub fn listed_schema_error(
+  modules: Modules,
+  schema: Option<String>,
+) -> Option<Diagnostic> / {memo.read, abort.raise} =
+  match schema {
+    None -> None,
+    Some(_) -> schema_error(view::listed(modules).checked.definitions, schema),
   }
 
 pub fn name_error(named: Option<String>) -> Option<Diagnostic> / {abort.raise} =
@@ -136,12 +144,12 @@ pub fn name_error(named: Option<String>) -> Option<Diagnostic> / {abort.raise} =
     Some(name) -> match check_name(name) { Ok(_) -> None, Err(d) -> Some(d) },
   }
 
-const specs: CheckedProgram =
+const specs: List<DefinitionInfo> =
   checked_program_of(
     whole_of(
       b"type Shape = | SText | SInt | SBool | SSecret\ntype Key = { name: String, shape: Shape, required: Bool, default: Option<String> }\ntype ConfigSpec = { keys: List<Key> }\neffect log { write emit(Bytes) -> Unit }\nfn config() -> ConfigSpec = { keys: [] }\nfn two(a: Int) -> ConfigSpec = { keys: [] }\nfn number() -> Int = 1\nfn loud() -> ConfigSpec / {log.write} = { log.emit(b\"x\"); config() }\n",
     ),
-  )
+  ).checked.definitions
 
 fn rejection_of(r: Result<String, Diagnostic>) -> Diagnostic / {abort.raise} =
   match r { Ok(_) -> panic("the flag took a name it should reject"), Err(d) -> d }
@@ -193,7 +201,10 @@ test "a name the program does not declare lists the schemas it does" {
   assert_eq(d.message, b"`--config-schema service.config` names no definition in this program");
   assert_eq(d.notes_text, [b"this program has: m.config"]);
   let none = rejection_of(
-    resolve_schema(checked_program_of(whole_of(b"fn number() -> Int = 1\n")), "m.config"),
+    resolve_schema(
+      checked_program_of(whole_of(b"fn number() -> Int = 1\n")).checked.definitions,
+      "m.config",
+    ),
   );
   assert_eq(none.notes_text, [
     b"this program declares no function without parameters that returns a `ConfigSpec`",

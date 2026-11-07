@@ -1,6 +1,9 @@
+import std.set (Set)
+import compiler.check.resolve.tables (error_unplaced)
+import compiler.syntax.parsing (Error, Warning)
 import compiler.cc
-import compiler.check.resolve.tables (Diagnostic, error_at)
-import compiler.front.rows (ModuleSpan)
+import compiler.check.resolve.tables (Diagnostic)
+import compiler.check.resolve.tables (Place)
 import compiler.load (LoadedAnalysis)
 import diagnostic (diagnostic_of, shown)
 import std.env (env)
@@ -8,7 +11,8 @@ import machine
 import machine (ConfigOptions, RunConfiguration)
 import std.machine as entering
 import units
-import units (emit)
+import compiler.emit.keys (Named)
+import units (CodeProgram, emit)
 import paths
 import report (count_of)
 import std.config (Key, Shape, SText, SInt, SBool, SSecret, optional)
@@ -22,7 +26,6 @@ import std.value (Value, VRecord, VList, VStr, VCtor, VBool, Field)
 import std.bytes (is_digit, is_letter)
 import std.json
 import proof.obligation (plural)
-import compiler.syntax.parsing (no_module, dummy_span)
 
 pub type Source = | BySet | ByFile(String) | ByEnvironment | ByDefault
 
@@ -83,10 +86,8 @@ fn is_secret(shape: Option<Shape>) -> Bool = shape == Some(SSecret)
 pub const redacted: String = "****"
 
 fn error(code: Bytes, message: String, label: String, notes: List<String>) -> Diagnostic =
-  error_at(
+  error_unplaced(
     code,
-    no_module,
-    dummy_span,
     Bytes::of_string(message),
     Bytes::of_string(label),
     notes.map(Bytes::of_string),
@@ -327,12 +328,12 @@ fn duplicate_key_error(name: String) -> Diagnostic =
 
 fn check_unique_keys(keys: List<Key>) -> Option<Diagnostic> = {
   let walked = keys.fold(
-    { seen: Map::new(), dup: None },
-    |accumulator: { seen: Map<String, Bool>, dup: Option<String> }, k: Key|
+    { seen: Set::empty(), dup: None },
+    |accumulator: { seen: Set<String>, dup: Option<String> }, k: Key|
       match accumulator.dup {
         Some(_) -> accumulator,
         None -> if accumulator.seen.contains(k.name) { { ..accumulator, dup: Some(k.name) } }
-        else { { ..accumulator, seen: accumulator.seen.insert(k.name, true) } },
+        else { { ..accumulator, seen: accumulator.seen.insert(k.name) } },
       },
   );
   match walked.dup { Some(name) -> Some(duplicate_key_error(name)), None -> None }
@@ -419,7 +420,7 @@ fn undeclared(key: String, source: Source, schema: Schema) -> Diagnostic = {
       "only `--set` and `--config` are checked: an environment is full of names that have nothing to do with this program",
     ],
   );
-  { ..d, severity: b"warning" }
+  { ..d, severity: Warning }
 }
 
 type ResolveState = { values: Map<String, ResolvedValue>, diagnostics: List<Diagnostic> }
@@ -468,8 +469,8 @@ pub fn resolved(
   let warnings = match schema {
     None -> [],
     Some(active_schema) -> {
-      let declared = active_schema.keys.fold(Map::new(), |m: Map<String, Bool>, k: Key|
-        m.insert(k.name, true));
+      let declared = active_schema.keys.fold(Set::empty(), |m: Set<String>, k: Key|
+        m.insert(k.name));
       sources.supplied.fold([], |diagnostics: List<Diagnostic>, key: String, sup: SuppliedValue|
         if is_explicit(sup.source) && !declared.contains(key) {
           diagnostics.push(undeclared(key, sup.source, active_schema))
@@ -489,14 +490,6 @@ pub fn resolved(
     })
   }
 }
-
-pub fn supplied(
-  flags: ConfigOptions,
-) -> RunConfiguration / {abort.raise, env.variables, env.working_directory, fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.read_file[cwd], fs.read_file[abs]} =
-  match resolve_configuration({ ..flags, schema: None }, |name: String| Err([])) {
-    Ok(r) -> run_configuration(r.configuration),
-    Err(_) -> machine::empty_configuration,
-  }
 
 pub fn resolve_configuration<| e>(
   flags: ConfigOptions,
@@ -520,16 +513,16 @@ pub fn resolve_configuration<| e>(
 }
 
 pub fn evaluate_schema(
-  front: LoadedAnalysis,
+  program: CodeProgram,
   profile: cc::Profile,
   name: String,
-) -> Result<Value, List<Diagnostic>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.unit, emit.compiled, abort.raise} =
-  match units::whole_library(front, profile) {
+) -> Result<Value, List<Diagnostic>> / {entering::machine.open, entering::machine.enter, entering::machine.close, emit.code, emit.libraries, abort.raise} =
+  match emit.libraries(emit.code(program, [Named(Bytes::of_string(name))]), profile) {
     Err(diagnostics) -> Err(diagnostics),
     Ok(library) -> match entering::machine.open(library) {
       Err(reason) -> Err([machine::unit_load_error(reason)]),
       Ok(has_input) -> {
-        let entered = evaluate_schema_on_unit(has_input.unit, machine::roots_of(front.dump), name);
+        let entered = evaluate_schema_on_unit(has_input.unit, program.roots, name);
         entering::machine.close(has_input.unit);
         entered
       },
@@ -538,7 +531,7 @@ pub fn evaluate_schema(
 
 pub fn evaluate_schema_on_unit(
   unit: Int,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   name: String,
 ) -> Result<Value, List<Diagnostic>> / {entering::machine.enter, abort.raise} = {
   let o = entering::machine.enter(
@@ -551,8 +544,8 @@ pub fn evaluate_schema_on_unit(
     entering::NoRoot ->
       Err([
         diagnostic_of(
-          "error",
-          "E0440",
+          Error,
+          b"E0440",
           "`--config-schema " ++ name ++ "` names no definition in this program",
           [],
           ["an artifact carries a schema only when `ply build --config-schema` shipped it"],
@@ -563,8 +556,8 @@ pub fn evaluate_schema_on_unit(
       Err(raised) ->
         Err([
           diagnostic_of(
-            "error",
-            "E0440",
+            Error,
+            b"E0440",
             "`--config-schema " ++ name ++ "` could not be evaluated: "
               ++ String::of_bytes_lossy(shown(raised).message),
             [],
@@ -961,7 +954,7 @@ test "an undeclared key given by `--set` or a file gives warning W0607 listing t
     spec_of([optional("SERVICE_REGION", SText)]),
   );
   assert_eq(codes(r.warnings), [b"W0607", b"W0607"]);
-  assert_eq(r.warnings.map(|diagnostic: Diagnostic| diagnostic.severity), [b"warning", b"warning"]);
+  assert_eq(r.warnings.map(|diagnostic: Diagnostic| diagnostic.severity), [Warning, Warning]);
   assert(
     r.warnings.fold(false, |hit: Bool, diagnostic: Diagnostic|
       hit || says(diagnostic, "--set supplies `SERVICE_PROT`")),

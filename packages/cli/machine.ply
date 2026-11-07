@@ -1,11 +1,13 @@
+import compiler.codes (internal_error_code, replay_mismatch_code, timed_out_code)
+import compiler.syntax.parsing (Error, Warning, Note, Severity)
 import std.cli (Parsed, has, parse_nat, value, values_of, nat_value)
 import surface
 import surface (range_of)
 import compiler.cc
-import compiler.check.resolve.tables (Diagnostic, Label)
+import compiler.check.resolve.tables (Diagnostic, Label, InSource, Place, Unplaced, place_module)
 import compiler.unit (entered_timeout_ms)
-import compiler.front.rows (Dump, EmitterRoot, ModuleSpan)
-import compiler.syntax.parsing (no_module)
+import compiler.front.rows (Dump, EmitterRoot)
+import compiler.emit.keys (printed)
 import diagnostic (SourceText, RuntimeDiagnostic, diagnostic_of, with_notes, shown)
 import entry (Main, Module)
 import std.bin
@@ -77,7 +79,7 @@ pub const default_options: Options =
     argv: [],
   }
 
-pub effect set MachineAccess = {entering::machine.report, entering::machine.open, entering::machine.bind, entering::machine.hosting, entering::machine.enter, entering::machine.changed_read, entering::machine.unbind, entering::machine.close}
+pub effect set MachineAccess = {entering::machine.report, entering::machine.open, entering::machine.bind, entering::machine.hosting, entering::machine.enter, entering::machine.unbind, entering::machine.close}
 
 pub const evaluation_limits: entering::Run =
   { ..entering::unbounded, timeout_ms: entered_timeout_ms }
@@ -149,67 +151,74 @@ pub fn project_root(path: String) -> String = {
   if joined == "" { if path.starts_with("/") { "/" } else { "." } } else { joined }
 }
 
-pub fn roots_of(d: Dump) -> Map<Bytes, ModuleSpan> =
-  d.emitter_roots.fold(Map::new(), |m: Map<Bytes, ModuleSpan>, r: EmitterRoot|
-    m.insert(r.root, r.at))
+pub fn roots_of(d: Dump) -> Map<Bytes, Place> =
+  d.emitter_roots.fold(Map::new(), |m: Map<Bytes, Place>, r: EmitterRoot|
+    m.insert(printed(r.key), r.at))
 
 pub fn arguments_of(values: List<Value>) -> Bytes =
   match value::encode(VList(values)) { Some(b) -> b, None -> b"" }
 
-pub fn is_internal_error(code: Bytes) -> Bool = code == b"E0505" || code == b"E0415"
+pub fn is_internal_error(code: Bytes) -> Bool =
+  code == internal_error_code || code == replay_mismatch_code
 
-pub fn is_timed_out(code: Bytes) -> Bool = code == b"W0612"
+pub fn is_timed_out(code: Bytes) -> Bool = code == timed_out_code
 
 pub fn locate_failure(
   f: entering::Failure,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   entry: String,
 ) -> RuntimeDiagnostic / {abort.raise} = {
-  let labels = f.labels.map(|l: entering::Label| {
-    let text = Bytes::of_string(l.text);
-    match site_of(l.site, roots) {
-      Some(at) ->
-        { module: at.module, start: at.start, end: at.end, primary: l.primary, text: text },
-      None -> { module: no_module, start: 0, end: 0, primary: l.primary, text: text },
-    }
-  });
+  let labels = f.labels.map(|l: entering::Label|
+    { place: site_of(l.site, roots), primary: l.primary, text: Bytes::of_string(label_text(l)) });
+  let elsewhere = f.labels.flat_map(|l: entering::Label| named_without_place(l, roots));
   let details = entering::failure_details(f);
   let diagnostic = diagnostic_of(
-    severity_word(f.severity),
-    f.code,
+    severity_of(f.severity),
+    Bytes::of_string(f.code),
     f.message,
     labels,
-    details.notes,
+    details.notes.concat(elsewhere),
   );
-  let unplaced = entry != "" && labels.all(|l: Label| l.module == no_module);
+  let unplaced = entry != "" && elsewhere == []
+    && labels.all(|l: Label| place_module(l.place) == None);
   {
     diagnostic: if unplaced { with_notes(diagnostic, [unlocated_note(entry)]) } else { diagnostic },
     values: details.values,
   }
 }
 
+fn label_text(l: entering::Label) -> String =
+  match l.site { None -> l.text, Some(s) -> l.text ++ ", in `" ++ s.root ++ "`" }
+
+fn named_without_place(l: entering::Label, roots: Map<Bytes, Place>) -> List<String> =
+  match l.site {
+    None -> [],
+    Some(_) -> if place_module(site_of(l.site, roots)) == None { [label_text(l)] } else { [] },
+  }
+
 pub fn unplaced(f: entering::Failure) -> Diagnostic / {abort.raise} =
   shown(locate_failure(f, Map::new(), ""))
 
-pub fn site_of(site: Option<entering::Site>, roots: Map<Bytes, ModuleSpan>) -> Option<ModuleSpan> =
+pub fn site_of(site: Option<entering::Site>, roots: Map<Bytes, Place>) -> Place =
   match site {
-    None -> None,
+    None -> Unplaced,
     Some(s) -> match roots.get(Bytes::of_string(s.root)) {
-      Some(root) ->
-        Some({ module: root.module, start: root.start + s.start, end: root.start + s.end }),
-      None -> None,
+      Some(InSource(root)) ->
+        InSource({ module: root.module, start: root.start + s.start, end: root.start + s.end }),
+      Some(whole) -> whole,
+      None -> Unplaced,
     },
   }
 
-fn severity_word(s: entering::Severity) -> String =
-  match s { entering::Error -> "error", entering::Warning -> "warning", entering::Note -> "note" }
+fn severity_of(s: entering::Severity) -> Severity =
+  match s { entering::Error -> Error, entering::Warning -> Warning, entering::Note -> Note }
 
 fn unlocated_note(entry: String) -> String =
   "this error was raised by the runtime, not by the program's source code: it happened while `"
     ++ entry
     ++ "` was running, in code the runtime runs on the program's behalf"
 
-pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
+pub fn step_of(s: entering::Step, roots: Map<Bytes, Place>) -> Step =
   {
     scheduler: s.scheduler,
     task: s.task,
@@ -223,10 +232,7 @@ pub fn step_of(s: entering::Step, roots: Map<Bytes, ModuleSpan>) -> Step =
       }),
     site: {
       definition: s.definition,
-      span: match site_of(s.site, roots) {
-        Some(at) -> at,
-        None -> { module: no_module, start: 0, end: 0 },
-      },
+      span: match site_of(s.site, roots) { InSource(at) -> Some(at), _ -> None },
     },
     vector_clock: s.stamp,
   }
@@ -235,7 +241,7 @@ pub type CallResult = { result: Result<Value, RuntimeDiagnostic>, warnings: List
 
 pub fn machine_call(
   unit: Int,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   name: String,
   args: List<Value>,
   run: entering::Run,
@@ -246,7 +252,7 @@ pub fn machine_call(
 
 pub fn result_of(
   o: entering::Outcome,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
   name: String,
 ) -> Result<Value, RuntimeDiagnostic> / {abort.raise} =
   if o.exit != None { Ok(value::VUnit) } else {
@@ -265,18 +271,18 @@ pub fn result_of(
 
 pub fn warnings_of(
   o: entering::Outcome,
-  roots: Map<Bytes, ModuleSpan>,
+  roots: Map<Bytes, Place>,
 ) -> List<Diagnostic> / {abort.raise} =
   o.warnings.map(|w: entering::Failure| shown(locate_failure(w, roots, "")))
 
 pub fn unit_load_error(reason: String) -> Diagnostic =
-  diagnostic_of("error", "E0450", "the unit could not be loaded: " ++ reason, [], [
+  diagnostic_of(Error, b"E0450", "the unit could not be loaded: " ++ reason, [], [
     "a unit is compiled against the runtime that opens it; this is Ply's fault",
   ])
 
 pub fn internal_error(name: String, reason: String) -> RuntimeDiagnostic =
   {
-    diagnostic: diagnostic_of("error", "E0505", "`" ++ name ++ "` " ++ reason, [], [
+    diagnostic: diagnostic_of(Error, internal_error_code, "`" ++ name ++ "` " ++ reason, [], [
       "this is Ply's fault, not the program's",
     ]),
     values: [],
@@ -358,8 +364,8 @@ test "`--config-schema` sets the configuration schema for both `build` and `run`
     Some("m.spec"),
   )
 }
-test "`locate_failure` converts label positions relative to a function into module offsets, and adds a note when a label has no position" {
-  let roots = Map::new().insert(b"m.f", { module: 0, start: 100, end: 120 });
+test "`locate_failure` converts label positions relative to a function into module offsets and names the function, and adds a note when a label has no position" {
+  let roots = Map::new().insert(b"m.f", InSource({ module: 0, start: 100, end: 120 }));
   let failure: entering::Failure = {
     code: "E0502",
     severity: entering::Error,
@@ -370,16 +376,36 @@ test "`locate_failure` converts label positions relative to a function into modu
   };
   let r = locate_failure(failure, roots, "m.main");
   assert_eq(r.diagnostic.labels, [
-    { module: 0, start: 103, end: 107, primary: true, text: b"here" },
+    {
+      place: InSource({ module: 0, start: 103, end: 107 }),
+      primary: true,
+      text: b"here, in `m.f`",
+    },
   ]);
-  assert_eq(r.diagnostic.notes, 0);
+  assert_eq(r.diagnostic.notes_text, []);
   let lost = locate_failure(
     { ..failure, labels: [{ site: None, primary: true, text: "here" }] },
     roots,
     "m.main",
   );
-  assert_eq(lost.diagnostic.labels.map(|l: Label| l.module), [no_module]);
-  assert_eq(lost.diagnostic.notes, 1)
+  assert_eq(lost.diagnostic.labels.map(|l: Label| l.place), [Unplaced]);
+  assert_eq(lost.diagnostic.notes_text, [Bytes::of_string(unlocated_note("m.main"))]);
+  let outside = locate_failure(
+    {
+      ..failure,
+      labels: [
+        { site: Some({ root: "lib.g", start: 1, end: 2 }), primary: true, text: "raised here" },
+        { site: Some({ root: "m.f", start: 3, end: 7 }), primary: false, text: "called here" },
+      ],
+    },
+    roots,
+    "m.main",
+  );
+  assert_eq(outside.diagnostic.labels.map(|l: Label| l.place), [
+    Unplaced,
+    InSource({ module: 0, start: 103, end: 107 }),
+  ]);
+  assert_eq(outside.diagnostic.notes_text, [b"raised here, in `lib.g`"])
 }
 
 pub type Rejection = {

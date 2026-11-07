@@ -1,6 +1,11 @@
-import compiler.load (Derives)
+import compiler.front.checking (in_memory)
+import progress
+import sources (ProjectFiles)
+import compiler.load (Loads)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
+import std.bin
+import std.set (Set)
 import std.random (entropy)
 import std.time (time)
 import builder (builder)
@@ -8,13 +13,15 @@ import args (Flags, style_of)
 import library (read, workspace_error, workspace_file, workspace_root)
 import paths
 import std.path (join)
-import program (Program, load_program, location_of, own_laws, own_tests, program_view)
+import program (location_of, manifest_of, own_laws, own_tests, places_of, session)
+import compiler.front.checking.view
+import compiler.front.checking.view (Listed, ListingRejected, listed_over)
+import compiler.front.checking.world (Modules)
+import compiler.front.checking.groups (ProgramSummary)
 import report (CommandOutput, schema_version, ok_code, indent, count_of, rejected, reported)
 import std.env (env)
 import std.term (Style, bold, dim)
-import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
-import compiler.front.facts (CheckedProgram, Frame)
-import compiler.front.published (analyse)
+import compiler.front.facts (ProgramListing)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.rows (Outline, OutlineItem, OutlinedEffect, OutlinedFunction, OutlinedType)
 import compiler.check.infer.checker (LawInfo, Location, TestInfo)
@@ -24,8 +31,9 @@ import compiler.store.hash.forms (DeclarationNamed, FunctionNamed, ItemKeyed, Re
                                   Subject, used_from)
 import std.fs (fs)
 import std.json (Json, Null, Str, Bool, Number, Array, object)
-import std.pkg (Suite, Workspace)
+import std.pkg (Manifest, Suite, Workspace)
 import std.string
+import project_store
 
 pub type Kind = | FunctionKind | TypeKind | EffectKind
 
@@ -34,6 +42,12 @@ type Written = { name: Bytes, kind: Kind, at: Location, public: Bool, entry: Boo
 pub type Listed = { name: Bytes, kind: Kind, location: Option<String> }
 
 pub type Unused = { definitions: Int, never_used: List<Listed>, only_tests: List<Listed> }
+
+derive bin for Kind
+
+derive bin for Listed
+
+derive bin for Unused
 
 pub type Walk = { written: List<Listed>, running: ReachableNames, testing: ReachableNames }
 
@@ -72,10 +86,8 @@ fn written_in(outline: Outline, module: Int) -> List<Written> =
       _ -> acc,
     })
 
-fn written_in_root_package(frame: Frame) -> List<Written> / {abort.raise} =
-  range(0, frame.outlines.len()).filter(|i: Int| frame.module_packages.at(i) == Some(0)).flat_map(
-    |i: Int| written_in(frame.outlines.get(i), i),
-  )
+fn written_in_root_package(listing: ProgramListing) -> List<Written> / {abort.raise} =
+  range(0, listing.root).flat_map(|i: Int| written_in(listing.outlines.get(i), i))
 
 fn subject_of(w: Written) -> Subject =
   match w.kind {
@@ -93,13 +105,13 @@ fn reached(names: ReachableNames, name: Bytes, kind: Kind) -> Bool =
 
 fn with_name(names: ReachableNames, name: Bytes, kind: Kind) -> ReachableNames =
   match kind {
-    FunctionKind -> { ..names, functions: names.functions.insert(name, true) },
-    TypeKind -> { ..names, declarations: names.declarations.insert(name, true) },
-    EffectKind -> { ..names, declarations: names.declarations.insert(name, true) },
+    FunctionKind -> { ..names, functions: names.functions.insert(name) },
+    TypeKind -> { ..names, declarations: names.declarations.insert(name) },
+    EffectKind -> { ..names, declarations: names.declarations.insert(name) },
   }
 
-fn importers_root(frame: Frame) -> Option<Bytes> =
-  match frame.manifest {
+fn importers_root(manifest: Option<Manifest>) -> Option<Bytes> =
+  match manifest {
     None -> None,
     Some(m) -> Some(Bytes::of_string(match m.prefix { Some(p) -> p, None -> m.name })),
   }
@@ -107,15 +119,15 @@ fn importers_root(frame: Frame) -> Option<Bytes> =
 fn as_imported(root: Option<Bytes>, name: Bytes) -> Bytes =
   match root { Some(r) -> qualify(r, name), None -> name }
 
-fn walk_of(
-  frame: Frame,
+fn walk_of<| e>(
+  listing: ProgramListing,
   tests: List<TestInfo>,
   laws: List<LawInfo>,
   public_is_used: Bool,
   root: Option<Bytes>,
-  located: (Location) -> Option<String> / {abort.raise},
-) -> Walk / {abort.raise} = {
-  let written = written_in_root_package(frame);
+  located: (Location) -> Option<String> / e,
+) -> Walk / {abort.raise | e} = {
+  let written = written_in_root_package(listing);
   let offers = public_is_used && !written.any(|w: Written| w.entry);
   let roots = written.filter(|w: Written| w.entry || w.held || (offers && w.public)).map(
     subject_of,
@@ -131,8 +143,8 @@ fn walk_of(
   {
     written: written.map(|w: Written|
       { name: as_imported(root, w.name), kind: w.kind, location: located(w.at) }),
-    running: imported(used_from(frame.hashes, roots)),
-    testing: imported(used_from(frame.hashes, roots.concat(checks))),
+    running: imported(used_from(listing.hashes, roots)),
+    testing: imported(used_from(listing.hashes, roots.concat(checks))),
   }
 }
 
@@ -149,10 +161,10 @@ fn unused_definitions(
   }
 
 fn joined(a: ReachableNames, b: ReachableNames) -> ReachableNames =
-  { functions: a.functions.merge(b.functions), declarations: a.declarations.merge(b.declarations) }
+  { functions: a.functions.union(b.functions), declarations: a.declarations.union(b.declarations) }
 
 pub fn across_packages(listed: List<Walk>, reading: List<Walk>) -> Unused = {
-  let nothing = { functions: Map::new(), declarations: Map::new() };
+  let nothing = { functions: Set::empty(), declarations: Set::empty() };
   let all = listed.concat(reading);
   unused_definitions(
     listed.flat_map(|walk: Walk| walk.written),
@@ -198,37 +210,38 @@ fn unused_output(style: Style, found: Unused) -> CommandOutput / {abort.raise} =
     code: ok_code,
   }
 
-fn walked_package(
+fn walked(
   flags: Flags,
   paths: List<paths::ResolvedPath>,
   public_is_used: Bool,
-) -> Result<Walk, CommandOutput> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} = {
-  let loaded: Program = load_program(paths, flags.verify_dependencies);
-  match program_view(loaded) {
-    None -> Err(rejected(style_of(flags), "unused", loaded.diagnostics, loaded.source_texts)),
-    Some(w) ->
+) -> Result<Walk, CommandOutput> / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], time.elapsed_ms, Loads, abort.raise, diverges} =
+  match progress::silently(||
+      session(paths, flags.verify_dependencies, |m: Modules, _: ProgramSummary| view::listed(m))) {
+    Err(r) -> Err(rejected(style_of(flags), "unused", r.diagnostics, r.places)),
+    Ok(opened) -> {
+      let places = places_of(opened);
       Ok(
         walk_of(
-          w.frame,
-          own_tests(loaded, w),
-          own_laws(loaded, w),
+          opened.value,
+          own_tests(opened.value),
+          own_laws(opened.value),
           public_is_used,
-          if public_is_used { None } else { importers_root(w.frame) },
-          |at: Location| location_of(loaded, at),
+          if public_is_used { None } else { importers_root(manifest_of(opened.project)) },
+          |at: Location| location_of(places, at),
         ),
-      ),
+      )
+    },
   }
-}
 
 fn walked_each(
   flags: Flags,
   root: String,
   dirs: List<String>,
-) -> Result<List<Walk>, CommandOutput> / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} =
+) -> Result<List<Walk>, CommandOutput> / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], env.working_directory, time.elapsed_ms, Loads, abort.raise, diverges} =
   dirs.fold(Ok([]), |acc: Result<List<Walk>, CommandOutput>, dir: String|
     match acc {
       Err(rejected_load) -> Err(rejected_load),
-      Ok(walks) -> match walked_package(flags, [paths::resolve(join(root, dir))], false) {
+      Ok(walks) -> match walked(flags, [paths::resolve(join(root, dir))], false) {
         Err(rejected_load) -> Err(rejected_load),
         Ok(walk) -> Ok(walks.push(walk)),
       },
@@ -244,7 +257,7 @@ fn reading_packages(w: Workspace) -> List<String> =
 
 fn over_workspace(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} = {
+) -> CommandOutput / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], env.working_directory, time.elapsed_ms, Loads, abort.raise, diverges} = {
   let s = style_of(flags);
   let dir = match flags.paths.at(0) { Some(r) -> r.absolute, None -> env.working_directory() };
   match workspace_root(dir) {
@@ -268,24 +281,25 @@ fn over_workspace(
   }
 }
 
+fn unused_from_sources(
+  flags: Flags,
+) -> CommandOutput / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], time.elapsed_ms, Loads, abort.raise, diverges} = {
+  match walked(flags, flags.paths, true) {
+    Err(rejected_load) -> rejected_load,
+    Ok(walk) ->
+      unused_output(style_of(flags), unused_definitions(walk.written, walk.running, walk.testing)),
+  }
+}
+
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.list_dir[shipped], fs.read_file[cwd], fs.read_file[abs], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], entropy.next, env.working_directory, time.now_ms, Derives, abort.raise, shipped.report_view_used, diverges} =
-  if flags.workspace { over_workspace(flags) } else {
-    match walked_package(flags, flags.paths, true) {
-      Err(rejected_load) -> rejected_load,
-      Ok(walk) ->
-        unused_output(
-          style_of(flags),
-          unused_definitions(walk.written, walk.running, walk.testing),
-        ),
-    }
-  }
+) -> CommandOutput / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.resolved_kind[cwd], fs.resolved_kind[abs], fs.write[cwd], fs.write[abs], fs.read[cwd], fs.read[abs], env.working_directory, time.elapsed_ms, Loads, abort.raise, diverges} =
+  if flags.workspace { over_workspace(flags) } else { unused_from_sources(flags) }
 
-fn analysed(sources: List<Source>) -> CheckedProgram / {abort.raise} =
-  match analyse(parse_all(sources)) {
-    Analysed(w) -> checked_program_of(w),
-    Rejected(rejected) ->
+fn listing_in(sources: List<Source>) -> ProgramListing / {abort.raise} =
+  match listed_over(in_memory(sources)) {
+    Listed(listing) -> listing,
+    ListingRejected(rejected) ->
       panic(
         "the fixture checks: "
           ++ String::join(rejected.map(|d: Diagnostic| String::of_bytes_lossy(d.message)), "; "),
@@ -297,11 +311,11 @@ fn walk_in(
   public_is_used: Bool,
   root: Option<Bytes>,
 ) -> Walk / {abort.raise} = {
-  let analysis = analysed(sources);
+  let listing = listing_in(sources);
   walk_of(
-    analysis.frame,
-    analysis.checked.tests,
-    analysis.checked.laws,
+    listing,
+    listing.checked.tests,
+    listing.checked.laws,
     public_is_used,
     root,
     |at: Location| None,

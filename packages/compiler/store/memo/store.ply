@@ -1,0 +1,193 @@
+import std.bin
+import std.bytes (u64_le, u64_be)
+import std.set (Set)
+import std.hash (blake3)
+import compiler.store.memo (Query, Queries)
+
+pub type Dependency =
+  | ExternalDependency({ kind: Bytes, at: Bytes, digest: Bytes })
+  | QueryDependency({ fact: Bytes, part: Bytes, digest: Option<Bytes> })
+
+pub type StoredFact = { parts: Map<Bytes, Bytes>, details: Bytes, depth: Int }
+
+pub type FactDetails = { query: Bytes, code: Bytes, input: Bytes, reads: List<Dependency> }
+
+pub type StoredInput = { kind: Bytes, at: Bytes, digest: Bytes }
+
+pub type Layer = | ProjectLayer | PackLayer
+
+derive bin for Dependency
+
+derive bin for StoredFact
+
+derive bin for FactDetails
+
+derive bin for StoredInput
+
+pub fn digest_of(query_output: Option<Bytes>) -> Bytes =
+  match query_output { Some(b) -> b"=".concat(blake3(b)), None -> b"-" }
+
+pub fn parts_digest(parts: Map<Bytes, Bytes>) -> Bytes / {abort.raise} =
+  blake3(bin::encode(parts, bin::map_bin(bin::bytes_bin(), bin::bytes_bin())))
+
+pub fn query_prefix(name: Bytes) -> Bytes / {abort.raise} = blake3(name).slice(0, 4)
+
+pub fn fact_key(name: Bytes, input: Bytes) -> Bytes / {abort.raise} =
+  query_prefix(name).concat(blake3(input).slice(0, 12))
+
+fn length_prefixed(b: Bytes) -> Bytes = u64_le(b.len()).concat(b)
+
+pub fn input_id(input: StoredInput) -> Bytes / {abort.raise} = location_id(input.kind, input.at)
+
+pub fn location_id(kind: Bytes, at: Bytes) -> Bytes / {abort.raise} =
+  blake3(Bytes::concat_all([b"ply.input\x00", length_prefixed(kind), at])).slice(0, 16)
+
+pub fn interfaces<| e>(queries: Queries<| e>) -> Map<Bytes, Set<Bytes>> =
+  queries.named.fold(Map::new(), |found: Map<Bytes, Set<Bytes>>, name: Bytes, q: Query<| e>|
+    if q.interface.is_empty() { found } else { found.insert(name, q.interface) })
+
+pub type EncodedDetails = { details: FactDetails, encoded: Bytes, digest: Bytes }
+
+pub fn encoded_details(d: FactDetails) -> EncodedDetails / {abort.raise} = {
+  let encoded = bin::encode(d, fact_details_bin());
+  { details: d, encoded: encoded, digest: blake3(encoded) }
+}
+
+pub effect memo_store {
+  read fact(key: Bytes) -> Option<StoredFact>
+  read details(digest: Bytes) -> FactDetails
+  read output(digest: Bytes) -> Option<Bytes>
+  read dependents(key: Bytes) -> List<Bytes>
+  read has_dependents(key: Bytes) -> Bool
+  read inputs() -> List<StoredInput>
+  read facts_of(prefix: Bytes, layer: Layer) -> List<Bytes>
+  read code(name: Bytes, layer: Layer) -> Option<Bytes>
+  read shipped_fact(key: Bytes) -> Bool
+  read external(kind: Bytes, at: Bytes) -> InputRead
+  read is_out_of_date(key: Bytes) -> Bool
+  read next_out_of_date() -> Option<Waited>
+  read out_of_date_level() -> List<Waited>
+  write put(key: Bytes, fact: StoredFact, details: FactDetails, encoded_details: Bytes, outputs: Map<Bytes, Bytes>, lasting: Bool) -> Unit
+  write deepen(key: Bytes, depth: Int) -> Unit
+  write computed(query: Bytes) -> Unit
+  write keep_output(digest: Bytes, output: Bytes, lasting: Bool) -> Unit
+  write delete(key: Bytes) -> Unit
+  write add_dependent(key: Bytes, dependent: Bytes) -> Unit
+  write remove_dependent(key: Bytes, dependent: Bytes) -> Unit
+  write put_input(input: StoredInput) -> Unit
+  write delete_input(id: Bytes) -> Unit
+  write put_code(name: Bytes, hash: Bytes) -> Unit
+  write mark_out_of_date(key: Bytes, depth: Int) -> Unit
+  write settle(key: Bytes) -> Unit
+  write log_change(key: Bytes) -> Unit
+  write note_edit() -> Unit
+  read deferred_kind(key: Bytes) -> Option<Bytes>
+  write defer_products(kinds: Map<Bytes, Bytes>) -> Unit
+  write push_products(kind: Bytes) -> Unit
+  read logged_changes(kind: Bytes) -> List<Bytes>
+  write log_read(kind: Bytes) -> Unit
+}
+
+pub type Waiting = {
+  depths: Map<Bytes, Int>,
+  order: Map<Bytes, Bool>,
+  products: Map<Bytes, Bytes>,
+  pushing: Set<Bytes>,
+}
+
+pub type Waited = { key: Bytes, depth: Int }
+
+pub const nothing_waiting: Waiting =
+  { depths: Map::new(), order: Map::new(), products: Map::new(), pushing: Set::empty() }
+
+pub fn deferred_kind(w: Waiting, key: Bytes) -> Option<Bytes> / {abort.raise} =
+  match w.products.get(key.slice(0, 4)) {
+    Some(kind) -> if w.pushing.contains(kind) { None } else { Some(kind) },
+    None -> None,
+  }
+
+pub fn nothing_left_waiting(w: Waiting) -> Unit / {abort.raise} =
+  if w.depths.len() > 0 { panic("a run reached its commit with facts still out of date") }
+
+fn waiting_name(depth: Int, key: Bytes) -> Bytes = u64_be(depth).concat(key)
+
+pub fn with_mark(w: Waiting, key: Bytes, depth: Int) -> Waiting = {
+  let unmarked = without_mark(w, key);
+  {
+    ..unmarked,
+    depths: unmarked.depths.insert(key, depth),
+    order: unmarked.order.insert(waiting_name(depth, key), true),
+  }
+}
+
+pub fn with_mark_moved(w: Waiting, key: Bytes, depth: Int) -> Waiting =
+  if w.depths.contains(key) { with_mark(w, key, depth) } else { w }
+
+pub fn without_mark(w: Waiting, key: Bytes) -> Waiting =
+  match w.depths.get(key) {
+    None -> w,
+    Some(d) -> { ..w, depths: w.depths.remove(key), order: w.order.remove(waiting_name(d, key)) },
+  }
+
+pub fn first_waiting(w: Waiting) -> Option<Waited> / {abort.raise} =
+  match w.order.range(None, true, None, true, 1) {
+    [first, ..] -> {
+      let key = first.key.slice(8, first.key.len());
+      Some({ key: key, depth: match w.depths.get(key) { Some(d) -> d, None -> 0 } })
+    },
+    [] -> None,
+  }
+
+pub fn lowest_waiting(w: Waiting) -> List<Waited> / {abort.raise} =
+  match first_waiting(w) {
+    None -> [],
+    Some(first) ->
+      w.order.range(
+        Some(u64_be(first.depth)),
+        true,
+        Some(u64_be(first.depth + 1)),
+        false,
+        w.order.len(),
+      ).map(|entry: { key: Bytes, value: Bool }|
+        { key: entry.key.slice(8, entry.key.len()), depth: first.depth }),
+  }
+
+pub type InputRead = { value: Option<Bytes>, digest: Bytes }
+
+pub effect session_inputs {
+  read held(id: Bytes) -> Option<InputRead>
+  write hold(id: Bytes, read: InputRead) -> Unit
+}
+
+pub fn with_session_inputs<a | e>(
+  body: () -> a / {session_inputs.read, session_inputs.write | e},
+) -> a / e =
+  handle {
+    body()
+  } with {
+    var held: Map<Bytes, InputRead> = Map::new(),
+    session_inputs.held(id) -> held.get(id),
+    session_inputs.hold(id, read) -> {
+      held = held.insert(id, read);
+    },
+  }
+
+pub fn session_input<| e>(
+  id: Bytes,
+  read: () -> Option<Bytes> / {abort.raise | e},
+) -> InputRead / {session_inputs.read, session_inputs.write, abort.raise | e} =
+  match session_inputs.held(id) {
+    Some(x) -> x,
+    None -> {
+      let value = read();
+      let x = { value: value, digest: digest_of(value) };
+      session_inputs.hold(id, x);
+      x
+    },
+  }
+
+test "a key marked again at another depth moves in the queue and leaves it when it settles" {
+  let moved = with_mark(with_mark(nothing_waiting, b"k", 1), b"k", 5);
+  assert_eq(first_waiting(moved), Some({ key: b"k", depth: 5 }));
+  assert_eq(first_waiting(without_mark(moved, b"k")), None)
+}

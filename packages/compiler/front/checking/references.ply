@@ -1,0 +1,126 @@
+import compiler.store.memo (memo, fact_inspection, FactReader)
+import compiler.store.handles (readers_of_fact, readers_of_keyed_part, input_read_by)
+import compiler.syntax.items (Module, Derivation, parse, member_of)
+import compiler.syntax.node_ids (numbered_module)
+import compiler.syntax.parsing (Error)
+import compiler.front.diagnostics (parse_from)
+import compiler.check.resolve (ResolveSucceeded, ResolveFailed, resolve_group)
+import compiler.check.resolve.tables (Diagnostic, ParsedModule, Resolution)
+import compiler.check.resolve.bindings (Written, written)
+import compiler.front.checking.world (ModuleKey, InterfaceKey, module_kind, imports_query,
+                                      with_decode_cache)
+import compiler.front.checking.groups (OwnerKey, UnitKey, CheckGroupKey, SignatureGroupKey,
+                                       with_stored_reads, import_packages, module_owners,
+                                       owner_facts, owners_query, declared_part,
+                                       name_declaration_query, symbol_part, header_query,
+                                       visible_modules_query, group_query, signatures_query,
+                                       cycles_query, group_imports_query, signature_imports_query,
+                                       typed_query, signature_declarations_query, calls_query,
+                                       owner_imports_query, value_call_modules_query)
+
+pub type ResolvedModule = {
+  tree: Module,
+  parsed: ParsedModule,
+  resolution: Resolution,
+  written: List<Written>,
+  import_targets: List<Bytes>,
+}
+
+fn derivations_of(key: ModuleKey) -> List<Derivation> / {memo.read, abort.raise} =
+  module_owners(key).fold([], |found: List<Derivation>, owner: Bytes|
+    owner_facts(key, owner).text.derived.fold(found, |all: List<Derivation>, d: Derivation|
+      all.push_unique(d)))
+
+pub fn resolved_module(
+  key: ModuleKey,
+  text: Bytes,
+) -> Result<ResolvedModule, List<Diagnostic>> / {memo.read, abort.raise} =
+  with_decode_cache(||
+    with_stored_reads(key, || {
+      let parsed = parse_from(
+        0,
+        { name: key.module, source_text: text },
+        parse(text),
+        derivations: derivations_of(key),
+      );
+      if parsed.diagnostics.len() > 0 { Err(parsed.diagnostics) } else {
+        match resolve_group([{ module: parsed.module, tables: import_packages(key) }], []) {
+          ResolveFailed(diagnostics) -> Err(diagnostics),
+          ResolveSucceeded(x) -> if x.diagnostics.any(|d: Diagnostic| d.severity == Error) {
+            Err(x.diagnostics)
+          } else {
+            Ok({
+              tree: numbered_module(parse(text).node),
+              parsed: x.modules.get(0),
+              resolution: x.resolution,
+              written: written(x.resolution, 0, numbered_module(parse(text).node)),
+              import_targets: x.resolution.imports.get(0).map(|t: Int| x.modules.get(t).name),
+            })
+          },
+        }
+      }
+    }))
+
+fn own_module(module: Bytes, shipped: Bool) -> Option<Bytes> =
+  if shipped { None } else { Some(module) }
+
+fn module_of_reader(r: FactReader) -> Option<Bytes> / {abort.raise} = {
+  let of_module = |k: ModuleKey| own_module(k.module, k.shipped);
+  let of_owner = |k: OwnerKey| own_module(k.module, k.shipped);
+  let of_unit = |k: UnitKey| own_module(k.module, k.shipped);
+  let of_check_group = |k: CheckGroupKey| own_module(k.module, k.shipped);
+  let of_signature_group = |k: SignatureGroupKey| own_module(k.module, k.shipped);
+  let of_interface = |k: InterfaceKey| own_module(k.module, k.shipped);
+  [
+    input_read_by(owners_query(), r).and_then(of_module),
+    input_read_by(header_query(), r).and_then(of_module),
+    input_read_by(imports_query(), r).and_then(of_module),
+    input_read_by(visible_modules_query(), r).and_then(of_module),
+    input_read_by(group_query(), r).and_then(of_check_group),
+    input_read_by(signatures_query(), r).and_then(of_signature_group),
+    input_read_by(cycles_query(), r).and_then(of_unit),
+    input_read_by(group_imports_query(), r).and_then(of_check_group),
+    input_read_by(signature_imports_query(), r).and_then(of_signature_group),
+    input_read_by(typed_query(), r).and_then(of_owner),
+    input_read_by(signature_declarations_query(), r).and_then(of_owner),
+    input_read_by(calls_query(), r).and_then(of_owner),
+    input_read_by(owner_imports_query(), r).and_then(of_owner),
+    input_read_by(value_call_modules_query(), r).and_then(of_interface),
+  ].fold(None, |found: Option<Bytes>, m: Option<Bytes>| match found { Some(_) -> found, None -> m })
+}
+
+fn modules_of_readers(readers: List<FactReader>, module: Bytes) -> List<Bytes> / {abort.raise} =
+  readers.fold([], |found: List<Bytes>, r: FactReader|
+    match module_of_reader(r) {
+      Some(m) -> if m == module { found } else { found.push_unique(m) },
+      None -> found,
+    })
+
+pub fn simple_part(name: Bytes) -> Bytes / {abort.raise} =
+  match member_of(name) { Some(m) -> m.member, None -> name }
+
+pub fn modules_reading(
+  module: Bytes,
+  names: List<Bytes>,
+) -> List<Bytes> / {fact_inspection.read, abort.raise} = {
+  let key = { module: module, shipped: false, tested: false };
+  modules_of_readers(
+    names.fold([], |found: List<FactReader>, name: Bytes|
+      found.concat(
+        readers_of_fact(name_declaration_query(), {
+          module: module,
+          shipped: false,
+          full_text: false,
+          name: name,
+        }),
+      ).concat(
+        readers_of_keyed_part(declared_part(), key, name),
+      ).concat(
+        readers_of_keyed_part(symbol_part(), false, simple_part(name)),
+      )),
+    module,
+  )
+}
+
+pub fn modules_importing(module: Bytes) -> List<Bytes> / {fact_inspection.read, abort.raise} =
+  modules_of_readers(fact_inspection.input_readers(module_kind, module), module)

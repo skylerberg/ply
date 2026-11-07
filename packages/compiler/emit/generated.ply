@@ -16,16 +16,16 @@ import compiler.check.types (Type, VariableType, NamedType, FunctionType, Record
                              fields_sorted)
 import compiler.emit.typing (unknown_type)
 import std.list
-import std.list (zip)
 import compiler.syntax.patterns (LiteralChar)
 import std.bytes (ascii_of_int)
 import compiler.emit.c (BoolKind, BoxedKind, IntKind, width_named)
 import compiler.emit.keys
 import compiler.emit.keys (name_in_module, RootKey, Generated, TypeOperation, Reflect, Show, Digest,
-                           ContainerWalk, Lower, Lift, Wrapping, Opening, root_name, root_text,
-                           operation_name)
-import compiler.emit.representations (Constructors, SumConstructor, OpenShape, Definition,
-                                      EmitParam, at_args, kind_of, runtime_object,
+                           ContainerWalk, Lower, Lift, Wrapping, Opening, OnCase, OnWordForm,
+                           Unboxed, root_name, root_text, operation_name)
+import compiler.emit.lower.module_context (scheme_called)
+import compiler.emit.representations (EmitReads, ShapeReads, code_facts, SumConstructor, OpenShape,
+                                      Definition, EmitParam, at_args, kind_of, runtime_object,
                                       contains_resource, constructor_fields_at, release_effects)
 import compiler.emit.lower.strings (strings_root, strings_code)
 import compiler.emit.marks (marked_type, marked_key, without_marks, dynamic_form, has_marks)
@@ -35,7 +35,7 @@ import compiler.emit.writing (unspanned_code, prelude_call, placed, int_code, bo
                               applied, builtin_call, native_call, compare_call, constructor_made,
                               prelude_made, prelude_pattern, value_made, if_code, match_code,
                               block_code, some_or, sequence, value_type, Bound, bound_from,
-                              bound_pattern, bound_read)
+                              bound_each, bound_pattern, bound_read)
 
 fn is_key_value(t: Type) -> Bool =
   match t { RecordType(fs) -> fs.map(|f: Field| f.name) == [b"key", b"value"], _ -> false }
@@ -43,15 +43,10 @@ fn is_key_value(t: Type) -> Bool =
 const walk_operations: List<Bytes> =
   [b"equal", b"equal_from", b"ordered", b"ordered_from"].concat(gathering_walks)
 
-const gathering_walks: List<Bytes> =
-  [
-    b"reflect_from",
-    b"shown_from",
-    b"digest_from",
-    b"reflect_entries_from",
-    b"shown_entries_from",
-    b"digest_entries_from",
-  ]
+const value_walks: List<Bytes> =
+  [b"reflect_from", b"shown_from", b"reflect_entries_from", b"shown_entries_from"]
+
+const gathering_walks: List<Bytes> = value_walks.concat([b"digest_from", b"digest_entries_from"])
 
 const marshal_loops: List<Bytes> =
   [b"lower_items", b"lower_entries", b"lift_items", b"lift_entries"]
@@ -69,7 +64,7 @@ pub fn container_reads_argument(operation: Bytes, k: Int) -> Bool =
       || operation == b"let_go_items"
   }
 
-pub fn container_definitions(module: Bytes, t: Type) -> List<Definition> / {abort.raise} =
+pub fn container_definitions(module: Bytes, t: Type) -> List<Definition> / {EmitReads} =
   [Reflect, Show, Digest].concat(walk_operations.map(ContainerWalk)).map(
     |written_op: TypeOperation| {
       let operation = operation_name(written_op);
@@ -115,17 +110,12 @@ pub type GeneratedRoot = {
   performs: Effects,
 }
 
-pub fn container_code(
-  module: Bytes,
-  constructors: Constructors,
-  operation: Bytes,
-  t: Type,
-) -> GeneratedRoot / {abort.raise} =
+pub fn container_code(module: Bytes, operation: Bytes, t: Type) -> GeneratedRoot / {EmitReads} =
   if strings_root(operation) {
     let s = strings_code(module, operation, t);
     { params: s.params, code: s.code, definitions: s.here, performs: no_effects }
   } else {
-    let e = container_walk_code(module, constructors, operation, t);
+    let e = container_walk_code(module, operation, t);
     let word = |n: Bytes|
       { name: n, kind: BoxedKind, ty: kind_of(t).ty, of: Some(t), lambda: None };
     let index = { name: b"i", kind: IntKind, ty: OpenShape([]), of: Some(int_type), lambda: None };
@@ -141,10 +131,9 @@ pub fn container_code(
 
 fn container_walk_code(
   module: Bytes,
-  constructors: Constructors,
   operation: Bytes,
   t: Type,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let args = match t { NamedType(c) -> c.args, _ -> [] };
   let kind = match t { NamedType(c) -> c.name, _ -> b"" };
   let fields_of = match t { RecordType(fs) -> fs, NominalType(x) -> x.fields, _ -> [] };
@@ -485,7 +474,7 @@ fn container_walk_code(
       if reflecting { b"reflect_entries_from" } else { b"shown_entries_from" }
     } else if reflecting { b"reflect_from" }
     else { b"shown_from" };
-    value_made(constructors, made, [
+    value_made(made, [
       looped(loop_name, [
         walked_of(a),
         empty(if kind == map_name { entry_of_values } else { value }),
@@ -506,46 +495,44 @@ pub type InstanceFunction = {
 
 pub fn key_instance(
   module: Bytes,
-  here: List<Definition>,
   items: List<Item>,
   ty: Type,
-) -> Option<InstanceFunction> =
-  instance_for(module, here, ty, |c: Bytes|
+) -> Option<InstanceFunction> / {EmitReads} =
+  instance_for(ty, |c: Bytes|
     items.fold(None, |accumulator: Option<Bytes>, item: Item|
       match item {
         InstanceItem(d) -> if d.kind == KeyInstance && qualify(module, d.target.name) == c {
-          Some(d.function.name)
+          Some(qualify(module, d.function.name))
         } else { accumulator },
         _ -> accumulator,
       }))
 
 pub fn numeric_instance(
   module: Bytes,
-  here: List<Definition>,
   items: List<Item>,
   ty: Type,
   operation: Bytes,
-) -> Option<InstanceFunction> =
-  instance_for(module, here, ty, |c: Bytes|
+) -> Option<InstanceFunction> / {EmitReads} =
+  instance_for(ty, |c: Bytes|
     items.fold(None, |accumulator: Option<Bytes>, item: Item|
       match item {
         NumericItem(d) -> if qualify(module, d.target.name) == c {
-          match numeric_by(d, operation) { Some(by) -> Some(by.name), None -> accumulator }
+          match numeric_by(d, operation) {
+            Some(by) -> Some(qualify(module, by.name)),
+            None -> accumulator,
+          }
         } else { accumulator },
         _ -> accumulator,
       }))
 
 fn instance_for(
-  module: Bytes,
-  here: List<Definition>,
   ty: Type,
   named: (Bytes) -> Option<Bytes>,
-) -> Option<InstanceFunction> =
+) -> Option<InstanceFunction> / {EmitReads} =
   match ty {
     NamedType(c) -> match named(c.name) {
       None -> None,
-      Some(f) -> match here.fold(None, |s: Option<Scheme>, h: Definition|
-          if h.name == f { h.scheme } else { s }) {
+      Some(f) -> match scheme_called(f) {
         Some(scheme) -> match scheme.ty {
           FunctionType(fn_type) -> {
             let at_type = fn_type.params.push(fn_type.return_type).fold(
@@ -574,7 +561,7 @@ fn instance_for(
                   _ -> found,
                 }));
             Some({
-              full: qualify(module, f),
+              full: f,
               args: args,
               fn_type: at_args(scheme.ty, scheme.type_variables, args),
               return_type: at_args(fn_type.return_type, scheme.type_variables, args),
@@ -622,9 +609,10 @@ pub fn equality_code(ty: Type, cs: List<SumConstructor>) -> Code = {
   let sum = match ty { NamedType(c) -> c.name, _ -> b"" };
   let arms = cs.map(|c: SumConstructor| {
     let xs = bound_from(2, b"x", c.fields);
-    let ys = bound_from(2 + xs.len(), b"y", c.fields);
-    let same = zip(xs, ys).fold(None, |both: Option<Code>, p: { first: Bound, second: Bound }| {
-      let eq = binary_of(b"eq", bound_read(p.first), bound_read(p.second));
+    let paired = bound_each(2 + xs.len(), b"y", xs, |x: Bound| x.ty);
+    let ys = paired.map(|p: { bound: Bound, item: Bound }| p.bound);
+    let same = paired.fold(None, |both: Option<Code>, p: { bound: Bound, item: Bound }| {
+      let eq = binary_of(b"eq", bound_read(p.item), bound_read(p.bound));
       Some(match both { None -> eq, Some(b) -> binary_of(b"and", b, eq) })
     });
     let inner = match_code(
@@ -693,16 +681,15 @@ pub fn ordering_code(ty: Type, cs: List<SumConstructor>) -> Code = {
     { arms: [], slot: 4 },
     |accumulator: { arms: List<CodeArm>, slot: Int }, c: SumConstructor| {
       let xs = bound_from(accumulator.slot, b"x", c.fields);
-      let ys = bound_from(accumulator.slot + xs.len(), b"y", c.fields);
-      let orders = bound_from(
+      let paired = bound_each(accumulator.slot + xs.len(), b"y", xs, |x: Bound| x.ty);
+      let ys = paired.map(|p: { bound: Bound, item: Bound }| p.bound);
+      let fields = bound_each(
         accumulator.slot + 2 * xs.len(),
         b"o",
-        c.fields.map(|_: Type| ordering_type),
-      );
-      let fields = zip(zip(xs, ys), orders).map(
-        |p: { first: { first: Bound, second: Bound }, second: Bound }|
-          { x: p.first.first, y: p.first.second, order: p.second },
-      );
+        paired,
+        |_: { bound: Bound, item: Bound }| ordering_type,
+      ).map(|o: { bound: Bound, item: { bound: Bound, item: Bound } }|
+        { x: o.item.item, y: o.item.bound, order: o.bound });
       let compared = |f: Ordered| compare_call(bound_read(f.x), bound_read(f.y));
       let lex = fields.fold_right(None, |f: Ordered, later: Option<Code>|
         Some(match later {
@@ -785,13 +772,7 @@ fn joined(parts: List<Code>) -> Code =
     bytes_type,
   )
 
-pub fn digest_code(
-  module: Bytes,
-  constructors: Constructors,
-  here: List<Definition>,
-  items: List<Item>,
-  ty: Type,
-) -> Code / {abort.raise} = {
+pub fn digest_code(module: Bytes, items: List<Item>, ty: Type) -> Code / {EmitReads} = {
   let a = slot_code(b"a", 0, ty);
   let counted = |tag: Int, n: Int| byte_of_int(tag).concat(little_endian_64(n));
   let blob = |tag: Int, b: Bytes| counted(tag, b.len()).concat(b);
@@ -809,9 +790,9 @@ pub fn digest_code(
           accumulator.concat([bytes_code(blob(13, f.name)), part(field_code(a, f.name, f.ty))])),
       ),
     None -> match ty {
-      NamedType(c) -> match constructors.sums.get(c.name) {
+      NamedType(c) -> match code_facts.sum_named(c.name) {
         None -> read,
-        Some(cs) -> match key_instance(module, here, items, ty) {
+        Some(cs) -> match key_instance(module, items, ty) {
           Some(k) -> joined([bytes_code(byte_of_int(16)), part(stated_call(k, [a]))]),
           None ->
             match_code(
@@ -857,12 +838,10 @@ pub fn digest_code(
 
 pub fn reflection_code(
   module: Bytes,
-  constructors: Constructors,
-  here: List<Definition>,
   items: List<Item>,
   shown: Bool,
   ty: Type,
-) -> Code = {
+) -> Code / {EmitReads} = {
   let a = slot_code(b"a", 0, ty);
   let value = value_type;
   let part = |x: Code|
@@ -875,7 +854,7 @@ pub fn reflection_code(
   let field = RecordType([{ name: b"name", ty: string_type }, { name: b"value", ty: value }]);
   match fields_of {
     Some(fs) ->
-      value_made(constructors, b"std.value.VRecord", [
+      value_made(b"std.value.VRecord", [
         unspanned_code(
           CodeList({
             items: fs.map(|f: Field|
@@ -893,21 +872,22 @@ pub fn reflection_code(
         ),
       ]),
     None -> match ty {
-      NamedType(c) -> match constructors.sums.get(c.name) {
+      NamedType(c) -> match code_facts.sum_named(c.name) {
         None -> part(a),
         Some(cs) -> {
           let stated = if !shown { None } else {
-            instance_for(module, here, ty, |n: Bytes|
+            instance_for(ty, |n: Bytes|
               items.fold(None, |accumulator: Option<Bytes>, item: Item|
                 match item {
                   InstanceItem(d) -> if d.kind == ShowInstance
-                      && qualify(module, d.target.name) == n { Some(d.function.name) }
-                  else { accumulator },
+                      && qualify(module, d.target.name) == n {
+                    Some(qualify(module, d.function.name))
+                  } else { accumulator },
                   _ -> accumulator,
                 }))
           };
           match stated {
-            Some(f) -> value_made(constructors, b"std.value.VShown", [stated_call(f, [a])]),
+            Some(f) -> value_made(b"std.value.VShown", [stated_call(f, [a])]),
             None ->
               match_code(
                 a,
@@ -928,7 +908,7 @@ pub fn reflection_code(
                           args: xs.map(bound_pattern),
                         }),
                         guard: None,
-                        body: value_made(constructors, b"std.value.VCtor", [
+                        body: value_made(b"std.value.VCtor", [
                           string_code(sum_constructor.name),
                           unspanned_code(
                             CodeList({ items: xs.map(|x: Bound| part(bound_read(x))) }),
@@ -950,13 +930,7 @@ pub fn reflection_code(
   }
 }
 
-pub fn release_resource_code(
-  module: Bytes,
-  constructors: Constructors,
-  here: List<Definition>,
-  key: RootKey,
-  ty: Type,
-) -> GeneratedRoot / {abort.raise} = {
+pub fn release_resource_code(module: Bytes, key: RootKey, ty: Type) -> GeneratedRoot / {EmitReads} = {
   let a = slot_code(b"a", 0, ty);
   let fields_of = match ty {
     RecordType(fs) -> Some(fs),
@@ -967,17 +941,15 @@ pub fn release_resource_code(
     Some(fs) ->
       {
         code: sequence(
-          fs.filter(|f: Field| contains_resource(constructors, f.ty)).map(|f: Field|
+          fs.filter(|f: Field| contains_resource(f.ty)).map(|f: Field|
             let_go(field_code(a, f.name, f.ty))),
         ),
         here: [],
       },
     None -> match ty {
-      NamedType(c) -> match constructors.released.get(c.name) {
-        Some(by) -> {
-          let local = name_in_module(module, by);
-          match instance_for(module, here, ty, |n: Bytes|
-              if n == c.name { Some(local) } else { None }) {
+      NamedType(c) -> match code_facts.released_by(c.name) {
+        Some(released) -> {
+          match instance_for(ty, |n: Bytes| if n == c.name { Some(released.by) } else { None }) {
             Some(f) -> { code: stated_call(f, [a]), here: [] },
             None -> { code: unit_code, here: [] },
           }
@@ -986,18 +958,10 @@ pub fn release_resource_code(
           let items = keys::generated_key(ContainerWalk(b"let_go_items"), ty, module);
           {
             code: call_of(module, items, [a, int_code(0)], unit_type),
-            here: [
-              definition_of(
-                module,
-                items,
-                [ty, int_type],
-                unit_type,
-                release_effects(constructors, ty),
-              ),
-            ],
+            here: [definition_of(module, items, [ty, int_type], unit_type, release_effects(ty))],
           }
         } else {
-          match constructors.sums.get(c.name) {
+          match code_facts.sum_named(c.name) {
             None -> { code: unit_code, here: [] },
             Some(cs) ->
               {
@@ -1011,8 +975,7 @@ pub fn release_resource_code(
                         b"x",
                         constructor_fields_at(sum_constructor, c.args),
                       );
-                      let resource_payloads = xs.filter(|x: Bound|
-                        contains_resource(constructors, x.ty));
+                      let resource_payloads = xs.filter(|x: Bound| contains_resource(x.ty));
                       {
                         arms: accumulator.arms.push({
                           pattern: CodeConstructorPattern({
@@ -1020,7 +983,7 @@ pub fn release_resource_code(
                             name: sum_constructor.name,
                             case: sum_constructor.index,
                             args: xs.map(|x: Bound|
-                              if contains_resource(constructors, x.ty) { bound_pattern(x) }
+                              if contains_resource(x.ty) { bound_pattern(x) }
                               else { CodeWildcardPattern }),
                           }),
                           guard: None,
@@ -1040,15 +1003,10 @@ pub fn release_resource_code(
       _ -> { code: unit_code, here: [] },
     },
   };
-  generated_root(module, key, [ty], unit_type, body, release_effects(constructors, ty))
+  generated_root(module, key, [ty], unit_type, body, release_effects(ty))
 }
 
-pub fn release_items_code(
-  module: Bytes,
-  constructors: Constructors,
-  key: RootKey,
-  ty: Type,
-) -> GeneratedRoot / {abort.raise} = {
+pub fn release_items_code(module: Bytes, key: RootKey, ty: Type) -> GeneratedRoot / {EmitReads} = {
   let item = match ty {
     NamedType(c) -> match c.args.at(0) { Some(t) -> t, None -> unknown_type },
     _ -> unknown_type,
@@ -1078,7 +1036,7 @@ pub fn release_items_code(
       ),
       here: [],
     },
-    release_effects(constructors, ty),
+    release_effects(ty),
   )
 }
 
@@ -1094,31 +1052,20 @@ pub fn is_marshal_operation(operation: TypeOperation) -> Bool =
     _ -> false,
   }
 
-pub fn marshal_root(
-  module: Bytes,
-  constructors: Constructors,
-  key: RootKey,
-) -> GeneratedRoot / {abort.raise} =
+pub fn marshal_root(module: Bytes, key: RootKey) -> GeneratedRoot / {EmitReads} =
   match key {
     Generated(w, _) -> {
       let marked = marked_type(w.ty, w.marks);
       match w.operation {
-        Lower ->
-          generated_root(
-            module,
-            key,
-            [w.ty],
-            unit_type,
-            lowering_code(module, constructors, marked),
-          ),
-        Lift -> generated_root(module, key, [], w.ty, lifting_code(module, constructors, marked)),
+        Lower -> generated_root(module, key, [w.ty], unit_type, lowering_code(module, marked)),
+        Lift -> generated_root(module, key, [], w.ty, lifting_code(module, marked)),
         Wrapping ->
           generated_root(
             module,
             key,
             [w.ty],
             dynamic_form(marked),
-            dynamic_code(module, constructors, marked, true),
+            dynamic_code(module, marked, true),
           ),
         Opening ->
           generated_root(
@@ -1126,7 +1073,7 @@ pub fn marshal_root(
             key,
             [dynamic_form(marked)],
             w.ty,
-            dynamic_code(module, constructors, marked, false),
+            dynamic_code(module, marked, false),
           ),
         ContainerWalk(c) -> match if dynamic_loops.contains(c) { dynamic_loop(module, c, marked) }
           else { marshal_loop(module, c, w.ty, marked) } {
@@ -1151,10 +1098,10 @@ pub fn marshal_root(
 const dynamic_loops: List<Bytes> =
   [b"keeping_items", b"opening_items", b"keeping_entries", b"opening_entries"]
 
-fn dynamic_side(ty: Type, retained: Bool) -> Type / {abort.raise} =
+fn dynamic_side(ty: Type, retained: Bool) -> Type / {EmitReads} =
   if retained { dynamic_form(ty) } else { without_marks(ty) }
 
-fn wrap_handles(x: Code, ty: Type, keeping: Bool) -> Code / {abort.raise} =
+fn wrap_handles(x: Code, ty: Type, keeping: Bool) -> Code / {EmitReads} =
   if !has_marks(ty) { x } else {
     builtin_call(
       if keeping { b"?keeping" } else { b"?opening" },
@@ -1166,10 +1113,9 @@ fn wrap_handles(x: Code, ty: Type, keeping: Bool) -> Code / {abort.raise} =
 
 fn dynamic_code(
   module: Bytes,
-  constructors: Constructors,
   ty: Type,
   keeping: Bool,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let from = dynamic_side(ty, !keeping);
   let a = slot_code(b"a", 0, from);
   let into = dynamic_side(ty, keeping);
@@ -1230,7 +1176,7 @@ fn dynamic_code(
         b"cannot convert a value of a runtime-managed type, even when that type is only an operation's type argument",
       )
     } else {
-      match constructors.sums.get(c.name) {
+      match code_facts.sum_named(c.name) {
         None ->
           internal_error(
             b"no constructors are known for the type being converted: ".concat(c.name),
@@ -1239,12 +1185,13 @@ fn dynamic_code(
           let arms = cs.fold(
             { arms: [], slot: 1 },
             |accumulator: { arms: List<CodeArm>, slot: Int }, sum_constructor: SumConstructor| {
-              let args = constructor_fields_at(sum_constructor, c.args);
-              let xs = bound_from(
+              let args = bound_each(
                 accumulator.slot,
                 b"x",
-                args.map(|t: Type| dynamic_side(t, !keeping)),
+                constructor_fields_at(sum_constructor, c.args),
+                |t: Type| dynamic_side(t, !keeping),
               );
+              let xs = args.map(|x: { bound: Bound, item: Type }| x.bound);
               {
                 arms: accumulator.arms.push({
                   pattern: CodeConstructorPattern({
@@ -1258,8 +1205,8 @@ fn dynamic_code(
                     c.name,
                     sum_constructor.name,
                     sum_constructor.index,
-                    zip(xs, args).map(|p: { first: Bound, second: Type }|
-                      wrap_handles(bound_read(p.first), p.second, keeping)),
+                    args.map(|x: { bound: Bound, item: Type }|
+                      wrap_handles(bound_read(x.bound), x.item, keeping)),
                     into,
                   ),
                 }),
@@ -1283,7 +1230,7 @@ fn dynamic_record(
   fields: List<Field>,
   into: Type,
   keeping: Bool,
-) -> { code: Code, here: List<Definition> } / {abort.raise} =
+) -> { code: Code, here: List<Definition> } / {EmitReads} =
   {
     code: unspanned_code(
       CodeRecord({
@@ -1304,7 +1251,7 @@ fn dynamic_function(
   from: Type,
   into: Type,
   keeping: Bool,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let n = params.len();
   let args = range(0, n).map(|j: Int|
     wrap_handles(
@@ -1345,7 +1292,7 @@ fn dynamic_loop(
   module: Bytes,
   operation: Bytes,
   over: Type,
-) -> Option<GeneratedRoot> / {abort.raise} = {
+) -> Option<GeneratedRoot> / {EmitReads} = {
   let wrapping = operation.starts_with(b"keeping");
   let key = marked_key(ContainerWalk(operation), over, module);
   let from = dynamic_side(over, !wrapping);
@@ -1411,14 +1358,14 @@ fn dynamic_loop(
   }
 }
 
-fn internal_error<a>(reason: Bytes) -> a / {abort.raise} = panic(String::of_bytes_lossy(reason))
+fn internal_error<a>(reason: Bytes) -> a / {EmitReads} = panic(String::of_bytes_lossy(reason))
 
 fn marshal_loop(
   module: Bytes,
   operation: Bytes,
   t: Type,
   marked: Type,
-) -> Option<GeneratedRoot> / {abort.raise} = {
+) -> Option<GeneratedRoot> / {EmitReads} = {
   let key = marked_key(ContainerWalk(operation), marked, module);
   match item_of(marked) {
     None -> None,
@@ -1461,7 +1408,7 @@ pub fn runtime_entry_code(
   effects: Effects,
   hosts: List<{ call: Bytes, effect: Bytes, adds: List<Effect> }>,
   pure: Bool = false,
-) -> GeneratedRoot / {abort.raise} = {
+) -> GeneratedRoot / {EmitReads} = {
   let key = keys::EntryPoint(root);
   let read = range(0, params.len()).fold(
     [CodeDo({ code: native_call(b"?in_count", [int_code(tag_list)], int_type) })],
@@ -1549,7 +1496,7 @@ pub fn called_definition(
   result: Type,
   effects: Effects,
   pure: Bool,
-) -> Definition / {abort.raise} =
+) -> Definition / {EmitReads} =
   {
     name: name_in_module(module, root_text(root_name(root))),
     return_kind: Some(kind_of(result).kind),
@@ -1564,11 +1511,7 @@ pub fn called_definition(
     root: root,
   }
 
-fn lowering_code(
-  module: Bytes,
-  constructors: Constructors,
-  ty: Type,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+fn lowering_code(module: Bytes, ty: Type) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let unmarked = without_marks(ty);
   let a = slot_code(b"a", 0, unmarked);
   let out = |name: Bytes, args: List<Code>| native_call(name, args, unit_type);
@@ -1641,7 +1584,7 @@ fn lowering_code(
         here: [definition_of(module, each, [without_marks(entries), int_type], unit_type)],
       }
     } else {
-      match constructors.sums.get(c.name) {
+      match code_facts.sum_named(c.name) {
         None ->
           internal_error(
             b"no constructors are known for the type being converted: ".concat(c.name),
@@ -1650,8 +1593,13 @@ fn lowering_code(
           let arms = cs.fold(
             { arms: [], slot: 1 },
             |accumulator: { arms: List<CodeArm>, slot: Int }, constructor: SumConstructor| {
-              let args = constructor_fields_at(constructor, c.args);
-              let xs = bound_from(accumulator.slot, b"x", args.map(without_marks));
+              let args = bound_each(
+                accumulator.slot,
+                b"x",
+                constructor_fields_at(constructor, c.args),
+                without_marks,
+              );
+              let xs = args.map(|x: { bound: Bound, item: Type }| x.bound);
               {
                 arms: accumulator.arms.push({
                   pattern: CodeConstructorPattern({
@@ -1665,8 +1613,8 @@ fn lowering_code(
                     [
                       out(b"?out_ctor", [bytes_code(constructor.name), int_code(args.len())]),
                     ].concat(
-                      zip(xs, args).map(|p: { first: Bound, second: Type }|
-                        builtin_call(b"?lower", [p.second], [bound_read(p.first)], unit_type)),
+                      args.map(|x: { bound: Bound, item: Type }|
+                        builtin_call(b"?lower", [x.item], [bound_read(x.bound)], unit_type)),
                     ),
                   ),
                 }),
@@ -1688,7 +1636,7 @@ fn lowering_code(
 fn record_lowered(
   a: Code,
   fields: List<Field>,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let fs = fields_sorted(fields);
   {
     code: sequence(
@@ -1709,11 +1657,7 @@ fn record_lowered(
   }
 }
 
-fn lifting_code(
-  module: Bytes,
-  constructors: Constructors,
-  ty: Type,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+fn lifting_code(module: Bytes, ty: Type) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let unmarked = without_marks(ty);
   let args_at = match unmarked { NamedType(c) -> c.args, _ -> [] };
   let alone = |c: Code| { code: c, here: [] };
@@ -1796,7 +1740,7 @@ fn lifting_code(
         here: [definition_of(module, each, [unmarked, int_type], unmarked)],
       }
     } else {
-      match constructors.sums.get(c.name) {
+      match code_facts.sum_named(c.name) {
         None ->
           internal_error(
             b"no constructors are known for the type being read into the program: ".concat(c.name),
@@ -1844,7 +1788,7 @@ fn lifting_code(
 fn record_lifted(
   ty: Type,
   fields: List<Field>,
-) -> { code: Code, here: List<Definition> } / {abort.raise} =
+) -> { code: Code, here: List<Definition> } / {EmitReads} =
   {
     code: sequence([
       native_call(b"?in_count", [int_code(tag_record)], int_type),
@@ -1871,7 +1815,7 @@ fn items_lowered(
   t: Type,
   container: Type,
   item: Type,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let a = slot_code(b"a", 0, t);
   let i = slot_code(b"i", 1, int_type);
   let next = call_of(module, key, [a, binary_of(b"add", i, int_code(1))], unit_type);
@@ -1936,7 +1880,7 @@ fn entries_lowered(
   key: RootKey,
   t: Type,
   entry: Type,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let es = slot_code(b"es", 0, t);
   let i = slot_code(b"i", 1, int_type);
   let e = slot_code(b"e", 2, without_marks(entry));
@@ -1969,7 +1913,7 @@ fn items_lifted(
   key: RootKey,
   t: Type,
   item: Type,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let accumulator = slot_code(b"acc", 0, t);
   let n = slot_code(b"n", 1, int_type);
   let pushed = prelude_call(
@@ -1993,7 +1937,7 @@ fn entries_lifted(
   key: RootKey,
   t: Type,
   ty: Type,
-) -> { code: Code, here: List<Definition> } / {abort.raise} = {
+) -> { code: Code, here: List<Definition> } / {EmitReads} = {
   let args = match ty { NamedType(c) -> c.args, _ -> [] };
   let m = slot_code(b"m", 0, t);
   let n = slot_code(b"n", 1, int_type);
@@ -2128,7 +2072,7 @@ fn generated_root(
   result: Type,
   body: { code: Code, here: List<Definition> },
   effects: Effects = { listed: [], variable: None },
-) -> GeneratedRoot / {abort.raise} =
+) -> GeneratedRoot / {EmitReads} =
   {
     params: range(0, params.len()).map(|i: Int| {
       let t = params.get(i);
@@ -2161,7 +2105,7 @@ fn definition_of(
   params: List<Type>,
   result: Type,
   effects: Effects = { listed: [], variable: None },
-) -> Definition / {abort.raise} =
+) -> Definition / {EmitReads} =
   {
     name: name_in_module(module, root_text(root_name(key))),
     return_kind: Some(kind_of(result).kind),
@@ -2176,15 +2120,10 @@ fn definition_of(
     root: key,
   }
 
-fn qualified_root(module: Bytes, key: RootKey) -> Bytes / {abort.raise} =
+fn qualified_root(module: Bytes, key: RootKey) -> Bytes / {EmitReads} =
   qualify(module, name_in_module(module, root_text(root_name(key))))
 
-fn call_of(
-  module: Bytes,
-  key: RootKey,
-  args: List<Code>,
-  return_type: Type,
-) -> Code / {abort.raise} =
+fn call_of(module: Bytes, key: RootKey, args: List<Code>, return_type: Type) -> Code / {EmitReads} =
   applied(
     unspanned_code(
       NDefinition({

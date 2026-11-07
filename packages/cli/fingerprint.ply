@@ -1,13 +1,15 @@
+import compiler.front.checking (FileAt, claimed_in_memory, in_memory, lowered_over)
+import compiler.check.infer.checker (elsewhere)
+import compiler.emit.representations (code_facts)
 import std.bin
 import std.bytes
 import std.list
-import compiler.front.published (no_rows, PublishedInterface, interfaces_of, rows_of)
-import compiler.front.emitter_input (Analysed, Rejected)
+import compiler.front.published (PublishedInterface, interfaces_of, rows_of)
+import compiler.front.checking.promises (ClaimIdentities, ClaimsAnalysed, ClaimsRejected)
 import compiler.front.facts (Analysis)
-import compiler.front (EmbedRecord, analyse_pulling_std_with)
 import compiler.front.rows (KnownTestRow, known_test_row_bin)
+import compiler.store.hash.forms (of_key)
 import compiler.front.interface (interface_of, interface_bin)
-import compiler.expand.embed (embed_file)
 import compiler.check.resolve.tables (Source)
 import proof.decide (Certified, GuardRefuted, StaticResult, Undecided, Unwitnessed)
 import proof.goal (default_prove_budget)
@@ -202,15 +204,7 @@ const scoped_source: String =
   \\  with_scope[file](n, |x: Int| io.close(x)) { h -> peek(h) }
   \\
 
-const embedded: List<EmbedRecord> =
-  [
-    {
-      root: b"",
-      module: b"words",
-      want: { path: b"words.txt", dir: false },
-      read: Ok([embed_file(b"", b"one two\n")]),
-    },
-  ]
+const embedded: List<FileAt> = [{ module: b"words", path: b"words.txt", bytes: b"one two\n" }]
 
 fn line(parts: List<Bytes>) -> Bytes =
   parts.fold(b"", |accumulator: Bytes, p: Bytes|
@@ -227,7 +221,12 @@ fn stored_interfaces(w: Analysis) -> Bytes / {abort.raise} =
   ).concat(
     Bytes::concat_all(
       rows_of(w).tests.map(|t: KnownTestRow|
-        line([b"test", t.key, hex(t.hash), hex(bin::encode(t, known_test_row_bin()))])),
+        line([
+          b"test",
+          t.key,
+          hex(of_key(w.hashes.tests, t.key)),
+          hex(bin::encode(t, known_test_row_bin())),
+        ])),
     ),
   )
 
@@ -250,8 +249,11 @@ fn verdict_word(s: StaticResult) -> Bytes =
     Undecided(_) -> b"undecided",
   }
 
-fn verdicts(analysis: Analysis) -> Bytes / {abort.raise} = {
-  let built = prover_input_of(analysis, |m: Bytes| true);
+fn verdicts(
+  analysis: Analysis,
+  identities: ClaimIdentities,
+) -> Bytes / {elsewhere.read, code_facts.read, abort.raise} = {
+  let built = prover_input_of(analysis, identities, |m: Bytes| true);
   let os = built.world.obligations;
   let p = prover_of(
     claims_for(analysis, modules_of(analysis, os)),
@@ -270,19 +272,14 @@ fn verdicts(analysis: Analysis) -> Bytes / {abort.raise} = {
   )
 }
 
-pub fn fingerprint(sources: List<Source>) -> Bytes / {abort.raise} =
-  match analyse_pulling_std_with(
-      sources,
-      sample_library_sources,
-      no_rows,
-      { root: b"", manifest: None, supplied: [] },
-      embedded,
-    ).out {
-    Rejected(_) ->
+pub fn fingerprint(sources: List<Source>) -> Bytes / {abort.raise} = {
+  let checked = claimed_in_memory(in_memory(sources, sample_library_sources, embedded));
+  match checked.outcome {
+    ClaimsRejected(_) ->
       panic(
         "the built-in sample program used to compute the interface checksum does not pass the checker",
       ),
-    Analysed(w) ->
+    ClaimsAnalysed(w, identities) ->
       Bytes::concat_all([
         stored_interfaces(w),
         Bytes::concat_all(w.hashes.laws.values().map(|h: Bytes| line([b"law", hex(h)]))),
@@ -298,10 +295,11 @@ pub fn fingerprint(sources: List<Source>) -> Bytes / {abort.raise} =
           ),
           interface_bin(),
         ),
-        verdicts(w),
+        lowered_over(checked.program, || verdicts(w, identities)),
       ]).blake3(
       ),
   }
+}
 
 fn replace_once(source: Bytes, was: Bytes, now: Bytes) -> Bytes / {abort.raise} =
   match source.index_of(was) {

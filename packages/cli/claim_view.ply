@@ -1,0 +1,546 @@
+import progress
+import std.set (Set)
+import compiler.check.resolve.tables (Place, InSource, WholeFile, Unplaced, in_module, place_module,
+                                      source_span)
+import compiler.front.facts (Analysis)
+import compiler.front.checking (LoadInputs, InMemory, in_memory, read_over, lowered_over)
+import compiler.front.checking.units (with_code_reads)
+import compiler.emit.representations (code_facts)
+import compiler.front.checking.promises (ClaimsProgram, ClaimIdentities, ClaimsAnalysed,
+                                         ClaimsRejected, claims_analysed)
+import compiler.check.resolve.tables (placed_in)
+import compiler.check.resolve.tables (Source, Diagnostic, Edit, Label, ParsedModule, diagnostic_bin,
+                                      fixes_moved)
+import compiler.check.infer.checker (DefinitionInfo, elsewhere)
+import claims (Claim, ClaimPlace, ClaimsEntry, Collection, DischargeResult, NotCompiled, OwnClaims,
+               PendingClaim, Rejection, StaticProver, WantedClaim, claim_bin, discharge_library,
+               discharging, lacks_proof, laws_by_key, evidence_keys, no_static_prover, own_claims,
+               proof_store, static_prover_of)
+import compiler.front.checking.view
+import compiler.front.checking.view (LaterReading)
+import compiler.front.checking.identity (listed_identities)
+import compiler.store.hash.forms (Identified, subject_identity_bin)
+import compiler.front.checking.world (Modules)
+import compiler.store.memo (memo)
+import std.machine as entering
+import std.time (time)
+import units
+import units (EmbeddedFiles, emit)
+import compiler.unit (identity_of, shipped)
+import program (ProgramStore, Session, in_program_store)
+import proof.obligation (Builds, Definition, Kind, Law, WrittenLaw, definition_bin, written_law_bin)
+import proof.prover_input (Obligation, ProverInput, ProverInputResult, empty_prover_input,
+                           prover_input_of, written_before, claimed_session)
+import proof.discharge (guard_place)
+import proof.static_prover (claims_for, diagnosis_of, modules_of, prover_of)
+import proof.decide (Proved)
+import proof.goal (default_prove_budget)
+import sources (File)
+import std.bin
+import std.hash (blake3)
+import std.list
+import std.map
+import std.list (somes)
+import std.string
+
+pub type ClaimReading = { later: LaterReading, reach: List<Bytes> }
+
+pub fn claim_reading(modules: Modules) -> ClaimReading / {memo.read, abort.raise} =
+  { later: view::later_reading(modules), reach: modules.own.map(claims_reach) }
+
+fn claims_reach(module: Bytes) -> Bytes / {memo.read, abort.raise} =
+  blake3(
+    bin::encode(
+      listed_identities({ module: module, shipped: false, tested: true }, |_: Identified| true),
+      bin::list_bin(subject_identity_bin()),
+    ),
+  )
+
+pub fn discharge_claims(
+  s: Session<ClaimReading>,
+  collection: Collection,
+  pending: List<PendingClaim>,
+) -> Result<DischargeResult, Rejection> / {entering::machine.open, entering::machine.enter, entering::machine.close, time.elapsed_ms, emit.code, emit.libraries, discharging.decided, EmbeddedFiles, abort.raise} =
+  match units::code_program_of(s, s.value.later.rollup) {
+    Err(diagnostics) -> Err(NotCompiled({ diagnostics: diagnostics, places: collection.places })),
+    Ok(program) ->
+      discharge_library(program, laws_by_key(s.value.later.rollup.laws), collection, pending),
+  }
+
+pub type ClaimedProgram<| e> = { mine: OwnClaims, statics: StaticProver<| e> }
+
+pub type ModuleClaims = {
+  claims: List<Claim>,
+  laws: List<WrittenLaw>,
+  warnings: List<Diagnostic>,
+  definitions: List<Definition>,
+}
+
+derive bin for ModuleClaims
+
+fn placements(modules: List<Bytes>, names: List<Bytes>) -> Map<Int, Int> / {abort.raise} =
+  range(0, modules.len()).fold(Map::new(), |found: Map<Int, Int>, i: Int|
+    match names.index_of(modules.get(i)) { Some(slot) -> found.insert(i, slot), None -> found })
+
+fn placed_place(placing: Map<Int, Int>, place: Place) -> Place =
+  match place {
+    InSource(s) -> InSource({ ..s, module: placing.get_or(s.module, s.module) }),
+    WholeFile(m) -> WholeFile(placing.get_or(m, m)),
+    Unplaced -> Unplaced,
+  }
+
+fn placed_diagnostic(placing: Map<Int, Int>, d: Diagnostic) -> Diagnostic =
+  {
+    ..d,
+    labels: d.labels.map(|l: Label| { ..l, place: placed_place(placing, l.place) }),
+    fixes: fixes_moved(d.fixes, |e: Edit| { ..e, module: placing.get_or(e.module, e.module) }),
+  }
+
+fn claim_place(placing: Map<Int, Int>, o: Obligation) -> ClaimPlace =
+  {
+    module: placing.get_or(o.module, o.module),
+    at: placed_place(placing, o.at),
+    guard: placed_place(placing, guard_place(o)),
+  }
+
+fn placed_own(
+  w: Analysis,
+  built: ProverInputResult,
+  placing: Map<Int, Int>,
+) -> OwnClaims / {abort.raise} = {
+  let fresh = own_claims(w, built, |o: Obligation| claim_place(placing, o));
+  { ..fresh, warnings: fresh.warnings.map(|d: Diagnostic| placed_diagnostic(placing, d)) }
+}
+
+type KnownModule = { name: Bytes, index: Int, identity: Bytes, claims: Option<ModuleClaims> }
+
+pub type ClaimInputs = { names: List<Bytes>, reach: List<Bytes>, texts: List<Bytes> }
+
+fn known_module(
+  identity: Bytes,
+  inputs: ClaimInputs,
+  index: Int,
+) -> KnownModule / {proof_store.module_claims, abort.raise} = {
+  let name = inputs.names.get(index);
+  let known = blake3(
+    Bytes::concat_all([identity, inputs.reach.get(index), inputs.texts.get(index)]),
+  );
+  {
+    name: name,
+    index: index,
+    identity: known,
+    claims: match proof_store.module_claims(name, known) {
+      None -> None,
+      Some(bytes) -> match bin::decode(bytes, module_claims_bin()) {
+        Ok(c) -> Some(placed_claims(c, index)),
+        Err(_) -> None,
+      },
+    },
+  }
+}
+
+fn in_slot(place: ClaimPlace, index: Int) -> ClaimPlace =
+  { module: index, at: in_module(place.at, index), guard: in_module(place.guard, index) }
+
+fn placed_claims(c: ModuleClaims, index: Int) -> ModuleClaims =
+  {
+    ..c,
+    claims: c.claims.map(|claim: Claim| { ..claim, place: in_slot(claim.place, index) }),
+    warnings: c.warnings.map(|d: Diagnostic| placed_in(d, index)),
+  }
+
+fn wants_view(known: KnownModule, every_module: Bool) -> Bool / {proof_store.cached, abort.raise} =
+  every_module || (match known.claims { None -> true, Some(c) -> c.claims.any(lacks_proof) })
+
+type WorldClaim = { claim: Claim, obligation: Option<Obligation> }
+
+fn kind_rank(k: Kind) -> Int = match k { Law(_) -> 2, Builds(_) -> 1, _ -> 0 }
+
+fn comes_first(a: WorldClaim, b: WorldClaim) -> Bool = {
+  let x = a.claim.place;
+  let y = b.claim.place;
+  let x_rank = kind_rank(a.claim.kind);
+  let y_rank = kind_rank(b.claim.kind);
+  x_rank < y_rank
+    || (x_rank == y_rank
+    && (x.module < y.module || (x.module == y.module && !written_before(y.at, x.at))))
+}
+
+type FreshModules = {
+  claims: Map<Int, List<Claim>>,
+  laws: Map<Bytes, List<WrittenLaw>>,
+  warnings: Map<Int, List<Diagnostic>>,
+  definitions: Map<Bytes, List<Definition>>,
+}
+
+fn law_module(names: Set<Bytes>, key: String) -> Bytes = {
+  let parts = Bytes::of_string(key).split(b".");
+  parts.take(parts.len() - 1).fold(
+    { prefix: b"", found: b"" },
+    |at: { prefix: Bytes, found: Bytes }, part: Bytes| {
+      let prefix = if at.prefix.len() == 0 { part }
+      else { Bytes::concat_all([at.prefix, b".", part]) };
+      { prefix: prefix, found: if names.contains(prefix) { prefix } else { at.found } }
+    },
+  ).found
+}
+
+fn warnings_by_module(warnings: List<Diagnostic>) -> Map<Int, List<Diagnostic>> =
+  warnings.fold(Map::new(), |found: Map<Int, List<Diagnostic>>, d: Diagnostic|
+    d.labels.fold(Set::empty(), |at: Set<Int>, l: Label|
+      match place_module(l.place) { Some(m) -> at.insert(m), None -> at }).elements(
+    ).fold(found, |all: Map<Int, List<Diagnostic>>, module: Int|
+      all.insert(module, all.get(module).unwrap_or([]).push(d))))
+
+fn fresh_by_module(
+  fresh: OwnClaims,
+  w: Analysis,
+  names: List<Bytes>,
+  opened: Map<Bytes, Int>,
+) -> FreshModules = {
+  let known = names.fold(Set::empty(), |found: Set<Bytes>, m: Bytes| found.insert(m));
+  let module_of = w.checked.definitions.fold(
+    Map::new(),
+    |found: Map<String, Bytes>, d: DefinitionInfo|
+      found.insert(String::of_bytes_lossy(d.name), d.module),
+  );
+  {
+    claims: fresh.claims.group_by(|c: Claim| c.place.module),
+    laws: fresh.laws.group_by(|l: WrittenLaw| law_module(known, l.key)),
+    warnings: warnings_by_module(fresh.warnings),
+    definitions: fresh.definitions.fold(
+      Map::new(),
+      |found: Map<Bytes, List<Definition>>, d: Definition|
+        match module_of.get(d.name) {
+          Some(module) -> if !opened.contains(module) { found }
+          else { found.insert(module, found.get(module).unwrap_or([]).push(d)) },
+          None -> found,
+        },
+    ),
+  }
+}
+
+fn fresh_claims(fresh: FreshModules, name: Bytes, index: Int) -> ModuleClaims =
+  {
+    claims: fresh.claims.get(index).unwrap_or([]),
+    laws: fresh.laws.get(name).unwrap_or([]),
+    warnings: fresh.warnings.get(index).unwrap_or([]),
+    definitions: fresh.definitions.get(name).unwrap_or([]),
+  }
+
+fn claims_of_program(
+  names: List<Bytes>,
+  world: ProverInput,
+  held: List<ModuleClaims>,
+  fresh: List<WorldClaim>,
+) -> OwnClaims = {
+  let stored = held.fold([], |found: List<WorldClaim>, c: ModuleClaims|
+    found.concat(c.claims.map(|claim: Claim| { claim: claim, obligation: None })));
+  let all = stored.concat(fresh).sort_by(comes_first);
+  {
+    claims: all.map(|w: WorldClaim| w.claim),
+    definitions: held.fold([], |found: List<Definition>, c: ModuleClaims|
+      found.concat(c.definitions)),
+    laws: held.fold([], |found: List<WrittenLaw>, c: ModuleClaims| found.concat(c.laws)),
+    warnings: held.fold([], |found: List<Diagnostic>, c: ModuleClaims| found.concat(c.warnings)),
+    world: { ..world, obligations: somes(all.map(|w: WorldClaim| w.obligation)) },
+    modules: names,
+  }
+}
+
+fn claimed_with_view<| e>(
+  c: ClaimClosure,
+  names: List<Bytes>,
+  known: List<KnownModule>,
+  open: List<KnownModule>,
+  in_session: keep (() -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}) -> List<WantedClaim> / {abort.raise | e},
+) -> Result<ClaimedProgram<| e>, List<Diagnostic>> / {proof_store.record_claims, abort.raise} = {
+  let w = c.analysis;
+  let owned = |m: Bytes| names.contains(m);
+  let built = prover_input_of(w, c.identities, owned);
+  let fresh = placed_own(w, built, placements(c.modules, names));
+  let opened = open.fold(Map::new(), |found: Map<Bytes, Int>, k: KnownModule|
+    found.insert(k.name, k.index));
+  let by_module = fresh_by_module(fresh, w, names, opened);
+  let fresh_of = |k: KnownModule| fresh_claims(by_module, k.name, k.index);
+  let store_warnings = proof_store.record_claims(
+    open.map(|k: KnownModule| {
+      let claimed = fresh_of(k);
+      {
+        module: k.name,
+        identity: k.identity,
+        claims: bin::encode(claimed, module_claims_bin()),
+        evidence: claimed.claims.flat_map(|claim: Claim| {
+          let keys = evidence_keys(claim);
+          [Bytes::of_hex(keys.bare), Bytes::of_hex(keys.ran)]
+        }),
+      }
+    }),
+  );
+  let current = known.fold([], |found: List<ModuleClaims>, k: KnownModule|
+    if opened.contains(k.name) { found.push({ ..fresh_of(k), claims: [] }) }
+    else { match k.claims { Some(claimed) -> found.push(claimed), None -> found } });
+  let pairs = range(0, fresh.claims.len()).fold([], |found: List<WorldClaim>, i: Int| {
+    let claim = fresh.claims.get(i);
+    if !opened.contains(names.at_or(claim.place.module, b"")) { found }
+    else { found.push({ claim: claim, obligation: Some(built.world.obligations.get(i)) }) }
+  });
+  let mine = claims_of_program(names, built.world, current, pairs);
+  Ok({
+    mine: { ..mine, warnings: mine.warnings.concat(store_warnings) },
+    statics: static_prover_of(w, mine.world, owned, in_session),
+  })
+}
+
+pub type ClaimClosure = { analysis: Analysis, identities: ClaimIdentities, modules: List<Bytes> }
+
+pub fn claimed_modules<| e>(
+  inputs: ClaimInputs,
+  every_module: Bool,
+  closure: (List<Bytes>) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise | e},
+  in_session: keep (() -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}) -> List<WantedClaim> / {abort.raise | e},
+) -> Result<ClaimedProgram<| e>, List<Diagnostic>> / {shipped.definitions, proof_store.module_claims, proof_store.record_claims, proof_store.cached, abort.raise | e} = {
+  let identity = identity_of(shipped.definitions(), [b"claims.own_claims"]);
+  let known = range(0, inputs.names.len()).map(|i: Int| known_module(identity, inputs, i));
+  let open = known.filter(|k: KnownModule| wants_view(k, every_module));
+  if open.len() == 0 {
+    Ok({
+      mine: claims_of_program(
+        inputs.names,
+        empty_prover_input,
+        known.fold([], |found: List<ModuleClaims>, k: KnownModule|
+          match k.claims { Some(c) -> found.push(c), None -> found }),
+        [],
+      ),
+      statics: no_static_prover(None),
+    })
+  } else {
+    match closure(open.map(|k: KnownModule| k.name)) {
+      Err(diagnostics) -> Err(diagnostics),
+      Ok(c) -> claimed_with_view(c, inputs.names, known, open, in_session),
+    }
+  }
+}
+
+pub fn claim_inputs(s: Session<ClaimReading>) -> ClaimInputs =
+  {
+    names: s.modules.own.take(s.modules.root),
+    reach: s.value.reach.take(s.modules.root),
+    texts: s.project.files.map(|f: File| f.text.blake3()),
+  }
+
+fn closure_of(
+  analysed: ClaimsProgram,
+  names: List<Bytes>,
+) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise} =
+  match analysed.outcome {
+    ClaimsRejected(ds) -> {
+      let placing = placements(analysed.modules, names);
+      Err(ds.map(|d: Diagnostic| placed_diagnostic(placing, d)))
+    },
+    ClaimsAnalysed(w, identities) ->
+      Ok({ analysis: w, identities: identities, modules: analysed.modules }),
+  }
+
+pub fn claims_closure(
+  s: Session<ClaimReading>,
+  open: List<Bytes>,
+) -> Result<ClaimClosure, List<Diagnostic>> / {ProgramStore, abort.raise} =
+  closure_of(
+    progress::silently(||
+      in_program_store(s.place, |_: LoadInputs|
+        claims_analysed(open.map(|m: Bytes| { module: m, shipped: false, tested: true })))).value,
+    s.modules.own.take(s.modules.root),
+  )
+
+pub fn proving_in_store(
+  s: Session<ClaimReading>,
+) -> (() -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}) -> List<WantedClaim> / {ProgramStore, abort.raise} =
+  |work: () -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}|
+    progress::silently(||
+      in_program_store(s.place, |_: LoadInputs| with_code_reads(true, work))).value
+
+fn closure_over(
+  sources: List<Source>,
+  open: List<Bytes>,
+) -> Result<ClaimClosure, List<Diagnostic>> / {abort.raise} =
+  closure_of(
+    read_over(sources, ||
+      claims_analysed(open.map(|m: Bytes| { module: m, shipped: false, tested: true }))),
+    sources.map(|s: Source| s.name),
+  )
+
+const claimed_sources: List<Source> =
+  [
+    {
+      name: b"app",
+      source_text: b"import lib (quad, twice)\n\npub fn four(n: Int) -> Int requires n > 0 && n < 1000 ensures result == quad(n) = twice(twice(n))\n\npub fn apart(n: Int) -> Int = n + 1\n\nlaw \"twice doubles\" forall (n: Int) where n > 0 && n < 1000 { twice(n) == n + n }\n",
+    },
+    {
+      name: b"lib",
+      source_text: b"pub fn twice(n: Int) -> Int = n + n\n\npub fn quad(n: Int) -> Int = n + n + n + n\n\npub fn spare(n: Int) -> Int = n + 5\n",
+    },
+    { name: b"other", source_text: b"pub fn unrelated(n: Int) -> Int = n * 3\n" },
+  ]
+
+fn claim_keys(w: Analysis, identities: ClaimIdentities) -> List<String> / {abort.raise} =
+  prover_input_of(w, identities, |m: Bytes| true).world.obligations.map(|o: Obligation| o.key)
+
+fn proved_claims(
+  program: InMemory,
+  w: Analysis,
+  identities: ClaimIdentities,
+) -> List<String> / {abort.raise} = {
+  let owned = |m: Bytes| [b"app", b"lib", b"other"].contains(m);
+  let world = prover_input_of(w, identities, owned).world;
+  let p = prover_of(
+    claims_for(w, modules_of(w, world.obligations), owned),
+    world,
+    default_prove_budget,
+  );
+  lowered_over(program, ||
+    world.obligations.filter(|o: Obligation|
+      match diagnosis_of(p, o) {
+        Some(d) -> match d.decision { Proved(_) -> true, _ -> false },
+        None -> false,
+      }).map(|o: Obligation| o.owner))
+}
+
+test "the claims of the open modules, checked by group, are the claims of the whole program and prove the same" {
+  let whole = claimed_session(claimed_sources);
+  let identities = whole.identities;
+  match closure_over(claimed_sources, [b"app", b"lib", b"other"]) {
+    Err(_) -> panic("the claims of a checked program were rejected"),
+    Ok(c) -> {
+      assert_eq(claim_keys(c.analysis, c.identities), claim_keys(whole.analysis, identities));
+      let proved = proved_claims(whole.program, whole.analysis, identities);
+      assert(proved.contains("app.four"));
+      assert_eq(proved_claims(whole.program, c.analysis, c.identities), proved);
+      assert_eq(c.analysis.modules.map(|m: ParsedModule| m.name).take(3), [
+        b"app",
+        b"lib",
+        b"other",
+      ])
+    },
+  }
+}
+
+test "a claim checked by group keeps its place and its guard's place in its file" {
+  match closure_over(claimed_sources, [b"app"]) {
+    Err(_) -> panic("the claims of a checked program were rejected"),
+    Ok(c) -> {
+      let names = [b"app", b"lib", b"other"];
+      let fresh = placed_own(
+        c.analysis,
+        prover_input_of(c.analysis, c.identities, |m: Bytes| names.contains(m)),
+        placements(c.modules, names),
+      );
+      let text = claimed_sources.get(0).source_text;
+      let four = fresh.claims.filter(|claim: Claim| claim.owner == "app.four");
+      assert(four.len() > 0);
+      assert(
+        four.all(|claim: Claim|
+          match ((claim.place.at, claim.place.guard)) {
+            (InSource(at), InSource(guard)) ->
+              claim.place.module == 0 && at.module == 0 && text.slice(at.start, at.end).len() > 0
+                && text.slice(0, at.start).index_of(b"pub fn four") != None
+                && guard.module == 0
+                && text.slice(guard.start, guard.end) == b"n > 0 && n < 1000",
+            _ -> false,
+          }),
+      )
+    },
+  }
+}
+
+type SourceSpan = { module: Int, start: Int, end: Int }
+
+fn primary_places(ds: List<Diagnostic>) -> List<SourceSpan> =
+  ds.flat_map(|d: Diagnostic|
+    somes(d.labels.filter(|l: Label| l.primary).map(source_span))).sort_by(
+    |a: SourceSpan, b: SourceSpan| a.start <= b.start,
+  )
+
+const cycle_text: Bytes =
+  b"fn even(n: Int) -> Bool = if n == 0 { true } else { odd(n - 1) && 1 }\n\nfn odd(n: Int) -> Bool = if n == 0 { false } else { even(n - 1) && \"x\" }\n"
+
+test "two functions that call each other, each with a type error in its own body, report only those errors, at their places in the file, because each call is checked against the written signature" {
+  let operand = |written: Bytes|
+    match cycle_text.index_of(b"&& ".concat(written)) {
+      Some(i) -> { module: 0, start: i + 3, end: i + 3 + written.len() },
+      None -> panic("the fixture holds the operand"),
+    };
+  match closure_over([{ name: b"m", source_text: cycle_text }], [b"m"]) {
+    Err(ds) -> assert_eq(primary_places(ds), [operand(b"1"), operand(b"\"x\"")]),
+    Ok(_) -> panic("the fixture program was accepted when checked by group"),
+  }
+}
+
+fn modules_with_claims(size: Int, edited: Bytes) -> List<Source> =
+  range(0, size).map(|i: Int| {
+    let body = if i == 0 { edited } else { b"n + 1" };
+    {
+      name: b"m".concat(Bytes::of_string(i.to_string())),
+      source_text: Bytes::concat_all([
+        b"pub fn step(n: Int) -> Int requires n > 0 ensures result > 0 = ",
+        body,
+        b"\n",
+      ]),
+    }
+  })
+
+type RecordedClaims = {
+  written: Map<Bytes, ClaimsEntry>,
+  claimed: Result<ClaimedProgram<| {}>, List<Diagnostic>>,
+}
+
+fn claimed_over(
+  sources: List<Source>,
+  stored: Map<Bytes, ClaimsEntry>,
+) -> RecordedClaims / {abort.raise} = {
+  let inputs = {
+    names: sources.map(|s: Source| s.name),
+    reach: sources.map(|s: Source| b""),
+    texts: sources.map(|s: Source| s.source_text.blake3()),
+  };
+  handle {
+    claimed_modules(
+      inputs,
+      false,
+      |open: List<Bytes>| closure_over(sources, open),
+      |work: () -> List<WantedClaim> / {elsewhere.read, code_facts.read, abort.raise}|
+        lowered_over(in_memory(sources), work),
+    )
+  } with {
+    var written = Map::new(),
+    shipped.definitions() -> b"claims.own_claims 00\n",
+    proof_store.module_claims(module, identity) -> match match written.get(module) {
+        Some(e) -> Some(e),
+        None -> stored.get(module),
+      } {
+      Some(e) -> if e.identity == identity { Some(e.claims) } else { None },
+      None -> None,
+    },
+    proof_store.record_claims(entries) -> {
+      written = entries.fold(written, |found: Map<Bytes, ClaimsEntry>, e: ClaimsEntry|
+        found.insert(e.module, e));
+      []
+    },
+    proof_store.cached(keys) -> keys.map(|k: String| Some(b"")),
+    return claimed -> { written: written, claimed: claimed },
+  }
+}
+
+test "a module loaded without the others keeps its place among all modules" {
+  let first = claimed_over(modules_with_claims(3, b"n + 1").reverse(), Map::new()).written;
+  match claimed_over(modules_with_claims(3, b"n + 2").reverse(), first).claimed {
+    Ok(c) -> {
+      let named = |claim: Claim|
+        claim.owner.starts_with(
+          String::of_bytes_lossy(c.mine.modules.get(claim.place.module)) ++ ".",
+        );
+      assert(c.mine.claims.len() > 0 && c.mine.claims.all(named))
+    },
+    Err(_) -> panic("the claims of a program with no errors do not load"),
+  }
+}

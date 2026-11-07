@@ -10,7 +10,7 @@ driver=$1 profile=$2 library=$(absolute "$3") out=$(absolute "$4")
 program="$root/packages/bootstrap"
 hashes=$(mktemp)
 trap 'rm -f "$hashes"' EXIT
-if ! "$driver" hash --json "$program" > "$hashes"; then
+if ! "$driver" hash --json --dependencies "$program" > "$hashes"; then
   cat "$hashes" >&2
   exit 1
 fi

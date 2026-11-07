@@ -1,4 +1,5 @@
-import compiler.emit.representations (layout_of)
+import compiler.front.checking (in_memory)
+import compiler.emit.representations (layout_of, EmitReads)
 import std.bytes (ascii_of_int)
 import compiler.prelude_source
 import compiler.check.types (Type, NamedType, RecordType, int_type, string_type, float_type,
@@ -7,12 +8,10 @@ import compiler.check.known (map_node_type)
 import compiler.emit.typing (unknown_type)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.emitter_input (Analysed)
-import compiler.front.published (analyse, no_rows)
-import compiler.front (analyse_pulling_std_with)
 import compiler.check.resolve.tables (qualify)
 import compiler.emit.layout (Intrinsic, intrinsics, container_layouts, words, branch_layout,
                              array_head)
-import compiler.emit.output (Need, Layout)
+import compiler.emit.output (Need, Layout, Exact)
 import compiler.emit.pieces (pieces_text)
 import compiler.emit.release (root_of)
 import compiler.emit.code (CodeFieldRead)
@@ -33,11 +32,11 @@ import compiler.emit.lower.base (Context, LoweredValue, initial_lowering)
 import compiler.emit.lower.calling (context_of)
 import compiler.emit.lower.containers (reads_column, column_read, list_literal, item_read,
                                        rest_read)
-import compiler.emit.lower.module_context (Root, module_context_in)
+import compiler.emit.lower.module_context (Root, module_context_in, native_called)
 import compiler.emit.keys (RootKey, Named, Generated, Copy)
 import compiler.emit.print (printed_function)
 import compiler.emit.emit_harness (entry_handler_words, Program, program_of, lowered_root, checked,
-                                   printed_text, build_failures)
+                                   printed_text, build_failures, program_in, over_program)
 import compiler.emit.print.count_functions (increments_count)
 import compiler.emit.tests.data (program_from)
 
@@ -127,13 +126,13 @@ test "a list literal is built from its items, each stored in the representation 
 test "a list pattern reads an item directly from the list and binds the rest as a new list" {
   let p = program_from(b"fn f(xs: List<String>) -> Int = 0\n");
   let strings = list_type(string_type);
-  let opened = |name: Bytes, ty: Type, act: (Context, Variable) -> LoweredValue|
+  let opened = |name: Bytes, ty: Type, act: (Context, Variable) -> LoweredValue / {EmitReads}|
     match p.roots.find(|r: Root| r.key == Named(qualify(b"m", name))) {
       None -> panic("no such root"),
       Some(r) -> {
         let code = r.code;
         let xs = { id: 0, ty: ty, representation: AsWord };
-        act(context_of(p.setting, r, code), xs)
+        over_program(p, || act(context_of(p.setting, r, code), xs))
       },
     };
   let bound = |l: LoweredValue|
@@ -203,7 +202,7 @@ test "`len` on a list, byte string or array reads the length directly, cannot fa
 }
 
 fn element_in(p: Program, t: Type) -> Element / {abort.raise} = {
-  let l = layout_of(p.setting.constructors, t);
+  let l = over_program(p, || layout_of(t));
   { layout: l, stride: max(1, words(l)) }
 }
 
@@ -372,13 +371,13 @@ test "`Columns` creation, writes, reads, length and `at` are lowered to one arra
   })
 }
 
-test "an array whose elements have a type variable's type is created using the element layout that its callers supply" {
+test "an array whose elements have a type variable's type is created using the element layout that its callers supply, and the exact type that releases the element it takes" {
   let p = program_from(
     b"fn made<a>(n: Int, x: a) -> Array<a> / {abort.raise} = Array::new(n, x)\n",
   );
   {
     let f = lowered_root(p, b"made");
-    assert_eq(f.links.needs.map(|n: Need| n.reads), [Layout]);
+    assert_eq(f.links.needs.map(|n: Need| n.reads), [Layout, Exact]);
     assert_eq(
       operations_in(bound_in(p, b"made")).map(
         |o: { operation: Operation, args: List<Arg>, uses: OperationSignature, result: Representation }|
@@ -387,6 +386,11 @@ test "an array whose elements have a type variable's type is created using the e
       [OfHandling(UnspecialisedBuiltin(b"Array::new"))],
     )
   }
+}
+
+test "a generic function that hands its list to `List::at` needs its callers' exact element type, because its specialised code releases the list" {
+  let p = program_from(b"fn first<a>(xs: List<a>) -> Option<a> = xs.at(0)\n");
+  assert(lowered_root(p, b"first").links.needs.map(|n: Need| n.reads).contains(Exact), None)
 }
 
 test "reading a field of a `Columns` element reads that field's array directly, without building the whole record" {
@@ -402,51 +406,55 @@ test "reading a field of a `Columns` element reads that field's array directly, 
   let read = |name: Bytes|
     match p.roots.find(|r: Root| r.key == Named(qualify(b"m", name))) {
       None -> [],
-      Some(r) -> {
-        let code = r.code;
-        let context = context_of(p.setting, r, code);
-        let base = match code.node {
-          CodeFieldRead(f) -> match f.base.node {
-            CodeFieldRead(g) -> Some({ base: g.base, name: g.field }),
-            _ -> Some({ base: f.base, name: f.field }),
-          },
-          _ -> None,
-        };
-        match base {
-          None -> [],
-          Some(b) -> match reads_column(context, b.base, b.name) {
-            false -> [],
-            true -> {
-              let ps = {
-                id: 0,
-                ty: match r.types.at(0) { Some(t) -> t, None -> unknown_type },
-                representation: AsWord,
-              };
-              let i = { id: 1, ty: int_type, representation: AsInt };
-              let l = column_read(
-                context,
-                initial_lowering([ps, i]),
-                [VariableOperand(ps), VariableOperand(i)],
-                b.base,
-                b.name,
-                code.span,
-              );
-              l.st.instructions.fold(
-                [],
-                |accumulator: List<{ operation: Operation, result: Representation }>, x: Instruction|
-                  match x {
-                    Let(v) -> match v.value {
-                      OperationCall(o) ->
-                        accumulator.push({ operation: o.operation, result: v.var.representation }),
+      Some(r) ->
+        over_program(p, || {
+          let code = r.code;
+          let context = context_of(p.setting, r, code);
+          let base = match code.node {
+            CodeFieldRead(f) -> match f.base.node {
+              CodeFieldRead(g) -> Some({ base: g.base, name: g.field }),
+              _ -> Some({ base: f.base, name: f.field }),
+            },
+            _ -> None,
+          };
+          match base {
+            None -> [],
+            Some(b) -> match reads_column(context, b.base, b.name) {
+              false -> [],
+              true -> {
+                let ps = {
+                  id: 0,
+                  ty: match r.types.at(0) { Some(t) -> t, None -> unknown_type },
+                  representation: AsWord,
+                };
+                let i = { id: 1, ty: int_type, representation: AsInt };
+                let l = column_read(
+                  context,
+                  initial_lowering([ps, i]),
+                  [VariableOperand(ps), VariableOperand(i)],
+                  b.base,
+                  b.name,
+                  code.span,
+                );
+                l.st.instructions.fold(
+                  [],
+                  |accumulator: List<{ operation: Operation, result: Representation }>, x: Instruction|
+                    match x {
+                      Let(v) -> match v.value {
+                        OperationCall(o) ->
+                          accumulator.push({
+                            operation: o.operation,
+                            result: v.var.representation,
+                          }),
+                        _ -> accumulator,
+                      },
                       _ -> accumulator,
                     },
-                    _ -> accumulator,
-                  },
-              )
+                )
+              },
             },
-          },
-        }
-      },
+          }
+        }),
     };
   assert_eq(read(b"x_at"), [
     {
@@ -747,15 +755,10 @@ test "an operator on a numeric type variable lowers to a generic builtin that is
 
 fn program_of_modules(
   sources: List<{ name: Bytes, source_text: Bytes }>,
-  natives: List<Bytes>,
 ) -> Program / {abort.raise} =
-  match analyse(parse_all(sources)) {
-    Analysed(a) -> match module_context_in(a, b"m") {
-      Ok(s) ->
-        { source: b"", analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
-      Err(reason) -> panic(String::of_bytes_lossy(reason)),
-    },
-    _ -> panic("the program does not check"),
+  match program_in(b"", b"m", in_memory(sources)) {
+    Ok(p) -> p,
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
   }
 
 test "a name that no import provides refers to the builtin, but an imported function with a builtin's name is called instead" {
@@ -764,16 +767,13 @@ test "a name that no import provides refers to the builtin, but an imported func
       |c: { name: Bytes, args: List<Arg>, uses: OperationSignature, result: Representation }|
         c.name,
     );
-  let whole = program_of_modules(
-    [
-      { name: b"min", source_text: b"pub fn size(xs: List<Int>) -> Int = xs.len()\n" },
-      {
-        name: b"m",
-        source_text: b"import min\nfn least(x: Int) -> Int = min(x, 1)\nfn n(xs: List<Int>) -> Int = min::size(xs)\n",
-      },
-    ],
-    [b"min", b"List::len"],
-  );
+  let whole = program_of_modules([
+    { name: b"min", source_text: b"pub fn size(xs: List<Int>) -> Int = xs.len()\n" },
+    {
+      name: b"m",
+      source_text: b"import min\nfn least(x: Int) -> Int = min(x, 1)\nfn n(xs: List<Int>) -> Int = min::size(xs)\n",
+    },
+  ]);
   assert_eq(names(whole, b"least"), []);
   assert(
     !bound_in(whole, b"least").any(|b: Binding| match b.value { Call(_) -> true, _ -> false }),
@@ -793,13 +793,10 @@ test "a name that no import provides refers to the builtin, but an imported func
     },
     None,
   );
-  let taken = program_of_modules(
-    [
-      { name: b"a", source_text: b"pub fn min(x: Int, y: Int) -> Int = x\n" },
-      { name: b"m", source_text: b"import a (min)\nfn least(x: Int) -> Int = min(x, 1)\n" },
-    ],
-    [b"min"],
-  );
+  let taken = program_of_modules([
+    { name: b"a", source_text: b"pub fn min(x: Int, y: Int) -> Int = x\n" },
+    { name: b"m", source_text: b"import a (min)\nfn least(x: Int) -> Int = min(x, 1)\n" },
+  ]);
   assert(
     {
       let _ = lowered_root(taken, b"least");
@@ -809,44 +806,35 @@ test "a name that no import provides refers to the builtin, but an imported func
   )
 }
 
-fn program_with_native(
-  native: Bytes,
-  user: Bytes,
-  natives: List<Bytes>,
-) -> Program / {abort.raise} = {
+fn program_with_native(native: Bytes, user: Bytes) -> Program / {abort.raise} = {
   let shipped = [{ name: b"std.native", source_text: native }];
-  match analyse_pulling_std_with([{ name: b"m", source_text: user }], shipped, no_rows).out {
-    Analysed(a) -> match module_context_in(a, b"m") {
-      Ok(s) ->
-        { source: user, analysis: a, setting: { ..s.setting, builtins: natives }, roots: s.roots },
-      Err(reason) -> panic(String::of_bytes_lossy(reason)),
-    },
-    _ -> panic("the program does not check"),
+  match program_in(user, b"m", in_memory([{ name: b"m", source_text: user }], shipped)) {
+    Ok(p) -> p,
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
   }
 }
 
-fn with_doubled(user: Bytes, natives: List<Bytes>) -> Program / {abort.raise} =
-  program_with_native(b"pub extern fn doubled(x: Int) -> Int\n", user, natives)
+fn with_doubled(user: Bytes) -> Program / {abort.raise} =
+  program_with_native(b"pub extern fn doubled(x: Int) -> Int\n", user)
 
 test "a call to a native function implemented by the runtime lowers to a function, and so does a call to a builtin on `U8`" {
   let user = b"import std.native (doubled)\nfn f() -> Int = doubled(2)\n";
-  assert_eq(lowered_root(with_doubled(user, [b"doubled"]), b"f").key, Named(b"m.f"));
+  assert_eq(lowered_root(with_doubled(user), b"f").key, Named(b"m.f"));
   let source = b"fn wrapped(a: U8, b: U8) -> U8 = wrap_add(a, b)\n";
   assert_eq(lowered_root(program_from(source), b"wrapped").key, Named(b"m.wrapped"))
 }
 
 test "an extern function of a standard library module is called by its own name, whether imported by name or through its module" {
   let user = b"import std.native (doubled)\nimport std.native as n\nfn f() -> Int = doubled(2) + n::doubled(3)\n";
-  assert_eq(lowered_root(with_doubled(user, [b"doubled"]), b"f").key, Named(b"m.f"))
+  assert_eq(lowered_root(with_doubled(user), b"f").key, Named(b"m.f"))
 }
 
 test "a standard library extern listed in the program's machine-function setting can be called, and the caller lowers to a function" {
   let p = program_with_native(
     b"pub extern fn halved(x: Int) -> Int\n",
     b"import std.native (halved)\nfn f() -> Int = halved(4)\n",
-    [b"halved"],
   );
-  assert(p.setting.machine.contains(b"halved"), None);
+  assert(over_program(p, || native_called(b"std.native.halved")) != None, None);
   assert_eq(lowered_root(p, b"f").key, Named(b"m.f"))
 }
 
@@ -854,9 +842,8 @@ test "a `Secret` passed to a native function and returned from it stays an opaqu
   let p = program_with_native(
     b"pub extern fn resealed(s: Secret<Bytes>) -> Secret<String>\n",
     b"import std.native (resealed)\nfn f() -> Int = if resealed(Secret::of_bytes(b\"key\")).is_empty() { 0 } else { 1 }\n",
-    [b"resealed"],
   );
-  assert(p.setting.machine.contains(b"resealed"), None);
+  assert(over_program(p, || native_called(b"std.native.resealed")) != None, None);
   assert_eq(lowered_root(p, b"f").key, Named(b"m.f"))
 }
 
@@ -1065,11 +1052,14 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
     ),
     [],
   );
-  match analyse(
-      parse_all([{ name: b"std.prelude", source_text: prelude_source::text.concat(probes) }]),
+  match program_in(
+      probes,
+      b"std.prelude",
+      in_memory([{ name: b"std.prelude", source_text: prelude_source::text.concat(probes) }]),
     ) {
-    Analysed(a) -> match module_context_in(a, b"std.prelude") {
-      Ok(s) -> {
+    Err(reason) -> panic(String::of_bytes_lossy(reason)),
+    Ok(s) ->
+      over_program(s, || {
         let lowered = |name: Bytes| {
           let full = b"std.prelude.probe_".concat(name);
           match s.roots.find(|r: Root| r.key == Named(full)) {
@@ -1102,8 +1092,7 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
           ),
           [],
         );
-        let code = |name: Bytes|
-          pieces_text(printed_function(lowered(name), s.setting.constructors).pieces);
+        let code = |name: Bytes| pieces_text(printed_function(lowered(name)).pieces);
         let laid = container_layouts;
         let has = |name: Bytes, text: Bytes| code(name).index_of(text) != None;
         let field = |name: Bytes| b"))->".concat(name);
@@ -1128,7 +1117,7 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
         });
         let copies = |name: Bytes| {
           let f = lowered(name);
-          printed_function(f, s.setting.constructors).calls.filter(|k: RootKey|
+          printed_function(f).calls.filter(|k: RootKey|
             match k { Generated(w, _) -> w.operation == Copy, _ -> false })
         };
         assert_eq([b"kid_put", b"map_swap", b"branch_cut", b"spelt"].map(copies), [
@@ -1189,19 +1178,11 @@ test "each prelude extern that has an intrinsic lowers to operations on the runt
           assert(missed.len() == 0, Some(String::of_bytes_lossy(Bytes::join(missed, b"\n"))));
         none_missed(
           [b"map_root"].fold([], |accumulator: List<Bytes>, name: Bytes| {
-            let text = pieces_text(
-              printed_function(
-                insert_reference_counts(lowered(name)),
-                s.setting.constructors,
-              ).pieces,
-            );
+            let text = pieces_text(printed_function(insert_reference_counts(lowered(name))).pieces);
             if increments_count(text) { accumulator }
             else { accumulator.push(Bytes::concat_all([name, b":\n", text])) }
           }),
         )
-      },
-      Err(reason) -> panic(String::of_bytes_lossy(reason)),
-    },
-    _ -> panic("the prelude and its probes do not check"),
+      }),
   }
 }

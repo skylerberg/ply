@@ -1,0 +1,157 @@
+import compiler.check.borrowing (mode_facts)
+import compiler.check.infer.checker (StoredDeclarations, elsewhere, CheckReads, Checked)
+import compiler.check.resolve.tables (declaration_bin)
+import compiler.check.resolve.tables (Declaration, Declarations, Namespace, Scope, other_modules,
+                                      qualify, ValueSpace, TypeSpace, EffectSpace, SetSpace)
+import compiler.check.termination (termination_facts)
+import std.bin
+import std.list
+
+pub type NameDeclarations = {
+  value: Option<Declaration>,
+  of_type: Option<Declaration>,
+  of_effect: Option<Declaration>,
+  of_set: Option<Declaration>,
+}
+
+derive bin for NameDeclarations
+
+fn in_namespace(found: NameDeclarations, namespace: Namespace) -> Option<Declaration> =
+  match namespace {
+    ValueSpace -> found.value,
+    TypeSpace -> found.of_type,
+    EffectSpace -> found.of_effect,
+    SetSpace -> found.of_set,
+  }
+
+pub type StoredReads<| e> = {
+  declarations_of: (Bytes, Option<Namespace>) -> List<StoredDeclarations> / {abort.raise | e},
+  module_package: (Bytes) -> Option<Int> / {abort.raise | e},
+  module_scope: (Bytes) -> Option<Scope> / {abort.raise | e},
+  names_declared: (Bytes, Bytes) -> NameDeclarations / {abort.raise | e},
+  module_declarations: (Bytes) -> Option<Declarations> / {abort.raise | e},
+  visible_modules: () -> List<Bytes> / {abort.raise | e},
+  every_module: () -> List<Bytes> / {abort.raise | e},
+  shipped_modules: () -> List<Bytes> / {abort.raise | e},
+}
+
+pub fn first_stored<a>(
+  stored: List<StoredDeclarations>,
+  pick: (StoredDeclarations) -> Option<a>,
+) -> Option<a> =
+  stored.fold(None, |found: Option<a>, s: StoredDeclarations|
+    match found { Some(_) -> found, None -> pick(s) })
+
+fn namespace_tag(namespace: Option<Namespace>) -> Bytes =
+  match namespace {
+    None -> b"*",
+    Some(ValueSpace) -> b"v",
+    Some(TypeSpace) -> b"t",
+    Some(EffectSpace) -> b"e",
+    Some(SetSpace) -> b"s",
+  }
+
+type Looked = { found: List<StoredDeclarations>, cache: Map<Bytes, List<StoredDeclarations>> }
+
+fn looked_up<| e>(
+  reads: StoredReads<| e>,
+  cache: Map<Bytes, List<StoredDeclarations>>,
+  name: Bytes,
+  namespace: Option<Namespace>,
+) -> Looked / {abort.raise | e} = {
+  let key = Bytes::concat_all([namespace_tag(namespace), b" ", name]);
+  match cache.get(key) {
+    Some(found) -> { found: found, cache: cache },
+    None -> {
+      let found = (reads.declarations_of)(name, namespace);
+      { found: found, cache: cache.insert(key, found) }
+    },
+  }
+}
+
+pub fn over_stored<a | e>(
+  reads: StoredReads<| e>,
+  body: () -> a / {CheckReads, abort.raise | e},
+) -> a / {abort.raise | e} =
+  handle {
+    body()
+  } with {
+    var cache: Map<Bytes, List<StoredDeclarations>> = Map::new(),
+    var names: Map<Bytes, NameDeclarations> = Map::new(),
+    elsewhere.look_up_type(name) -> {
+      let l = looked_up(reads, cache, name, Some(TypeSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.types.get(name))
+    },
+    elsewhere.look_up_effect(name) -> {
+      let l = looked_up(reads, cache, name, Some(EffectSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.effects.get(name))
+    },
+    elsewhere.look_up_constructor(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.constructors.get(name))
+    },
+    elsewhere.look_up_definition(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name))
+    },
+    mode_facts.look_up_modes(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      match first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name)) {
+        Some(d) -> d.modes,
+        None -> None,
+      }
+    },
+    termination_facts.look_up_summary(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      match first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name)) {
+        Some(d) -> d.summary,
+        None -> None,
+      }
+    },
+    termination_facts.look_up_ending(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      match first_stored(l.found, |s: StoredDeclarations| s.definitions.get(name)) {
+        Some(d) -> match d.implementation { Checked(x, _) -> Some(x.ending), _ -> None },
+        None -> None,
+      }
+    },
+    other_modules.look_up_package(module) -> (reads.module_package)(module),
+    other_modules.look_up_module_scope(module) -> (reads.module_scope)(module),
+    other_modules.look_up_declaration(module, namespace, name) -> {
+      let key = qualify(module, name);
+      match names.get(key) {
+        Some(found) -> in_namespace(found, namespace),
+        None -> {
+          let found = (reads.names_declared)(module, name);
+          names = names.insert(key, found);
+          in_namespace(found, namespace)
+        },
+      }
+    },
+    other_modules.look_up_declarations(module) -> (reads.module_declarations)(module),
+    other_modules.look_up_effect_set(module, name) -> {
+      let l = looked_up(reads, cache, qualify(module, name), Some(SetSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.sets.get(qualify(module, name)))
+    },
+    other_modules.look_up_schema(module, name) -> {
+      let l = looked_up(reads, cache, qualify(module, name), None);
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.schemas.get(qualify(module, name)))
+    },
+    other_modules.look_up_parameters(name) -> {
+      let l = looked_up(reads, cache, name, Some(ValueSpace));
+      cache = l.cache;
+      first_stored(l.found, |s: StoredDeclarations| s.parameters.get(name))
+    },
+    other_modules.list_visible_modules(module) -> (reads.visible_modules)(),
+    other_modules.list_modules() -> (reads.every_module)(),
+    other_modules.list_shipped_modules() -> (reads.shipped_modules)(),
+  }

@@ -1,3 +1,8 @@
+import std.set (Set)
+import std.graph (Visit, traverse, keyed, post_order, numbered, named)
+import compiler.check.infer.checker (CallShape, call_shape, elsewhere, ConstructorInfo, TypeFacts,
+                                     builtin_constructors)
+import compiler.check.infer.definitions (Extern)
 import compiler.syntax.items (FnDefinition, Constraint, is_predicate)
 import compiler.syntax.type_syntax (Mode)
 import compiler.emit.code (Lambda)
@@ -27,156 +32,314 @@ import compiler.emit.c (BoolKind, BoxedKind, DecimalKind, FloatKind, IntKind, Si
                         WideKind, Kind, width_named, in_register)
 import compiler.emit.keys (RootKey, Named, specialisation_key, root_name, root_text)
 
-pub type Constructors = {
-  names: List<Bytes>,
-  keyed: List<Bytes>,
-  numeric: List<Bytes>,
-  stated: Map<Bytes, Bool>,
-  sums: Map<Bytes, List<SumConstructor>>,
-  named: Map<Bytes, Bool>,
-  sum_of: Map<Bytes, Bytes>,
-  recursive: Map<Bytes, RecursiveGroup>,
-  unkept: Map<Bytes, Unstorable>,
-  sum_layouts: Map<Bytes, SumLayout>,
-  released: Map<Bytes, Bytes>,
-  release_effects_by_type: Map<Bytes, Effects>,
-}
-
 pub type SumConstructor = { name: Bytes, index: Int, fields: List<Type>, params: List<Int> }
 
 pub type RecursiveGroup = { group: List<Bytes>, indirect: List<Bool> }
 
 pub type Unstorable = { always: Bool, params: List<Int> }
 
-pub fn constructors_of(
-  names: List<Bytes>,
-  keyed: List<Bytes>,
-  numeric: List<Bytes>,
-  sums: Map<Bytes, List<SumConstructor>>,
-) -> Constructors =
+pub type Released = { by: Bytes, effects: Option<Effects> }
+
+pub effect code_facts {
+  read value_named(name: Bytes) -> Option<ConstantData>
+  read native_named(name: Bytes) -> Option<Extern>
+  read stated_function(name: Bytes) -> Bool
+  read sum_named(name: Bytes) -> Option<List<SumConstructor>>
+  read sum_of_constructor(name: Bytes) -> Option<Bytes>
+  read keyed_constructor(name: Bytes) -> Bool
+  read numeric_constructor(name: Bytes) -> Bool
+  read released_by(type_name: Bytes) -> Option<Released>
+  read recursive_group_of(type_name: Bytes) -> Option<RecursiveGroup>
+  read unkept_of(type_name: Bytes) -> Option<Unstorable>
+  read sum_layout_of(sum: AppliedSum) -> Option<SumLayout>
+}
+
+pub type AppliedSum = { name: Bytes, args: List<Type>, constructors: List<SumConstructor> }
+
+pub effect set ShapeReads = {code_facts.read, abort.raise}
+
+pub effect lowering {
+  raise fail(reason: Bytes)
+}
+
+pub effect set EmitReads = {elsewhere.read, code_facts.read, lowering.fail, abort.raise}
+
+pub type CodeSources<| e> = {
+  value_of: (Bytes) -> Option<ConstantData> / {abort.raise | e},
+  native_of: (Bytes) -> Option<Extern> / {abort.raise | e},
+  stated_of: (Bytes) -> Bool / {abort.raise | e},
+  sum_of: (Bytes) -> Option<List<SumConstructor>> / {abort.raise | e},
+  home_of: (Bytes) -> Option<Bytes> / {abort.raise | e},
+  keyed_of: (Bytes) -> Bool / {abort.raise | e},
+  numeric_of: (Bytes) -> Bool / {abort.raise | e},
+  released_of: (Bytes) -> Option<Released> / {abort.raise | e},
+}
+
+pub fn table_sources(sums: Map<Bytes, List<SumConstructor>>) -> CodeSources<| {}> =
   {
-    names: names,
-    keyed: keyed,
-    numeric: numeric,
-    stated: Map::new(),
-    sums: sums,
-    named: names.fold(Map::new(), |m: Map<Bytes, Bool>, n: Bytes| m.insert(n, true)),
-    sum_of: sums.fold(Map::new(), |m: Map<Bytes, Bytes>, sum: Bytes, cs: List<SumConstructor>|
-      cs.fold(m, |k: Map<Bytes, Bytes>, c: SumConstructor|
-        if k.contains(c.name) { k } else { k.insert(c.name, sum) })),
-    recursive: recursive_groups(sums),
-    unkept: unstorable_sums(sums),
-    sum_layouts: Map::new(),
-    released: Map::new(),
-    release_effects_by_type: Map::new(),
+    value_of: |_: Bytes| None,
+    native_of: |_: Bytes| None,
+    stated_of: |_: Bytes| false,
+    sum_of: |name: Bytes| sums.get(name),
+    home_of: |name: Bytes|
+      sums.fold(None, |found: Option<Bytes>, sum: Bytes, cs: List<SumConstructor>|
+        if cs.any(|c: SumConstructor| c.name == name) { Some(sum) } else { found }),
+    keyed_of: |_: Bytes| false,
+    numeric_of: |_: Bytes| false,
+    released_of: |_: Bytes| None,
   }
 
-pub fn with_released(
-  constructors: Constructors,
-  released: Map<Bytes, Bytes>,
-  scheme_of: (Bytes) -> Option<Scheme>,
-) -> Constructors =
+pub fn failing_on_lowering<a | e>(
+  body: () -> a / {lowering.fail, abort.raise | e},
+) -> a / {abort.raise | e} =
+  handle { body() } with { lowering.fail(reason) -> panic(String::of_bytes_lossy(reason)) }
+
+pub fn with_no_shapes<a>(body: () -> a / {ShapeReads, lowering.fail}) -> a / {abort.raise} =
+  failing_on_lowering(|| over_code_facts(table_sources(Map::new()), body))
+
+pub fn over_code_facts<a | e>(
+  sources: CodeSources<| e>,
+  body: () -> a / {code_facts.read, abort.raise | e},
+) -> a / {abort.raise | e} =
+  handle {
+    body()
+  } with {
+    var sums: Map<Bytes, Option<List<SumConstructor>>> = Map::new(),
+    var groups: Map<Bytes, Option<RecursiveGroup>> = Map::new(),
+    var unkept: Map<Bytes, Option<Unstorable>> = Map::new(),
+    var layouts: Map<AppliedSum, Option<SumLayout>> = Map::new(),
+    code_facts.value_named(name) -> (sources.value_of)(name),
+    code_facts.native_named(name) -> (sources.native_of)(name),
+    code_facts.stated_function(name) -> (sources.stated_of)(name),
+    code_facts.sum_named(name) -> match sums.get(name) {
+      Some(found) -> found,
+      None -> {
+        let found = (sources.sum_of)(name);
+        sums = sums.insert(name, found);
+        found
+      },
+    },
+    code_facts.sum_of_constructor(name) -> (sources.home_of)(name),
+    code_facts.keyed_constructor(name) -> (sources.keyed_of)(name),
+    code_facts.numeric_constructor(name) -> (sources.numeric_of)(name),
+    code_facts.released_by(type_name) -> (sources.released_of)(type_name),
+    code_facts.recursive_group_of(type_name) -> match groups.get(type_name) {
+      Some(found) -> found,
+      None -> {
+        let found = recursive_groups(sums_around(sources.sum_of, [type_name])).get(type_name);
+        groups = groups.insert(type_name, found);
+        found
+      },
+    },
+    code_facts.unkept_of(type_name) -> match unkept.get(type_name) {
+      Some(found) -> found,
+      None -> {
+        let found = unstorable_sums(sums_around(sources.sum_of, [type_name])).get(type_name);
+        unkept = unkept.insert(type_name, found);
+        found
+      },
+    },
+    code_facts.sum_layout_of(sum) -> match layouts.get(sum) {
+      Some(laid) -> laid,
+      None -> {
+        let laid = sum_layouts(sources.sum_of, sum);
+        layouts = layouts.union(laid);
+        found(laid, sum)
+      },
+    },
+  }
+
+fn sum_layouts<| e>(
+  sum_of: (Bytes) -> Option<List<SumConstructor>> / {abort.raise | e},
+  sum: AppliedSum,
+) -> Map<AppliedSum, Option<SumLayout>> / {abort.raise | e} = {
+  let sums = sums_around(sum_of, type_names(NamedType({ name: sum.name, args: sum.args })));
+  let reads = table_reads(sums, recursive_groups(sums));
+  answered(
+    reads,
+    [{ sum: sum, cut: [] }],
+    |cases: List<InstanceCase>, known: Map<SumInstance, Option<SumLayout>>|
+      instance_layout(reads, cases, known),
+  ).fold(
+    Map::new(),
+    |top_level: Map<AppliedSum, Option<SumLayout>>, instance: SumInstance, laid: Option<SumLayout>|
+      if instance.cut.len() == 0 { top_level.insert(instance.sum, laid) } else { top_level },
+  )
+}
+
+pub fn sum_constructor(
+  name: Bytes,
+  index: Int,
+  scheme: Scheme,
+  fields: List<Type>,
+) -> SumConstructor = {
+  let typed = match scheme.ty {
+    FunctionType(f) -> { fields: f.params, made: f.return_type },
+    t -> { fields: fields, made: t },
+  };
   {
-    ..constructors,
-    released: released,
-    release_effects_by_type: released.fold(
-      Map::new(),
-      |m: Map<Bytes, Effects>, ty: Bytes, by: Bytes|
-        match scheme_of(by) {
-          Some(scheme) -> match scheme.ty {
-            FunctionType(f) -> m.insert(ty, { listed: f.effects.listed, variable: None }),
-            _ -> m,
-          },
-          None -> m,
-        },
-    ),
+    name: name,
+    index: index,
+    fields: typed.fields,
+    params: match typed.made {
+      NamedType(t) -> t.args.map(|a: Type| match a { VariableType(v) -> v, _ -> 0 - 1 }),
+      _ -> [],
+    },
+  }
+}
+
+pub fn stored_sources<| e>(
+  value_of: keep (Bytes) -> Option<ConstantData> / {elsewhere.read, abort.raise | e},
+  native_of: keep (Bytes) -> Option<Extern> / {elsewhere.read, abort.raise | e},
+  stated_of: keep (Bytes) -> Bool / {elsewhere.read, abort.raise | e},
+) -> CodeSources<| {elsewhere.read | e}> =
+  {
+    value_of: value_of,
+    native_of: native_of,
+    stated_of: stated_of,
+    sum_of: sum_read,
+    home_of: sum_of_read,
+    keyed_of: keyed_read,
+    numeric_of: numeric_read,
+    released_of: released_read,
   }
 
-pub fn release_effects(constructors: Constructors, ty: Type) -> Effects / {abort.raise} =
-  if constructors.release_effects_by_type.len() == 0 { no_effects } else {
-    let effects = iterate(
-      { todo: [ty], seen: [], listed: [] },
-      constructors.sums.fold(256, |n: Int, _: Bytes, cs: List<SumConstructor>|
-        cs.fold(n, |m: Int, k: SumConstructor| m + 4 * (k.fields.len() + 1))),
-      |w: { todo: List<Type>, seen: List<Bytes>, listed: List<Effect> }|
-        match w.todo {
-          [] -> Stop(w.listed),
-          [t, ..rest] -> match t {
-            NamedType(c) -> if is_label_or_effects(t) { Continue({ ..w, todo: rest }) } else {
-              match constructors.release_effects_by_type.get(c.name) {
-                Some(r) -> Continue({ ..w, todo: rest, listed: effects_union(w.listed, r.listed) }),
-                None -> {
-                  let args = rest.concat(c.args);
-                  if w.seen.contains(c.name) { Continue({ ..w, todo: args }) } else {
-                    match constructors.sums.get(c.name) {
-                      Some(cs) ->
-                        Continue({
-                          ..w,
-                          todo: cs.fold(args, |accumulator: List<Type>, k: SumConstructor|
-                            accumulator.concat(constructor_fields_at(k, c.args))),
-                          seen: w.seen.push(c.name),
-                        }),
-                      None -> Continue({ ..w, todo: args }),
-                    }
-                  }
-                },
-              }
-            },
-            RecordType(fs) -> Continue({ ..w, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
-            NominalType(n) -> Continue({ ..w, todo: rest.concat(n.fields.map(|f: Field| f.ty)) }),
-            _ -> Continue({ ..w, todo: rest }),
-          },
-        },
-    );
-    { listed: effects, variable: None }
-  }
+fn sum_of_info(c: ConstructorInfo) -> SumConstructor =
+  sum_constructor(c.name, c.index, c.scheme, c.fields)
 
-pub fn contains_resource(constructors: Constructors, ty: Type) -> Bool / {abort.raise} =
-  constructors.released.len() > 0
-    && iterate(
-      { todo: [ty], seen: [] },
-      constructors.sums.fold(256, |n: Int, _: Bytes, cs: List<SumConstructor>|
-        cs.fold(n, |m: Int, k: SumConstructor| m + 4 * (k.fields.len() + 1))),
-      |w: { todo: List<Type>, seen: List<Bytes> }|
-        match w.todo {
-          [] -> Stop(false),
-          [t, ..rest] -> match t {
-            VariableType(_) -> Stop(true),
-            NamedType(c) -> if is_label_or_effects(t) { Continue({ ..w, todo: rest }) }
-            else if constructors.released.contains(c.name) { Stop(true) } else {
-              let args = rest.concat(c.args);
-              if w.seen.contains(c.name) { Continue({ ..w, todo: args }) } else {
-                match constructors.sums.get(c.name) {
-                  Some(cs) ->
-                    Continue({
-                      todo: cs.fold(args, |accumulator: List<Type>, k: SumConstructor|
-                        accumulator.concat(constructor_fields_at(k, c.args))),
-                      seen: w.seen.push(c.name),
-                    }),
-                  None -> Continue({ ..w, todo: args }),
-                }
-              }
-            },
-            RecordType(fs) -> Continue({ ..w, todo: rest.concat(fs.map(|f: Field| f.ty)) }),
-            NominalType(n) -> Continue({ ..w, todo: rest.concat(n.fields.map(|f: Field| f.ty)) }),
-            FunctionType(_) -> Continue({ ..w, todo: rest }),
-          },
-        },
+fn builtin_constructor_named(name: Bytes) -> Option<ConstructorInfo> / {abort.raise} =
+  builtin_constructors().find(|c: ConstructorInfo| c.name == name)
+
+fn sum_read(name: Bytes) -> Option<List<SumConstructor>> / {elsewhere.read, abort.raise} = {
+  let builtin = builtin_constructors().filter(|c: ConstructorInfo| c.type_name == name);
+  let declared = if builtin.len() > 0 { builtin }
+  else { match elsewhere.look_up_type(name) { Some(t) -> t.constructors, None -> [] } };
+  if declared.len() == 0 { None } else {
+    Some(
+      declared.sort_by(|a: ConstructorInfo, b: ConstructorInfo| a.index <= b.index).map(
+        sum_of_info,
+      ),
     )
+  }
+}
 
-pub fn with_sums_laid(constructors: Constructors) -> Constructors =
-  {
-    ..constructors,
-    sum_layouts: constructors.sums.fold(
-      Map::new(),
-      |m: Map<Bytes, SumLayout>, name: Bytes, cs: List<SumConstructor>|
-        if cs.any(|c: SumConstructor| c.params.len() > 0) { m } else {
-          match sum_within(constructors, { name: name, args: [] }, cs, [], true, nesting) {
-            Some(s) -> m.insert(name, s),
-            None -> m,
-          }
-        },
-    ),
+fn sum_of_read(name: Bytes) -> Option<Bytes> / {elsewhere.read, abort.raise} =
+  match builtin_constructor_named(name) {
+    Some(c) -> Some(c.type_name),
+    None -> match elsewhere.look_up_constructor(name) {
+      Some(c) -> Some(c.type_name),
+      None -> None,
+    },
+  }
+
+fn type_of_constructor(name: Bytes) -> Option<TypeFacts> / {elsewhere.read, abort.raise} =
+  match sum_of_read(name) { Some(t) -> elsewhere.look_up_type(t), None -> None }
+
+fn keyed_read(name: Bytes) -> Bool / {elsewhere.read, abort.raise} =
+  match type_of_constructor(name) { Some(t) -> t.keyed, None -> false }
+
+fn numeric_read(name: Bytes) -> Bool / {elsewhere.read, abort.raise} =
+  match type_of_constructor(name) { Some(t) -> t.numeric != None, None -> false }
+
+fn released_read(type_name: Bytes) -> Option<Released> / {elsewhere.read} =
+  match elsewhere.look_up_type(type_name) {
+    Some(t) -> match t.release_function {
+      Some(by) ->
+        Some({
+          by: by,
+          effects: match elsewhere.look_up_definition(by) {
+            Some(d) -> match d.scheme.ty {
+              FunctionType(f) -> Some({ listed: f.effects.listed, variable: None }),
+              _ -> None,
+            },
+            None -> None,
+          },
+        }),
+      None -> None,
+    },
+    None -> None,
+  }
+
+pub fn sums_around<| e>(
+  sum_of: (Bytes) -> Option<List<SumConstructor>> / {abort.raise | e},
+  names: List<Bytes>,
+) -> Map<Bytes, List<SumConstructor>> / {abort.raise | e} =
+  traverse(names, |name: Bytes| {
+    let found = sum_of(name);
+    {
+      value: found,
+      next: match found {
+        Some(cs) ->
+          cs.fold([], |inside: List<Bytes>, c: SumConstructor|
+            c.fields.fold(inside, |names_in: List<Bytes>, t: Type| names_in.concat(type_names(t)))),
+        None -> [],
+      },
+    }
+  }).fold(
+    Map::new(),
+    |sums: Map<Bytes, List<SumConstructor>>, v: Visit<Bytes, Option<List<SumConstructor>>>|
+      match v.value { Some(cs) -> sums.insert(v.key, cs), None -> sums },
+  )
+
+fn release_effects_of(type_name: Bytes) -> Option<Effects> / {ShapeReads} =
+  match code_facts.released_by(type_name) { Some(r) -> r.effects, None -> None }
+
+pub fn release_effects(ty: Type) -> Effects / {ShapeReads} = {
+  let effects = traverse([ty], released_within).fold(
+    [],
+    |listed: List<Effect>, v: Visit<Type, List<Effect>>| effects_union(listed, v.value),
+  );
+  { listed: effects, variable: None }
+}
+
+fn released_within(t: Type) -> { value: List<Effect>, next: List<Type> } / {ShapeReads} =
+  match t {
+    NamedType(c) -> if is_label_or_effects(t) { { value: [], next: [] } } else {
+      match release_effects_of(c.name) {
+        Some(r) -> { value: r.listed, next: [] },
+        None -> { value: [], next: c.args.concat(sum_fields(c)) },
+      }
+    },
+    RecordType(fs) -> { value: [], next: fs.map(|f: Field| f.ty) },
+    NominalType(n) -> { value: [], next: n.fields.map(|f: Field| f.ty) },
+    _ -> { value: [], next: [] },
+  }
+
+pub fn contains_resource(ty: Type) -> Bool / {ShapeReads} =
+  traverse([ty], resources_within).any(|v: Visit<Type, Bool>| v.value)
+
+fn resources_within(t: Type) -> { value: Bool, next: List<Type> } / {ShapeReads} =
+  match t {
+    VariableType(_) -> { value: true, next: [] },
+    NamedType(c) -> if is_label_or_effects(t) { { value: false, next: [] } }
+    else if code_facts.released_by(c.name) != None { { value: true, next: [] } }
+    else { { value: false, next: c.args.concat(sum_fields(c)) } },
+    RecordType(fs) -> { value: false, next: fs.map(|f: Field| f.ty) },
+    NominalType(n) -> { value: false, next: n.fields.map(|f: Field| f.ty) },
+    FunctionType(_) -> { value: false, next: [] },
+  }
+
+pub fn holds_list_of(element: Type) -> Bool / {ShapeReads} =
+  traverse([element], |t: Type| lists_of_within(element, t)).any(|v: Visit<Type, Bool>| v.value)
+
+fn lists_of_within(element: Type, t: Type) -> { value: Bool, next: List<Type> } / {ShapeReads} =
+  match t {
+    VariableType(_) -> { value: true, next: [] },
+    FunctionType(_) -> { value: true, next: [] },
+    NamedType(c) -> if list_item(t) == Some(element) || runtime_object(c.name) {
+      { value: true, next: [] }
+    } else if is_label_or_effects(t) { { value: false, next: [] } }
+    else { { value: false, next: c.args.concat(sum_fields(c)) } },
+    RecordType(fs) -> { value: false, next: fs.map(|f: Field| f.ty) },
+    NominalType(n) -> { value: false, next: n.fields.map(|f: Field| f.ty) },
+  }
+
+pub fn sum_fields(c: { name: Bytes, args: List<Type> }) -> List<Type> / {ShapeReads} =
+  match code_facts.sum_named(c.name) {
+    Some(cs) ->
+      cs.fold([], |fields: List<Type>, k: SumConstructor|
+        fields.concat(constructor_fields_at(k, c.args))),
+    None -> [],
   }
 
 pub fn constructor_fields_at(c: SumConstructor, args: List<Type>) -> List<Type> =
@@ -204,10 +367,10 @@ pub fn at_args(ty: Type, params: List<Int>, args: List<Type>) -> Type =
       }),
   }
 
-pub fn contains_unstorable(constructors: Constructors, ty: Type) -> Bool =
-  unkept_in(constructors.unkept, ty).always
+pub fn contains_unstorable(ty: Type) -> Bool / {ShapeReads} =
+  unkept_in(|name: Bytes| code_facts.unkept_of(name), ty).always
 
-fn unkept_in(unkept: Map<Bytes, Unstorable>, ty: Type) -> Unheld =
+fn unkept_in<| e>(unkept: (Bytes) -> Option<Unstorable> / e, ty: Type) -> Unheld / e =
   match ty {
     VariableType(v) -> { always: false, variables: [v] },
     FunctionType(_) -> { always: true, variables: [] },
@@ -225,7 +388,7 @@ fn unkept_in(unkept: Map<Bytes, Unstorable>, ty: Type) -> Unheld =
           _ -> accumulator,
         })
     } else {
-      match unkept.get(c.name) {
+      match unkept(c.name) {
         Some(u) -> if u.always { { always: true, variables: [] } } else {
           c.args.fold(
             { at: 0, out: no_unheld },
@@ -288,7 +451,8 @@ fn unstorable_sums(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, Unstora
   );
   let summary = |known: Map<Bytes, Unstorable>, cs: List<SumConstructor>|
     cs.fold({ always: false, params: [] }, |accumulator: Unstorable, c: SumConstructor| {
-      let r = c.fields.fold(no_unheld, |a: Unheld, f: Type| unheld_joined(a, unkept_in(known, f)));
+      let r = c.fields.fold(no_unheld, |a: Unheld, f: Type|
+        unheld_joined(a, unkept_in(|n: Bytes| known.get(n), f)));
       {
         always: accumulator.always || r.always,
         params: range(0, c.params.len()).fold(accumulator.params, |ps: List<Int>, i: Int|
@@ -339,7 +503,9 @@ pub fn type_names(ty: Type) -> List<Bytes> =
       ),
   }
 
-fn recursive_groups(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, RecursiveGroup> = {
+fn recursive_groups(
+  sums: Map<Bytes, List<SumConstructor>>,
+) -> Map<Bytes, RecursiveGroup> / {abort.raise} = {
   let inline = params_in_place(sums);
   let inner_sums = |cs: List<SumConstructor>|
     cs.fold([], |accumulator: List<Bytes>, c: SumConstructor|
@@ -357,9 +523,8 @@ fn recursive_groups(sums: Map<Bytes, List<SumConstructor>>) -> Map<Bytes, Recurs
       Some(hs) -> hs.filter(|h: Bytes| cyclic.contains(h)),
       None -> [],
     }));
-  let steps = within.fold(0, |n: Int, _: Bytes, hs: List<Bytes>| n + hs.len());
-  let reach = cyclic.fold(Map::new(), |m: Map<Bytes, Map<Bytes, Bool>>, n: Bytes|
-    m.insert(n, reachable(within, n, 2 * steps + 1)));
+  let reach = cyclic.fold(Map::new(), |m: Map<Bytes, Set<Bytes>>, n: Bytes|
+    m.insert(n, reachable(within, n)));
   let is_reachable = |from: Bytes, to: Bytes|
     match reach.get(from) { Some(r) -> r.contains(to), None -> false };
   cyclic.fold(Map::new(), |m: Map<Bytes, RecursiveGroup>, n: Bytes|
@@ -493,33 +658,18 @@ fn on_cycles(inner_sums: Map<Bytes, List<Bytes>>) -> List<Bytes> = {
   names.filter(|n: Bytes| match ended.open.get(n) { Some(k) -> k > 0, None -> false })
 }
 
-fn reachable(inner_sums: Map<Bytes, List<Bytes>>, from: Bytes, bound: Int) -> Map<Bytes, Bool> = {
+fn reachable(inner_sums: Map<Bytes, List<Bytes>>, from: Bytes) -> Set<Bytes> / {abort.raise} = {
   let next = |n: Bytes| match inner_sums.get(n) { Some(hs) -> hs, None -> [] };
-  range(0, bound).fold(
-    { seen: Map::new(), todo: next(from), at: 0 },
-    |s: { seen: Map<Bytes, Bool>, todo: List<Bytes>, at: Int }, _: Int|
-      match s.todo.at(s.at) {
-        None -> s,
-        Some(n) -> if s.seen.contains(n) { { ..s, at: s.at + 1 } }
-        else { { seen: s.seen.insert(n, true), todo: s.todo.concat(next(n)), at: s.at + 1 } },
-      },
-  ).seen
+  traverse(next(from), |n: Bytes| { value: (), next: next(n) }).fold(
+    Set::empty(),
+    |reached: Set<Bytes>, v: Visit<Bytes, Unit>| reached.insert(v.key),
+  )
 }
-
-pub const no_constructors: Constructors = constructors_of([], [], [], Map::new())
 
 pub fn constructor_sums(rows: List<ConstructorRow>) -> Map<Bytes, List<SumConstructor>> =
   rows.fold(Map::new(), |accumulator: Map<Bytes, List<SumConstructor>>, c: ConstructorRow| {
     let had = match accumulator.get(c.type_name) { Some(cs) -> cs, None -> [] };
-    let typed = match c.scheme.ty {
-      FunctionType(f) -> { fields: f.params, made: f.return_type },
-      t -> { fields: c.fields, made: t },
-    };
-    let params = match typed.made {
-      NamedType(t) -> t.args.map(|a: Type| match a { VariableType(v) -> v, _ -> 0 - 1 }),
-      _ -> [],
-    };
-    let mine = { name: c.name, index: c.index, fields: typed.fields, params: params };
+    let mine = sum_constructor(c.name, c.index, c.scheme, c.fields);
     accumulator.insert(
       c.type_name,
       had.filter(|x: SumConstructor| x.index < c.index).concat(
@@ -595,10 +745,6 @@ pub type Definition = {
   root: RootKey,
 }
 
-pub fn definition_named(definitions: List<Definition>, name: Bytes) -> Option<Definition> =
-  definitions.fold(None, |accumulator: Option<Definition>, d: Definition|
-    if d.name == name { Some(d) } else { accumulator })
-
 pub type EffectName = { global: Bytes, operations: List<EffectOperation> }
 
 pub type EffectOperation = {
@@ -622,47 +768,40 @@ pub type BoundLambda = {
   nth: Int,
   code: Lambda,
   module: Bytes,
-  module_definitions: List<Definition>,
   imports: List<Imported>,
-  effects: List<EffectName>,
   base: Int,
   written: List<Lambda>,
 }
 
-pub type Imported = { name: Bytes, module: Bytes, definitions: List<Definition>, whole: Bool }
-
-pub type ModuleDefinitions = { module: Bytes, definitions: List<Definition> }
+pub type Imported = { name: Bytes, module: Bytes, whole: Bool }
 
 pub fn inline_fields(f: FieldShape) -> Option<List<FieldShape>> =
   match f.ty { RecordShape(fs) -> Some(fs), _ -> None }
 
-pub fn compared_by_root(constructors: Constructors, name: Bytes) -> Bool =
-  match constructors.sums.get(name) { Some(cs) -> cs.len() > 0, None -> false }
+pub fn compared_by_root(name: Bytes) -> Bool / {ShapeReads} =
+  match code_facts.sum_named(name) { Some(cs) -> cs.len() > 0, None -> false }
 
-pub fn keyed_sum(constructors: Constructors, name: Bytes) -> Bool =
-  match constructors.sums.get(name) {
-    Some(cs) -> cs.any(|c: SumConstructor| constructors.keyed.contains(c.name)),
+pub fn keyed_sum(name: Bytes) -> Bool / {ShapeReads} =
+  match code_facts.sum_named(name) {
+    Some(cs) -> cs.any(|c: SumConstructor| code_facts.keyed_constructor(c.name)),
     None -> false,
   }
 
-pub fn numeric_sum(constructors: Constructors, ty: Type) -> Bool =
+pub fn numeric_sum(ty: Type) -> Bool / {ShapeReads} =
   match ty {
-    NamedType(c) -> match constructors.sums.get(c.name) {
-      Some(cs) -> cs.any(|k: SumConstructor| constructors.numeric.contains(k.name)),
+    NamedType(c) -> match code_facts.sum_named(c.name) {
+      Some(cs) -> cs.any(|k: SumConstructor| code_facts.numeric_constructor(k.name)),
       None -> false,
     },
     _ -> false,
   }
 
-pub fn generic_sum(constructors: Constructors, t: Type) -> Bool =
+pub fn generic_sum(t: Type) -> Bool / {ShapeReads} =
   !has_variables(t)
-    && (match t {
-      NamedType(c) -> c.args.len() > 0 && compared_by_root(constructors, c.name),
-      _ -> false,
-    })
+    && (match t { NamedType(c) -> c.args.len() > 0 && compared_by_root(c.name), _ -> false })
 
-pub fn written_sum(constructors: Constructors, c: { name: Bytes, args: List<Type> }) -> Bool =
-  constructors.sums.contains(c.name)
+pub fn written_sum(c: { name: Bytes, args: List<Type> }) -> Bool / {ShapeReads} =
+  code_facts.sum_named(c.name) != None
 
 pub fn nullary_sum(cs: List<SumConstructor>) -> Bool =
   cs.fold(true, |ok: Bool, c: SumConstructor| ok && c.fields.len() == 0)
@@ -707,9 +846,6 @@ pub fn field_shape(name: Bytes, t: Type) -> Option<FieldShape> =
     _ -> Some(field_type({ name: name, ty: t })),
   }
 
-fn is_record(ty: Type) -> Bool =
-  match ty { RecordType(_) -> true, NominalType(_) -> true, _ -> false }
-
 fn has_variable_field(fs: List<Field>) -> Bool =
   fs.fold(false, |open: Bool, f: Field|
     open
@@ -727,17 +863,17 @@ fn field_type(f: Field) -> FieldShape = {
 
 pub type Sig = { params: List<Type>, result_type: Type }
 
-pub fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
-  match schemes.get(full) {
-    Some(s) -> match s.ty {
-      FunctionType(f) -> Some({ params: f.params, result_type: f.return_type }),
-      _ -> None,
-    },
-    None -> None,
+fn sig_of_scheme(s: Scheme) -> Option<Sig> =
+  match s.ty {
+    FunctionType(f) -> Some({ params: f.params, result_type: f.return_type }),
+    _ -> None,
   }
 
-pub fn layout_of(constructors: Constructors, ty: Type) -> layout::ValueLayout / {abort.raise} =
-  match known_layout(constructors, ty) {
+pub fn sig_of(schemes: Map<Bytes, Scheme>, full: Bytes) -> Option<Sig> =
+  match schemes.get(full) { Some(s) -> sig_of_scheme(s), None -> None }
+
+pub fn layout_of(ty: Type) -> layout::ValueLayout / {ShapeReads} =
+  match known_layout(ty) {
     Some(l) -> l,
     None ->
       panic(
@@ -747,99 +883,42 @@ pub fn layout_of(constructors: Constructors, ty: Type) -> layout::ValueLayout / 
       ),
   }
 
-pub fn known_layout(constructors: Constructors, ty: Type) -> Option<layout::ValueLayout> =
-  layout_within(constructors, ty, [], nesting)
+pub fn known_layout(ty: Type) -> Option<layout::ValueLayout> / {ShapeReads} =
+  placed_at_top(ty).plain
 
-const nesting: Int = 256
+pub fn inside_layout(ty: Type) -> Option<layout::ValueLayout> / {ShapeReads} =
+  placed_at_top(ty).plain.map(inside)
 
-fn layout_within(
-  constructors: Constructors,
+pub fn pointer_layout(ty: Type) -> Option<layout::ValueLayout> / {ShapeReads} =
+  placed_at_top(ty).pointed
+
+type Placed = { plain: Option<layout::ValueLayout>, pointed: Option<layout::ValueLayout> }
+
+fn placed_at_top(ty: Type) -> Placed / {ShapeReads} =
+  placed(ty, |c: { name: Bytes, args: List<Type> }|
+    named_layout(shape_reads(), |sum: AppliedSum| code_facts.sum_layout_of(sum), [], c))
+
+fn placed<| e>(
   ty: Type,
-  cut: List<Bytes>,
-  depth: Int,
-) -> Option<layout::ValueLayout> =
-  if depth <= 0 { None } else {
-    match ty {
-      VariableType(_) -> None,
-      FunctionType(_) -> Some(PlainWords([Pointer])),
-      RecordType(fs) -> fields_layout(constructors, fs, cut, depth),
-      NominalType(x) -> fields_layout(constructors, x.fields, cut, depth),
-      NamedType(c) -> match constructors.sums.get(c.name) {
-        Some(cs) -> if cut.contains(c.name) {
-          sum_within(constructors, c, cs, cut, false, depth - 1).map(|s: SumLayout|
-            PlainWords(classes(SumCases(s))))
-        } else {
-          match if cut.len() == 0 && c.args.len() == 0 { constructors.sum_layouts.get(c.name) }
-            else { None } {
-            Some(s) -> Some(SumCases(s)),
-            None -> sum_within(constructors, c, cs, cut, true, depth - 1).map(SumCases),
-          }
-        },
-        None -> Some(PlainWords(classes_named(c.name))),
-      },
-    }
-  }
-
-fn fields_layout(
-  constructors: Constructors,
-  fs: List<Field>,
-  cut: List<Bytes>,
-  depth: Int,
-) -> Option<layout::ValueLayout> =
-  match all_known(fs.map(|f: Field| pointed_within(constructors, f.ty, cut, depth - 1))) {
-    Some(ps) -> if fits_flat_record(words(record_layout(ps))) { Some(record_layout(ps)) } else {
-      all_known(fs.map(|f: Field| inside_within(constructors, f.ty, cut, depth - 1))).map(
-        record_layout,
-      )
+  named_placed: ({ name: Bytes, args: List<Type> }) -> Option<layout::ValueLayout> / e,
+) -> Placed / e =
+  match ty {
+    VariableType(_) -> { plain: None, pointed: None },
+    FunctionType(_) -> { plain: Some(PlainWords([Pointer])), pointed: Some(PlainWords([Pointer])) },
+    RecordType(fs) -> fields_placed(fs.map(|f: Field| placed(f.ty, named_placed))),
+    NominalType(x) -> fields_placed(x.fields.map(|f: Field| placed(f.ty, named_placed))),
+    NamedType(c) -> {
+      let laid = named_placed(c);
+      { plain: laid, pointed: laid }
     },
-    None -> None,
   }
 
-pub fn inside_layout(constructors: Constructors, ty: Type) -> Option<layout::ValueLayout> =
-  inside_within(constructors, ty, [], nesting)
-
-fn inside_within(
-  constructors: Constructors,
-  ty: Type,
-  cut: List<Bytes>,
-  depth: Int,
-) -> Option<layout::ValueLayout> =
-  if depth <= 0 { None } else {
-    match ty {
-      RecordType(fs) -> fields_layout(constructors, fs, cut, depth).map(inside),
-      NominalType(x) -> fields_layout(constructors, x.fields, cut, depth).map(inside),
-      _ -> layout_within(constructors, ty, cut, depth),
-    }
-  }
-
-pub fn pointer_layout(constructors: Constructors, ty: Type) -> Option<layout::ValueLayout> =
-  pointed_within(constructors, ty, [], nesting)
-
-fn pointed_within(
-  constructors: Constructors,
-  ty: Type,
-  cut: List<Bytes>,
-  depth: Int,
-) -> Option<layout::ValueLayout> =
-  if depth <= 0 { None } else {
-    match ty {
-      RecordType(fs) -> record_pointer_layout(constructors, fs, cut, depth),
-      NominalType(x) -> record_pointer_layout(constructors, x.fields, cut, depth),
-      _ -> layout_within(constructors, ty, cut, depth),
-    }
-  }
-
-fn record_pointer_layout(
-  constructors: Constructors,
-  fs: List<Field>,
-  cut: List<Bytes>,
-  depth: Int,
-) -> Option<layout::ValueLayout> = {
-  let r = fs.fold(
+fn fields_placed(fields: List<Placed>) -> Placed = {
+  let pointed = fields.fold(
     { layout: [], words: 0, open: false },
-    |accumulator: { layout: List<layout::ValueLayout>, words: Int, open: Bool }, f: Field|
+    |accumulator: { layout: List<layout::ValueLayout>, words: Int, open: Bool }, f: Placed|
       if !fits_flat_record(accumulator.words) { accumulator } else {
-        match pointed_within(constructors, f.ty, cut, depth - 1) {
+        match f.pointed {
           None -> { ..accumulator, open: true },
           Some(l) ->
             {
@@ -850,8 +929,31 @@ fn record_pointer_layout(
         }
       },
   );
-  if r.open && fits_flat_record(r.words) { None } else { Some(by_pointer(record_layout(r.layout))) }
+  {
+    plain: match all_known(fields.map(|f: Placed| f.pointed)) {
+      Some(ps) -> if fits_flat_record(words(record_layout(ps))) { Some(record_layout(ps)) }
+      else { all_known(fields.map(|f: Placed| f.plain.map(inside))).map(record_layout) },
+      None -> None,
+    },
+    pointed: if pointed.open && fits_flat_record(pointed.words) { None }
+    else { Some(by_pointer(record_layout(pointed.layout))) },
+  }
 }
+
+fn named_layout<| e>(
+  reads: SumReads<| e>,
+  layout_of_sum: (AppliedSum) -> Option<SumLayout> / {abort.raise | e},
+  cut: List<Bytes>,
+  c: { name: Bytes, args: List<Type> },
+) -> Option<layout::ValueLayout> / {abort.raise | e} =
+  match (reads.constructors_of)(c.name) {
+    None -> Some(PlainWords(classes_named(c.name))),
+    Some(cs) -> {
+      let laid = layout_of_sum({ name: c.name, args: c.args, constructors: cs });
+      if cut.contains(c.name) { laid.map(|s: SumLayout| PlainWords(classes(SumCases(s)))) }
+      else { laid.map(SumCases) }
+    },
+  }
 
 fn all_known(ls: List<Option<layout::ValueLayout>>) -> Option<List<layout::ValueLayout>> =
   ls.fold(
@@ -863,101 +965,195 @@ fn all_known(ls: List<Option<layout::ValueLayout>>) -> Option<List<layout::Value
       },
   )
 
-fn sum_within(
-  constructors: Constructors,
-  c: { name: Bytes, args: List<Type> },
-  cs: List<SumConstructor>,
-  cut: List<Bytes>,
-  open: Bool,
-  depth: Int,
-) -> Option<SumLayout> = {
-  let recursive_group = constructors.recursive.get(c.name);
-  let group = match recursive_group {
-    Some(r) ->
-      r.group.fold(cut, |accumulator: List<Bytes>, g: Bytes|
-        if accumulator.contains(g) { accumulator } else { accumulator.push(g) }),
-    None -> cut,
-  };
-  let cases = cs.fold(Some([]), |accumulator: Option<List<CaseArgs>>, k: SumConstructor|
+fn instance_layout<| e>(
+  reads: SumReads<| e>,
+  cases: List<InstanceCase>,
+  known: Map<SumInstance, Option<SumLayout>>,
+) -> Option<SumLayout> / {abort.raise | e} =
+  cases.fold(Some([]), |accumulator: Option<List<CaseArgs>>, sum_case: InstanceCase|
     match accumulator {
       None -> None,
-      Some(done) -> {
-        let boxed = match recursive_group {
-          Some(r) -> r.indirect.at(done.len()) == Some(true),
-          None -> false,
-        };
-        let args = if boxed && !open { Some(PlainWords([])) } else {
+      Some(done) -> match sum_case {
+        RecursiveBox -> Some(done.push({ args: PlainWords([]), indirect: true })),
+        WithFields(f) ->
           all_known(
-            constructor_fields_at(k, c.args).map(|t: Type|
-              pointed_within(constructors, t, if boxed { group } else { cut }, depth)),
-          ).map(
-            record_layout,
-          )
-        };
-        match args { Some(a) -> Some(done.push({ args: a, indirect: boxed })), None -> None }
+            f.fields.map(|t: Type|
+              placed(t, |c: { name: Bytes, args: List<Type> }|
+                named_layout(
+                  reads,
+                  |sum: AppliedSum| found(known, { sum: sum, cut: f.cut }),
+                  f.cut,
+                  c,
+                )).pointed),
+          ).map(|args: List<layout::ValueLayout>|
+            done.push({ args: record_layout(args), indirect: f.indirect })),
       },
-    });
-  cases.map(sum_layout)
+    }).map(
+    sum_layout,
+  )
+
+pub fn open_variables(ty: Type) -> List<Int> / {ShapeReads} = {
+  let reads = shape_reads();
+  let known = answered(
+    reads,
+    sums_in(reads, ty).map(|sum: AppliedSum| { sum: sum, cut: [] }),
+    |cases: List<InstanceCase>, answers: Map<SumInstance, List<Int>>|
+      instance_variables(reads, cases, answers),
+  );
+  variables_placed(ty, |c: { name: Bytes, args: List<Type> }| named_variables(reads, known, [], c))
 }
 
-pub fn open_variables(constructors: Constructors, ty: Type) -> List<Int> =
-  variables_within(constructors, ty, [], nesting)
-
-fn variables_within(
-  constructors: Constructors,
+fn variables_placed<| e>(
   ty: Type,
-  cut: List<Bytes>,
-  depth: Int,
-) -> List<Int> =
-  if depth <= 0 { [] } else {
-    let fields = |fs: List<Field>|
+  named_variables_of: ({ name: Bytes, args: List<Type> }) -> List<Int> / e,
+) -> List<Int> / e =
+  match ty {
+    VariableType(v) -> if v >= 0 { [v] } else { [] },
+    FunctionType(_) -> [],
+    RecordType(fs) ->
       fs.fold([], |accumulator: List<Int>, f: Field|
-        ints_joined(accumulator, variables_within(constructors, f.ty, cut, depth - 1)));
-    match ty {
-      VariableType(v) -> if v >= 0 { [v] } else { [] },
-      FunctionType(_) -> [],
-      RecordType(fs) -> fields(fs),
-      NominalType(x) -> fields(x.fields),
-      NamedType(c) -> match constructors.sums.get(c.name) {
-        None -> [],
-        Some(cs) -> {
-          let recursive_group = constructors.recursive.get(c.name);
-          let inside = match recursive_group {
-            Some(r) ->
-              r.group.fold(cut, |accumulator: List<Bytes>, g: Bytes|
-                if accumulator.contains(g) { accumulator } else { accumulator.push(g) }),
-            None -> cut,
-          };
-          cs.fold(
-            { at: 0, vars: [] },
-            |accumulator: { at: Int, vars: List<Int> }, k: SumConstructor| {
-              let boxed = match recursive_group {
-                Some(r) -> r.indirect.at(accumulator.at) == Some(true),
-                None -> false,
-              };
-              {
-                at: accumulator.at + 1,
-                vars: if boxed && cut.contains(c.name) { accumulator.vars } else {
-                  constructor_fields_at(k, c.args).fold(
-                    accumulator.vars,
-                    |vs: List<Int>, t: Type|
-                      ints_joined(
-                        vs,
-                        variables_within(
-                          constructors,
-                          t,
-                          if boxed { inside } else { cut },
-                          depth - 1,
-                        ),
-                      ),
-                  )
-                },
-              }
-            },
-          ).vars
-        },
-      },
-    }
+        ints_joined(accumulator, variables_placed(f.ty, named_variables_of))),
+    NominalType(x) ->
+      x.fields.fold([], |accumulator: List<Int>, f: Field|
+        ints_joined(accumulator, variables_placed(f.ty, named_variables_of))),
+    NamedType(c) -> named_variables_of(c),
+  }
+
+fn named_variables<| e>(
+  reads: SumReads<| e>,
+  known: Map<SumInstance, List<Int>>,
+  cut: List<Bytes>,
+  c: { name: Bytes, args: List<Type> },
+) -> List<Int> / {abort.raise | e} =
+  match (reads.constructors_of)(c.name) {
+    None -> [],
+    Some(cs) -> found(known, { sum: { name: c.name, args: c.args, constructors: cs }, cut: cut }),
+  }
+
+fn instance_variables<| e>(
+  reads: SumReads<| e>,
+  cases: List<InstanceCase>,
+  known: Map<SumInstance, List<Int>>,
+) -> List<Int> / {abort.raise | e} =
+  cases.fold([], |variables: List<Int>, sum_case: InstanceCase|
+    match sum_case {
+      RecursiveBox -> variables,
+      WithFields(f) ->
+        f.fields.fold(variables, |vs: List<Int>, t: Type|
+          ints_joined(
+            vs,
+            variables_placed(t, |c: { name: Bytes, args: List<Type> }|
+              named_variables(reads, known, f.cut, c)),
+          )),
+    })
+
+type SumReads<| e> = {
+  constructors_of: (Bytes) -> Option<List<SumConstructor>> / {abort.raise | e},
+  group_of: (Bytes) -> Option<RecursiveGroup> / {abort.raise | e},
+}
+
+fn shape_reads() -> SumReads<| {code_facts.read}> =
+  {
+    constructors_of: |name: Bytes| code_facts.sum_named(name),
+    group_of: |name: Bytes| code_facts.recursive_group_of(name),
+  }
+
+fn table_reads(
+  sums: Map<Bytes, List<SumConstructor>>,
+  groups: Map<Bytes, RecursiveGroup>,
+) -> SumReads<| {}> =
+  { constructors_of: |name: Bytes| sums.get(name), group_of: |name: Bytes| groups.get(name) }
+
+type SumInstance = { sum: AppliedSum, cut: List<Bytes> }
+
+type InstanceCase = | RecursiveBox | WithFields(CaseFields)
+
+type CaseFields = { indirect: Bool, fields: List<Type>, cut: List<Bytes> }
+
+type ExpandedInstance = { cases: List<InstanceCase>, inner: List<SumInstance> }
+
+fn answered<a | e>(
+  reads: SumReads<| e>,
+  roots: List<SumInstance>,
+  answer: (List<InstanceCase>, Map<SumInstance, a>) -> a / {abort.raise | e},
+) -> Map<SumInstance, a> / {abort.raise | e} = {
+  let reached = traverse(roots, |instance: SumInstance| {
+    let cases = instance_cases(reads, instance);
+    let inner = inner_instances(reads, cases);
+    { value: { cases: cases, inner: inner }, next: inner }
+  });
+  let expanded = reached.fold(
+    Map::new(),
+    |m: Map<SumInstance, ExpandedInstance>, v: Visit<SumInstance, ExpandedInstance>|
+      m.insert(v.key, v.value),
+  );
+  let graph = keyed(
+    reached.map(|v: Visit<SumInstance, ExpandedInstance>| v.key),
+    |instance: SumInstance| found(expanded, instance).inner,
+  );
+  named(graph, post_order(graph.graph, numbered(graph, roots))).fold(
+    Map::new(),
+    |answers: Map<SumInstance, a>, instance: SumInstance|
+      answers.insert(instance, answer(found(expanded, instance).cases, answers)),
+  )
+}
+
+fn instance_cases<| e>(
+  reads: SumReads<| e>,
+  instance: SumInstance,
+) -> List<InstanceCase> / {abort.raise | e} = {
+  let group = (reads.group_of)(instance.sum.name);
+  let enclosed = instance.cut.contains(instance.sum.name);
+  let boxed_cut = match group { Some(r) -> widened(instance.cut, r.group), None -> instance.cut };
+  instance.sum.constructors.fold([], |done: List<InstanceCase>, k: SumConstructor| {
+    let indirect = match group {
+      Some(r) -> r.indirect.at(done.len()) == Some(true),
+      None -> false,
+    };
+    done.push(if indirect && enclosed { RecursiveBox } else {
+      WithFields({
+        indirect: indirect,
+        fields: constructor_fields_at(k, instance.sum.args),
+        cut: if indirect { boxed_cut } else { instance.cut },
+      })
+    })
+  })
+}
+
+fn widened(cut: List<Bytes>, group: List<Bytes>) -> List<Bytes> =
+  cut.concat(group.filter(|name: Bytes| !cut.contains(name))).sort()
+
+fn inner_instances<| e>(
+  reads: SumReads<| e>,
+  cases: List<InstanceCase>,
+) -> List<SumInstance> / {abort.raise | e} =
+  cases.fold([], |inner: List<SumInstance>, sum_case: InstanceCase|
+    match sum_case {
+      RecursiveBox -> inner,
+      WithFields(f) ->
+        f.fields.fold(inner, |within: List<SumInstance>, t: Type|
+          within.concat(sums_in(reads, t).map(|sum: AppliedSum| { sum: sum, cut: f.cut }))),
+    })
+
+fn sums_in<| e>(reads: SumReads<| e>, ty: Type) -> List<AppliedSum> / {abort.raise | e} =
+  match ty {
+    RecordType(fs) ->
+      fs.fold([], |within: List<AppliedSum>, f: Field| within.concat(sums_in(reads, f.ty))),
+    NominalType(x) ->
+      x.fields.fold([], |within: List<AppliedSum>, f: Field| within.concat(sums_in(reads, f.ty))),
+    NamedType(c) -> match (reads.constructors_of)(c.name) {
+      Some(cs) -> [{ name: c.name, args: c.args, constructors: cs }],
+      None -> [],
+    },
+    _ -> [],
+  }
+
+fn found<k, a>(answers: Map<k, a>, key: k) -> a / {abort.raise}
+  where derivable(ord, k)
+=
+  match answers.get(key) {
+    Some(answer) -> answer,
+    None -> panic("a sum instance is read before its answer is computed"),
   }
 
 fn classes_named(name: Bytes) -> List<WordClass> =
@@ -972,56 +1168,51 @@ fn classes_named(name: Bytes) -> List<WordClass> =
     }
   }
 
-pub fn layout_key(constructors: Constructors, ty: Type) -> Bytes / {abort.raise} =
-  key_within(constructors, ty, nesting)
-
-fn key_within(constructors: Constructors, ty: Type, depth: Int) -> Bytes / {abort.raise} =
-  if depth <= 0 {
-    panic(String::of_bytes_lossy(b"a layout nested too deep: ".concat(encode_type(ty))))
-  } else if classes(layout_of(constructors, ty)) == [Pointer] && !is_record(ty) { b"_" } else {
-    let fields_key = |fs: List<Field>|
-      Bytes::concat_all([
-        b"{",
-        Bytes::join(
-          fs.map(|f: Field|
-            Bytes::concat_all([f.name, b":", key_within(constructors, f.ty, depth - 1)])),
-          b",",
-        ),
-        b"}",
-      ]);
-    match ty {
-      RecordType(fs) -> fields_key(fs),
-      NominalType(x) -> fields_key(x.fields),
-      NamedType(c) -> match constructors.sums.get(c.name) {
-        Some(cs) -> {
-          let recursive_group = constructors.recursive.get(c.name);
-          let cases = cs.fold([], |accumulator: List<Bytes>, k: SumConstructor| {
-            let boxed = match recursive_group {
-              Some(r) -> r.indirect.at(accumulator.len()) == Some(true),
-              None -> false,
-            };
-            accumulator.push(if boxed { b"_" } else {
-              Bytes::concat_all([
-                b"{",
-                Bytes::join(
-                  constructor_fields_at(k, c.args).map(|t: Type|
-                    key_within(constructors, t, depth - 1)),
-                  b",",
-                ),
-                b"}",
-              ])
-            })
-          });
-          Bytes::concat_all([b"_|<", Bytes::join(cases, b","), b">"])
+pub fn layout_key(ty: Type) -> Bytes / {ShapeReads} =
+  match ty {
+    RecordType(fs) -> fields_key(fs.map(|f: Field| { name: f.name, key: layout_key(f.ty) })),
+    NominalType(x) -> fields_key(x.fields.map(|f: Field| { name: f.name, key: layout_key(f.ty) })),
+    _ -> if classes(layout_of(ty)) == [Pointer] { b"_" } else {
+      match ty {
+        NamedType(c) -> match code_facts.sum_named(c.name) {
+          Some(_) ->
+            Bytes::concat_all([
+              c.name,
+              b"<",
+              Bytes::join(c.args.map(|t: Type| layout_key(t)), b","),
+              b">",
+            ]),
+          None -> c.name,
         },
-        None -> c.name,
-      },
-      _ -> b"_",
-    }
+        _ -> b"_",
+      }
+    },
   }
 
-pub fn word_form(constructors: Constructors, ty: Type) -> WordForm / {abort.raise} = {
-  let l = layout_of(constructors, ty);
+fn fields_key(fields: List<{ name: Bytes, key: Bytes }>) -> Bytes =
+  Bytes::concat_all([
+    b"{",
+    Bytes::join(
+      fields.map(|f: { name: Bytes, key: Bytes }| Bytes::concat_all([f.name, b":", f.key])),
+      b",",
+    ),
+    b"}",
+  ])
+
+pub fn layout_representative(ty: Type) -> Type / {ShapeReads} =
+  match ty {
+    RecordType(fs) -> RecordType(fs.map(|f: Field| { ..f, ty: layout_representative(f.ty) })),
+    NominalType(x) -> RecordType(x.fields.map(|f: Field| { ..f, ty: layout_representative(f.ty) })),
+    _ -> if classes(layout_of(ty)) == [Pointer] { bytes_type } else {
+      match ty {
+        NamedType(c) -> NamedType({ ..c, args: c.args.map(|t: Type| layout_representative(t)) }),
+        _ -> ty,
+      }
+    },
+  }
+
+pub fn word_form(ty: Type) -> WordForm / {ShapeReads} = {
+  let l = layout_of(ty);
   let n = words(l);
   let layout_form = match l {
     SumCases(s) -> if layout::raw_sum(s) { Bits } else if n <= 1 { Itself } else { Box(n) },
@@ -1031,7 +1222,7 @@ pub fn word_form(constructors: Constructors, ty: Type) -> WordForm / {abort.rais
   match ty {
     RecordType(_) -> record,
     NominalType(_) -> record,
-    NamedType(c) -> if constructors.sums.contains(c.name) { layout_form }
+    NamedType(c) -> if code_facts.sum_named(c.name) != None { layout_form }
     else if is_int(ty) || is_bool(ty) || is_float(ty) { Bits }
     else if is_decimal(ty) { RuntimeBox } else {
       match width_named(c.name) {
@@ -1143,35 +1334,30 @@ pub fn substituted_fully(ty: Type, args: List<Type>) -> Type =
       }),
   }
 
-pub fn definition_entry(
+pub fn definition_shaped(
   module: Bytes,
-  d: FnDefinition,
-  pure: Map<Bytes, Bool>,
-  schemes: Map<Bytes, Scheme>,
-  values: Map<Bytes, ConstantData>,
+  name: Bytes,
+  shape: CallShape,
+  pure: Bool,
+  scheme: Scheme,
+  value: Option<ConstantData>,
 ) -> Definition = {
-  let full = qualify(module, d.name.name);
-  let sig = sig_of(schemes, full);
-  let return_shape = match sig { Some(s) -> Some(kind_of(s.result_type)), None -> None };
-  let witnesses = d.constraints.fold([], |accumulator: List<Bytes>, c: Constraint|
-    if !is_predicate(c.deriver) || accumulator.contains(c.param.name) { accumulator }
-    else { accumulator.push(c.param.name) }).len(
-  );
+  let return_shape = match sig_of_scheme(scheme) {
+    Some(s) -> Some(kind_of(s.result_type)),
+    None -> None,
+  };
   {
-    name: d.name.name,
+    name: name,
     return_kind: match return_shape { Some(r) -> Some(r.kind), None -> None },
     return_type: match return_shape { Some(r) -> r.ty, None -> OpenShape([]) },
-    pure: pure.contains(full),
-    constant: d.constant != None,
-    value: values.get(full),
-    arity: witnesses + d.params.len() + d.generics.labels.len(),
-    scheme: schemes.get(full),
-    witnesses: witnesses,
-    borrowed: range(0, d.params.len()).filter(|i: Int|
-      match d.params.at(i) { Some(p) -> parameter_mode(p).borrowed, None -> false }).map(
-      |i: Int| i + witnesses,
-    ),
-    root: Named(full),
+    pure: pure,
+    constant: shape.constant,
+    value: value,
+    arity: shape.arity,
+    scheme: Some(scheme),
+    witnesses: shape.witnesses,
+    borrowed: shape.borrowed,
+    root: Named(qualify(module, name)),
   }
 }
 
@@ -1207,264 +1393,307 @@ fn case_of(name: Bytes, index: Int, fields: List<Type>, params: List<Int>) -> Su
 
 pub fn applied(name: Bytes, args: List<Type>) -> Type = NamedType({ name: name, args: args })
 
-const sample_constructors: Constructors = {
+fn over_sample<a>(
+  sums: Map<Bytes, List<SumConstructor>>,
+  body: () -> a / {ShapeReads},
+) -> a / {abort.raise} = over_code_facts(table_sources(sums), body)
+
+const sample_sums: Map<Bytes, List<SumConstructor>> = {
   let a = VariableType(0);
   let b = VariableType(1);
   let int = int_type;
-  constructors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(option_name, [
-      case_of(none_constructor, 0, [], [0]),
-      case_of(some_constructor, 1, [a], [0]),
-    ]).insert(result_name, [
-      case_of(ok_constructor, 0, [a], [0, 1]),
-      case_of(err_constructor, 1, [b], [0, 1]),
-    ]).insert(b"m.Color", [
-      case_of(b"m.Red", 0, [], []),
-      case_of(b"m.Green", 1, [], []),
-      case_of(b"m.Blue", 2, [], []),
-    ]).insert(b"m.Shape", [
-      case_of(b"m.Circle", 0, [int], []),
-      case_of(b"m.Square", 1, [int], []),
-    ]).insert(b"m.Size", [
-      case_of(b"m.Small", 0, [int], []),
-      case_of(b"m.Large", 1, [int], []),
-    ]).insert(b"m.Either", [
-      case_of(b"m.Left", 0, [a], [0, 1]),
-      case_of(b"m.Right", 1, [b], [0, 1]),
-    ]).insert(b"m.Ints", [
-      case_of(b"m.More", 0, [int, named_type(b"m.Ints")], []),
-      case_of(b"m.Done", 1, [], []),
-    ]).insert(b"m.A", [
-      case_of(b"m.AC", 0, [named_type(b"m.B")], []),
-      case_of(b"m.AN", 1, [], []),
-    ]).insert(b"m.B", [
-      case_of(b"m.BC", 0, [named_type(b"m.A")], []),
-      case_of(b"m.BN", 1, [], []),
-    ]).insert(b"m.Wrap", [case_of(b"m.W", 0, [list_type(a)], [0])]).insert(b"m.Out", [
-      case_of(b"m.OC", 0, [applied(b"m.Wrap", [named_type(b"m.Out")])], []),
-      case_of(b"m.ON", 1, [], []),
-    ]).insert(b"m.Opt", [
-      case_of(b"m.PC", 0, [option_type(named_type(b"m.Opt"))], []),
-      case_of(b"m.PN", 1, [], []),
-    ]).insert(b"m.Nest", [
-      case_of(b"m.Leaf", 0, [a], [0]),
-      case_of(b"m.Deeper", 1, [applied(b"m.Nest", [list_type(a)])], [0]),
-    ]),
-  )
+  Map::new().insert(option_name, [
+    case_of(none_constructor, 0, [], [0]),
+    case_of(some_constructor, 1, [a], [0]),
+  ]).insert(result_name, [
+    case_of(ok_constructor, 0, [a], [0, 1]),
+    case_of(err_constructor, 1, [b], [0, 1]),
+  ]).insert(b"m.Color", [
+    case_of(b"m.Red", 0, [], []),
+    case_of(b"m.Green", 1, [], []),
+    case_of(b"m.Blue", 2, [], []),
+  ]).insert(b"m.Shape", [
+    case_of(b"m.Circle", 0, [int], []),
+    case_of(b"m.Square", 1, [int], []),
+  ]).insert(b"m.Size", [
+    case_of(b"m.Small", 0, [int], []),
+    case_of(b"m.Large", 1, [int], []),
+  ]).insert(b"m.Either", [
+    case_of(b"m.Left", 0, [a], [0, 1]),
+    case_of(b"m.Right", 1, [b], [0, 1]),
+  ]).insert(b"m.Ints", [
+    case_of(b"m.More", 0, [int, named_type(b"m.Ints")], []),
+    case_of(b"m.Done", 1, [], []),
+  ]).insert(b"m.A", [
+    case_of(b"m.AC", 0, [named_type(b"m.B")], []),
+    case_of(b"m.AN", 1, [], []),
+  ]).insert(b"m.B", [
+    case_of(b"m.BC", 0, [named_type(b"m.A")], []),
+    case_of(b"m.BN", 1, [], []),
+  ]).insert(b"m.Wrap", [case_of(b"m.W", 0, [list_type(a)], [0])]).insert(b"m.Out", [
+    case_of(b"m.OC", 0, [applied(b"m.Wrap", [named_type(b"m.Out")])], []),
+    case_of(b"m.ON", 1, [], []),
+  ]).insert(b"m.Opt", [
+    case_of(b"m.PC", 0, [option_type(named_type(b"m.Opt"))], []),
+    case_of(b"m.PN", 1, [], []),
+  ]).insert(b"m.Nest", [
+    case_of(b"m.Leaf", 0, [a], [0]),
+    case_of(b"m.Deeper", 1, [applied(b"m.Nest", [list_type(a)])], [0]),
+  ])
 }
 
 fn payloads(l: layout::ValueLayout) -> List<Payload> =
   match l { SumCases(s) -> s.cases.map(|c: CaseLayout| c.payload), _ -> [] }
 
 test "`layout_of` describes a scalar as plain words, a record by the layouts of its fields, and a sum by its cases" {
-  let t = sample_constructors;
-  let lay = |ty: Type| layout_of(t, ty);
-  assert_eq(lay(int_type), PlainWords([any_integer()]));
-  assert_eq(
-    [b"Unit", b"Bool", b"Char", b"Decimal", b"U8", b"U128", b"String"].map(|n: Bytes|
-      classes(lay(named_type(n)))),
-    [
-      [],
-      [RawRange({ lo: 0, hi: 1 })],
-      [CharImmediate(0)],
-      [any_integer(), any_integer()],
-      [any_integer()],
-      [any_integer(), any_integer()],
-      [Pointer],
-    ],
-  );
-  assert_eq(classes(lay(list_type(int_type))), [Pointer]);
-  assert_eq(
-    classes(
-      lay(
-        FunctionType({
-          keep_parameters: [],
-          once: false,
-          params: [int_type],
-          return_type: int_type,
-          effects: no_effects,
-        }),
+  over_sample(sample_sums, || {
+    let lay = |ty: Type| layout_of(ty);
+    assert_eq(lay(int_type), PlainWords([any_integer()]));
+    assert_eq(
+      [b"Unit", b"Bool", b"Char", b"Decimal", b"U8", b"U128", b"String"].map(|n: Bytes|
+        classes(lay(named_type(n)))),
+      [
+        [],
+        [RawRange({ lo: 0, hi: 1 })],
+        [CharImmediate(0)],
+        [any_integer(), any_integer()],
+        [any_integer()],
+        [any_integer(), any_integer()],
+        [Pointer],
+      ],
+    );
+    assert_eq(classes(lay(list_type(int_type))), [Pointer]);
+    assert_eq(
+      classes(
+        lay(
+          FunctionType({
+            keep_parameters: [],
+            once: false,
+            params: [int_type],
+            return_type: int_type,
+            effects: no_effects,
+          }),
+        ),
       ),
-    ),
-    [Pointer],
-  );
-  assert_eq(
-    lay(RecordType([{ name: b"a", ty: int_type }, { name: b"b", ty: string_type }])),
-    record_layout([PlainWords([any_integer()]), PlainWords([Pointer])]),
-  );
-  assert_eq(
-    lay(option_type(string_type)),
-    SumCases(
-      sum_layout([
-        { args: record_layout([]), indirect: false },
-        { args: record_layout([PlainWords([Pointer])]), indirect: false },
-      ]),
-    ),
-  );
-  assert_eq(classes(lay(option_type(named_type(b"m.Color")))), [RawRange({ lo: 0, hi: 3 })]);
-  assert_eq(classes(lay(result_type(int_type, string_type))), [RawRange({ lo: 0, hi: 1 }), Mixed]);
-  assert_eq(handle { words(lay(VariableType(0))) } with { abort.raise(_) -> 0 - 1 }, 0 - 1)
+      [Pointer],
+    );
+    assert_eq(
+      lay(RecordType([{ name: b"a", ty: int_type }, { name: b"b", ty: string_type }])),
+      record_layout([PlainWords([any_integer()]), PlainWords([Pointer])]),
+    );
+    assert_eq(
+      lay(option_type(string_type)),
+      SumCases(
+        sum_layout([
+          { args: record_layout([]), indirect: false },
+          { args: record_layout([PlainWords([Pointer])]), indirect: false },
+        ]),
+      ),
+    );
+    assert_eq(classes(lay(option_type(named_type(b"m.Color")))), [RawRange({ lo: 0, hi: 3 })]);
+    assert_eq(classes(lay(result_type(int_type, string_type))), [
+      RawRange({ lo: 0, hi: 1 }),
+      Mixed,
+    ]);
+    assert_eq(handle { words(lay(VariableType(0))) } with { abort.raise(_) -> 0 - 1 }, 0 - 1)
+  })
 }
 
-test "a table whose sum layouts are computed once gives every type the same layout as a table that computes them on demand" {
-  let t = sample_constructors;
-  let once = with_sums_laid(t);
-  assert(once.sum_layouts.len() > 0, None);
-  t.sums.keys().fold((), |_: Unit, name: Bytes| {
+test "a sum's layout is the same when it is laid out inside another type first" {
+  sample_sums.keys().fold((), |_: Unit, name: Bytes| {
     let ty = named_type(name);
-    assert_eq(known_layout(once, ty), known_layout(t, ty));
-    assert_eq(known_layout(once, option_type(ty)), known_layout(t, option_type(ty)))
+    assert_eq(
+      over_sample(sample_sums, || [known_layout(option_type(ty)), known_layout(ty)]).at(1),
+      Some(over_sample(sample_sums, || known_layout(ty))),
+    )
+  })
+}
+
+test "a type nested to any depth has a layout, its variables, a key and a representative" {
+  over_sample(sample_sums, || {
+    let options = |inner: Type| range(0, 300).fold(inner, |t: Type, _: Int| option_type(t));
+    let records = |inner: Type|
+      range(0, 300).fold(inner, |t: Type, _: Int|
+        RecordType([{ name: b"a", ty: t }, { name: b"b", ty: int_type }]));
+    assert(
+      known_layout(options(int_type)) != None && known_layout(records(int_type)) != None,
+      None,
+    );
+    assert_eq(open_variables(records(options(VariableType(3)))), [3]);
+    assert_eq(layout_key(options(string_type)), layout_key(options(bytes_type)));
+    assert_eq(layout_key(records(string_type)), layout_key(records(bytes_type)));
+    assert_eq(
+      layout_representative(options(string_type)),
+      layout_representative(options(bytes_type)),
+    )
   })
 }
 
 test "`inside_layout` returns no layout for a record with a type-variable field, and a record too wide for registers is stored as a pointer inside a sum case" {
-  let t = sample_constructors;
-  let ints = |n: Int|
-    range(0, n).map(|i: Int| { name: b"f".concat(Bytes::of_string(i.to_string())), ty: int_type });
-  let n = layout::max_flat_words;
-  let wide = RecordType(ints(n + 1).push({ name: b"g", ty: VariableType(0) }));
-  let narrow = RecordType(ints(2).push({ name: b"g", ty: VariableType(0) }));
-  assert_eq(inside_layout(t, wide), None);
-  assert_eq(known_layout(t, wide), None);
-  assert_eq(inside_layout(t, narrow), None);
-  assert_eq(known_layout(t, RecordType([{ name: b"r", ty: wide }].concat(ints(n)))), None);
-  assert_eq(
-    known_layout(t, RecordType([{ name: b"r", ty: wide }, { name: b"x", ty: int_type }])) != None,
-    true,
-  );
-  assert_eq(known_layout(t, option_type(wide)) != None, true);
-  let closed = RecordType(ints(n + 2));
-  assert_eq(inside_layout(t, closed), Some(layout::inside(layout_of(t, closed))));
-  assert_eq(
-    inside_layout(t, RecordType(ints(4))),
-    Some(layout::inside(layout_of(t, RecordType(ints(4))))),
-  )
+  over_sample(sample_sums, || {
+    let ints = |n: Int|
+      range(0, n).map(|i: Int|
+        { name: b"f".concat(Bytes::of_string(i.to_string())), ty: int_type });
+    let n = layout::max_flat_words;
+    let wide = RecordType(ints(n + 1).push({ name: b"g", ty: VariableType(0) }));
+    let narrow = RecordType(ints(2).push({ name: b"g", ty: VariableType(0) }));
+    assert_eq(inside_layout(wide), None);
+    assert_eq(known_layout(wide), None);
+    assert_eq(inside_layout(narrow), None);
+    assert_eq(known_layout(RecordType([{ name: b"r", ty: wide }].concat(ints(n)))), None);
+    assert_eq(
+      known_layout(RecordType([{ name: b"r", ty: wide }, { name: b"x", ty: int_type }])) != None,
+      true,
+    );
+    assert_eq(known_layout(option_type(wide)) != None, true);
+    let closed = RecordType(ints(n + 2));
+    assert_eq(inside_layout(closed), Some(layout::inside(layout_of(closed))));
+    assert_eq(
+      inside_layout(RecordType(ints(4))),
+      Some(layout::inside(layout_of(RecordType(ints(4))))),
+    )
+  })
+}
+
+test "a type holds a list of itself when a list of that same type is inside it, or when it has a variable a list could fill" {
+  over_sample(sample_sums, || {
+    let out = named_type(b"m.Out");
+    assert_eq(
+      [out, option_type(out), named_type(b"m.Ints"), list_type(int_type), VariableType(0)].map(
+        holds_list_of,
+      ),
+      [true, false, false, false, true],
+    )
+  })
 }
 
 test "a sum case that directly contains its own recursive type is stored in a box, and inside that box the sum is stored as its words" {
-  let t = sample_constructors;
-  let indirect = |name: Bytes| match t.recursive.get(name) { Some(r) -> r.indirect, None -> [] };
-  assert_eq(indirect(b"m.Ints"), [true, false]);
-  assert_eq([b"m.A", b"m.B"].map(indirect), [[true, false], [true, false]]);
-  assert_eq(match t.recursive.get(b"m.A") { Some(r) -> r.group.sort(), None -> [] }, [
-    b"m.A",
-    b"m.B",
-  ]);
-  assert_eq(indirect(b"m.Opt"), [true, false]);
-  assert_eq([b"m.Out", b"m.Wrap", b"Option", b"m.Color"].map(indirect), [[], [], [], []]);
-  assert_eq(indirect(b"m.Nest"), [false, true]);
-  let ints = layout_of(t, named_type(b"m.Ints"));
-  assert_eq(classes(ints), [PointerSum(1)]);
-  assert_eq(payloads(ints), [
-    Boxed({
-      at: 0,
-      stripped: false,
-      skip: 0,
-      layout: record_layout([PlainWords([any_integer()]), PlainWords([PointerSum(1)])]),
-    }),
-    Nullary,
-  ]);
-  assert_eq(payloads(layout_of(t, named_type(b"m.A"))), [
-    Boxed({
-      at: 0,
-      stripped: false,
-      skip: 0,
-      layout: record_layout([PlainWords([PointerSum(1)])]),
-    }),
-    Nullary,
-  ]);
-  assert_eq(
-    payloads(layout_of(t, named_type(b"m.Out"))).map(|p: Payload|
-      match p { Nullary -> b"nullary", Inline(_) -> b"inline", Boxed(_) -> b"boxed" }),
-    [b"inline", b"nullary"],
-  );
-  let twice = layout_of(t, option_type(option_type(string_type)));
-  assert_eq(classes(twice), [PointerSum(2)]);
-  assert_eq(
-    payloads(twice).map(|p: Payload| match p { Inline(i) -> classes(i.layout), _ -> [] }),
-    [[], [PointerSum(1)]],
-  );
-  let nest = layout_of(t, applied(b"m.Nest", [int_type]));
-  assert_eq(classes(nest), [RawRange({ lo: 0, hi: 1 }), Mixed]);
-  assert_eq(
-    match payloads(nest).at(1) { Some(p) -> p, None -> Nullary },
-    Boxed({
-      at: 1,
-      stripped: false,
-      skip: 0,
-      layout: record_layout([PlainWords([PointerSum(0)])]),
-    }),
-  )
+  over_sample(sample_sums, || {
+    let indirect = |name: Bytes|
+      match code_facts.recursive_group_of(name) { Some(r) -> r.indirect, None -> [] };
+    assert_eq(indirect(b"m.Ints"), [true, false]);
+    assert_eq([b"m.A", b"m.B"].map(indirect), [[true, false], [true, false]]);
+    assert_eq(
+      match code_facts.recursive_group_of(b"m.A") { Some(r) -> r.group.sort(), None -> [] },
+      [b"m.A", b"m.B"],
+    );
+    assert_eq(indirect(b"m.Opt"), [true, false]);
+    assert_eq([b"m.Out", b"m.Wrap", b"Option", b"m.Color"].map(indirect), [[], [], [], []]);
+    assert_eq(indirect(b"m.Nest"), [false, true]);
+    let ints = layout_of(named_type(b"m.Ints"));
+    assert_eq(classes(ints), [PointerSum(1)]);
+    assert_eq(payloads(ints), [
+      Boxed({
+        at: 0,
+        stripped: false,
+        skip: 0,
+        layout: record_layout([PlainWords([any_integer()]), PlainWords([PointerSum(1)])]),
+      }),
+      Nullary,
+    ]);
+    assert_eq(payloads(layout_of(named_type(b"m.A"))), [
+      Boxed({
+        at: 0,
+        stripped: false,
+        skip: 0,
+        layout: record_layout([PlainWords([PointerSum(1)])]),
+      }),
+      Nullary,
+    ]);
+    assert_eq(
+      payloads(layout_of(named_type(b"m.Out"))).map(|p: Payload|
+        match p { Nullary -> b"nullary", Inline(_) -> b"inline", Boxed(_) -> b"boxed" }),
+      [b"inline", b"nullary"],
+    );
+    let twice = layout_of(option_type(option_type(string_type)));
+    assert_eq(classes(twice), [PointerSum(2)]);
+    assert_eq(
+      payloads(twice).map(|p: Payload| match p { Inline(i) -> classes(i.layout), _ -> [] }),
+      [[], [PointerSum(1)]],
+    );
+    let nest = layout_of(applied(b"m.Nest", [int_type]));
+    assert_eq(classes(nest), [RawRange({ lo: 0, hi: 1 }), Mixed]);
+    assert_eq(
+      match payloads(nest).at(1) { Some(p) -> p, None -> Nullary },
+      Boxed({
+        at: 1,
+        stripped: false,
+        skip: 0,
+        layout: record_layout([PlainWords([PointerSum(0)])]),
+      }),
+    )
+  })
 }
 
-test "two sums laid alike share a layout key, and Option<Color> and Option<String> do not" {
-  let t = sample_constructors;
-  let key = |ty: Type| layout_key(t, ty);
-  let either = |x: Type| applied(b"m.Either", [x, x]);
-  assert_eq(key(named_type(b"m.Shape")), key(named_type(b"m.Size")));
-  assert(key(option_type(string_type)) != key(option_type(named_type(b"m.Color"))), None);
-  assert(key(named_type(b"m.Shape")) != key(option_type(string_type)), None);
-  assert_eq(key(option_type(option_type(string_type))), key(option_type(option_type(bytes_type))));
-  assert_eq(key(either(char_type)) == key(either(string_type)), false);
-  let pointer = key(string_type);
-  assert_eq([list_type(int_type), applied(b"m.Wrap", [int_type])].map(key), [pointer, pointer]);
-  assert_eq(key(RecordType([{ name: b"s", ty: string_type }])), b"{s:_}");
-  let record_key = |b: Type| key(RecordType([{ name: b"a", ty: int_type }, { name: b"b", ty: b }]));
-  assert_eq(record_key(string_type), record_key(list_type(int_type)));
-  assert(record_key(string_type) != record_key(int_type), None);
-  let scalars = [b"Unit", b"Bool", b"Float"].map(|n: Bytes| key(named_type(n))).push(pointer);
-  assert_eq(
-    range(0, scalars.len()).filter(|i: Int| scalars.drop(i + 1).contains(scalars.get(i))),
-    [],
-  )
+test "one layout key has one representative type, a sum's key names the sum, and Option<Color> and Option<String> differ" {
+  over_sample(sample_sums, || {
+    let key = |ty: Type| layout_key(ty);
+    let either = |x: Type| applied(b"m.Either", [x, x]);
+    assert(key(named_type(b"m.Shape")) != key(named_type(b"m.Size")), None);
+    assert_eq(
+      layout_representative(option_type(option_type(string_type))),
+      layout_representative(option_type(option_type(bytes_type))),
+    );
+    assert(key(option_type(string_type)) != key(option_type(named_type(b"m.Color"))), None);
+    assert(key(named_type(b"m.Shape")) != key(option_type(string_type)), None);
+    assert_eq(
+      key(option_type(option_type(string_type))),
+      key(option_type(option_type(bytes_type))),
+    );
+    assert_eq(key(either(char_type)) == key(either(string_type)), false);
+    let pointer = key(string_type);
+    assert_eq([list_type(int_type), applied(b"m.Wrap", [int_type])].map(key), [pointer, pointer]);
+    assert_eq(key(RecordType([{ name: b"s", ty: string_type }])), b"{s:_}");
+    let record_key = |b: Type|
+      key(RecordType([{ name: b"a", ty: int_type }, { name: b"b", ty: b }]));
+    assert_eq(record_key(string_type), record_key(list_type(int_type)));
+    assert(record_key(string_type) != record_key(int_type), None);
+    let scalars = [b"Unit", b"Bool", b"Float"].map(|n: Bytes| key(named_type(n))).push(pointer);
+    assert_eq(
+      range(0, scalars.len()).filter(|i: Int| scalars.drop(i + 1).contains(scalars.get(i))),
+      [],
+    )
+  })
 }
 
 test "a type is stored in one word as the value itself, as scalar bits, as a pointer to a runtime-allocated box, or as a pointer to a box of its own words" {
-  let t = sample_constructors;
-  let form = |ty: Type| word_form(t, ty);
-  assert_eq(
-    [
-      b"Int",
-      b"U8",
-      b"I32",
-      b"U64",
-      b"Float",
-      b"Decimal",
-      b"Bool",
-      b"Char",
-      b"Unit",
-      b"String",
-      b"U128",
-    ].map(|n: Bytes| form(named_type(n))),
-    [Bits, Bits, Bits, Bits, Bits, RuntimeBox, Bits, Itself, Itself, Itself, RuntimeBox],
-  );
-  let one = |t: Type| RecordType([{ name: b"a", ty: t }]);
-  assert_eq([one(int_type), one(map_type(bytes_type, bool_type)), one(unit_type)].map(form), [
-    Box(1),
-    Box(1),
-    Itself,
+  over_sample(sample_sums, || {
+    let form = |ty: Type| word_form(ty);
+    assert_eq(
+      [
+        b"Int",
+        b"U8",
+        b"I32",
+        b"U64",
+        b"Float",
+        b"Decimal",
+        b"Bool",
+        b"Char",
+        b"Unit",
+        b"String",
+        b"U128",
+      ].map(|n: Bytes| form(named_type(n))),
+      [Bits, Bits, Bits, Bits, Bits, RuntimeBox, Bits, Itself, Itself, Itself, RuntimeBox],
+    );
+    let one = |t: Type| RecordType([{ name: b"a", ty: t }]);
+    assert_eq([one(int_type), one(map_type(bytes_type, bool_type)), one(unit_type)].map(form), [
+      Box(1),
+      Box(1),
+      Itself,
+    ]);
+    assert_eq(
+      form(RecordType([{ name: b"a", ty: int_type }, { name: b"b", ty: string_type }])),
+      Box(2),
+    );
+    assert_eq(
+      [option_type(string_type), option_type(int_type), named_type(b"m.Color")].map(form),
+      [Itself, Box(2), Itself],
+    );
+  });
+  let ids = Map::new().insert(b"m.Id", [case_of(b"m.Id", 0, [int_type], [])]).insert(b"m.Small", [
+    case_of(b"m.Small", 0, [width_type({ bits: 8, signed: false })], []),
   ]);
-  assert_eq(
-    form(RecordType([{ name: b"a", ty: int_type }, { name: b"b", ty: string_type }])),
-    Box(2),
-  );
-  assert_eq([option_type(string_type), option_type(int_type), named_type(b"m.Color")].map(form), [
-    Itself,
-    Box(2),
-    Itself,
-  ]);
-  let ids = constructors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(b"m.Id", [case_of(b"m.Id", 0, [int_type], [])]).insert(b"m.Small", [
-      case_of(b"m.Small", 0, [width_type({ bits: 8, signed: false })], []),
-    ]),
-  );
-  assert_eq([named_type(b"m.Id"), named_type(b"m.Small")].map(|t: Type| word_form(ids, t)), [
+  assert_eq(over_sample(ids, || [named_type(b"m.Id"), named_type(b"m.Small")].map(word_form)), [
     Bits,
     Bits,
   ])

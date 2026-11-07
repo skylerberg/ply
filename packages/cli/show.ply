@@ -1,22 +1,33 @@
-import compiler.load (Derives)
+import progress
+import compiler.codes (internal_error_code, unknown_name_code)
+import compiler.check.resolve.tables (error_unplaced)
+import sources (ProjectFiles)
+import compiler.load (Loads)
 import compiler.cc (toolchain)
 import compiler.unit (shipped)
 import std.random (entropy)
 import std.time (time)
 import builder (builder)
 import args (Flags, style_of)
-import program (Program, load_program, definitions_in_order, place_of, resolve_definition,
-                unknown_definition, program_view)
+import program (definitions_in_order, place_of, places_of, resolve_definition, session_over,
+                unknown_definition)
+import sources (DependencyPackage, File, Project, load_resolved)
+import diagnostic (SourceText)
+import compiler.front.checking.view
+import compiler.front.checking.world (Modules)
+import compiler.front.checking.groups (ProgramSummary)
+import compiler.store.memo (memo)
 import report (CommandOutput, schema_version, ok_code, rejected, reported)
-import compiler.front.facts (CheckedProgram)
+import compiler.front.facts (ProgramListing)
 import compiler.front.rows (OutlineItem, OutlinedType)
 import compiler.syntax.fmt (item_range)
 import compiler.check.infer.checker (Location)
-import compiler.check.resolve.tables (Diagnostic, error_at, qualify)
+import compiler.check.resolve.tables (Diagnostic, error_at, module_elsewhere, qualify)
 import std.fs (fs)
 import std.json (Str, Bool, Number, object)
 import std.string
-import compiler.syntax.parsing (no_module, dummy_span, span_between)
+import compiler.syntax.parsing (generated_span, span_between)
+import project_store
 
 pub type NamedDefinition = { name: String, simple: String, at: Location }
 
@@ -35,9 +46,9 @@ pub fn source_of(shown: DefinitionSource) -> String / {abort.raise} =
 
 type Lookup = | NoType | OneType(NamedDefinition) | ManyTypes(List<String>)
 
-fn declared_types(view: CheckedProgram) -> List<NamedDefinition> =
-  range(0, view.frame.outlines.len()).fold([], |accumulator: List<NamedDefinition>, i: Int|
-    match view.frame.outlines.at(i) {
+fn declared_types(view: ProgramListing) -> List<NamedDefinition> =
+  range(0, view.outlines.len()).fold([], |accumulator: List<NamedDefinition>, i: Int|
+    match view.outlines.at(i) {
       None -> accumulator,
       Some(o) ->
         o.items.fold(accumulator, |a: List<NamedDefinition>, it: OutlineItem|
@@ -52,7 +63,7 @@ fn declared_types(view: CheckedProgram) -> List<NamedDefinition> =
           }),
     })
 
-fn type_named(analysis: CheckedProgram, query: String) -> Lookup = {
+fn type_named(analysis: ProgramListing, query: String) -> Lookup = {
   let all = declared_types(analysis);
   let exact = all.fold(None, |accumulator: Option<NamedDefinition>, t: NamedDefinition|
     match accumulator {
@@ -73,10 +84,8 @@ fn type_named(analysis: CheckedProgram, query: String) -> Lookup = {
 }
 
 fn many_types(query: String, names: List<String>) -> Diagnostic =
-  error_at(
-    b"E0101",
-    no_module,
-    dummy_span,
+  error_unplaced(
+    unknown_name_code,
     Bytes::of_string("`" ++ query ++ "` names " ++ names.len().to_string() ++ " types"),
     b"say which",
     [Bytes::of_string("one of: " ++ String::join(names, ", "))],
@@ -84,7 +93,7 @@ fn many_types(query: String, names: List<String>) -> Diagnostic =
 
 fn no_text(name: String, location: Location) -> Diagnostic =
   error_at(
-    b"E0505",
+    internal_error_code,
     location.module,
     location.span,
     Bytes::of_string("`" ++ name ++ "` has no source text"),
@@ -94,7 +103,7 @@ fn no_text(name: String, location: Location) -> Diagnostic =
 
 fn unlocatable(name: String, reason: String, location: Location) -> Diagnostic =
   error_at(
-    b"E0101",
+    unknown_name_code,
     location.module,
     location.span,
     Bytes::of_string("`" ++ name ++ "`: " ++ reason),
@@ -103,10 +112,10 @@ fn unlocatable(name: String, reason: String, location: Location) -> Diagnostic =
   )
 
 fn located_source(
-  program: Program,
+  places: List<SourceText>,
   found: NamedDefinition,
 ) -> Result<DefinitionSource, Diagnostic> / {abort.raise} =
-  match place_of(program, found.at) {
+  match place_of(places, found.at) {
     None -> Err(no_text(found.name, found.at)),
     Some(place) -> match item_range(place.text, Bytes::of_string(found.simple)) {
       Err(reason) -> Err(unlocatable(found.name, String::of_bytes_lossy(reason), found.at)),
@@ -124,19 +133,19 @@ fn located_source(
   }
 
 pub fn locate(
-  program: Program,
-  analysis: CheckedProgram,
+  places: List<SourceText>,
+  analysis: ProgramListing,
   query: String,
 ) -> Result<DefinitionSource, Diagnostic> / {abort.raise} =
   match resolve_definition(definitions_in_order(analysis), query) {
     Ok(d) ->
-      located_source(program, {
+      located_source(places, {
         name: String::of_bytes_lossy(d.name),
         simple: String::of_bytes_lossy(d.simple_name),
         at: d.at,
       }),
     Err(names) -> match type_named(analysis, query) {
-      OneType(t) -> located_source(program, t),
+      OneType(t) -> located_source(places, t),
       ManyTypes(ns) -> Err(many_types(query, ns)),
       NoType -> Err(unknown_definition(query, names)),
     },
@@ -171,16 +180,79 @@ pub fn show_output(shown: DefinitionSource) -> CommandOutput / {abort.raise} = {
   }
 }
 
+fn own_file(project: Project, module: String) -> Option<File> =
+  project.files.concat(project.packages.flat_map(|p: DependencyPackage| p.files)).filter(
+    |f: File| f.module == module,
+  ).at(
+    0,
+  )
+
+fn named_in(query: String) -> { module: String, simple: String } = {
+  let parts = query.split(".");
+  let last = parts.len() - 1;
+  { module: String::join(parts.take(last), "."), simple: parts.at_or(last, query) }
+}
+
+fn found_by_name(
+  project: Project,
+  query: String,
+) -> Option<DefinitionSource> / {memo.read, abort.raise} = {
+  let named = named_in(query);
+  match view::declarers(Bytes::of_string(named.simple)) {
+    [only] -> {
+      let module = String::of_bytes_lossy(only);
+      match if named.module == "" || named.module == module { own_file(project, module) }
+        else { None } {
+        None -> None,
+        Some(file) -> match item_range(file.text, Bytes::of_string(named.simple)) {
+          Err(_) -> None,
+          Ok(r) ->
+            Some({
+              name: module ++ "." ++ named.simple,
+              unqualified_name: named.simple,
+              at: { module: module_elsewhere, span: generated_span },
+              path: file.path,
+              text: file.text,
+              start: r.start,
+              end: r.end,
+            }),
+        },
+      }
+    },
+    _ -> None,
+  }
+}
+
+type ShowReading = | FoundByName(DefinitionSource) | WholeListing(ProgramListing)
+
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let loaded: Program = load_program(flags.paths, flags.verify_dependencies);
+) -> CommandOutput / {project_store::Databases, time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise, diverges} = {
   let s = style_of(flags);
-  match program_view(loaded) {
-    None -> rejected(s, "show", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> match locate(loaded, w, flags.query) {
-      Err(d) -> reported(s, "show", [d], loaded.source_texts),
-      Ok(shown) -> show_output(shown),
+  let started = time.elapsed_ms();
+  let project = load_resolved(flags.paths);
+  match progress::silently(||
+      session_over(
+        flags.paths,
+        project,
+        started,
+        flags.verify_dependencies,
+        |m: Modules, _: ProgramSummary|
+          match found_by_name(project, flags.query) {
+            Some(shown) -> FoundByName(shown),
+            None -> WholeListing(view::listed(m)),
+          },
+      )) {
+    Err(r) -> rejected(s, "show", r.diagnostics, r.places),
+    Ok(opened) -> match opened.value {
+      FoundByName(shown) -> show_output(shown),
+      WholeListing(w) -> {
+        let places = places_of(opened);
+        match locate(places, w, flags.query) {
+          Err(d) -> reported(s, "show", [d], places),
+          Ok(shown) -> show_output(shown),
+        }
+      },
     },
   }
 }

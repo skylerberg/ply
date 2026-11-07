@@ -1,5 +1,10 @@
+import std.set (Set)
+import std.bin
 import std.bytes
+import std.fs (fs, File)
 import std.hash (blake3)
+import std.path (parent)
+import std.random (entropy)
 import std.internal.native (native, wait, job_wait, found, parts, encode_parts, decode_int)
 import std.list
 import std.string
@@ -83,7 +88,7 @@ fn marks(text: Bytes) -> List<{ at: Int, label: String }> / {abort.raise} =
       },
   )
 
-pub fn split(text: Bytes) -> { head: Bytes, parts: List<WrittenPart> } / {abort.raise} = {
+pub fn split(text: Bytes) -> GeneratedC / {abort.raise} = {
   let found = marks(text);
   let labels = found.map(|m: { at: Int, label: String }| m.label).sort();
   match range(1, labels.len()).find(|i: Int| labels.get(i) == labels.get(i - 1)) {
@@ -91,12 +96,12 @@ pub fn split(text: Bytes) -> { head: Bytes, parts: List<WrittenPart> } / {abort.
     None -> (),
   };
   match found.at(0) {
-    None -> { head: text, parts: [written_part(text, "runtime", b"")] },
+    None -> { head: text, files: [written_part(text, "runtime", b"")] },
     Some(first) -> {
       let head = text.slice(0, first.at);
       {
         head: head,
-        parts: range(0, found.len()).map(|i: Int| {
+        files: range(0, found.len()).map(|i: Int| {
           let end = match found.at(i + 1) { Some(next) -> next.at, None -> text.len() };
           written_part(head, found.get(i).label, text.slice(found.get(i).at, end))
         }),
@@ -130,36 +135,22 @@ pub fn toolchain_of(compiler: Compiler, level: String, checked: Bool) -> Toolcha
     checked: checked,
   }
 
-pub type Profile = {
-  name: String,
-  runtime_dir: String,
-  unit: String,
-  native: String,
-  checked: Bool,
-  tcc: Bool,
-}
+pub type Profile = { name: String, unit: String, native: String, checked: Bool, tcc: Bool }
 
 pub fn development() -> Profile =
-  {
-    name: "development",
-    runtime_dir: "debug",
-    unit: "-O0",
-    native: "-O2",
-    checked: true,
-    tcc: true,
-  }
+  { name: "development", unit: "-O0", native: "-O2", checked: true, tcc: true }
 
 pub fn release() -> Profile =
-  {
-    name: "release",
-    runtime_dir: "release",
-    unit: "-O2",
-    native: "-O2",
-    checked: false,
-    tcc: false,
-  }
+  { name: "release", unit: "-O2", native: "-O2", checked: false, tcc: false }
 
 pub const profiles: List<Profile> = [development(), release()]
+
+type CompiledBy = { unit: String, checked: Bool, tcc: Bool }
+
+derive bin for CompiledBy
+
+pub fn profile_identity(p: Profile) -> Bytes / {abort.raise} =
+  bin::encode({ unit: p.unit, checked: p.checked, tcc: p.tcc }, compiled_by_bin())
 
 type Started = { job: Int, args: List<String> }
 
@@ -199,160 +190,147 @@ fn run_all<[c]>(runs: List<List<String>>) -> Result<Unit, String> / {compilers.w
   }
 }
 
-pub type Source = { label: String, digest: String }
+pub type WrittenPart = { label: String, digest: String, size: Int, text: Bytes }
 
-fn source_digest(head: Bytes, part: Bytes) -> String / {abort.raise} =
-  blake3(head.concat(part)).hex_of()
+derive bin for WrittenPart
 
-fn source_path(digest: String) -> String = "src/" ++ digest ++ ".c"
-
-fn uncached(s: Source) -> String =
-  "the generated C file `" ++ s.label ++ "` is no longer in the toolchain's cache"
-
-pub type WrittenPart = { label: String, digest: String, size: Int, text: Option<Bytes> }
+pub type GeneratedC = { head: Bytes, files: List<WrittenPart> }
 
 pub fn written_part(head: Bytes, label: String, text: Bytes) -> WrittenPart / {abort.raise} =
-  { label: label, digest: source_digest(head, text), size: text.len(), text: Some(text) }
+  { label: label, digest: blake3(head.concat(text)).hex_of(), size: text.len(), text: text }
 
-pub fn is_source_cached(digest: String) -> Bool / {toolchain.read} =
-  toolchain.exists(source_path(digest))
+fn version_of(key: String) -> String / {abort.raise} =
+  blake3(Bytes::of_string(key)).slice(0, 12).hex_of()
 
-pub fn cache_sources(
-  head: Bytes,
-  written: List<WrittenPart>,
-) -> Result<List<Source>, String> / {toolchain.read, toolchain.write} = {
-  let landed = written.fold(true, |ok: Bool, w: WrittenPart|
-    ok
-      && (is_source_cached(w.digest)
-      || (match w.text {
-        None -> false,
-        Some(t) -> toolchain.write_file(source_path(w.digest), head.concat(t)),
-      })));
-  if !landed { Err("generated C code could not be written to the toolchain's cache") } else {
-    Ok(
-      written.sort_by(|a: WrittenPart, b: WrittenPart| a.size > b.size).map(|w: WrittenPart|
-        { label: w.label, digest: w.digest }),
-    )
-  }
+fn version_path(owner: String, version: String, file: String) -> String =
+  owner ++ "/" ++ version ++ "/" ++ file
+
+fn installed_version(
+  owner: String,
+  version: String,
+  file: String,
+  made: String,
+) -> Bool / {toolchain.read, toolchain.write} = {
+  let current = owner ++ "/current";
+  let previous = match toolchain.read_file(current) {
+    Some(b) -> String::of_bytes_lossy(b),
+    None -> "",
+  };
+  let placed = toolchain.rename(made, version_path(owner, version, file))
+    && toolchain.write_file(current, Bytes::of_string(version));
+  if placed && previous != "" && previous != version {
+    toolchain.remove_tree(owner ++ "/" ++ previous)
+  };
+  placed
 }
 
-pub fn cache_text(
-  text: Bytes,
-) -> Result<List<Source>, String> / {toolchain.read, toolchain.write, abort.raise} = {
-  let cut = split(text);
-  cache_sources(cut.head, cut.parts)
-}
+type CFile = { head: Bytes, file: WrittenPart }
 
-pub fn read_back(
-  head: Bytes,
-  sources: List<Source>,
-) -> Result<Bytes, String> / {toolchain.read, abort.raise} =
-  match sources.fold(Ok([head]), |accumulator: Result<List<Bytes>, String>, s: Source|
-      match accumulator {
-        Err(reason) -> Err(reason),
-        Ok(texts) -> match toolchain.read_file(source_path(s.digest)) {
-          None -> Err(uncached(s)),
-          Some(c) -> if c.starts_with(head) { Ok(texts.push(c.slice(head.len(), c.len()))) } else {
-            Err(
-              "the generated C file `" ++ s.label
-                ++ "` in the toolchain's cache starts with different shared code than expected",
-            )
-          },
-        },
-      }) {
-    Err(reason) -> Err(reason),
-    Ok(texts) -> Ok(Bytes::concat_all(texts)),
-  }
-
-pub fn manifest(sources: List<Source>) -> Bytes =
-  Bytes::concat_all(sources.map(|s: Source| Bytes::of_string(s.label ++ " " ++ s.digest ++ "\n")))
-
-pub fn parse_manifest(text: Bytes) -> Option<List<Source>> =
-  text.split(b"\n").fold(Some([]), |accumulator: Option<List<Source>>, line: Bytes|
-    match accumulator {
-      None -> None,
-      Some(xs) -> if line.len() == 0 { accumulator } else {
-        match line.split(b" ") {
-          [label, digest] -> if digest.len() == 64 {
-            Some(
-              xs.push({
-                label: String::of_bytes_lossy(label),
-                digest: String::of_bytes_lossy(digest),
-              }),
-            )
-          } else { None },
-          _ -> None,
-        }
-      },
-    })
-
-pub fn sources_cached(sources: List<Source>) -> Bool / {toolchain.read} =
-  sources.fold(true, |ok: Bool, s: Source| ok && is_source_cached(s.digest))
-
-fn object_path(t: Toolchain, flags: List<String>, s: Source) -> String / {abort.raise} =
-  "obj/" ++ cache_key(t, flags, [Bytes::of_string(s.digest)]) ++ ".o"
-
-pub type Objects = { paths: List<String>, compiled_count: Int }
-
-pub fn objects<[c]>(
+fn compiled_in<[c]>(
   t: Toolchain,
-  sources: List<Source>,
   flags: List<String>,
+  files: List<CFile>,
   work: String,
-) -> Result<Objects, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
-  let cache = toolchain.cache();
-  let targets = sources.map(|s: Source| object_path(t, flags, s));
-  let missing = range(0, targets.len()).filter(|i: Int| !toolchain.exists(targets.get(i)));
-  match missing.find(|i: Int| !is_source_cached(sources.get(i).digest)) {
-    Some(i) -> Err(uncached(sources.get(i))),
-    None -> {
-      let object = |i: Int| work ++ "/" ++ i.to_string() ++ ".o";
-      let runs = missing.map(|i: Int|
-        t.support_flags.concat(compile_flags(t).concat(flags)).concat([
-          "-c",
-          "-o",
-          cache ++ "/" ++ object(i),
-          cache ++ "/" ++ source_path(sources.get(i).digest),
-        ]));
-      match run_all[c](runs) {
-        Err(reason) -> Err(reason),
-        Ok(_) -> {
-          let placed = missing.fold(true, |ok: Bool, i: Int|
-            ok && toolchain.rename(object(i), targets.get(i)));
-          if placed {
-            Ok({ paths: targets.map(|o: String| cache ++ "/" ++ o), compiled_count: missing.len() })
-          } else { Err("an object could not be written to the toolchain's cache") }
-        },
-      }
-    },
-  }
-}
-
-fn link_shared<[c]>(
-  t: Toolchain,
-  objects: List<String>,
-  work: String,
-) -> Result<String, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
-  let cache = toolchain.cache();
-  let library = library_path(t, objects);
-  if toolchain.exists(library) { Ok(cache ++ "/" ++ library) } else {
-    let made = work ++ "/unit.so";
-    match run_all[c]([
-        t.support_flags.concat(["-shared", "-o", cache ++ "/" ++ made].concat(objects)),
-      ]) {
+) -> Result<List<String>, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let root = toolchain.cache();
+  let source = |i: Int| work ++ "/" ++ i.to_string() ++ ".c";
+  let object = |i: Int| work ++ "/" ++ i.to_string() ++ ".o";
+  let written = range(0, files.len()).fold(true, |ok: Bool, i: Int|
+    ok && toolchain.write_file(source(i), files.get(i).head.concat(files.get(i).file.text)));
+  if !written { Err("generated C could not be written to the toolchain's directory") } else {
+    let largest_first = range(0, files.len()).sort_by(|a: Int, b: Int|
+      files.get(a).file.size > files.get(b).file.size);
+    match run_all[c](
+        largest_first.map(|i: Int|
+          t.support_flags.concat(compile_flags(t).concat(flags)).concat([
+            "-c",
+            "-o",
+            root ++ "/" ++ object(i),
+            root ++ "/" ++ source(i),
+          ])),
+      ) {
       Err(reason) -> Err(reason),
-      Ok(_) -> match toolchain.read_file(made) {
-        None -> Err("the C compiler linked no library"),
-        Some(linked) -> if toolchain.write_file(made, with_stack_header(linked))
-            && toolchain.rename(made, library) { Ok(cache ++ "/" ++ library) }
-        else { Err("the library could not be written to the toolchain's cache") },
-      },
+      Ok(_) -> Ok(range(0, files.len()).map(object)),
     }
   }
 }
 
-fn library_path(t: Toolchain, objects: List<String>) -> String / {abort.raise} =
-  cache_key(t, ["-shared", "stack-marked"], objects.map(Bytes::of_string)) ++ ".so"
+pub type Objects = { paths: List<String>, compiled_count: Int }
+
+type PlacedObject = { file: WrittenPart, owner: String, version: String }
+
+fn label_dir(owner: String, label: String) -> String / {abort.raise} =
+  owner ++ "/" ++ blake3(Bytes::of_string(label)).slice(0, 8).hex_of()
+
+pub fn objects<[c]>(
+  t: Toolchain,
+  owner: String,
+  c: GeneratedC,
+  flags: List<String>,
+) -> Result<Objects, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let placed = c.files.map(|w: WrittenPart|
+    {
+      file: w,
+      owner: label_dir(owner, w.label),
+      version: version_of(cache_key(t, flags, [Bytes::of_string(w.digest)])),
+    });
+  let path = |o: PlacedObject| version_path(o.owner, o.version, "object.o");
+  let missing = placed.filter(|o: PlacedObject| !toolchain.exists(path(o)));
+  let compiled = if missing.len() == 0 { Ok(()) } else {
+    match toolchain.temp_dir() {
+      None -> Err("the toolchain's directory has no room to compile in"),
+      Some(work) -> {
+        let made = match compiled_in[c](
+            t,
+            flags,
+            missing.map(|o: PlacedObject| { head: c.head, file: o.file }),
+            work,
+          ) {
+          Err(reason) -> Err(reason),
+          Ok(objects) -> if range(0, missing.len()).fold(true, |ok: Bool, i: Int|
+              ok
+                && installed_version(
+                  missing.get(i).owner,
+                  missing.get(i).version,
+                  "object.o",
+                  objects.get(i),
+                )) { Ok(()) }
+          else { Err("an object could not be written to the toolchain's directory") },
+        };
+        toolchain.remove_tree(work);
+        made
+      },
+    }
+  };
+  match compiled {
+    Err(reason) -> Err(reason),
+    Ok(_) -> {
+      forget_other_labels(owner, placed.map(|o: PlacedObject| o.owner));
+      Ok({
+        paths: placed.map(|o: PlacedObject| toolchain.cache() ++ "/" ++ path(o)),
+        compiled_count: missing.len(),
+      })
+    },
+  }
+}
+
+fn forget_other_labels(
+  owner: String,
+  dirs: List<String>,
+) -> Unit / {toolchain.read, toolchain.write} = {
+  let listing = owner ++ "/labels";
+  let wanted = dirs.fold(Set::empty(), |m: Set<String>, d: String| m.insert(d));
+  match toolchain.read_file(listing) {
+    Some(b) ->
+      b.split(b"\n").fold((), |_: Unit, line: Bytes| {
+        let dir = String::of_bytes_lossy(line);
+        if dir != "" && !wanted.contains(dir) { toolchain.remove_tree(dir) }
+      }),
+    None -> (),
+  };
+  toolchain.write_file(listing, Bytes::of_string(String::join(dirs, "\n")));
+  ()
+}
 
 fn read_little_endian(b: Bytes, from: Int, count: Int) -> Int / {abort.raise} =
   range(0, count).fold(0, |n: Int, k: Int| n * 256 + b.at(from + count - 1 - k))
@@ -362,6 +340,8 @@ fn little_endian_bytes(n: Int, count: Int) -> Bytes / {abort.raise} =
     { rest: s.rest / 256, out: s.out.concat(byte_of_int(s.rest % 256)) }).out
 
 const pt_gnu_stack: Int = 0x6474E551
+
+const largest_page: Int = 0x10000
 
 pub fn with_stack_header(library: Bytes) -> Bytes / {abort.raise} = {
   let size = library.len();
@@ -377,7 +357,7 @@ pub fn with_stack_header(library: Bytes) -> Bytes / {abort.raise} = {
         None -> false,
       });
     if !whole || marked { library } else {
-      let pad = (8 - size % 8) % 8;
+      let pad = (largest_page - size % largest_page) % largest_page;
       Bytes::concat_all([
         library.slice(0, 32),
         little_endian_bytes(size + pad, 8),
@@ -413,32 +393,119 @@ pub fn targets_x86_64_linux<[c]>() -> Bool / {compilers.write[c], toolchain.read
   }
 }
 
+pub type WantedLibrary = { owner: String, key: Bytes }
+
+pub type FoundLibrary = { wanted: WantedLibrary, path: String, built: Bool }
+
+pub type LibraryToBuild = { wanted: WantedLibrary, c: GeneratedC }
+
 pub fn library<[c]>(
   p: Profile,
-  sources: List<Source>,
-) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
-  match compilers.find[c]() {
-    None -> Err("no C compiler is installed to compile the unit with"),
-    Some(compiler) -> {
-      let t = toolchain_of(compiler, p.unit, p.checked);
-      let flags = library_flags;
-      let cache = toolchain.cache();
-      let made = library_path(t, sources.map(|s: Source| cache ++ "/" ++ object_path(t, flags, s)));
-      if toolchain.exists(made) { Ok(cache ++ "/" ++ made) } else {
-        match toolchain.temp_dir() {
-          None -> Err("the toolchain's cache has no room to compile in"),
-          Some(work) -> {
-            let built = match objects[c](t, sources, flags, work) {
-              Err(reason) -> Err(reason),
-              Ok(compiled) -> link_shared[c](t, compiled.paths, work),
-            };
-            toolchain.remove_tree(work);
-            built
-          },
-        }
+  owner: String,
+  c: GeneratedC,
+) -> Result<String, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let wanted = {
+    owner: owner,
+    key: Bytes::concat_all(c.files.map(|f: WrittenPart| Bytes::of_string(f.digest))),
+  };
+  match found_libraries[c](p, [wanted]) {
+    Err(reason) -> Err(reason),
+    Ok(found) -> if found.get(0).built { Ok(found.get(0).path) } else {
+      match built_libraries[c](p, [{ wanted: wanted, c: c }]) {
+        Err(reason) -> Err(reason),
+        Ok(_) -> Ok(found.get(0).path),
       }
     },
   }
+}
+
+fn library_version(t: Toolchain, wanted: WantedLibrary) -> String / {abort.raise} =
+  version_of(cache_key(t, library_flags.push("-shared"), [wanted.key]))
+
+fn library_toolchain<[c]>(p: Profile) -> Result<Toolchain, String> / {compilers.read[c]} =
+  match compilers.find[c]() {
+    None -> Err("no C compiler is installed to compile the unit with"),
+    Some(compiler) -> Ok(toolchain_of(compiler, p.unit, p.checked)),
+  }
+
+pub fn found_libraries<[c]>(
+  p: Profile,
+  wanted: List<WantedLibrary>,
+) -> Result<List<FoundLibrary>, String> / {compilers.read[c], toolchain.read, abort.raise} =
+  match library_toolchain[c](p) {
+    Err(reason) -> Err(reason),
+    Ok(t) ->
+      Ok(
+        wanted.map(|w: WantedLibrary| {
+          let at = version_path(w.owner, library_version(t, w), "library.so");
+          { wanted: w, path: toolchain.cache() ++ "/" ++ at, built: toolchain.exists(at) }
+        }),
+      ),
+  }
+
+pub fn built_libraries<[c]>(
+  p: Profile,
+  missing: List<LibraryToBuild>,
+) -> Result<Unit, String> / {compilers.read[c], compilers.write[c], toolchain.read, toolchain.write, abort.raise} =
+  if missing.len() == 0 { Ok(()) } else {
+    match library_toolchain[c](p) {
+      Err(reason) -> Err(reason),
+      Ok(t) -> match toolchain.temp_dir() {
+        None -> Err("the toolchain's directory has no room to compile in"),
+        Some(work) -> {
+          let made = linked_libraries[c](t, missing, work);
+          toolchain.remove_tree(work);
+          made
+        },
+      },
+    }
+  }
+
+fn linked_libraries<[c]>(
+  t: Toolchain,
+  missing: List<LibraryToBuild>,
+  work: String,
+) -> Result<Unit, String> / {compilers.write[c], toolchain.read, toolchain.write, abort.raise} = {
+  let files = missing.fold([], |all: List<CFile>, l: LibraryToBuild|
+    all.concat(l.c.files.map(|f: WrittenPart| { head: l.c.head, file: f })));
+  match compiled_in[c](t, library_flags, files, work) {
+    Err(reason) -> Err(reason),
+    Ok(objects) -> {
+      let root = toolchain.cache();
+      let firsts = missing.fold(
+        { next: 0, at: [] },
+        |s: { next: Int, at: List<Int> }, l: LibraryToBuild|
+          { next: s.next + l.c.files.len(), at: s.at.push(s.next) },
+      ).at;
+      let made = |j: Int| work ++ "/" ++ j.to_string() ++ ".so";
+      match run_all[c](
+          range(0, missing.len()).map(|j: Int|
+            t.support_flags.concat(["-shared", "-o", root ++ "/" ++ made(j)]).concat(
+              objects.slice(firsts.get(j), firsts.get(j) + missing.get(j).c.files.len()).map(
+                |o: String| root ++ "/" ++ o,
+              ),
+            )),
+        ) {
+        Err(reason) -> Err(reason),
+        Ok(_) ->
+          range(0, missing.len()).fold(Ok(()), |done: Result<Unit, String>, j: Int|
+            match done {
+              Err(reason) -> Err(reason),
+              Ok(_) -> match toolchain.read_file(made(j)) {
+                None -> Err("the C compiler linked no library"),
+                Some(linked) -> {
+                  let w = missing.get(j).wanted;
+                  if toolchain.write_file(made(j), with_stack_header(linked))
+                      && installed_version(w.owner, library_version(t, w), "library.so", made(j)) {
+                    Ok(())
+                  } else { Err("the library could not be written to the toolchain's directory") }
+                },
+              },
+            }),
+      }
+    },
+  }
+}
 
 pub fn executable<[c]>(
   t: Toolchain,
@@ -463,6 +530,56 @@ pub fn executable<[c]>(
         Ok(_) -> Ok(out),
       },
     }
+  }
+}
+
+pub fn cache_relative(path: String) -> String / {toolchain.read, abort.raise} = {
+  let cache = toolchain.cache();
+  if path.starts_with(cache ++ "/") { path.slice(cache.len() + 1, path.len()) } else { path }
+}
+
+pub fn products_in<a, [r] | e>(
+  dir: String,
+  body: () -> a / {toolchain.read, toolchain.write | e},
+) -> a / {fs.read[r], fs.write[r], entropy.next, toolchain.read, toolchain.write, abort.raise | e} = {
+  fs.create_dir[r](dir);
+  let absolute = match fs.canonical[r](dir) { Some(p) -> p, None -> dir };
+  let at = |path: String| dir ++ "/" ++ path;
+  let with_parent = |path: String| {
+    fs.create_dir[r](parent(at(path)));
+    at(path)
+  };
+  handle {
+    body()
+  } with {
+    toolchain.cache() -> absolute,
+    toolchain.exists(path) -> fs.kind[r](at(path)) == File,
+    toolchain.read_file(path) -> fs.read_file[r](at(path)),
+    toolchain.write_file(path, bytes) -> {
+      let target = with_parent(path);
+      let written = target ++ "." ++ entropy.next().to_string();
+      if fs.write_file[r](written, bytes) && fs.rename[r](written, target) { true } else {
+        fs.remove[r](written);
+        false
+      }
+    },
+    toolchain.rename(from, to) -> fs.rename[r](at(from), with_parent(to)),
+    toolchain.temp_dir() -> {
+      fs.create_dir[r](at("work"));
+      match fs.temp_dir[r](at("work"), "build") {
+        Some(d) -> Some(d.slice(dir.len() + 1, d.len())),
+        None -> None,
+      }
+    },
+    toolchain.remove_tree(path) -> {
+      fs.remove_tree[r](at(path));
+      ()
+    },
+    toolchain.append(path, bytes) -> toolchain.append(path, bytes),
+    toolchain.libraries() -> toolchain.libraries(),
+    toolchain.run(path, args) -> toolchain.run(path, args),
+    toolchain.reuse_dir() -> toolchain.reuse_dir(),
+    toolchain.bodies_dir() -> toolchain.bodies_dir(),
   }
 }
 
@@ -603,23 +720,21 @@ const unit_labels: List<String> = ["0123456789abcdef", "1f", "runtime", "fields"
 
 fn part_label(part: WrittenPart) -> String = part.label
 
-fn part_text(part: WrittenPart) -> Bytes = match part.text { Some(t) -> t, None -> b"" }
-
-fn source_label(s: Source) -> String = s.label
+fn part_text(part: WrittenPart) -> Bytes = part.text
 
 test "`split` cuts C text at each part marker into a shared header and labeled parts that concatenate back to the original" {
   let p = split(unit_text);
   assert_eq(p.head, b"#include <x>\n");
-  assert_eq(p.parts.map(part_label), unit_labels);
-  assert_eq(Bytes::concat_all([p.head].concat(p.parts.map(part_text))), unit_text);
-  assert_eq(part_text(p.parts.get(2)), runtime_text)
+  assert_eq(p.files.map(part_label), unit_labels);
+  assert_eq(Bytes::concat_all([p.head].concat(p.files.map(part_text))), unit_text);
+  assert_eq(part_text(p.files.get(2)), runtime_text)
 }
 
 test "`split` of C text with no part marker returns the whole text as the header and one empty `runtime` part" {
   let text = b"int x;\n/* --- part of a comment */\nint y;\n";
   let p = split(text);
   assert_eq(p.head, text);
-  assert_eq(p.parts, [written_part(text, "runtime", b"")])
+  assert_eq(p.files, [written_part(text, "runtime", b"")])
 }
 
 test "`split` aborts with a message naming the label when two parts have the same label" {
@@ -636,21 +751,13 @@ test "`split` aborts with a message naming the label when two parts have the sam
 
 test "a part's digest is the BLAKE3 hash of the header followed by the part's C, so changing the header changes every digest" {
   let p = split(unit_text);
-  let first = p.parts.get(0);
+  let first = p.files.get(0);
   assert_eq(first.digest, blake3(p.head.concat(part_text(first))).hex_of());
   let moved = split(b"#include <y>\n".concat(unit_text.slice(p.head.len(), unit_text.len())));
   assert(
-    moved.parts.get(1).digest != p.parts.get(1).digest,
+    moved.files.get(1).digest != p.files.get(1).digest,
     Some("the head is part of every source"),
   )
-}
-
-test "`parse_manifest` returns the label and digest list that `manifest` wrote, and `None` for malformed text" {
-  let sources = split(unit_text).parts.map(|w: WrittenPart| { label: w.label, digest: w.digest });
-  assert_eq(parse_manifest(manifest(sources)), Some(sources));
-  assert_eq(parse_manifest(b""), Some([]));
-  assert_eq(parse_manifest(b"0a short\n"), None);
-  assert_eq(parse_manifest(b"just-a-label\n"), None)
 }
 
 test "`cache_key` changes when the compiler identity, optimization level, flags or C text changes" {
@@ -674,6 +781,11 @@ test "a toolchain with checking on compiles with `PLY_CHECKED` defined and has d
       != cache_key({ ..development, checked: false }, ["-c"], [b"text"]),
     None,
   )
+}
+
+test "two profiles that compile a unit differently have different identities, and a profile's name is no part of its identity" {
+  assert(profile_identity(development()) != profile_identity(release()), None);
+  assert_eq(profile_identity({ ..release(), name: "other" }), profile_identity(release()))
 }
 
 test "both profiles optimise native programs the same" {
@@ -823,7 +935,10 @@ fn fake_build<a>(
       },
     },
     toolchain.temp_dir() -> Some("work"),
-    toolchain.remove_tree(dir) -> (),
+    toolchain.remove_tree(dir) -> {
+      files = files.fold(Map::new(), |remaining: Map<String, Bytes>, path: String, bytes: Bytes|
+        if path.starts_with(dir ++ "/") { remaining } else { remaining.insert(path, bytes) });
+    },
     toolchain.reuse_dir() -> panic("a build reads no store"),
     toolchain.bodies_dir() -> panic("a build reads no store"),
     toolchain.libraries() -> panic("a build links nothing"),
@@ -832,79 +947,47 @@ fn fake_build<a>(
     return made -> { made: made, written: written, runs: runs, files: files },
   }
 
-test "a build compiles each part whose object is not cached, including a part whose C must be read back from the cache" {
+fn kept_under(files: Map<String, Bytes>, owner: String) -> List<String> =
+  files.keys().filter(|path: String| path.starts_with(owner ++ "/") && path.ends_with(".o")).sort()
+
+test "objects are kept under their owner, and a build of the same C compiles nothing" {
+  let t = toolchain_of({ path: "cc", identity: b"cc 1", support_flags: [] }, "-O2", false);
+  let c = split(unit_text);
+  let build = || objects[cc](t, "ply", c, []);
+  let first = fake_build(Map::new(), build);
+  let again = fake_build(first.files, build);
+  assert_eq(again.runs, []);
+  assert_eq(again.made.map(|o: Objects| o.paths), first.made.map(|o: Objects| o.paths))
+}
+
+test "a changed file's object replaces its old object, and a file that is gone loses its object" {
   let t = toolchain_of({ path: "cc", identity: b"cc 1", support_flags: [] }, "-O2", false);
   let head = b"#include <x>\n";
-  let fresh = [written_part(head, "a", b"int a;\n"), written_part(head, "a", b"int b;\n")];
-  let built = written_part(head, "c", b"int c;\n");
-  let taken = { ..written_part(head, "d", b"int d;\n"), text: None };
-  let cached_files = Map::new().insert(source_path(taken.digest), head.concat(b"int d;\n")).insert(
-    object_path(t, [], { label: built.label, digest: built.digest }),
-    b"compiled",
-  );
-  let build = ||
-    match cache_sources(head, fresh.push(built).push(taken)) {
-      Err(reason) -> Err(reason),
-      Ok(sources) -> objects[cc](t, sources, [], "work"),
-    };
-  let first = fake_build(cached_files, build);
-  let input = |w: WrittenPart| Some("/cache/" ++ source_path(w.digest));
-  assert_eq(first.written, fresh.push(built).map(|w: WrittenPart| source_path(w.digest)));
-  assert_eq(first.runs.map(|run: List<String>| run.last()), fresh.push(taken).map(input));
-  let again = fake_build(first.files, build);
-  let paths = |r: Result<Objects, String>| r.map(|o: Objects| o.paths);
-  assert_eq(paths(again.made), paths(first.made));
-  assert_eq(again.runs, []);
-  assert_eq(again.written, []);
-  let lost = { label: taken.label, digest: taken.digest };
-  assert(fake_build(Map::new(), || objects[cc](t, [lost], [], "work")).made.is_err(), None)
-}
-
-test "building the same C text a second time with the cache populated starts no compiler and writes no files" {
-  let compiled = ||
-    match cache_text(unit_text) {
-      Err(reason) -> Err(reason),
-      Ok(sources) -> library[cc](development(), sources),
-    };
-  let first = fake_build(Map::new(), compiled);
-  assert(first.made.is_ok(), None);
-  let again = fake_build(first.files, compiled);
-  assert_eq(again.made, first.made);
-  assert_eq(again.runs, []);
-  assert_eq(again.written, [])
-}
-
-test "`cache_sources` writes the C of each new part, reuses the C of parts already cached, and fails when a needed cached part is missing" {
-  let fresh = { label: "a", digest: "aa", size: 2, text: Some(b"a\n") };
-  let beside = { label: "c", digest: "cc", size: 2, text: Some(b"c\n") };
-  let taken = { label: "b", digest: "bb", size: 9, text: None };
-  let r = fake_build(Map::new().insert("src/bb.c", b"h\nb\n"), ||
-    cache_sources(b"h\n", [fresh, beside, taken]));
-  assert_eq(r.made.map(|sources: List<Source>| sources.map(source_label)), Ok(["b", "a", "c"]));
-  assert_eq(r.written, ["src/aa.c", "src/cc.c"]);
-  assert(fake_build(Map::new(), || cache_sources(b"h\n", [fresh, taken])).made.is_err(), None)
-}
-
-test "`read_back` rebuilds a C text from the cached part files and writes nothing, and fails when a cached file is missing" {
-  let cut = split(unit_text);
-  let first = fake_build(Map::new(), || cache_sources(cut.head, cut.parts));
-  let sources = first.made.expect("the parts are kept");
-  let again = fake_build(first.files, ||
-    match read_back(cut.head, sources) {
-      Err(reason) -> Err(reason),
-      Ok(back) -> cache_text(back).map(|s: List<Source>| { back: back, sources: s }),
-    });
-  match again.made {
-    Err(reason) -> panic(reason),
-    Ok(r) -> {
-      assert_eq(r.sources, sources);
-      assert_eq(again.written, []);
-      let back = split(r.back);
-      assert_eq(back.parts.map(part_label), sources.map(source_label));
-      assert_eq(back.parts.sort_by_key(part_label), cut.parts.sort_by_key(part_label))
-    },
+  let before = {
+    head: head,
+    files: [written_part(head, "a", b"int a;\n"), written_part(head, "b", b"int b;\n")],
   };
-  assert(fake_build(Map::new(), || read_back(cut.head, sources)).made.is_err(), None)
+  let after = { head: head, files: [written_part(head, "a", b"int a = 1;\n")] };
+  let first = fake_build(Map::new(), || objects[cc](t, "ply", before, []));
+  let second = fake_build(first.files, || objects[cc](t, "ply", after, []));
+  assert_eq(
+    kept_under(second.files, "ply"),
+    second.made.map(|o: Objects| o.paths.map(in_test_cache)).unwrap_or([]),
+  )
+}
+
+test "a library is built again only when its C changes, and the new library replaces the old one" {
+  let head = b"#include <x>\n";
+  let one = { head: head, files: [written_part(head, "a", b"int a;\n")] };
+  let two = { head: head, files: [written_part(head, "a", b"int a = 2;\n")] };
+  let first = fake_build(Map::new(), || library[cc](development(), "parts/m", one));
+  let same = fake_build(first.files, || library[cc](development(), "parts/m", one));
+  assert_eq(same.runs, []);
+  assert_eq(same.made, first.made);
+  let changed = fake_build(first.files, || library[cc](development(), "parts/m", two));
+  assert(changed.made != first.made, None);
+  let libraries = changed.files.keys().filter(|path: String| path.ends_with("library.so"));
+  assert_eq(libraries.map(|path: String| "/cache/" ++ path), [changed.made.unwrap_or("")])
 }
 
 fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
@@ -924,14 +1007,35 @@ fn elf_of(machine: Int, headers: Bytes, count: Int) -> Bytes / {abort.raise} =
 test "`with_stack_header` adds a `PT_GNU_STACK` program header to a library without one and returns a library with one unchanged" {
   let load = little_endian_bytes(1, 4).concat(b"\x00".repeat(52));
   let marked = with_stack_header(elf_of(0, load, 1).concat(b"body"));
-  assert_eq(marked.len(), 128 + 2 * 56);
-  assert_eq(read_little_endian(marked, 32, 8), 128);
+  let at = read_little_endian(marked, 32, 8);
+  assert(at >= 124, None);
   assert_eq(read_little_endian(marked, 56, 2), 2);
   assert_eq(marked.slice(120, 124), b"body");
-  assert_eq(marked.slice(128, 184), load);
-  assert_eq(read_little_endian(marked, 184, 4), pt_gnu_stack);
-  assert_eq(read_little_endian(marked, 188, 4), 6);
+  assert_eq(marked.slice(at, at + 56), load);
+  assert_eq(read_little_endian(marked, at + 56, 4), pt_gnu_stack);
+  assert_eq(read_little_endian(marked, at + 60, 4), 6);
   assert_eq(with_stack_header(marked), marked)
+}
+
+fn loaded_through(end: Int) -> Bytes / {abort.raise} =
+  Bytes::concat_all([
+    little_endian_bytes(1, 4),
+    b"\x00".repeat(28),
+    little_endian_bytes(end, 8),
+    b"\x00".repeat(16),
+  ])
+
+test "a stack header's table lies past every page a segment maps, where zeroing `.bss` cannot erase it" {
+  let page = 4096;
+  range(0, 3).fold((), |_: Unit, pages: Int|
+    [1, 656, 2344, 3000, 4095, 4096].fold((), |_: Unit, into: Int| {
+      let end = pages * page + into;
+      let library = elf_of(0, loaded_through(end), 1);
+      let whole = library.concat(b"\x00".repeat(end - library.len() + 1528));
+      let at = read_little_endian(with_stack_header(whole), 32, 8);
+      let mapped_to = (end + page - 1) / page * page;
+      assert(at >= mapped_to, Some(end.to_string() ++ " maps past " ++ at.to_string()));
+    }))
 }
 
 test "what is not a 64-bit little-endian ELF file is left as it is" {

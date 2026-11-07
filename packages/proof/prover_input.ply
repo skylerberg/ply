@@ -1,9 +1,13 @@
+import compiler.syntax.parsing (Warning)
+import compiler.check.infer.checker (TypeFacts)
 import compiler.front.diagnostics (parse_all)
-import compiler.front.published (no_rows, analyse)
 import compiler.front.facts (Analysis, claim_literals, literals_of, schema_definitions, Bounded,
                              bounds_of, guard_bounds)
 import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front (analyse_pulling_std_with)
+import compiler.front.checking (read_over, analysed_over, session_over, claimed_in_memory,
+                                in_memory, InMemory, FileAt)
+import compiler.front.checking.promises (ClaimIdentities, ClaimsAnalysed, ClaimsRejected,
+                                         claims_analysed)
 import compiler.front.rows (module_imports)
 import compiler.check.infer.checker (Builtin, ConstructorInfo, DefinitionInfo, LawBinder, LawInfo,
                                      SpecInfo, InstanceInfo, NumericInfo, EffectInfo, OperationInfo,
@@ -13,11 +17,14 @@ import compiler.syntax.items (Item, FunctionItem, TypeItem, LawItem, CostClause,
                               InvariantInstance)
 import compiler.syntax.expressions (Expression, NameExpression, Param, expression_span,
                                     expression_nodes)
-import compiler.store.hash.forms (HashOutput, NodeRef, ItemKeyed, references_in)
+import compiler.store.hash.forms (HashOutput, NodeRef, ItemKeyed, references_in, Identities,
+                                  Identified, identity_in, DefinitionRun, DefinitionProof, LawRun,
+                                  LawProof)
 import compiler.store.hash.encoding (hex)
 import std.hash (blake3)
-import compiler.check.resolve.tables (Diagnostic, ParsedModule, error_at, qualify)
-import compiler.syntax.parsing (Span, no_module)
+import compiler.check.resolve.tables (Diagnostic, InSource, ParsedModule, Place, Unplaced,
+                                      WholeFile, Source, error_at, place_of, qualify)
+import compiler.syntax.parsing (Span)
 import compiler.check.types (Effect, Field, Printer, Type, NamedType, FunctionType, RecordType,
                              VariableType, print_resource, print_effects, print_type,
                              printer_naming, printer_new, reserve_effects, is_pure,
@@ -29,6 +36,7 @@ import domain (Cases, NamedSort, Declaration, Domain, Interval, FunctionSort, Re
 import obligation (Builds, Cost, Definition, Ensures, Frame, Kind, Law, NoWrites, Space, Writes,
                    WrittenLaw)
 import std.list
+import std.graph (reachable)
 
 pub type Signature = {
   name: String,
@@ -54,17 +62,27 @@ pub type Obligation = {
   run_key: String,
   owner: String,
   kind: Kind,
-  at: { module: Int, start: Int, end: Int },
+  module: Int,
+  at: Place,
   binders: List<Binder>,
   result: Option<Binder>,
   variables: List<String>,
-  guards: List<{ module: Int, start: Int, end: Int }>,
+  guards: List<Place>,
   literals: List<Bytes>,
   effects: Option<String>,
   frame: Frame,
   strategy: Strategy,
   identities: List<Int>,
 }
+
+pub fn written_before(earlier: Place, later: Place) -> Bool =
+  match ((earlier, later)) {
+    (InSource(a), InSource(b)) -> a.start < b.start,
+    (WholeFile(_), InSource(_)) -> true,
+    (WholeFile(_), Unplaced) -> true,
+    (InSource(_), Unplaced) -> true,
+    _ -> false,
+  }
 
 pub type Measure = {
   owner: String,
@@ -96,6 +114,10 @@ pub type TrustedLaw = {
   module: Int,
 }
 
+type TrustedIdentity = { law: LawInfo, identity: Bytes }
+
+type ObligationKeys = { key: Bytes, run_key: Bytes }
+
 pub type ProverInputResult = {
   world: ProverInput,
   definitions: List<Definition>,
@@ -105,55 +127,51 @@ pub type ProverInputResult = {
 
 pub fn prover_input_of(
   analysis: Analysis,
+  claimed: ClaimIdentities,
   owned: (Bytes) -> Bool,
 ) -> ProverInputResult / {abort.raise} = {
+  let identities = claimed.identities;
+  let claims_of = |m: Bytes| owned(m) && claimed.opened.contains(m);
   let declarations = declarations_of(analysis.checked.constructors);
   let closing: OpaqueTypes = {
-    closed: opaque_types_of(analysis.modules),
+    closed: opaque_types_of(analysis),
     constructors: analysis.checked.constructors,
     declarations: declarations,
   };
   let written = written_params(analysis.modules);
   let wheres = law_guards(analysis.modules);
   let requires = clauses_written(analysis.modules);
-  let by_name = |xs: List<{ name: Bytes, hashes: List<Bytes> }>|
-    xs.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }|
-        accumulator.insert(s.name, s.hashes),
-    );
-  let keys = by_name(analysis.hashes.spec_checks);
-  let runs = by_name(analysis.hashes.specs);
-  let definitions = analysis.checked.definitions.filter(|d: DefinitionInfo| owned(d.module));
+  let specs = spec_hashes(analysis.hashes);
+  let definitions = analysis.checked.definitions.filter(|d: DefinitionInfo| claims_of(d.module));
   let schemas = schema_definitions(analysis.modules);
-  let laws = analysis.checked.laws.filter(|l: LawInfo| owned(l.module));
+  let laws = analysis.checked.laws.filter(|l: LawInfo| claims_of(l.module));
   let clauses = definitions.fold(
     { obligations: [], warnings: [] },
     |accumulator: CollectedObligations, d: DefinitionInfo|
-      clauses_of(accumulator, d, written, requires, keys, runs, closing),
+      clauses_of(accumulator, d, written, requires, specs, identities, closing),
   );
   let stating = invariants_of(analysis.checked.instances);
   let values = if stating.len() == 0 { Map::new() } else { values_named(analysis.modules) };
   let built = definitions.fold(clauses, |accumulator: CollectedObligations, d: DefinitionInfo|
-    builds_of(accumulator, d, written, stating, values, analysis.hashes, closing));
+    builds_of(accumulator, d, written, stating, values, analysis.hashes, identities, closing));
   let collected = laws.fold(built, |accumulator: CollectedObligations, l: LawInfo|
-    law_of(accumulator, l, analysis.hashes.laws, wheres, closing));
+    law_of(accumulator, l, identities, wheres, closing));
   let imports = imports_of(analysis.modules);
-  let trusted = analysis.checked.laws.filter(|l: LawInfo|
-    !owned(l.module) && !l.has_guard && analysis.hashes.law_texts.contains(l.key));
-  let imported_law_hashes = |o: Obligation|
+  let trusted = analysis.checked.laws.fold([], |found: List<TrustedIdentity>, l: LawInfo|
+    if claims_of(l.module) || l.has_guard { found } else {
+      match identity_in(identities, LawRun(l.key)) {
+        Some(identity) -> found.push({ law: l, identity: identity }),
+        None -> panic("a law the prover may trust has no run identity"),
+      }
+    });
+  let imported_law_identities = |o: Obligation|
     match o.kind {
       Cost(_) -> [],
       Space(_) -> [],
-      _ -> match imports.at(o.at.module) {
+      _ -> match imports.at(o.module) {
         Some(reach) ->
-          trusted.filter(|l: LawInfo| reach.contains(l.at.module)).fold(
-            [],
-            |accumulator: List<Bytes>, l: LawInfo|
-              match analysis.hashes.laws.get(l.key) {
-                Some(h) -> accumulator.push(h),
-                None -> accumulator,
-              },
+          trusted.filter(|t: TrustedIdentity| reach.contains(t.law.at.module)).map(
+            |t: TrustedIdentity| t.identity,
           ),
         None -> [],
       },
@@ -164,14 +182,14 @@ pub fn prover_input_of(
       signatures: analysis.checked.definitions.map(signature_of),
       builtins: builtin_signatures,
       obligations: collected.obligations.map(|o: Obligation|
-        with_imported_laws(o, imported_law_hashes(o))),
+        with_imported_laws(o, imported_law_identities(o))),
       measures: measures_in(analysis, owned),
       keys: keys_of(analysis.checked.instances),
       numerics: numerics_of(analysis.checked.numeric_types),
       invariants: stating.map(|i: { type_name: Bytes, by: Bytes }|
         { type_name: String::of_bytes_lossy(i.type_name), by: String::of_bytes_lossy(i.by) }),
       imports: imports,
-      trusted_laws: trusted.map(|l: LawInfo| trusted_law_from(l, closing)),
+      trusted_laws: trusted.map(|t: TrustedIdentity| trusted_law_from(t.law, closing)),
       operations: operations_of(analysis.checked.effects),
     },
     definitions: defined(
@@ -183,13 +201,13 @@ pub fn prover_input_of(
   }
 }
 
-fn defined(ds: List<DefinitionInfo>, h: HashOutput) -> List<Definition> / {abort.raise} = {
+pub fn defined(ds: List<DefinitionInfo>, h: HashOutput) -> List<Definition> / {abort.raise} = {
   let hashed = h.definitions.fold(
     Map::new(),
     |accumulator: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
       accumulator.insert(x.name, x.hash),
   );
-  let clauses = h.spec_texts.fold(
+  let clauses = h.specs.fold(
     Map::new(),
     |accumulator: Map<Bytes, List<Bytes>>, x: { name: Bytes, hashes: List<Bytes> }|
       accumulator.insert(x.name, x.hashes),
@@ -214,7 +232,7 @@ fn sentences_of(ls: List<LawInfo>, h: HashOutput) -> List<WrittenLaw> / {abort.r
       Some(hash) ->
         accumulator.push({
           key: String::of_bytes_lossy(l.key),
-          text: hashed_text(match h.law_texts.get(l.key) { Some(t) -> t, None -> hash }),
+          text: hashed_text(hash),
           mentions: references_in(h, ItemKeyed(l.key)).fold(
             [],
             |ns: List<Bytes>, r: NodeRef| ns.push_unique(r.name),
@@ -232,14 +250,25 @@ type OpaqueTypes = {
 
 const no_opaque_types: OpaqueTypes = { closed: [], constructors: [], declarations: [] }
 
-fn opaque_types_of(modules: List<ParsedModule>) -> List<{ ty: Bytes, home: Bytes }> =
-  modules.fold([], |accumulator: List<{ ty: Bytes, home: Bytes }>, m: ParsedModule|
-    m.module.items.fold(accumulator, |a: List<{ ty: Bytes, home: Bytes }>, item: Item|
-      match item {
-        TypeItem(t) -> if t.opaque == None { a }
-        else { a.push({ ty: qualify(m.name, t.name.name), home: m.name }) },
-        _ -> a,
-      }))
+fn opaque_types_of(analysis: Analysis) -> List<{ ty: Bytes, home: Bytes }> = {
+  let written = analysis.modules.fold(
+    [],
+    |accumulator: List<{ ty: Bytes, home: Bytes }>, m: ParsedModule|
+      m.module.items.fold(accumulator, |a: List<{ ty: Bytes, home: Bytes }>, item: Item|
+        match item {
+          TypeItem(t) -> if t.opaque == None { a }
+          else { a.push({ ty: qualify(m.name, t.name.name), home: m.name }) },
+          _ -> a,
+        }),
+  );
+  analysis.declared.types.fold(
+    written,
+    |found: List<{ ty: Bytes, home: Bytes }>, name: Bytes, f: TypeFacts|
+      if f.declaration.opaque == None || found.any(|x: { ty: Bytes, home: Bytes }| x.ty == name) {
+        found
+      } else { found.push({ ty: name, home: f.declaration.home }) },
+  )
+}
 
 fn makes_opaque_value(
   t: Type,
@@ -499,13 +528,6 @@ fn declarations_of(constructors: List<ConstructorInfo>) -> List<Declaration> / {
 
 type CollectedObligations = { obligations: List<Obligation>, warnings: List<Diagnostic> }
 
-fn at_of(module: Int, s: Span) -> { module: Int, start: Int, end: Int } =
-  {
-    module: if s.start == 0 && s.end == 0 { no_module } else { module },
-    start: s.start,
-    end: s.end,
-  }
-
 fn written_params(modules: List<ParsedModule>) -> Map<Bytes, List<Bytes>> =
   modules.fold(Map::new(), |accumulator: Map<Bytes, List<Bytes>>, m: ParsedModule|
     m.module.items.fold(accumulator, |a: Map<Bytes, List<Bytes>>, it: Item|
@@ -579,6 +601,9 @@ fn effects_text(effects: List<Effect>) -> Option<String> / {abort.raise} =
     )
   }
 
+fn source_at(module: Int, span: Span) -> { module: Int, start: Int, end: Int } =
+  { module: module, start: span.start, end: span.end }
+
 fn unhashed(name: Bytes, module: Int, s: Span) -> Diagnostic = {
   let d: Diagnostic = error_at(
     b"W0602",
@@ -588,7 +613,7 @@ fn unhashed(name: Bytes, module: Int, s: Span) -> Diagnostic = {
     b"this claim was not checked",
     [b"the claim is not known to hold"],
   );
-  { ..d, severity: b"warning" }
+  { ..d, severity: Warning }
 }
 
 fn clauses_of(
@@ -596,8 +621,8 @@ fn clauses_of(
   d: DefinitionInfo,
   written: Map<Bytes, List<Bytes>>,
   clauses: Map<Bytes, Clauses>,
-  keys: Map<Bytes, List<Bytes>>,
-  runs: Map<Bytes, List<Bytes>>,
+  specs: Map<Bytes, List<Bytes>>,
+  identities: Identities,
   closing: OpaqueTypes,
 ) -> CollectedObligations / {abort.raise} = {
   let claimed = d.spec.filter(|s: SpecInfo| s.kind != RequiresClause);
@@ -618,7 +643,7 @@ fn clauses_of(
     let result = printed.binders.at(params.len());
     let stated = match clauses.get(d.name) { Some(c) -> c, None -> { requires: [], ensures: [] } };
     let propositions = stated.requires;
-    let guards = propositions.map(|g: Expression| at_of(d.at.module, expression_span(g)));
+    let guards = propositions.map(|g: Expression| place_of(d.at.module, expression_span(g)));
     let frame = frame_of(d.effects);
     let strategy = clause_strategy(
       effects_text(run_needs(d.effects)),
@@ -626,8 +651,11 @@ fn clauses_of(
       bounds_of(propositions),
       closing,
     );
-    let hashed = match keys.get(d.name) { Some(hs) -> hs, None -> [] };
-    let ran = match runs.get(d.name) { Some(hs) -> hs, None -> [] };
+    let definition_keys = definition_keys_of(identities, d.name);
+    let hashed = match specs.get(d.name) {
+      Some(hashes) -> clause_keys(definition_keys, hashes),
+      None -> [],
+    };
     claimed.fold(
       { owed: accumulator, ensures: 0, costs: 0, spaces: 0 },
       |st: { owed: CollectedObligations, ensures: Int, costs: Int, spaces: Int }, clause: SpecInfo| {
@@ -646,23 +674,22 @@ fn clauses_of(
                 warnings: st.owed.warnings.push(unhashed(d.name, d.at.module, clause.span)),
               },
             },
-          Some(key) ->
+          Some(clause_key) ->
             {
               ..next,
               owed: {
                 ..st.owed,
                 obligations: st.owed.obligations.push({
-                  key: String::of_bytes_lossy(hex(key)),
-                  run_key: String::of_bytes_lossy(
-                    hex(match ran.at(clause.index) { Some(r) -> r, None -> key }),
-                  ),
+                  key: String::of_bytes_lossy(hex(clause_key.key)),
+                  run_key: String::of_bytes_lossy(hex(clause_key.run_key)),
                   owner: String::of_bytes_lossy(d.name),
                   kind: match clause.kind {
                     CostClause -> Cost(st.costs),
                     SpaceClause -> Space(st.spaces),
                     _ -> Ensures(st.ensures),
                   },
-                  at: at_of(d.at.module, clause.span),
+                  module: d.at.module,
+                  at: place_of(d.at.module, clause.span),
                   binders: binders,
                   result: if bound { None } else { result },
                   variables: printed.variables,
@@ -689,54 +716,48 @@ fn clauses_of(
 fn law_of(
   accumulator: CollectedObligations,
   l: LawInfo,
-  hashes: Map<Bytes, Bytes>,
+  identities: Identities,
   wheres: Map<Bytes, LawGuardSummary>,
   closing: OpaqueTypes,
-) -> CollectedObligations / {abort.raise} =
-  match hashes.get(l.key) {
-    None ->
-      {
-        ..accumulator,
-        warnings: accumulator.warnings.push(unhashed(l.key, l.at.module, l.at.span)),
+) -> CollectedObligations / {abort.raise} = {
+  let law_key = subject_keys(identities, l.key, LawProof(l.key), LawRun(l.key));
+  let printed = binders_of(
+    l.binders.map(|b: LawBinder| { name: b.name, ty: b.ty }),
+    closing,
+    l.module,
+  );
+  let type_variables = l.binders.fold([], |accumulator: List<Int>, b: LawBinder|
+    met(b.ty, accumulator));
+  let effects = effects_text(l.effects);
+  {
+    ..accumulator,
+    obligations: accumulator.obligations.push({
+      key: String::of_bytes_lossy(hex(law_key.key)),
+      run_key: String::of_bytes_lossy(hex(law_key.run_key)),
+      owner: String::of_bytes_lossy(l.key),
+      kind: Law(Some(String::of_bytes_lossy(l.name))),
+      module: l.at.module,
+      at: place_of(l.at.module, l.at.span),
+      binders: printed.binders,
+      result: None,
+      variables: printed.variables,
+      guards: match wheres.get(l.key) {
+        Some(s) -> match s.guard { Some(g) -> [place_of(l.at.module, g)], None -> [] },
+        None -> [],
       },
-    Some(key) -> {
-      let printed = binders_of(
-        l.binders.map(|b: LawBinder| { name: b.name, ty: b.ty }),
+      literals: match wheres.get(l.key) { Some(s) -> s.literals, None -> [] },
+      effects: effects,
+      frame: NoWrites,
+      strategy: law_strategy(
+        effects,
+        printed.binders,
+        match wheres.get(l.key) { Some(s) -> s.bounds, None -> [] },
         closing,
-        l.module,
-      );
-      let type_variables = l.binders.fold([], |accumulator: List<Int>, b: LawBinder|
-        met(b.ty, accumulator));
-      let effects = effects_text(l.effects);
-      {
-        ..accumulator,
-        obligations: accumulator.obligations.push({
-          key: String::of_bytes_lossy(hex(key)),
-          run_key: String::of_bytes_lossy(hex(key)),
-          owner: String::of_bytes_lossy(l.key),
-          kind: Law(Some(String::of_bytes_lossy(l.name))),
-          at: at_of(l.at.module, l.at.span),
-          binders: printed.binders,
-          result: None,
-          variables: printed.variables,
-          guards: match wheres.get(l.key) {
-            Some(s) -> match s.guard { Some(g) -> [at_of(l.at.module, g)], None -> [] },
-            None -> [],
-          },
-          literals: match wheres.get(l.key) { Some(s) -> s.literals, None -> [] },
-          effects: effects,
-          frame: NoWrites,
-          strategy: law_strategy(
-            effects,
-            printed.binders,
-            match wheres.get(l.key) { Some(s) -> s.bounds, None -> [] },
-            closing,
-          ),
-          identities: l.identities.map(|v: Int| number_of(type_variables, v)),
-        }),
-      }
-    },
+      ),
+      identities: l.identities.map(|v: Int| number_of(type_variables, v)),
+    }),
   }
+}
 
 pub fn measures_input(analysis: Analysis, measures: List<Measure>) -> ProverInput / {abort.raise} =
   {
@@ -756,12 +777,12 @@ pub fn measures_input(analysis: Analysis, measures: List<Measure>) -> ProverInpu
     operations: operations_of(analysis.checked.effects),
   }
 
-fn with_imported_laws(o: Obligation, hashes: List<Bytes>) -> Obligation / {abort.raise} =
-  if hashes.len() == 0 { o } else {
+fn with_imported_laws(o: Obligation, identities: List<Bytes>) -> Obligation / {abort.raise} =
+  if identities.len() == 0 { o } else {
     {
       ..o,
       key: String::of_bytes_lossy(
-        hex(blake3(Bytes::concat_all([Bytes::of_string(o.key)].concat(hashes)))),
+        hex(blake3(Bytes::concat_all([Bytes::of_string(o.key)].concat(identities)))),
       ),
     }
   }
@@ -816,33 +837,10 @@ pub fn imports_of(modules: List<ParsedModule>) -> List<List<Int>> / {abort.raise
   range(0, modules.len()).map(|i: Int| reachable_from(direct, i))
 }
 
-fn reachable_from(direct: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} = {
-  let start = match direct.at(from) { Some(xs) -> xs, None -> [] };
-  let seen = iterate(
-    { seen: start.fold(Map::new(), |m: Map<Int, Bool>, x: Int| m.insert(x, true)), stack: start },
-    direct.len() * direct.len() + 2,
-    |s: { seen: Map<Int, Bool>, stack: List<Int> }|
-      match s.stack.at(s.stack.len() - 1) {
-        None -> Stop(s.seen),
-        Some(i) -> {
-          let rest = s.stack.take(s.stack.len() - 1);
-          let next = match direct.at(i) { Some(xs) -> xs, None -> [] };
-          Continue(
-            next.fold(
-              { seen: s.seen, stack: rest },
-              |accumulator: { seen: Map<Int, Bool>, stack: List<Int> }, j: Int|
-                if accumulator.seen.contains(j) { accumulator } else {
-                  { seen: accumulator.seen.insert(j, true), stack: accumulator.stack.push(j) }
-                },
-            ),
-          )
-        },
-      },
-  );
-  seen.keys().filter(|j: Int| j != from)
-}
+fn reachable_from(direct: List<List<Int>>, from: Int) -> List<Int> / {abort.raise} =
+  reachable({ out: direct }, [from]).filter(|j: Int| j != from)
 
-fn invariants_of(instances: List<InstanceInfo>) -> List<{ type_name: Bytes, by: Bytes }> =
+pub fn invariants_of(instances: List<InstanceInfo>) -> List<{ type_name: Bytes, by: Bytes }> =
   instances.fold([], |accumulator: List<{ type_name: Bytes, by: Bytes }>, x: InstanceInfo|
     match x.kind {
       InvariantInstance -> accumulator.push({ type_name: x.type_name, by: x.by }),
@@ -872,6 +870,7 @@ fn builds_of(
   stating: List<{ type_name: Bytes, by: Bytes }>,
   values: Map<Bytes, List<Bytes>>,
   h: HashOutput,
+  identities: Identities,
   closing: OpaqueTypes,
 ) -> CollectedObligations / {abort.raise} = {
   let named = h.dependencies.fold(
@@ -901,36 +900,68 @@ fn builds_of(
       closing,
       d.module,
     );
-    let check = h.checks.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
-      if x.name == d.name { x.hash } else { found });
-    owed_for.fold(accumulator, |a: CollectedObligations, i: { type_name: Bytes, by: Bytes }| {
-      let typed = h.declarations.fold(b"", |found: Bytes, x: { name: Bytes, hash: Bytes }|
-        if x.name == i.type_name { x.hash } else { found });
-      let key = String::of_bytes_lossy(
-        hex(blake3(Bytes::concat_all([b"builds\x00", check, typed]))),
-      );
-      {
-        ..a,
-        obligations: a.obligations.push({
-          key: key,
-          run_key: key,
-          owner: String::of_bytes_lossy(d.name),
-          kind: Builds(String::of_bytes_lossy(i.type_name)),
-          at: at_of(d.at.module, d.at.span),
-          binders: range(0, params.len()).map(|k: Int| printed.binders.get(k)),
-          result: printed.binders.at(params.len()),
-          variables: printed.variables,
-          guards: [],
-          literals: [],
-          effects: None,
-          frame: NoWrites,
-          strategy: Bounded,
-          identities: [],
-        }),
-      }
-    })
+    let definition_keys = definition_keys_of(identities, d.name);
+    owed_for.fold(accumulator, |a: CollectedObligations, i: { type_name: Bytes, by: Bytes }|
+      match h.declarations.filter(|x: { name: Bytes, hash: Bytes }| x.name == i.type_name).at(0) {
+        None -> { ..a, warnings: a.warnings.push(unhashed(i.type_name, d.at.module, d.at.span)) },
+        Some(declared) -> {
+          let built = |identity: Bytes|
+            String::of_bytes_lossy(
+              hex(blake3(Bytes::concat_all([b"builds\x00", identity, declared.hash]))),
+            );
+          {
+            ..a,
+            obligations: a.obligations.push({
+              key: built(definition_keys.key),
+              run_key: built(definition_keys.run_key),
+              owner: String::of_bytes_lossy(d.name),
+              kind: Builds(String::of_bytes_lossy(i.type_name)),
+              module: d.at.module,
+              at: place_of(d.at.module, d.at.span),
+              binders: range(0, params.len()).map(|k: Int| printed.binders.get(k)),
+              result: printed.binders.at(params.len()),
+              variables: printed.variables,
+              guards: [],
+              literals: [],
+              effects: None,
+              frame: NoWrites,
+              strategy: Bounded,
+              identities: [],
+            }),
+          }
+        },
+      })
   }
 }
+
+fn subject_keys(
+  identities: Identities,
+  owner: Bytes,
+  proof: Identified,
+  run: Identified,
+) -> ObligationKeys / {abort.raise} =
+  match ((identity_in(identities, proof), identity_in(identities, run))) {
+    (Some(key), Some(run_key)) -> { key: key, run_key: run_key },
+    _ ->
+      panic(
+        "internal error: `" ++ String::of_bytes_lossy(owner)
+          ++ "` is claimed, but the stored identities of its module do not hold it",
+      ),
+  }
+
+fn definition_keys_of(identities: Identities, name: Bytes) -> ObligationKeys / {abort.raise} =
+  subject_keys(identities, name, DefinitionProof(name), DefinitionRun(name))
+
+fn clause_keys(definition: ObligationKeys, clauses: List<Bytes>) -> List<ObligationKeys> =
+  clauses.map(|c: Bytes|
+    { key: blake3(definition.key.concat(c)), run_key: blake3(definition.run_key.concat(c)) })
+
+fn spec_hashes(h: HashOutput) -> Map<Bytes, List<Bytes>> =
+  h.specs.fold(
+    Map::new(),
+    |found: Map<Bytes, List<Bytes>>, s: { name: Bytes, hashes: List<Bytes> }|
+      found.insert(s.name, s.hashes),
+  )
 
 fn keys_of(instances: List<InstanceInfo>) -> List<{ type_name: String, by: String }> =
   instances.fold([], |accumulator: List<{ type_name: String, by: String }>, x: InstanceInfo|
@@ -974,7 +1005,7 @@ pub fn measures_in(analysis: Analysis, owned: (Bytes) -> Bool) -> List<Measure> 
           let names = match written.get(d.name) { Some(ns) -> ns, None -> [] };
           accumulator.push({
             owner: String::of_bytes_lossy(d.name),
-            at: at_of(d.at.module, expression_span(m)),
+            at: source_at(d.at.module, expression_span(m)),
             binders: binders_of(
               range(0, min(names.len(), shape.len())).map(|i: Int|
                 { name: names.get(i), ty: shape.get(i) }),
@@ -998,8 +1029,29 @@ fn measures_of(modules: List<ParsedModule>) -> Map<Bytes, Expression> =
         _ -> a,
       }))
 
+pub type Claimed = { program: InMemory, analysis: Analysis, identities: ClaimIdentities }
+
+pub fn claimed_session(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+) -> Claimed / {abort.raise} = {
+  let claimed = claimed_in_memory(in_memory(sources, shipped, files));
+  match claimed.outcome {
+    ClaimsRejected(_) -> panic("the fixture program was rejected by the checker"),
+    ClaimsAnalysed(w, identities) ->
+      { program: claimed.program, analysis: w, identities: identities },
+  }
+}
+
+pub fn claimed_input(
+  claimed: Claimed,
+  owned: (Bytes) -> Bool,
+) -> ProverInputResult / {abort.raise} =
+  prover_input_of(claimed.analysis, claimed.identities, owned)
+
 pub fn whole_of(source: Bytes) -> Analysis / {abort.raise} =
-  match analyse(parse_all([{ name: b"m", source_text: source }])) {
+  match analysed_over([{ name: b"m", source_text: source }]) {
     Rejected(_) -> panic("the fixture program was rejected by the checker"),
     Analysed(w) -> w,
   }
@@ -1007,7 +1059,7 @@ pub fn whole_of(source: Bytes) -> Analysis / {abort.raise} =
 pub fn every(m: Bytes) -> Bool = true
 
 fn prover_input(source: Bytes) -> ProverInputResult / {abort.raise} =
-  prover_input_of(whole_of(source), every)
+  claimed_input(claimed_session([{ name: b"m", source_text: source }]), every)
 
 fn declaration_named(ds: List<Declaration>, name: String) -> Declaration / {abort.raise} =
   match ds.fold(None, |found: Option<Declaration>, d: Declaration|
@@ -1089,7 +1141,7 @@ test "a clause's variables are its definition's parameters as written, and `resu
     Some({ name: "result", ty: SortVariable(0), text: "a", constructible: true }),
   );
   assert_eq(o.variables, ["a", "b"]);
-  assert_eq(o.guards.map(|g: { module: Int, start: Int, end: Int }| g.start), [49]);
+  assert(match o.guards { [InSource(g)] -> g.start == 49, _ -> false });
   assert_eq(o.frame, NoWrites);
   assert_eq(o.effects, None);
   assert_eq(o.key.len(), 64);
@@ -1142,28 +1194,43 @@ test "an `ensures` clause's frame comes from the effects its definition declares
 fn hex_len(o: Option<String>) -> Int = match o { Some(t) -> t.len(), None -> 0 }
 
 test "`prover_input_of` includes the definitions and `law`s of the modules being proved, with hashes and texts matching what review stores" {
-  let w = whole_of(
-    b"fn f(x: Int) -> Int ensures result == x = x\nfn g() -> Int = 1\nlaw \"f is g\" forall (x: Int) { f(x) == x + g() - 1 }\n",
-  );
-  let built = prover_input_of(w, |m: Bytes| m == b"m");
+  let w = claimed_session([
+    {
+      name: b"m",
+      source_text: b"fn f(x: Int) -> Int ensures result == x = x\nfn g() -> Int = 1\nlaw \"f is g\" forall (x: Int) { f(x) == x + g() - 1 }\n",
+    },
+  ]);
+  let built = claimed_input(w, |m: Bytes| m == b"m");
   assert_eq(built.definitions.map(|d: Definition| d.name), ["m.f", "m.g"]);
   assert_eq(built.definitions.map(|d: Definition| hex_len(d.hash)), [64, 64]);
   assert_eq(built.definitions.map(|d: Definition| d.specs.map(String::len)), [[64], []]);
   assert_eq(built.laws.map(|l: WrittenLaw| (l.key, l.text.len())), [("m.f is g", 64)]);
   let mentions = built.laws.get(0).mentions;
   assert(mentions.contains("m.f") && mentions.contains("m.g"));
-  let other = prover_input_of(w, |m: Bytes| m != b"m");
+  let other = claimed_input(w, |m: Bytes| m != b"m");
   assert_eq(other.definitions.filter(|d: Definition| d.name.starts_with("m.")), []);
   assert_eq(other.laws, [])
 }
 
 test "`prover_input_of` omits the claims of modules outside the proof run, but still includes their types" {
-  let built = prover_input_of(
-    whole_of(b"type Coin = | Heads | Tails\nlaw \"heads\" forall (c: Coin) { c == c || true }\n"),
+  let built = claimed_input(
+    claimed_session([
+      {
+        name: b"m",
+        source_text: b"type Coin = | Heads | Tails\nlaw \"heads\" forall (c: Coin) { c == c || true }\n",
+      },
+    ]),
     |m: Bytes| m != b"m",
   );
   assert_eq(built.world.obligations, []);
   assert_eq(declaration_named(built.world.declarations, "m.Coin").variants.len(), 2)
+}
+
+test "a claim about a function whose body calls a prelude function is keyed by the stored identities" {
+  let built = prover_input(
+    b"fn made(n: Int) -> List<Int> requires n >= 0 ensures result.len() == n = range(0, n)\n",
+  );
+  assert(owned_by(built.world.obligations, "m.made").len() > 0)
 }
 
 const coin_type_shape: Shape =
@@ -1241,8 +1308,9 @@ test "a `law`'s guard is its `where` condition, located at its position in the s
   );
   assert_eq(
     os.map(|obligation: Obligation|
-      obligation.guards.map(|g: { module: Int, start: Int, end: Int }| (g.start, g.end))),
-    [[(36, 41)]],
+      obligation.guards.map(|g: Place|
+        match g { InSource(s) -> Some((s.start, s.end)), _ -> None })),
+    [[Some((36, 41))]],
   )
 }
 
@@ -1267,9 +1335,13 @@ test "outside the module that defines an opaque type, the prover never builds va
       source_text: b"import std.vault (Token, Stamp, Coin)\ntype Held = | Held(Token, Int)\nfn kept(t: Token) -> Int ensures result != 7 = 1\nfn stamps(ss: List<Stamp>) -> Int ensures result != 7 = ss.len()\nfn wrapped(h: Held) -> Int ensures result != 7 = 1\nfn flipped(c: Coin, n: Int) -> Int ensures result != 7 = n\n",
     },
   ];
-  let built = match analyse_pulling_std_with(user, shipped, no_rows, cut_unused: false).out {
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> prover_input_of(w, every),
+  let built = match session_over(in_memory(user, shipped), |_: List<Bytes>|
+      claims_analysed([
+        { module: b"m", shipped: false, tested: true },
+        { module: b"std.vault", shipped: true, tested: false },
+      ]).outcome).value {
+    ClaimsRejected(_) -> panic("the fixture program was rejected by the checker"),
+    ClaimsAnalysed(w, identities) -> prover_input_of(w, identities, every),
   };
   let made = |owner: String|
     owned_by(built.world.obligations, owner).get(0).binders.map(|b: Binder| b.constructible);
@@ -1300,26 +1372,110 @@ test "outside the module that defines an opaque type, the prover never builds va
   ])
 }
 
-fn app_law_key(source: Bytes) -> String / {abort.raise} =
-  match analyse(
-      parse_all([
-        { name: b"base", source_text: b"pub fn f(x: Int) -> Int = x\n".concat(source) },
-        {
-          name: b"app",
-          source_text: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n",
-        },
-      ]),
-    ) {
-    Rejected(_) -> panic("the fixture program was rejected by the checker"),
-    Analysed(w) -> match prover_input_of(w, |m: Bytes| m == b"app").world.obligations.fold(
-        None,
-        |found: Option<String>, o: Obligation|
-          if o.owner == "app.uses" { Some(o.key) } else { found },
-      ) {
-      Some(k) -> k,
-      None -> panic("the fixture has no claim named `app.uses`"),
+test "a claim checked by group over another module's opaque type is never built from its fields" {
+  let sources = [
+    {
+      name: b"vault",
+      source_text: b"pub opaque type Token = | Token(Int)\n\npub fn worth(t: Token) -> Int = match t { Token(n) -> n }\n",
+    },
+    {
+      name: b"app",
+      source_text: b"import vault (Token, worth)\n\nfn kept(t: Token) -> Int ensures result != 7 = worth(t)\n",
+    },
+  ];
+  match read_over(sources, ||
+      claims_analysed([{ module: b"app", shipped: false, tested: true }])).outcome {
+    ClaimsRejected(_) -> panic("the fixture program was rejected by the checker"),
+    ClaimsAnalysed(w, identities) ->
+      assert_eq(
+        owned_by(prover_input_of(w, identities, every).world.obligations, "app.kept").map(
+          |o: Obligation| o.binders.map(|b: Binder| b.constructible),
+        ),
+        [[false]],
+      ),
+  }
+}
+
+type PlacelessObligation = {
+  key: String,
+  run_key: String,
+  owner: String,
+  kind: Kind,
+  binders: List<Binder>,
+  result: Option<Binder>,
+  variables: List<String>,
+  literals: List<Bytes>,
+  effects: Option<String>,
+  frame: Frame,
+  strategy: Strategy,
+}
+
+fn placeless(built: ProverInputResult) -> List<PlacelessObligation> =
+  built.world.obligations.map(|o: Obligation|
+    {
+      key: o.key,
+      run_key: o.run_key,
+      owner: o.owner,
+      kind: o.kind,
+      binders: o.binders,
+      result: o.result,
+      variables: o.variables,
+      literals: o.literals,
+      effects: o.effects,
+      frame: o.frame,
+      strategy: o.strategy,
+    })
+
+fn by_key(a: PlacelessObligation, b: PlacelessObligation) -> Bool =
+  match compare_values(a.key, b.key) { Greater -> false, _ -> true }
+
+test "a claim's prover input read from stored group results equals the one a whole check of the program gives" {
+  let sources = [
+    {
+      name: b"lib",
+      source_text: b"pub type Coin = | Heads | Tails\n\npub fn twice(n: Int) -> Int ensures result == n + n = n + n\n",
+    },
+    {
+      name: b"app",
+      source_text: b"import lib (Coin, twice)\n\nfn four(n: Int, c: Coin) -> Int requires n > 0 ensures result == twice(twice(n)) = twice(n) + twice(n)\n\nlaw \"twice adds\" forall (n: Int) where n > 0 { twice(n) == n + n }\n",
+    },
+  ];
+  let owned = |m: Bytes| m == b"lib" || m == b"app";
+  let whole = claimed_input(claimed_session(sources), owned);
+  match read_over(sources, ||
+      claims_analysed([
+        { module: b"app", shipped: false, tested: true },
+        { module: b"lib", shipped: false, tested: true },
+      ])).outcome {
+    ClaimsRejected(_) -> panic("the fixture program was rejected when read from stored results"),
+    ClaimsAnalysed(w, identities) -> {
+      let stored = prover_input_of(w, identities, owned);
+      assert(whole.world.obligations.len() > 0);
+      assert_eq(placeless(stored).sort_by(by_key), placeless(whole).sort_by(by_key));
+      assert_eq(stored.definitions, whole.definitions);
+      assert_eq(stored.laws, whole.laws);
+      assert_eq(stored.warnings, whole.warnings)
     },
   }
+}
+
+fn app_law_key(source: Bytes) -> String / {abort.raise} = {
+  let claimed = claimed_session([
+    { name: b"base", source_text: b"pub fn f(x: Int) -> Int = x\n".concat(source) },
+    {
+      name: b"app",
+      source_text: b"import base\nlaw \"uses\" forall (x: Int) { base::f(x) == x }\n",
+    },
+  ]);
+  match claimed_input(claimed, |m: Bytes| m == b"app").world.obligations.fold(
+      None,
+      |found: Option<String>, o: Obligation|
+        if o.owner == "app.uses" { Some(o.key) } else { found },
+    ) {
+    Some(k) -> k,
+    None -> panic("the fixture has no claim named `app.uses`"),
+  }
+}
 
 test "a claim's cache key changes when the `law`s of an imported package change, and when the definitions a `law` mentions change" {
   let none = app_law_key(b"");

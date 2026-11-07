@@ -1,4 +1,3 @@
-import std.list (zip)
 import compiler.emit.code (Code, read_name, CodeLiteral, CodeVariable, NDefinition, NConstructor,
                            NBuiltin, CodeUnary, CodeBinary, CodeApply, CodeIf, CodeBlock, CodeList,
                            CodeRecord, CodeMatch, CodePerform, CodeLabel, CodeLambda, CodeSimulate,
@@ -8,21 +7,23 @@ import compiler.emit.code (Code, read_name, CodeLiteral, CodeVariable, NDefiniti
 import compiler.syntax.parsing (Span)
 import compiler.syntax.patterns (LiteralUnit)
 import compiler.syntax.expressions (detached_closure_span, scheduler_module)
-import compiler.emit.representations (Definition, resume_result_type, no_constructors)
+import compiler.emit.representations (Definition, resume_result_type, EmitReads)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.typed_ir (Arg, AsBool, AsListView, Return, Function, Metered, falls_through,
                                operand_representation, CleanupScope, Unwinding, Fail, LetMismatch,
                                operand_variable)
-import compiler.emit.lower.module_context (ModuleContext, Root)
+import compiler.emit.lower.module_context (ModuleContext, Root, definition_at)
+import compiler.check.resolve.tables (module_of_name)
 import compiler.emit.keys (Named, root_name, root_text, module_of)
 import compiler.check.types (Type, no_effects)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, ToConstructor, ToBuiltin,
                                  ToDefinition, ToValue, ToInlinedBody, LoweredArm, GroupMember,
                                  initial_lowering, unreachable, enter_block, exit_block, joined,
                                  short_circuit, represented_as, note_slot_read, read_note,
-                                 typed_slot_read, list_of_view, type_of, with_need,
+                                 field_read_note, typed_slot_read, list_of_view, type_of, with_need,
                                  no_captured_evidence, emitted)
-import compiler.emit.lower.data (constructed, record_literal, field, record_update)
+import compiler.emit.lower.data (constructed, record_literal, field, update_started, holds_base,
+                                 update_finished)
 import compiler.emit.lower.scalars (literal, constant, operand, unary, binary, unwound)
 import compiler.emit.lower.containers (list_literal, reads_column, column_read)
 import compiler.emit.lower.matching (arm_start, match_joined, let_bound, let_else, compared_side,
@@ -46,17 +47,17 @@ import compiler.emit.evidence (evidence_type)
 import compiler.emit.output (EffectsGeneric)
 import compiler.emit.statics (folded)
 
-pub fn root_lowered(setting: ModuleContext, r: Root) -> Function / {abort.raise} = {
+pub fn root_lowered(setting: ModuleContext, r: Root) -> Function / {EmitReads} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn(context_of(setting, r, body), body)
 }
 
-pub fn root_observed(setting: ModuleContext, r: Root) -> Function / {abort.raise} = {
+pub fn root_observed(setting: ModuleContext, r: Root) -> Function / {EmitReads} = {
   let body = known_body(root_text(root_name(r.key)), r.params, r.code);
   lowered_fn({ ..context_of(setting, r, body), emits_notes: true }, body)
 }
 
-pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Function / {abort.raise} =
+pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Function / {EmitReads} =
   lowered_group(
     roots.map(|r: Root| {
       let body = known_body(root_text(root_name(r.key)), r.params, r.code);
@@ -66,29 +67,32 @@ pub fn group_lowered(setting: ModuleContext, roots: List<Root>) -> Function / {a
 
 pub type TailCall = { full: Bytes, args: List<Type> }
 
+fn calls_own_definition(s: ModuleContext, full: Bytes, arity: Int) -> Bool / {EmitReads} =
+  module_of_name(full) == s.module
+    && (match definition_at(s, full) {
+      Some(d) -> d.definition.root == Named(full) && d.definition.arity == arity,
+      None -> false,
+    })
+
 pub fn tail_calls(
-  here: List<Definition>,
+  s: ModuleContext,
   code: Code,
   accumulator: List<TailCall>,
-) -> List<TailCall> / {abort.raise} =
+) -> List<TailCall> / {EmitReads} =
   match code.node {
     CodeApply(a) -> match a.function.node {
-      NDefinition(d) -> if here.any(|h: Definition|
-          h.root == Named(d.full) && h.arity == a.args.len()) {
+      NDefinition(d) -> if calls_own_definition(s, d.full, a.args.len()) {
         accumulator.push({ full: d.full, args: d.args })
       } else { accumulator },
       _ -> accumulator,
     },
     CodeBinary(b) -> if b.operation == b"and" || b.operation == b"or" {
-      tail_calls(here, b.right_operand, accumulator)
+      tail_calls(s, b.right_operand, accumulator)
     } else { accumulator },
-    CodeIf(i) -> tail_calls(here, i.else_branch, tail_calls(here, i.then_branch, accumulator)),
-    CodeBlock(b) -> match b.tail {
-      Some(t) -> tail_calls(here, t, accumulator),
-      None -> accumulator,
-    },
+    CodeIf(i) -> tail_calls(s, i.else_branch, tail_calls(s, i.then_branch, accumulator)),
+    CodeBlock(b) -> match b.tail { Some(t) -> tail_calls(s, t, accumulator), None -> accumulator },
     CodeMatch(m) ->
-      m.arms.fold(accumulator, |a: List<TailCall>, arm: CodeArm| tail_calls(here, arm.body, a)),
+      m.arms.fold(accumulator, |a: List<TailCall>, arm: CodeArm| tail_calls(s, arm.body, a)),
     _ -> accumulator,
   }
 
@@ -99,7 +103,7 @@ fn spawn_argument_lowered(
   context: Context,
   state: Lowering,
   x: Code,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match x.node {
     CodeLambda(l) -> {
       let captured_evidence = captured_evidence_for(
@@ -147,7 +151,7 @@ fn let_with_mismatch(
   written: Code,
   pattern: CodePattern,
   at: Span,
-) -> Lowering / {abort.raise} = {
+) -> Lowering / {EmitReads} = {
   let written_arguments = match written.node {
     CodeApply(a) -> a.args.take(a.args.len() - 1),
     _ -> [],
@@ -180,7 +184,7 @@ fn within_cleanup_scope(
   state: Lowering,
   args: List<Code>,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match args.at(args.len() - 1) {
     None -> unreachable(b"a cleanup scope has no body expression"),
     Some(body) -> {
@@ -213,7 +217,7 @@ fn within_cleanup_scope(
     },
   }
 
-pub fn lowered_fn(context: Context, body: Code) -> Function / {abort.raise} = {
+pub fn lowered_fn(context: Context, body: Code) -> Function / {EmitReads} = {
   let conv = convention(context);
   let known_representations = parameter_representations(context);
   let declared = context.params.len();
@@ -240,7 +244,7 @@ pub fn lowered_fn(context: Context, body: Code) -> Function / {abort.raise} = {
   let returned = if falls_through(out.st.instructions) {
     represented_as(out, conv.result, body.span)
   } else { out };
-  folded(context.setting.constructors, {
+  folded({
     key: context.key,
     kind: Metered,
     params: params,
@@ -257,7 +261,7 @@ pub fn lowered_fn(context: Context, body: Code) -> Function / {abort.raise} = {
   })
 }
 
-pub fn lowered_group(members: List<GroupMember>) -> Function / {abort.raise} = {
+pub fn lowered_group(members: List<GroupMember>) -> Function / {EmitReads} = {
   let starts = group_body_starts(members);
   let bodies = range(0, members.len()).fold(
     { after: None, out: [] },
@@ -274,25 +278,30 @@ pub fn lowered_group(members: List<GroupMember>) -> Function / {abort.raise} = {
         },
       },
   );
-  folded(
-    match members.at(0) { Some(m) -> m.context.setting.constructors, None -> no_constructors },
-    {
-      ..tail_group_root(members, bodies.out),
-      statics: match bodies.after { Some(a) -> a.statics, None -> [] },
-    },
-  )
+  folded({
+    ..tail_group_root(members, bodies.out),
+    statics: match bodies.after { Some(a) -> a.statics, None -> [] },
+  })
 }
 
 type SlotRead = { slot: Int, at: Span, arg: Arg }
 
 type Operands = { state: Lowering, args: List<Arg>, read: List<SlotRead> }
 
+type Operand = { state: Lowering, arg: Arg, read: Option<SlotRead> }
+
+type FieldOperands = {
+  state: Lowering,
+  fields: List<{ name: Bytes, arg: Arg }>,
+  read: List<SlotRead>,
+}
+
 fn slot_read(
   context: Context,
   state: Lowering,
   x: Code,
   views: Bool,
-) -> Option<{ st: Lowering, read: SlotRead }> / {abort.raise} =
+) -> Option<{ st: Lowering, read: SlotRead }> / {EmitReads} =
   match x.node {
     CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) -> {
@@ -313,18 +322,14 @@ fn slot_taken(
   a: Arg,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let l = list_of_view({ st: state, arg: a }, at);
   if is_label_binder(name) { l } else if resume_result_type(type_of(a)) != None {
     continuation_closure(context, l.st, slot, a, at)
   } else { typed_slot_read(context, l, name, slot, ty, at) }
 }
 
-fn callee_lowered(
-  context: Context,
-  state: Lowering,
-  function: Code,
-) -> LoweredValue / {abort.raise} =
+fn callee_lowered(context: Context, state: Lowering, function: Code) -> LoweredValue / {EmitReads} =
   match function.node {
     CodeVariable(v) -> match state.env.get(v.slot) {
       Some(a) -> if resume_result_type(type_of(a)) != None {
@@ -345,25 +350,87 @@ fn list_view_slot(state: Lowering, c: Code) -> Option<{ slot: Int, arg: Arg }> =
     _ -> None,
   }
 
+fn operand_lowered(
+  context: Context,
+  state: Lowering,
+  x: Code,
+  views: Bool,
+) -> Operand / {EmitReads} =
+  match slot_read(context, state, x, views) {
+    Some(r) -> { state: r.st, arg: r.read.arg, read: Some(r.read) },
+    None -> {
+      let o = lowered(context, state, x, false);
+      { state: o.st, arg: o.arg, read: None }
+    },
+  }
+
+fn read_kept(read: List<SlotRead>, operand: Operand) -> List<SlotRead> =
+  match operand.read { Some(r) -> read.push(r), None -> read }
+
+fn operands_lowered(
+  context: Context,
+  state: Lowering,
+  codes: List<Code>,
+  views: Bool,
+) -> Operands / {EmitReads} =
+  codes.fold({ state: state, args: [], read: [] }, |accumulator: Operands, x: Code| {
+    let o = operand_lowered(context, accumulator.state, x, views);
+    { state: o.state, args: accumulator.args.push(o.arg), read: read_kept(accumulator.read, o) }
+  })
+
+fn fields_lowered(
+  context: Context,
+  state: Lowering,
+  fields: List<CodeField>,
+) -> FieldOperands / {EmitReads} =
+  fields.fold({ state: state, fields: [], read: [] }, |accumulator: FieldOperands, f: CodeField| {
+    let o = operand_lowered(context, accumulator.state, f.value, false);
+    {
+      state: o.state,
+      fields: accumulator.fields.push({ name: f.name, arg: o.arg }),
+      read: read_kept(accumulator.read, o),
+    }
+  })
+
 fn reads_noted(context: Context, state: Lowering, read: List<SlotRead>) -> Lowering =
   read.fold(state, |s: Lowering, r: SlotRead| note_slot_read(context, s, read_note, r.slot, r.at))
 
-fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredValue / {abort.raise} =
+fn variable_lowered(
+  context: Context,
+  state: Lowering,
+  v: { name: Bytes, slot: Int },
+  c: Code,
+  note: Bytes,
+) -> LoweredValue / {EmitReads} =
+  match state.env.get(v.slot) {
+    Some(a) ->
+      slot_taken(
+        context,
+        note_slot_read(context, state, note, v.slot, c.span),
+        v.name,
+        v.slot,
+        a,
+        c.ty,
+        c.span,
+      ),
+    None -> unreachable(b"a variable has no value in the environment: ".concat(v.name)),
+  }
+
+fn field_base_lowered(
+  context: Context,
+  state: Lowering,
+  base: Code,
+  name: Bytes,
+) -> LoweredValue / {EmitReads} =
+  match base.node {
+    CodeVariable(v) -> variable_lowered(context, state, v, base, field_read_note.concat(name)),
+    _ -> lowered(context, state, base, false),
+  }
+
+fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredValue / {EmitReads} =
   match c.node {
     CodeLiteral(l) -> literal(context, state, l, c.span),
-    CodeVariable(v) -> match state.env.get(v.slot) {
-      Some(a) ->
-        slot_taken(
-          context,
-          note_slot_read(context, state, read_note, v.slot, c.span),
-          v.name,
-          v.slot,
-          a,
-          c.ty,
-          c.span,
-        ),
-      None -> unreachable(b"a variable has no value in the environment: ".concat(v.name)),
-    },
+    CodeVariable(v) -> variable_lowered(context, state, v, c, read_note),
     NDefinition(_) -> global_value(context, state, c),
     NConstructor(_) -> global_value(context, state, c),
     NBuiltin(_) -> global_value(context, state, c),
@@ -584,22 +651,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       },
       Some(ToValue) -> {
         let f = callee_lowered(context, state, a.function);
-        let args = a.args.fold(
-          { state: f.st, args: [], read: [] },
-          |accumulator: Operands, x: Code|
-            match slot_read(context, accumulator.state, x, false) {
-              Some(r) ->
-                {
-                  state: r.st,
-                  args: accumulator.args.push(r.read.arg),
-                  read: accumulator.read.push(r.read),
-                },
-              None -> {
-                let o = lowered(context, accumulator.state, x, false);
-                { ..accumulator, state: o.st, args: accumulator.args.push(o.arg) }
-              },
-            },
-        );
+        let args = operands_lowered(context, f.st, a.args, false);
         let called = reads_noted(context, args.state, args.read);
         match a.function.node {
           CodeKnownLambda(k) ->
@@ -609,22 +661,7 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       },
       Some(t) -> {
         let views = match t { ToDefinition(_) -> true, _ -> false };
-        let operands = a.args.fold(
-          { state: state, args: [], read: [] },
-          |accumulator: Operands, x: Code|
-            match slot_read(context, accumulator.state, x, views) {
-              Some(r) ->
-                {
-                  state: r.st,
-                  args: accumulator.args.push(r.read.arg),
-                  read: accumulator.read.push(r.read),
-                },
-              None -> {
-                let o = lowered(context, accumulator.state, x, false);
-                { ..accumulator, state: o.st, args: accumulator.args.push(o.arg) }
-              },
-            },
-        );
+        let operands = operands_lowered(context, state, a.args, views);
         let args = { st: reads_noted(context, operands.state, operands.read), args: operands.args };
         match t {
           ToConstructor(name) -> constructed(context, args.st, name, args.args, c.ty, c.span),
@@ -636,53 +673,16 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       },
     },
     CodeList(l) -> {
-      let operands = l.items.fold(
-        { state: state, args: [], read: [] },
-        |accumulator: Operands, x: Code|
-          match slot_read(context, accumulator.state, x, false) {
-            Some(r) ->
-              {
-                state: r.st,
-                args: accumulator.args.push(r.read.arg),
-                read: accumulator.read.push(r.read),
-              },
-            None -> {
-              let o = lowered(context, accumulator.state, x, false);
-              { ..accumulator, state: o.st, args: accumulator.args.push(o.arg) }
-            },
-          },
-      );
+      let operands = operands_lowered(context, state, l.items, false);
       let items = { st: reads_noted(context, operands.state, operands.read), args: operands.args };
       list_literal(context, items.st, items.args, c.ty, c.span)
     },
     CodeRecord(r) -> {
-      let fs = r.fields.fold(
-        { state: state, args: [], read: [] },
-        |accumulator: Operands, f: CodeField|
-          match slot_read(context, accumulator.state, f.value, false) {
-            Some(r) ->
-              {
-                state: r.st,
-                args: accumulator.args.push(r.read.arg),
-                read: accumulator.read.push(r.read),
-              },
-            None -> {
-              let o = lowered(context, accumulator.state, f.value, false);
-              { ..accumulator, state: o.st, args: accumulator.args.push(o.arg) }
-            },
-          },
-      );
-      record_literal(
-        context,
-        reads_noted(context, fs.state, fs.read),
-        zip(r.fields, fs.args).map(|x: { first: CodeField, second: Arg }|
-          { name: x.first.name, arg: x.second }),
-        c.ty,
-        c.span,
-      )
+      let fs = fields_lowered(context, state, r.fields);
+      record_literal(context, reads_noted(context, fs.state, fs.read), fs.fields, c.ty, c.span)
     },
     CodeFieldRead(f) -> if !reads_column(context, f.base, f.field) {
-      field(context, lowered(context, state, f.base, false), f.field, c.span)
+      field(context, field_base_lowered(context, state, f.base, f.field), f.field, c.span)
     } else {
       let args = match f.base.node {
         CodeApply(ca) ->
@@ -698,40 +698,35 @@ fn lowered(context: Context, state: Lowering, c: Code, tail: Bool) -> LoweredVal
       column_read(context, args.st, args.args, f.base, f.field, c.span)
     },
     CodeUpdate(u) -> {
-      let base = match slot_read(context, state, u.base, false) {
-        Some(r) -> { state: r.st, args: [r.read.arg], read: [r.read] },
-        None -> {
-          let o = lowered(context, state, u.base, false);
-          { state: o.st, args: [o.arg], read: [] }
-        },
-      };
-      let operands = u.sets.fold(base, |accumulator: Operands, f: CodeField|
-        match slot_read(context, accumulator.state, f.value, false) {
-          Some(r) ->
-            {
-              state: r.st,
-              args: accumulator.args.push(r.read.arg),
-              read: accumulator.read.push(r.read),
-            },
-          None -> {
-            let o = lowered(context, accumulator.state, f.value, false);
-            { ..accumulator, state: o.st, args: accumulator.args.push(o.arg) }
-          },
-        });
-      match operands.args {
-        [b, ..set] ->
-          record_update(
+      let base = operands_lowered(context, state, [u.base], false);
+      let started = match base.args {
+        [b] ->
+          update_started(
             context,
-            reads_noted(context, operands.state, operands.read),
+            base.state,
             b,
             u.copied_fields,
-            zip(u.sets, set).map(|x: { first: CodeField, second: Arg }|
-              { name: x.first.name, arg: x.second }),
+            u.sets.map(|f: CodeField| f.name),
             c.ty,
             c.span,
           ),
-        [] -> unreachable(b"a record update has no base record"),
-      }
+        _ -> unreachable(b"a record update has no base record"),
+      };
+      let held = holds_base(started.plan);
+      let sets = fields_lowered(
+        context,
+        if held { started.st } else { reads_noted(context, started.st, base.read) },
+        u.sets,
+      );
+      update_finished(
+        context,
+        reads_noted(context, sets.state, if held { base.read.concat(sets.read) }
+        else { sets.read }),
+        started.plan,
+        sets.fields,
+        c.ty,
+        c.span,
+      )
     },
     CodeMatch(m) -> {
       let s = match list_view_slot(state, m.scrutinee) {

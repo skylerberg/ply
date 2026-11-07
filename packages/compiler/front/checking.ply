@@ -1,54 +1,64 @@
+import compiler.emit.representations (EmitReads, failing_on_lowering)
+import std.set (Set)
 import std.bin
 import std.hash (blake3)
 import std.bytes
 import std.list
 import std.fs
 import std.fs (fs)
-import compiler.store.memo
-import compiler.store.memo (memo, memo_store, MemoryStore, Record, Run, query_output,
-                            empty_memory_store, with_memory_store, executed_count, executed_for,
-                            start_run)
-import compiler.store.memo_files
+import compiler.store.memo (memo, main_only, main_part)
+import compiler.store.handles (fetch, fetch_all)
+import compiler.store.database
+import compiler.store.database (WriteLimit, Finished, Stopped, Stored, NotKept)
+import compiler.store.memo.store (interfaces)
+import compiler.store.memo.engine (Run, QueryStats, reading, in_session, query_stats)
 import compiler.store.packs
-import compiler.unit (definition_hash)
+import compiler.unit (definition_hashes)
 import compiler.front.owner_checks
-import compiler.check.types (tables_joined)
 import compiler.front.emitter_input (AnalysisOutcome, Analysed, Rejected)
 import compiler.front.rows (Rows, Outline)
-import compiler.front (Published, published, ShippedWants, shipped_wants_bin)
-import compiler.front.published (no_rows, decode_rows, analyse, analyse_with,
-                                 reserved_prefix_diagnostics)
+import compiler.front (Published, published, ShippedWants, shipped_wants_bin, locked_packages)
+import compiler.front.published (decode_rows, reserved_prefix_diagnostics)
 import compiler.front.facts (ModuleFacts, Frame, TableReads, CheckedProgram, no_module_tables,
-                             pulled_next, checked_program_over)
-import compiler.front.diagnostics (parse_all, diagnostic_in_module, with_prelude_source)
+                             pulled_next, checked_program_over, ToolchainTree, NoTree)
+import compiler.front.diagnostics (diagnostic_in_module, with_prelude_source)
 import compiler.expand.embed (ModuleEmbed, EmbedBytes, EmbedBytesResult, EmbedRequest, embed_file,
-                              request_of_key)
-import compiler.front.pkg (PackageSources, read_packages, validated_packages_bin, without_locations)
-import compiler.check.resolve.tables (Source, Diagnostic, Label, backticked, error_at)
-import compiler.syntax.parsing (Span, ParseDiagnostic, dummy_span)
-import compiler.store.hash.forms (CachedNode, CachedHashes, ModuleHashes, no_cached_hashes,
-                                  joined_cached_hashes)
+                              embed_snapshot, request_of_key, snapshot_embed, with_embed_snapshot)
+import compiler.front.pkg (PackageSources, SuppliedPackage, LockedPackage, read_packages,
+                           validated_packages_bin, without_locations)
+import compiler.check.resolve.tables (placed_in, place_module)
+import compiler.check.resolve.tables (Source, Diagnostic, Edit, Label, backticked, error_at,
+                                      fix_edits, offered_fixes)
+import compiler.syntax.parsing (Span, ParseDiagnostic, generated_span)
+import compiler.store.hash.forms (DefinitionHash, OwnHashes, ModuleHashes, joined_module_hashes,
+                                  definition_key, Identified, DefinitionRun, DefinitionProof)
+import compiler.front.checking.identity (identity_queries, identity_of)
 import compiler.front.pages (Pages, pages_bin)
+import compiler.store.hash.encoding (hex)
 import compiler.front.checking.world (PackageLocation, ModuleKey, Embedding, ModuleResult,
                                       package_location_bin, module_key_bin, embedding_bin,
-                                      module_result_bin, layout_kind, module_kind, text_kind,
-                                      shipped_kind, shipped_exists_kind, data_kind,
-                                      embedded_file_kind, derived_kind, shipped_names_kind,
-                                      QueryEffects, RunEffects, CheckQuery, with_decode_cache,
-                                      decoded, prefix_in, module_query, imports_query, ImportOf,
-                                      imports_of_bin, absent, hash_result_bin, context_query,
-                                      owner_interfaces_query)
-import compiler.front.checking.groups (group_key_bin, owners_result_bin, group_hashes_bin,
-                                       owners_query, owner_query, calls_query, cycles_query,
-                                       shape_query, signature_unit_query, setting_query,
-                                       group_imports_query, visible_modules_query,
-                                       wanted_files_query, group_query, owner_interface_query,
-                                       shown_query, signatures_query, signature_query,
-                                       group_interface_query, typed_query, group_hash_query,
-                                       names_query, whole_query, header_text_query, header_query,
-                                       exported_query, hashes_query, documented_query,
-                                       declaring_query, declaring_bin, queries, tables_of_result,
-                                       value_call_modules_query, declared_query, owner_hash_query)
+                                      layout_kind, module_kind, text_kind, shipped_kind,
+                                      shipped_exists_kind, data_kind, embedded_file_kind,
+                                      shipped_names_kind, own_modules_kind, QueryEffects,
+                                      RunEffects, SessionReads, CheckQuery, CheckQueries,
+                                      check_queries, with_decode_cache, decoded, prefix_in,
+                                      imports_query, ImportOf, imports_of_bin, absent,
+                                      shipped_names_listed, CheckDefinition)
+import compiler.front.checking.promises (promise_queries, program_analysed, claims_analysed,
+                                         ClaimsOutcome, ClaimsRejected, ClaimsAnalysed)
+import compiler.front.checking.groups (module_rejected, listed_result, owners_result_bin,
+                                       owners_query, group_imports_query, visible_modules_query,
+                                       wanted_files_query, group_hash_query, owner_imports_query,
+                                       signature_imports_query, module_record_query,
+                                       documented_query, declaring_query, queries, tables_of_result,
+                                       module_listing_query, module_listing_bin, checked_module,
+                                       module_own_hashes, imports_of_module)
+
+import compiler.front.checking.units (code_queries, with_code_reads)
+import compiler.front.checking.interfaces (interface_queries, published_module)
+import compiler.front.checking.program_facts (program_queries)
+import compiler.front.interface (module_interface_of)
+import compiler.store.hash (Contract, public_contracts)
 
 pub type PackageFile = { module: Bytes, text: Bytes }
 
@@ -152,7 +162,6 @@ pub fn lookup_input<| e>(
   data: (Bytes) -> Option<Bytes> / {abort.raise | e},
   names: () -> List<Bytes> / {abort.raise | e},
   reader: (Int, Bytes, EmbedRequest) -> EmbedBytesResult / {abort.raise | e},
-  derived: (Bytes) -> Option<Bytes> / {abort.raise | e},
   kind: Bytes,
   at: Bytes,
 ) -> Option<Bytes> / {abort.raise | e} =
@@ -164,20 +173,41 @@ pub fn lookup_input<| e>(
   else if kind == shipped_exists_kind { match shipped(at) { Some(_) -> Some(b""), None -> None } }
   else if kind == data_kind { data(at) }
   else if kind == embedded_file_kind { embedded_at(w, reader, at) }
-  else if kind == derived_kind { derived(at) }
+  else if kind == own_modules_kind { Some(bin::encode(w.own, bin::list_bin(bin::bytes_bin()))) }
   else { None }
 
 pub fn evaluator_of(stamps: Bytes) -> Bytes / {abort.raise} =
   stamps.split(b"\n").fold(b"", |accumulator: Bytes, line: Bytes|
     if line.starts_with(b"evaluator ") { line.slice(10, line.len()) } else { accumulator })
 
-pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, CheckQuery> / {abort.raise} =
-  queries().fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CheckQuery>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
+pub fn every_query() -> List<CheckDefinition> =
+  queries().concat(promise_queries()).concat(code_queries()).concat(interface_queries()).concat(
+    program_queries(),
+  ).concat(
+    identity_queries(),
+  )
+
+pub const placeholder_definitions: Bytes =
+  Bytes::concat_all(
+    every_query().map(|q: CheckDefinition|
+      Bytes::concat_all([q.definition, b" ", hex(blake3(q.definition)), b"\n"])),
+  )
+
+pub fn registry(
+  definitions: Bytes,
+  evaluator: Bytes,
+  more: List<CheckDefinition> = [],
+) -> CheckQueries / {abort.raise} = {
+  let all = every_query().concat(more);
+  let hashes = definition_hashes(
+    definitions,
+    Set::of_list(all.map(|q: CheckDefinition| q.definition)),
+  );
+  check_queries(
+    all.fold(Map::new(), |accumulator: Map<Bytes, CheckQuery>, q: CheckDefinition|
       accumulator.insert(q.name, {
         name: q.name,
-        hash: match definition_hash(definitions, q.definition) {
+        hash: match hashes.get(q.definition) {
           Some(h) -> blake3(Bytes::concat_all([h, b"\x00", evaluator])),
           None ->
             panic(
@@ -186,21 +216,26 @@ pub fn registry(definitions: Bytes, evaluator: Bytes) -> Map<Bytes, CheckQuery> 
         },
         body: q.body,
         persistent: !digest_only_queries.contains(q.name),
-        summarized: List::contains(summarized_queries, q.name),
-      }),
+        product: q.product,
+        interface: q.interface,
+      })),
   )
+}
 
-pub fn fresh_registry() -> Map<Bytes, CheckQuery> =
-  queries().fold(
-    Map::new(),
-    |accumulator: Map<Bytes, CheckQuery>, q: { name: Bytes, definition: Bytes, body: (Bytes) -> Bytes / {QueryEffects, abort.raise} }|
-      accumulator.insert(q.name, {
-        name: q.name,
-        hash: q.name,
-        body: q.body,
-        persistent: true,
-        summarized: List::contains(summarized_queries, q.name),
-      }),
+pub fn fresh_registry(more: List<CheckDefinition> = []) -> CheckQueries =
+  check_queries(
+    every_query().concat(more).fold(
+      Map::new(),
+      |accumulator: Map<Bytes, CheckQuery>, q: CheckDefinition|
+        accumulator.insert(q.name, {
+          name: q.name,
+          hash: q.name,
+          body: q.body,
+          persistent: true,
+          product: q.product,
+          interface: q.interface,
+        }),
+    ),
   )
 
 pub type CheckedModule = { module: Bytes, result: ModuleResult }
@@ -224,59 +259,35 @@ pub fn checked_program_from_results(
 
 pub type LoadResults = { results: List<CheckedModule>, pulled: List<Bytes> }
 
+pub fn listed_module(named: ModuleKey) -> CheckedModule / {memo.read, abort.raise} =
+  if module_rejected(named) { module_of(named) }
+  else { { module: named.module, result: listed_result(named) } }
+
+pub fn module_of(named: ModuleKey) -> CheckedModule / {memo.read, abort.raise} =
+  { module: named.module, result: checked_module(named) }
+
 pub fn query_load(
-  qs: Map<Bytes, CheckQuery>,
   own: List<Bytes>,
   required_modules: List<Bytes>,
   tested: Bool,
-  run: Run,
-) -> { run: Run, value: LoadResults } / {RunEffects, abort.raise} = {
-  let cycles = cycles_among(qs, run, own);
-  if cycles.rejected.len() > 0 {
-    { run: cycles.run, value: { results: cycles.rejected, pulled: [] } }
-  } else {
-    let ask = |r: Run, named: ModuleKey| {
-      let a = query_output(qs, r, module_query, bin::encode(named, module_key_bin()));
-      {
-        run: a.run,
-        returned: {
-          module: named.module,
-          result: decoded(a.output, module_result_bin(), "a module's result"),
-        },
-      }
-    };
+  read: (ModuleKey) -> CheckedModule / {memo.read, abort.raise},
+) -> LoadResults / {memo.read, abort.raise} = {
+  let cycles = cycles_among(own);
+  if cycles.len() > 0 { { results: cycles, pulled: [] } } else {
     let ordered = dependencies_first(
-      qs,
-      cycles.run,
       own.map(|n: Bytes| { module: n, shipped: false, tested: false }),
     );
     let asked_own = ordered.order.fold(
-      { run: ordered.run, returned: Map::new(), written: Map::new(), stopped: Map::new() },
-      |accumulator: { run: Run, returned: Map<Bytes, CheckedModule>, written: Map<Bytes, List<Bytes>>, stopped: Map<Bytes, Bool> }, n: ModuleKey| {
-        let imports = match ordered.edges.get(n.module) { Some(ms) -> ms, None -> [] };
-        if imports.fold(false, |b: Bool, m: Bytes| b || accumulator.stopped.contains(m)) {
-          {
-            ..accumulator,
-            returned: accumulator.returned.insert(n.module, {
-              module: n.module,
-              result: { ..absent(n.module), imports: imports },
-            }),
-            stopped: accumulator.stopped.insert(n.module, true),
-          }
-        } else {
-          let a = ask(accumulator.run, n);
-          {
-            run: a.run,
-            returned: accumulator.returned.insert(n.module, a.returned),
-            written: accumulator.written.insert(n.module, a.returned.result.shape.written),
-            stopped: if a.returned.result.rejected.len() == 0 { accumulator.stopped }
-            else { accumulator.stopped.insert(n.module, true) },
-          }
+      { returned: Map::new(), written: Map::new() },
+      |accumulator: { returned: Map<Bytes, CheckedModule>, written: Map<Bytes, List<Bytes>> }, n: ModuleKey| {
+        let a = read(n);
+        {
+          returned: accumulator.returned.insert(n.module, a),
+          written: accumulator.written.insert(n.module, a.result.shape.written),
         }
       },
     );
     let first = {
-      run: asked_own.run,
       results: own.map(|n: Bytes|
         match asked_own.returned.get(n) {
           Some(a) -> a,
@@ -284,24 +295,23 @@ pub fn query_load(
         }),
       written: asked_own.written,
     };
-    let listed = shipped_listed().fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: Bytes|
-      accumulator.insert(n, true));
+    let listed = shipped_names_listed().fold(Set::empty(), |accumulator: Set<Bytes>, n: Bytes|
+      accumulator.insert(n));
     let pulled = iterate(
-      { run: first.run, results: first.results, written: first.written, read: own, pulled: [] },
-      listed.len() + 2,
-      |x: { run: Run, results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }| {
+      { results: first.results, written: first.written, read: own, pulled: [] },
+      listed.size() + 2,
+      |x: { results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }| {
         let fresh = pulled_next(x.read, x.written, listed, required_modules);
         if fresh.len() == 0 { Stop(x) } else {
           Continue(
             fresh.fold(
               { ..x, read: x.read.concat(fresh), pulled: x.pulled.concat(fresh) },
-              |accumulator: { run: Run, results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }, n: Bytes| {
-                let a = ask(accumulator.run, { module: n, shipped: true, tested: tested });
+              |accumulator: { results: List<CheckedModule>, written: Map<Bytes, List<Bytes>>, read: List<Bytes>, pulled: List<Bytes> }, n: Bytes| {
+                let a = read({ module: n, shipped: true, tested: tested });
                 {
                   ..accumulator,
-                  run: a.run,
-                  results: accumulator.results.push(a.returned),
-                  written: accumulator.written.insert(n, a.returned.result.shape.written),
+                  results: accumulator.results.push(a),
+                  written: accumulator.written.insert(n, a.result.shape.written),
                 }
               },
             ),
@@ -309,206 +319,94 @@ pub fn query_load(
         }
       },
     );
-    { run: pulled.run, value: { results: pulled.results, pulled: pulled.pulled } }
+    { results: pulled.results, pulled: pulled.pulled }
   }
 }
-
-fn shipped_listed() -> List<Bytes> / {memo_store.read, abort.raise} =
-  match memo_store.external(shipped_names_kind, b"") {
-    Some(b) -> decoded(b, bin::list_bin(bin::bytes_bin()), "the shipped modules' names"),
-    None -> [],
-  }
-
-pub const shipped_queries: List<Bytes> =
-  [
-    owners_query,
-    whole_query,
-    signatures_query,
-    typed_query,
-    calls_query,
-    cycles_query,
-    group_query,
-    group_hash_query,
-    module_query,
-    header_query,
-    header_text_query,
-    hashes_query,
-    wanted_files_query,
-    documented_query,
-    declaring_query,
-  ]
 
 pub const digest_only_queries: List<Bytes> =
   [
-    owner_query,
-    shape_query,
-    signature_unit_query,
-    context_query,
-    setting_query,
-    visible_modules_query,
-    group_imports_query,
-    names_query,
-    signature_query,
-    group_interface_query,
-    owner_interface_query,
-    shown_query,
-    exported_query,
-  ]
-
-pub const summarized_queries: List<Bytes> =
-  [
-    owners_query,
-    context_query,
-    setting_query,
-    whole_query,
-    visible_modules_query,
-    names_query,
-    module_query,
-    imports_query,
-    header_text_query,
-    header_query,
-    hashes_query,
-    documented_query,
-    declaring_query,
-    value_call_modules_query,
-    declared_query,
-    owner_interfaces_query,
-    exported_query,
-    owner_hash_query,
+    visible_modules_query().name,
+    group_imports_query().name,
+    owner_imports_query().name,
+    signature_imports_query().name,
   ]
 
 pub fn check_shipped_modules(
-  qs: Map<Bytes, CheckQuery>,
   shipped: List<Bytes>,
-  run: Run,
-) -> { run: Run, rejected: List<CheckedModule> } / {RunEffects, abort.raise} = {
-  let ordered = dependencies_first(
-    qs,
-    run,
+) -> List<CheckedModule> / {memo.read, abort.raise} = {
+  let rejected = dependency_levels(
     shipped.map(|m: Bytes| { module: m, shipped: true, tested: false }),
-  );
-  let checked = ordered.order.fold(
-    { run: ordered.run, rejected: [] },
-    |accumulator: { run: Run, rejected: List<CheckedModule> }, named: ModuleKey| {
-      let at = bin::encode(named, module_key_bin());
-      let m = query_output(qs, accumulator.run, module_query, at);
-      let a = decoded(m.output, module_result_bin(), "a module's result");
-      {
-        run: [hashes_query, wanted_files_query].fold(m.run, |r: Run, query: Bytes|
-          query_output(qs, r, query, at).run),
-        rejected: if a.rejected.len() == 0 { accumulator.rejected }
-        else { accumulator.rejected.push({ module: named.module, result: a }) },
-      }
-    },
-  );
-  { run: declaring_in(qs, b"std", checked.run).run, rejected: checked.rejected }
+  ).levels.fold([], |accumulator: List<CheckedModule>, level: List<ModuleKey>| {
+    fetch_all(module_record_query(), level);
+    fetch_all(wanted_files_query(), level);
+    fetch_all(module_listing_query(), level);
+    level.fold(accumulator, |found: List<CheckedModule>, named: ModuleKey|
+      if module_rejected(named) { found.push(module_of(named)) } else { found })
+  });
+  declaring_in(b"std");
+  rejected
 }
 
 pub fn wanted_all(
-  qs: Map<Bytes, CheckQuery>,
   pulled: List<Bytes>,
   tested: Bool,
-  run: Run,
-) -> { run: Run, value: Map<Bytes, ShippedWants> } / {RunEffects, abort.raise} =
-  pulled.fold(
-    { run: run, value: Map::new() },
-    |accumulator: { run: Run, value: Map<Bytes, ShippedWants> }, m: Bytes| {
-      let a = query_output(
-        qs,
-        accumulator.run,
-        wanted_files_query,
-        bin::encode({ module: m, shipped: true, tested: tested }, module_key_bin()),
-      );
-      {
-        run: a.run,
-        value: accumulator.value.insert(
-          m,
-          decoded(a.output, shipped_wants_bin(), "a module's wants"),
-        ),
-      }
-    },
-  )
+) -> Map<Bytes, ShippedWants> / {memo.read, abort.raise} =
+  pulled.fold(Map::new(), |accumulator: Map<Bytes, ShippedWants>, m: Bytes|
+    accumulator.insert(
+      m,
+      fetch(wanted_files_query(), { module: m, shipped: true, tested: tested }),
+    ))
 
-pub fn documented_all(
-  qs: Map<Bytes, CheckQuery>,
-  modules: List<ModuleKey>,
-  run: Run,
-) -> { run: Run, value: List<Pages> } / {RunEffects, abort.raise} =
-  modules.fold(
-    { run: run, value: [] },
-    |accumulator: { run: Run, value: List<Pages> }, named: ModuleKey| {
-      let a = query_output(
-        qs,
-        accumulator.run,
-        documented_query,
-        bin::encode(named, module_key_bin()),
-      );
-      {
-        run: a.run,
-        value: accumulator.value.push(decoded(a.output, pages_bin(), "a module's pages")),
-      }
-    },
-  )
+pub fn documented_all(modules: List<ModuleKey>) -> List<Pages> / {memo.read, abort.raise} =
+  modules.map(|named: ModuleKey| fetch(documented_query(), named))
 
-pub fn declaring_in(
-  qs: Map<Bytes, CheckQuery>,
-  package: Bytes,
-  run: Run,
-) -> { run: Run, value: Map<Bytes, List<Bytes>> } / {RunEffects, abort.raise} = {
-  let a = query_output(qs, run, declaring_query, package);
-  { run: a.run, value: decoded(a.output, declaring_bin(), "the modules that declare each name") }
-}
+pub fn declaring_in(package: Bytes) -> Map<Bytes, List<Bytes>> / {memo.read, abort.raise} =
+  fetch(declaring_query(), package)
 
 fn dependencies_first(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
   modules: List<ModuleKey>,
-) -> { run: Run, order: List<ModuleKey>, edges: Map<Bytes, List<Bytes>> } / {RunEffects, abort.raise} = {
-  let read = modules.fold(
-    { run: run, edges: Map::new() },
-    |accumulator: { run: Run, edges: Map<Bytes, List<Bytes>> }, n: ModuleKey| {
-      let a = query_output(qs, accumulator.run, imports_query, bin::encode(n, module_key_bin()));
-      {
-        run: a.run,
-        edges: accumulator.edges.insert(
-          n.module,
-          decoded(a.output, imports_of_bin(), "a module's imports").imports.map(|i: ImportOf|
-            i.named.module),
-        ),
-      }
-    },
-  );
-  let among = modules.fold(Map::new(), |accumulator: Map<Bytes, Bool>, n: ModuleKey|
-    accumulator.insert(n.module, true));
-  let order = iterate(
-    { placed: Map::new(), left: modules, out: [] },
+) -> { order: List<ModuleKey>, edges: Map<Bytes, List<Bytes>> } / {memo.read, abort.raise} = {
+  let levelled = dependency_levels(modules);
+  { order: levelled.levels.flat_map(|level: List<ModuleKey>| level), edges: levelled.edges }
+}
+
+fn dependency_levels(
+  modules: List<ModuleKey>,
+) -> { levels: List<List<ModuleKey>>, edges: Map<Bytes, List<Bytes>> } / {memo.read, abort.raise} = {
+  let edges = modules.fold(Map::new(), |accumulator: Map<Bytes, List<Bytes>>, n: ModuleKey|
+    accumulator.insert(n.module, imports_of_module(n).map(|i: ImportOf| i.named.module)));
+  let among = modules.fold(Set::empty(), |accumulator: Set<Bytes>, n: ModuleKey|
+    accumulator.insert(n.module));
+  let levels = iterate(
+    { placed: Set::empty(), left: modules, out: [] },
     modules.len() + 2,
-    |x: { placed: Map<Bytes, Bool>, left: List<ModuleKey>, out: List<ModuleKey> }| {
+    |x: { placed: Set<Bytes>, left: List<ModuleKey>, out: List<List<ModuleKey>> }| {
       let ready = x.left.filter(|n: ModuleKey|
         List::fold(
-          match read.edges.get(n.module) { Some(es) -> es, None -> [] },
+          match edges.get(n.module) { Some(es) -> es, None -> [] },
           true,
           |b: Bool, m: Bytes| b && (m == n.module || !among.contains(m) || x.placed.contains(m)),
         ));
-      if ready.len() == 0 { Stop(x.out.concat(x.left)) } else {
-        let placed = ready.fold(x.placed, |accumulator: Map<Bytes, Bool>, n: ModuleKey|
-          accumulator.insert(n.module, true));
+      if ready.len() == 0 { Stop(if x.left.len() == 0 { x.out } else { x.out.push(x.left) }) }
+      else {
+        let placed = ready.fold(x.placed, |accumulator: Set<Bytes>, n: ModuleKey|
+          accumulator.insert(n.module));
         let left = x.left.filter(|n: ModuleKey| !placed.contains(n.module));
-        if left.len() == 0 { Stop(x.out.concat(ready)) }
-        else { Continue({ placed: placed, left: left, out: x.out.concat(ready) }) }
+        if left.len() == 0 { Stop(x.out.push(ready)) }
+        else { Continue({ placed: placed, left: left, out: x.out.push(ready) }) }
       }
     },
   );
-  { run: read.run, order: order, edges: read.edges }
+  { levels: levels, edges: edges }
 }
 
 pub fn packages_rejected(
   packages: PackageSources,
   root_modules: List<Bytes>,
   modules: Int,
-  listed: List<Bytes>,
+  tree: ToolchainTree,
 ) -> List<Diagnostic> / {abort.raise} =
-  reserved_prefix_diagnostics(root_modules, listed).map(
+  reserved_prefix_diagnostics(root_modules, tree).map(
     |sd: { slot: Int, diagnostic: ParseDiagnostic }|
       diagnostic_in_module(0 - sd.slot - 1, sd.diagnostic),
   ).concat(
@@ -519,48 +417,26 @@ pub fn packages_rejected(
   )
 
 pub fn hashed_all(
-  qs: Map<Bytes, CheckQuery>,
   own: List<Bytes>,
   shipped: List<Bytes>,
   tested: Bool,
-  run: Run,
-) -> { run: Run, value: List<ModuleHashes> } / {RunEffects, abort.raise} =
+) -> List<ModuleHashes> / {memo.read, abort.raise} =
   own.map(|n: Bytes| { module: n, shipped: false, tested: false }).concat(
     shipped.map(|n: Bytes| { module: n, shipped: true, tested: tested }),
-  ).fold(
-    { run: run, value: [] },
-    |accumulator: { run: Run, value: List<ModuleHashes> }, named: ModuleKey| {
-      let a = query_output(qs, accumulator.run, hashes_query, bin::encode(named, module_key_bin()));
-      let h = decoded(a.output, hash_result_bin(), "a module's hashing");
-      { run: a.run, value: accumulator.value.push({ record: h.record, cached: h.fixing }) }
-    },
+  ).map(
+    module_hashes,
   )
 
-pub fn cycles_among(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  own: List<Bytes>,
-) -> { run: Run, rejected: List<CheckedModule> } / {RunEffects, abort.raise} = {
-  let read = own.fold(
-    { run: run, edges: Map::new() },
-    |accumulator: { run: Run, edges: Map<Bytes, List<ImportOf>> }, m: Bytes| {
-      let a = query_output(
-        qs,
-        accumulator.run,
-        imports_query,
-        bin::encode({ module: m, shipped: false, tested: false }, module_key_bin()),
-      );
-      {
-        run: a.run,
-        edges: accumulator.edges.insert(
-          m,
-          decoded(a.output, imports_of_bin(), "a module's imports").imports.filter(|i: ImportOf|
-            !i.named.shipped),
-        ),
-      }
-    },
-  );
-  let edges = read.edges;
+pub fn module_hashes(named: ModuleKey) -> ModuleHashes / {memo.read, abort.raise} =
+  { record: fetch(module_record_query(), named), own: module_own_hashes(named) }
+
+pub fn cycles_among(own: List<Bytes>) -> List<CheckedModule> / {memo.read, abort.raise} = {
+  let edges = own.fold(Map::new(), |accumulator: Map<Bytes, List<ImportOf>>, m: Bytes|
+    accumulator.insert(
+      m,
+      imports_of_module({ module: m, shipped: false, tested: false }).filter(|i: ImportOf|
+        !i.named.shipped),
+    ));
   let next = |m: Bytes|
     List::map(match edges.get(m) { Some(es) -> es, None -> [] }, |i: ImportOf| i.named.module);
   let paths = |from: Bytes|
@@ -585,10 +461,9 @@ pub fn cycles_among(
           )
         },
     );
-  let rejected = own.sort_by(|a: Bytes, b: Bytes|
-    match compare_values(a, b) { Greater -> false, _ -> true }).fold(
-    { done: Map::new(), out: [] },
-    |accumulator: { done: Map<Bytes, Bool>, out: List<CheckedModule> }, m: Bytes|
+  own.sort_by(|a: Bytes, b: Bytes| match compare_values(a, b) { Greater -> false, _ -> true }).fold(
+    { done: Set::empty(), out: [] },
+    |accumulator: { done: Set<Bytes>, out: List<CheckedModule> }, m: Bytes|
       if accumulator.done.contains(m) { accumulator } else {
         match paths(m).get(m) {
           None -> accumulator,
@@ -596,7 +471,7 @@ pub fn cycles_among(
             let closing = path.get(path.len() - 1);
             let span = List::fold(
               match edges.get(closing) { Some(es) -> es, None -> [] },
-              dummy_span,
+              generated_span,
               |s: Span, i: ImportOf| if i.named.module == m { i.span } else { s },
             );
             let diagnostic = if path.len() == 1 {
@@ -628,7 +503,7 @@ pub fn cycles_among(
               )
             };
             {
-              done: path.fold(accumulator.done, |d: Map<Bytes, Bool>, p: Bytes| d.insert(p, true)),
+              done: path.fold(accumulator.done, |d: Set<Bytes>, p: Bytes| d.insert(p)),
               out: accumulator.out.push({
                 module: closing,
                 result: { ..absent(closing), rejected: [diagnostic] },
@@ -637,45 +512,19 @@ pub fn cycles_among(
           },
         }
       },
-  ).out;
-  { run: read.run, rejected: rejected }
+  ).out
 }
-
-pub fn entry_hash(
-  qs: Map<Bytes, CheckQuery>,
-  run: Run,
-  module: Bytes,
-  name: Bytes,
-) -> { run: Run, hash: Option<Bytes> } / {RunEffects, abort.raise} =
-  if module.len() == 0 { { run: run, hash: None } } else {
-    let a = query_output(
-      qs,
-      run,
-      hashes_query,
-      bin::encode({ module: module, shipped: false, tested: false }, module_key_bin()),
-    );
-    let hashed = decoded(a.output, hash_result_bin(), "a module's hashing");
-    {
-      run: a.run,
-      hash: hashed.fixing.nodes.fold(None, |accumulator: Option<Bytes>, f: CachedNode|
-        if !f.declaration && f.name == name { Some(f.hash) } else { accumulator }),
-    }
-  }
 
 pub fn root_warnings(results: List<CheckedModule>, root: Int) -> List<Diagnostic> =
   range(0, root).fold([], |accumulator: List<Diagnostic>, i: Int|
     match results.at(i) {
       None -> accumulator,
-      Some(a) ->
-        accumulator.concat(
-          a.result.warnings.map(|d: Diagnostic|
-            { ..d, labels: d.labels.map(|l: Label| { ..l, module: i }) }),
-        ),
+      Some(a) -> accumulator.concat(a.result.warnings.map(|d: Diagnostic| placed_in(d, i))),
     })
 
 pub fn rejected_first(results: List<CheckedModule>) -> List<CheckedModule> = {
-  let rejected = results.fold(Map::new(), |accumulator: Map<Bytes, Bool>, a: CheckedModule|
-    if a.result.rejected.len() > 0 { accumulator.insert(a.module, true) } else { accumulator });
+  let rejected = results.fold(Set::empty(), |accumulator: Set<Bytes>, a: CheckedModule|
+    if a.result.rejected.len() > 0 { accumulator.insert(a.module) } else { accumulator });
   results.filter(|a: CheckedModule|
     a.result.rejected.len() > 0
       && !a.result.imports.fold(false, |b: Bool, m: Bytes| b || rejected.contains(m)))
@@ -697,62 +546,165 @@ pub fn outcome_summary(outcome: AnalysisOutcome) -> OutcomeSummary / {abort.rais
 pub fn reject_embed(package: Int, module: Bytes, want: EmbedRequest) -> EmbedBytesResult =
   Err(b"no file is there")
 
-pub fn nothing_derived(ask: Bytes) -> Option<Bytes> / {abort.raise} = None
-
 pub fn over_decoding<a | e>(
-  store: MemoryStore,
-  read: (String, Int, Int) -> Option<Bytes> / {abort.raise | e},
-  world: Bytes,
+  store: fs::MemFs,
+  read: (packs::PackPart) -> Option<Bytes> / {abort.raise | e},
   look: (Bytes, Bytes) -> Option<Bytes> / {abort.raise | e},
   work: () -> a / {RunEffects, abort.raise},
-) -> { store: MemoryStore, value: a } / {abort.raise | e} =
-  with_memory_store(store, read, world, look, || with_decode_cache(work))
+) -> { store: fs::MemFs, value: a } / {abort.raise | e} = {
+  let done = database::with_store_in_memory(store, read, look, || with_decode_cache(work));
+  { store: done.tree, value: done.value }
+}
 
 pub fn queried_over(
-  store: MemoryStore,
+  store: fs::MemFs,
   sources: List<Source>,
-) -> { store: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} =
-  queried_under(fresh_registry(), store, sources)
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} =
+  queried_results(fresh_registry(), store, sources)
 
 pub fn queried_results(
-  qs: Map<Bytes, CheckQuery>,
-  store: MemoryStore,
+  qs: CheckQueries,
+  store: fs::MemFs,
   sources: List<Source>,
-) -> { store: MemoryStore, run: Run, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
+) -> { store: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes, results: List<CheckedModule> } / {abort.raise} = {
   let w = inputs_alone(sources);
   let done = over_decoding(
     store,
     prelude_frames,
-    prelude_files,
     |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
-    || query_alone(qs, w),
+    || query_outcome(qs, w),
   );
-  { store: done.store, run: done.value.run, fixing: done.value.fixing, results: done.value.results }
-}
-
-pub fn queried_under(
-  qs: Map<Bytes, CheckQuery>,
-  store: MemoryStore,
-  sources: List<Source>,
-) -> { store: MemoryStore, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes, results: List<CheckedModule> } / {abort.raise} = {
-  let done = queried_results(qs, store, sources);
   {
     store: done.store,
-    run: done.run,
-    fixing: done.fixing,
-    results: done.results,
-    outcome: outcome_of(sources, done.results),
+    run: done.value.run,
+    outcome: done.value.outcome,
+    own_hashes: done.value.own_hashes,
+    results: done.value.results,
   }
 }
 
-pub const prelude_files: Bytes = b"the shipped files"
+pub const prelude_pack: packs::PackFiles = shipped_pack([])
 
-const prelude_pack: Option<packs::PackFiles> = pack_of(shipped_store([]))
+pub fn prelude_frames(part: packs::PackPart) -> Option<Bytes> =
+  packs::frame_in(Some(prelude_pack), part)
 
-pub fn prelude_frames(path: String, offset: Int, len: Int) -> Option<Bytes> / {abort.raise} =
-  packs::frame_in(prelude_pack, path, offset, len)
+pub type FileAt = { module: Bytes, path: Bytes, bytes: Bytes }
 
-fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
+pub type InMemory = {
+  store: fs::MemFs,
+  sources: List<Source>,
+  shipped: List<Source>,
+  files: List<FileAt>,
+  packages: PackageSources,
+}
+
+pub fn in_memory(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+  packages: PackageSources = { root: b"", manifest: None, supplied: [] },
+) -> InMemory =
+  { store: fs::mem_empty(), sources: sources, shipped: shipped, files: files, packages: packages }
+
+fn package_files(sources: List<Source>) -> List<PackageFile> / {abort.raise} =
+  sources.map(|s: Source|
+    if s.name.len() == 0 {
+      panic(
+        "an in-memory source needs a module name: names in a module without one resolve to nothing",
+      )
+    } else { { module: s.name, text: s.source_text } })
+
+fn inputs_in_memory(program: InMemory) -> LoadInputs / {abort.raise} =
+  load_inputs_of(
+    {
+      root: program.packages.root,
+      manifest: program.packages.manifest,
+      files: package_files(program.sources),
+    },
+    program.packages.supplied.map(|p: SuppliedPackage|
+      { root: p.root, manifest: p.manifest, files: package_files(p.modules) }),
+  )
+
+fn embedded_in_memory(
+  files: List<FileAt>,
+  module: Bytes,
+  want: EmbedRequest,
+) -> EmbedBytesResult / {abort.raise} =
+  if want.dir {
+    let prefix = want.path.concat(b"/");
+    match files.filter(|f: FileAt| f.module == module && f.path.starts_with(prefix)).sort_by_key(
+        |f: FileAt| f.path,
+      ) {
+      [] -> Err(b"no directory is there"),
+      found ->
+        Ok(
+          found.map(|f: FileAt| { name: f.path.slice(prefix.len(), f.path.len()), bytes: f.bytes }),
+        ),
+    }
+  } else {
+    match files.find(|f: FileAt| f.module == module && f.path == want.path) {
+      Some(f) -> Ok([{ name: b"", bytes: f.bytes }]),
+      None -> Err(b"no file is there"),
+    }
+  }
+
+pub fn session_over<a>(
+  program: InMemory,
+  work: (List<Bytes>) -> a / {SessionReads, abort.raise},
+  pack: packs::PackFiles = prelude_pack,
+) -> { program: InMemory, value: a } / {abort.raise} = {
+  let w = inputs_in_memory(program);
+  let qs = fresh_registry();
+  let all = with_prelude_source(program.shipped);
+  let text_of = |name: Bytes|
+    match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.source_text), None -> None };
+  let read = |package: Int, module: Bytes, want: EmbedRequest|
+    embedded_in_memory(program.files, module, want);
+  let done = over_decoding(
+    program.store,
+    |part: packs::PackPart| packs::frame_in(Some(pack), part),
+    |kind: Bytes, at: Bytes|
+      lookup_input(w, text_of, text_of, || all.map(|s: Source| s.name), read, kind, at),
+    || in_session(qs, |run: Run| reading(qs, run, || work(w.own))),
+  );
+  { program: { ..program, store: done.store }, value: done.value }
+}
+
+pub fn read_over<a>(
+  sources: List<Source>,
+  work: () -> a / {SessionReads, abort.raise},
+) -> a / {abort.raise} = session_over(in_memory(sources), |_: List<Bytes>| work()).value
+
+pub type CheckedInMemory = { program: InMemory, outcome: AnalysisOutcome }
+
+pub fn checked_in_memory(
+  program: InMemory,
+  shipped_opened: List<Bytes> = [],
+) -> CheckedInMemory / {abort.raise} = {
+  let done = session_over(program, |own: List<Bytes>|
+    program_outcome(own, query_load(own, [], false, module_of).results, shipped_opened));
+  { program: done.program, outcome: done.value }
+}
+
+pub type ClaimedInMemory = { program: InMemory, outcome: ClaimsOutcome }
+
+pub fn claimed_in_memory(program: InMemory) -> ClaimedInMemory / {abort.raise} = {
+  let done = session_over(program, |own: List<Bytes>|
+    program_claims(own, query_load(own, [], false, module_of).results));
+  { program: done.program, outcome: done.value }
+}
+
+pub fn analysed_over(
+  sources: List<Source>,
+  shipped: List<Source> = [],
+  files: List<FileAt> = [],
+) -> AnalysisOutcome / {abort.raise} = checked_in_memory(in_memory(sources, shipped, files)).outcome
+
+pub fn lowered_over<a>(program: InMemory, body: () -> a / {EmitReads}) -> a / {abort.raise} =
+  session_over(program, |_: List<Bytes>|
+    failing_on_lowering(|| with_code_reads(true, || body()))).value
+
+pub fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
   load_inputs_of(
     {
       root: b"",
@@ -765,64 +717,116 @@ fn inputs_alone(sources: List<Source>) -> LoadInputs / {abort.raise} =
 pub fn lookup_input_alone(w: LoadInputs, kind: Bytes, at: Bytes) -> Option<Bytes> / {abort.raise} =
   lookup_input_shipping(w, [], kind, at)
 
-fn lookup_input_shipping(
+pub fn lookup_input_shipping(
   w: LoadInputs,
   shipped: List<Source>,
   kind: Bytes,
   at: Bytes,
-  derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
 ) -> Option<Bytes> / {abort.raise} = {
   let all = with_prelude_source(shipped);
   let source_text = |name: Bytes|
     match all.find(|s: Source| s.name == name) { Some(s) -> Some(s.source_text), None -> None };
-  lookup_input(
-    w,
-    source_text,
-    source_text,
-    || all.map(|s: Source| s.name),
-    reject_embed,
-    derived,
-    kind,
-    at,
-  )
+  lookup_input(w, source_text, source_text, || all.map(|s: Source| s.name), reject_embed, kind, at)
+}
+
+fn hashed_load(
+  own: List<Bytes>,
+) -> { results: List<CheckedModule>, own_hashes: OwnHashes } / {memo.read, abort.raise} = {
+  let all = query_load(own, [], false, module_of);
+  {
+    results: all.results,
+    own_hashes: joined_module_hashes(
+      hashed_all(
+        own.filter(|m: Bytes|
+          all.results.any(|a: CheckedModule| a.module == m && a.result.rejected.len() == 0)),
+        all.pulled,
+        false,
+      ),
+    ),
+  }
 }
 
 fn query_alone(
-  qs: Map<Bytes, CheckQuery>,
+  qs: CheckQueries,
   w: LoadInputs,
-) -> { run: Run, results: List<CheckedModule>, fixing: CachedHashes } / {RunEffects, abort.raise} = {
-  let all = query_load(qs, w.own, [], false, start_run(qs));
-  if rejected_first(all.value.results).len() > 0 {
-    { run: all.run, results: all.value.results, fixing: no_cached_hashes }
-  } else {
-    let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
-    { run: fixed.run, results: all.value.results, fixing: joined_cached_hashes(fixed.value) }
-  }
+) -> { run: Run, results: List<CheckedModule>, own_hashes: OwnHashes } / {RunEffects, abort.raise} =
+  in_session(qs, |run: Run| {
+    let done = reading(qs, run, || hashed_load(w.own));
+    {
+      run: done.run,
+      value: { run: done.run, results: done.value.results, own_hashes: done.value.own_hashes },
+    }
+  })
+
+type QueriedOutcome = {
+  run: Run,
+  results: List<CheckedModule>,
+  own_hashes: OwnHashes,
+  outcome: AnalysisOutcome,
 }
 
-pub fn outcome_of(
-  sources: List<Source>,
+fn query_outcome(qs: CheckQueries, w: LoadInputs) -> QueriedOutcome / {RunEffects, abort.raise} =
+  in_session(qs, |run: Run| {
+    let done = reading(qs, run, || {
+      let loaded = hashed_load(w.own);
+      {
+        results: loaded.results,
+        own_hashes: loaded.own_hashes,
+        outcome: program_outcome(w.own, loaded.results),
+      }
+    });
+    {
+      run: done.run,
+      value: {
+        run: done.run,
+        results: done.value.results,
+        own_hashes: done.value.own_hashes,
+        outcome: done.value.outcome,
+      },
+    }
+  })
+
+pub fn program_outcome(
+  own: List<Bytes>,
   results: List<CheckedModule>,
-) -> AnalysisOutcome / {abort.raise} =
-  match rejected_first(results) {
+  shipped_opened: List<Bytes> = [],
+) -> AnalysisOutcome / {SessionReads, abort.raise} =
+  match rejections_of(results) {
     [] ->
-      analyse_with(
-        parse_all(sources),
-        results.fold(no_rows, |accumulator: Rows, a: CheckedModule| {
-          let r = rows_of_result(a.result);
-          {
-            definitions: accumulator.definitions.concat(r.definitions),
-            tests: accumulator.tests.concat(r.tests),
-            types: tables_joined(accumulator.types, r.types),
-          }
-        }),
+      program_analysed(
+        open_modules(own).concat(
+          shipped_opened.map(|m: Bytes| { module: m, shipped: true, tested: true }),
+        ),
       ),
-    first ->
-      Rejected(
-        first.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
-          accumulator.concat(a.result.rejected)),
-      ),
+    diagnostics -> Rejected(diagnostics),
   }
+
+fn program_claims(
+  own: List<Bytes>,
+  results: List<CheckedModule>,
+) -> ClaimsOutcome / {SessionReads, abort.raise} =
+  match rejections_of(results) {
+    [] -> claims_analysed(open_modules(own)).outcome,
+    diagnostics -> ClaimsRejected(diagnostics),
+  }
+
+fn rejections_of(results: List<CheckedModule>) -> List<Diagnostic> = {
+  let first = Set::of_list(rejected_first(results).map(|a: CheckedModule| a.module));
+  results.fold(
+    { at: 0, found: [] },
+    |accumulator: { at: Int, found: List<Diagnostic> }, a: CheckedModule| {
+      let i = accumulator.at;
+      {
+        at: i + 1,
+        found: if !first.contains(a.module) { accumulator.found }
+        else { accumulator.found.concat(a.result.rejected.map(|d: Diagnostic| placed_in(d, i))) },
+      }
+    },
+  ).found
+}
+
+fn open_modules(own: List<Bytes>) -> List<ModuleKey> =
+  own.map(|m: Bytes| { module: m, shipped: false, tested: true })
 
 pub type StoreSharing = | Alone | Concurrent | Turns
 
@@ -831,38 +835,43 @@ fn queried_in(
   sources: List<Source>,
   company: StoreSharing,
   nth: Int,
-) -> { tree: fs::MemFs, run: Run, outcome: AnalysisOutcome, fixing: CachedHashes } / {abort.raise} = {
+) -> { tree: fs::MemFs, run: Run, outcome: AnalysisOutcome, own_hashes: OwnHashes } / {abort.raise} = {
   let w = inputs_alone(sources);
-  let qs = if company != Turns { fresh_registry() } else {
-    fresh_registry().insert(b"spare", {
-      name: b"spare",
-      hash: if nth % 2 == 1 { b"odd" } else { b"even" },
-      body: |input: Bytes| input,
-      persistent: true,
-      summarized: false,
-    })
+  let fresh = fresh_registry();
+  let qs = if company != Turns { fresh } else {
+    {
+      ..fresh,
+      named: fresh.named.insert(b"spare", {
+        name: b"spare",
+        hash: if nth % 2 == 1 { b"odd" } else { b"even" },
+        body: main_only,
+        persistent: true,
+        product: None,
+        interface: Set::empty(),
+      }),
+    }
   };
   let done = fs::on_mem[abs](tree, ||
     handle {
-      memo_files::with_memo_store[abs](
+      database::with_database[abs](
         "s",
         prelude_frames,
-        prelude_files,
         |kind: Bytes, at: Bytes| {
           if raced.is_first_lookup() {
-            memo_files::with_memo_store[abs](
+            database::with_database[abs](
               "s",
               prelude_frames,
-              prelude_files,
               |k: Bytes, a: Bytes| lookup_input_alone(w, k, a),
+              |_: Bytes| (),
               || with_decode_cache(|| query_alone(qs, w).run),
             );
             ()
           };
           lookup_input_alone(w, kind, at)
         },
-        || with_decode_cache(|| query_alone(qs, w)),
-      )
+        |_: Bytes| (),
+        || with_decode_cache(|| query_outcome(qs, w)),
+      ).value
     } with {
       var begun = company != Concurrent,
       raced.is_first_lookup() -> {
@@ -874,9 +883,39 @@ fn queried_in(
   {
     tree: done.tree,
     run: done.value.run,
-    fixing: done.value.fixing,
-    outcome: outcome_of(sources, done.value.results),
+    own_hashes: done.value.own_hashes,
+    outcome: done.value.outcome,
   }
+}
+
+pub fn checked_with_write_limit(
+  store: fs::MemFs,
+  sources: List<Source>,
+  limit: WriteLimit,
+) -> fs::MemFs / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  match database::with_writes_limited(
+      store,
+      limit,
+      prelude_frames,
+      |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+      || with_decode_cache(|| query_alone(qs, w).own_hashes),
+    ) {
+    Finished(ran) -> ran.tree,
+    Stopped(stopped) -> stopped.tree,
+  }
+}
+
+pub fn operations_of_check(store: fs::MemFs, sources: List<Source>) -> Int / {abort.raise} = {
+  let w = inputs_alone(sources);
+  let qs = fresh_registry();
+  database::operations_of_session(
+    store,
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    || with_decode_cache(|| query_alone(qs, w).own_hashes),
+  )
 }
 
 effect raced {
@@ -885,39 +924,68 @@ effect raced {
 
 pub fn files_differing(steps: List<Step>, company: StoreSharing) -> List<Bytes> / {abort.raise} =
   range(0, steps.len()).fold(
-    { tree: fs::mem_of([]), store: empty_memory_store, off: [] },
-    |s: { tree: fs::MemFs, store: MemoryStore, off: List<Bytes> }, i: Int| {
+    { tree: fs::mem_empty(), off: [] },
+    |s: { tree: fs::MemFs, off: List<Bytes> }, i: Int| {
       let step = steps.get(i);
       let recorded = queried_in(s.tree, step.sources, company, i);
-      let queried = queried_over(s.store, step.sources);
-      let agrees = outcome_summary(recorded.outcome) == outcome_summary(queried.outcome)
-        && recorded.fixing == queried.fixing
-        && (company != Alone || executed_count(recorded.run) == executed_count(queried.run));
-      {
-        tree: recorded.tree,
-        store: queried.store,
-        off: if agrees { s.off } else { s.off.push(step.what) },
-      }
+      let fresh = queried_over(fs::mem_empty(), step.sources);
+      let agrees = outcome_summary(recorded.outcome) == outcome_summary(fresh.outcome)
+        && recorded.own_hashes == fresh.own_hashes;
+      { tree: recorded.tree, off: if agrees { s.off } else { s.off.push(step.what) } }
     },
   ).off
 
 pub type Step = { what: Bytes, sources: List<Source> }
 
 test "every query whose results the toolchain ships caches its results" {
-  assert_eq(shipped_queries.filter(|n: Bytes| digest_only_queries.contains(n)), [])
+  assert_eq(
+    every_query().filter(|q: CheckDefinition|
+      !q.interface.is_empty() && digest_only_queries.contains(q.name)).map(|q: CheckDefinition|
+      q.name),
+    [],
+  )
 }
 
+fn kept_outputs(store: fs::MemFs, digests: List<Bytes>) -> List<Bytes> / {abort.raise} =
+  database::outputs_in_memory(store, digests).values().flat_map(|o: database::StoredOutput|
+    match o { Stored(bytes) -> [bytes], NotKept -> [] })
+
 fn stored_results(name: Bytes) -> List<Bytes> / {abort.raise} = {
-  let store = check_sources(
-    empty_memory_store,
-    layered(b"pub fn step(n: Int) -> Int = n + 1\n"),
-    [],
+  let w = inputs_alone(layered(b"pub fn step(n: Int) -> Int = n + 1\n"));
+  let qs = fresh_registry();
+  let store = over_decoding(
+    fs::mem_empty(),
+    prelude_frames,
+    |kind: Bytes, at: Bytes| lookup_input_alone(w, kind, at),
+    ||
+      in_session(qs, |run: Run| {
+        let read = reading(qs, run, || {
+          let all = query_load(w.own, [], false, module_of);
+          hashed_all(w.own, all.pulled, false);
+          fetch_all(
+            module_listing_query(),
+            w.own.map(|m: Bytes| { module: m, shipped: false, tested: false }),
+          );
+          ()
+        });
+        { run: read.run, value: () }
+      }),
   ).store;
-  memo::current_records(store).fold([], |accumulator: List<Bytes>, _key: Bytes, r: Record|
-    if r.query != name { accumulator } else {
-      match store.outputs.get(r.output) { Some(out) -> accumulator.push(out), None -> accumulator }
+  let digests = database::facts_in_memory(store).values().flat_map(|r: database::FactRecord|
+    if r.query != name { [] } else { match r.parts.get(main_part) { Some(d) -> [d], None -> [] } });
+  let outputs = database::outputs_in_memory(store, digests).values();
+  outputs.map(|o: database::StoredOutput|
+    match o {
+      Stored(bytes) -> bytes,
+      NotKept -> panic("a result of a query that keeps its results is not stored"),
     })
 }
+
+fn stored_outputs(store: fs::MemFs) -> List<Bytes> / {abort.raise} =
+  kept_outputs(
+    store,
+    database::facts_in_memory(store).values().flat_map(|r: database::FactRecord| r.parts.values()),
+  )
 
 fn results_round_trip<a>(results: List<Bytes>, codec: bin::BinCodec<a>) -> Bool / {abort.raise} =
   results.len() > 0
@@ -926,30 +994,30 @@ fn results_round_trip<a>(results: List<Bytes>, codec: bin::BinCodec<a>) -> Bool 
       ok && bin::encode(value, codec) == b && bin::round_trips(value, codec)
     })
 
-test "a module's result reads back as it was recorded" {
-  assert(results_round_trip(stored_results(module_query), module_result_bin()))
+test "a module's listing reads back as it was recorded" {
+  assert(results_round_trip(stored_results(module_listing_query().name), module_listing_bin()))
 }
 
 test "a module's definition list decodes to the same value that was stored" {
-  assert(results_round_trip(stored_results(owners_query), owners_result_bin()))
+  assert(results_round_trip(stored_results(owners_query().name), owners_result_bin()))
 }
 
 test "a group's hashes decode to the same value that was stored" {
-  assert(results_round_trip(stored_results(group_hash_query), group_hashes_bin()))
+  assert(results_round_trip(stored_results(group_hash_query().name), group_hash_query().output))
 }
 
 test "a module's imports read back as they were recorded" {
-  assert(results_round_trip(stored_results(imports_query), imports_of_bin()))
+  assert(results_round_trip(stored_results(imports_query().name), imports_of_bin()))
 }
 
-test "a module's hashes read back as they were recorded" {
-  assert(results_round_trip(stored_results(hashes_query), hash_result_bin()))
+test "a module's record of its hashes reads back as it was recorded" {
+  assert(results_round_trip(stored_results(module_record_query().name), bin::bytes_bin()))
 }
 
 fn embedding_queried(
   source_text: Bytes,
   files: Map<Bytes, Bytes>,
-) -> { store: MemoryStore, results: List<CheckedModule>, fixing: CachedHashes } / {abort.raise} = {
+) -> { store: fs::MemFs, results: List<CheckedModule>, own_hashes: OwnHashes } / {abort.raise} = {
   let w = inputs_alone([{ name: b"m", source_text: source_text }]);
   let none = |name: Bytes| None;
   let read = |package: Int, module: Bytes, want: EmbedRequest|
@@ -958,17 +1026,16 @@ fn embedding_queried(
       None -> Err(b"no file is there"),
     };
   let done = over_decoding(
-    empty_memory_store,
+    fs::mem_empty(),
     packs::no_pack,
-    b"",
-    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, nothing_derived, kind, at),
+    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, kind, at),
     || query_alone(fresh_registry(), w),
   );
-  { store: done.store, results: done.value.results, fixing: done.value.fixing }
+  { store: done.store, results: done.value.results, own_hashes: done.value.own_hashes }
 }
 
-fn fixed_hash(fixing: CachedHashes, name: Bytes) -> Option<Bytes> =
-  fixing.nodes.fold(None, |accumulator: Option<Bytes>, f: CachedNode|
+fn own_hash_of(own_hashes: OwnHashes, name: Bytes) -> Option<Bytes> =
+  own_hashes.definitions.fold(None, |accumulator: Option<Bytes>, f: DefinitionHash|
     if f.name == name { Some(f.hash) } else { accumulator })
 
 const two_embeds: Bytes =
@@ -982,12 +1049,12 @@ test "a module's stored results refer to an embedded file by its digest and neve
   let source_text = b"pub fn data() -> Bytes = embed(\"big.bin\")\npub fn size() -> Int = data().len()\ntest \"sized\" { assert(size() > 0) }\n";
   let done = embedding_queried(source_text, Map::new().insert(b"big.bin", big));
   assert_eq(rejected_first(done.results), []);
-  assert(fixed_hash(done.fixing, b"m.data") != None);
+  assert(own_hash_of(done.own_hashes, b"m.data") != None);
   assert_eq(
     done.results.map(|a: CheckedModule| a.result.shape.embeds.map(|e: ModuleEmbed| e.read)),
     [[Ok([embed_file(b"", big)])]],
   );
-  let largest = done.store.outputs.fold(0, |most: Int, _: Bytes, result: Bytes|
+  let largest = stored_outputs(done.store).fold(0, |most: Int, result: Bytes|
     if result.len() > most { result.len() } else { most });
   assert(
     largest < big.len() / 10,
@@ -999,39 +1066,265 @@ test "a module's stored results refer to an embedded file by its digest and neve
 
 test "changing an embedded file's bytes changes the hash of the definition that embeds it and of no other definition" {
   let over = |a: Bytes, b: Bytes|
-    embedding_queried(two_embeds, Map::new().insert(b"a.bin", a).insert(b"b.bin", b)).fixing;
+    embedding_queried(two_embeds, Map::new().insert(b"a.bin", a).insert(b"b.bin", b)).own_hashes;
   let first = over(b"one", b"two");
   let moved = over(b"one", b"three");
-  assert(fixed_hash(first, b"m.a") != None);
-  assert_eq(fixed_hash(moved, b"m.a"), fixed_hash(first, b"m.a"));
-  assert(fixed_hash(moved, b"m.b") != fixed_hash(first, b"m.b"));
+  assert(own_hash_of(first, b"m.a") != None);
+  assert_eq(own_hash_of(moved, b"m.a"), own_hash_of(first, b"m.a"));
+  assert(own_hash_of(moved, b"m.b") != own_hash_of(first, b"m.b"));
   let same = over(b"one", b"one");
-  assert_eq(fixed_hash(same, b"m.a"), fixed_hash(same, b"m.b"))
+  assert_eq(own_hash_of(same, b"m.a"), own_hash_of(same, b"m.b"))
+}
+
+fn manifest_text(name: Bytes, dependencies: Bytes) -> Bytes =
+  Bytes::concat_all([
+    b"import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"",
+    name,
+    b"\", version: {major: 0, minor: 0, patch: 1}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: [",
+    dependencies,
+    b"], entry: None}",
+  ])
+
+const on_lib: Bytes =
+  b"{name: \"lib\", prefix: None, min: {major: 0, minor: 0, patch: 1}, source: Path(\"../lib\")}"
+
+fn with_lib(dependencies: Bytes, lib: List<Source>) -> PackageSources =
+  {
+    root: b"/x/app",
+    manifest: Some(manifest_text(b"app", dependencies)),
+    supplied: [{ root: b"/x/lib", manifest: Some(manifest_text(b"lib", b"")), modules: lib }],
+  }
+
+const answer_lib: List<Source> =
+  [
+    { name: b"answer", source_text: b"pub fn answer() -> Int = 42\n" },
+    { name: b"extra", source_text: b"fn hidden() -> Int = 1\n" },
+  ]
+
+const answer_user: List<Source> =
+  [{ name: b"m", source_text: b"import lib.answer\nfn main() -> Int = answer::answer()\n" }]
+
+fn package_codes(packages: PackageSources) -> List<Bytes> / {abort.raise} =
+  packages_rejected(packages, [b"m"], 1, NoTree).map(|d: Diagnostic| d.code)
+
+test "a project's manifest is checked before the program, and a malformed manifest rejects it" {
+  assert_eq(package_codes(with_lib(on_lib, answer_lib)), []);
+  assert_eq(package_codes({ root: b"/x/app", manifest: None, supplied: [] }), []);
+  assert_eq(
+    package_codes({ root: b"/x/app", manifest: Some(b"fn package() -> Int = 1"), supplied: [] }),
+    [b"E0129"],
+  )
+}
+
+test "a declared dependency's modules resolve under its prefix" {
+  let outcome = checked_in_memory(
+    in_memory(answer_user, packages: with_lib(on_lib, answer_lib)),
+  ).outcome;
+  assert_eq(rejection_codes(outcome), []);
+  assert(accepted(outcome))
+}
+
+test "importing a module from an undeclared dependency is rejected, naming the package and the importing module" {
+  match checked_in_memory(in_memory(answer_user, packages: with_lib(b"", answer_lib))).outcome {
+    Analysed(_) -> panic("the undeclared dependency was imported"),
+    Rejected(ds) -> {
+      assert_eq(ds.map(|d: Diagnostic| d.code), [b"E0132"]);
+      assert(ds.get(0).message.contains(b"`lib`"));
+      assert(ds.get(0).message.contains(b"`app`"))
+    },
+  }
+}
+
+test "a dependency's imports resolve under the dependency's prefix, not at the top level of the program" {
+  let lib = [
+    { name: b"answer", source_text: b"import extra\npub fn answer() -> Int = extra::hidden()\n" },
+    { name: b"extra", source_text: b"pub fn hidden() -> Int = 1\n" },
+  ];
+  let outcome = checked_in_memory(in_memory(answer_user, packages: with_lib(on_lib, lib))).outcome;
+  assert_eq(rejection_codes(outcome), []);
+  assert(accepted(outcome))
+}
+
+fn identity_across(square: Bytes, subject: Identified) -> Option<Bytes> / {abort.raise} =
+  session_over(
+    in_memory(
+      [
+        {
+          name: b"m",
+          source_text: b"import lib.calc\npub fn f(x: Int) -> Int\n  ensures result >= 0\n= calc::square(x)\n",
+        },
+      ],
+      packages: with_lib(on_lib, [{ name: b"calc", source_text: square }]),
+    ),
+    |_: List<Bytes>|
+      identity_of({ module: { module: b"m", shipped: false, tested: false }, subject: subject }),
+  ).value
+
+test "a definition's stored proof identity reads another package's callee by its contract, while its run identity reads the callee's body" {
+  let proof = |square: Bytes| identity_across(square, DefinitionProof(b"m.f"));
+  let run = |square: Bytes| identity_across(square, DefinitionRun(b"m.f"));
+  let plain = b"pub fn square(x: Int) -> Int = x * x\n";
+  let edited = b"pub fn square(x: Int) -> Int = x * x + 0\n";
+  let promising = b"pub fn square(x: Int) -> Int\n  ensures result >= 0\n= x * x\n";
+  assert(proof(plain) != None, None);
+  assert_eq(proof(edited), proof(plain));
+  assert(proof(promising) != proof(plain), None);
+  assert(run(edited) != run(plain), None)
+}
+
+test "a declared dependency with no manifest is reported as an error at its declaration" {
+  assert_eq(
+    package_codes({
+      ..with_lib(on_lib, answer_lib),
+      supplied: [{ root: b"/x/lib", manifest: None, modules: [] }],
+    }),
+    [b"E0135"],
+  )
+}
+
+fn embedded_outcome(source_text: Bytes, files: List<FileAt>) -> AnalysisOutcome / {abort.raise} =
+  analysed_over([{ name: b"m", source_text: source_text }], files: files)
+
+test "a directory embed returns a list of records, one per file, named by its path inside the directory" {
+  match embedded_outcome(
+      b"pub fn tree() -> List<{ name: String, bytes: Bytes }> = embed_dir(\"t\")\n",
+      [
+        { module: b"m", path: b"t/b/c", bytes: b"2" },
+        { module: b"m", path: b"t/a", bytes: b"1" },
+        { module: b"m", path: b"u/d", bytes: b"3" },
+      ],
+    ) {
+    Rejected(ds) ->
+      panic("the directory embed was rejected: " ++ String::of_bytes_lossy(ds.get(0).message)),
+    Analysed(w) -> {
+      assert_eq(w.embeds.map(|e: ModuleEmbed| e.key), [b"dir:t"]);
+      assert_eq(w.embeds.map(|e: ModuleEmbed| e.read), [
+        Ok([embed_file(b"a", b"1"), embed_file(b"b/c", b"2")]),
+      ])
+    },
+  }
+}
+
+test "an embed's path must be a literal, and an embed whose file cannot be read is rejected" {
+  assert_eq(
+    rejection_codes(
+      embedded_outcome(b"fn p() -> String = \"d.txt\"\npub fn data() -> Bytes = embed(p())\n", []),
+    ),
+    [b"E0147"],
+  );
+  assert_eq(
+    rejection_codes(embedded_outcome(b"pub fn data() -> Bytes = embed(\"d.txt\")\n", [])),
+    [b"E0146"],
+  )
+}
+
+test "a module that defines its own `embed` function calls that function instead of the built-in `embed`" {
+  match embedded_outcome(
+      b"fn embed(p: String) -> Bytes = b\"mine\"\npub fn data() -> Bytes = embed(\"d.txt\")\n",
+      [],
+    ) {
+    Rejected(_) -> panic("a module's own `embed` was taken for the built-in"),
+    Analysed(w) -> assert_eq(w.embeds, []),
+  }
+}
+
+fn locked_digests(read: Bytes) -> List<Bytes> / {abort.raise} = {
+  let packages = with_lib(on_lib, [
+    { name: b"answer", source_text: b"pub fn answer() -> Int = embed(\"n.txt\").len()\n" },
+  ]);
+  let embeds = [
+    {
+      root: b"/x/lib",
+      module: b"answer",
+      want: { path: b"n.txt", dir: false },
+      read: Ok([embed_file(b"", read)]),
+    },
+  ];
+  match locked_packages(answer_user, packages, embeds) {
+    Ok(pins) -> pins.map(|pin: LockedPackage| pin.digest),
+    Err(_) -> panic("the packages lock"),
+  }
+}
+
+test "a dependency's locked hash depends on the files its modules embed as well as on their text" {
+  assert(locked_digests(b"one").len() > 0);
+  assert(locked_digests(b"one") != locked_digests(b"two"));
+  assert_eq(locked_digests(b"one"), locked_digests(b"one"))
+}
+
+fn embed_from_files<[r]>(
+  want: EmbedRequest,
+) -> EmbedBytesResult / {fs.read[r], embed_snapshot.read, embed_snapshot.write} =
+  snapshot_embed(want.path, ||
+    match fs.read_file[r](String::of_bytes_lossy(want.path)) {
+      Some(bytes) -> Ok([{ name: b"", bytes: bytes }]),
+      None -> Err(b"no file is there"),
+    })
+
+fn session_over_embeds<[r]>(
+  checks: Bool,
+) -> Option<Bytes> / {fs.read[r], fs.write[r], embed_snapshot.read, embed_snapshot.write, abort.raise} = {
+  let w = inputs_alone([{ name: b"m", source_text: two_embeds }]);
+  let none = |name: Bytes| None;
+  let read = |package: Int, module: Bytes, want: EmbedRequest| embed_from_files[r](want);
+  let qs = fresh_registry();
+  database::with_database[r](
+    "s",
+    packs::no_pack,
+    |kind: Bytes, at: Bytes| lookup_input(w, none, none, || [], read, kind, at),
+    |_: Bytes| (),
+    ||
+      with_decode_cache(||
+        if checks { own_hash_of(query_alone(qs, w).own_hashes, b"m.a") }
+        else { in_session(qs, |run: Run| { run: run, value: None }) }),
+  ).value
+}
+
+test "a third session in a command reads the embedded file the second session read first, and the next command reads the saved file" {
+  let files = fs::mem_of([{ path: "a.bin", body: b"one" }, { path: "b.bin", body: b"two" }]);
+  let command = fs::on_mem[abs](files, ||
+    with_embed_snapshot(|| {
+      let first = session_over_embeds[abs](false);
+      let second = session_over_embeds[abs](true);
+      fs.write_file[abs]("a.bin", b"saved");
+      { first: first, second: second, third: session_over_embeds[abs](true) }
+    }));
+  let next = fs::on_mem[abs](command.tree, ||
+    with_embed_snapshot(|| session_over_embeds[abs](true)));
+  assert_eq(command.value.first, None);
+  assert(command.value.second != None);
+  assert_eq(command.value.third, command.value.second);
+  assert(next.value != command.value.second)
 }
 
 type CheckedSources = {
-  store: MemoryStore,
+  store: fs::MemFs,
   run: Run,
   results: List<CheckedModule>,
-  cached_hashes: CachedHashes,
+  own_hashes: OwnHashes,
   warnings: List<Diagnostic>,
   fetched: List<Bytes>,
 }
 
 pub fn check_sources(
-  store: MemoryStore,
+  store: fs::MemFs,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
-) -> CheckedSources / {abort.raise} =
-  check_with_pack(store, prelude_pack, sources, shipped, derived: derived)
+) -> CheckedSources / {abort.raise} = check_with_pack(store, Some(prelude_pack), sources, shipped)
 
 pub fn check_with_pack(
-  store: MemoryStore,
+  store: fs::MemFs,
   packed: Option<packs::PackFiles>,
   sources: List<Source>,
   shipped: List<Source>,
-  derived: (Bytes) -> Option<Bytes> / {abort.raise} = nothing_derived,
+) -> CheckedSources / {abort.raise} = check_under(fresh_registry(), store, packed, sources, shipped)
+
+pub fn check_under(
+  qs: CheckQueries,
+  store: fs::MemFs,
+  packed: Option<packs::PackFiles>,
+  sources: List<Source>,
+  shipped: List<Source>,
 ) -> CheckedSources / {abort.raise} = {
   let w = load_inputs_of(
     {
@@ -1044,35 +1337,43 @@ pub fn check_with_pack(
   handle {
     let done = over_decoding(
       store,
-      |path: String, offset: Int, len: Int| {
-        let found = packs::frame_in(packed, path, offset, len);
-        match found { Some(b) -> fetching.fetched(b), None -> () };
+      |part: packs::PackPart| {
+        let found = packs::frame_in(packed, part);
+        match found { Some(b) -> fetching.fetch(b), None -> () };
         found
       },
-      b"",
-      |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at, derived: derived),
+      |kind: Bytes, at: Bytes| lookup_input_shipping(w, shipped, kind, at),
       || {
-        let qs = fresh_registry();
-        let all = query_load(qs, w.own, [], false, start_run(qs));
-        let fixed = hashed_all(qs, w.own, all.value.pulled, false, all.run);
-        {
-          run: fixed.run,
-          results: all.value.results,
-          fixing: joined_cached_hashes(fixed.value),
-          warnings: root_warnings(all.value.results, sources.len()),
-        }
+        in_session(qs, |run: Run| {
+          let done = reading(qs, run, || {
+            let all = query_load(w.own, [], false, listed_module);
+            {
+              results: all.results,
+              own_hashes: joined_module_hashes(hashed_all(w.own, all.pulled, false)),
+            }
+          });
+          {
+            run: done.run,
+            value: {
+              run: done.run,
+              results: done.value.results,
+              own_hashes: done.value.own_hashes,
+              warnings: root_warnings(done.value.results, sources.len()),
+            },
+          }
+        })
       },
     );
     {
       store: done.store,
       run: done.value.run,
       results: done.value.results,
-      fixing: done.value.fixing,
+      own_hashes: done.value.own_hashes,
       warnings: done.value.warnings,
     }
   } with {
     var fetched: List<Bytes> = [],
-    fetching.fetched(b) -> {
+    fetching.fetch(b) -> {
       fetched = fetched.push(b);
     },
     return d ->
@@ -1080,7 +1381,7 @@ pub fn check_with_pack(
         store: d.store,
         run: d.run,
         results: d.results,
-        cached_hashes: d.fixing,
+        own_hashes: d.own_hashes,
         warnings: d.warnings,
         fetched: fetched,
       },
@@ -1088,7 +1389,7 @@ pub fn check_with_pack(
 }
 
 effect fetching {
-  write fetched(b: Bytes) -> Unit
+  write fetch(b: Bytes) -> Unit
 }
 
 pub fn layered(lib: Bytes) -> List<Source> =
@@ -1098,7 +1399,62 @@ pub fn layered(lib: Bytes) -> List<Source> =
     { name: b"aside", source_text: b"pub fn alone() -> Int = 7\n" },
   ]
 
-test "a definition group that calls a group with a type error is skipped, and the module reports the same errors as a whole-module check" {
+test "a program whose imported module has a broken signature reports that module's error and no other" {
+  let sources = [
+    { name: b"lib", source_text: b"pub fn broken(n: Missing) -> Int = 1\n" },
+    { name: b"app", source_text: b"import lib\npub fn go(n: Int) -> Int = lib::broken(n)\n" },
+  ];
+  assert_eq(rejection_codes(queried_over(fs::mem_empty(), sources).outcome), [b"E0102"])
+}
+
+fn rejection_codes(outcome: AnalysisOutcome) -> List<Bytes> =
+  match outcome { Rejected(ds) -> ds.map(|d: Diagnostic| d.code), Analysed(_) -> [] }
+
+fn accepted(outcome: AnalysisOutcome) -> Bool =
+  match outcome { Analysed(_) -> true, Rejected(_) -> false }
+
+test "a comparison looks inside a type that another module declares" {
+  let sources = [
+    { name: b"lib", source_text: b"pub type Held = { run: () -> Int }\n" },
+    {
+      name: b"app",
+      source_text: b"import lib\npub fn same(a: lib::Held, b: lib::Held) -> Bool = a == b\n",
+    },
+  ];
+  let alone = [
+    {
+      name: b"app",
+      source_text: b"pub type Held = { run: () -> Int }\npub fn same(a: Held, b: Held) -> Bool = a == b\n",
+    },
+  ];
+  assert_eq(
+    rejection_codes(queried_over(fs::mem_empty(), sources).outcome),
+    rejection_codes(queried_over(fs::mem_empty(), alone).outcome),
+  )
+}
+
+test "arithmetic works on a numeric type that another group declares" {
+  let sources = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"pub type Length = | Metres(Int)\n",
+        b"key for Length by metres\n",
+        b"numeric for Length by { add: plus, sub: minus, mul: times, neg: negated, of_int: length }\n",
+        b"fn length(n: Int) -> Length = Metres(n)\n",
+        b"fn metres(l: Length) -> Int = match l { Metres(n) -> n }\n",
+        b"fn plus(a: Length, b: Length) -> Length = Metres(metres(a) + metres(b))\n",
+        b"fn minus(a: Length, b: Length) -> Length = Metres(metres(a) - metres(b))\n",
+        b"fn times(a: Length, b: Length) -> Length = Metres(metres(a) * metres(b))\n",
+        b"fn negated(a: Length) -> Length = Metres(0 - metres(a))\n",
+        b"pub fn doubled(l: Length) -> Length = l + l\n",
+      ]),
+    },
+  ];
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
+}
+
+test "a group that calls a group with a type error is checked against its written signature, and the module reports the same errors as a whole-module check" {
   let source = |body: Bytes|
     [
       {
@@ -1111,66 +1467,42 @@ test "a definition group that calls a group with a type error is skipped, and th
         ]),
       },
     ];
-  let cold = queried_over(empty_memory_store, source(b"n + 1"));
+  let cold = queried_over(fs::mem_empty(), source(b"n + 1"));
   let broken = queried_over(cold.store, source(b"n + true"));
   assert_eq(
     outcome_summary(broken.outcome),
-    outcome_summary(analyse(parse_all(source(b"n + true")))),
-  );
-  let waiting = memo::current_records(broken.store).fold(
-    [],
-    |accumulator: List<Bytes>, _key: Bytes, r: Record|
-      if r.query != group_query { accumulator } else {
-        match broken.store.outputs.get(r.output) {
-          None -> accumulator,
-          Some(out) -> {
-            let a = owner_checks::decode_group(
-              decoded(out, owner_checks::encoded_group_bin(), "a group's result"),
-            );
-            if a.rejected.any(|d: Diagnostic| d.message.index_of(b" waits on ") != None) {
-              accumulator.concat(decoded(r.input, group_key_bin(), "a group's names").owners)
-            } else { accumulator }
-          },
-        }
-      },
-  );
-  let checked = executed_for(broken.run, group_query).fold(
-    [],
-    |accumulator: List<Bytes>, b: Bytes|
-      accumulator.concat(decoded(b, group_key_bin(), "a group's names").owners),
-  ).filter(|o: Bytes| o != b"base");
-  assert(checked.contains(b"over"));
-  assert_eq(waiting.sort(), checked.sort())
-}
-
-pub fn shipped_store(shipped: List<Source>) -> MemoryStore / {abort.raise} =
-  shipped_store_results(shipped).store
-
-fn shipped_store_results(
-  shipped: List<Source>,
-) -> { store: MemoryStore, value: List<CheckedModule> } / {abort.raise} = {
-  let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
-  over_decoding(
-    empty_memory_store,
-    packs::no_pack,
-    b"",
-    |kind: Bytes, at: Bytes| lookup_input_shipping(nowhere, shipped, kind, at),
-    || {
-      let qs = fresh_registry();
-      check_shipped_modules(
-        qs,
-        with_prelude_source(shipped).map(|s: Source| s.name),
-        start_run(qs),
-      ).rejected
-    },
+    outcome_summary(queried_over(fs::mem_empty(), source(b"n + true")).outcome),
   )
 }
 
+type ShippedStore = {
+  store: fs::MemFs,
+  interfaces: Map<Bytes, Set<Bytes>>,
+  rejected: List<CheckedModule>,
+}
+
+fn shipped_store(shipped: List<Source>) -> ShippedStore / {abort.raise} = {
+  let nowhere = load_inputs_of({ root: b"", manifest: None, files: [] }, []);
+  let qs = fresh_registry();
+  let done = over_decoding(
+    fs::mem_empty(),
+    packs::no_pack,
+    |kind: Bytes, at: Bytes| lookup_input_shipping(nowhere, shipped, kind, at),
+    ||
+      in_session(qs, |run: Run| {
+        let all = reading(qs, run, ||
+          check_shipped_modules(with_prelude_source(shipped).map(|s: Source| s.name)));
+        { run: all.run, value: all.value }
+      }),
+  );
+  { store: done.store, interfaces: interfaces(qs), rejected: done.value }
+}
+
 test "computing the shipped modules' results names each one that fails" {
-  let rejected = shipped_store_results([
+  let rejected = shipped_store([
     { name: b"std.a", source_text: b"pub fn a() -> Int = 1\n" },
     { name: b"std.b", source_text: b"import std.a (a)\n\npub fn b() -> Int = a(2)\n" },
-  ]).value;
+  ]).rejected;
   assert_eq(rejected.map(|x: CheckedModule| x.module), [b"std.b"]);
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), [
     [b"E0202"],
@@ -1185,7 +1517,7 @@ test "a compiler module imports another below the compiler's root by its full na
       source_text: b"import compiler.syntax.base (one)\n\npub fn two() -> Int = one() + one()\n",
     },
   ];
-  let rejected = shipped_store_results(shipped).value;
+  let rejected = shipped_store(shipped).rejected;
   assert_eq(rejected.map(|x: CheckedModule| x.result.rejected.map(|d: Diagnostic| d.code)), []);
   let user = [
     {
@@ -1193,7 +1525,7 @@ test "a compiler module imports another below the compiler's root by its full na
       source_text: b"import compiler.check.user (two)\npub fn main() -> Int = two()\n",
     },
   ];
-  let f = check_sources(empty_memory_store, user, shipped);
+  let f = check_sources(fs::mem_empty(), user, shipped);
   assert_eq(
     f.results.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
       accumulator.concat(a.result.rejected)),
@@ -1201,47 +1533,275 @@ test "a compiler module imports another below the compiler's root by its full na
   )
 }
 
-pub fn pack_of(store: MemoryStore) -> Option<packs::PackFiles> / {abort.raise} =
-  Some(
-    memo::pack_memory_store(
-      {
-        ..store,
-        records: memo::current_records(store).fold(
-          Map::new(),
-          |accumulator: Map<Bytes, Record>, k: Bytes, r: Record|
-            if shipped_queries.contains(r.query) { accumulator.insert(k, r) } else { accumulator },
-        ),
-      },
-      fresh_registry(),
-      prelude_files,
-    ),
-  )
-
-test "loading from a prebuilt store of shipped results fetches a module's definition list fewer times than the module has definitions" {
-  let owners = 24;
-  let shipped = [
-    {
-      name: b"std.many",
-      source_text: Bytes::concat_all(
-        range(0, owners).map(|i: Int|
-          Bytes::of_string(f"pub fn f{i.to_string()}() -> Int = {i.to_string()} + 1\n\n")),
-      ),
-    },
-  ];
-  let store = shipped_store(shipped);
-  let read = memo::current_records(store).fold(b"", |found: Bytes, _: Bytes, r: Record|
-    if r.query == owners_query { r.output } else { found });
-  let read_bytes = match store.outputs.get(read) { Some(o) -> o, None -> b"" };
-  let user = [
-    { name: b"main", source_text: b"import std.many (f0)\npub fn main() -> Int = f0()\n" },
-  ];
-  let load = check_with_pack(empty_memory_store, pack_of(store), user, shipped);
-  let fetches = load.fetched.filter(|b: Bytes| b == read_bytes).len();
-  assert(fetches > 0, Some("the read is short enough to be kept inside its record"));
-  assert(fetches < owners, Some(f"the read was fetched {fetches.to_string()} times"))
+pub fn shipped_pack(shipped: List<Source>) -> packs::PackFiles / {abort.raise} = {
+  let built = shipped_store(shipped);
+  database::pack_in_memory(built.store, built.interfaces)
 }
 
-test "loading from a prebuilt store of shipped results type-checks no definition of a shipped module" {
+test "a module whose text fails to parse outside its items is rejected with the parse error" {
+  let checked = check_sources(
+    fs::mem_empty(),
+    [{ name: b"m", source_text: b"fn f() -> Int = 1\n\n/// below nothing\n" }],
+    [],
+  );
+  assert_eq(
+    checked.results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code)),
+    [b"E0003"],
+  )
+}
+
+test "a cycle whose signatures are rejected reports each error once" {
+  let codes = |text: String|
+    check_sources(
+      fs::mem_empty(),
+      [{ name: b"m", source_text: Bytes::of_string(text) }],
+      [],
+    ).results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code));
+  assert_eq(
+    codes(
+      \\type Box = | Box(Int, Int)
+      \\fn area(b: Box) -> Int = match b { Box(w, h) -> w * h }
+      \\fn width(b: Box) -> Int = match b { Box(w, _) -> w }
+      \\key for Box by area
+      \\key for Box by width
+      \\
+    ),
+    [b"E0105"],
+  );
+  assert_eq(
+    codes(
+      \\effect set Web = {Storage, abort.raise}
+      \\effect set Storage = {Web}
+      \\fn report() -> Int / {Web} = 1
+      \\
+    ),
+    [b"E0115"],
+  )
+}
+
+test "an effect set cycle and a type error in a function that uses the set are both reported" {
+  let codes = check_sources(
+    fs::mem_empty(),
+    [
+      {
+        name: b"m",
+        source_text: b"effect set Web = {Storage, abort.raise}\neffect set Storage = {Web}\nfn report() -> Int / {Web} = true\n",
+      },
+    ],
+    [],
+  ).results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code)).sort(
+  );
+  assert_eq(codes, [b"E0115", b"E0201"])
+}
+
+test "a function defined twice and a type error in another function are each reported once, and the module's other declarations are still declared" {
+  let rejected = check_sources(
+    fs::mem_empty(),
+    [
+      {
+        name: b"m",
+        source_text: Bytes::concat_all([
+          b"type Shape = | Circle(Int) | Square(Int)\n",
+          b"fn area(s: Shape) -> Int = match s { Circle(r) -> r * r, Square(w) -> w * w }\n",
+          b"fn area(s: Shape) -> Int = 0\n",
+          b"fn wrong() -> Int = true\n",
+          b"fn total() -> Int = area(Circle(2)) + area(Square(3))\n",
+        ]),
+      },
+    ],
+    [],
+  ).results.flat_map(|a: CheckedModule| a.result.rejected);
+  assert_eq(rejected.map(|d: Diagnostic| d.code).sort(), [b"E0105", b"E0201"]);
+  assert_eq(rejected.filter(|d: Diagnostic| d.code == b"E0105").map(|d: Diagnostic| d.message), [
+    b"`area` is defined twice in module `m`",
+  ])
+}
+
+test "a failed import is reported once, uses of its names are not, and other errors still are" {
+  let codes = check_sources(
+    fs::mem_empty(),
+    [
+      {
+        name: b"m",
+        source_text: b"import nowhere (f)\nimport elsewhere\nfn g() -> Int = f() + elsewhere::h()\nfn k() -> Int = true\n",
+      },
+    ],
+    [],
+  ).results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code)).sort(
+  );
+  assert_eq(codes, [b"E0106", b"E0106", b"E0201"])
+}
+
+test "a `const` that reads itself, holds a function or performs an effect is rejected with one E0156" {
+  let codes = |text: Bytes|
+    check_sources(fs::mem_empty(), [{ name: b"m", source_text: text }], []).results.flat_map(
+      |a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code),
+    );
+  assert_eq(codes(b"const f: Int = f + 1\n"), [b"E0156"]);
+  assert_eq(codes(b"const f: (Int) -> Int = |x: Int| x\n"), [b"E0156"]);
+  assert_eq(codes(b"effect ticks { read now() -> Int }\n\nconst f: Int = ticks.now()\n"), [
+    b"E0156",
+  ]);
+  assert_eq(
+    codes(
+      b"const f: Int = 1\n\nfn const(const: Int) -> Int = const + f\n\nfn main() -> Int = const(2)\n",
+    ),
+    [],
+  )
+}
+
+test "a test's cases are checked by their own data, so a `key` on their type does not let a case hold a function" {
+  let cases = {
+    name: b"std.cases",
+    source_text: Bytes::concat_all([
+      b"pub type Table<a> = List<a>\n",
+      b"pub type Listed = { label: String, identity: Bytes }\n",
+      b"pub fn listed<a | e>(table: List<a>, label: (a) -> String / e) -> List<Listed> / e\n",
+      b"  where derivable(hash, a)\n",
+      b"= table.map(|c: a| { label: label(c), identity: b\"\" })\n",
+      b"pub fn chosen<a>(table: List<a>, at: Int, wanted: Bytes) -> a / {abort.raise}\n",
+      b"  where derivable(hash, a)\n",
+      b"= match table.at(at) { Some(c) -> c, None -> panic(\"no case\") }\n",
+    ]),
+  };
+  let codes = |payload: Bytes, value: Bytes|
+    check_sources(
+      fs::mem_empty(),
+      [
+        {
+          name: b"m",
+          source_text: Bytes::concat_all([
+            b"type Named = | Named(String, ",
+            payload,
+            b")\n\nkey for Named by name_of\n\nfn name_of(n: Named) -> String = match n { Named(name, _) -> name }\n\n",
+            b"test \"each case is named\" for n: Named in [Named(\"a\", ",
+            value,
+            b")] { assert(name_of(n) == \"a\") }\n",
+          ]),
+        },
+      ],
+      [cases],
+    ).results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.code));
+  assert_eq([codes(b"Int", b"1"), codes(b"() -> Int", b"|| 1")], [[], [b"E0206"]])
+}
+
+test "an opaque record from another module cannot be built from a literal, and the error names its maker" {
+  let lib = {
+    name: b"lib",
+    source_text: b"pub opaque type Id = new { octets: Bytes }\npub fn id_of(octets: Bytes) -> Option<Id> = Some({ octets: octets })\npub fn shown(u: Id) -> Int = u.octets.len()\n",
+  };
+  let rejected = |use_site: Bytes|
+    check_sources(
+      fs::mem_empty(),
+      [
+        lib,
+        {
+          name: b"app",
+          source_text: Bytes::concat_all([
+            b"import lib (Id, shown)\npub fn f(b: Bytes) -> Int = {\n  let u",
+            use_site,
+            b" = { octets: b };\n  shown(u)\n}\n",
+          ]),
+        },
+      ],
+      [],
+    ).results.flat_map(|a: CheckedModule| a.result.rejected);
+  let closed = rejected(b": Id");
+  assert_eq(closed.map(|d: Diagnostic| d.code), [b"E0220"]);
+  assert(
+    closed.any(|d: Diagnostic| d.notes_text.any(|n: Bytes| n.index_of(b"id_of") != None)),
+    Some(
+      String::of_bytes_lossy(Bytes::join(closed.flat_map(|d: Diagnostic| d.notes_text), b" | ")),
+    ),
+  );
+  let mismatched = rejected(b"");
+  assert_eq(mismatched.map(|d: Diagnostic| d.code), [b"E0201"])
+}
+
+test "a module with an error in one group still reports the warnings of its other groups" {
+  let codes = |text: String|
+    check_sources(
+      fs::mem_empty(),
+      [{ name: b"m", source_text: Bytes::of_string(text) }],
+      [],
+    ).results.flat_map(|a: CheckedModule|
+      a.result.rejected.concat(a.result.warnings).map(|d: Diagnostic| d.code)).sort(
+    );
+  let handled =
+    \\effect io {
+    \\  read get(n: Int) -> Int
+    \\}
+    \\pub fn touch(c: Int) -> Int / {io.get} = io.get(c)
+    \\test "one operation, twice" {
+    \\  handle { assert_eq(touch(3), 0) } with {
+    \\    io.get(n) -> 0,
+    \\    io.get(n) -> 1,
+    \\  }
+    \\}
+    \\
+  ;
+  assert_eq([codes(handled), codes(handled ++ "pub fn boom() -> Int = nope(1)\n")], [
+    [b"E0105"],
+    [b"E0101", b"E0105"],
+  ])
+}
+
+test "a function whose type parameter is named like a rejected function is checked and callable" {
+  let rejected = check_sources(
+    fs::mem_empty(),
+    [
+      { name: b"n", source_text: b"pub type Wrapper = W(Float)\n" },
+      {
+        name: b"m",
+        source_text: b"import n\nfn a() -> Map<n::Wrapper, Int> = Map::new()\nfn needs<a>(x: a) -> Int = 1\nfn i() -> Int = needs(1)\n",
+      },
+    ],
+    [],
+  ).results.flat_map(|c: CheckedModule| c.result.rejected.map(|d: Diagnostic| d.code));
+  assert_eq(rejected, [b"E0206"])
+}
+
+test "a group that reads a rejected unit of its module still reports its own error" {
+  let text = "type Count = Int\n\ntype Span = new { from: Int, to: Int }\n\nfn more(a: Count, b: Count) -> Count = a\n\nnumeric for Count by { add: more, sub: more, mul: more, neg: more, of_int: more }\n\nnumeric for Span by { add: more, sub: more, mul: more, neg: more, of_int: more }\n";
+  let rejected = check_sources(
+    fs::mem_empty(),
+    [{ name: b"m", source_text: Bytes::of_string(text) }],
+    [],
+  ).results.flat_map(|a: CheckedModule| a.result.rejected.map(|d: Diagnostic| d.message));
+  assert_eq(rejected, [
+    b"`Count` is not a sum, and a `numeric` must be a sum",
+    b"`Span` is a `new` record, which cannot state a `numeric` yet",
+  ])
+}
+
+test "a group's fix edits the module's file where its warning points" {
+  let text =
+    \\import lib
+    \\
+    \\effect io {
+    \\  read get(n: Int) -> Int
+    \\}
+    \\pub fn quiet() -> Int / {io.get} = lib::first()
+    \\
+  ;
+  let source = Bytes::of_string(text);
+  let warned = check_sources(
+    fs::mem_empty(),
+    [
+      { name: b"lib", source_text: b"pub fn first() -> Int = 1\n" },
+      { name: b"m", source_text: source },
+    ],
+    [],
+  ).results.filter(|a: CheckedModule| a.module == b"m").flat_map(|a: CheckedModule|
+    a.result.warnings).filter(|d: Diagnostic| d.code == b"W0614");
+  assert(warned.len() == 1);
+  let edits = offered_fixes(warned.get(0).fixes).flat_map(fix_edits);
+  assert(edits.len() > 0);
+  assert(edits.all(|e: Edit| place_module(warned.get(0).labels.get(0).place) == Some(e.module)));
+  assert_eq(edits.map(|e: Edit| source.slice(e.start, e.end)), [b" / {io.get}"])
+}
+
+test "a program checked over a prebuilt store of shipped results gives the result of a check from scratch" {
   let shipped = [
     {
       name: b"std.pair",
@@ -1251,10 +1811,47 @@ test "loading from a prebuilt store of shipped results type-checks no definition
   let user = [
     { name: b"main", source_text: b"import std.pair (both)\npub fn main() -> Bool = both(3)\n" },
   ];
-  let load = check_with_pack(empty_memory_store, pack_of(shipped_store(shipped)), user, shipped);
-  assert_eq(executed_for(load.run, typed_query), []);
-  assert_eq(load.results, check_sources(empty_memory_store, user, shipped).results)
+  let load = check_with_pack(fs::mem_empty(), Some(shipped_pack(shipped)), user, shipped);
+  assert_eq(load.results, check_sources(fs::mem_empty(), user, shipped).results)
 }
+
+test "a program over a shipped pack gives the result of a check from scratch after an edit to a shipped module it imports, and checks none of its own groups after an edit to one it does not" {
+  let shipped = [
+    { name: b"std.used", source_text: b"pub fn one() -> Int = 1\n" },
+    { name: b"std.apart", source_text: b"pub fn two() -> Int = 2\n" },
+  ];
+  let user = [
+    { name: b"main", source_text: b"import std.used (one)\npub fn main() -> Int = one()\n" },
+  ];
+  let pack = Some(shipped_pack(shipped));
+  let groups_in = |checked: CheckedSources|
+    query_stats(checked.run).fold(0, |n: Int, s: QueryStats|
+      if s.query == b"group" { n + s.ran } else { n });
+  let edited = |program: List<Source>, name: Bytes, text: Bytes|
+    groups_in(
+      check_with_pack(
+        check_with_pack(fs::mem_empty(), pack, program, shipped).store,
+        pack,
+        program,
+        with_text(shipped, name, text),
+      ),
+    );
+  let groups_after = |name: Bytes, text: Bytes| edited(user, name, text);
+  let importing_nothing = [{ name: b"main", source_text: b"pub fn main() -> Int = 1\n" }];
+  assert_eq(
+    groups_after(b"std.apart", b"pub fn two() -> Int = 3\n"),
+    edited(importing_nothing, b"std.apart", b"pub fn two() -> Int = 3\n"),
+  );
+  let changed = with_text(shipped, b"std.used", b"pub fn one() -> Bool = true\n");
+  let first = check_with_pack(fs::mem_empty(), pack, user, shipped);
+  assert_eq(
+    check_with_pack(first.store, pack, user, changed).results,
+    check_sources(fs::mem_empty(), user, changed).results,
+  )
+}
+
+fn with_text(sources: List<Source>, name: Bytes, text: Bytes) -> List<Source> =
+  sources.map(|s: Source| if s.name == name { { ..s, source_text: text } } else { s })
 
 test "a shipped module's imports are checked as an importing module sees them, ignoring imports used only by its tests" {
   let user = [
@@ -1268,7 +1865,7 @@ test "a shipped module's imports are checked as an importing module sees them, i
     { name: b"std.b", source_text: b"pub fn one() -> Int = 1\n" },
     { name: b"std.c", source_text: b"pub fn spare() -> Int = 3\n" },
   ];
-  let f = check_sources(empty_memory_store, user, shipped);
+  let f = check_sources(fs::mem_empty(), user, shipped);
   assert_eq(
     f.results.fold([], |accumulator: List<Diagnostic>, a: CheckedModule|
       accumulator.concat(a.result.rejected)),
@@ -1283,7 +1880,7 @@ test "a module reports the errors of a definition with an error, and none from t
       source_text: b"fn pick() -> Int = missing()\n\nfn read() -> Int = 1\n\nfn main() -> Int = pick() + read()\n",
     },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.message))),
@@ -1293,7 +1890,7 @@ test "a module reports the errors of a definition with an error, and none from t
 
 test "an import of a module that does not exist fails the importing module even when nothing uses the import" {
   let sources = [{ name: b"app", source_text: b"import nonesuch\npub fn f() -> Int = 1\n" }];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
@@ -1307,7 +1904,7 @@ test "two imports that give the same module name fail their module even when nei
     { name: b"lib.net", source_text: b"pub fn y() -> Int = 2\n" },
     { name: b"app", source_text: b"import net\nimport lib.net\npub fn f() -> Int = 1\n" },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
@@ -1323,7 +1920,7 @@ test "a name two imports select fails their module, though its module exports it
       source_text: b"import base (T)\nimport base (T, f)\npub fn g() -> Bool = f() == f()\n",
     },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
@@ -1336,10 +1933,112 @@ test "a name a module selects that its module does not declare fails the module"
     { name: b"lib", source_text: b"pub fn used() -> Int = 1\n" },
     { name: b"app", source_text: b"import lib (used, gone)\nfn go() -> Int = used()\n" },
   ];
-  let f = check_sources(empty_memory_store, sources, []);
+  let f = check_sources(fs::mem_empty(), sources, []);
   assert_eq(
     f.results.fold([], |accumulator: List<Bytes>, a: CheckedModule|
       accumulator.concat(a.result.rejected.map(|d: Diagnostic| d.code))),
     [b"E0101"],
   )
 }
+
+test "a type and another type's constructor may share a name" {
+  let sources = [
+    {
+      name: b"m",
+      source_text: Bytes::concat_all([
+        b"type Queued<v> = { value: v, stamp: List<Int> }\n",
+        b"type Route = | Closed | Queued\n",
+        b"pub fn held(q: Queued<Int>) -> Int = q.value\n",
+        b"pub fn routed(full: Bool) -> Bool = match if full { Closed } else { Queued } { Closed -> false, Queued -> true }\n",
+      ]),
+    },
+  ];
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
+}
+
+test "a signature may use an effect set whose effects live in a module it does not import" {
+  let sources = [
+    { name: b"eff", source_text: b"pub effect counter {\n  read count() -> Int\n}\n" },
+    {
+      name: b"sets",
+      source_text: b"import eff (counter)\npub effect set Counting = {counter.count}\npub fn counted() -> Int / {Counting} = counter.count()\n",
+    },
+    {
+      name: b"app",
+      source_text: b"import sets (Counting, counted)\npub fn twice() -> Int / {Counting} = counted() + counted()\n",
+    },
+  ];
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
+}
+
+test "a constructor whose type has a label parameter, declared in another group, is a value that needs no label" {
+  let sources = [
+    {
+      name: b"m",
+      source_text: b"effect log {\n  write note[l](line: String) -> Unit\n}\n\ntype Sink<[l]> = | Sink((String) -> Unit / {log.note[l]}) | Quiet\n\nfn write_line<[l]>(s: Sink<[l]>, line: String) -> Unit / {log.note[l]} =\n  match s { Sink(f) -> f(line), Quiet -> () }\n\nfn hush() -> Unit / {log.note[app]} = write_line[app](Quiet, \"unheard\")\n",
+    },
+  ];
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
+}
+
+test "a signature that names a type keyed by its parameter implies that the parameter is ordered" {
+  let sources = [
+    {
+      name: b"m",
+      source_text: b"pub opaque type Bag<a> = | Bag(Map<a, Unit>)\npub fn empty_bag<a>() -> Bag<a> = Bag(Map::new())\npub fn held<a>(b: Bag<a>, x: a) -> Bool = match b { Bag(m) -> m.contains(x) }\n",
+    },
+  ];
+  assert(accepted(queried_over(fs::mem_empty(), sources).outcome))
+}
+
+test "a module's stored interface and contracts equal those its checked groups give" {
+  let sources = [
+    {
+      name: b"lib",
+      source_text: b"pub type Pair = { a: Int, b: Int }\npub effect log { write emit(Bytes) -> Unit }\nfn helper(x: Int) -> Int = x * 2\npub fn two(x: Int) -> Int requires x >= 0 ensures result > x = helper(x) + 1\npub fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\npub fn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\npub fn mk(x: Int) -> Pair = { a: x, b: two(x) }\npub fn say(b: Bytes) -> Unit / {log.write} = log.emit(b)\n",
+    },
+  ];
+  let read = read_over(sources, ||
+    {
+      stored: published_module({ module: b"lib", shipped: false, tested: false }),
+      claimed: claims_analysed([{ module: b"lib", shipped: false, tested: true }]).outcome,
+    });
+  match ((read.stored, read.claimed)) {
+    (None, _) -> panic("the stored interface is missing"),
+    (_, ClaimsRejected(_)) -> panic("the sample program was rejected"),
+    (Some(p), ClaimsAnalysed(whole, identities)) -> {
+      assert_eq(p.interface, module_interface_of(whole, sources, b"lib"));
+      assert_eq(
+        contract_lines(p.contracts),
+        contract_lines(
+          public_contracts(whole.index, identities.identities, |m: Bytes| m == b"lib"),
+        ),
+      )
+    },
+  }
+}
+
+test "the stored interface of a module whose unit holds several check groups equals the one its checked groups give" {
+  let sources = [
+    {
+      name: b"lib",
+      source_text: b"pub type Box = | Box(List<Int>)\n\nshow for Box by shown\n\npub fn shown(b: Box) -> String = \"a box of {items(grown(b, 0)).len()}\"\n\npub fn items(b: Box) -> List<Int> = match b { Box(xs) -> xs }\n\npub fn grown(b: Box, n: Int) -> Box = match b { Box(xs) -> Box(xs.push(n)) }\n",
+    },
+  ];
+  let read = read_over(sources, ||
+    {
+      stored: published_module({ module: b"lib", shipped: false, tested: false }),
+      claimed: claims_analysed([{ module: b"lib", shipped: false, tested: true }]).outcome,
+    });
+  match ((read.stored, read.claimed)) {
+    (None, _) -> panic("the stored interface is missing"),
+    (_, ClaimsRejected(_)) -> panic("the sample program was rejected"),
+    (Some(p), ClaimsAnalysed(whole, _)) ->
+      assert_eq(p.interface, module_interface_of(whole, sources, b"lib")),
+  }
+}
+
+fn contract_lines(contracts: List<Contract>) -> List<Bytes> =
+  contracts.map(|c: Contract|
+    Bytes::concat_all([definition_key(c.reference.name, c.reference.kind), b" ", c.hash])).sort(
+  )

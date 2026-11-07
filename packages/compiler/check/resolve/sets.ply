@@ -1,4 +1,5 @@
-import compiler.syntax.parsing (Span, Identifier, QName, dummy_span, is_bare, span_between)
+import compiler.check.resolve.tables (other_modules)
+import compiler.syntax.parsing (Span, Identifier, QName, generated_span, is_bare, span_between)
 import compiler.syntax.node_ids (numbered_missing)
 import compiler.syntax.type_syntax (TypeExpression, VariableTypeExpression, NamedTypeExpression,
                                     FunctionTypeExpression, RecordTypeExpression, EffectsExpression,
@@ -25,15 +26,14 @@ import compiler.syntax.patterns (Pattern, PatternWildcard, PatternVariable, Patt
                                  PatternOr, PatternInvalid)
 import std.list
 import std.bytes (ascii_of_int)
-import compiler.check.resolve.tables (ParsedModule, EffectSpace, SetSpace, ValueSpace, Declaration,
-                                      Binding, ModuleBinding, Scope, Label, Diagnostic, Resolution,
-                                      lookup_declared, lookup, find_module_binding, position,
-                                      qualify, label_at, error_with_labels, error_at, error_at_and,
-                                      backticked)
+import compiler.check.resolve.tables (module_index, ParsedModule, EffectSpace, SetSpace, ValueSpace,
+                                      Declaration, Binding, ModuleBinding, Scope, Label, Diagnostic,
+                                      Resolution, find_module_binding, position, qualify, label_at,
+                                      error_with_labels, error_at, error_at_and, backticked,
+                                      declared_in, declarations_named, bound_in, scope_bindings,
+                                      module_binding_in, implicit_binder, implicit_target)
 import compiler.check.resolve.scopes (private_name_error, find)
 import compiler.expand.rewrite.shared (bare_names_read)
-
-pub fn implicit_binder(module: Bytes) -> Bytes = b"@".concat(module)
 
 type Member = { entry: EffectExpression, defining_module: Int }
 
@@ -41,6 +41,7 @@ type SetNode = {
   definition: EffectSetDefinition,
   module: Int,
   includes: List<Option<Int>>,
+  stored_members: List<EffectExpression>,
   cyclic: Bool,
   members: List<Member>,
 }
@@ -90,6 +91,7 @@ fn set_table(modules: List<ParsedModule>) -> SetTable / {abort.raise} =
                       definition: d,
                       module: m,
                       includes: [],
+                      stored_members: [],
                       cyclic: false,
                       members: [],
                     }),
@@ -101,10 +103,14 @@ fn set_table(modules: List<ParsedModule>) -> SetTable / {abort.raise} =
       ),
   )
 
-fn unknown_set(resolved: Resolution, m: Int, qualified_name: QName) -> Diagnostic / {abort.raise} = {
+fn unknown_set(
+  resolved: Resolution,
+  m: Int,
+  qualified_name: QName,
+) -> Diagnostic / {abort.raise, other_modules.read} = {
   let scope = resolved.scopes.get(m);
   let n = qualified_name.name.name;
-  let effect_notes = match lookup(scope.bound, EffectSpace, n) {
+  let effect_notes = match bound_in(scope, EffectSpace, n) {
     Some(_) ->
       [
         Bytes::concat_all([
@@ -120,7 +126,7 @@ fn unknown_set(resolved: Resolution, m: Int, qualified_name: QName) -> Diagnosti
       ],
     None -> [],
   };
-  let named = scope.bound.sets.map(|binding: Binding| binding.name);
+  let named = scope_bindings(scope, SetSpace).map(|binding: Binding| binding.name);
   let known = if named.len() == 0 {
     b"this module names no `effect set`: declare one, or import a `pub` effect set by name from another module"
   } else { b"the sets this module names: ".concat(backticked(named, b", ")) };
@@ -148,20 +154,48 @@ fn diverges_expression(qualified_name: QName) -> EffectExpression =
     span: qualified_name.span,
   }
 
+type SetFound = | LoadedSet(Int) | StoredSet(List<EffectExpression>)
+
+fn set_in(
+  resolved: Resolution,
+  table: SetTable,
+  owner: Bytes,
+  name: Bytes,
+) -> Option<SetFound> / {abort.raise, other_modules.read} =
+  match match resolved.positions.get(owner) {
+      Some(i) -> table.by_module.get(i).get(name),
+      None -> None,
+    } {
+    Some(id) -> Some(LoadedSet(id)),
+    None -> match other_modules.look_up_effect_set(owner, name) {
+      Some(d) -> Some(StoredSet(d.expansion)),
+      None -> None,
+    },
+  }
+
+fn members_found(table: SetTable, m: Int, found: SetFound) -> List<Member> / {abort.raise} =
+  match found {
+    LoadedSet(id) -> table.nodes.get(id).members,
+    StoredSet(entries) ->
+      entries.map(|entry: EffectExpression| { entry: entry, defining_module: m }),
+  }
+
 fn set_named(
   resolved: Resolution,
   table: SetTable,
   m: Int,
   qualified_name: QName,
-) -> Result<Int, Diagnostic> / {abort.raise} = {
+) -> Result<SetFound, Diagnostic> / {abort.raise, other_modules.read} = {
   let scope = resolved.scopes.get(m);
   let name = qualified_name.name.name;
+  let found_in = |owner: Bytes|
+    match set_in(resolved, table, owner, name) {
+      Some(found) -> Ok(found),
+      None -> Err(unknown_set(resolved, m, qualified_name)),
+    };
   match qualified_name.module {
-    None -> match lookup(scope.bound, SetSpace, name) {
-      Some(b) -> match table.by_module.get(b.owner).get(name) {
-        Some(id) -> Ok(id),
-        None -> Err(unknown_set(resolved, m, qualified_name)),
-      },
+    None -> match bound_in(scope, SetSpace, name) {
+      Some(b) -> found_in(b.owner),
       None -> Err(unknown_set(resolved, m, qualified_name)),
     },
     Some(binder) -> match find_module_binding(scope.modules, binder.name) {
@@ -177,11 +211,14 @@ fn set_named(
           ),
         ),
       Some(mb) -> {
-        let module = resolved.scopes.get(mb.target).module;
-        match lookup_declared(resolved.declarations.get(mb.target), SetSpace, name) {
+        let module = mb.target;
+        match declared_in(resolved, module, SetSpace, name) {
           None -> {
-            let exported = resolved.declarations.get(mb.target).sets.filter(|d: Declaration|
-              d.public).map(|d: Declaration| d.name);
+            let exported = match declarations_named(resolved, module) {
+              Some(declarations) ->
+                declarations.sets.filter(|d: Declaration| d.public).map(|d: Declaration| d.name),
+              None -> [],
+            };
             Err(
               error_at(
                 b"E0114",
@@ -205,37 +242,48 @@ fn set_named(
               ),
             )
           },
-          Some(d) -> if !d.public && mb.target != m {
+          Some(d) -> if !d.public && module != scope.module {
             Err(
-              private_name_error(m, qualified_name.span, mb.target, d.span, SetSpace, name, module),
+              private_name_error(
+                m,
+                qualified_name.span,
+                module_index(resolved, module),
+                d.span,
+                SetSpace,
+                name,
+                module,
+              ),
             )
-          } else {
-            match table.by_module.get(mb.target).get(name) {
-              Some(id) -> Ok(id),
-              None -> Err(unknown_set(resolved, m, qualified_name)),
-            }
-          },
+          } else { found_in(module) },
         }
       },
     },
   }
 }
 
-fn set_includes(resolved: Resolution, table: SetTable) -> SetTable / {abort.raise} =
+fn set_includes(
+  resolved: Resolution,
+  table: SetTable,
+) -> SetTable / {abort.raise, other_modules.read} =
   range(0, table.nodes.len()).fold(table, |accumulator: SetTable, id: Int| {
     let node = accumulator.nodes.get(id);
     let walked = node.definition.includes.fold(
-      { diagnostics: accumulator.diagnostics, xs: [] },
-      |w: { diagnostics: List<Diagnostic>, xs: List<Option<Int>> }, qualified_name: QName|
+      { diagnostics: accumulator.diagnostics, xs: [], stored: [] },
+      |w: { diagnostics: List<Diagnostic>, xs: List<Option<Int>>, stored: List<EffectExpression> }, qualified_name: QName|
         match set_named(resolved, accumulator, node.module, qualified_name) {
-          Ok(i) -> { ..w, xs: w.xs.push(Some(i)) },
-          Err(d) -> { diagnostics: w.diagnostics.push(d), xs: w.xs.push(None) },
+          Ok(LoadedSet(i)) -> { ..w, xs: w.xs.push(Some(i)) },
+          Ok(StoredSet(entries)) -> { ..w, xs: w.xs.push(None), stored: w.stored.concat(entries) },
+          Err(d) -> { ..w, diagnostics: w.diagnostics.push(d), xs: w.xs.push(None) },
         },
     );
     {
       ..accumulator,
       diagnostics: walked.diagnostics,
-      nodes: accumulator.nodes.set(id, { ..node, includes: walked.xs }),
+      nodes: accumulator.nodes.set(id, {
+        ..node,
+        includes: walked.xs,
+        stored_members: walked.stored,
+      }),
     }
   })
 
@@ -349,31 +397,27 @@ fn effect_owner(
   resolved: Resolution,
   home: Int,
   qualified_name: QName,
-) -> Option<{ target: Int, name: Bytes }> / {abort.raise} = {
+) -> Option<{ module: Bytes, name: Bytes }> / {abort.raise, other_modules.read} = {
   let scope = resolved.scopes.get(home);
   match qualified_name.module {
-    Some(b) -> match find_module_binding(scope.modules, b.name) {
-      Some(mb) -> match lookup_declared(
-          resolved.declarations.get(mb.target),
-          EffectSpace,
-          qualified_name.name.name,
-        ) {
-        Some(_) -> Some({ target: mb.target, name: qualified_name.name.name }),
+    Some(b) -> match module_binding_in(scope, b.name) {
+      Some(mb) -> match declared_in(resolved, mb.target, EffectSpace, qualified_name.name.name) {
+        Some(_) -> Some({ module: mb.target, name: qualified_name.name.name }),
         None -> None,
       },
       None -> None,
     },
-    None -> match lookup(scope.bound, EffectSpace, qualified_name.name.name) {
-      Some(b) -> Some({ target: b.owner, name: b.name }),
+    None -> match bound_in(scope, EffectSpace, qualified_name.name.name) {
+      Some(b) -> Some({ module: b.owner, name: b.name }),
       None -> None,
     },
   }
 }
 
-fn member_key(resolved: Resolution, member: Member) -> Bytes / {abort.raise} = {
+fn member_key(resolved: Resolution, member: Member) -> Bytes / {abort.raise, other_modules.read} = {
   let a = member.entry;
   let eff = match effect_owner(resolved, member.defining_module, a.effect_name) {
-    Some(o) -> qualify(resolved.scopes.get(o.target).module, o.name),
+    Some(o) -> qualify(o.module, o.name),
     None -> match a.effect_name.module {
       Some(b) -> Bytes::concat_all([b.name, b"::", a.effect_name.name.name]),
       None -> a.effect_name.name.name,
@@ -402,7 +446,10 @@ fn insert_keyed(sorted: List<KeyedMember>, k: KeyedMember) -> List<KeyedMember> 
     accumulator.push(x))
 }
 
-fn canonical_members(resolved: Resolution, xs: List<Member>) -> List<Member> / {abort.raise} = {
+fn canonical_members(
+  resolved: Resolution,
+  xs: List<Member>,
+) -> List<Member> / {abort.raise, other_modules.read} = {
   let sorted = xs.fold([], |accumulator: List<KeyedMember>, member: Member|
     insert_keyed(accumulator, { key: member_key(resolved, member), member: member }));
   sorted.fold([], |accumulator: List<KeyedMember>, keyed: KeyedMember|
@@ -413,7 +460,10 @@ fn canonical_members(resolved: Resolution, xs: List<Member>) -> List<Member> / {
 
 type SetWork = { t: SetTable, done: List<Bool>, work: List<{ node: Int, visited: Bool }> }
 
-fn set_expand_all(resolved: Resolution, table: SetTable) -> SetTable / {abort.raise} = {
+fn set_expand_all(
+  resolved: Resolution,
+  table: SetTable,
+) -> SetTable / {abort.raise, other_modules.read} = {
   let n = table.nodes.len();
   let steps = table.nodes.fold(0, |accumulator: Int, node: SetNode|
     accumulator + node.includes.len());
@@ -426,7 +476,10 @@ fn set_expand_all(resolved: Resolution, table: SetTable) -> SetTable / {abort.ra
   finished.t
 }
 
-fn set_expand_step(resolved: Resolution, x: SetWork) -> SetWork / {abort.raise} = {
+fn set_expand_step(
+  resolved: Resolution,
+  x: SetWork,
+) -> SetWork / {abort.raise, other_modules.read} = {
   let top = x.work.get(x.work.len() - 1);
   let rest = x.work.take(x.work.len() - 1);
   let node = x.t.nodes.get(top.node);
@@ -443,7 +496,7 @@ fn set_expand_step(resolved: Resolution, x: SetWork) -> SetWork / {abort.raise} 
     );
     { ..x, work: pushed }
   } else {
-    let own = node.definition.listed.map(|entry: EffectExpression|
+    let own = node.definition.listed.concat(node.stored_members).map(|entry: EffectExpression|
       { entry: entry, defining_module: node.module });
     let all = node.includes.fold(own, |accumulator: List<Member>, e: Option<Int>|
       match e {
@@ -487,35 +540,43 @@ fn effect_with_span(entry: EffectExpression, span: Span) -> EffectExpression =
 
 type LocalizedEffect = { entry: EffectExpression, bind: Option<ModuleBinding> }
 
+fn qualified_member(
+  resolved: Resolution,
+  member: Member,
+  span: Span,
+) -> LocalizedEffect / {abort.raise, other_modules.read} = {
+  let moved = effect_with_span(member.entry, span);
+  match effect_owner(resolved, member.defining_module, member.entry.effect_name) {
+    None -> { entry: moved, bind: None },
+    Some(o) -> if o.module.len() == 0 { { entry: moved, bind: None } } else {
+      let binder = implicit_binder(o.module);
+      {
+        entry: {
+          ..moved,
+          effect_name: {
+            module: Some({ name: binder, span: span }),
+            name: { name: o.name, span: span },
+            span: span,
+          },
+        },
+        bind: Some({ binder: binder, target: o.module, span: generated_span }),
+      }
+    },
+  }
+}
+
+fn named_through_implicit_binder(entry: EffectExpression) -> Bool / {abort.raise} =
+  match entry.effect_name.module { Some(b) -> implicit_target(b.name) != None, None -> false }
+
 fn localize_member(
   resolved: Resolution,
   m: Int,
   member: Member,
   span: Span,
-) -> LocalizedEffect / {abort.raise} =
-  if member.defining_module == m { { entry: member.entry, bind: None } } else {
-    let moved = effect_with_span(member.entry, span);
-    match effect_owner(resolved, member.defining_module, member.entry.effect_name) {
-      None -> { entry: moved, bind: None },
-      Some(o) -> {
-        let module = resolved.scopes.get(o.target).module;
-        if module.len() == 0 { { entry: moved, bind: None } } else {
-          let binder = implicit_binder(module);
-          {
-            entry: {
-              ..moved,
-              effect_name: {
-                module: Some({ name: binder, span: span }),
-                name: { name: o.name, span: span },
-                span: span,
-              },
-            },
-            bind: Some({ binder: binder, target: o.target, span: dummy_span }),
-          }
-        }
-      },
-    }
-  }
+) -> LocalizedEffect / {abort.raise, other_modules.read} =
+  if member.defining_module == m && !named_through_implicit_binder(member.entry) {
+    { entry: member.entry, bind: None }
+  } else { qualified_member(resolved, member, span) }
 
 fn add_binding_once(xs: List<ModuleBinding>, b: Option<ModuleBinding>) -> List<ModuleBinding> =
   match b {
@@ -554,7 +615,7 @@ type ExpandedEffects = { expander: EffectsExpander, r: EffectsExpression }
 fn expand_effects(
   expander: EffectsExpander,
   effects: EffectsExpression,
-) -> ExpandedEffects / {abort.raise} =
+) -> ExpandedEffects / {abort.raise, other_modules.read} =
   if effects.aliases.len() == 0 { { expander: expander, r: effects } } else {
     let o = effects.aliases.fold(
       { expander: expander, listed: effects.listed },
@@ -579,8 +640,8 @@ fn expand_effects(
                   diagnostics: accumulator.expander.diagnostics.push(d),
                 },
               },
-            Ok(id) ->
-              accumulator.expander.table.nodes.get(id).members.fold(
+            Ok(found) ->
+              members_found(accumulator.expander.table, accumulator.expander.module, found).fold(
                 accumulator,
                 |a: { expander: EffectsExpander, listed: List<EffectExpression> }, member: Member| {
                   let u = localize_member(
@@ -618,7 +679,7 @@ fn expand_module_sets(
   table: SetTable,
   m: Int,
   parsed: ParsedModule,
-) -> { module: ParsedModule, expander: EffectsExpander } / {abort.raise} = {
+) -> { module: ParsedModule, expander: EffectsExpander } / {abort.raise, other_modules.read} = {
   let start: EffectsExpander = {
     resolved: resolved,
     table: table,
@@ -634,7 +695,7 @@ fn expand_module_sets(
         EffectSetItem(d) -> match table.by_module.get(m).get(d.name.name) {
           Some(id) -> if table.nodes.get(id).definition.span == d.span {
             let us = table.nodes.get(id).members.map(|member: Member|
-              localize_member(resolved, m, member, d.name.span));
+              qualified_member(resolved, member, d.name.span));
             {
               expander: {
                 ..accumulator.expander,
@@ -674,7 +735,7 @@ fn expand_module_sets(
 fn expand_optional_effects(
   expander: EffectsExpander,
   r: Option<EffectsExpression>,
-) -> { expander: EffectsExpander, r: Option<EffectsExpression> } / {abort.raise} =
+) -> { expander: EffectsExpander, r: Option<EffectsExpression> } / {abort.raise, other_modules.read} =
   match r {
     None -> { expander: expander, r: None },
     Some(x) -> {
@@ -686,7 +747,7 @@ fn expand_optional_effects(
 fn expand_effects_in_type(
   expander: EffectsExpander,
   ty: TypeExpression,
-) -> { expander: EffectsExpander, t: TypeExpression } / {abort.raise} =
+) -> { expander: EffectsExpander, t: TypeExpression } / {abort.raise, other_modules.read} =
   match ty {
     NamedTypeExpression(c) -> {
       let o = expand_effects_in_types(expander, c.args);
@@ -727,7 +788,7 @@ fn expand_effects_in_type(
 fn expand_effects_in_types(
   expander: EffectsExpander,
   types: List<TypeExpression>,
-) -> { expander: EffectsExpander, ts: List<TypeExpression> } / {abort.raise} =
+) -> { expander: EffectsExpander, ts: List<TypeExpression> } / {abort.raise, other_modules.read} =
   types.fold(
     { expander: expander, ts: [] },
     |accumulator: { expander: EffectsExpander, ts: List<TypeExpression> }, ty: TypeExpression| {
@@ -739,7 +800,7 @@ fn expand_effects_in_types(
 fn expand_effects_in_optional_type(
   expander: EffectsExpander,
   ty: Option<TypeExpression>,
-) -> { expander: EffectsExpander, t: Option<TypeExpression> } / {abort.raise} =
+) -> { expander: EffectsExpander, t: Option<TypeExpression> } / {abort.raise, other_modules.read} =
   match ty {
     None -> { expander: expander, t: None },
     Some(x) -> {
@@ -751,7 +812,7 @@ fn expand_effects_in_optional_type(
 fn expand_effects_in_parameters(
   expander: EffectsExpander,
   params: List<Param>,
-) -> { expander: EffectsExpander, ps: List<Param> } / {abort.raise} =
+) -> { expander: EffectsExpander, ps: List<Param> } / {abort.raise, other_modules.read} =
   params.fold(
     { expander: expander, ps: [] },
     |accumulator: { expander: EffectsExpander, ps: List<Param> }, param: Param| {
@@ -763,7 +824,7 @@ fn expand_effects_in_parameters(
 fn expand_effects_in_expressions(
   expander: EffectsExpander,
   expressions: List<Expression>,
-) -> { expander: EffectsExpander, xs: List<Expression> } / {abort.raise} =
+) -> { expander: EffectsExpander, xs: List<Expression> } / {abort.raise, other_modules.read} =
   expressions.fold(
     { expander: expander, xs: [] },
     |accumulator: { expander: EffectsExpander, xs: List<Expression> }, expression: Expression| {
@@ -775,7 +836,7 @@ fn expand_effects_in_expressions(
 fn expand_effects_in_fields(
   expander: EffectsExpander,
   fields: List<RecordLiteralField>,
-) -> { expander: EffectsExpander, fs: List<RecordLiteralField> } / {abort.raise} =
+) -> { expander: EffectsExpander, fs: List<RecordLiteralField> } / {abort.raise, other_modules.read} =
   fields.fold(
     { expander: expander, fs: [] },
     |accumulator: { expander: EffectsExpander, fs: List<RecordLiteralField> }, field: RecordLiteralField| {
@@ -787,7 +848,7 @@ fn expand_effects_in_fields(
 fn expand_effects_in_optional_expression(
   expander: EffectsExpander,
   expression: Option<Expression>,
-) -> { expander: EffectsExpander, e: Option<Expression> } / {abort.raise} =
+) -> { expander: EffectsExpander, e: Option<Expression> } / {abort.raise, other_modules.read} =
   match expression {
     None -> { expander: expander, e: None },
     Some(x) -> {
@@ -799,7 +860,7 @@ fn expand_effects_in_optional_expression(
 fn expand_effects_in_expression(
   expander: EffectsExpander,
   expression: Expression,
-) -> { expander: EffectsExpander, e: Expression } / {abort.raise} =
+) -> { expander: EffectsExpander, e: Expression } / {abort.raise, other_modules.read} =
   match expression {
     BinaryExpression(b) -> {
       let l = expand_effects_in_expression(expander, b.left_operand);
@@ -1063,7 +1124,7 @@ fn expand_effects_in_expression(
 fn expand_effects_in_item(
   expander: EffectsExpander,
   item: Item,
-) -> { expander: EffectsExpander, it: Item } / {abort.raise} =
+) -> { expander: EffectsExpander, it: Item } / {abort.raise, other_modules.read} =
   match item {
     FunctionItem(d) -> {
       let ps = expand_effects_in_parameters(expander, d.params);
@@ -1208,6 +1269,20 @@ fn schema_identities(schema: SchemaDefinition) -> List<SchemaIdentity> = {
 
 type Instantiation = { r: Resolution, law: LawDefinition, diagnostics: List<Diagnostic> }
 
+fn schema_in(
+  r: Resolution,
+  modules: List<ParsedModule>,
+  module: Bytes,
+  name: Bytes,
+) -> Option<SchemaDefinition> / {abort.raise, other_modules.read} =
+  match match r.positions.get(module) {
+      Some(i) -> schema_named(modules.get(i).module, name),
+      None -> None,
+    } {
+    Some(schema) -> Some(schema),
+    None -> other_modules.look_up_schema(module, name),
+  }
+
 fn instantiate_law(
   r: Resolution,
   modules: List<ParsedModule>,
@@ -1215,14 +1290,13 @@ fn instantiate_law(
   d: LawDefinition,
   i: SchemaInstance,
   diagnostics: List<Diagnostic>,
-) -> Instantiation / {abort.raise} =
+) -> Instantiation / {abort.raise, other_modules.read} =
   match find(r, m, ValueSpace, i.schema) {
     None -> { r: r, law: d, diagnostics: diagnostics },
     Some(b) -> {
       let name = i.schema.name.name;
-      let home = modules.get(b.owner);
       let args = match d.body { CallExpression(a) -> a.args, _ -> [] };
-      match schema_named(home.module, name) {
+      match schema_in(r, modules, b.owner, name) {
         None ->
           {
             r: r,
@@ -1234,7 +1308,7 @@ fn instantiate_law(
                 i.schema.span,
                 Bytes::concat_all([b"`", name, b"` is not a law schema"]),
                 b"a law instantiates a schema",
-                b.owner,
+                module_index(r, b.owner),
                 b.span,
                 b"declared here",
                 [
@@ -1267,7 +1341,7 @@ fn instantiate_law(
                   b", found ",
                   ascii_of_int(args.len()),
                 ]),
-                b.owner,
+                module_index(r, b.owner),
                 schema.name.span,
                 b"this is the schema being instantiated",
                 [],
@@ -1277,7 +1351,7 @@ fn instantiate_law(
         } else {
           let at = { ..i.span, site: 0 };
           let schema_at = { ..i.schema.span, site: 0 };
-          let through = { name: implicit_binder(home.name), span: schema_at };
+          let through = { name: implicit_binder(b.owner), span: schema_at };
           let end = span_between(i.span.end, i.span.end);
           let names = schema.binders.fold([], |accumulator: List<Bytes>, binder: Binder|
             accumulator.push(
@@ -1326,7 +1400,7 @@ fn instantiate_law(
               },
               of: Some({
                 ..i,
-                module: Some(home.name),
+                module: Some(b.owner),
                 argument_names: schema.binders.map(|binder: Binder| binder.name.name),
                 identities: schema_identities(schema),
               }),
@@ -1351,7 +1425,7 @@ type LawInstantiation = {
 pub fn instantiate_laws(
   r: Resolution,
   modules: List<ParsedModule>,
-) -> LawInstantiation / {abort.raise} =
+) -> LawInstantiation / {abort.raise, other_modules.read} =
   range(0, modules.len()).fold(
     { resolution: r, modules: [], diagnostics: [] },
     |accumulator: LawInstantiation, m: Int| {
@@ -1394,7 +1468,10 @@ type SetExpansion = {
   diagnostics: List<Diagnostic>,
 }
 
-pub fn expand_sets(r: Resolution, modules: List<ParsedModule>) -> SetExpansion / {abort.raise} = {
+pub fn expand_sets(
+  r: Resolution,
+  modules: List<ParsedModule>,
+) -> SetExpansion / {abort.raise, other_modules.read} = {
   let t = set_expand_all(r, set_cycles(set_includes(r, set_table(modules))));
   range(0, modules.len()).fold(
     { resolution: r, modules: [], diagnostics: t.diagnostics },
@@ -1417,7 +1494,7 @@ pub fn add_module_binding(
   resolved: Resolution,
   module: Int,
   binder: Bytes,
-  target: Int,
+  target: Bytes,
 ) -> Resolution / {abort.raise} = {
   let scope: Scope = resolved.scopes.get(module);
   match find_module_binding(scope.modules, binder) {
@@ -1427,7 +1504,7 @@ pub fn add_module_binding(
         ..resolved,
         scopes: resolved.scopes.set(module, {
           ..scope,
-          modules: scope.modules.push({ binder: binder, target: target, span: dummy_span }),
+          modules: scope.modules.push({ binder: binder, target: target, span: generated_span }),
         }),
       },
   }

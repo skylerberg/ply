@@ -34,6 +34,8 @@ import term (Terms, InternedTerm, IntTerm, BoolTerm, StringTerm, DecimalTerm, Fl
              operator_bit_not, op_shl, op_shr, op_ushr, op_lt, op_le, op_gt, operator_ge,
              operator_float)
 import std.list
+import std.set (Set)
+import std.graph (Visit, traverse)
 import std.option
 import std.string
 import compiler.syntax.expressions (is_arithmetic, is_order_comparison)
@@ -189,9 +191,9 @@ pub type Lowering = {
   blockers: List<Blocker>,
   requirements: List<Int>,
   path: List<Int>,
-  identities: Map<Int, Bool>,
-  total: Map<String, Bool>,
-  unrolled: Map<String, Bool>,
+  identities: Set<Int>,
+  total: Set<String>,
+  unrolled: Set<String>,
   equations: List<Int>,
   defined: List<Int>,
   calls: List<Int>,
@@ -199,7 +201,7 @@ pub type Lowering = {
   lemmas: List<Lemma>,
   facts: List<Int>,
   closures: List<Closure>,
-  contracts: Map<String, Bool>,
+  contracts: Set<String>,
   induction_hypothesis: Option<{ name: String, clause: Int }>,
   building: Option<{ type_name: String, by: String }>,
   built: List<Int>,
@@ -227,9 +229,9 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering =
     blockers: [],
     requirements: [],
     path: [],
-    identities: Map::new(),
-    total: Map::new(),
-    unrolled: Map::new(),
+    identities: Set::empty(),
+    total: Set::empty(),
+    unrolled: Set::empty(),
     equations: [],
     defined: [],
     calls: [],
@@ -238,7 +240,7 @@ pub fn lowering(rules: RuleLog, unfold_limit: Int) -> Lowering =
     facts: [],
     closures: [],
     impure: false,
-    contracts: Map::new(),
+    contracts: Set::empty(),
     induction_hypothesis: None,
     building: None,
     built: [],
@@ -1670,7 +1672,7 @@ fn law_covers_call(
   context: Context,
   declared: List<Sort>,
   terms: List<Int>,
-) -> Bool =
+) -> Bool / {abort.raise} =
   !declared.any(|t: Sort| contains_function(context, t))
     && !keyed_at_variable(lowering, context, declared, terms)
 
@@ -1680,7 +1682,7 @@ fn keyed_at_variable(
   declared: List<Sort>,
   terms: List<Int>,
 ) -> Bool =
-  context.compared_by_key.len() > 0
+  !context.compared_by_key.is_empty()
     && (match range(0, declared.len()).fold(
         Some(Map::new()),
         |accumulator: Option<Map<Int, Sort>>, i: Int|
@@ -1696,58 +1698,29 @@ fn keyed_at_variable(
       Some(resolved) -> resolved.values().any(|s: Sort| may_call_key(context, Some(s))),
     })
 
-fn contains_function(context: Context, ty: Sort) -> Bool = function_within(context, ty, [], 64)
+fn contains_function(context: Context, ty: Sort) -> Bool / {abort.raise} =
+  sorts_within(context, ty).any(|s: Sort| match s { FunctionSort(_, _, _) -> true, _ -> false })
 
-fn function_within(context: Context, ty: Sort, seen: List<String>, depth_left: Int) -> Bool =
-  depth_left <= 0
-    || (match ty {
-      SortVariable(_) -> false,
-      FunctionSort(_, _, _) -> true,
-      RecordSort(fields) ->
-        fields.any(|f: { name: String, ty: Sort }|
-          function_within(context, f.ty, seen, depth_left - 1)),
-      NamedSort(n, args) ->
-        args.any(|a: Sort| function_within(context, a, seen, depth_left - 1))
-          || (!seen.contains(n)
-          && (match context.declarations.get(n) {
-            Some(declaration) ->
-              declaration.variants.any(|v: Variant|
-                v.fields.any(|f: Sort| function_within(context, f, seen.push(n), depth_left - 1))),
-            None -> false,
-          })),
-    })
+fn mentions_any(context: Context, ty: Sort, names: List<String>) -> Bool / {abort.raise} =
+  names.len() > 0
+    && sorts_within(context, ty).any(|s: Sort|
+      match s { NamedSort(n, _) -> names.contains(n), _ -> false })
 
-fn mentions_any(context: Context, ty: Sort, names: List<String>) -> Bool =
-  names.len() > 0 && contains_any_name(context, ty, names, [], 64)
-
-fn contains_any_name(
-  context: Context,
-  ty: Sort,
-  names: List<String>,
-  seen: List<String>,
-  depth_left: Int,
-) -> Bool =
-  depth_left <= 0
-    || (match ty {
-      SortVariable(_) -> false,
-      NamedSort(n, args) ->
-        names.contains(n)
-          || args.any(|a: Sort| contains_any_name(context, a, names, seen, depth_left - 1))
-          || (!seen.contains(n)
-          && (match context.declarations.get(n) {
-            Some(declaration) ->
-              declaration.variants.any(|v: Variant|
-                v.fields.any(|f: Sort|
-                  contains_any_name(context, f, names, seen.push(n), depth_left - 1))),
-            None -> false,
-          })),
-      FunctionSort(params, return_type, _) ->
-        params.any(|p: Sort| contains_any_name(context, p, names, seen, depth_left - 1))
-          || contains_any_name(context, return_type, names, seen, depth_left - 1),
-      RecordSort(fields) ->
-        fields.any(|f: { name: String, ty: Sort }|
-          contains_any_name(context, f.ty, names, seen, depth_left - 1)),
-    })
+fn sorts_within(context: Context, ty: Sort) -> List<Sort> / {abort.raise} =
+  traverse([ty], |s: Sort|
+    {
+      value: (),
+      next: match s {
+        SortVariable(_) -> [],
+        FunctionSort(params, return_type, _) -> params.push(return_type),
+        RecordSort(fields) -> fields.map(|f: { name: String, ty: Sort }| f.ty),
+        NamedSort(n, args) ->
+          args.concat(match context.declarations.get(n) {
+            Some(declaration) -> declaration.variants.flat_map(|v: Variant| v.fields),
+            None -> [],
+          }),
+      },
+    }).map(|v: Visit<Sort, Unit>| v.key)
 
 fn call_by_contract(
   lowering: Lowering,
@@ -1840,7 +1813,7 @@ fn call_by_contract(
     }
   }
 
-fn contract_applies(lowering: Lowering, context: Context, name: String) -> Bool =
+fn contract_applies(lowering: Lowering, context: Context, name: String) -> Bool / {abort.raise} =
   (lowering.tainted.len() == 0
     && (match lowering.induction_hypothesis { Some(i) -> i.name == name, None -> false }))
     || (terminates(context, name)
@@ -2584,42 +2557,20 @@ fn bind_opaque(lowering: Lowering, pattern: CodePattern) -> Lowering / {abort.ra
     bind(with_terms(accumulator, t.terms), slot, t.id)
   })
 
-fn pattern_slots(p: CodePattern) -> List<Int> / {abort.raise} =
-  iterate({ stack: [p], out: [] }, 1000000, |s: { stack: List<CodePattern>, out: List<Int> }|
-    match s.stack.at(s.stack.len() - 1) {
-      None -> Stop(s),
-      Some(top) -> {
-        let rest = s.stack.take(s.stack.len() - 1);
-        Continue(match top {
-          CodeBindingPattern(v) ->
-            {
-              stack: rest,
-              out: {
-                let slot = v.slot;
-                s.out.push(slot)
-              },
-            },
-          CodeConstructorPattern(c) ->
-            {
-              stack: c.args.fold(rest, |accumulator: List<CodePattern>, a: CodePattern|
-                accumulator.push(a)),
-              out: s.out,
-            },
-          CodeRecordPattern(r) ->
-            {
-              stack: r.fields.fold(rest, |accumulator: List<CodePattern>, f: CodePatternField|
-                accumulator.push(f.pattern)),
-              out: s.out,
-            },
-          CodeListPattern(l) -> {
-            let items = l.items.fold(rest, |accumulator: List<CodePattern>, a: CodePattern|
-              accumulator.push(a));
-            { stack: match l.rest { Some(r) -> items.push(r), None -> items }, out: s.out }
-          },
-          _ -> { stack: rest, out: s.out },
-        })
-      },
-    }).out
+fn pattern_slots(p: CodePattern) -> List<Int> =
+  match p {
+    CodeBindingPattern(v) -> [v.slot],
+    CodeConstructorPattern(c) ->
+      c.args.fold([], |slots: List<Int>, a: CodePattern| pattern_slots(a).concat(slots)),
+    CodeRecordPattern(r) ->
+      r.fields.fold([], |slots: List<Int>, f: CodePatternField|
+        pattern_slots(f.pattern).concat(slots)),
+    CodeListPattern(l) ->
+      (match l.rest { Some(rest) -> pattern_slots(rest), None -> [] }).concat(
+        l.items.fold([], |slots: List<Int>, a: CodePattern| pattern_slots(a).concat(slots)),
+      ),
+    _ -> [],
+  }
 
 fn match_expression(
   lowering: Lowering,

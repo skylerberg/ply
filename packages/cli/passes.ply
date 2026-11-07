@@ -1,0 +1,391 @@
+import std.bytes
+import std.list
+import std.hash (blake3)
+import std.fs
+import std.fs (fs, Kind, File, Dir, Symlink, Missing, Listed, Entry, MemFs, mem_of, mem_empty)
+import compiler.store.hash.encoding (hex)
+import compiler.unit (shipped)
+import module_queries (shipped_data)
+import sources (shipped_text)
+import testing.reads (RecordedRead, TracedRead, ReadPath, ReadConfiguration, UsedBinding,
+                      ReadShippedModule, ReadShippedData, ReadShippedNames, ReadProgram, PathRead,
+                      WholeFile, DirectoryEntries, PathKind, DirectoryTree, UnderRoot, OutsideRoots,
+                      PathReadAt)
+
+pub type NamedRoot = { name: Bytes, directory: Bytes }
+
+pub type ConfiguredKey = { key: Bytes, digest: Bytes }
+
+pub type PassContext = {
+  roots: List<NamedRoot>,
+  configuration: List<ConfiguredKey>,
+  binding: Bytes,
+  program: Bytes,
+}
+
+type TracedFile = { how: PathRead, place: String, own: List<Bytes> }
+
+type WorldRead = | TracedPath(TracedFile) | ShippedModule(Bytes) | ShippedData(Bytes) | ShippedNames
+
+type ReadSource = | FromContext(Bytes) | FromWorld(WorldRead) | Unrepeatable
+
+type Checked = { holds: Bool, digests: Map<WorldRead, Bytes> }
+
+type Holding = { held: Map<Bytes, List<RecordedRead>>, digests: Map<WorldRead, Bytes> }
+
+const read_chunk_size: Int = 16777216
+
+pub fn still_holding(
+  context: PassContext,
+  stored: Map<Bytes, List<RecordedRead>>,
+) -> Map<Bytes, List<RecordedRead>> / {fs.read[abs], fs.read_file[shipped], shipped.names, abort.raise} =
+  stored.fold(
+    { held: Map::new(), digests: Map::new() },
+    |found: Holding, key: Bytes, reads: List<RecordedRead>| {
+      let checked = checked_reads(context, found.digests, reads);
+      {
+        held: if checked.holds { found.held.insert(key, reads) } else { found.held },
+        digests: checked.digests,
+      }
+    },
+  ).held
+
+fn checked_reads(
+  context: PassContext,
+  digests: Map<WorldRead, Bytes>,
+  reads: List<RecordedRead>,
+) -> Checked / {fs.read[abs], fs.read_file[shipped], shipped.names, abort.raise} =
+  reads.fold({ holds: true, digests: digests }, |checked: Checked, recorded: RecordedRead|
+    if !checked.holds { checked } else {
+      match source_of(context, recorded.read) {
+        FromContext(digest) -> { ..checked, holds: digest == recorded.digest },
+        Unrepeatable -> { ..checked, holds: false },
+        FromWorld(read) -> {
+          let digest = match checked.digests.get(read) {
+            Some(known) -> known,
+            None -> world_digest(read),
+          };
+          { holds: digest == recorded.digest, digests: checked.digests.insert(read, digest) }
+        },
+      }
+    })
+
+fn source_of(context: PassContext, read: TracedRead) -> ReadSource / {abort.raise} =
+  match read {
+    ReadPath(at) -> match traced_file_of(context, at) {
+      Some(file) -> FromWorld(TracedPath(file)),
+      None -> Unrepeatable,
+    },
+    ReadConfiguration(key) -> FromContext(configured_now(context, key)),
+    UsedBinding -> FromContext(context.binding),
+    ReadProgram -> FromContext(context.program),
+    ReadShippedModule(name) -> FromWorld(ShippedModule(name)),
+    ReadShippedData(name) -> FromWorld(ShippedData(name)),
+    ReadShippedNames -> FromWorld(ShippedNames),
+  }
+
+fn traced_file_of(context: PassContext, at: PathReadAt) -> Option<TracedFile> / {abort.raise} =
+  match at.place {
+    OutsideRoots(path) -> file_at(at, path),
+    UnderRoot(rooted) -> match context.roots.find(|r: NamedRoot| r.name == rooted.root) {
+      Some(root) -> file_at(at, joined(root.directory, rooted.path)),
+      None -> None,
+    },
+  }
+
+fn file_at(at: PathReadAt, path: Bytes) -> Option<TracedFile> / {abort.raise} =
+  if !path.starts_with(b"/") { None } else {
+    Some({ how: at.how, place: String::of_bytes_lossy(path.slice(1, path.len())), own: at.own })
+  }
+
+fn joined(directory: Bytes, path: Bytes) -> Bytes =
+  if path.len() == 0 { directory }
+  else if directory.ends_with(b"/") { directory.concat(path) }
+  else { Bytes::concat_all([directory, b"/", path]) }
+
+fn configured_now(context: PassContext, key: Bytes) -> Bytes / {abort.raise} =
+  match context.configuration.find(|c: ConfiguredKey| c.key == key) {
+    Some(c) -> c.digest,
+    None -> configured_digest(None),
+  }
+
+pub fn configured_digest(value: Option<Bytes>) -> Bytes / {abort.raise} =
+  hex(blake3(match value { Some(v) -> Bytes::concat_all([b"value\x00", v]), None -> b"none" }))
+
+fn world_digest(
+  read: WorldRead,
+) -> Bytes / {fs.read[abs], fs.read_file[shipped], shipped.names, abort.raise} =
+  match read {
+    TracedPath(file) -> path_digest(file, read_chunk_size),
+    ShippedModule(name) -> shipped_digest(shipped_text(name)),
+    ShippedData(name) -> shipped_digest(shipped_data(name)),
+    ShippedNames ->
+      hex(
+        blake3(
+          Bytes::concat_all(
+            shipped.names().map(|name: String| Bytes::of_string(name).concat(b"\x00")),
+          ),
+        ),
+      ),
+  }
+
+fn shipped_digest(text: Option<Bytes>) -> Bytes / {abort.raise} =
+  match text { Some(t) -> hex(blake3(t)), None -> b"none" }
+
+fn path_digest(file: TracedFile, step: Int) -> Bytes / {fs.read[abs], abort.raise} =
+  hex(blake3(Bytes::concat_all([how_word(file.how), b"\x00", path_contents(file, step)])))
+
+fn how_word(how: PathRead) -> Bytes =
+  match how {
+    WholeFile -> b"file",
+    DirectoryEntries -> b"dir",
+    PathKind -> b"kind",
+    DirectoryTree -> b"tree",
+  }
+
+fn path_contents(file: TracedFile, step: Int) -> Bytes / {fs.read[abs], abort.raise} =
+  match file.how {
+    WholeFile -> match file_bytes(file.place, step) {
+      Some(bytes) -> Bytes::concat_all([b"bytes\x00", bytes]),
+      None -> b"none",
+    },
+    DirectoryEntries -> match fs.list_dir[abs](file.place) {
+      Some(entries) ->
+        Bytes::concat_all(
+          [b"entries\x00"].concat(
+            entries.filter(|e: Listed| !excluded_entry(e.name, file.own)).map(|e: Listed|
+              Bytes::concat_all([Bytes::of_string(e.name), b"\x00", kind_number(e.kind)])),
+          ),
+        ),
+      None -> b"none",
+    },
+    PathKind -> kind_word(fs.kind[abs](file.place)),
+    DirectoryTree -> match fs.walk[abs](file.place) {
+      Some(entries) ->
+        Bytes::concat_all(
+          entries.fold([], |found: List<Bytes>, e: Entry| {
+            let relative = below(file.place, e.path);
+            if excluded_below(relative, file.own) { found }
+            else { found.push(tree_entry(file.place, relative, e.kind, step)) }
+          }),
+        ),
+      None -> b"none",
+    },
+  }
+
+fn file_bytes(place: String, step: Int) -> Option<Bytes> / {fs.read[abs]} =
+  match fs.file_size[abs](place) {
+    None -> None,
+    Some(size) ->
+      range(0, size / max(step, 1) + 1).fold(Some(b""), |sofar: Option<Bytes>, i: Int|
+        match sofar {
+          None -> None,
+          Some(read) -> match fs.read_at[abs](place, i * step, step) {
+            None -> None,
+            Some(chunk) -> Some(read.concat(chunk)),
+          },
+        }),
+  }
+
+const cache_dir_name: Bytes = b".ply-cache"
+
+fn excluded_entry(name: String, own: List<Bytes>) -> Bool = {
+  let named = Bytes::of_string(name);
+  named == cache_dir_name || own.any(|o: Bytes| o == named)
+}
+
+fn excluded_below(relative: Bytes, own: List<Bytes>) -> Bool =
+  relative.split(b"/").any(|part: Bytes| part == cache_dir_name)
+    || own.any(|o: Bytes| relative == o || relative.starts_with(o.concat(b"/")))
+
+fn below(place: String, path: String) -> Bytes / {abort.raise} = {
+  let whole = Bytes::of_string(path);
+  let prefix = Bytes::of_string(place).concat(b"/");
+  if whole.starts_with(prefix) { whole.slice(prefix.len(), whole.len()) } else { whole }
+}
+
+fn tree_entry(place: String, relative: Bytes, kind: Kind, step: Int) -> Bytes / {fs.read[abs]} =
+  Bytes::concat_all([
+    relative,
+    b"\x00",
+    match kind {
+      Symlink -> b"link\x00",
+      Dir -> b"dir\x00",
+      File ->
+        Bytes::concat_all([
+          b"file\x00",
+          blake3(match file_bytes(place ++ "/" ++ String::of_bytes_lossy(relative), step) {
+            Some(bytes) -> bytes,
+            None -> b"",
+          }),
+        ]),
+      Missing -> b"none\x00",
+    },
+  ])
+
+fn kind_number(kind: Kind) -> Bytes =
+  match kind { File -> b"\x00", Dir -> b"\x01", Symlink -> b"\x02", Missing -> b"\x03" }
+
+fn kind_word(kind: Kind) -> Bytes =
+  match kind { Symlink -> b"link", Dir -> b"dir", File -> b"file", Missing -> b"none" }
+
+fn context_with(configuration: List<ConfiguredKey>) -> PassContext =
+  {
+    roots: [{ name: b"cwd", directory: b"/project" }],
+    configuration: configuration,
+    binding: b"granted",
+    program: b"this ply",
+  }
+
+fn holding_over(
+  context: PassContext,
+  files: MemFs,
+  shipped_files: MemFs,
+  names: List<String>,
+  stored: Map<Bytes, List<RecordedRead>>,
+) -> Map<Bytes, List<RecordedRead>> / {abort.raise} =
+  fs::on_mem[shipped](shipped_files, ||
+    fs::on_mem[abs](files, || shipping_names(names, || still_holding(context, stored))).value).value
+
+fn shipping_names<a | e>(names: List<String>, body: () -> a / {shipped.names | e}) -> a / e =
+  handle { body() } with { shipped.names() -> names }
+
+fn file_read(path: Bytes, digest: Bytes) -> RecordedRead =
+  {
+    read: ReadPath({ how: WholeFile, place: UnderRoot({ root: b"cwd", path: path }), own: [] }),
+    digest: digest,
+  }
+
+fn file_rule(text: Bytes) -> Bytes / {abort.raise} =
+  hex(blake3(Bytes::concat_all([b"file\x00bytes\x00", text])))
+
+test "a stored pass that read a file holds while the file is unchanged, and not after it changes" {
+  let stored = Map::new().insert(b"t", [file_read(b"a.txt", file_rule(b"one"))]);
+  let held_with = |body: Bytes|
+    holding_over(
+      context_with([]),
+      mem_of([{ path: "project/a.txt", body: body }]),
+      mem_empty(),
+      [],
+      stored,
+    );
+  assert_eq(held_with(b"one"), stored);
+  assert_eq(held_with(b"two"), Map::new())
+}
+
+test "a stored pass that read a file under a root granted as `/` is checked against that file" {
+  let stored = Map::new().insert(b"t", [file_read(b"repo/ply.work", file_rule(b"one"))]);
+  let held = holding_over(
+    { ..context_with([]), roots: [{ name: b"cwd", directory: b"/" }] },
+    mem_of([{ path: "repo/ply.work", body: b"one" }]),
+    mem_empty(),
+    [],
+    stored,
+  );
+  assert_eq(held, stored)
+}
+
+test "passes that read the same file are each answered by the file's current text" {
+  let stored = Map::new().insert(b"old", [file_read(b"a.txt", file_rule(b"one"))]).insert(
+    b"new",
+    [file_read(b"a.txt", file_rule(b"two"))],
+  );
+  let held = holding_over(
+    context_with([]),
+    mem_of([{ path: "project/a.txt", body: b"two" }]),
+    mem_empty(),
+    [],
+    stored,
+  );
+  assert_eq(held, Map::new().insert(b"new", [file_read(b"a.txt", file_rule(b"two"))]))
+}
+
+test "a stored pass that read a standard library module's text holds only while that text is unchanged" {
+  let stored = Map::new().insert(b"t", [
+    { read: ReadShippedModule(b"std.list"), digest: hex(blake3(b"one")) },
+  ]);
+  let held_with = |shipped_files: MemFs|
+    holding_over(context_with([]), mem_empty(), shipped_files, [], stored);
+  assert_eq(held_with(mem_of([{ path: "std.list.ply", body: b"one" }])), stored);
+  assert_eq(held_with(mem_of([{ path: "std.list.ply", body: b"two" }])), Map::new());
+  assert_eq(held_with(mem_empty()), Map::new())
+}
+
+test "a stored pass that read the list of shipped modules holds only while the list and its order are unchanged" {
+  let stored = Map::new().insert(b"t", [
+    { read: ReadShippedNames, digest: hex(blake3(b"std.list\x00std.fs\x00")) },
+  ]);
+  let held_with = |names: List<String>|
+    holding_over(context_with([]), mem_empty(), mem_empty(), names, stored);
+  assert_eq(held_with(["std.list", "std.fs"]), stored);
+  assert_eq(held_with(["std.fs", "std.list"]), Map::new());
+  assert_eq(held_with(["std.list"]), Map::new())
+}
+
+test "a stored pass does not hold once a configuration value, the grants, the program or a root it read differs" {
+  let holds = |read: TracedRead, digest: Bytes, context: PassContext| {
+    let stored = Map::new().insert(b"t", [{ read: read, digest: digest }]);
+    holding_over(
+        context,
+        mem_of([{ path: "project/a.txt", body: b"one" }]),
+        mem_empty(),
+        [],
+        stored,
+      )
+      == stored
+  };
+  let region = |value: Bytes| [{ key: b"SERVICE_REGION", digest: configured_digest(Some(value)) }];
+  let eu = configured_digest(Some(b"eu"));
+  assert(holds(ReadConfiguration(b"SERVICE_REGION"), eu, context_with(region(b"eu"))), None);
+  assert(!holds(ReadConfiguration(b"SERVICE_REGION"), eu, context_with(region(b"us"))), None);
+  assert(!holds(ReadConfiguration(b"SERVICE_REGION"), eu, context_with([])), None);
+  assert(holds(UsedBinding, b"granted", context_with([])), None);
+  assert(!holds(UsedBinding, b"granted", { ..context_with([]), binding: b"more granted" }), None);
+  assert(!holds(ReadProgram, b"this ply", { ..context_with([]), program: b"another ply" }), None);
+  let under_root = file_read(b"a.txt", file_rule(b"one")).read;
+  assert(holds(under_root, file_rule(b"one"), context_with([])), None);
+  assert(!holds(under_root, file_rule(b"one"), { ..context_with([]), roots: [] }), None)
+}
+
+test "a file's digest read in chunks equals the digest of its whole text, at and just past a chunk's size" {
+  let digest_of_file = |body: Bytes|
+    fs::on_mem[abs](mem_of([{ path: "project/a.txt", body: body }]), ||
+      path_digest({ how: WholeFile, place: "project/a.txt", own: [] }, 4)).value;
+  assert_eq(
+    [b"", b"four", b"fives", b"eight by"].map(digest_of_file),
+    [b"", b"four", b"fives", b"eight by"].map(file_rule),
+  );
+  assert_eq(
+    fs::on_mem[abs](mem_empty(), ||
+      path_digest({ how: WholeFile, place: "project/a.txt", own: [] }, 4)).value,
+    hex(blake3(b"file\x00none")),
+  );
+  assert_eq(
+    fs::on_mem[abs](mem_of([{ path: "project/a.txt", body: b"fives" }]), ||
+      path_digest({ how: DirectoryTree, place: "project", own: [] }, 4)).value,
+    hex(blake3(Bytes::concat_all([b"tree\x00a.txt\x00file\x00", blake3(b"fives")]))),
+  )
+}
+
+test "a tree's digest ignores `.ply-cache` and the paths the run wrote, and changes with any other file below it" {
+  let digest_of_tree = |files: List<{ path: String, body: Bytes }>|
+    fs::on_mem[abs](mem_of(files), ||
+      path_digest({ how: DirectoryTree, place: "project", own: [b"out"] }, read_chunk_size)).value;
+  let base = [{ path: "project/a.ply", body: b"a" }, { path: "project/b/c.ply", body: b"c" }];
+  let original = digest_of_tree(base);
+  assert_eq(
+    digest_of_tree(
+      base.concat([
+        { path: "project/.ply-cache/entry", body: b"cached" },
+        { path: "project/out/written", body: b"written" },
+      ]),
+    ),
+    original,
+  );
+  assert(
+    digest_of_tree([{ path: "project/a.ply", body: b"a" }, { path: "project/b/c.ply", body: b"d" }])
+      != original,
+    None,
+  );
+  assert(digest_of_tree(base.concat([{ path: "project/b/new.ply", body: b"n" }])) != original, None)
+}

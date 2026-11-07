@@ -1,32 +1,31 @@
-import compiler.load (Derives)
-import compiler.front (viewed_text)
-import compiler.front.facts (is_shipped_module)
+import progress
+import std.set (Set)
+import sources (ProjectFiles)
+import compiler.load (Loads)
 import compiler.unit (shipped)
 import std.random (entropy)
 import std.time (time)
-import module_queries
 import builder (builder)
 import args (Flags, matches_filters, module_names, no_flags, style_of)
 import compiler.cc (toolchain)
-import program (Program, Tables, TimedLoad, definitions_in_order, tables_of, location_of, place_of,
-                hash_of, own_hash_of, dependencies_of, specialization_count, short_of, timed_over,
-                no_program, program_view, encoded_command_line, cached_command, cache_command)
-import module_queries (command_key)
-import sources (Project, load_resolved)
-import std.bin
-import std.bytes
+import program (Tables, definitions_in_order, tables_of, location_of, place_of, places_of, hash_of,
+                dependencies_of, session, specialization_count, short_of)
+import diagnostic (SourceText)
+import compiler.front.checking.view
+import compiler.front.checking.world (Modules)
+import compiler.front.checking.groups (ProgramSummary)
 import report (CommandOutput, schema_version, ok_code, count_of, indent, rejected)
 import std.term (Style, bold, dim)
 import compiler.store.hash.forms (FunctionNamed)
 import compiler.store.hash (no_hashes)
-import compiler.check.infer.checker (DefinitionInfo)
+import compiler.check.infer.checker (DefinitionInfo, WrittenEffects)
 import compiler.check.termination (Terminates, unknown_summary)
 import compiler.check.types (Effect, NamedType, FunctionType, effects_text, scheme_text)
 import std.fs (fs)
-import std.json (Json, Null, Str, Bool, Number, Array, Object, object, parse_string, string_or_null,
-                 strings, to_string)
+import std.json (Json, Null, Str, Bool, Number, Array, object, string_or_null, strings)
 import signature (effect_texts)
 import compiler.syntax.parsing (span_between)
+import project_store
 
 pub fn scheme_of(definition_info: DefinitionInfo) -> String / {abort.raise} =
   String::of_bytes_lossy(scheme_text(definition_info.scheme))
@@ -36,7 +35,7 @@ pub fn listed_effects_text(effects: List<Effect>) -> String / {abort.raise} =
 
 fn is_listed(
   flags: Flags,
-  modules: Map<String, Bool>,
+  modules: Set<String>,
   pulled: (Int) -> Bool,
   definition_info: DefinitionInfo,
 ) -> Bool / {abort.raise} =
@@ -48,11 +47,11 @@ fn is_listed(
       String::of_bytes_lossy(definition_info.name),
     )
 
-fn file_of(p: Program, definition_info: DefinitionInfo) -> Json =
-  match place_of(p, definition_info.at) { Some(place) -> Str(place.path), None -> Null }
+fn file_of(places: List<SourceText>, definition_info: DefinitionInfo) -> Json =
+  match place_of(places, definition_info.at) { Some(place) -> Str(place.path), None -> Null }
 
 fn definition_json(
-  program: Program,
+  places: List<SourceText>,
   tables: Tables,
   definition_info: DefinitionInfo,
 ) -> Json / {abort.raise} =
@@ -60,12 +59,11 @@ fn definition_json(
     { key: "name", value: Str(String::of_bytes_lossy(definition_info.name)) },
     { key: "module", value: Str(String::of_bytes_lossy(definition_info.module)) },
     { key: "simple_name", value: Str(String::of_bytes_lossy(definition_info.simple_name)) },
-    { key: "location", value: string_or_null(location_of(program, definition_info.at)) },
-    { key: "file", value: file_of(program, definition_info) },
+    { key: "location", value: string_or_null(location_of(places, definition_info.at)) },
+    { key: "file", value: file_of(places, definition_info) },
     { key: "start", value: Number(Decimal::of_int(definition_info.at.span.start)) },
     { key: "end", value: Number(Decimal::of_int(definition_info.at.span.end)) },
     { key: "hash", value: string_or_null(hash_of(tables, definition_info.name)) },
-    { key: "own", value: string_or_null(own_hash_of(tables, definition_info.name)) },
     { key: "type", value: Str(scheme_of(definition_info)) },
     { key: "effects", value: strings(effect_texts(definition_info.effects)) },
     { key: "performed", value: strings(effect_texts(definition_info.performed)) },
@@ -84,12 +82,15 @@ fn definition_json(
 fn short_or_blank(tables: Tables, definition_info: DefinitionInfo) -> String / {abort.raise} =
   match hash_of(tables, definition_info.name) { Some(h) -> short_of(h), None -> "" }
 
-fn location_or_blank(p: Program, definition_info: DefinitionInfo) -> String / {abort.raise} =
-  match location_of(p, definition_info.at) { Some(l) -> l, None -> "" }
+fn location_or_blank(
+  places: List<SourceText>,
+  definition_info: DefinitionInfo,
+) -> String / {abort.raise} =
+  match location_of(places, definition_info.at) { Some(l) -> l, None -> "" }
 
 fn text_lines(
   style: Style,
-  program: Program,
+  places: List<SourceText>,
   tables: Tables,
   definitions: List<DefinitionInfo>,
 ) -> List<String> / {abort.raise} =
@@ -98,7 +99,7 @@ fn text_lines(
       indent ++ dim(style, short_or_blank(tables, definition_info)) ++ "  "
         ++ bold(style, String::of_bytes_lossy(definition_info.name))
         ++ "  "
-        ++ dim(style, location_or_blank(program, definition_info)),
+        ++ dim(style, location_or_blank(places, definition_info)),
     ).push(
       indent ++ indent ++ scheme_of(definition_info) ++ " / "
         ++ listed_effects_text(definition_info.effects),
@@ -106,7 +107,7 @@ fn text_lines(
 
 fn definitions_output(
   style: Style,
-  program: Program,
+  places: List<SourceText>,
   tables: Tables,
   definitions: List<DefinitionInfo>,
 ) -> CommandOutput / {abort.raise} =
@@ -120,12 +121,12 @@ fn definitions_output(
         key: "definitions",
         value: Array(
           definitions.map(|definition_info: DefinitionInfo|
-            definition_json(program, tables, definition_info)),
+            definition_json(places, tables, definition_info)),
         ),
       },
       { key: "diagnostics", value: Array([]) },
     ]),
-    lines: text_lines(style, program, tables, definitions).push("").push(
+    lines: text_lines(style, places, tables, definitions).push("").push(
       indent ++ count_of(definitions.len(), "definition"),
     ),
     errs: [],
@@ -134,92 +135,22 @@ fn definitions_output(
 
 pub fn run(
   flags: Flags,
-  argv: List<String>,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, entropy.next, time.now_ms, Derives, abort.raise, diverges, shipped.report_view_used} = {
-  let started = time.elapsed_ms();
-  let project = load_resolved(flags.paths);
-  let key = command_key(module_queries::program_digest(), encoded_command_line(argv, flags.paths));
-  let shown = key.hex_of();
-  match cached_command(flags.paths, project, key) {
-    Some(bytes) -> match bin::decode(bytes, cached_listing_bin()) {
-      Ok(l) -> match parse_string(l.json) {
-        Ok(Object(members)) ->
-          {
-            json: Object(
-              members.insert(
-                "front_end",
-                object([{ key: "reused", value: Bool(true) }, { key: "key", value: Str(shown) }]),
-              ),
-            ),
-            lines: l.lines,
-            errs: l.errs,
-            code: l.code,
-          },
-        _ -> list_now(flags, project, started, key),
-      },
-      Err(_) -> list_now(flags, project, started, key),
-    },
-    None -> list_now(flags, project, started, key),
-  }
-}
-
-type CachedListing = { lines: List<String>, errs: List<String>, code: Int, json: String }
-
-derive bin for CachedListing
-
-fn list_now(
-  flags: Flags,
-  project: Project,
-  started: Int,
-  key: Bytes,
-) -> CommandOutput / {shipped.read_pack, toolchain.reuse_dir, fs.kind[cwd], fs.kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, entropy.next, time.now_ms, Derives, abort.raise, shipped.report_view_used} = {
-  let t: TimedLoad = timed_over(flags.paths, project, started, flags.verify_dependencies);
-  let loaded: Program = t.program;
-  match program_view(loaded) {
-    None -> rejected(style_of(flags), "definitions", loaded.diagnostics, loaded.source_texts),
-    Some(w) -> {
-      let modules = module_names(w.frame.order);
-      let listed = definitions_output(
+) -> CommandOutput / {project_store::Databases, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], time.elapsed_ms, Loads, abort.raise, diverges} =
+  match progress::silently(||
+      session(flags.paths, flags.verify_dependencies, |m: Modules, _: ProgramSummary|
+        view::listed(m))) {
+    Err(r) -> rejected(style_of(flags), "definitions", r.diagnostics, r.places),
+    Ok(opened) -> {
+      let w = opened.value;
+      definitions_output(
         style_of(flags),
-        loaded,
-        tables_of(w.frame.hashes),
+        places_of(opened),
+        tables_of(w.hashes),
         definitions_in_order(w).filter(|definition_info: DefinitionInfo|
-          is_listed(
-            flags,
-            modules,
-            |i: Int| is_shipped_module(w.frame.packages, w.frame.module_packages, i),
-            definition_info,
-          )),
-      );
-      let result = match listed.json {
-        Object(members) ->
-          {
-            ..listed,
-            json: Object(
-              members.insert("front_end", object([{ key: "reused", value: Bool(false) }])),
-            ),
-          },
-        _ -> listed,
-      };
-      let _ = cache_command(
-        flags.paths,
-        project,
-        key,
-        loaded,
-        bin::encode(
-          {
-            lines: result.lines,
-            errs: result.errs,
-            code: result.code,
-            json: to_string(result.json),
-          },
-          cached_listing_bin(),
-        ),
-      );
-      result
+          is_listed(flags, module_names(w.order), |i: Int| i >= w.own, definition_info)),
+      )
     },
   }
-}
 
 fn monomorphic_definition(name: Bytes, module: Bytes, simple: Bytes) -> DefinitionInfo =
   {
@@ -241,6 +172,8 @@ fn monomorphic_definition(name: Bytes, module: Bytes, simple: Bytes) -> Definiti
     },
     effects: [],
     performed: [],
+    removable: [],
+    effects_source: WrittenEffects,
     scaling: [],
     repeats: [],
     promised_bounded: [],
@@ -251,6 +184,7 @@ fn monomorphic_definition(name: Bytes, module: Bytes, simple: Bytes) -> Definiti
     effect_aliases: [],
     constraints: [],
     spec: [],
+    waits: [],
     at: { module: 0, span: span_between(20, 40) },
   }
 
@@ -278,16 +212,8 @@ test "a definition with no effects and no type variables prints as `() -> Int` w
 }
 
 test "a definitions listing starts and ends with a blank line, and its last line is the definition count" {
-  let p: Program = {
-    ..no_program,
-    source_texts: [{ path: "m.ply", text: b"fn two() -> Int = 1\n" }],
-  };
-  let tables: Tables = {
-    definitions: Map::new(),
-    own: Map::new(),
-    specs: Map::new(),
-    hashes: no_hashes,
-  };
+  let p = [{ path: "m.ply", text: b"fn two() -> Int = 1\n" }];
+  let tables: Tables = { definitions: Map::new(), specs: Map::new(), hashes: no_hashes };
   let result = definitions_output(style_of(flags_of([])), p, tables, [
     monomorphic_definition(b"m.two", b"m", b"two"),
   ]);

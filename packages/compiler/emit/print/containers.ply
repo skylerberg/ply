@@ -4,7 +4,8 @@ import compiler.check.types (Type, NamedType, FunctionType, RecordType, Field, r
                              encode_type, list_type, int_type, string_type, float_type,
                              decimal_type)
 import compiler.check.known (array_type, columns_type)
-import compiler.emit.representations (layout_of, pointer_layout, known_layout, no_constructors)
+import compiler.emit.representations (layout_of, pointer_layout, known_layout, holds_list_of,
+                                      ShapeReads, with_no_shapes)
 import compiler.emit.c (int_literal)
 import compiler.emit.typing (unknown_type)
 import compiler.emit.layout (Intrinsic, OfMap, MapRoot, NodeCount, MapHeight, NodeKey, NodeValue,
@@ -35,7 +36,7 @@ import compiler.emit.print.text (operand, word_slot, Printing, InstructionContex
                                  source_position, fails_when, check, zero, part_names, unsupported,
                                  slot, nth)
 import compiler.emit.lower.representation (leaf_span, leaves_within, leaf_values, c_values_of,
-                                           representation_with)
+                                           representation_of)
 import compiler.emit.print.value_printing (c_type, c_types, as_word, word_as, word_to_parts,
                                            signature_types, arg_parts, values_as_words, parts_read,
                                            values_read, layout_dups, layout_retain_at)
@@ -54,14 +55,14 @@ pub fn list_printed(
   printing: Printing,
   into: Option<Variable>,
   m: { made: Allocation, args: List<Arg>, reuse: Option<Variable> },
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match base_allocation(m.made) {
     ListAllocation(_) -> match into {
       Some(v) -> {
         let n = named(printing, v);
         let items = m.args.map(|a: Arg|
           values_as_words(arg_parts(printing, a), c_values_of(operand_representation(a))));
-        let stride = match pointer_layout(printing.constructors, element_type(v.ty)) {
+        let stride = match pointer_layout(element_type(v.ty)) {
           Some(l) -> max(1, words(l)),
           None -> if m.args.len() == 0 { 1 }
           else { item_element(printing, element_type(v.ty)).stride },
@@ -81,8 +82,8 @@ fn retained_printed(
   printing: Printing,
   v: Variable,
   object: Bytes,
-) -> Printing / {abort.raise} =
-  match known_layout(printing.constructors, v.ty) {
+) -> Printing / {ShapeReads} =
+  match known_layout(v.ty) {
     Some(l) -> {
       let m = words(l);
       let n = named(printing, v);
@@ -135,7 +136,7 @@ pub fn container_operation(
   operation: ContainerOperation,
   args: List<Arg>,
   uses: OperationSignature,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let object = operand(printing, args, 0);
   let index = operand(printing, args, 1);
   match into {
@@ -251,8 +252,8 @@ pub fn container_operation(
   }
 }
 
-pub fn item_element(printing: Printing, ty: Type) -> Element / {abort.raise} =
-  match pointer_layout(printing.constructors, ty) {
+pub fn item_element(printing: Printing, ty: Type) -> Element / {ShapeReads} =
+  match pointer_layout(ty) {
     Some(l) -> { layout: l, stride: max(1, words(l)) },
     None ->
       unsupported(
@@ -273,7 +274,7 @@ fn run_start(from: Int, k: Bytes, stride: Int) -> Bytes =
 
 type PairLayout = { key: Element, value: Element, pair: Int, branch: BranchLayout }
 
-fn pair_layout(printing: Printing, node: Type) -> PairLayout / {abort.raise} = {
+fn pair_layout(printing: Printing, node: Type) -> PairLayout / {ShapeReads} = {
   let k = item_element(printing, type_arg(node, 0));
   let v = item_element(printing, type_arg(node, 1));
   { key: k, value: v, pair: k.stride + v.stride, branch: branch_layout(k.stride) }
@@ -318,7 +319,7 @@ fn intrinsic_printed(
   v: Variable,
   intrinsic: Intrinsic,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let laid = container_layouts;
   let o = operand(printing, args, 0);
   let i = operand(printing, args, 1);
@@ -370,10 +371,7 @@ fn intrinsic_printed(
         strided_set(printing, a, from, k, stride, e, x),
       ),
     );
-    fragment_line(
-      p.depth,
-      parts_released(set, layout_parts(printing.constructors, ty, e.layout, 0), olds.names),
-    )
+    fragment_line(p.depth, parts_released(set, layout_parts(ty, e.layout, 0), olds.names))
   };
   let pl = || pair_layout(printing, if args.len() == 0 { v.ty } else { node });
   match intrinsic {
@@ -515,7 +513,7 @@ fn intrinsic_printed(
         p.depth,
         parts_released(
           kid,
-          layout_parts(printing.constructors, type_arg(node, 0), l.key.layout, 0),
+          layout_parts(type_arg(node, 0), l.key.layout, 0),
           range(0, ks).map(|j: Int| strided_slot(a, l.branch.keys, i, ks, j)),
         ),
       );
@@ -548,7 +546,7 @@ fn record_printed(
   v: Variable,
   operation: Intrinsic,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let laid = container_layouts;
   let d = p.depth;
   let container_temp = temp(printing);
@@ -825,7 +823,7 @@ fn array_new(
   v: Variable,
   e: Element,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let ty = element_type(v.ty);
   let n = operand(printing, args, 0);
   let x = operand_arg(args, 1);
@@ -864,7 +862,7 @@ fn copies_counted(
   ty: Type,
   r: Representation,
   xs: List<Bytes>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let dups = duped(printing, ty, r, xs);
   let none = released(dups.printing, ty, r, xs);
   if dups.out.len() == 0 { none.printing } else {
@@ -887,7 +885,7 @@ fn array_set(
   v: Variable,
   e: Element,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let ty = element_type(v.ty);
   let i = operand(printing, args, 1);
   let x = operand_arg(args, 2);
@@ -913,7 +911,7 @@ fn array_set(
   let copy_unless_unique = array_writable(line(raised, d, b"} else {"), d + 1, a, n.name, e, v.ty);
   let replaced = parts_released(
     copy_unless_unique,
-    layout_parts(printing.constructors, ty, e.layout, 0),
+    layout_parts(ty, e.layout, 0),
     element_slots(a, i, e),
   );
   let written = line(
@@ -931,13 +929,10 @@ fn array_writable(
   n: Bytes,
   e: Element,
   ty: Type,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let c = temp(printing);
   let j = temp(c.printing);
-  let dups = dup_of(
-    layout_parts(printing.constructors, element_type(ty), e.layout, 0),
-    element_slots(c.name, j.name, e),
-  );
+  let dups = dup_of(layout_parts(element_type(ty), e.layout, 0), element_slots(c.name, j.name, e));
   let old = released(j.printing, ty, AsWord, [a]);
   pieces(
     old.printing,
@@ -993,8 +988,9 @@ fn list_pushed(
   v: Variable,
   e: Element,
   args: List<Arg>,
-) -> Printing = {
+) -> Printing / {ShapeReads} = {
   let d = p.depth;
+  let shares = if holds_list_of(element_type(v.ty)) { b"0" } else { b"1" };
   let held = assigned(printing, d, v, c_type(v.representation), operand(printing, args, 0));
   let a = name_of(held, v);
   let c = copy_called(held, a, v.ty);
@@ -1024,7 +1020,15 @@ fn list_pushed(
     ),
     Hole(Symbol(Root(root_of(Copy, v.ty)))),
     Text(
-      Bytes::concat_all([b", ", ascii_of_int(e.stride), b"); else ", lh(b"claimed"), b" += 1;\n"]),
+      Bytes::concat_all([
+        b", ",
+        ascii_of_int(e.stride),
+        b", ",
+        shares,
+        b"); else ",
+        lh(b"claimed"),
+        b" += 1;\n",
+      ]),
     ),
   ]);
   let w = temp(opened);
@@ -1056,7 +1060,7 @@ fn list_set(
   v: Variable,
   e: Element,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let ty = element_type(v.ty);
   let i = operand(printing, args, 1);
   let x = operand_arg(args, 2);
@@ -1106,7 +1110,7 @@ fn list_set(
   );
   let replaced = parts_released(
     located,
-    layout_parts(printing.constructors, ty, e.layout, 0),
+    layout_parts(ty, e.layout, 0),
     range(0, e.stride).map(|j: Int| slot_at(w.name, j)),
   );
   let written = line(
@@ -1123,7 +1127,7 @@ fn array_of_list(
   v: Variable,
   e: Element,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let ty = element_type(v.ty);
   let l = operand(printing, args, 0);
   let listed = list_type(ty);
@@ -1173,8 +1177,8 @@ fn item_loop(
   n: Bytes,
   i: Bytes,
   ty: Type,
-) -> { printing: Printing, values: List<Bytes>, representation: Representation } / {abort.raise} = {
-  let rep = representation_with(printing.constructors, ty);
+) -> { printing: Printing, values: List<Bytes>, representation: Representation } / {ShapeReads} = {
+  let rep = representation_of(ty);
   let e = item_element(printing, ty);
   let w = temp(printing);
   let x = temp(w.printing);
@@ -1182,7 +1186,7 @@ fn item_loop(
   let opened = line(x.printing, depth, for_each(i, b"0", n));
   let read = item_read(opened, depth + 1, w.name, l, i, e.stride);
   let words = range(0, e.stride).map(|j: Int| slot_at(w.name, j));
-  let dup = dup_of(layout_parts(printing.constructors, ty, e.layout, 0), words);
+  let dup = dup_of(layout_parts(ty, e.layout, 0), words);
   let counted = if dup.len() == 0 { read } else { line(read, depth + 1, dup) };
   let values = values_read(|j: Int| slot_at(w.name, j), c_values_of(rep));
   {
@@ -1245,7 +1249,7 @@ fn find_bytes_printed(
   printing: Printing,
   v: Variable,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let b = operand(printing, args, 0);
   let from = operand(printing, args, 1);
   let f = operand(printing, args, 2);
@@ -1315,14 +1319,11 @@ fn find_bytes_printed(
   line(hit, d, b"}")
 }
 
-fn predicate_convention(printing: Printing, args: List<Arg>) -> Convention / {abort.raise} =
+fn predicate_convention(printing: Printing, args: List<Arg>) -> Convention / {ShapeReads} =
   match args.at(2) {
     Some(VariableOperand(v)) -> match v.ty {
       FunctionType(t) -> {
-        let c = convention_of(printing.constructors, {
-          params: t.params,
-          result_type: t.return_type,
-        });
+        let c = convention_of({ params: t.params, result_type: t.return_type });
         if reps_of(c) == [AsInt] && c.result == AsBool { c } else {
           unsupported(
             b"the predicate given to a byte string's `position` must take an integer and return a `Bool`",
@@ -1359,7 +1360,7 @@ fn columns_new(
   v: Variable,
   es: List<Element>,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let ty = element_type(v.ty);
   let n = operand(printing, args, 0);
   let x = operand_arg(args, 1);
@@ -1419,7 +1420,7 @@ fn columns_of_list(
   v: Variable,
   es: List<Element>,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let ty = element_type(v.ty);
   let l = operand(printing, args, 0);
   let listed = list_type(ty);
@@ -1490,7 +1491,7 @@ fn columns_get(
   v: Variable,
   es: List<Element>,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let c = operand(printing, args, 0);
   let i = operand(printing, args, 1);
   let tested = index_check(p, printing, b"Columns::get", word_slot(c, b"0"), i);
@@ -1521,7 +1522,7 @@ fn columns_set(
   v: Variable,
   es: List<Element>,
   args: List<Arg>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let ty = element_type(v.ty);
   let fields = field_types(ty);
   let i = operand(printing, args, 1);
@@ -1607,7 +1608,7 @@ fn columns_set(
     );
     let replaced = parts_released(
       copy_unless_unique,
-      layout_parts(printing.constructors, element_type(column_type(f)), e.layout, 0),
+      layout_parts(element_type(column_type(f)), e.layout, 0),
       element_slots(col.name, i, e),
     );
     line(
@@ -1688,7 +1689,7 @@ fn element_values(a: Bytes, i: Bytes, e: Element, r: Representation) -> List<Byt
     c_values_of(r),
   )
 
-fn field_words(ws: List<Bytes>, es: List<Element>, f: Int) -> List<Bytes> / {abort.raise} =
+fn field_words(ws: List<Bytes>, es: List<Element>, f: Int) -> List<Bytes> / {ShapeReads} =
   ws.drop(es.take(f).fold(0, |n: Int, e: Element| n + words(e.layout))).take(
     words(es.get(f).layout),
   )
@@ -1722,9 +1723,9 @@ fn allocate_columns(c: Bytes, k: Int) -> Bytes =
 fn columns_allocation(k: Int) -> Bytes =
   Bytes::concat_all([b"ply_alloc(ctx, ", ascii_of_int(header_bytes + 8 * k), b")"])
 
-fn max_elements(e: Element) -> Int / {abort.raise} = min(array_limit, 4294967295 / e.stride)
+fn max_elements(e: Element) -> Int / {ShapeReads} = min(array_limit, 4294967295 / e.stride)
 
-fn max_records(es: List<Element>) -> Int / {abort.raise} =
+fn max_records(es: List<Element>) -> Int / {ShapeReads} =
   es.fold(array_limit, |m: Int, e: Element| min(m, max_elements(e)))
 
 fn rejected(
@@ -1811,156 +1812,168 @@ test "a length stores no site, and a failing index stores one on the branch that
 }
 
 test "a list literal is laid out by the emitted code, its items in the block its room asks for" {
-  let made_of = |item: Type, args: List<Arg>|
-    pieces_text(
-      list_printed(
-        at_top,
-        empty_printing(Map::new().insert(0, b"p0")),
-        Some({ id: 1, ty: list_type(item), representation: AsWord }),
-        { made: ListAllocation(args.len()), args: args, reuse: None },
-      ).out,
-    );
-  let made = |args: List<Arg>| made_of(string_type, args);
-  let laid = container_layouts.list;
-  let item = |k: Int| Bytes::concat_all([b"[", ascii_of_int(laid.items + k), b"] = "]);
-  let two = made([VariableOperand(local_var(0, string_type, AsWord)), ZeroOperand(AsWord)]);
-  let has = |text: Bytes, t: Bytes|
-    assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  has(two, b"ply_list_room(ctx, 2, 1)");
-  has(two, item(0).concat(b"p0;"));
-  has(two, item(1).concat(b"0;"));
-  has(two, b"))->len = 2;");
-  assert_eq(made([]).index_of(b")["), None);
-  let decimal_list_text = made_of(decimal_type, [ZeroOperand(AsDecimal)]);
-  has(decimal_list_text, b"ply_list_room(ctx, 1, 2)");
-  has(decimal_list_text, item(1).concat(b"("));
-  [made([]), two].fold((), |_: Unit, text: Bytes| assert_eq(text.index_of(b"ctx->failed"), None))
+  with_no_shapes(|| {
+    let made_of = |item: Type, args: List<Arg>|
+      pieces_text(
+        list_printed(
+          at_top,
+          empty_printing(Map::new().insert(0, b"p0")),
+          Some({ id: 1, ty: list_type(item), representation: AsWord }),
+          { made: ListAllocation(args.len()), args: args, reuse: None },
+        ).out,
+      );
+    let made = |args: List<Arg>| made_of(string_type, args);
+    let laid = container_layouts.list;
+    let item = |k: Int| Bytes::concat_all([b"[", ascii_of_int(laid.items + k), b"] = "]);
+    let two = made([VariableOperand(local_var(0, string_type, AsWord)), ZeroOperand(AsWord)]);
+    let has = |text: Bytes, t: Bytes|
+      assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+    has(two, b"ply_list_room(ctx, 2, 1)");
+    has(two, item(0).concat(b"p0;"));
+    has(two, item(1).concat(b"0;"));
+    has(two, b"))->len = 2;");
+    assert_eq(made([]).index_of(b")["), None);
+    let decimal_list_text = made_of(decimal_type, [ZeroOperand(AsDecimal)]);
+    has(decimal_list_text, b"ply_list_room(ctx, 1, 2)");
+    has(decimal_list_text, item(1).concat(b"("));
+    [made([]), two].fold((), |_: Unit, text: Bytes| assert_eq(text.index_of(b"ctx->failed"), None))
+  })
 }
 
 test "a list literal of any length is one block, its items in a run" {
-  let n = 70;
-  let text = pieces_text(
-    list_printed(
-      at_top,
-      empty_printing(Map::new()),
-      Some({ id: 1, ty: list_type(int_type), representation: AsWord }),
-      { made: ListAllocation(n), args: range(0, n).map(IntOperand), reuse: None },
-    ).out,
-  );
-  let items = container_layouts.list.items;
-  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  has(empty_list_allocation(b"70", 1));
-  has(Bytes::concat_all([b"[", ascii_of_int(items + n - 1), b"] = "]));
-  has(b"))->len = 70;");
-  assert_eq(text.index_of(b"ply_node("), None)
+  with_no_shapes(|| {
+    let n = 70;
+    let text = pieces_text(
+      list_printed(
+        at_top,
+        empty_printing(Map::new()),
+        Some({ id: 1, ty: list_type(int_type), representation: AsWord }),
+        { made: ListAllocation(n), args: range(0, n).map(IntOperand), reuse: None },
+      ).out,
+    );
+    let items = container_layouts.list.items;
+    let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+    has(empty_list_allocation(b"70", 1));
+    has(Bytes::concat_all([b"[", ascii_of_int(items + n - 1), b"] = "]));
+    has(b"))->len = 70;");
+    assert_eq(text.index_of(b"ply_node("), None)
+  })
 }
 
 test "a list's item is read where it lies and its rest shares its list, neither through the runtime" {
-  let operation_text = |c: ContainerOperation, item: Type, into: Variable|
-    pieces_text(
-      container_operation(
-        at_top,
-        empty_printing(Map::new().insert(0, b"p0")),
-        Some(into),
-        c,
-        [VariableOperand({ id: 0, ty: list_type(item), representation: AsWord }), IntOperand(2)],
-        { takes: [false, false], owned: c == Rest, fails: false, suspends: false },
-      ).out,
+  with_no_shapes(|| {
+    let operation_text = |c: ContainerOperation, item: Type, into: Variable|
+      pieces_text(
+        container_operation(
+          at_top,
+          empty_printing(Map::new().insert(0, b"p0")),
+          Some(into),
+          c,
+          [VariableOperand({ id: 0, ty: list_type(item), representation: AsWord }), IntOperand(2)],
+          { takes: [false, false], owned: c == Rest, fails: false, suspends: false },
+        ).out,
+      );
+    let item = operation_text(ItemAt, string_type, local_var(1, string_type, AsWord));
+    let scalar = operation_text(ItemAt, int_type, local_var(1, int_type, AsInt));
+    let rest = operation_text(Rest, string_type, {
+      id: 1,
+      ty: list_type(string_type),
+      representation: AsWord,
+    });
+    let ints = operation_text(Rest, int_type, {
+      id: 1,
+      ty: list_type(int_type),
+      representation: AsWord,
+    });
+    [item, scalar, rest, ints].fold((), |_: Unit, text: Bytes| {
+      assert_eq([text.index_of(b"rt_list_at_p"), text.index_of(b"rt_list_rest_p")], [None, None]);
+      assert_eq(text.index_of(b"ctx->failed"), None)
+    });
+    [item, scalar].fold((), |_: Unit, text: Bytes|
+      assert(!counts_any(text), Some(String::of_bytes_lossy(text))));
+    assert(
+      rest.split(call_start(duplicate_function, [])).len() > 2,
+      Some(String::of_bytes_lossy(rest)),
     );
-  let item = operation_text(ItemAt, string_type, local_var(1, string_type, AsWord));
-  let scalar = operation_text(ItemAt, int_type, local_var(1, int_type, AsInt));
-  let rest = operation_text(Rest, string_type, {
-    id: 1,
-    ty: list_type(string_type),
-    representation: AsWord,
-  });
-  let ints = operation_text(Rest, int_type, {
-    id: 1,
-    ty: list_type(int_type),
-    representation: AsWord,
-  });
-  [item, scalar, rest, ints].fold((), |_: Unit, text: Bytes| {
-    assert_eq([text.index_of(b"rt_list_at_p"), text.index_of(b"rt_list_rest_p")], [None, None]);
-    assert_eq(text.index_of(b"ctx->failed"), None)
-  });
-  [item, scalar].fold((), |_: Unit, text: Bytes|
-    assert(!counts_any(text), Some(String::of_bytes_lossy(text))));
-  assert(
-    rest.split(call_start(duplicate_function, [])).len() > 2,
-    Some(String::of_bytes_lossy(rest)),
-  );
-  assert_eq(ints.split(call_start(duplicate_function, [])).len(), 2);
-  assert(scalar.index_of(b"int64_t ") != None, Some(String::of_bytes_lossy(scalar)))
+    assert_eq(ints.split(call_start(duplicate_function, [])).len(), 2);
+    assert(scalar.index_of(b"int64_t ") != None, Some(String::of_bytes_lossy(scalar)))
+  })
 }
 
 test "an array of `Int`s stores each element's raw bits in its own word, and a negative length raises a runtime failure" {
-  let int = int_type;
-  let printing = container_operation(
-    at_top,
-    empty_printing(Map::new().insert(0, b"p0")),
-    Some({ id: 1, ty: array_type(int), representation: AsWord }),
-    ArrayNew({ layout: layout_of(no_constructors, int), stride: 1 }),
-    [VariableOperand({ id: 0, ty: int, representation: AsInt }), IntOperand(7)],
-    { takes: [false, true], owned: true, fails: true, suspends: false },
-  );
-  let text = pieces_text(printing.out);
-  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  let ints = { layout: layout_of(no_constructors, int), stride: 1 };
-  has(Bytes::concat_all([b" = ply_alloc(ctx, ", array_bytes(b"p0", ints), b");"]));
-  has(Bytes::concat_all([array_len(b"t1"), b" = p0;"]));
-  has(b" * 1 + 1] = (Word)(INT64_C(7));");
-  has(b"ply_refused(ctx, 0, p0, 0, 0);");
-  assert_eq([text.index_of(b"builtin_array_"), text.index_of(b"->aux")], [None, None])
+  with_no_shapes(|| {
+    let int = int_type;
+    let printing = container_operation(
+      at_top,
+      empty_printing(Map::new().insert(0, b"p0")),
+      Some({ id: 1, ty: array_type(int), representation: AsWord }),
+      ArrayNew({ layout: layout_of(int), stride: 1 }),
+      [VariableOperand({ id: 0, ty: int, representation: AsInt }), IntOperand(7)],
+      { takes: [false, true], owned: true, fails: true, suspends: false },
+    );
+    let text = pieces_text(printing.out);
+    let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+    let ints = { layout: layout_of(int), stride: 1 };
+    has(Bytes::concat_all([b" = ply_alloc(ctx, ", array_bytes(b"p0", ints), b");"]));
+    has(Bytes::concat_all([array_len(b"t1"), b" = p0;"]));
+    has(b" * 1 + 1] = (Word)(INT64_C(7));");
+    has(b"ply_refused(ctx, 0, p0, 0, 0);");
+    assert_eq([text.index_of(b"builtin_array_"), text.index_of(b"->aux")], [None, None])
+  })
 }
 
 test "an array of records stores each record's words inline in the array, and a write releases the element it replaces according to the element type" {
-  let int = int_type;
-  let record = RecordType([{ name: b"s", ty: string_type }, { name: b"x", ty: float_type }]);
-  let array = array_type(record);
-  let printing = container_operation(
-    at_top,
-    empty_printing(Map::new().insert(0, b"p0").insert(1, b"p1").insert(2, b"p2")),
-    Some({ id: 3, ty: array, representation: AsWord }),
-    ArraySet({ layout: layout_of(no_constructors, record), stride: 2 }),
-    [
-      VariableOperand({ id: 0, ty: array, representation: AsWord }),
-      VariableOperand({ id: 1, ty: int, representation: AsInt }),
-      VariableOperand({
-        id: 2,
-        ty: record,
-        representation: AsFlattened([
-          { name: b"s", representation: AsWord },
-          { name: b"x", representation: AsFloat },
-        ]),
-      }),
-    ],
-    { takes: [true, false, true], owned: true, fails: true, suspends: false },
-  );
-  let text = pieces_text(printing.out);
-  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  has(b") * 2); memcpy(ply_words(");
-  has(call_start(release_function, [b"ctx", b"ply_words(t1)[(p1) * 2 + 1]"]));
-  has(b"ply_words(t1)[(p1) * 2 + 2] = ply_f64_bits(");
-  has(b"ply_refused(ctx, 5, p1, ")
+  with_no_shapes(|| {
+    let int = int_type;
+    let record = RecordType([{ name: b"s", ty: string_type }, { name: b"x", ty: float_type }]);
+    let array = array_type(record);
+    let printing = container_operation(
+      at_top,
+      empty_printing(Map::new().insert(0, b"p0").insert(1, b"p1").insert(2, b"p2")),
+      Some({ id: 3, ty: array, representation: AsWord }),
+      ArraySet({ layout: layout_of(record), stride: 2 }),
+      [
+        VariableOperand({ id: 0, ty: array, representation: AsWord }),
+        VariableOperand({ id: 1, ty: int, representation: AsInt }),
+        VariableOperand({
+          id: 2,
+          ty: record,
+          representation: AsFlattened([
+            { name: b"s", representation: AsWord },
+            { name: b"x", representation: AsFloat },
+          ]),
+        }),
+      ],
+      { takes: [true, false, true], owned: true, fails: true, suspends: false },
+    );
+    let text = pieces_text(printing.out);
+    let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+    has(b") * 2); memcpy(ply_words(");
+    has(call_start(release_function, [b"ctx", b"ply_words(t1)[(p1) * 2 + 1]"]));
+    has(b"ply_words(t1)[(p1) * 2 + 2] = ply_f64_bits(");
+    has(b"ply_refused(ctx, 5, p1, ")
+  })
 }
 
 test "reading a field of a `Columns` record reads that field's column in place, and an out-of-range index raises a runtime failure" {
-  let float = float_type;
-  let printing = container_operation(
-    at_top,
-    empty_printing(Map::new().insert(0, b"p0").insert(1, b"p1")),
-    Some({ id: 2, ty: float, representation: AsFloat }),
-    ColumnField({ k: 2, column: { layout: layout_of(no_constructors, float), stride: 1 } }),
-    [
-      VariableOperand({ id: 0, ty: columns_type(RecordType([])), representation: AsWord }),
-      VariableOperand({ id: 1, ty: int_type, representation: AsInt }),
-    ],
-    { takes: [false, false], owned: false, fails: true, suspends: false },
-  );
-  let text = pieces_text(printing.out);
-  let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
-  has(Bytes::concat_all([b"(uint64_t)p1 >= (uint64_t)", array_len(b"ply_words(p0)[2]")]));
-  has(b"ply_refused(ctx, 6, p1, ");
-  has(b"(ply_words(ply_words(p0)[2]) + 1 + (p1) * 1)[0]");
-  assert(!allocates(text), Some(String::of_bytes_lossy(text)))
+  with_no_shapes(|| {
+    let float = float_type;
+    let printing = container_operation(
+      at_top,
+      empty_printing(Map::new().insert(0, b"p0").insert(1, b"p1")),
+      Some({ id: 2, ty: float, representation: AsFloat }),
+      ColumnField({ k: 2, column: { layout: layout_of(float), stride: 1 } }),
+      [
+        VariableOperand({ id: 0, ty: columns_type(RecordType([])), representation: AsWord }),
+        VariableOperand({ id: 1, ty: int_type, representation: AsInt }),
+      ],
+      { takes: [false, false], owned: false, fails: true, suspends: false },
+    );
+    let text = pieces_text(printing.out);
+    let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
+    has(Bytes::concat_all([b"(uint64_t)p1 >= (uint64_t)", array_len(b"ply_words(p0)[2]")]));
+    has(b"ply_refused(ctx, 6, p1, ");
+    has(b"(ply_words(ply_words(p0)[2]) + 1 + (p1) * 1)[0]");
+    assert(!allocates(text), Some(String::of_bytes_lossy(text)))
+  })
 }

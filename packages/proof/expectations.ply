@@ -1,8 +1,8 @@
+import compiler.front.checking (InMemory, lowered_over)
 import compiler.emit.code (Code)
 import compiler.front.diagnostics (parse_all)
 import compiler.front.facts (Analysis)
-import compiler.front.emitter_input (Analysed, Rejected)
-import compiler.front.published (ClaimClause, analyse, claims)
+import compiler.front.published (ClaimClause, claims)
 import compiler.syntax.items (CostClause, EnsuresClause, RequiresClause)
 import context (Context, Claims, Law, Definition, claims_of, context, terminates, unfoldable,
                 self_recursive)
@@ -19,7 +19,7 @@ import rules (Rule, LinearArithmetic, Propositional, Congruence, Injectivity, Ca
               Induction, Cited, Descent, Spine)
 import sort (canonical, int_sort)
 import prover_input
-import prover_input (ProverInputResult, Obligation, Signature, prover_input_of)
+import prover_input (ProverInputResult, Obligation, Signature, claimed_session, claimed_input)
 import obligation (Builds)
 import std.list
 import std.string
@@ -28,14 +28,9 @@ type Fixture = { context: Context, built: ProverInputResult, claims: Claims }
 
 fn fixture(source: String) -> Fixture / {abort.raise} = {
   let sources = [{ name: b"m", source_text: Bytes::of_string(source) }];
-  match analyse(parse_all(sources)) {
-    Rejected(_) -> panic("the fixture checks"),
-    Analysed(w) -> {
-      let built = prover_input_of(w, prover_input::every);
-      let cs = claims_of(claims(sources));
-      { context: context(cs, built.world), built: built, claims: cs }
-    },
-  }
+  let built = claimed_input(claimed_session(sources), prover_input::every);
+  let cs = claims_of(claims(sources));
+  { context: context(cs, built.world), built: built, claims: cs }
 }
 
 fn owner(label: String) -> String = "m." ++ label
@@ -975,29 +970,30 @@ test "a measure is proved only when every call back into its recursive group dec
   assert(!terminates(p.prover.context, "m.tock"))
 }
 
-type Proving = { prover: Prover, built: ProverInputResult, analysis: Analysis }
+type Proving = { prover: Prover, built: ProverInputResult, analysis: Analysis, program: InMemory }
 
 fn proving(source: String) -> Proving / {abort.raise} =
   proving_all([{ name: b"m", source_text: Bytes::of_string(source) }])
 
-fn proving_all(sources: List<{ name: Bytes, source_text: Bytes }>) -> Proving / {abort.raise} =
-  match analyse(parse_all(sources)) {
-    Rejected(_) -> panic("the test source was rejected by the checker"),
-    Analysed(w) -> {
-      let built = prover_input_of(w, prover_input::every);
-      {
-        prover: prover_of(claims_of(claims(sources)), built.world, default_prove_budget),
-        built: built,
-        analysis: w,
-      }
-    },
+fn proving_all(sources: List<{ name: Bytes, source_text: Bytes }>) -> Proving / {abort.raise} = {
+  let fixture = claimed_session(sources);
+  let built = claimed_input(fixture, prover_input::every);
+  {
+    prover: prover_of(claims_of(claims(sources)), built.world, default_prove_budget),
+    built: built,
+    analysis: fixture.analysis,
+    program: fixture.program,
   }
+}
+
+fn diagnosed_in(p: Proving, o: Obligation) -> Option<Diagnosis> / {abort.raise} =
+  lowered_over(p.program, || static_prover::diagnosis_of(p.prover, o))
 
 fn proof_of(p: Proving, pick: (Obligation) -> Bool) -> Option<Proof> / {abort.raise} =
   match p.built.world.obligations.fold(None, |found: Option<Obligation>, o: Obligation|
       match found { Some(_) -> found, None -> if pick(o) { Some(o) } else { None } }) {
     None -> panic("no such obligation"),
-    Some(o) -> match static_prover::diagnosis_of(p.prover, o) {
+    Some(o) -> match diagnosed_in(p, o) {
       Some(d) -> match d.decision { Proved(pr) -> Some(pr), _ -> None },
       None -> None,
     },
@@ -2261,10 +2257,7 @@ test "an `ensures` is proved about the value the body returns, but does not show
 
 fn decision_of(p: Proving, owner: String) -> Option<Decision> / {abort.raise} =
   match p.built.world.obligations.filter(|o: Obligation| o.owner == owner) {
-    [o, ..] -> match static_prover::diagnosis_of(p.prover, o) {
-      Some(d) -> Some(d.decision),
-      None -> None,
-    },
+    [o, ..] -> match diagnosed_in(p, o) { Some(d) -> Some(d.decision), None -> None },
     [] -> panic("no obligation of " ++ owner),
   }
 

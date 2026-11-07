@@ -5,6 +5,8 @@ import domain (Sort, NamedSort, RecordSort, Declaration, Variant)
 import union_find (Classes, TermPair, UnionResult, classes, grow, find, union, equal, distinguish,
                    has_disequality, check_disequalities, groups, Shape, shape_of, conflict)
 import lower (field_sorts)
+import std.set (Set)
+import std.graph (Visit, traverse)
 import rules (RuleLog, Rule, record_rule, Propositional, CaseSplit, Congruence, Injectivity,
               LinearArithmetic)
 import sort (is_named_sort, list_element, field_names, int_sort)
@@ -21,7 +23,7 @@ pub type Verdict = | Closed | Open | Exhausted
 
 pub type Solver = { terms: Terms, rules: RuleLog, budget: Int, split_depth: Int, context: Context }
 
-type Branch = { classes: Classes, int_less_than: List<TermPair>, split: Map<TermPair, Bool> }
+type Branch = { classes: Classes, int_less_than: List<TermPair>, split: Set<TermPair> }
 
 type Split =
   | SplitBool(Int)
@@ -52,7 +54,7 @@ pub fn refute(
     |cs: Classes, a: { term: Int, polarity: Bool }|
       union(cs, a.term, if a.polarity { true_id } else { false_id }).classes,
   );
-  explore(solver, { classes: start, int_less_than: [], split: Map::new() }, solver.split_depth)
+  explore(solver, { classes: start, int_less_than: [], split: Set::empty() }, solver.split_depth)
 }
 
 fn explore(solver: Solver, branch: Branch, room: Int) -> SearchResult / {abort.raise} = {
@@ -169,7 +171,7 @@ fn children(
         children: [{ a: x, b: y }, { a: y, b: x }].map(|lohi: TermPair|
           {
             ..branch,
-            split: branch.split.insert(key, true),
+            split: branch.split.insert(key),
             int_less_than: branch.int_less_than.push(lohi),
           }),
       }
@@ -1102,53 +1104,21 @@ fn undecided_atom(terms: Terms, branch: Branch) -> Option<Int> / {abort.raise} =
   let known = range(0, size(terms)).filter(|t: Int| truth(terms, branch, t) != None);
   let roots = branch.classes.disequalities.fold(known, |accumulator: List<Int>, d: TermPair|
     accumulator.push(d.a).push(d.b));
-  let walked = iterate(
-    { stack: roots, seen: Map::new(), best: None },
-    10000000,
-    |st: { stack: List<Int>, seen: Map<Int, Bool>, best: Option<Int> }|
-      match st.stack.at(st.stack.len() - 1) {
-        None -> Stop(st),
-        Some(t) -> {
-          let rest = range(0, st.stack.len() - 1).fold([], |accumulator: List<Int>, i: Int|
-            match st.stack.at(i) { Some(x) -> accumulator.push(x), None -> accumulator });
-          if st.seen.contains(t) { Continue({ ..st, stack: rest }) } else {
-            let seen = st.seen.insert(t, true);
-            Continue(match node(terms, t) {
-              NotTerm(a) -> { stack: rest.push(a), seen: seen, best: st.best },
-              AndTerm(x, y) -> { stack: rest.push(x).push(y), seen: seen, best: st.best },
-              OrTerm(x, y) -> { stack: rest.push(x).push(y), seen: seen, best: st.best },
-              IfTerm(i) -> { stack: rest.push(i.cond), seen: seen, best: st.best },
-              EqualTerm(e) -> if is_bool(terms, e.left_operand) && is_bool(terms, e.right_operand) {
-                {
-                  stack: rest.push(e.left_operand).push(e.right_operand),
-                  seen: seen,
-                  best: st.best,
-                }
-              } else { atom(terms, branch, t, rest, seen, st.best) },
-              _ -> atom(terms, branch, t, rest, seen, st.best),
-            })
-          }
-        },
-      },
-  );
-  walked.best
+  let undecided = |t: Int| is_bool(terms, t) && truth(terms, branch, t) == None;
+  traverse(roots, |t: Int|
+    match node(terms, t) {
+      NotTerm(a) -> { value: false, next: [a] },
+      AndTerm(x, y) -> { value: false, next: [x, y] },
+      OrTerm(x, y) -> { value: false, next: [x, y] },
+      IfTerm(i) -> { value: false, next: [i.cond] },
+      EqualTerm(e) -> if is_bool(terms, e.left_operand) && is_bool(terms, e.right_operand) {
+        { value: false, next: [e.left_operand, e.right_operand] }
+      } else { { value: undecided(t), next: [] } },
+      _ -> { value: undecided(t), next: [] },
+    }).fold(None, |best: Option<Int>, v: Visit<Int, Bool>|
+    if !v.value { best }
+    else { match best { Some(p) -> Some(if p < v.key { p } else { v.key }), None -> Some(v.key) } })
 }
-
-fn atom(
-  terms: Terms,
-  branch: Branch,
-  t: Int,
-  rest: List<Int>,
-  seen: Map<Int, Bool>,
-  best: Option<Int>,
-) -> { stack: List<Int>, seen: Map<Int, Bool>, best: Option<Int> } =
-  if is_bool(terms, t) && truth(terms, branch, t) == None {
-    {
-      stack: rest,
-      seen: seen,
-      best: match best { Some(p) -> Some(if p < t { p } else { t }), None -> Some(t) },
-    }
-  } else { { stack: rest, seen: seen, best: best } }
 
 fn constructor_split(solver: Solver, scrutinee: Int) -> Option<Split> =
   match sort_of(solver.terms, scrutinee) {
@@ -1180,8 +1150,8 @@ fn arithmetic(
   let terms = solver.terms;
   let f = |t: Int| find(branch.classes, t);
   let from_cmps = range(0, size(terms)).fold(
-    { rows: [], relevant: Map::new() },
-    |accumulator: { rows: List<{ coefficients: Map<Int, I128>, constant: I128 }>, relevant: Map<Int, Bool> }, t: Int|
+    { rows: [], relevant: Set::empty() },
+    |accumulator: { rows: List<{ coefficients: Map<Int, I128>, constant: I128 }>, relevant: Set<Int> }, t: Int|
       match node(terms, t) {
         CompareTerm(c) -> match truth(terms, branch, t) {
           None -> accumulator,
@@ -1201,10 +1171,7 @@ fn arithmetic(
                 coefficients: difference(f(oriented.a), f(oriented.b)),
                 constant: oriented.slack,
               }),
-              relevant: accumulator.relevant.insert(f(oriented.a), true).insert(
-                f(oriented.b),
-                true,
-              ),
+              relevant: accumulator.relevant.insert(f(oriented.a)).insert(f(oriented.b)),
             }
           },
         },
@@ -1213,10 +1180,10 @@ fn arithmetic(
   );
   let comparisons = branch.int_less_than.fold(
     from_cmps,
-    |accumulator: { rows: List<{ coefficients: Map<Int, I128>, constant: I128 }>, relevant: Map<Int, Bool> }, p: TermPair|
+    |accumulator: { rows: List<{ coefficients: Map<Int, I128>, constant: I128 }>, relevant: Set<Int> }, p: TermPair|
       {
         rows: accumulator.rows.push({ coefficients: difference(f(p.a), f(p.b)), constant: 1i128 }),
-        relevant: accumulator.relevant.insert(f(p.a), true).insert(f(p.b), true),
+        relevant: accumulator.relevant.insert(f(p.a)).insert(f(p.b)),
       },
   );
   let definitions = range(0, size(terms)).fold(
@@ -1257,10 +1224,10 @@ fn arithmetic(
   let relevant_definitions = iterate(
     { used: used0, relevant: comparisons.relevant },
     definitions.len() + 2,
-    |st: { used: List<Bool>, relevant: Map<Int, Bool> }| {
+    |st: { used: List<Bool>, relevant: Set<Int> }| {
       let next = range(0, definitions.len()).fold(
         { used: st.used, relevant: st.relevant, grew: false },
-        |accumulator: { used: List<Bool>, relevant: Map<Int, Bool>, grew: Bool }, i: Int|
+        |accumulator: { used: List<Bool>, relevant: Set<Int>, grew: Bool }, i: Int|
           if accumulator.used.at(i) == Some(true) { accumulator } else {
             match definitions.at(i) {
               Some(d) -> if d.coefficients.keys().fold(false, |f2: Bool, v: Int|
@@ -1269,7 +1236,7 @@ fn arithmetic(
                   used: accumulator.used.set(i, true),
                   relevant: d.coefficients.keys().fold(
                     accumulator.relevant,
-                    |r: Map<Int, Bool>, v: Int| r.insert(v, true),
+                    |r: Set<Int>, v: Int| r.insert(v),
                   ),
                   grew: true,
                 }

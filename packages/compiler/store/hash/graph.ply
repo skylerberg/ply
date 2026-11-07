@@ -4,14 +4,19 @@ import compiler.syntax.items (Item, FnDefinition, TypeDefinition, EffectDefiniti
                               LawDefinition, is_pub, InstanceItem, InstanceDefinition, InstanceKind,
                               KeyInstance, ShowInstance, InvariantInstance, HostInstance,
                               ReleaseInstance, NumericDefinition, member_name, member_of)
-import compiler.check.resolve.tables (ParsedModule, Diagnostic, error_at_and)
+import compiler.check.resolve.tables (ParsedModule, Diagnostic, error_at_and, qualify)
 import compiler.check.resolve.scopes (method_binder_module)
+import std.bin
 import std.list
 import std.option
 import std.bytes
 import std.string
 
-pub type NodeBody = | NodeFn(FnDefinition) | NodeType(TypeDefinition) | NodeEffect(EffectDefinition)
+pub type NodeBody =
+  | NodeFn(FnDefinition)
+  | NodeType(TypeDefinition)
+  | NodeEffect(EffectDefinition)
+  | NodeElsewhere({ public: Bool, kind: HeldKind })
 
 pub type Node = { name: Bytes, simple: Bytes, module: Int, body: NodeBody }
 
@@ -51,7 +56,6 @@ pub type Index = {
   order: List<IndexEntry>,
   items: List<ModuleItems>,
   scopes: List<ScopeIndex>,
-  effect_sketches: Map<Int, Bytes>,
   written: Map<Bytes, Int>,
 }
 
@@ -146,9 +150,6 @@ fn instance_rank(kind: InstanceKind) -> Int =
     HostInstance -> 4,
   }
 
-pub fn is_effect(index: Index, v: Int) -> Bool / {abort.raise} =
-  match index.nodes.get(v).body { NodeEffect(_) -> true, _ -> false }
-
 fn target(
   index: Index,
   module: Int,
@@ -205,8 +206,124 @@ fn exports(index: Index, qual: Option<Bytes>, node: Int) -> Bool / {abort.raise}
       NodeFn(d) -> is_pub(d.visibility),
       NodeType(d) -> is_pub(d.visibility),
       NodeEffect(d) -> is_pub(d.visibility),
+      NodeElsewhere(e) -> e.public,
     },
   }
+
+pub type HeldKind = | HeldType | HeldEffect | HeldValue
+
+derive bin for HeldKind
+
+pub type Held = | HeldName(HeldKind) | HeldConstructor(Bytes)
+
+pub type NameElsewhere = { module: Bytes, name: Bytes, public: Bool, held: Held, bare: Bool }
+
+pub fn is_declared_kind(kind: HeldKind) -> Bool =
+  match kind { HeldType -> true, HeldEffect -> true, HeldValue -> false }
+
+fn module_position(index: Index, module: Bytes) -> Option<Int> / {abort.raise} =
+  range(0, index.modules.len()).find(|i: Int| index.modules.get(i).name == module)
+
+fn held_module(index: Index, n: NameElsewhere) -> Int / {abort.raise} =
+  match module_position(index, n.module) {
+    Some(at) -> at,
+    None ->
+      panic(
+        "`" ++ String::of_bytes_lossy(n.name) ++ "` is held in module `"
+          ++ String::of_bytes_lossy(n.module)
+          ++ "`, which the group does not load",
+      ),
+  }
+
+fn with_name_elsewhere(index: Index, n: NameElsewhere, kind: HeldKind) -> Index / {abort.raise} = {
+  let at = held_module(index, n);
+  let node = index.nodes.len();
+  let items = index.items.get(at);
+  let target = { owner: at, name: n.name };
+  let scope = index.scopes.get(0);
+  let added = {
+    ..index,
+    nodes: index.nodes.push({
+      name: qualify(n.module, n.name),
+      simple: n.name,
+      module: at,
+      body: NodeElsewhere({ public: n.public, kind: kind }),
+    }),
+    written: if n.module == prelude_module && kind == HeldValue {
+      index.written.insert(n.name, node)
+    } else { index.written },
+  };
+  if kind == HeldEffect {
+    {
+      ..added,
+      items: index.items.set(at, { ..items, effects: items.effects.insert(n.name, node) }),
+      scopes: if !n.bare { index.scopes }
+      else { index.scopes.set(0, { ..scope, effects: scope.effects.insert(n.name, target) }) },
+    }
+  } else if kind == HeldType {
+    {
+      ..added,
+      items: index.items.set(at, { ..items, types: items.types.insert(n.name, node) }),
+      scopes: if !n.bare { index.scopes }
+      else { index.scopes.set(0, { ..scope, types: scope.types.insert(n.name, target) }) },
+    }
+  } else {
+    let functions = items.functions.insert(n.name, node);
+    let members = match member_of(n.name) {
+      Some(of) ->
+        items.members.insert(
+          of.member,
+          List::push(match items.members.get(of.member) { Some(ns) -> ns, None -> [] }, node),
+        ),
+      None -> items.members,
+    };
+    {
+      ..added,
+      items: index.items.set(at, { ..items, functions: functions, members: members }),
+      scopes: if !n.bare { index.scopes }
+      else { index.scopes.set(0, { ..scope, values: scope.values.insert(n.name, target) }) },
+    }
+  }
+}
+
+fn with_constructor_elsewhere(index: Index, n: NameElsewhere) -> Index / {abort.raise} =
+  match n.held {
+    HeldName(_) -> index,
+    HeldConstructor(owner) -> {
+      let at = held_module(index, n);
+      let items = index.items.get(at);
+      let owner_name = simple_of(owner, n.module);
+      match items.types.get(owner_name) {
+        None -> index,
+        Some(node) -> {
+          let scope = index.scopes.get(0);
+          {
+            ..index,
+            items: index.items.set(at, {
+              ..items,
+              constructors: items.constructors.insert(n.name, node),
+            }),
+            scopes: if !n.bare { index.scopes } else {
+              index.scopes.set(0, {
+                ..scope,
+                values: scope.values.insert(n.name, { owner: at, name: n.name }),
+              })
+            },
+          }
+        },
+      }
+    },
+  }
+
+pub fn index_beside(index: Index, names: List<NameElsewhere>) -> Index / {abort.raise} =
+  names.fold(
+    names.fold(index, |found: Index, n: NameElsewhere|
+      match n.held {
+        HeldName(kind) -> with_name_elsewhere(found, n, kind),
+        HeldConstructor(_) -> found,
+      }),
+    with_constructor_elsewhere,
+  )
 
 fn exported(
   index: Index,
@@ -332,10 +449,4 @@ pub fn effect_target(
         module,
         index.items.get(t.owner).effects.get(t.name),
       ),
-  }
-
-pub fn is_cyclic(component: List<Int>, edges: List<List<Int>>) -> Bool / {abort.raise} =
-  if component.len() != 1 { true } else {
-    let only = component.get(0);
-    edges.get(only).contains(only)
   }

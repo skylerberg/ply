@@ -1,15 +1,19 @@
-import compiler.front.published (no_rows)
-import compiler.front.emitter_input (Analysed, Rejected, checked_program_of)
-import compiler.front.facts (CheckedProgram)
-import compiler.front.rows (ModuleSpan, OutlinedType, OutlineItem, location_span)
-import compiler.store.hash.forms (ItemKeyed, no_cached_hashes, reach)
+import compiler.front.checking (in_memory)
+import compiler.front.checking.view (Listed, ListingRejected, listed_over)
+import std.set (Set)
+import compiler.front.facts (OneModule, ProgramListing)
+import compiler.front.rows (Outline, OutlinedType, OutlineItem)
+import compiler.store.hash.forms (OwnHashes, DefinitionHash, TestHash, ItemKeyed, reach)
+import compiler.store.hash.graph (HeldValue)
+import compiler.check.infer (CheckOutput)
 import compiler.check.infer.checker (DefinitionInfo, EffectInfo, Location, TestInfo)
 import compiler.check.resolve.tables (Source, qualify)
 import compiler.syntax.fmt (line_end, line_start)
-import program (Program, front_end, sources_of)
+import program (sources_of)
+import diagnostic (SourceText)
 import std.diff
-import testing.delta (Added, Change, ChangeKind, Declaration, Delta, DefinitionKey, Derived, Edited,
-                      Removed, Value, classify, kind_word)
+import testing.delta (Added, Change, ChangeKind, Declaration, Delta, DefinitionKey, Edited,
+                      Rehashed, Removed, Value, classify, kind_word)
 import testing.facts (Baseline, CurrentProgram, facts, moved_from)
 import tester (result_cache, LastPass)
 import std.bytes
@@ -18,7 +22,7 @@ import std.option
 import proof.prover_input (every)
 
 pub type Tree = {
-  whole: CheckedProgram,
+  whole: ProgramListing,
   sources: List<Source>,
   places: Locations,
   definitions: Map<String, String>,
@@ -29,26 +33,26 @@ fn by_name(xs: List<{ name: Bytes, hash: Bytes }>) -> Map<String, String> / {abo
   xs.fold(Map::new(), |accumulator: Map<String, String>, x: { name: Bytes, hash: Bytes }|
     accumulator.insert(String::of_bytes_lossy(x.name), x.hash.hex_of()))
 
-pub fn program_of(program: Program, analysis: CheckedProgram) -> Tree / {abort.raise} =
-  tree_of(sources_of(program, analysis.frame), analysis)
+pub fn program_of(places: List<SourceText>, analysis: ProgramListing) -> Tree / {abort.raise} =
+  tree_of(sources_of(places, analysis.outlines), analysis)
 
-pub fn tree_of(sources: List<Source>, analysis: CheckedProgram) -> Tree / {abort.raise} =
+pub fn tree_of(sources: List<Source>, analysis: ProgramListing) -> Tree / {abort.raise} =
   {
     whole: analysis,
     sources: sources,
     places: places_of(analysis),
-    definitions: by_name(analysis.frame.hashes.definitions),
-    declarations: by_name(analysis.frame.hashes.declarations),
+    definitions: by_name(analysis.hashes.definitions),
+    declarations: by_name(analysis.hashes.declarations),
   }
 
 fn closed(
   t: Tree,
   key: String,
 ) -> { functions: List<String>, declarations: List<String> } / {abort.raise} = {
-  let reachable = reach(t.whole.frame.hashes, [ItemKeyed(Bytes::of_string(key))]);
+  let reachable = reach(t.whole.hashes, [ItemKeyed(Bytes::of_string(key))]);
   {
-    functions: reachable.functions.keys().map(String::of_bytes_lossy),
-    declarations: reachable.declarations.keys().map(String::of_bytes_lossy),
+    functions: reachable.functions.elements().map(String::of_bytes_lossy),
+    declarations: reachable.declarations.elements().map(String::of_bytes_lossy),
   }
 }
 
@@ -82,9 +86,8 @@ pub fn compared(
 pub fn stored_baseline_texts(
   cs: List<Compared>,
 ) -> Map<String, Bytes> / {result_cache.texts, abort.raise} = {
-  let wanted = cs.fold(Map::new(), |m: Map<String, Bool>, c: Compared|
-    moved_from(c.baseline, c.now).fold(m, |into: Map<String, Bool>, h: String|
-      into.insert(h, true))).keys(
+  let wanted = cs.fold(Set::empty(), |m: Set<String>, c: Compared|
+    moved_from(c.baseline, c.now).fold(m, |into: Set<String>, h: String| into.insert(h))).elements(
   );
   let stored_texts = result_cache.texts(wanted.map(Bytes::of_hex));
   range(0, wanted.len()).fold(Map::new(), |m: Map<String, Bytes>, i: Int|
@@ -115,20 +118,23 @@ pub type Locations = {
   tests: Map<Bytes, Location>,
 }
 
-fn places_of(analysis: CheckedProgram) -> Locations / {abort.raise} = {
-  let effects = analysis.checked.effects.fold(
+fn places_of(analysis: ProgramListing) -> Locations / {abort.raise} =
+  locations(analysis.outlines, analysis.checked)
+
+fn locations(outlines: List<Outline>, checked: CheckOutput) -> Locations / {abort.raise} = {
+  let effects = checked.effects.fold(
     Map::new(),
     |accumulator: Map<Bytes, Location>, e: EffectInfo| accumulator.insert(e.name, e.at),
   );
   {
-    values: analysis.checked.definitions.fold(
+    values: checked.definitions.fold(
       Map::new(),
       |accumulator: Map<Bytes, Location>, d: DefinitionInfo| accumulator.insert(d.name, d.at),
     ),
-    declarations: range(0, analysis.frame.outlines.len()).fold(
+    declarations: range(0, outlines.len()).fold(
       effects,
       |accumulator: Map<Bytes, Location>, i: Int| {
-        let o = analysis.frame.outlines.get(i);
+        let o = outlines.get(i);
         o.items.fold(accumulator, |into: Map<Bytes, Location>, item: OutlineItem|
           match item {
             OutlinedType(t) -> into.insert(qualify(o.name, t.name), { module: i, span: t.span }),
@@ -136,10 +142,8 @@ fn places_of(analysis: CheckedProgram) -> Locations / {abort.raise} = {
           })
       },
     ),
-    tests: analysis.checked.tests.fold(
-      Map::new(),
-      |accumulator: Map<Bytes, Location>, t: TestInfo| accumulator.insert(t.key, t.at),
-    ),
+    tests: checked.tests.fold(Map::new(), |accumulator: Map<Bytes, Location>, t: TestInfo|
+      accumulator.insert(t.key, t.at)),
   }
 }
 
@@ -166,45 +170,50 @@ fn defined_at(p: Locations, k: DefinitionKey) -> Option<Location> = {
 fn text_at(pull_request: Tree, at: Option<Location>) -> Option<Bytes> / {abort.raise} =
   match at { Some(l) -> lines_at(pull_request.sources, l), None -> None }
 
-pub fn texts_of(
-  analysis: CheckedProgram,
+pub type StoredText = { hash: Bytes, text: Bytes }
+
+pub fn stored_text_at(
   sources: List<Source>,
-  wanted: List<Bytes>,
-) -> List<{ hash: Bytes, text: Bytes }> / {abort.raise} = {
-  let wanted_hashes = wanted.fold(Map::new(), |m: Map<Bytes, Bool>, h: Bytes| m.insert(h, true));
-  let p = places_of(analysis);
-  let h = analysis.frame.hashes;
-  let placed = |at: Map<Bytes, Location>, xs: List<{ name: Bytes, hash: Bytes }>|
-    xs.map(|x: { name: Bytes, hash: Bytes }| { hash: x.hash, at: at.get(x.name) });
-  placed(p.values, h.definitions).concat(placed(p.declarations, h.declarations)).concat(
-    h.tests.fold(
-      [],
-      |accumulator: List<{ hash: Bytes, at: Option<Location> }>, key: Bytes, hash: Bytes|
-        accumulator.push({ hash: hash, at: p.tests.get(key) }),
-    ),
-  ).fold(
-    { seen: Map::new(), out: [] },
-    |accumulator: { seen: Map<Bytes, Bool>, out: List<{ hash: Bytes, text: Bytes }> }, x: { hash: Bytes, at: Option<Location> }|
-      if !wanted_hashes.contains(x.hash) || accumulator.seen.contains(x.hash) { accumulator } else {
-        match x.at {
-          None -> accumulator,
-          Some(at) -> match lines_at(sources, at) {
-            None -> accumulator,
-            Some(text) ->
-              {
-                seen: accumulator.seen.insert(x.hash, true),
-                out: accumulator.out.push({ hash: x.hash, text: text }),
-              },
-          },
-        }
+  at: Location,
+  hash: Bytes,
+) -> Option<StoredText> / {abort.raise} =
+  match lines_at(sources, at) { Some(text) -> Some({ hash: hash, text: text }), None -> None }
+
+fn texts_at(
+  sources: List<Source>,
+  placed: List<{ hash: Bytes, at: Option<Location> }>,
+) -> List<StoredText> / {abort.raise} =
+  placed.fold([], |found: List<StoredText>, x: { hash: Bytes, at: Option<Location> }|
+    match x.at {
+      None -> found,
+      Some(at) -> match stored_text_at(sources, at, x.hash) {
+        Some(t) -> found.push(t),
+        None -> found,
       },
-  ).out
+    })
+
+pub fn module_texts(
+  one: OneModule,
+  hashes: OwnHashes,
+  source: Source,
+) -> List<StoredText> / {abort.raise} = {
+  let p = locations(one.outlines, one.checked);
+  texts_at(
+    [source],
+    hashes.definitions.map(|n: DefinitionHash|
+      {
+        hash: n.hash,
+        at: (if n.kind == HeldValue { p.values } else { p.declarations }).get(n.name),
+      }).concat(
+      hashes.tests.map(|t: TestHash| { hash: t.hash, at: p.tests.get(t.key) }),
+    ),
+  )
 }
 
 pub type ChangeDiff = {
   name: String,
   change: ChangeKind,
-  at: Option<ModuleSpan>,
+  at: Option<Location>,
   diff: Option<String>,
 }
 
@@ -218,7 +227,7 @@ pub fn change_diffs(
   let shown = deltas.fold([], |accumulator: List<ChangedItem>, d: Delta| {
     let own = match d.own { Some(c) -> [{ change: c, test: true }], None -> [] };
     own.concat(
-      d.changes.filter(|c: Change| c.kind != Derived).map(|c: Change| { change: c, test: false }),
+      d.changes.filter(|c: Change| c.kind != Rehashed).map(|c: Change| { change: c, test: false }),
     ).fold(accumulator, |out: List<ChangedItem>, s: ChangedItem|
       if out.contains(s) { out } else { out.push(s) })
   });
@@ -228,7 +237,7 @@ pub fn change_diffs(
     {
       name: s.change.name,
       change: s.change.kind,
-      at: match at { Some(l) -> Some(location_span(l)), None -> None },
+      at: at,
       diff: diff_of(
         s.change,
         match s.change.before { Some(h) -> then.get(h), None -> None },
@@ -260,36 +269,44 @@ const call_chain_source: String =
   "fn leaf(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
 
 fn tree_of_source(source: String) -> Tree / {abort.raise} = {
-  let sources = [{ name: b"", source_text: Bytes::of_string(source) }];
-  let loaded = front_end(
-    sources,
-    { sources: [], unread: [], data: [], required_modules: [], dependencies: [] },
-    no_rows,
-    { root: b"", manifest: None, supplied: [] },
-    [],
-    true,
-    no_cached_hashes,
-    [],
-  );
-  match loaded.out {
-    Analysed(w) -> tree_of(sources, checked_program_of(w)),
-    Rejected(_) -> panic("the test fixture failed to check"),
+  let sources = [{ name: b"m", source_text: Bytes::of_string(source) }];
+  match listed_over(in_memory(sources)) {
+    Listed(listing) -> tree_of(sources, listing),
+    ListingRejected(_) -> panic("the test fixture failed to check"),
   }
 }
 
+fn texts_wanted(t: Tree, wanted: List<Bytes>) -> List<StoredText> / {abort.raise} = {
+  let h = t.whole.hashes;
+  let placed = |at: Map<Bytes, Location>, xs: List<{ name: Bytes, hash: Bytes }>|
+    xs.map(|x: { name: Bytes, hash: Bytes }| { hash: x.hash, at: at.get(x.name) });
+  texts_at(
+    t.sources,
+    placed(t.places.values, h.definitions).concat(
+      placed(t.places.declarations, h.declarations),
+    ).concat(
+      h.tests.fold(
+        [],
+        |found: List<{ hash: Bytes, at: Option<Location> }>, key: Bytes, hash: Bytes|
+          found.push({ hash: hash, at: t.places.tests.get(key) }),
+      ),
+    ).filter(|x: { hash: Bytes, at: Option<Location> }| wanted.contains(x.hash)),
+  )
+}
+
 fn hash_of_test(t: Tree, key: String) -> Option<String> / {abort.raise} =
-  match t.whole.frame.hashes.tests.get(Bytes::of_string(key)) {
+  match t.whole.hashes.tests.get(Bytes::of_string(key)) {
     Some(h) -> Some(h.hex_of()),
     None -> None,
   }
 
 fn last_passed_hashes(t: Tree, key: String) -> LastPass / {abort.raise} = {
-  let h = t.whole.frame.hashes;
+  let h = t.whole.hashes;
   let reachable = reach(h, [ItemKeyed(Bytes::of_string(key))]);
-  let hashed = |names: Map<Bytes, Bool>, of: List<{ name: Bytes, hash: Bytes }>| {
+  let hashed = |names: Set<Bytes>, of: List<{ name: Bytes, hash: Bytes }>| {
     let by = of.fold(Map::new(), |m: Map<Bytes, Bytes>, x: { name: Bytes, hash: Bytes }|
       m.insert(x.name, x.hash));
-    names.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, n: Bytes, _: Bool|
+    names.fold(Map::new(), |accumulator: Map<Bytes, Bytes>, n: Bytes|
       match by.get(n) { Some(x) -> accumulator.insert(n, x), None -> accumulator })
   };
   {
@@ -307,13 +324,13 @@ fn over(
   key: String,
   recorded: (Bytes) -> Bool,
 ) -> { delta: Delta, diffs: List<ChangeDiff> } / {abort.raise} = {
-  let hashes = before.whole.frame.hashes;
+  let hashes = before.whole.hashes;
   let all = hashes.definitions.concat(hashes.declarations).map(
     |x: { name: Bytes, hash: Bytes }| x.hash,
   ).concat(
     hashes.tests.values(),
   );
-  let texts = texts_of(before.whole, before.sources, all.filter(recorded));
+  let texts = texts_wanted(before, all.filter(recorded));
   let c = compared(after, key, hash_of_test(after, key), last_passed_hashes(before, key));
   let then = handle {
     stored_baseline_texts([c])
@@ -334,34 +351,35 @@ fn kinds(before: String, after: String, key: String) -> List<String> / {abort.ra
 const leaf_edited: String =
   "fn leaf(n: Int) -> Int = n + 2\nfn mid(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n"
 
-test "editing a function marks it as edited, and marks the functions that call it as derived, meaning changed only because a function they call changed" {
-  assert_eq(kinds(call_chain_source, leaf_edited, "chain"), [
-    "leaf edited",
-    "mid derived",
-    "top derived",
-  ]);
+test "editing a function marks it as edited, and the functions that call it keep their hashes" {
+  assert_eq(kinds(call_chain_source, leaf_edited, "m.chain"), ["m.leaf edited"]);
   assert_eq(
-    over(tree_of_source(call_chain_source), tree_of_source(leaf_edited), "chain", every).delta.own,
+    over(
+      tree_of_source(call_chain_source),
+      tree_of_source(leaf_edited),
+      "m.chain",
+      every,
+    ).delta.own,
     None,
   )
 }
 
-test "a renamed definition is no change" {
+test "renaming a definition is no change to it, and edits the definitions that call it by name" {
   let renamed = "fn first(n: Int) -> Int = n + 1\nfn mid(n: Int) -> Int = first(n) + 1\nfn top(n: Int) -> Int = mid(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n";
-  assert_eq(kinds(call_chain_source, renamed, "chain"), [])
+  assert_eq(kinds(call_chain_source, renamed, "m.chain"), ["m.mid edited"])
 }
 
 test "an edit to the test body is the test's own change" {
   let edited = call_chain_source.replace("top(1), 4", "top(2), 4");
-  let o = over(tree_of_source(call_chain_source), tree_of_source(edited), "chain", every);
-  assert_eq(match o.delta.own { Some(c) -> c.name, None -> "none" }, "chain");
+  let o = over(tree_of_source(call_chain_source), tree_of_source(edited), "m.chain", every);
+  assert_eq(match o.delta.own { Some(c) -> c.name, None -> "none" }, "m.chain");
   assert_eq(o.delta.changes, [])
 }
 
-test "editing one member of a recursive pair names only that member as edited" {
+test "editing one member of a recursive pair reports only that member" {
   let parity = "fn even(n: Int) -> Bool = if n <= 0 { true } else { odd(n - 1) }\nfn odd(n: Int) -> Bool = if n <= 0 { false } else { even(n - 1) }\ntest \"parity holds\" { assert(even(4)) }\n";
   let edited = parity.replace("else { even(n - 1) }", "else { even(n - 1) && true }");
-  assert_eq(kinds(parity, edited, "parity holds"), ["even derived", "odd edited"])
+  assert_eq(kinds(parity, edited, "m.parity holds"), ["m.odd edited"])
 }
 
 test "an added definition is added, and the one that calls it edited" {
@@ -369,7 +387,7 @@ test "an added definition is added, and the one that calls it edited" {
     "fn mid(n: Int) -> Int = leaf(n) + 1",
     "fn bump(n: Int) -> Int = n\nfn mid(n: Int) -> Int = bump(leaf(n)) + 1",
   );
-  assert_eq(kinds(call_chain_source, added, "chain"), ["bump added", "mid edited", "top derived"])
+  assert_eq(kinds(call_chain_source, added, "m.chain"), ["m.bump added", "m.mid edited"])
 }
 
 fn zero_padded(i: Int) -> String = if i < 10 { "00" ++ i.to_string() } else { "0" ++ i.to_string() }
@@ -384,61 +402,45 @@ fn deep(depth: Int, leaf: String) -> String =
     ++ depth.to_string()
     ++ ") }\n"
 
-test "in a chain of 64 functions, editing the last one reports it as edited and the 63 functions that call it as derived (changed only through it)" {
-  let k = kinds(deep(64, "n + 1"), deep(64, "n + 2"), "deep");
-  assert_eq(k.filter(|x: String| x.ends_with(" edited")), ["f000 edited"]);
-  assert_eq(k.filter(|x: String| x.ends_with(" derived")).len(), 63);
-  assert_eq(k.filter(|x: String| x.starts_with("std.")), [])
+test "in a chain of 64 functions, editing the last one reports only that function as changed" {
+  assert_eq(kinds(deep(64, "n + 1"), deep(64, "n + 2"), "m.deep"), ["m.f000 edited"])
 }
 
 const handled_source: String =
   "effect db {\n  read get[users](key: Int) -> Int\n}\nfn lookup(k: Int) -> Int / {db.get[users]} = db.get[users](k)\nfn twice(k: Int) -> Int / {db.get[users]} = lookup(k) + lookup(k)\nfn seeded(k: Int) -> Int = handle { twice(k) } with { db.get[users](n) -> n * 10 }\ntest \"handled\" { assert_eq(seeded(2), 40) }\n"
 
 test "editing an effect handler reports only the definition containing the handler, not the functions that run under it" {
-  assert_eq(kinds(handled_source, handled_source.replace("n * 10", "n * 11"), "handled"), [
-    "seeded edited",
+  assert_eq(kinds(handled_source, handled_source.replace("n * 10", "n * 11"), "m.handled"), [
+    "m.seeded edited",
   ])
 }
 
-test "editing an effect declaration reports the declaration as edited and the functions that use the effect as derived (changed only because the effect changed)" {
+test "editing an effect declaration reports the declaration as edited, and the functions that use the effect keep their hashes" {
   let after = handled_source.replace(
     "}\nfn lookup",
     "  read peek[users](key: Int) -> Int\n}\nfn lookup",
   );
-  let o = over(tree_of_source(handled_source), tree_of_source(after), "handled", every);
+  let o = over(tree_of_source(handled_source), tree_of_source(after), "m.handled", every);
   assert_eq(
     o.delta.changes.map(|c: Change|
       { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
-    [
-      { name: "db", declaration: true, kind: Edited },
-      { name: "lookup", declaration: false, kind: Derived },
-      { name: "seeded", declaration: false, kind: Derived },
-      { name: "twice", declaration: false, kind: Derived },
-    ],
+    [{ name: "m.db", declaration: true, kind: Edited }],
   )
 }
 
-test "a rename beside an edit shows the old name removed and the new one added" {
+test "a definition renamed beside an edit to its callee is still a rename" {
   let after = "fn leaf(n: Int) -> Int = n + 2\nfn middle(n: Int) -> Int = leaf(n) + 1\nfn top(n: Int) -> Int = middle(n) + 1\ntest \"chain\" { assert_eq(top(1), 4) }\n";
-  assert_eq(kinds(call_chain_source, after, "chain"), [
-    "leaf edited",
-    "mid removed",
-    "middle added",
-    "top edited",
-  ])
+  assert_eq(kinds(call_chain_source, after, "m.chain"), ["m.leaf edited", "m.top edited"])
 }
 
-test "when a function and a type share a name, reordering the type's variants reports the type as edited, not the function" {
+test "when a function and a type share a name, reordering the type's variants reports only the type as edited" {
   let collide = "type Amount = Cents(Int) | Dollars(Int)\nfn Amount(n: Int) -> Int = n + 1\nfn use_it(a: Amount) -> Int = match a { Cents(c) -> c, Dollars(d) -> d * 100 }\ntest \"t\" { assert_eq(use_it(Cents(5)), 5) }\n";
   let swapped = collide.replace("Cents(Int) | Dollars(Int)", "Dollars(Int) | Cents(Int)");
-  let o = over(tree_of_source(collide), tree_of_source(swapped), "t", every);
+  let o = over(tree_of_source(collide), tree_of_source(swapped), "m.t", every);
   assert_eq(
     o.delta.changes.map(|c: Change|
       { name: c.name, declaration: c.ns == Declaration, kind: c.kind }),
-    [
-      { name: "Amount", declaration: true, kind: Edited },
-      { name: "use_it", declaration: false, kind: Derived },
-    ],
+    [{ name: "m.Amount", declaration: true, kind: Edited }],
   )
 }
 
@@ -449,13 +451,13 @@ test "an edited definition's diff shows the full old and new lines of the defini
   let diffs = over(
     tree_of_source(call_chain_source),
     tree_of_source(leaf_edited),
-    "chain",
+    "m.chain",
     every,
   ).diffs;
-  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["leaf"]);
+  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["m.leaf"]);
   assert_eq(diffs.map(|d: ChangeDiff| d.diff), [
     Some(
-      "--- leaf\n+++ leaf\n@@ -1 +1 @@\n-fn leaf(n: Int) -> Int = n + 1\n+fn leaf(n: Int) -> Int = n + 2\n",
+      "--- m.leaf\n+++ m.leaf\n@@ -1 +1 @@\n-fn leaf(n: Int) -> Int = n + 1\n+fn leaf(n: Int) -> Int = n + 2\n",
     ),
   ]);
   assert(diffs.all(|d: ChangeDiff| d.at != None))
@@ -464,8 +466,8 @@ test "an edited definition's diff shows the full old and new lines of the defini
 test "an edited test shows its own diff, and an added or a removed definition shows one side" {
   let before = "fn spare() -> Int = 1\nfn leaf(n: Int) -> Int = n + spare()\ntest \"chain\" { assert_eq(leaf(1), 2) }\n";
   let after = "fn bump(n: Int) -> Int = n\nfn leaf(n: Int) -> Int = bump(n) + 1\ntest \"chain\" { assert_eq(leaf(1), 3) }\n";
-  let diffs = over(tree_of_source(before), tree_of_source(after), "chain", every).diffs;
-  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["chain", "bump", "leaf", "spare"]);
+  let diffs = over(tree_of_source(before), tree_of_source(after), "m.chain", every).diffs;
+  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["m.chain", "m.bump", "m.leaf", "m.spare"]);
   assert_eq(
     diffs.map(|d: ChangeDiff|
       d.diff.unwrap_or("").contains("+test \"chain\" { assert_eq(leaf(1), 3) }")),
@@ -480,25 +482,24 @@ test "when the store has no earlier source text for a definition, it is reported
   let diffs = over(
     tree_of_source(call_chain_source),
     tree_of_source(leaf_edited),
-    "chain",
+    "m.chain",
     |_h: Bytes| false,
   ).diffs;
-  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["leaf", "mid", "top"]);
+  assert_eq(diffs.map(|d: ChangeDiff| d.name), ["m.leaf"]);
   assert(diffs.all(|d: ChangeDiff| d.diff == None && d.at != None))
 }
 
 test "a recorded text is the whole lines of a definition, a type, an effect and a test" {
   let source = "effect db {\n  read get(key: Int) -> Int\n}\ntype Shape = | Dot | Line(Int)\npub fn size(s: Shape) -> Int =\n  match s { Dot -> 1, Line(n) -> n }\ntest \"sized\" { assert_eq(size(Dot), 1) }\n";
   let t = tree_of_source(source);
-  let hashes = t.whole.frame.hashes;
+  let hashes = t.whole.hashes;
   let wanted = hashes.definitions.concat(hashes.declarations).filter(
-    |x: { name: Bytes, hash: Bytes }| x.name == b"size" || x.name == b"Shape" || x.name == b"db",
+    |x: { name: Bytes, hash: Bytes }|
+      x.name == b"m.size" || x.name == b"m.Shape" || x.name == b"m.db",
   ).map(|x: { name: Bytes, hash: Bytes }| x.hash).concat(
     hashes.tests.values(),
   );
-  let texts = texts_of(t.whole, t.sources, wanted).map(|x: { hash: Bytes, text: Bytes }|
-    String::of_bytes_lossy(x.text)).sort(
-  );
+  let texts = texts_wanted(t, wanted).map(|x: StoredText| String::of_bytes_lossy(x.text)).sort();
   assert_eq(texts, [
     "effect db {\n  read get(key: Int) -> Int\n}\n",
     "pub fn size(s: Shape) -> Int =\n  match s { Dot -> 1, Line(n) -> n }\n",

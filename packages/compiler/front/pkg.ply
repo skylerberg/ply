@@ -1,4 +1,5 @@
-import compiler.syntax.parsing (Span, ParseDiagnostic, error_at, dummy_span, starts_upper,
+import std.set (Set)
+import compiler.syntax.parsing (Span, ParseDiagnostic, error_at, generated_span, starts_upper,
                                 parse_diagnostic_bin)
 import compiler.syntax.items (Module, FunctionItem, FnDefinition, item_span, parse)
 import compiler.syntax.expressions (Expression, LiteralExpression, NameExpression, CallExpression,
@@ -92,7 +93,7 @@ fn literal_in(
     [] ->
       Err([
         shape_error(
-          dummy_span,
+          generated_span,
           s,
           message_text([
             b"a ",
@@ -500,7 +501,7 @@ test "a manifest is rejected when a field needs computing, such as a function ca
   )
 }
 
-pub fn a_manifest(name: String, dependencies: List<String>) -> Bytes =
+fn a_manifest(name: String, dependencies: List<String>) -> Bytes =
   Bytes::of_string(
     "import std.pkg (Manifest)\nfn package() -> Manifest = {name: \"" ++ name
       ++ "\", version: {major: 0, minor: 1, patch: 0}, prefix: None, runtime: {major: 0, minor: 0, patch: 1}, dependencies: ["
@@ -530,11 +531,8 @@ test "a registry dependency is looked for in the `.ply-cache/registry` directory
     a_dependency("lib", 0, "../lib"),
   ]);
   let lib = supplied_at("/x/lib", "lib", [a_registry_dependency("money", 0)]);
-  assert_eq(roots_wanted([b"/x/app"], [app]), [b"/x/app/.ply-cache/registry/orders", b"/x/lib"]);
-  assert_eq(
-    roots_wanted([b"/x/app", b"/x/app/.ply-cache/registry/orders", b"/x/lib"], [app, lib]),
-    [b"/x/app/.ply-cache/registry/money"],
-  );
+  assert_eq(dependency_roots(b"/x/app", app), [b"/x/app/.ply-cache/registry/orders", b"/x/lib"]);
+  assert_eq(dependency_roots(b"/x/app", lib), [b"/x/app/.ply-cache/registry/money"]);
   assert_eq(registry_key(b".", b"orders"), b".ply-cache/registry/orders")
 }
 
@@ -572,7 +570,7 @@ test "a registry dependency is rejected when it has not been fetched, the cached
     [],
   );
   assert_eq(codes_of(below), [b"E0136"]);
-  assert_eq(below.diagnostics.get(0).diagnostic.notes, 1);
+  assert_eq(below.diagnostics.get(0).diagnostic.notes_text.len(), 1);
   let other = closure(
     {
       root: b"/x/app",
@@ -800,46 +798,33 @@ fn normalize(path: Bytes) -> Bytes / {abort.raise} = {
   if path.len() > 0 && path.at(0) == 47 { b"/".concat(joined) } else { joined }
 }
 
-pub fn roots_wanted(
-  known: List<Bytes>,
-  manifests: List<SuppliedPackage>,
-) -> List<Bytes> / {abort.raise} = {
-  let root = match manifests.at(0) { Some(s) -> s.root, None -> b"" };
-  manifests.fold([], |accumulator: List<Bytes>, s: SuppliedPackage|
-    match s.manifest {
-      None -> accumulator,
-      Some(manifest_text) -> match check_manifest(manifest_text).manifest {
-        None -> accumulator,
-        Some(m) ->
-          m.dependencies.fold(accumulator, |accumulator2: List<Bytes>, d: Dependency|
-            match d.source {
-              Path(p) ->
-                add_wanted_root(known, accumulator2, join_normalized(s.root, Bytes::of_string(p))),
-              Git(url, rev) ->
-                add_wanted_root(
-                  known,
-                  accumulator2,
-                  git_key(Bytes::of_string(url), Bytes::of_string(rev)),
-                ),
-              Registry ->
-                add_wanted_root(known, accumulator2, registry_key(root, Bytes::of_string(d.name))),
-            }),
-      },
-    })
-}
+pub fn dependency_roots(
+  program_root: Bytes,
+  package: SuppliedPackage,
+) -> List<Bytes> / {abort.raise} =
+  match package.manifest {
+    None -> [],
+    Some(manifest_text) -> match check_manifest(manifest_text).manifest {
+      None -> [],
+      Some(m) ->
+        m.dependencies.fold([], |roots: List<Bytes>, d: Dependency| {
+          let wanted = match d.source {
+            Path(p) -> join_normalized(package.root, Bytes::of_string(p)),
+            Git(url, rev) -> git_key(Bytes::of_string(url), Bytes::of_string(rev)),
+            Registry -> registry_key(program_root, Bytes::of_string(d.name)),
+          };
+          if roots.contains(wanted) { roots } else { roots.push(wanted) }
+        }),
+    },
+  }
 
-fn add_wanted_root(known: List<Bytes>, accumulator: List<Bytes>, root: Bytes) -> List<Bytes> =
-  if known.contains(root) || accumulator.contains(root) { accumulator }
-  else { accumulator.push(root) }
-
-test "`roots_wanted` returns the dependency directories that the loaded manifests list and whose manifests are not loaded yet" {
+test "`dependency_roots` returns the dependency directories that a manifest lists" {
   let app = supplied_at("/x/app", "app", [
     a_dependency("b", 1, "../b"),
     a_dependency("c", 1, "../c"),
   ]);
-  assert_eq(roots_wanted([b"/x/app"], [app]), [b"/x/b", b"/x/c"]);
-  assert_eq(roots_wanted([b"/x/app", b"/x/b"], [app]), [b"/x/c"]);
-  assert_eq(roots_wanted([b"/x/app"], [{ root: b"/x/app", manifest: None, modules: [] }]), [])
+  assert_eq(dependency_roots(b"/x/app", app), [b"/x/b", b"/x/c"]);
+  assert_eq(dependency_roots(b"/x/app", { root: b"/x/app", manifest: None, modules: [] }), [])
 }
 
 pub fn git_key(url: Bytes, rev: Bytes) -> Bytes = Bytes::concat_all([b"git+", url, b"@", rev])
@@ -899,7 +884,10 @@ fn manifest_diagnostic(
   code: Bytes,
   message: Bytes,
 ) -> { slot: Int, diagnostic: ParseDiagnostic } =
-  { slot: slot, diagnostic: error_at(code, dummy_span, message, b"in this package's manifest", []) }
+  {
+    slot: slot,
+    diagnostic: error_at(code, generated_span, message, b"in this package's manifest", []),
+  }
 
 pub const anonymous_package: PackageSources = { root: b"", manifest: None, supplied: [] }
 
@@ -1031,11 +1019,8 @@ fn package_digest(pkg: Int, clo: Closure, embeds: List<ModuleEmbed>) -> Bytes / 
   let mine = clo.modules.filter(|m: { pkg: Int, source: Source }| m.pkg == pkg);
   let parts = mine.map(|m: { pkg: Int, source: Source }|
     Bytes::concat_all([m.source.name, b"\0", m.source.source_text, b"\0"]));
-  let names = mine.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, m: { pkg: Int, source: Source }|
-      accumulator.insert(m.source.name, true),
-  );
+  let names = mine.fold(Set::empty(), |accumulator: Set<Bytes>, m: { pkg: Int, source: Source }|
+    accumulator.insert(m.source.name));
   let embedded = embeds.filter(|embed: ModuleEmbed| names.contains(embed.module)).map(embed_part);
   let modules = Bytes::concat_all(sort_bytes(parts));
   let tail = if embedded.len() == 0 { b"" }
@@ -1097,7 +1082,7 @@ fn link_packages(
         slot: slot_of(texts, c.get(0)),
         diagnostic: error_at(
           b"E0134",
-          dummy_span,
+          generated_span,
           Bytes::concat_all([b"packages depend on one another in a cycle: ", cycle_text(roots, c)]),
           b"in this package's manifest",
           [
@@ -1139,7 +1124,7 @@ fn version_judgments(
               slot: slot_of(texts, requester_of(edges, i)),
               diagnostic: error_at(
                 b"E0137",
-                dummy_span,
+                generated_span,
                 Bytes::concat_all([
                   b"`",
                   Bytes::of_string(named(p)),
@@ -1348,7 +1333,7 @@ fn push_diagnostic_notes(
     ..accumulator,
     diagnostics: accumulator.diagnostics.push({
       slot: slot,
-      diagnostic: error_at(code, dummy_span, message, b"in this package's manifest", notes),
+      diagnostic: error_at(code, generated_span, message, b"in this package's manifest", notes),
     }),
   }
 
@@ -1375,7 +1360,7 @@ fn prefix_judgments(
             slot: slot_of(texts, i),
             diagnostic: error_at(
               b"E0133",
-              dummy_span,
+              generated_span,
               Bytes::concat_all([
                 b"the package at `",
                 p.root,
@@ -1398,7 +1383,7 @@ fn prefix_judgments(
                 slot: slot_of(texts, j),
                 diagnostic: error_at(
                   b"E0133",
-                  dummy_span,
+                  generated_span,
                   Bytes::concat_all([
                     b"the packages at `",
                     p.root,
@@ -1431,7 +1416,7 @@ fn prefix_judgments(
             slot: slot_of(texts, j),
             diagnostic: error_at(
               b"E0133",
-              dummy_span,
+              generated_span,
               Bytes::concat_all([
                 b"`",
                 m,

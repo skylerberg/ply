@@ -1,3 +1,5 @@
+import std.set (Set)
+import sources (ProjectFiles)
 import std.fs (fs, Missing)
 import std.json (Json, Str, Bool, Number, Array, Null, object)
 import args (Flags)
@@ -10,23 +12,25 @@ import builder (builder)
 import std.random (entropy)
 import std.time (time)
 import compiler.cc (toolchain)
-import compiler.load (Derives)
+import compiler.load (Loads)
 import compiler.unit (shipped)
 import compiler.check.resolve.tables (Source, Declaration, Namespace, declarations_in, namespaces,
                                       describe_namespace)
 import compiler.check.resolve.bindings (Reference, Member, Local, FieldName)
 import compiler.syntax.lexer (lex, Token)
-import rename.lines (LocalLine, Moved, MemberLine, Renames, keyword_rejection, only_locals, renamed,
-                     renames_of, shown)
+import sources (File)
+import rename.lines (LocalLine, Moved, MemberLine, Renames, keyword_rejection, mentions_rename,
+                     needs_of, renamed, renames_of, shown)
 import rename.strings (Mention, mentions_in, module_mentions, qualified_edits)
 import rename.programs (Entry, Library, Loaded, Read, DeclaredRecord, DefinitionKey, libraries_of,
                         loads_of)
 import rename.edits (Edit, Edited, ModuleMove, SharedName, applied, comment_edits, edited_of,
                      local_binders, shared_names, split_names, SplitName, moved_name,
-                     unqualified_name, qualified_renames, record_clashes, renaming_of,
-                     renames_derived, uses_renamed, with_derived, Renaming)
-import rename.verify (Checked, Renamed, retargeted_calls, verified)
-import program (ParsedSources)
+                     qualified_renames, record_clashes, renaming_of, renames_derived, uses_renamed,
+                     with_derived, changed_names, Renaming)
+import rename.verify (Checked, Renamed, verified)
+import compiler.front.checking.references (simple_part)
+import project_store
 
 type Change = { at: RootedPath, text: Bytes, changed: Bool, to: Option<RootedPath> }
 
@@ -51,17 +55,17 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
       accumulator.insert(displayed(x.read.file.at), x),
   );
   let fields_written = reads.fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, x: { load: Loaded, read: Read }|
-      x.read.entries.fold(accumulator, |into: Map<Bytes, Bool>, e: Entry|
-        e.names.members.fold(into, |found: Map<Bytes, Bool>, m: Member|
-          match m.kind { FieldName(_) -> found.insert(m.name, true), _ -> found })),
+    Set::empty(),
+    |accumulator: Set<Bytes>, x: { load: Loaded, read: Read }|
+      x.read.entries.fold(accumulator, |into: Set<Bytes>, e: Entry|
+        e.names.members.fold(into, |found: Set<Bytes>, m: Member|
+          match m.kind { FieldName(_) -> found.insert(m.name), _ -> found })),
   );
   let missing = |path: String| { path: path, reason: "is not among the files being renamed" };
   let declares = |x: { load: Loaded, read: Read }, name: Bytes|
     namespaces.any(|namespace: Namespace|
-        declarations_in(x.load.declarations.get(x.read.index), namespace).any(|d: Declaration|
-          d.name == name || unqualified_name(d.name) == name))
+        declarations_in(x.read.declarations, namespace).any(|d: Declaration|
+          d.name == name || simple_part(d.name) == name))
       || x.read.entries.any(|e: Entry|
         e.names.references.any(|r: Reference|
           r.name == name && (match r.target { Local(_) -> true, _ -> false })));
@@ -114,7 +118,7 @@ fn unmatched(renames: Renames, loads: List<Loaded>) -> List<Failure> / {abort.ra
 fn plan_of(
   renaming: Renaming,
   loads: List<Loaded>,
-) -> Plan / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.read[abs], Derives, abort.raise, diverges} = {
+) -> Plan / {project_store::Databases, time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise, diverges} = {
   let renames = renaming.renames;
   let reads = loads.fold([], |accumulator: List<{ load: Loaded, read: Read }>, l: Loaded|
     accumulator.concat(l.reads.map(|r: Read| { load: l, read: r })));
@@ -142,23 +146,23 @@ fn plan_of(
       accumulator.push(x.read.name)
     } else { accumulator });
   let qualifiers = renaming.modules.values().fold(
-    Map::new(),
-    |accumulator: Map<Bytes, Bool>, m: ModuleMove|
+    Set::empty(),
+    |accumulator: Set<Bytes>, m: ModuleMove|
       match m.before.at(m.before.len() - 1) {
-        Some(last) -> accumulator.insert(last, true),
+        Some(last) -> accumulator.insert(last),
         None -> accumulator,
       },
   );
-  let olds = edited.fold(Map::new(), |accumulator: Map<Bytes, Bool>, e: Edited|
-    e.renamed.fold(accumulator, |into: Map<Bytes, Bool>, old: Bytes, _: List<Bytes>|
-      if qualifiers.contains(old) { into } else { into.insert(old, true) }));
-  let words = olds.fold(Map::new(), |accumulator: Map<Bytes, Bool>, old: Bytes, _: Bool|
-    if renames.words || renames.names.contains(old) { accumulator.insert(old, true) }
+  let olds = edited.fold(Set::empty(), |accumulator: Set<Bytes>, e: Edited|
+    e.renamed.fold(accumulator, |into: Set<Bytes>, old: Bytes, _: List<Bytes>|
+      if qualifiers.contains(old) { into } else { into.insert(old) }));
+  let words = olds.fold(Set::empty(), |accumulator: Set<Bytes>, old: Bytes|
+    if renames.words || renames.names.contains(old) { accumulator.insert(old) }
     else { accumulator });
-  let names = edited.fold(Map::new(), |accumulator: Map<Bytes, Bool>, e: Edited|
-    e.edits.fold(accumulator, |into: Map<Bytes, Bool>, x: Edit|
-      x.names.fold(into, |n: Map<Bytes, Bool>, name: Bytes| n.insert(name, true))));
-  let named = names.keys().fold([], |accumulator: List<Failure>, name: Bytes|
+  let names = edited.fold(Set::empty(), |accumulator: Set<Bytes>, e: Edited|
+    e.edits.fold(accumulator, |into: Set<Bytes>, x: Edit|
+      x.names.fold(into, |n: Set<Bytes>, name: Bytes| n.insert(name))));
+  let named = names.fold([], |accumulator: List<Failure>, name: Bytes|
     match keyword_rejection(name) { Some(f) -> accumulator.push(f), None -> accumulator });
   let targets = changes.fold(
     Map::new(),
@@ -199,8 +203,6 @@ fn plan_of(
   ).concat(
     taken,
   ).concat(
-    retargeted_calls(renaming, loads),
-  ).concat(
     record_clashes(renaming, loads),
   ).concat(
     loads.fold([], |accumulator: List<Failure>, l: Loaded|
@@ -224,14 +226,14 @@ fn plan_of(
   let checked: Checked = if rejections.len() > 0 { { failures: rejections, derived: Map::new() } }
   else {
     let renamed = changes.fold(
-      { pwd: renaming.pwd, texts: Map::new(), gone: Map::new() },
+      { pwd: renaming.pwd, texts: Map::new(), gone: Set::empty() },
       |accumulator: Renamed, change: Change|
         match change.to {
           Some(to) ->
             {
               ..accumulator,
               texts: accumulator.texts.insert(absolute(renaming.pwd, to), change.text),
-              gone: accumulator.gone.insert(absolute(renaming.pwd, change.at), true),
+              gone: accumulator.gone.insert(absolute(renaming.pwd, change.at)),
             },
           None -> if !change.changed { accumulator } else {
             {
@@ -241,22 +243,16 @@ fn plan_of(
           },
         },
     );
-    loads.fold(
-      { checked: { failures: [], derived: Map::new() }, parses: Map::new() },
-      |accumulator: { checked: Checked, parses: ParsedSources }, l: Loaded| {
-        let v = verified(renaming, l, library, texts, renamed, accumulator.parses);
-        {
-          checked: {
-            failures: accumulator.checked.failures.concat(v.checked.failures),
-            derived: v.checked.derived.fold(
-              accumulator.checked.derived,
-              |m: Map<DefinitionKey, Bytes>, key: DefinitionKey, new: Bytes| m.insert(key, new),
-            ),
-          },
-          parses: v.parses,
-        }
-      },
-    ).checked
+    loads.fold({ failures: [], derived: Map::new() }, |accumulator: Checked, l: Loaded| {
+      let v = verified(renaming, l, library, texts, renamed);
+      {
+        failures: accumulator.failures.concat(v.failures),
+        derived: v.derived.fold(
+          accumulator.derived,
+          |m: Map<DefinitionKey, Bytes>, key: DefinitionKey, new: Bytes| m.insert(key, new),
+        ),
+      }
+    })
   };
   {
     changes: changes.filter(|change: Change| change.changed || change.to != None),
@@ -283,7 +279,7 @@ fn planned(
   renames: Renames,
   loads: List<Loaded>,
   libraries: List<Library>,
-) -> Plan / {builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.read[abs], Derives, abort.raise, diverges} = {
+) -> Plan / {project_store::Databases, time.elapsed_ms, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise, diverges} = {
   let renaming = renaming_of(pwd, renames, loads, libraries);
   let first = plan_of(renaming, loads);
   if renames_derived(renaming, first.derived) { first }
@@ -411,7 +407,7 @@ fn rejected_with(reason: String) -> CommandOutput =
 
 pub fn run(
   flags: Flags,
-) -> CommandOutput / {env.working_directory, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], fs.kind[cwd], fs.kind[abs], fs.resolved_kind[abs], fs.list_dir[cwd], fs.list_dir[abs], fs.read_file[cwd], fs.read_file[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], entropy.next, time.now_ms, Derives, abort.raise, diverges} =
+) -> CommandOutput / {project_store::Databases, time.elapsed_ms, env.working_directory, shipped.read_pack, toolchain.reuse_dir, builder.git[vcs], ProjectFiles, fs.resolved_kind[abs], fs.list_dir[shipped], fs.read_file[shipped], fs.write_file[cwd], fs.write_file[abs], fs.create_dir[cwd], fs.create_dir[abs], fs.rename[cwd], fs.rename[abs], fs.read[cwd], fs.write[cwd], fs.read[abs], fs.write[abs], Loads, abort.raise, diverges} =
   match flags.renames_file {
     None -> rejected_with("list the renames in a file and pass it with `--map FILE`"),
     Some(map) -> match read_file(rooted_path(map)) {
@@ -422,7 +418,13 @@ pub fn run(
           let given = if flags.paths.len() == 0 { [here()] } else { flags.paths };
           let pwd = env.working_directory();
           let libraries = libraries_of(given);
-          let loading = loads_of(given, pwd, !only_locals(renames));
+          let loading = loads_of(
+            given,
+            pwd,
+            needs_of(renames),
+            |f: File| mentions_rename(renames, displayed(f.at), f.text),
+            |r: Read| changed_names(renames, r),
+          );
           if loading.failures.len() > 0 { command_output(nothing_planned, loading.failures, false) }
           else {
             let plan = planned(pwd, renames, loading.loads, libraries);

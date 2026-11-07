@@ -17,9 +17,9 @@ HOST_PACKAGES=(ply-host-tests)
 
 SUPERSEDED=(ply-stores-)
 
-NEWEST=(nextest-archive- ply-runtime- ply-built- rust-passed- ply-c-stage-sources- ply-c-runs-)
+NEWEST=(nextest-archive- ply-runtime- ply-built- rust-passed- ply-c-stage-sources-)
 
-PER_JOB=(ply-stores- ply-c-runs-)
+PER_JOB=(ply-stores-)
 
 FIXED=(tcc-)
 
@@ -70,19 +70,6 @@ workspace() {
 role() {
   if [[ $1 == in-process ]]; then printf '%s\n' "$IN_PROCESS_SUITE"; return; fi
   awk -v r="$1" '$1 == r { print $2 }' <<< "$WORK"
-}
-
-cmd_ply_trees() {
-  {
-    role std
-    role std-tests
-    role compiler
-    role cli
-    role cli-tests
-    role package
-    role suite
-    role fixtures
-  } | LC_ALL=C sort -u
 }
 
 cmd_store_paths() {
@@ -498,11 +485,32 @@ toolchain_inputs() {
           embeds_from <<< "$prev" | while IFS=: read -r file target; do
             covered "$target" "$prev" || printf '%s\n' "$target"
           done
+          deriver_sources
         fi
       } | grep . | LC_ALL=C sort -u
     )
   done
   printf '%s\n' "$all"
+}
+
+deriver_sources() {
+  local std file module next seen=''
+  std=$(role std)
+  next=$(std_imports "$root/$(role compiler)/expand/derive.ply")
+  while [[ -n $next ]]; do
+    module=${next%%$'\n'*}
+    [[ $next == *$'\n'* ]] && next=${next#*$'\n'} || next=
+    file="$std/$(tr . / <<< "${module#std.}").ply"
+    [[ $'\n'$seen$'\n' == *$'\n'$file$'\n'* || ! -f $root/$file ]] && continue
+    seen+=$file$'\n'
+    printf '%s\n' "$file"
+    next+=$'\n'$(std_imports "$root/$file")
+    next=$(grep . <<< "$next" || true)
+  done
+}
+
+std_imports() {
+  sed -nE 's/^import (std(\.[a-z_0-9]+)+).*/\1/p' "$1" | LC_ALL=C sort -u
 }
 
 embeds_from() {
@@ -661,7 +669,7 @@ cmd_prune_check() {
   local a b got want
   a=$(printf 'a%.0s' {1..40})
   b=$(printf 'b%.0s' {1..40})
-  want="1 superseded;4 unnamed;7 superseded;11 superseded;12 unnamed;13 superseded;17 unnamed;19 superseded;"
+  want="1 superseded;4 unnamed;7 superseded;13 superseded;17 unnamed;19 superseded;"
   got=$(printf '%s\t%s\t%s\n' \
     1 2026-01-01T00:00:00Z ply-stores-stdlib-100 \
     2 2026-01-02T00:00:00Z "ply-stores-stdlib-$b-200" \
@@ -670,9 +678,6 @@ cmd_prune_check() {
     7 2026-01-01T00:00:00Z "ply-built-Linux-X64-$a" \
     8 2026-01-02T00:00:00Z "ply-built-Linux-X64-$b" \
     9 2026-01-01T00:00:00Z "ply-built-macOS-ARM64-$a" \
-    10 2026-01-02T00:00:00Z "ply-c-runs-stdlib-$a" \
-    11 2026-01-01T00:00:00Z "ply-c-runs-stdlib-$b" \
-    12 2026-01-02T00:00:00Z "ply-c-runs-cli-part-3-$a" \
     13 2026-01-01T00:00:00Z v0-rust-build-Linux-x64-11111111-22222222 \
     14 2026-01-02T00:00:00Z v0-rust-build-Linux-x64-11111111-33333333 \
     15 2026-01-01T00:00:00Z v0-rust-clippy-Linux-x64-11111111-22222222 \
@@ -680,7 +685,7 @@ cmd_prune_check() {
     17 2026-01-02T00:00:00Z sccache/a/b/c/abcdef \
     18 2026-01-03T00:00:00Z "ply-stores-stdlib-$b-300" \
     19 2026-01-01T00:00:00Z "ply-stores-stdlib-$a-150" |
-    prune_plan 200 "ply-stores-stdlib- ply-stores-proofs-" "ply-built- ply-c-runs-stdlib- v0-rust-" "tcc-" |
+    prune_plan 200 "ply-stores-stdlib- ply-stores-proofs-" "ply-built- v0-rust-" "tcc-" |
     cut -f1,2 | LC_ALL=C sort -n | tr '\t\n' ' ;')
   if [[ $got != "$want" ]]; then
     echo "FAIL: in its test listing, \`supersede\` would delete '$got' but should delete '$want'" >&2
@@ -1009,24 +1014,6 @@ cmd_verify() {
     fi
   fi
 
-  local sweep_rs="$root/crates/ply-compiled/src/c/sweep.rs" swept cut
-  swept=$(sed -n 's/^const BY_FILE: \[&str; [0-9]*\] = \[\(.*\)\];$/\1/p' "$sweep_rs" | tr -d ' ' | tr ',' '\n' |
-    while read -r name; do sed -n "s/^pub const $name: &str = \"\\(.*\\)\";$/\\1/p" "$sweep_rs"; done | LC_ALL=C sort)
-  cut=$(sed -n 's/^ *\([a-z| ]*\)) find "\$dir" -type f ! -newer "\$mark" -delete ;;$/\1/p' "$root/.github/ci-warm.sh" |
-    tr -d ' ' | tr '|' '\n' | LC_ALL=C sort)
-  if [[ -z $swept || $swept != "$cut" ]]; then
-    echo "FAIL: the sweep takes '$(echo $swept)' file by file and ci-warm.sh cuts '$(echo $cut)' file by file" >&2
-    failures=$((failures + 1))
-  fi
-  local stores_rs stores_warm stores_ply
-  stores_rs=$(sed -n 's/^pub const STORES: &str = "\(.*\)";$/\1/p' "$sweep_rs")
-  stores_warm=$(sed -n 's/^stores=\$cache\/\(.*\)$/\1/p' "$root/.github/ci-warm.sh")
-  stores_ply=$(sed -n 's/^stores=ply-c-cache\/\(.*\)$/\1/p' "$root/.github/ci-ply.sh")
-  if [[ -z $stores_rs || $stores_rs != "$stores_warm" || $stores_rs != "$stores_ply" ]]; then
-    echo "FAIL: the sweep takes the stores below '$stores_rs' whole, ci-warm.sh those below '$stores_warm' and ci-ply.sh those below '$stores_ply'" >&2
-    failures=$((failures + 1))
-  fi
-
   cmd_cache_keys || failures=$((failures + 1))
   cmd_prune_check || failures=$((failures + 1))
   cmd_actions || failures=$((failures + 1))
@@ -1042,7 +1029,7 @@ cmd_verify() {
 }
 
 case "${1:-}" in
-  verify | toolchain-inputs | work | store-paths | ply-trees | runs-matrix | job-runs | run-line | \
+  verify | toolchain-inputs | work | store-paths | runs-matrix | job-runs | run-line | \
     formatted-sources | supersede) workspace ;;
 esac
 
@@ -1057,7 +1044,6 @@ case "${1:-}" in
   c-compiler) cmd_c_compiler ;;
   work) role "${2:?a role}" ;;
   store-paths) cmd_store_paths ;;
-  ply-trees) cmd_ply_trees ;;
   nextest-shards) cmd_nextest_shards ;;
   durations) cmd_durations "${2:?a nextest JUnit report}" ;;
   runs-matrix) cmd_runs_matrix ;;
@@ -1070,7 +1056,7 @@ case "${1:-}" in
   nightly-modules) nightly_of "${2:?a role}" | paste -sd ' ' - ;;
   in-process-suite) printf '%s\n' "$IN_PROCESS_SUITE" ;;
   *)
-    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|ply-trees|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules|in-process-suite}" >&2
+    echo "usage: ci-shards.sh {verify|cache-keys|toolchain-inputs [core]|c-compiler|work ROLE|store-paths|nextest-shards|durations FILE|runs-matrix|job-runs ID|run-line ID|host-filter|formatted-sources|rust-inputs DEPINFO|supersede RUN REF|nightly-modules|in-process-suite}" >&2
     exit 2
     ;;
 esac

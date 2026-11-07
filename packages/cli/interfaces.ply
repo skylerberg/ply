@@ -1,20 +1,14 @@
+import compiler.check.resolve.tables (error_unplaced)
 import std.bin
 import std.fs (fs)
-import compiler.front.facts (Analysis)
-import compiler.front.interface (Interface, ModuleInterface, interface_of, interface_bin,
-                                 envelope_of)
-import compiler.front.pkg (PackageSources, closure, registry_dir)
-import compiler.check.resolve.tables (Diagnostic, Source, error_at)
+import compiler.store.memo (memo)
+import compiler.front.checking.interfaces (published_module)
+import compiler.front.interface (Interface, ModuleInterface, interface_bin, envelope_of)
+import compiler.front.pkg (registry_dir)
+import compiler.check.resolve.tables (Diagnostic)
 import semantics
 import sources
-import compiler.syntax.parsing (no_module, dummy_span)
 import std.path (strip_root)
-
-pub fn dependency_sources(
-  packages: PackageSources,
-  roots: List<Bytes>,
-) -> List<Source> / {abort.raise} =
-  closure(packages, roots).modules.map(|m: { pkg: Int, source: Source }| m.source)
 
 pub fn slot_interface(slot: String) -> String = slot ++ "/.interface/" ++ semantics::version
 
@@ -25,14 +19,12 @@ pub fn slots(root_key: String, roots: List<String>) -> List<String> / {abort.rai
   roots.filter(|r: String| r.starts_with(dir))
 }
 
-pub fn read_slot_interface(slot: String) -> Option<Bytes> / {fs.read_file[abs], abort.raise} =
+fn read_slot_interface(slot: String) -> Option<Bytes> / {fs.read_file[abs], abort.raise} =
   fs.read_file[abs](strip_root(slot_interface(slot)))
 
 fn rederive_mismatch(slot: String, what: String) -> Diagnostic =
-  error_at(
+  error_unplaced(
     b"E0149",
-    no_module,
-    dummy_span,
     Bytes::of_string(
       "the interface published for `" ++ last_segment(slot)
         ++ "` does not re-derive from its source: "
@@ -62,9 +54,7 @@ fn interface_difference(published: Interface, own: Interface) -> Option<String> 
     let named = "`" ++ String::of_bytes_lossy(m.exports.module) ++ "`";
     match modules.get(m.exports.module) {
       None -> Some(named),
-      Some(o) -> if o.exports != m.exports { Some(named ++ "'s exports") }
-      else if o.hashes != m.hashes { Some(named ++ "'s hashes") }
-      else { None },
+      Some(o) -> if o.exports != m.exports { Some(named ++ "'s exports") } else { None },
     }
   })
 }
@@ -76,22 +66,37 @@ fn decode_interface(bytes: Bytes) -> Option<Interface> / {abort.raise} =
     else { match bin::decode(e.payload, interface_bin()) { Err(_) -> None, Ok(p) -> Some(p) } },
   }
 
-pub fn rederive_mismatches(
+pub type SlotInterface = { slot: String, interface: Interface }
+
+pub fn published_interfaces(
   slots: List<String>,
-  sources: List<Source>,
-  analysis: Analysis,
-) -> List<Diagnostic> / {fs.read_file[abs], abort.raise} =
-  slots.fold([], |accumulator: List<Diagnostic>, slot: String|
+) -> List<SlotInterface> / {fs.read_file[abs], abort.raise} =
+  slots.fold([], |found: List<SlotInterface>, slot: String|
     match read_slot_interface(slot) {
-      None -> accumulator,
+      None -> found,
       Some(bytes) -> match decode_interface(bytes) {
-        None -> accumulator,
-        Some(p) -> match interface_difference(
-            p,
-            interface_of(analysis, sources, p.modules.map(|m: ModuleInterface| m.exports.module)),
-          ) {
-          None -> accumulator,
-          Some(what) -> accumulator.push(rederive_mismatch(slot, what)),
-        },
+        None -> found,
+        Some(p) -> found.push({ slot: slot, interface: p }),
       },
     })
+
+pub fn rederive_mismatches(
+  published: List<SlotInterface>,
+  own: List<Bytes>,
+) -> List<Diagnostic> / {memo.read, abort.raise} =
+  published.fold([], |accumulator: List<Diagnostic>, p: SlotInterface| {
+    let derived = p.interface.modules.fold(
+      [],
+      |found: List<ModuleInterface>, m: ModuleInterface|
+        if !own.contains(m.exports.module) { found } else {
+          match published_module({ module: m.exports.module, shipped: false, tested: false }) {
+            Some(x) -> found.push(x.interface),
+            None -> found,
+          }
+        },
+    );
+    match interface_difference(p.interface, { modules: derived }) {
+      None -> accumulator,
+      Some(what) -> accumulator.push(rederive_mismatch(p.slot, what)),
+    }
+  })

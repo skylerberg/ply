@@ -12,9 +12,9 @@
 //! source position.
 //!
 //! `hermetic_machine` provides the same operations using only what they are given. It binds no host
-//! effects, it applies no time limit, it does not measure how long an entry takes, and
-//! `changed_read` never reports a change. A test that runs a program through it is therefore
-//! deterministic and its result can be cached. It needs no grant.
+//! effects, it applies no time limit and it does not measure how long an entry takes. A test that
+//! runs a program through it is therefore deterministic and its result can be cached. It needs no
+//! grant.
 
 import std.bin
 import std.internal.trail as trail
@@ -24,9 +24,9 @@ import std.value (Value)
 /// Runs compiled units: loads them, binds the host features a program was granted, and runs their
 /// roots.
 pub nondet effect machine {
-  /// Loads the unit compiled into the library at `library`, or returns why it did not load, such
-  /// as a library built against another runtime.
-  write open(library: String) -> Result<LoadedUnit, String>
+  /// Loads the unit compiled into the libraries at `libraries`, or returns why it did not load,
+  /// such as a library built against another runtime.
+  write open(libraries: List<String>) -> Result<LoadedUnit, String>
   /// Creates a binding of the families the runtime handles itself, from only `grants`, or returns
   /// why it could not: a file root that is not a directory (`E0454`), a program that cannot be
   /// started (`E0457`), or a credential that does not load (`E0430`).
@@ -39,9 +39,6 @@ pub nondet effect machine {
   /// otherwise on standard output. It is a `read` so that `parallel` branches can report as they
   /// finish: what it prints changes no result.
   read report(line: String, to_stderr: Bool) -> Unit
-  /// Describes, for a person, the first read in `trace` that no longer returns what it did under
-  /// `grants`, or `None` if no read changed.
-  read changed_read(grants: Grants, trace: Bytes) -> Option<String>
   /// Returns the facts about the host effects that the runtime implements itself, for a run granted
   /// `grants`. They are why a credential or file directory was rejected, the TLS settings and
   /// credentials the run's connections use, the file directories the run may access, and where log
@@ -57,16 +54,13 @@ pub nondet effect machine {
 /// Has the same operations as `machine`, but each handler uses only the arguments its operation is
 /// given, never any state outside them.
 pub effect hermetic_machine {
-  /// Loads the unit compiled into the library at `library`, or returns why it did not load.
-  write open(library: String) -> Result<LoadedUnit, String>
+  /// Loads the unit compiled into the libraries at `libraries`, or returns why it did not load.
+  write open(libraries: List<String>) -> Result<LoadedUnit, String>
   /// Sets up the host effects that the runtime implements itself (such as files and processes) from
   /// `grants`, and returns the binding, or the reasons it could not.
   write bind(grants: Grants) -> Result<Int, List<Failure>>
   /// Runs `root` of unit `unit` within the limits `run` sets, and returns how the run ended.
   read enter(unit: Int, root: String, arguments: Bytes, run: Run) -> Outcome
-  /// Returns a description of the first read in `trace` whose result differs under `grants`, or
-  /// `None` if no read changed.
-  read changed_read(grants: Grants, trace: Bytes) -> Option<String>
   /// Returns the facts about the host effects that the runtime implements itself (files, TLS, log
   /// output and so on) for a run given `grants`. A run prints these when it starts.
   read hosting(grants: Grants) -> Hosting
@@ -270,6 +264,10 @@ pub type Hosting = {
   roots: List<NamedPath>,
   sink: Sink,
   signals: List<String>,
+  /// The digest that a run's trace records for these grants when the run uses the host.
+  binding: String,
+  /// The digest that a run's trace records when the run reads the running `ply` program.
+  program: String,
 }
 
 /// The TLS a run's connections use: the library and its provider, the protocol versions and ALPN
@@ -324,13 +322,11 @@ pub fn served<a | e>(go: () -> a / {machine.read, machine.write | e}) -> a / {ab
   handle {
     go()
   } with {
-    machine.open(library) -> loaded_unit_of(unit_open(library)),
+    machine.open(libraries) -> loaded_unit_of(unit_open(String::join(libraries, "\n"))),
     machine.bind(grants) -> bound_of(unit_bind(encode_grants(grants))),
     machine.enter(unit, root, arguments, run) ->
       read(unit_enter(unit, root, arguments, bin::encode(run, run_bin())), outcome_bin()),
     machine.report(line, to_stderr) -> unit_report(line, to_stderr),
-    machine.changed_read(grants, trace) ->
-      changed_read_of(unit_moved(encode_grants(grants), trace)),
     machine.hosting(grants) -> read(unit_hosting(encode_grants(grants)), hosting_bin()),
     machine.unbind(binding) -> read(unit_unbind(binding), reports_bin()),
     machine.close(unit) -> unit_close(unit),
@@ -344,7 +340,7 @@ pub fn served_hermetically<a | e>(
   handle {
     go()
   } with {
-    hermetic_machine.open(library) -> loaded_unit_of(unit_open(library)),
+    hermetic_machine.open(libraries) -> loaded_unit_of(unit_open(String::join(libraries, "\n"))),
     hermetic_machine.bind(grants) -> match hermetic_failure(grants) {
       Some(rejected) -> Err([rejected]),
       None -> Ok(0),
@@ -364,7 +360,6 @@ pub fn served_hermetically<a | e>(
       );
       { ..outcome, trace: if run.observe { Some(b"") } else { outcome.trace } }
     },
-    hermetic_machine.changed_read(grants, trace) -> None,
     hermetic_machine.hosting(grants) -> match hermetic_failure(grants) {
       Some(rejected) ->
         { ..read(unit_hosting(encode_grants(no_grants)), hosting_bin()), rejections: [rejected] },
@@ -445,19 +440,15 @@ fn loaded_unit_of(bytes: Bytes) -> Result<LoadedUnit, String> / {abort.raise} =
 fn bound_of(bytes: Bytes) -> Result<Int, List<Failure>> / {abort.raise} =
   read(bytes, bin::result_bin(bin::int_bin(), bin::list_bin(failure_bin())))
 
-fn changed_read_of(bytes: Bytes) -> Option<String> / {abort.raise} =
-  read(bytes, bin::option_bin(bin::string_bin()))
-
 fn read<a>(bytes: Bytes, codec: bin::BinCodec<a>) -> a / {abort.raise} =
   match bin::decode(bytes, codec) {
     Ok(x) -> x,
     Err(e) -> panic("the runtime's result cannot be decoded: " ++ bin::error_to_string(e)),
   }
 
-extern fn unit_open(library: String) -> Bytes
+extern fn unit_open(libraries: String) -> Bytes
 extern fn unit_bind(grants: Bytes) -> Bytes
 extern fn unit_enter(unit: Int, root: String, arguments: Bytes, run: Bytes) -> Bytes
-extern fn unit_moved(grants: Bytes, trace: Bytes) -> Bytes
 extern fn unit_hosting(grants: Bytes) -> Bytes
 extern fn unit_unbind(binding: Int) -> Bytes
 extern fn unit_close(unit: Int) -> Unit

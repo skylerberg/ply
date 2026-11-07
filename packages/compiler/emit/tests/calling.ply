@@ -6,12 +6,19 @@ import compiler.emit.keys (RootKey, InlinedLambda, Named, Root, Generic, LawPart
                            specialisation_key, RootName, root_name, root_text, site_owner_text,
                            test_key, law_key, specialisation_key_with_effects, KeyType,
                            Specialisation, Evidence, key_types, definition_of)
-import compiler.unit (roots_built, built, unit_text)
-import compiler.emit.typed_ir.statics (StaticDefinition, StaticWords, FieldWord)
+import compiler.front.checking.unit_programs (built, roots_built)
+import compiler.unit (unit_text)
+import compiler.emit.typed_ir.statics (StaticDefinition, StaticWords, FieldWord, StaticStruct,
+                                       RawWord, EntryWord, named_by_content)
+import compiler.emit.code (Code, CodeLiteral)
+import compiler.emit.pieces (own_symbol)
+import compiler.emit.print (printed_function)
+import compiler.syntax.patterns (SourceLiteral, LiteralInt)
+import compiler.syntax.parsing (generated_span)
 import compiler.emit.typed_ir (with_ownerships, reps_of, param_ownerships, LoopVariable, OfHandling)
 import compiler.emit.typed_ir.handling (SchedulerEvidence, Perform, HeapInstance)
 import compiler.emit.representations (BoundLambda, EmitParam, has_variables)
-import compiler.emit.lower.module_context (root_body, param_type)
+import compiler.emit.lower.module_context (ModuleContext, root_body, param_type)
 import compiler.check.typed (WholeBody)
 import compiler.emit.typed_ir (ZeroOperand, Representation, AsInt, AsBool, AsWord, AsImmediate,
                                AsFlattened, AsSum, AsListView, CaseAllocation, Variable, Arg,
@@ -27,13 +34,14 @@ import compiler.emit.typed_ir.containers (Rest, ItemAt)
 import compiler.emit.lower (lowered_fn, lowered_group)
 import compiler.emit.lower.base (GroupMember)
 import compiler.emit.lower.calling (known_body, lambdas_of, context_of)
-import compiler.emit.output (GenericCall, needs_specialisation)
-import compiler.emit.root_emission (built_form)
+import compiler.emit.output (GenericCall, DefinitionSymbol, needs_specialisation)
+import compiler.emit.root_emission (built_form, emitted_of, ir_tables, root_from_code)
 import compiler.emit.own (insert_reference_counts)
 import compiler.emit.verify (ownership_fault)
 import compiler.emit.roots (symbol_of)
 import compiler.emit.emit_harness (Program, program_of, scheduled_program_of, printed_text,
-                                   build_failure, built_c, shipped_lowered, recorded_in)
+                                   build_failure, built_c, shipped_lowered, recorded_in,
+                                   over_program, lowered_in_empty_module)
 import compiler.emit.lower.representation (passing, ByReference, c_values_of, value_words)
 import compiler.emit.layout (max_flat_words)
 import compiler.emit.print.value_printing (signature_types)
@@ -231,14 +239,14 @@ fn lowered_by_key(p: Program, key: RootKey) -> Function / {abort.raise} =
     Some(i) -> {
       let r = p.roots.get(i);
       let body = known_body(root_text(root_name(r.key)), r.params, r.code);
-      lowered_fn(context_of(p.setting, r, body), body)
+      over_program(p, || lowered_fn(context_of(p.setting, r, body), body))
     },
   }
 
-const corpus_program: Program =
+fn corpus_program() -> Program / {abort.raise} =
   match program_of(corpus) { Ok(p) -> p, Err(reason) -> panic(String::of_bytes_lossy(reason)) }
 
-fn lowered(name: Bytes) -> Function / {abort.raise} = lowered_as_built(corpus_program, name)
+fn lowered(name: Bytes) -> Function / {abort.raise} = lowered_as_built(corpus_program(), name)
 
 fn values_in(b: Block) -> List<Rvalue> =
   b.fold([], |accumulator: List<Rvalue>, i: Instruction|
@@ -529,7 +537,7 @@ test "a lambda becomes a closure over its own function, which receives its captu
 test "a closure is its own heap block that starts with its function descriptor, and the generated entry function reads the captured values from the block and releases them" {
   {
     let f = lowered(b"adder");
-    let text = printed_text(corpus_program, f);
+    let text = printed_text(corpus_program(), f);
     let name = symbol_of(b"m.adder").concat(b"_lambda0");
     let has = |t: Bytes| assert(text.index_of(t) != None, Some(String::of_bytes_lossy(text)));
     has(b"ply_alloc(ctx, 24)");
@@ -574,7 +582,7 @@ test "a record captured by a closure is stored in the closure's block as separat
       values_in(f.body).filter(|v: Rvalue| match v { Convert(_) -> true, _ -> false }).len(),
       0,
     );
-    let text = printed_text(corpus_program, f);
+    let text = printed_text(corpus_program(), f);
     assert(text.index_of(b"ply_alloc(ctx, 32)") != None, Some(String::of_bytes_lossy(text)))
   }
 }
@@ -831,7 +839,7 @@ test "`iterate` on a step that is a function value loops in the body, calling th
   {
     let f = lowered(b"iterate_named");
     assert_eq(applying(f.body), 1);
-    assert(printed_text(corpus_program, f).index_of(b"->typed)(ctx") != None, None)
+    assert(printed_text(corpus_program(), f).index_of(b"->typed)(ctx") != None, None)
   };
   {
     let f = lowered(b"iterate_by");
@@ -848,7 +856,7 @@ test "`iterate` on a step that is a function value loops in the body, calling th
 test "a step's loop fails by the runtime once its budget is spent" {
   {
     let f = lowered(b"stepped");
-    assert_eq(printed_text(corpus_program, f).split(b"ply_iterate_bad(ctx, ").len() - 1, 1)
+    assert_eq(printed_text(corpus_program(), f).split(b"ply_iterate_bad(ctx, ").len() - 1, 1)
   }
 }
 
@@ -975,28 +983,29 @@ fn specialised_at(
 ) -> Result<Function, Bytes> / {abort.raise} =
   match match root_index(p, name) { Some(i) -> p.roots.at(i), None -> None } {
     None -> Err(b"no such root"),
-    Some(r) -> {
-      let recorded = recorded_in(p.analysis, site_owner_text(r.key));
-      let own = root_body(recorded, WholeBody, r.base, [], key_types(key)).params.len();
-      let labels = r.params.drop(own).map(|q: EmitParam| q.name);
-      let b = root_body(recorded, WholeBody, r.base, labels, key_types(key));
-      let params = range(0, b.params.len()).map(|i: Int|
-        match lambda_arguments.at(i) {
-          Some(Some(bl)) -> { ..b.params.get(i), lambda: Some(bl) },
-          _ -> b.params.get(i),
-        });
-      let body = known_body(root_text(root_name(key)), params, b.code);
-      Ok(
-        lowered_fn(
-          context_of(
-            p.setting,
-            { ..r, key: key, params: params, types: params.map(param_type), code: b.code },
+    Some(r) ->
+      over_program(p, || {
+        let recorded = recorded_in(p.analysis, site_owner_text(r.key));
+        let own = root_body(recorded, WholeBody, r.base, [], key_types(key)).params.len();
+        let labels = r.params.drop(own).map(|q: EmitParam| q.name);
+        let b = root_body(recorded, WholeBody, r.base, labels, key_types(key));
+        let params = range(0, b.params.len()).map(|i: Int|
+          match lambda_arguments.at(i) {
+            Some(Some(bl)) -> { ..b.params.get(i), lambda: Some(bl) },
+            _ -> b.params.get(i),
+          });
+        let body = known_body(root_text(root_name(key)), params, b.code);
+        Ok(
+          lowered_fn(
+            context_of(
+              p.setting,
+              { ..r, key: key, params: params, types: params.map(param_type), code: b.code },
+              body,
+            ),
             body,
           ),
-          body,
-        ),
-      )
-    },
+        )
+      }),
   }
 
 fn lambda_specialisation(
@@ -1019,9 +1028,7 @@ fn lambda_specialisation(
               nth: 0,
               code: first,
               module: b"m",
-              module_definitions: p.setting.definitions,
               imports: p.setting.imports,
-              effects: p.setting.effects,
               base: l.base,
               written: written,
             };
@@ -1045,7 +1052,7 @@ fn borrowed_lambda_key(
   lambda_root: Bytes,
   generic: Bytes,
   param: Int,
-) -> Result<RootKey, Bytes> / {abort.raise} =
+) -> Result<RootKey, Bytes> =
   match roots_built([{ name: b"m", source_text: source }]) {
     Err(reason) -> Err(reason),
     Ok(keys) -> {
@@ -1242,6 +1249,7 @@ test "a lambda passed without ownership uses its parameter at its declared type,
     b"fn most<c>(xs: List<c>, g: (Int, c) -> Int) -> Int = xs.fold(0, g)\n",
     b"fn heaviest<a>(pairs: List<{ item: a, weight: Int }>) -> Int =\n",
     b"  most(pairs, |most: Int, p: { item: a, weight: Int }| if p.weight > most { p.weight } else { most })\n",
+    b"fn used() -> Int = heaviest([{ item: 1, weight: 2 }])\n",
   ]);
   match borrowed_lambda_key(source, b"heaviest", b"most", 1) {
     Err(reason) -> assert(reason.len() == 0, Some(String::of_bytes_lossy(reason))),
@@ -1381,7 +1389,7 @@ fn builds(
   source: Bytes,
   shipped: List<{ name: Bytes, source_text: Bytes }>,
   root: RootKey,
-) -> Result<Bool, Bytes> / {abort.raise} =
+) -> Result<Bool, Bytes> =
   match built_c(source, shipped, root) { Err(reason) -> Err(reason), Ok(_) -> Ok(true) }
 
 test "a `test` declared `for` each case of a list uses each case at its declared type, and the generic functions it calls agree on that type" {
@@ -1404,41 +1412,43 @@ test "the variables a `law` binds become parameters of its generated functions, 
     Ok(true),
   ]);
   let poly = b"fn pair<a>(x: a) -> a = x\nlaw \"identity is identity\"\n  forall (x: a) {\n    pair(x) == x\n  }\n";
-  assert_eq(builds(poly, [], law_key(b"m", b"identity is identity", LawBody)), Ok(true));
   let alone = b"law \"a value is itself\"\n  forall (x: a, y: b) {\n    x == x && y == y\n  }\n";
-  let itself = law_key(b"m", b"a value is itself", LawBody);
-  assert_eq(builds(alone, [], itself), Ok(true));
-  match program_of(alone) {
-    Err(reason) -> assert_eq(reason, b""),
-    Ok(p) ->
-      assert_eq(
-        {
-          let _ = lowered_by_key(p, itself);
-          b""
-        },
-        b"",
-      ),
-  }
+  [
+    { source: poly, root: law_key(b"m", b"identity is identity", LawBody) },
+    { source: alone, root: law_key(b"m", b"a value is itself", LawBody) },
+  ].fold((), |_: Unit, generic: { source: Bytes, root: RootKey }|
+    match program_of(generic.source) {
+      Err(reason) -> assert_eq(reason, b""),
+      Ok(p) ->
+        assert_eq(
+          {
+            let _ = lowered_by_key(p, generic.root);
+            b""
+          },
+          b"",
+        ),
+    })
 }
 
 fn lowered_tail_group(corpus_names: List<Bytes>) -> Result<Function, Bytes> / {abort.raise} =
   match program_of(corpus) {
     Err(reason) -> Err(reason),
-    Ok(p) -> {
-      let members = corpus_names.fold([], |accumulator: List<GroupMember>, n: Bytes|
-        match range(0, p.roots.len()).fold(None, |found: Option<GroupMember>, i: Int|
-            match p.roots.at(i) {
-              Some(r) -> if r.key != Named(qualify(b"m", n)) { found } else {
-                let body = known_body(root_text(root_name(r.key)), r.params, r.code);
-                Some({ context: context_of(p.setting, r, body), body: body })
-              },
-              None -> found,
-            }) {
-          Some(m) -> accumulator.push(m),
-          None -> accumulator,
-        });
-      Ok(lowered_group(members))
-    },
+    Ok(p) ->
+      over_program(p, || {
+        let members = corpus_names.fold([], |accumulator: List<GroupMember>, n: Bytes|
+          match range(0, p.roots.len()).fold(None, |found: Option<GroupMember>, i: Int|
+              match p.roots.at(i) {
+                Some(r) -> if r.key != Named(qualify(b"m", n)) { found } else {
+                  let body = known_body(root_text(root_name(r.key)), r.params, r.code);
+                  Some({ context: context_of(p.setting, r, body), body: body })
+                },
+                None -> found,
+              }) {
+            Some(m) -> accumulator.push(m),
+            None -> accumulator,
+          });
+        Ok(lowered_group(members))
+      }),
   }
 
 fn instructions_in(b: Block) -> List<Instruction> =
@@ -1557,7 +1567,7 @@ test "mutually tail-calling functions take and return a record and a sum as sepa
           match i { Jump(e) -> accumulator.push(e.member), _ -> accumulator }),
         [1, 0],
       );
-      let text = printed_text(corpus_program, insert_reference_counts(f));
+      let text = printed_text(corpus_program(), insert_reference_counts(f));
       assert(text.index_of(symbol_of(b"m.walk").concat(b"_group(ctx, 0, ")) != None)
     },
   };
@@ -1569,7 +1579,7 @@ test "mutually tail-calling functions take and return a record and a sum as sepa
           reps_of(m.convention).push(m.convention.result).map(several_values)),
         [[true, false, true], [true, false, true]],
       );
-      let text = printed_text(corpus_program, insert_reference_counts(f));
+      let text = printed_text(corpus_program(), insert_reference_counts(f));
       assert(text.index_of(symbol_of(b"m.seek").concat(b"_group(ctx, 0, ")) != None)
     },
   }
@@ -1718,7 +1728,7 @@ test "a restart and a loop over a record set its parameter or state value by val
         }),
       [true, false],
     );
-    assert_eq(undeclared(printed_text(corpus_program, insert_reference_counts(f))), [])
+    assert_eq(undeclared(printed_text(corpus_program(), insert_reference_counts(f))), [])
   }
 }
 
@@ -1839,14 +1849,14 @@ fn name_length(s: Bytes) -> Int =
   }).n
 
 test "every function in the calling test corpus prints C that assigns only variables it declares" {
-  let left_of = |f: Function| {
-    let built = built_form(f);
-    if needs_specialisation(built.links.needs) { [] }
-    else { undeclared(printed_text(corpus_program, built)) }
-  };
   match program_of(corpus) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(p) -> {
+      let left_of = |f: Function| {
+        let built = built_form(f);
+        if needs_specialisation(built.links.needs) { [] }
+        else { undeclared(printed_text(p, built)) }
+      };
       let roots = corpus_names().fold(
         [],
         |accumulator: List<{ name: Bytes, names: List<Bytes> }>, n: Bytes| {
@@ -1974,7 +1984,7 @@ test "a sum too wide for a call's registers is passed by reference, and its resu
         reps_of(c.convention).map(is_wide_sum).push(is_wide_sum(c.convention.result))),
       [[false, true], [true, false]],
     );
-    assert_eq(undeclared(printed_text(corpus_program, insert_reference_counts(f))), [])
+    assert_eq(undeclared(printed_text(corpus_program(), insert_reference_counts(f))), [])
   }
 }
 
@@ -1983,7 +1993,8 @@ test "a borrowed sum wider than a call's registers is read through a const point
     let f = lowered(b"wide_loop");
     let lambda_arguments = { ..f, convention: with_ownerships(f.convention, [BorrowedParam]) };
     assert_eq(signature_types(lambda_arguments.convention).params.at(0), Some(b"const Word*"));
-    let written = printed_text(corpus_program, lambda_arguments).split(b"\n").filter(|l: Bytes|
+    let text = printed_text(corpus_program(), lambda_arguments);
+    let written = text.split(b"\n").filter(|l: Bytes|
       match l.index_of(b" = ") {
         Some(i) -> l.slice(0, i).index_of(b"p0[") != None,
         None -> false,
@@ -2021,7 +2032,7 @@ test "a tail group member takes a wide sum by reference, and its wrapper passes 
         [true, false],
         [true, false],
       ]);
-      let text = printed_text(corpus_program, insert_reference_counts(f));
+      let text = printed_text(corpus_program(), insert_reference_counts(f));
       assert(
         text.index_of(symbol_of(b"m.wide_even").concat(b"_group(ctx, 0, (Word)(intptr_t)p0"))
           != None,
@@ -2043,7 +2054,7 @@ test "a sum whose constructors take no fields is passed and returned as a single
   };
   {
     let f = lowered(b"hue_next");
-    let text = printed_text(corpus_program, insert_reference_counts(f));
+    let text = printed_text(corpus_program(), insert_reference_counts(f));
     assert(text.index_of(b"->layout == ") == None, Some(String::of_bytes_lossy(text)))
   }
 }
@@ -2205,7 +2216,7 @@ test "a function passed through a module that does not import its effect still r
   match built(modules) {
     Err(reason) -> assert_eq(reason, b""),
     Ok(e) -> {
-      let opened = unit_text(e.produced.parts).split(b"\n}\n").filter(|f: Bytes|
+      let opened = unit_text(e.output.parts).split(b"\n}\n").filter(|f: Bytes|
         f.split(b"\n").any(|line: Bytes|
           line.index_of(b" ply_packs_") != None && line.index_of(b"(PlyCtx *ctx") != None
             && line.index_of(b"entered") == None
@@ -2214,4 +2225,49 @@ test "a function passed through a module that does not import its effect still r
       assert_eq(opened.filter(|f: Bytes| f.index_of(b"ctx->bridge") != None).len(), 0)
     },
   }
+}
+
+const empty_module_context: ModuleContext =
+  { module: b"m", definitions: [], imports: [], release_build: false }
+
+fn literal_code(l: SourceLiteral) -> Code =
+  { node: CodeLiteral(l), span: generated_span, ty: int_type }
+
+test "a root is emitted with an `_entry` function that the runtime calls, and is recorded as defined with that entry" {
+  let e = lowered_in_empty_module(||
+    emitted_of(
+      root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7))),
+    ));
+  assert_eq(e.tables.defined.map(|d: DefinitionSymbol| d.entered), [true]);
+  assert_eq(e.text.index_of(symbol_of(b"m.f")), None);
+  assert(
+    e.text.index_of(
+        Bytes::concat_all([b"Word ", own_symbol(None), b"_entry(PlyCtx *ctx, const Word *args)"]),
+      )
+      != None,
+  )
+}
+
+test "a function that a static's type-descriptor entry points to is listed among the calls of the function body that uses the static" {
+  let dup = Named(b"m.dup#T");
+  let type_descriptor = named_by_content(
+    StaticStruct({
+      of: b"PlyType",
+      fields: [
+        RawWord(1),
+        RawWord(0),
+        RawWord(0),
+        EntryWord(dup),
+        RawWord(0),
+        RawWord(0),
+        RawWord(0),
+      ],
+    }),
+  );
+  let t = lowered_in_empty_module(|| {
+    let f = root_from_code(empty_module_context, 0, Named(b"m.f"), [], literal_code(LiteralInt(7)));
+    let counted = { ..insert_reference_counts(f), statics: [type_descriptor] };
+    ir_tables(counted, printed_function(counted))
+  });
+  assert(t.calls.contains(dup))
 }

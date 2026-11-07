@@ -1,0 +1,334 @@
+import std.bin
+import std.list
+import std.graph
+import std.set (Set)
+import compiler.store.memo (memo)
+import compiler.store.handles (QueryOf, Written, written, fetch_part, product_definition)
+import compiler.check.infer.checker (TestInfo, test_info_bin)
+import compiler.check.resolve.tables (in_module)
+import compiler.expand.embed (ModuleEmbed, module_embed_bin)
+import compiler.front.emitter_input (ConstSite, LawPlace, MainPlace, ModuleMain, RootPlace,
+                                     const_site_bin, law_place_bin, main_place_bin, root_place_bin)
+import compiler.front.exports (named_node)
+import compiler.front.facts (Argument, TextArgument, CallArgument, RowArgument, TaggedArgument,
+                             ListArgument, ConstructorArgument, OtherArgument, StatementSite,
+                             TaggedSite, statement_site_bin, tagged_site_bin)
+import compiler.front.rows (DeclaredEffect, DeclaredOperation, declared_effect_bin)
+import compiler.front.checking.world (CheckDefinition, ModuleKey, Modules, modules_bin, shipped_for,
+                                      program_products)
+import compiler.front.checking.groups (code_part, declared_effects_part, imports_part, sites_part,
+                                       tests_part)
+import compiler.front.checking.identity (identity_of)
+import compiler.store.hash.forms (DefinitionRun)
+
+pub fn own_key(module: Bytes) -> ModuleKey = { module: module, shipped: false, tested: false }
+
+pub fn pulled_key(module: Bytes) -> ModuleKey = { module: module, shipped: true, tested: false }
+
+pub fn keys_of(modules: Modules) -> List<ModuleKey> =
+  modules.own.map(own_key).concat(modules.pulled.map(pulled_key))
+
+pub fn names_of(modules: Modules) -> List<Bytes> = modules.own.concat(modules.pulled)
+
+pub type TestList = { root: Int, names: List<Bytes>, tests: List<TestInfo> }
+
+derive bin for TestList
+
+pub fn test_list_query() -> QueryOf<Modules, TestList> =
+  { name: b"test list", input: modules_bin(), output: test_list_bin() }
+
+pub fn test_list_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
+  let keys = keys_of(modules);
+  written(test_list_query(), {
+    root: modules.root,
+    names: names_of(modules),
+    tests: range(0, modules.own.len()).fold([], |found: List<TestInfo>, i: Int|
+      fetch_part(tests_part(), keys.get(i)).fold(found, |tests: List<TestInfo>, t: TestInfo|
+        tests.push({
+          ..t,
+          index: tests.len(),
+          at: { ..t.at, module: i },
+          label: { ..t.label, module: i },
+        }))),
+  })
+}
+
+pub type ProgramRollup = {
+  embeds: List<ModuleEmbed>,
+  roots: List<RootPlace>,
+  mains: List<MainPlace>,
+  declared: List<DeclaredEffect>,
+  laws: List<LawPlace>,
+}
+
+derive bin for ProgramRollup
+
+pub fn program_rollup_query() -> QueryOf<Modules, ProgramRollup> =
+  { name: b"program rollup", input: modules_bin(), output: program_rollup_bin() }
+
+fn declared_at(d: DeclaredEffect, i: Int) -> DeclaredEffect =
+  {
+    ..d,
+    at: in_module(d.at, i),
+    operations: d.operations.map(|o: DeclaredOperation| { ..o, at: in_module(o.at, i) }),
+  }
+
+pub fn program_rollup_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
+  let keys = keys_of(modules);
+  let at = range(0, keys.len());
+  let code = keys.map(|k: ModuleKey| fetch_part(code_part(), k));
+  written(program_rollup_query(), {
+    embeds: at.fold([], |found: List<ModuleEmbed>, i: Int| found.concat(code.get(i).embeds)),
+    roots: at.fold([], |found: List<RootPlace>, i: Int|
+      found.concat(code.get(i).roots.map(|r: RootPlace| { ..r, at: in_module(r.at, i) }))),
+    mains: at.fold([], |found: List<MainPlace>, i: Int|
+      found.concat(
+        code.get(i).mains.map(|m: ModuleMain|
+          { root: m.root, module: i, span: m.span, effects: m.effects }),
+      )),
+    declared: at.fold([], |found: List<DeclaredEffect>, i: Int|
+      found.concat(
+        fetch_part(declared_effects_part(), keys.get(i)).map(|d: DeclaredEffect| declared_at(d, i)),
+      )),
+    laws: at.fold([], |found: List<LawPlace>, i: Int| found.concat(code.get(i).laws)),
+  })
+}
+
+pub type CalleeIdentity = | RunIdentity(Bytes) | NoRunIdentity
+
+derive bin for CalleeIdentity
+
+pub type Callee = { name: Bytes, identity: CalleeIdentity }
+
+derive bin for Callee
+
+pub type IdentifiedSite<a> = { site: a, identity: CalleeIdentity }
+
+derive bin for IdentifiedSite
+
+pub type ProgramSites = {
+  tagged: List<IdentifiedSite<TaggedSite>>,
+  statements: List<StatementSite<Callee>>,
+  constants: List<IdentifiedSite<ConstSite>>,
+}
+
+derive bin for ProgramSites
+
+pub fn run_identity(identity: CalleeIdentity) -> Option<Bytes> =
+  match identity { RunIdentity(hash) -> Some(hash), NoRunIdentity -> None }
+
+pub fn program_sites_query() -> QueryOf<Modules, ProgramSites> =
+  { name: b"program sites", input: modules_bin(), output: program_sites_bin() }
+
+pub fn program_imports_query() -> QueryOf<Modules, List<List<Int>>> =
+  {
+    name: b"program imports",
+    input: modules_bin(),
+    output: bin::list_bin(bin::list_bin(bin::int_bin())),
+  }
+
+pub fn program_imports_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
+  let names = names_of(modules);
+  let slots = range(0, names.len()).fold(Map::new(), |found: Map<Bytes, Int>, i: Int|
+    found.insert(names.get(i), i));
+  written(
+    program_imports_query(),
+    keys_of(modules).map(|k: ModuleKey|
+      fetch_part(imports_part(), k).fold([], |found: List<Int>, name: Bytes|
+        match slots.get(name) { Some(i) -> found.push(i), None -> found })),
+  )
+}
+
+pub fn reached_modules(imports: List<List<Int>>, start: List<Int>) -> Set<Int> / {abort.raise} =
+  Set::of_list(graph::reachable({ out: imports }, start))
+
+pub fn names_reached(
+  names: List<Bytes>,
+  imports: List<List<Int>>,
+  start: List<Bytes>,
+) -> Set<Bytes> / {abort.raise} = {
+  let wanted = Set::of_list(start);
+  reached_modules(
+    imports,
+    range(0, names.len()).filter(|i: Int| wanted.contains(names.get(i))),
+  ).fold(Set::empty(), |found: Set<Bytes>, i: Int| found.insert(names.get(i)))
+}
+
+type Identifying<a> = { identities: Map<Bytes, CalleeIdentity>, value: a }
+
+fn identified_callee(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  name: Bytes,
+) -> Identifying<Callee> / {memo.read, abort.raise} =
+  match identities.get(name) {
+    Some(identity) -> { identities: identities, value: { name: name, identity: identity } },
+    None -> {
+      let identity = callee_identity(program_modules, name);
+      { identities: identities.insert(name, identity), value: { name: name, identity: identity } }
+    },
+  }
+
+fn identified_sites<a>(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  sites: List<a>,
+  called: (a) -> Bytes,
+) -> Identifying<List<IdentifiedSite<a>>> / {memo.read, abort.raise} =
+  sites.fold(
+    { identities: identities, value: [] },
+    |found: Identifying<List<IdentifiedSite<a>>>, site: a| {
+      let callee = identified_callee(program_modules, found.identities, called(site));
+      {
+        identities: callee.identities,
+        value: found.value.push({ site: site, identity: callee.value.identity }),
+      }
+    },
+  )
+
+fn identified_arguments(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  arguments: List<Argument<Bytes>>,
+) -> Identifying<List<Argument<Callee>>> / {memo.read, abort.raise} =
+  arguments.fold(
+    { identities: identities, value: [] },
+    |found: Identifying<List<Argument<Callee>>>, a: Argument<Bytes>| {
+      let one = identified_argument(program_modules, found.identities, a);
+      { identities: one.identities, value: found.value.push(one.value) }
+    },
+  )
+
+fn identified_argument(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  a: Argument<Bytes>,
+) -> Identifying<Argument<Callee>> / {memo.read, abort.raise} =
+  match a {
+    TextArgument(text) -> { identities: identities, value: TextArgument(text) },
+    CallArgument(c) -> {
+      let callee = identified_callee(program_modules, identities, c.callee);
+      let args = identified_arguments(program_modules, callee.identities, c.args);
+      {
+        identities: args.identities,
+        value: CallArgument({ callee: callee.value, args: args.value }),
+      }
+    },
+    RowArgument(fields) -> { identities: identities, value: RowArgument(fields) },
+    TaggedArgument(t) -> {
+      let callee = identified_callee(program_modules, identities, t.callee);
+      let holes = identified_arguments(program_modules, callee.identities, t.holes);
+      {
+        identities: holes.identities,
+        value: TaggedArgument({ callee: callee.value, parts: t.parts, holes: holes.value }),
+      }
+    },
+    ListArgument(items) -> {
+      let listed = identified_arguments(program_modules, identities, items);
+      { identities: listed.identities, value: ListArgument(listed.value) }
+    },
+    ConstructorArgument(c) -> { identities: identities, value: ConstructorArgument(c) },
+    OtherArgument -> { identities: identities, value: OtherArgument },
+  }
+
+fn identified_statements(
+  program_modules: Set<Bytes>,
+  identities: Map<Bytes, CalleeIdentity>,
+  sites: List<StatementSite<Bytes>>,
+) -> Identifying<List<StatementSite<Callee>>> / {memo.read, abort.raise} =
+  sites.fold(
+    { identities: identities, value: [] },
+    |found: Identifying<List<StatementSite<Callee>>>, site: StatementSite<Bytes>| {
+      let args = identified_arguments(program_modules, found.identities, site.args);
+      {
+        identities: args.identities,
+        value: found.value.push({
+          module: site.module,
+          span: site.span,
+          callee: site.callee,
+          label: site.label,
+          args: args.value,
+        }),
+      }
+    },
+  )
+
+fn callee_identity(known: Set<Bytes>, name: Bytes) -> CalleeIdentity / {memo.read, abort.raise} = {
+  let module = named_node(name).module;
+  if !known.contains(module) { NoRunIdentity } else {
+    match identity_of({
+        module: { module: module, shipped: shipped_for(false, module), tested: false },
+        subject: DefinitionRun(name),
+      }) {
+      Some(identity) -> RunIdentity(identity),
+      None -> NoRunIdentity,
+    }
+  }
+}
+
+pub fn program_sites_result(modules: Modules) -> Written / {memo.read, abort.raise} = {
+  let keys = keys_of(modules);
+  let root = range(0, modules.root);
+  let read = root.map(|i: Int| fetch_part(sites_part(), keys.get(i)));
+  let tagged = root.fold([], |found: List<TaggedSite>, i: Int|
+    found.concat(read.get(i).tagged.map(|t: TaggedSite| { ..t, module: i })));
+  let statements = root.fold([], |found: List<StatementSite<Bytes>>, i: Int|
+    found.concat(read.get(i).statements.map(|x: StatementSite<Bytes>| { ..x, module: i })));
+  let constants = root.fold([], |found: List<ConstSite>, i: Int|
+    found.concat(read.get(i).constants.map(|c: ConstSite| { ..c, module: i })));
+  let program_modules = Set::of_list(names_of(modules));
+  let identified_tagged = identified_sites(program_modules, Map::new(), tagged, |t: TaggedSite|
+    t.callee);
+  let identified_constants = identified_sites(
+    program_modules,
+    identified_tagged.identities,
+    constants,
+    |c: ConstSite| c.name,
+  );
+  written(program_sites_query(), {
+    tagged: identified_tagged.value,
+    statements: identified_statements(
+      program_modules,
+      identified_constants.identities,
+      statements,
+    ).value,
+    constants: identified_constants.value,
+  })
+}
+
+pub fn program_queries() -> List<CheckDefinition> =
+  [
+    product_definition(
+      test_list_query(),
+      b"compiler.front.checking.program_facts.test_list_result",
+      test_list_result,
+      program_products,
+    ),
+    product_definition(
+      program_rollup_query(),
+      b"compiler.front.checking.program_facts.program_rollup_result",
+      program_rollup_result,
+      program_products,
+    ),
+    product_definition(
+      program_sites_query(),
+      b"compiler.front.checking.program_facts.program_sites_result",
+      program_sites_result,
+      program_products,
+    ),
+    product_definition(
+      program_imports_query(),
+      b"compiler.front.checking.program_facts.program_imports_result",
+      program_imports_result,
+      program_products,
+    ),
+  ]
+
+test "a module reaches the modules it imports, directly or indirectly" {
+  let imports = [[1], [2], [], [0], []];
+  let reached = |m: Int| reached_modules(imports, [m]).elements();
+  assert_eq(reached(0), [0, 1, 2]);
+  assert_eq(reached(3), [0, 1, 2, 3]);
+  assert_eq(reached(4), [4]);
+  assert_eq(reached_modules([[1], [0]], [1]).elements(), [0, 1])
+}

@@ -1,9 +1,11 @@
+import std.set (Set)
 import compiler.syntax.type_syntax (Mode, ReadMode, WriteMode, InvalidMode, RaiseMode, is_raise,
                                     mode_text, angled, mode_bin)
 import compiler.syntax.lexer (is_identifier_continue)
 import compiler.syntax.parsing (Identifier)
 import std.bin
 import std.list
+import std.map
 import std.bytes (ascii_of_int)
 import std.option
 
@@ -320,18 +322,18 @@ pub fn fresh_effects(fresh: Fresh) -> { fresh: Fresh, effects: Effects } = {
 pub type Substitution = {
   ty: Map<Int, Type>,
   effects: Map<Int, Effects>,
-  rigid_type: Map<Int, Bool>,
-  rigid_effects: Map<Int, Bool>,
+  rigid_type: Set<Int>,
+  rigid_effects: Set<Int>,
 }
 
 pub const substitution_new: Substitution =
-  { ty: Map::new(), effects: Map::new(), rigid_type: Map::new(), rigid_effects: Map::new() }
+  { ty: Map::new(), effects: Map::new(), rigid_type: Set::empty(), rigid_effects: Set::empty() }
 
 pub fn mark_rigid_type(substitution: Substitution, v: Int) -> Substitution =
   {
     ty: substitution.ty,
     effects: substitution.effects,
-    rigid_type: substitution.rigid_type.insert(v, true),
+    rigid_type: substitution.rigid_type.insert(v),
     rigid_effects: substitution.rigid_effects,
   }
 pub fn mark_rigid_effects(substitution: Substitution, v: Int) -> Substitution =
@@ -339,7 +341,7 @@ pub fn mark_rigid_effects(substitution: Substitution, v: Int) -> Substitution =
     ty: substitution.ty,
     effects: substitution.effects,
     rigid_type: substitution.rigid_type,
-    rigid_effects: substitution.rigid_effects.insert(v, true),
+    rigid_effects: substitution.rigid_effects.insert(v),
   }
 pub fn is_rigid_type(substitution: Substitution, v: Int) -> Bool =
   substitution.rigid_type.contains(v)
@@ -430,45 +432,36 @@ fn effects_may_change(substitution: Substitution, effects: Effects) -> Bool =
     || effects.listed.fold(false, |found: Bool, entry: Effect|
       found || (match entry.resource { ResourceVariable(_) -> true, _ -> false }))
 
-pub fn resolved_variable(
-  substitution: Substitution,
-  effects: Effects,
-) -> Option<Int> / {abort.raise} = {
+type EffectChain = { passed: List<Effects>, end: Option<Int> }
+
+fn effect_chain(substitution: Substitution, tail: Option<Int>) -> EffectChain / {abort.raise} = {
   let bound = substitution.effects.len();
-  iterate({ tail: effects.variable, hops: 0 }, bound + 2, |st: { tail: Option<Int>, hops: Int }|
-    match st.tail {
-      None -> Stop(None),
+  iterate({ passed: [], end: tail }, bound + 2, |chain: EffectChain|
+    match chain.end {
+      None -> Stop(chain),
       Some(v) -> match substitution.effects.get(v) {
-        Some(next) -> if next.variable == Some(v) { Stop(Some(v)) }
-        else if st.hops + 1 > bound { Stop(next.variable) }
-        else { Continue({ tail: next.variable, hops: st.hops + 1 }) },
-        None -> Stop(Some(v)),
+        None -> Stop(chain),
+        Some(next) -> if chain.passed.len() == bound {
+          panic(
+            "internal error: an effect variable's binding leads back to itself, though unification binds only unbound variables to unbound tails",
+          )
+        } else { Continue({ passed: chain.passed.push(next), end: next.variable }) },
       },
     })
 }
 
+pub fn resolved_variable(
+  substitution: Substitution,
+  effects: Effects,
+) -> Option<Int> / {abort.raise} = effect_chain(substitution, effects.variable).end
+
 pub fn resolve_effects(substitution: Substitution, effects: Effects) -> Effects / {abort.raise} = {
-  let bound = substitution.effects.len();
-  let walked = iterate(
-    { listed: effects.listed, variable: effects.variable, seen: [] },
-    bound + 2,
-    |st: { listed: List<Effect>, variable: Option<Int>, seen: List<Int> }|
-      match st.variable {
-        None -> Stop({ listed: st.listed, variable: None }),
-        Some(v) -> if st.seen.contains(v) { Stop({ listed: st.listed, variable: st.variable }) }
-        else {
-          match substitution.effects.get(v) {
-            Some(next) ->
-              Continue({
-                listed: effects_union(st.listed, next.listed),
-                variable: next.variable,
-                seen: st.seen.push(v),
-              }),
-            None -> Stop({ listed: st.listed, variable: st.variable }),
-          }
-        },
-      },
-  );
+  let chain = effect_chain(substitution, effects.variable);
+  let walked = {
+    listed: chain.passed.fold(effects.listed, |listed: List<Effect>, binding: Effects|
+      effects_union(listed, binding.listed)),
+    variable: chain.end,
+  };
   if !walked.listed.fold(false, |accumulator: Bool, entry: Effect|
       accumulator || (match entry.resource { ResourceVariable(_) -> true, _ -> false })) { walked }
   else {
@@ -1228,8 +1221,10 @@ pub type SchemeInstance = {
   ty: Type,
   args: List<Type>,
   labels: List<Type>,
-  effect_variables: List<Int>,
+  effect_variables: List<InstantiatedEffect>,
 }
+
+pub type InstantiatedEffect = { quantified: Int, instance: Int }
 
 pub fn instantiate_with(scheme: Scheme, fresh: Fresh) -> SchemeInstance / {abort.raise} =
   if scheme.type_variables.len() == 0 && scheme.effect_variables.len() == 0
@@ -1252,9 +1247,13 @@ pub fn instantiate_with(scheme: Scheme, fresh: Fresh) -> SchemeInstance / {abort
     );
     let effects = scheme.effect_variables.fold(
       { f: labels.f, m: Map::new(), vars: [] },
-      |accumulator: { f: Fresh, m: Map<Int, Int>, vars: List<Int> }, v: Int| {
+      |accumulator: { f: Fresh, m: Map<Int, Int>, vars: List<InstantiatedEffect> }, v: Int| {
         let o = fresh_effect_variable(accumulator.f);
-        { f: o.fresh, m: accumulator.m.insert(v, o.var), vars: accumulator.vars.push(o.var) }
+        {
+          f: o.fresh,
+          m: accumulator.m.insert(v, o.var),
+          vars: accumulator.vars.push({ quantified: v, instance: o.var }),
+        }
       },
     );
     {
@@ -1412,19 +1411,20 @@ pub fn type_at(
   table: TypeTable,
   key: Bytes,
   read: Map<Bytes, Type>,
-) -> { ty: Type, read: Map<Bytes, Type> } = type_within(table, key, read, table.len())
+) -> { ty: Type, read: Map<Bytes, Type> } / {abort.raise} =
+  type_within(table, key, read, table.len())
 
 fn type_within(
   table: TypeTable,
   key: Bytes,
   read: Map<Bytes, Type>,
   budget: Int,
-) -> { ty: Type, read: Map<Bytes, Type> } =
+) -> { ty: Type, read: Map<Bytes, Type> } / {abort.raise} =
   match read.get(key) {
     Some(t) -> { ty: t, read: read },
-    None -> if budget <= 0 { { ty: VariableType(0 - 1), read: read } } else {
+    None -> if budget <= 0 { panic("a type table refers to its own types in a cycle") } else {
       let made = match table.get(key) {
-        None -> { ty: VariableType(0 - 1), read: read },
+        None -> panic("a type table has no entry for a type it refers to"),
         Some(node) -> type_of_node(table, node, read, budget - 1),
       };
       { ty: made.ty, read: made.read.insert(key, made.ty) }
@@ -1436,7 +1436,7 @@ fn types_within(
   keys: List<Bytes>,
   read: Map<Bytes, Type>,
   budget: Int,
-) -> ReadTypes =
+) -> ReadTypes / {abort.raise} =
   keys.fold({ types: [], read: read }, |accumulator: ReadTypes, k: Bytes| {
     let t = type_within(table, k, accumulator.read, budget);
     { types: accumulator.types.push(t.ty), read: t.read }
@@ -1447,16 +1447,14 @@ fn fields_within(
   fs: List<NodeField>,
   read: Map<Bytes, Type>,
   budget: Int,
-) -> { fields: List<Field>, read: Map<Bytes, Type> } = {
-  let r = types_within(table, fs.map(|f: NodeField| f.ty), read, budget);
-  {
-    fields: range(0, fs.len()).map(|i: Int|
-      {
-        name: match fs.at(i) { Some(f) -> f.name, None -> b"" },
-        ty: match r.types.at(i) { Some(t) -> t, None -> VariableType(0 - 1) },
-      }),
-    read: r.read,
-  }
+) -> { fields: List<Field>, read: Map<Bytes, Type> } / {abort.raise} = {
+  fs.fold(
+    { fields: [], read: read },
+    |found: { fields: List<Field>, read: Map<Bytes, Type> }, f: NodeField| {
+      let t = type_within(table, f.ty, found.read, budget);
+      { fields: found.fields.push({ name: f.name, ty: t.ty }), read: t.read }
+    },
+  )
 }
 
 fn type_of_node(
@@ -1464,7 +1462,7 @@ fn type_of_node(
   node: TypeNode,
   read: Map<Bytes, Type>,
   budget: Int,
-) -> { ty: Type, read: Map<Bytes, Type> } =
+) -> { ty: Type, read: Map<Bytes, Type> } / {abort.raise} =
   match node {
     NodeVariable(v) -> { ty: VariableType(v), read: read },
     NodeNamed(c) -> {
@@ -1718,8 +1716,6 @@ fn name_in(n: VariableRenaming, ty: Type) -> VariableRenaming =
 fn as_types(naming: VariableRenaming) -> Map<Int, Type> =
   naming.types.fold(Map::new(), |m: Map<Int, Type>, k: Int, v: Int| m.insert(k, VariableType(v)))
 
-fn renamed(m: Map<Int, Int>, v: Int) -> Int = match m.get(v) { Some(w) -> w, None -> v }
-
 pub fn canonical_type(ty: Type) -> Type / {abort.raise} = {
   let n = name_in(no_naming, ty);
   rename(ty, as_types(n), n.effect_variables)
@@ -1731,36 +1727,42 @@ pub fn canonical_effects(effects: List<Effect>) -> List<Effect> / {abort.raise} 
 }
 
 pub fn canonical_scheme(scheme: Scheme) -> Scheme / {abort.raise} =
-  canonical_beside(scheme, []).scheme
+  canonical_beside(scheme, [], []).scheme
 
 pub fn canonical_beside(
   scheme: Scheme,
+  types: List<Type>,
   effect_lists: List<List<Effect>>,
-) -> { scheme: Scheme, effect_lists: List<List<Effect>> } / {abort.raise} = {
+) -> CanonicalForm / {abort.raise} = {
   let head = scheme.effect_variables.fold(
     scheme.label_variables.fold(scheme.type_variables.fold(no_naming, name_type), name_type),
     name_effect_variable,
   );
-  let n = effect_lists.fold(name_in(head, scheme.ty), name_effects);
-  let types = as_types(n);
+  let n = effect_lists.fold(types.fold(name_in(head, scheme.ty), name_in), name_effects);
+  let renames = as_types(n);
   {
     scheme: {
-      type_variables: scheme.type_variables.map(|v: Int| renamed(n.types, v)),
-      effect_variables: scheme.effect_variables.map(|v: Int| renamed(n.effect_variables, v)),
-      keep_variables: scheme.keep_variables.map(|v: Int| renamed(n.types, v)),
-      label_variables: scheme.label_variables.map(|v: Int| renamed(n.types, v)),
-      ty: rename(scheme.ty, types, n.effect_variables),
+      type_variables: scheme.type_variables.map(|v: Int| n.types.get_or(v, v)),
+      effect_variables: scheme.effect_variables.map(|v: Int| n.effect_variables.get_or(v, v)),
+      keep_variables: scheme.keep_variables.map(|v: Int| n.types.get_or(v, v)),
+      label_variables: scheme.label_variables.map(|v: Int| n.types.get_or(v, v)),
+      ty: rename(scheme.ty, renames, n.effect_variables),
     },
-    effect_lists: effect_lists.map(|effects: List<Effect>|
-      effects_sorted(effects.map(|entry: Effect| rename_effect(entry, types)))),
+    types: types.map(|ty: Type| rename(ty, renames, n.effect_variables)),
+    renames: renames,
   }
 }
+
+pub type CanonicalForm = { scheme: Scheme, types: List<Type>, renames: Map<Int, Type> }
+
+pub fn canonical_in(form: CanonicalForm, effects: List<Effect>) -> List<Effect> / {abort.raise} =
+  effects_sorted(effects.map(|entry: Effect| rename_effect(entry, form.renames)))
 
 pub type Printer = {
   type_names: Map<Int, Bytes>,
   effect_variable_names: Map<Int, Bytes>,
   label_names: Map<Int, Bytes>,
-  taken: Map<Bytes, Bool>,
+  taken: Set<Bytes>,
 }
 
 pub const printer_new: Printer =
@@ -1768,7 +1770,7 @@ pub const printer_new: Printer =
     type_names: Map::new(),
     effect_variable_names: Map::new(),
     label_names: Map::new(),
-    taken: Map::new(),
+    taken: Set::empty(),
   }
 
 pub fn printer_naming(printer: Printer, v: Int, name: Bytes) -> Printer =
@@ -1823,7 +1825,7 @@ fn label_name(printer: Printer, v: Int) -> { printer: Printer, name: Bytes } / {
   }
 
 fn free_label(printer: Printer) -> Bytes / {abort.raise} =
-  iterate(0, printer.taken.len() + printer.label_names.len() + 1, |i: Int| {
+  iterate(0, printer.taken.size() + printer.label_names.len() + 1, |i: Int| {
     let name = letter_name(label_letters, i);
     if printer.taken.contains(name) || label_in_use(printer.label_names, name) { Continue(i + 1) }
     else { Stop(name) }
@@ -1834,10 +1836,7 @@ fn label_in_use(names: Map<Int, Bytes>, name: Bytes) -> Bool =
     accumulator || existing_name == name)
 
 fn reserve_resource(printer: Printer, resource: Resource) -> Printer =
-  match resource {
-    NamedResource(n) -> { ..printer, taken: printer.taken.insert(n, true) },
-    _ -> printer,
-  }
+  match resource { NamedResource(n) -> { ..printer, taken: printer.taken.insert(n) }, _ -> printer }
 
 pub fn reserve_effects(printer: Printer, effects: List<Effect>) -> Printer =
   effects.fold(printer, |accumulator: Printer, entry: Effect|
@@ -2146,66 +2145,15 @@ pub fn last_dot(b: Bytes) -> Int =
   range(0, b.len()).fold(0 - 1, |accumulator: Int, i: Int|
     if b.at(i) == 46 { i } else { accumulator })
 
-type Split = { name: Bytes, resource: Resource }
-
-fn read_effect(text: Bytes) -> Option<Effect> / {abort.raise} =
-  if text == b"diverges" { Some(diverges_effect) } else {
-    let n = text.len();
-    let split: Option<Split> = match text.index_of(b"[") {
-      None -> Some({ name: text, resource: SingletonResource }),
-      Some(i) -> if n == 0 || text.at(n - 1) != 93 || i == 0 { None }
-      else { Some({ name: text.slice(0, i), resource: NamedResource(text.slice(i + 1, n - 1)) }) },
-    };
-    match split {
-      None -> None,
-      Some(s) -> {
-        let d = last_dot(s.name);
-        if d <= 0 || d >= s.name.len() - 1 { None } else {
-          let eff = s.name.slice(0, d);
-          let access = s.name.slice(d + 1, s.name.len());
-          if access == b"read" {
-            Some({ effect: eff, resource: s.resource, mode: ReadMode, operation: None })
-          } else if access == b"write" {
-            Some({ effect: eff, resource: s.resource, mode: WriteMode, operation: None })
-          } else {
-            Some({ effect: eff, resource: s.resource, mode: WriteMode, operation: Some(access) })
-          }
-        }
-      },
-    }
-  }
-
-pub fn read_effects(text: Bytes) -> Option<List<Effect>> / {abort.raise} =
-  if text.len() == 0 { Some([]) }
-  else if text.at(0) == 60 { None }
-  else { Option::traverse(text.split(b","), read_effect) }
-
-fn label_position_name(i: Int) -> Bytes = b"#".concat(ascii_of_int(i))
-
-pub fn positional_effects_text(effects: List<Effect>, labels: List<Int>) -> Bytes / {abort.raise} =
-  effect_list_text(positional_effects(effects, labels), b",")
-
-pub fn positional_effects(effects: List<Effect>, labels: List<Int>) -> List<Effect> =
-  effects.map(|entry: Effect|
-    match entry.resource {
-      ResourceVariable(v) -> match labels.index_of(v) {
-        Some(i) -> { ..entry, resource: NamedResource(label_position_name(i)) },
-        None -> entry,
-      },
-      _ -> entry,
-    })
-
-pub fn effects_with_label_variables(
-  effects: List<Effect>,
-  labels: List<Int>,
-) -> Option<List<Effect>> / {abort.raise} =
+pub fn relabelled(effects: List<Effect>, from: List<Int>, to: List<Int>) -> Option<List<Effect>> =
   Option::traverse(effects, |entry: Effect|
     match entry.resource {
-      NamedResource(n) -> if !n.starts_with(b"#") { Some(entry) } else {
-        match range(0, labels.len()).find(|i: Int| label_position_name(i) == n) {
-          Some(i) -> Some({ ..entry, resource: ResourceVariable(labels.get(i)) }),
+      ResourceVariable(v) -> match from.index_of(v) {
+        Some(i) -> match to.at(i) {
+          Some(label) -> Some({ ..entry, resource: ResourceVariable(label) }),
           None -> None,
-        }
+        },
+        None -> None,
       },
       _ -> Some(entry),
     })
@@ -2372,61 +2320,16 @@ test "`net.send[conn]` is ordered after `net.write[conn]` in an effect list, and
   )
 }
 
-test "effects read back as the effects they were printed from" {
-  let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, operation: None };
-  let wr = { effect: b"m.net", resource: SingletonResource, mode: WriteMode, operation: None };
-  let send = {
-    effect: b"m.net",
-    resource: NamedResource(b"conn"),
-    mode: WriteMode,
-    operation: Some(b"send"),
-  };
-  assert_eq(read_effects(b""), Some([]));
-  assert_eq(read_effects(effect_list_text([rd], b",")), Some([rd]));
-  assert_eq(read_effects(effect_list_text([rd, wr], b",")), Some([rd, wr]));
-  assert_eq(read_effects(effect_list_text([send], b",")), Some([send]));
-  assert_eq(
-    read_effects(
-      effect_list_text(
-        [
-          {
-            effect: b"m.net",
-            resource: ResourceVariable(4),
-            mode: WriteMode,
-            operation: Some(b"send"),
-          },
-        ],
-        b",",
-      ),
-    ),
-    None,
-  );
-  assert_eq(read_effects(b"db"), None);
-  assert_eq(read_effects(b".read"), None);
-  assert_eq(read_effects(b"m.db."), None);
-  assert_eq(read_effects(b"m.db.read[users"), None)
-}
-
-test "effects can be written as text with each label parameter named by its position, and read back with each position replaced by a given label variable" {
+test "relabelled effects swap each label variable for the label at its position, and fail on a variable that is not a label" {
   let send = |r: Resource|
     { effect: b"m.net", resource: r, mode: WriteMode, operation: Some(b"send") };
   let rd = { effect: b"m.db", resource: NamedResource(b"users"), mode: ReadMode, operation: None };
-  let recorded = positional_effects_text(
-    [send(ResourceVariable(7)), rd, send(ResourceVariable(4))],
-    [4, 7],
+  assert_eq(
+    relabelled([send(ResourceVariable(7)), rd, send(ResourceVariable(4))], [4, 7], [12, 30]),
+    Some([send(ResourceVariable(30)), rd, send(ResourceVariable(12))]),
   );
-  assert_eq(recorded, b"m.net.send[#1],m.db.read[users],m.net.send[#0]");
-  match read_effects(recorded) {
-    None -> panic("a recorded row reads as nothing"),
-    Some(effects) -> {
-      assert_eq(
-        effects_with_label_variables(effects, [12, 30]),
-        Some([send(ResourceVariable(30)), rd, send(ResourceVariable(12))]),
-      );
-      assert_eq(effects_with_label_variables(effects, [12]), None)
-    },
-  };
-  assert_eq(read_effects(positional_effects_text([send(ResourceVariable(9))], [4])), None)
+  assert_eq(relabelled([send(ResourceVariable(7))], [4, 7], [12]), None);
+  assert_eq(relabelled([send(ResourceVariable(9))], [4], [12]), None)
 }
 
 test "the printer names type variables in order of first appearance, and names effect variables separately" {
@@ -2519,8 +2422,8 @@ test "in an effect list a label variable is ordered after a named label and befo
   let s = {
     ty: Map::new().insert(4, label_type(b"conn")),
     effects: Map::new(),
-    rigid_type: Map::new(),
-    rigid_effects: Map::new(),
+    rigid_type: Set::empty(),
+    rigid_effects: Set::empty(),
   };
   assert_eq(effect_text(resolve_effect(s, var_)), b"net.send[conn]");
   assert_eq(effects_text(resolve_effects(s, closed_effects([var_, named]))), b"{net.send[conn]}")
@@ -2683,8 +2586,8 @@ test "instantiating a scheme gives its label parameters fresh variables and retu
   let s = {
     ty: Map::new().insert(bound, label_type(b"conn")),
     effects: Map::new(),
-    rigid_type: Map::new(),
-    rigid_effects: Map::new(),
+    rigid_type: Set::empty(),
+    rigid_effects: Set::empty(),
   };
   assert_eq(type_text(resolve_type(s, instance.ty)), b"() -> Unit / {net.send[conn]}")
 }

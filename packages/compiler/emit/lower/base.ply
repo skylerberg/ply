@@ -5,9 +5,8 @@ import compiler.check.types (Type, VariableType, NamedType, FunctionType, Record
                              float_type, decimal_type, unit_type)
 import compiler.check.known (char_type, width_named)
 import compiler.emit.typing (SiteType, unknown_type)
-import compiler.syntax.parsing (Span, dummy_span)
-import std.list (zip)
-import compiler.emit.representations (EmitParam, word_type)
+import compiler.syntax.parsing (Span, generated_span)
+import compiler.emit.representations (EmitParam, word_type, ShapeReads, EmitReads, lowering)
 import compiler.emit.output (Need)
 import compiler.emit.keys (RootKey, Evidence)
 import compiler.emit.evidence (EffectsEvidence)
@@ -79,20 +78,6 @@ pub fn evidence_values_of(h: CapturedEvidence) -> EvidenceValues<Arg> =
     retained_values: h.retained_values,
   }
 
-pub fn substitute_evidence_variables(
-  h: CapturedEvidence,
-  variables: EvidenceValues<Variable>,
-) -> CapturedEvidence =
-  {
-    words: zip(h.words, variables.words).map(|p: { first: EvidenceWord, second: Variable }|
-      { ..p.first, word: VariableOperand(p.second) }),
-    instance: match ((h.instance, variables.instance)) {
-      (Some(i), Some(v)) -> Some({ ..i, word: VariableOperand(v) }),
-      _ -> None,
-    },
-    retained_values: variables.retained_values.map(VariableOperand),
-  }
-
 pub type EvidenceWord = { evidence: Evidence, word: Arg, inherited: Bool, handled: Bool }
 
 pub type TailCalls = | Restarts(List<Representation>) | Enters(List<RootKey>) | PlainCalls
@@ -153,18 +138,19 @@ pub fn initial_lowering(params: List<Variable>) -> Lowering =
     closures: Map::new(),
   }
 
-pub fn unreachable<a>(reason: Bytes) -> a / {abort.raise} =
-  panic(
-    String::of_bytes_lossy(
-      b"internal compiler error, impossible in a checked program: ".concat(reason),
-    ),
-  )
+pub fn unreachable<a>(reason: Bytes) -> a / {lowering.fail} =
+  lowering.fail(b"internal compiler error, impossible in a checked program: ".concat(reason))
 
 pub fn fresh(st: Lowering, ty: Type, rep: Representation) -> { st: Lowering, var: Variable } =
   { st: { ..st, next: st.next + 1 }, var: { id: st.next, ty: ty, representation: rep } }
 
-pub fn bound(context: Context, st: Lowering, ty: Type, value: Rvalue, at: Span) -> LoweredValue =
-  bound_as(st, ty, representation_of(context.setting, ty), value, at)
+pub fn bound(
+  context: Context,
+  st: Lowering,
+  ty: Type,
+  value: Rvalue,
+  at: Span,
+) -> LoweredValue / {ShapeReads} = bound_as(st, ty, representation_of(ty), value, at)
 
 pub fn bound_as(
   st: Lowering,
@@ -197,6 +183,8 @@ pub fn emitted(st: Lowering, i: Instruction) -> Lowering =
 pub const read_note: Bytes = b"#read"
 
 pub const capture_note: Bytes = b"#capture"
+
+pub const field_read_note: Bytes = b"#field."
 
 pub const enter_note: Bytes = b"#enter"
 
@@ -279,7 +267,7 @@ pub fn typed_slot_read(
   slot: Int,
   ty: Type,
   at: Span,
-) -> LoweredValue =
+) -> LoweredValue / {ShapeReads} =
   if !context.captured.contains(slot) && operand_representation(l.arg) != AsWord { l }
   else { retyped(context, l, ty, at) }
 
@@ -494,11 +482,16 @@ fn unread_dropped_in(b: Block, read: (Int) -> Bool) -> Block =
 fn argument_references(a: Arg, id: Int) -> Bool =
   match a { VariableOperand(v) -> v.id == id, _ -> false }
 
-pub fn retyped(context: Context, l: LoweredValue, t: Type, at: Span) -> LoweredValue =
+pub fn retyped(
+  context: Context,
+  l: LoweredValue,
+  t: Type,
+  at: Span,
+) -> LoweredValue / {ShapeReads} =
   match l.arg {
     VariableOperand(v) -> {
       let refined = refined_type(v.ty, t);
-      let rep = representation_of(context.setting, refined);
+      let rep = representation_of(refined);
       if rep == v.representation {
         if refined == v.ty { l } else { { st: l.st, arg: VariableOperand({ ..v, ty: refined }) } }
       } else if refined == v.ty && v.representation != AsWord { l } else {
@@ -624,8 +617,11 @@ pub fn set_join(
     }
   }
 
-pub fn join_representation(context: Context, ty: Type, tail: Bool) -> Representation =
-  if tail { context.result } else { representation_of(context.setting, ty) }
+pub fn join_representation(
+  context: Context,
+  ty: Type,
+  tail: Bool,
+) -> Representation / {ShapeReads} = if tail { context.result } else { representation_of(ty) }
 
 pub fn joined(
   context: Context,
@@ -634,7 +630,7 @@ pub fn joined(
   otherwise: LoweredValue,
   tail: Bool,
   at: Span,
-) -> LoweredValue = {
+) -> LoweredValue / {ShapeReads} = {
   let ty = join_type(context, [then, otherwise]);
   let j = fresh(exit_block(cond.st, otherwise.st), ty, join_representation(context, ty, tail));
   let t = set_join(j.st, then, j.var, at);
@@ -679,18 +675,23 @@ test "a zero converts directly to another representation's zero, except when eit
   let st = initial_lowering([]);
   let byte = AsFixed({ bits: 8, signed: false });
   assert_eq(
-    represented_as({ st: st, arg: ZeroOperand(AsInt) }, byte, dummy_span).arg,
+    represented_as({ st: st, arg: ZeroOperand(AsInt) }, byte, generated_span).arg,
     ZeroOperand(byte),
   );
   assert_eq(
-    match represented_as({ st: st, arg: ZeroOperand(AsUnit) }, AsWord, dummy_span).st.instructions {
+    match represented_as(
+        { st: st, arg: ZeroOperand(AsUnit) },
+        AsWord,
+        generated_span,
+      ).st.instructions {
       [Let(x)] -> Some({ value: x.value, ty: x.var.ty }),
       _ -> None,
     },
     Some({ value: Convert({ arg: ZeroOperand(AsUnit), to: AsWord }), ty: unit_type }),
   );
   assert(
-    represented_as({ st: st, arg: ZeroOperand(AsWord) }, AsInt, dummy_span).st.instructions != [],
+    represented_as({ st: st, arg: ZeroOperand(AsWord) }, AsInt, generated_span).st.instructions
+      != [],
     None,
   )
 }
@@ -703,9 +704,9 @@ test "converting a word to its typed form and straight back to a word returns th
     int,
     AsInt,
     Convert({ arg: VariableOperand(w), to: AsInt }),
-    dummy_span,
+    generated_span,
   );
-  let back = represented_as(enter_block, AsWord, dummy_span);
+  let back = represented_as(enter_block, AsWord, generated_span);
   assert_eq(back.arg, VariableOperand(w));
   assert_eq(back.st.instructions, enter_block.st.instructions);
   assert_eq(drop_unread_conversions(back.st.instructions), []);
@@ -713,9 +714,9 @@ test "converting a word to its typed form and straight back to a word returns th
     ..enter_block,
     st: { ..enter_block.st, env: enter_block.st.env.insert(1, enter_block.arg) },
   };
-  assert_eq(represented_as(named, AsWord, dummy_span).arg, VariableOperand(w));
+  assert_eq(represented_as(named, AsWord, generated_span).arg, VariableOperand(w));
   let byte = AsFixed({ bits: 8, signed: false });
-  assert(represented_as(enter_block, byte, dummy_span).arg != VariableOperand(w), None)
+  assert(represented_as(enter_block, byte, generated_span).arg != VariableOperand(w), None)
 }
 
 test "a static data block is stored once however often it is added, after any block it points to, and a lambda's blocks go to the enclosing function" {

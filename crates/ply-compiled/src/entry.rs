@@ -22,9 +22,9 @@ unsafe impl Send for Opened {}
 unsafe impl Sync for Opened {}
 
 impl Opened {
-    pub fn open(library: &std::path::Path) -> Result<Arc<Opened>, String> {
+    pub fn open(libraries: &[std::path::PathBuf]) -> Result<Arc<Opened>, String> {
         let started = Instant::now();
-        let native = crate::c::load_from_path(library).map_err(|e| format!("{e:#}"))?;
+        let native = crate::c::load_libraries(libraries).map_err(|e| format!("{e:#}"))?;
         Ok(Arc::new(Opened {
             native,
             nanos: elapsed_nanos(started),
@@ -67,8 +67,6 @@ pub trait Binder: Send + Sync {
     fn bind(&self, grants: Grants) -> Result<Arc<dyn Bound>, Vec<Diagnostic>>;
 
     fn hosting(&self, grants: &Grants, w: &mut Writer);
-
-    fn moved(&self, grants: &Grants, trace: &str, caller: Option<&Recorder>) -> Option<String>;
 }
 
 pub trait Bound: Send + Sync {
@@ -237,28 +235,6 @@ pub fn enter(
         outcome.trace = w.by.traced(&own, outcome.usage.host);
     }
     outcome
-}
-
-pub fn run_to_result(
-    opened: &Opened,
-    root: &str,
-    arguments: Vec<u8>,
-    timeout_ms: u64,
-) -> Result<Vec<u8>, String> {
-    let run = Run {
-        timeout_ms,
-        ..Run::unbounded()
-    };
-    on_program_thread(
-        || match enter(opened, root, arguments, &run, None, None).ended {
-            Ended::Returned(bytes) => Ok(bytes),
-            Ended::Failed(diagnostic) => Err(diagnostic.to_string()),
-            Ended::Panicked(said) => Err(said),
-            Ended::NoRoot => Err(format!("the unit is entered at no root `{root}`")),
-            Ended::NotReturnable(reason) => Err(reason.to_string()),
-        },
-    )
-    .unwrap_or_else(|| Err(format!("`{root}` could not be given a thread")))
 }
 
 const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -497,10 +473,6 @@ pub fn natives() -> Vec<crate::c::MachineNative> {
             rt_unit_hosting as unsafe extern "C" fn(_, _, _) -> _,
         ),
         runtime_native(
-            "unit_moved",
-            rt_unit_moved as unsafe extern "C" fn(_, _, _, _, _) -> _,
-        ),
-        runtime_native(
             "unit_enter",
             rt_unit_enter as unsafe extern "C" fn(_, _, _, _, _, _, _, _) -> _,
         ),
@@ -546,12 +518,18 @@ fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 unsafe extern "C" fn rt_unit_open(ctx: *mut Ctx, p: Addr, n: I64) -> TakenBytes {
-    let library = unsafe { borrowed(p, n) };
+    let libraries = unsafe { borrowed(p, n) };
     let mut w = Writer::new();
-    match std::str::from_utf8(library)
-        .map_err(|_| "the library's path is not UTF-8".to_string())
-        .and_then(|path| Opened::open(std::path::Path::new(path)))
-    {
+    match std::str::from_utf8(libraries)
+        .map_err(|_| "a library's path is not UTF-8".to_string())
+        .and_then(|paths| {
+            Opened::open(
+                &paths
+                    .lines()
+                    .map(std::path::PathBuf::from)
+                    .collect::<Vec<_>>(),
+            )
+        }) {
         Ok(opened) => {
             let (roots, nanos) = (opened.roots() as u64, opened.nanos());
             let unit = units().keep(opened);
@@ -628,33 +606,6 @@ unsafe extern "C" fn rt_unit_hosting(ctx: *mut Ctx, p: Addr, n: I64) -> TakenByt
     };
     let mut w = Writer::new();
     binder.hosting(&grants, &mut w);
-    c.given(w.finish())
-}
-
-unsafe extern "C" fn rt_unit_moved(
-    ctx: *mut Ctx,
-    gp: Addr,
-    gn: I64,
-    tp: Addr,
-    tn: I64,
-) -> TakenBytes {
-    let c = unsafe { &mut *ctx };
-    let Some(grants) = read_or_fail(c, unsafe { borrowed(gp, gn) }, read_grants) else {
-        return TakenBytes(0);
-    };
-    if !allowed(c, "machine.moved") {
-        return TakenBytes(0);
-    }
-    let Some(binder) = INSTALLED_BINDER.get() else {
-        return TakenBytes(c.fail(err_no_binder()));
-    };
-    let trace = String::from_utf8_lossy(unsafe { borrowed(tp, tn) }).into_owned();
-    let caller = ply_host::observe::of(&*c.host_runtime());
-    let moved = binder.moved(&grants, &trace, caller.as_deref());
-    let mut w = Writer::new();
-    w.option(moved.as_deref(), |w, m| {
-        w.str(m);
-    });
     c.given(w.finish())
 }
 

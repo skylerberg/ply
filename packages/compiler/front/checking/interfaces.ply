@@ -1,0 +1,83 @@
+import std.set (Set)
+import std.bin
+import compiler.store.memo (memo)
+import compiler.store.handles (QueryOf, Written, written, fetch, product_definition)
+import compiler.store.hash (Contract, contract_bin)
+import compiler.store.hash.forms (Identified, SubjectIdentity, DefinitionContract)
+import compiler.front.interface (ModuleInterface, module_interface_bin)
+import compiler.front.exports (exports_from)
+import compiler.front.rows (KnownDefinitionRow)
+import compiler.front.checking.world (ModuleKey, QueryEffects, module_key_bin, module_read,
+                                      CheckDefinition, interface_products)
+import compiler.front.checking.identity (listed_identities)
+import compiler.front.checking.groups (CheckGroupKey, module_groups, stored_rows, summary_of,
+                                       context_once)
+import compiler.syntax.items (Item, FunctionItem, TypeItem, EffectItem, Module, is_pub)
+import std.list
+
+pub type PublishedModule = { interface: ModuleInterface, contracts: List<Contract> }
+
+derive bin for PublishedModule
+
+pub fn interface_query() -> QueryOf<ModuleKey, Option<PublishedModule>> =
+  { name: b"interface", input: module_key_bin(), output: bin::option_bin(published_module_bin()) }
+
+pub fn interface_result(key: ModuleKey) -> Written / {QueryEffects, abort.raise} =
+  written(interface_query(), if summary_of(key).rejected { None } else {
+    match module_read(key) {
+      None -> None,
+      Some(m) -> {
+        let rows = module_groups(key).flat_map(|g: CheckGroupKey| stored_rows(g).definitions);
+        Some({
+          interface: {
+            exports: exports_from(
+              m.parsed,
+              m.raw,
+              m.source.source_text,
+              context_once(key).targets,
+              rows,
+            ),
+          },
+          contracts: contracts_of(key, m.raw),
+        })
+      },
+    }
+  })
+
+fn contracts_of(key: ModuleKey, raw: Module) -> List<Contract> / {memo.read, abort.raise} = {
+  let public = raw.items.fold(Set::empty(), |found: Set<Bytes>, item: Item|
+    match public_name(item) {
+      Some(name) -> found.insert(key.module.concat(b".").concat(name)),
+      None -> found,
+    });
+  listed_identities(key, |subject: Identified|
+    match subject {
+      DefinitionContract(reference) -> public.contains(reference.name),
+      _ -> false,
+    }).flat_map(|listed: SubjectIdentity|
+    match listed.subject {
+      DefinitionContract(reference) -> [{ reference: reference, hash: listed.identity }],
+      _ -> [],
+    })
+}
+
+fn public_name(item: Item) -> Option<Bytes> =
+  match item {
+    FunctionItem(d) -> if is_pub(d.visibility) { Some(d.name.name) } else { None },
+    TypeItem(d) -> if is_pub(d.visibility) { Some(d.name.name) } else { None },
+    EffectItem(d) -> if is_pub(d.visibility) { Some(d.name.name) } else { None },
+    _ -> None,
+  }
+
+pub fn published_module(key: ModuleKey) -> Option<PublishedModule> / {memo.read, abort.raise} =
+  fetch(interface_query(), key)
+
+pub fn interface_queries() -> List<CheckDefinition> =
+  [
+    product_definition(
+      interface_query(),
+      b"compiler.front.checking.interfaces.interface_result",
+      interface_result,
+      interface_products,
+    ),
+  ]

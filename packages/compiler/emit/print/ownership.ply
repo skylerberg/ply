@@ -15,7 +15,7 @@ import compiler.emit.layout (SumLayout, WordIs, WordOutside, LowBits, Nullary, I
                              head_words, text_head, list_head, node_head, array_head,
                              text_block_bytes, ValueLayout, InlineRecord)
 import compiler.emit.lower.representation (c_values_of, leaf_values, passing, ByValue, ByReference,
-                                           return_buffer_words, representation_with)
+                                           return_buffer_words, representation_of)
 import compiler.emit.typed_ir (placeholder_var, param_ownerships, param_rep, Representation, AsInt,
                                AsWord, AsFlattened, AsReuseToken, AsSum, Leaf, Variable,
                                Instruction, Increment, Decrement, Reset, Free, Destructure,
@@ -25,7 +25,8 @@ import compiler.emit.typed_ir (placeholder_var, param_ownerships, param_rep, Rep
 import compiler.emit.c (int_literal)
 import compiler.emit.print.matching (switch_value, case_label, empty_arms)
 import compiler.emit.pieces (Piece, Text, Hole, Symbol, pieces_text)
-import compiler.emit.representations (Constructors, constructors_of, inside_layout, known_layout)
+import compiler.emit.representations (inside_layout, known_layout, ShapeReads, SumConstructor,
+                                      over_code_facts, table_sources, with_no_shapes)
 import compiler.emit.release (Part, WordAt, ByCase, CountedWord, Object, CaseBox, SumWord,
                               ScalarWord, ThroughDescriptor, RuntimeHandle, BlockContents,
                               WordBlock, ScopedContents, BytesBlock, ListOf, MapOf, MapNodeOf,
@@ -155,7 +156,7 @@ fn resource_cleanup_jump(
   }
 }
 
-fn resource_released(printing: Printing, u: Unwinding) -> Fragment / {abort.raise} = {
+fn resource_released(printing: Printing, u: Unwinding) -> Fragment / {ShapeReads} = {
   let k = u.callee;
   let noted = if printing.calls.contains(k) { printing } else {
     {
@@ -219,7 +220,7 @@ pub fn block_closed(
   outer: Int,
   depth: Int,
   falls: Bool,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let here = match printing.tails.by_block.get(printing.block) {
     Some(ks) -> ks.reverse(),
     None -> [],
@@ -280,12 +281,12 @@ pub fn block_closed(
 
 pub type Fragment = { printing: Printing, out: List<Piece> }
 
-fn slot_released(printing: Printing, name: Bytes, ty: Type) -> Fragment / {abort.raise} =
-  match known_layout(printing.constructors, ty) {
+fn slot_released(printing: Printing, name: Bytes, ty: Type) -> Fragment / {ShapeReads} =
+  match known_layout(ty) {
     Some(l) ->
       parts_released(
         printing,
-        layout_parts(printing.constructors, ty, l, 0),
+        layout_parts(ty, l, 0),
         range(0, words(l)).map(|k: Int| slot(name, k)),
       ),
     None -> unsupported(b"a record field whose type has no known size in memory", name),
@@ -295,7 +296,7 @@ pub fn count_printed(
   p: InstructionContext,
   printing: Printing,
   i: Instruction,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match i {
     Increment(n) -> {
       let once = duped(
@@ -310,29 +311,27 @@ pub fn count_printed(
           spaced(accumulator, once.out)),
       })
     },
-    Decrement(v) -> match printing.placing.slots.get(v.id) {
-      None ->
-        fragment_line(
-          p.depth,
-          released(
-            printing,
-            v.ty,
-            v.representation,
-            part_names(name_of(printing, v), v.representation),
-          ),
+    Decrement(v) -> if !printing.placing.slots.contains(v.id) {
+      fragment_line(
+        p.depth,
+        released(
+          printing,
+          v.ty,
+          v.representation,
+          part_names(name_of(printing, v), v.representation),
         ),
-      Some(_) -> if printing.placing.moved.contains(v.id) {
-        { ..printing, placing: { ..printing.placing, moved: printing.placing.moved.remove(v.id) } }
-      } else { fragment_line(p.depth, slot_released(printing, name_of(printing, v), v.ty)) },
-    },
+      )
+    } else if printing.placing.moved.contains(v.id) {
+      { ..printing, placing: { ..printing.placing, moved: printing.placing.moved.remove(v.id) } }
+    } else { fragment_line(p.depth, slot_released(printing, name_of(printing, v), v.ty)) },
     Reset(r) ->
       reset_boxed(
         printing,
         p.depth,
         r.token,
         r.of,
-        block_contents(printing.constructors, r.of.ty, r.of.representation),
-        root_of_representation(Drop, printing.constructors, r.of.ty, r.of.representation),
+        block_contents(r.of.ty, r.of.representation),
+        root_of_representation(Drop, r.of.ty, r.of.representation),
       ),
     Free(r) -> {
       let t = name_of(printing, r.of);
@@ -357,7 +356,7 @@ pub fn count_printed(
             p.depth,
             o.of,
             o.words,
-            block_contents(printing.constructors, o.of.ty, o.of.representation),
+            block_contents(o.of.ty, o.of.representation),
           ),
         None -> opened_sum(printing, p.depth, o.of, o.words),
       },
@@ -367,7 +366,7 @@ pub fn count_printed(
           p.depth,
           o.of,
           o.words,
-          block_contents(printing.constructors, o.of.ty, o.of.representation),
+          block_contents(o.of.ty, o.of.representation),
         ),
     },
     _ -> printing,
@@ -447,14 +446,14 @@ pub fn released(
   ty: Type,
   r: Representation,
   values: List<Bytes>,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   match r {
     AsReuseToken(n) -> {
       let t = nth_or_zero(values, 0);
       { printing: printing, out: [Text(Bytes::concat_all([b"if (", t, b") ", freed(t, n)]))] }
     },
     _ -> {
-      let each = counted_parts(printing.constructors, ty, r);
+      let each = counted_parts(ty, r);
       let vs = per_part(r, values);
       let by_word = range(0, each.len()).fold(
         { printing: printing, out: [] },
@@ -493,8 +492,8 @@ pub fn duped(
   ty: Type,
   r: Representation,
   values: List<Bytes>,
-) -> Fragment / {abort.raise} = {
-  let each = counted_parts(printing.constructors, ty, r);
+) -> Fragment / {ShapeReads} = {
+  let each = counted_parts(ty, r);
   let vs = per_part(r, values);
   let d = Bytes::join(
     range(0, each.len()).fold([], |accumulator: List<Bytes>, k: Int|
@@ -534,11 +533,11 @@ fn count_root(
   ty: Type,
   r: Representation,
   values: List<Bytes>,
-) -> Option<RootKey> / {abort.raise} =
+) -> Option<RootKey> / {ShapeReads} =
   if printing.count_root_type == Some(ty) || values.all(|v: Bytes| v == b"0") { None }
-  else { counted_through(operation, printing.constructors, ty, r) }
+  else { counted_through(operation, ty, r) }
 
-fn shorter(by_word: Fragment, call: Fragment) -> Fragment / {abort.raise} =
+fn shorter(by_word: Fragment, call: Fragment) -> Fragment / {ShapeReads} =
   if pieces_text(call.out).len() < pieces_text(by_word.out).len() { call } else { by_word }
 
 fn count_root_call(
@@ -765,7 +764,7 @@ pub fn opened_block(
   o: Variable,
   ws: List<Variable>,
   opening: BlockContents,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let x = name_of(printing, o);
   let read = |parts: List<BlockPart>|
     range(0, ws.len()).fold(printing, |q: Printing, i: Int|
@@ -826,7 +825,7 @@ fn contents_released(
   printing: Printing,
   x: Bytes,
   opening: BlockContents,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   match opening {
     BytesBlock ->
       {
@@ -939,7 +938,7 @@ fn item_read_at(
   x: Bytes,
   from: Int,
   stride: Int,
-) -> { names: List<Bytes>, read: Bytes } / {abort.raise} =
+) -> { names: List<Bytes>, read: Bytes } / {ShapeReads} =
   run_read(x, b"ply_w", from, stride, stride)
 
 fn run_read(
@@ -948,7 +947,7 @@ fn run_read(
   from: Int,
   stride: Int,
   count: Int,
-) -> { names: List<Bytes>, read: Bytes } / {abort.raise} = {
+) -> { names: List<Bytes>, read: Bytes } / {ShapeReads} = {
   let slots = run_slots(x, from, stride, count);
   let names = if count == 1 { [prefix] }
   else { range(0, count).map(|j: Int| prefix.concat(ascii_of_int(j))) };
@@ -980,7 +979,7 @@ pub fn walk_value(
   into: Option<Variable>,
   of: Variable,
   operation: TypeOperation,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match into {
     None ->
       unsupported(
@@ -995,21 +994,13 @@ pub fn walk_value(
           n,
           of,
           operation,
-          block_contents(q.constructors, of.ty, of.representation),
-          root_of_representation(Drop, q.constructors, of.ty, of.representation),
+          block_contents(of.ty, of.representation),
+          root_of_representation(Drop, of.ty, of.representation),
         );
       match of.representation {
         AsSum(s) -> match sole_boxed_payload(s.layout) {
           Some(_) -> whole(printing),
-          None ->
-            walk_sum(
-              printing,
-              p.depth,
-              n,
-              of,
-              operation,
-              case_blocks(printing.constructors, of.ty, s.layout),
-            ),
+          None -> walk_sum(printing, p.depth, n, of, operation, case_blocks(of.ty, s.layout)),
         },
         _ -> whole(printing),
       }
@@ -1024,7 +1015,7 @@ pub fn walk_block(
   operation: TypeOperation,
   opening: BlockContents,
   dropped: RootKey,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let x = name_of(printing, of);
   let n = named(printing, into);
   let a = n.name;
@@ -1082,7 +1073,7 @@ pub fn walk_block(
         out: [Text(Bytes::concat_all([b"Word ", a, b" = 1; "]))].concat(marked.out),
       })
     },
-    Keep -> if contains_unkeepable_value(n.printing.constructors, opening) {
+    Keep -> if contains_unkeepable_value(opening) {
       line(n.printing, depth, Bytes::concat_all([b"Word ", a, b" = 0;"]))
     } else {
       match opening {
@@ -1178,7 +1169,7 @@ pub fn walk_sum(
   of: Variable,
   operation: TypeOperation,
   blocks: List<{ case: Int, ty: Type, representation: Representation, opening: BlockContents }>,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match of.representation {
     AsSum(s) -> {
       let n = named(printing, into);
@@ -1187,7 +1178,7 @@ pub fn walk_sum(
           && blocks.fold(
             false,
             |any: Bool, b: { case: Int, ty: Type, representation: Representation, opening: BlockContents }|
-              any || contains_unkeepable_value(printing.constructors, b.opening),
+              any || contains_unkeepable_value(b.opening),
           ) { line(n.printing, depth, Bytes::concat_all([b"Word ", a, b" = 0;"])) }
       else { walk_sum_cases(n.printing, depth, a, of, s, operation, blocks) }
     },
@@ -1202,7 +1193,7 @@ fn walk_sum_cases(
   s: { layout: SumLayout, cases: List<Bytes> },
   operation: TypeOperation,
   blocks: List<{ case: Int, ty: Type, representation: Representation, opening: BlockContents }>,
-) -> Printing / {abort.raise} = {
+) -> Printing / {ShapeReads} = {
   let x = name_of(printing, of);
   let untagged = match s.layout.classes { [Pointer] -> true, _ -> false };
   let target = if operation == Keep { b"*ply_into" } else { a };
@@ -1327,7 +1318,7 @@ fn walk_case(
   ty: Type,
   rep: Representation,
   o: BlockContents,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   match ((operation, uses_root_call(rep, o))) {
     (Keep, true) -> {
       let c = root_call(printing, root_of(Keep, ty), AsWord, b"ply_b");
@@ -1578,8 +1569,8 @@ pub fn each_counted_slot(
   printing: Printing,
   b: Bytes,
   o: BlockContents,
-  act: (Printing, List<Part>, List<Bytes>) -> Fragment / {abort.raise},
-) -> Fragment / {abort.raise} = {
+  act: (Printing, List<Part>, List<Bytes>) -> Fragment / {ShapeReads},
+) -> Fragment / {ShapeReads} = {
   let node = |k: RootKey| [WordAt({ at: 0, masked: false, how: Object(k) })];
   let each = |q: Printing, parts: List<{ ps: List<Part>, ws: List<Bytes> }>|
     parts.fold(
@@ -1594,10 +1585,9 @@ pub fn each_counted_slot(
       each(
         printing,
         x.parts.map(|h: BlockPart|
-          { ps: stored_parts(printing.constructors, h), ws: slots_of(b, h.at, h.representation) }),
+          { ps: stored_parts(h), ws: slots_of(b, h.at, h.representation) }),
       ),
-    ScopedContents(h) ->
-      each(printing, [{ ps: stored_parts(printing.constructors, h), ws: [slot(b, h.at)] }]),
+    ScopedContents(h) -> each(printing, [{ ps: stored_parts(h), ws: [slot(b, h.at)] }]),
     ListOf(l) -> {
       let laid = container_layouts.list;
       let items = act(printing, l.item, item_slots_at(b, laid.items, l.stride));
@@ -1674,7 +1664,7 @@ fn shared_parts(
   a: Bytes,
   parts: List<Part>,
   ws: List<Bytes>,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   each_word(printing, parts, ws, |q: Printing, w: Bytes, how: CountedWord| {
     let rejected = Bytes::concat_all([b") ", a, b" = 0;"]);
     match how {
@@ -1721,7 +1711,7 @@ fn persisted_parts(
   printing: Printing,
   parts: List<Part>,
   ws: List<Bytes>,
-) -> Fragment / {abort.raise} =
+) -> Fragment / {ShapeReads} =
   each_word(printing, parts, ws, |q: Printing, w: Bytes, how: CountedWord|
     match how {
       ThroughDescriptor -> unsupported(b"cannot store a function value inside another value", w),
@@ -1745,8 +1735,8 @@ fn each_word(
   printing: Printing,
   parts: List<Part>,
   ws: List<Bytes>,
-  act: (Printing, Bytes, CountedWord) -> Fragment / {abort.raise},
-) -> Fragment / {abort.raise} =
+  act: (Printing, Bytes, CountedWord) -> Fragment / {ShapeReads},
+) -> Fragment / {ShapeReads} =
   parts.fold({ printing: printing, out: [] }, |accumulator: Fragment, p: Part| {
     let s = match p {
       WordAt(w) -> if w.masked { unsupported_walk(nth_or_zero(ws, w.at)) }
@@ -1784,13 +1774,13 @@ fn each_word(
     { printing: s.printing, out: spaced(accumulator.out, s.out) }
   })
 
-fn unsupported_walk(w: Bytes) -> Fragment / {abort.raise} =
+fn unsupported_walk(w: Bytes) -> Fragment / {ShapeReads} =
   unsupported(
     b"copying or dropping a value whose case is stored in its pointer is not supported",
     w,
   )
 
-fn walk_root(operation: TypeOperation, how: CountedWord) -> RootKey / {abort.raise} =
+fn walk_root(operation: TypeOperation, how: CountedWord) -> RootKey / {ShapeReads} =
   match how {
     Object(k) -> retargeted(k, operation),
     SumWord(k) -> retargeted(k, operation),
@@ -1800,7 +1790,7 @@ fn walk_root(operation: TypeOperation, how: CountedWord) -> RootKey / {abort.rai
       unsupported(b"no code exists to copy or drop this kind of value", operation_name(operation)),
   }
 
-fn retargeted(k: RootKey, operation: TypeOperation) -> RootKey / {abort.raise} =
+fn retargeted(k: RootKey, operation: TypeOperation) -> RootKey / {ShapeReads} =
   match k {
     Generated(_, _) -> keys::with_operation(k, operation),
     _ ->
@@ -1824,7 +1814,7 @@ pub fn opened_sum(
   depth: Int,
   o: Variable,
   ws: List<Variable>,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match ((o.representation, ws)) {
     (AsSum(s), [b]) -> {
       let x = name_of(printing, o);
@@ -1848,7 +1838,7 @@ pub fn reset_boxed(
   of: Variable,
   opening: BlockContents,
   dropped: RootKey,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match opening {
     WordBlock(b) -> {
       let x = name_of(printing, of);
@@ -1858,7 +1848,7 @@ pub fn reset_boxed(
         |accumulator: Fragment, h: BlockPart| {
           let s = parts_released(
             accumulator.printing,
-            stored_parts(printing.constructors, h),
+            stored_parts(h),
             slots_of(x, h.at, h.representation),
           );
           { printing: s.printing, out: spaced(accumulator.out, s.out) }
@@ -1900,8 +1890,8 @@ pub fn updated(
   printing: Printing,
   into: Option<Variable>,
   u: { of: Variable, sets: List<FieldWrite> },
-) -> Printing / {abort.raise} =
-  match ((into, block_contents(printing.constructors, u.of.ty, u.of.representation))) {
+) -> Printing / {ShapeReads} =
+  match ((into, block_contents(u.of.ty, u.of.representation))) {
     (Some(v), WordBlock(_)) -> {
       let x = name_of(printing, u.of);
       let n = named(printing, v);
@@ -1915,7 +1905,7 @@ pub fn updated(
               let first = Bytes::concat_all([b"&", slot(o, s.at + 1)]);
               let old = parts_released(
                 accumulator.printing,
-                layout_parts(printing.constructors, s.ty, l, 0),
+                layout_parts(s.ty, l, 0),
                 range(0, words(l)).map(|k: Int| slot(o, s.at + 1 + k)),
               );
               let source = nth_or_zero(arg_parts(old.printing, s.arg), 0);
@@ -1964,7 +1954,7 @@ pub fn updated(
       let opened = if !printing.placing.results.contains(v.id) {
         { printing: written.printing, out: reused }
       } else {
-        match known_layout(printing.constructors, u.of.ty) {
+        match known_layout(u.of.ty) {
           Some(l) -> {
             let moved = write_inline(written.printing, b"*(Word *)d", b"ply_words(d)", x, l);
             {
@@ -2008,15 +1998,15 @@ pub fn updated(
       ),
   }
 
-fn inline_layout(printing: Printing, ty: Type) -> Option<ValueLayout> =
-  match inside_layout(printing.constructors, ty) { Some(InlineRecord(l)) -> Some(l), _ -> None }
+fn inline_layout(printing: Printing, ty: Type) -> Option<ValueLayout> / {ShapeReads} =
+  match inside_layout(ty) { Some(InlineRecord(l)) -> Some(l), _ -> None }
 
 pub fn last_of(
   p: InstructionContext,
   printing: Printing,
   into: Option<Variable>,
   v: Variable,
-) -> Printing / {abort.raise} =
+) -> Printing / {ShapeReads} =
   match into {
     None ->
       unsupported(b"a check for the last reference whose result is never used", variable_text(v)),
@@ -2068,10 +2058,10 @@ const fake_instruction_context: InstructionContext =
     depth: 0,
   }
 
-fn printed(printing: Printing, i: Instruction) -> Bytes / {abort.raise} =
+fn printed(printing: Printing, i: Instruction) -> Bytes / {ShapeReads} =
   pieces_text(count_printed(fake_instruction_context, printing, i).out)
 
-fn failure_exit_text(printing: Printing, unwind: List<Variable>) -> Bytes / {abort.raise} = {
+fn failure_exit_text(printing: Printing, unwind: List<Variable>) -> Bytes / {ShapeReads} = {
   let x = failure_exit({ ..printing, out: [] }, unwind, b"return 0;");
   Bytes::concat_all([x.leave, b"\n", pieces_text(block_closed(x.printing, 0, 0, false).out)])
 }
@@ -2087,85 +2077,91 @@ fn int() -> Type = int_type
 
 fn text_local(id: Int) -> Variable = { id: id, ty: string(), representation: AsWord }
 
-fn drop_symbol_text(ty: Type) -> Bytes / {abort.raise} = root_symbol_text(drop_of(ty))
+fn drop_symbol_text(ty: Type) -> Bytes / {ShapeReads} = root_symbol_text(drop_of(ty))
 
 test "incrementing or releasing a value's reference count applies to each reference-counted word in the value, incrementing once per requested amount" {
-  let record_type = RecordType([{ name: b"a", ty: int() }, { name: b"b", ty: string() }]);
-  let x = text_local(0);
-  let flat = {
-    id: 1,
-    ty: record_type,
-    representation: AsFlattened([
-      { name: b"a", representation: AsInt },
-      { name: b"b", representation: AsWord },
-    ]),
-  };
-  let k = { id: 2, ty: int(), representation: AsInt };
-  let d = drop_symbol_text(string());
-  let printing = empty_printing(Map::new().insert(0, b"p0").insert(1, b"t1").insert(2, b"t2"));
-  let dup = called(duplicate_function, [b"p0"]);
-  let let_go = called(release_function, [b"ctx", b"p0", d]);
-  assert_eq(occurrences(printed(printing, Increment({ var: x, n: 2 })), dup), 2);
-  assert(printed(printing, Decrement(x)).contains(let_go), None);
-  let flat_let_go = called(release_function, [b"ctx", b"t1_1", d]);
-  let flat_dec = printed(printing, Decrement(flat));
-  assert(flat_dec.contains(flat_let_go) && !releases(flat_dec, b"t1_0"), None);
-  let unwinding = failure_exit_text(printing, [x, k, flat]);
-  let at = |part: Bytes| match unwinding.index_of(part) { Some(i) -> i, None -> 0 - 1 };
-  assert(
-    at(flat_let_go) >= 0 && at(let_go) > at(flat_let_go),
-    Some(String::of_bytes_lossy(unwinding)),
-  );
-  assert_eq(failure_exit_text(printing, [k]), b"return 0;\n")
+  with_no_shapes(|| {
+    let record_type = RecordType([{ name: b"a", ty: int() }, { name: b"b", ty: string() }]);
+    let x = text_local(0);
+    let flat = {
+      id: 1,
+      ty: record_type,
+      representation: AsFlattened([
+        { name: b"a", representation: AsInt },
+        { name: b"b", representation: AsWord },
+      ]),
+    };
+    let k = { id: 2, ty: int(), representation: AsInt };
+    let d = drop_symbol_text(string());
+    let printing = empty_printing(Map::new().insert(0, b"p0").insert(1, b"t1").insert(2, b"t2"));
+    let dup = called(duplicate_function, [b"p0"]);
+    let let_go = called(release_function, [b"ctx", b"p0", d]);
+    assert_eq(occurrences(printed(printing, Increment({ var: x, n: 2 })), dup), 2);
+    assert(printed(printing, Decrement(x)).contains(let_go), None);
+    let flat_let_go = called(release_function, [b"ctx", b"t1_1", d]);
+    let flat_dec = printed(printing, Decrement(flat));
+    assert(flat_dec.contains(flat_let_go) && !releases(flat_dec, b"t1_0"), None);
+    let unwinding = failure_exit_text(printing, [x, k, flat]);
+    let at = |part: Bytes| match unwinding.index_of(part) { Some(i) -> i, None -> 0 - 1 };
+    assert(
+      at(flat_let_go) >= 0 && at(let_go) > at(flat_let_go),
+      Some(String::of_bytes_lossy(unwinding)),
+    );
+    assert_eq(failure_exit_text(printing, [k]), b"return 0;\n")
+  })
 }
 
 test "resetting a heap block with one owner turns it into a reuse token, and an unused token is freed with the block's byte size" {
-  let record_type = RecordType([{ name: b"a", ty: int() }, { name: b"b", ty: string() }]);
-  let x = { id: 0, ty: record_type, representation: AsWord };
-  let token = { id: 1, ty: record_type, representation: AsReuseToken(2) };
-  let printing = empty_printing(Map::new().insert(0, b"p0"));
-  let reset = count_printed(fake_instruction_context, printing, Reset({ token: token, of: x }));
-  assert_eq(name_of(reset, token), b"t1");
-  let let_go = called(release_function, [b"ctx", b"p0", drop_symbol_text(record_type)]);
-  let text = pieces_text(reset.out);
-  assert(
-    [
-      b"->rc == 1",
-      called(release_function, [b"ctx", b"ply_words(p0)[1]", drop_symbol_text(string())]),
-      b"t1 = p0;",
-      let_go,
-    ].all(|part: Bytes| text.contains(part)),
-    Some(String::of_bytes_lossy(text)),
-  );
-  let unwinding = failure_exit_text(reset, [x, token]);
-  let at = |part: Bytes| match unwinding.index_of(part) { Some(i) -> i, None -> 0 - 1 };
-  let freed = called(free_function, [b"ctx", b"t1", b"24"]);
-  assert(at(freed) >= 0 && at(let_go) > at(freed), Some(String::of_bytes_lossy(unwinding)))
+  with_no_shapes(|| {
+    let record_type = RecordType([{ name: b"a", ty: int() }, { name: b"b", ty: string() }]);
+    let x = { id: 0, ty: record_type, representation: AsWord };
+    let token = { id: 1, ty: record_type, representation: AsReuseToken(2) };
+    let printing = empty_printing(Map::new().insert(0, b"p0"));
+    let reset = count_printed(fake_instruction_context, printing, Reset({ token: token, of: x }));
+    assert_eq(name_of(reset, token), b"t1");
+    let let_go = called(release_function, [b"ctx", b"p0", drop_symbol_text(record_type)]);
+    let text = pieces_text(reset.out);
+    assert(
+      [
+        b"->rc == 1",
+        called(release_function, [b"ctx", b"ply_words(p0)[1]", drop_symbol_text(string())]),
+        b"t1 = p0;",
+        let_go,
+      ].all(|part: Bytes| text.contains(part)),
+      Some(String::of_bytes_lossy(text)),
+    );
+    let unwinding = failure_exit_text(reset, [x, token]);
+    let at = |part: Bytes| match unwinding.index_of(part) { Some(i) -> i, None -> 0 - 1 };
+    let freed = called(free_function, [b"ctx", b"t1", b"24"]);
+    assert(at(freed) >= 0 && at(let_go) > at(freed), Some(String::of_bytes_lossy(unwinding)))
+  })
 }
 
 test "destructuring a record stored as separate words generates no C, and each word variable is named after the record's field at the same position" {
-  let record_type = RecordType([{ name: b"a", ty: string() }, { name: b"b", ty: int() }]);
-  let flat = {
-    id: 0,
-    ty: record_type,
-    representation: AsFlattened([
-      { name: b"a", representation: AsWord },
-      { name: b"b", representation: AsInt },
-    ]),
-  };
-  let words = [text_local(1), { id: 2, ty: int(), representation: AsInt }];
-  let printing = empty_printing(Map::new().insert(0, b"p0"));
-  let opened = count_printed(
-    fake_instruction_context,
-    printing,
-    Destructure({ of: flat, words: words }),
-  );
-  assert_eq(opened.out, []);
-  assert_eq(words.map(|w: Variable| name_of(opened, w)), [b"p0_0", b"p0_1"]);
-  let by_words = failure_exit_text(opened, [words.get(0)]);
-  let whole = failure_exit_text(printing, [flat]);
-  assert(releases(by_words, b"p0_0") && releases(whole, b"p0_0"));
-  assert(!releases(by_words, b"p0_1") && !releases(whole, b"p0_1"))
+  with_no_shapes(|| {
+    let record_type = RecordType([{ name: b"a", ty: string() }, { name: b"b", ty: int() }]);
+    let flat = {
+      id: 0,
+      ty: record_type,
+      representation: AsFlattened([
+        { name: b"a", representation: AsWord },
+        { name: b"b", representation: AsInt },
+      ]),
+    };
+    let words = [text_local(1), { id: 2, ty: int(), representation: AsInt }];
+    let printing = empty_printing(Map::new().insert(0, b"p0"));
+    let opened = count_printed(
+      fake_instruction_context,
+      printing,
+      Destructure({ of: flat, words: words }),
+    );
+    assert_eq(opened.out, []);
+    assert_eq(words.map(|w: Variable| name_of(opened, w)), [b"p0_0", b"p0_1"]);
+    let by_words = failure_exit_text(opened, [words.get(0)]);
+    let whole = failure_exit_text(printing, [flat]);
+    assert(releases(by_words, b"p0_0") && releases(whole, b"p0_0"));
+    assert(!releases(by_words, b"p0_1") && !releases(whole, b"p0_1"))
+  })
 }
 
 test "destructuring a record stored as separate words copies a sum field's whole run of words from the record's words" {
@@ -2205,68 +2201,72 @@ test "destructuring a record stored as separate words copies a sum field's whole
 }
 
 test "failure exits whose release lists end the same way share that final generated code, and each release call is generated once" {
-  let a = text_local(0);
-  let b = text_local(1);
-  let c = text_local(2);
-  let rel = |n: Bytes| called(release_function, [b"ctx", n, drop_symbol_text(string())]);
-  let declared = |printing: Printing, v: Variable| named(printing, v).printing;
-  let printing = declared(declared(empty_printing(Map::new().insert(0, b"p0")), b), c);
-  let first = failure_exit(printing, [a, b], b"return 0;");
-  let second = failure_exit(first.printing, [b, c, a], b"return 0;");
-  let third = failure_exit(second.printing, [a, c], b"return 0;");
-  assert_eq(failure_exit(third.printing, [b, a], b"return 0;").leave, first.leave);
-  assert_eq([first.leave, second.leave, third.leave], [
-    b"goto ply_u1;",
-    b"goto ply_u2;",
-    b"goto ply_u3;",
-  ]);
-  let closed = block_closed(third.printing, 0, 0, false);
-  let tails = pieces_text(closed.out);
-  assert_eq(occurrences(tails, rel(b"p0")), 1);
-  assert_eq(occurrences(tails, rel(b"t1")), 1);
-  assert_eq(closed.calls, [drop_of(string())])
+  with_no_shapes(|| {
+    let a = text_local(0);
+    let b = text_local(1);
+    let c = text_local(2);
+    let rel = |n: Bytes| called(release_function, [b"ctx", n, drop_symbol_text(string())]);
+    let declared = |printing: Printing, v: Variable| named(printing, v).printing;
+    let printing = declared(declared(empty_printing(Map::new().insert(0, b"p0")), b), c);
+    let first = failure_exit(printing, [a, b], b"return 0;");
+    let second = failure_exit(first.printing, [b, c, a], b"return 0;");
+    let third = failure_exit(second.printing, [a, c], b"return 0;");
+    assert_eq(failure_exit(third.printing, [b, a], b"return 0;").leave, first.leave);
+    assert_eq([first.leave, second.leave, third.leave], [
+      b"goto ply_u1;",
+      b"goto ply_u2;",
+      b"goto ply_u3;",
+    ]);
+    let closed = block_closed(third.printing, 0, 0, false);
+    let tails = pieces_text(closed.out);
+    assert_eq(occurrences(tails, rel(b"p0")), 1);
+    assert_eq(occurrences(tails, rel(b"t1")), 1);
+    assert_eq(closed.calls, [drop_of(string())])
+  })
 }
 
 test "the release code for a value is placed at the end of the block where the value was declared, off the path that normal execution continues on" {
-  let a = text_local(0);
-  let b = text_local(1);
-  let d = drop_symbol_text(string());
-  let printing = empty_printing(Map::new().insert(0, b"p0"));
-  let inner = named(block_opened(printing), b);
-  let x = failure_exit(inner.printing, [a, b], b"goto ply_h0;");
-  assert_eq(x.leave, b"goto ply_u1;");
-  let closed = block_closed(x.printing, printing.block, 1, true);
-  let inner_tail = pieces_text(closed.out);
-  assert(
-    inner_tail.contains(b"if (0) {")
-      && inner_tail.contains(called(release_function, [b"ctx", b"t1", d]))
-      && !releases(inner_tail, b"p0"),
-    Some(String::of_bytes_lossy(inner_tail)),
-  );
-  assert_eq(closed.block, printing.block);
-  let outer_tail = pieces_text(block_closed({ ..closed, out: [] }, 0, 0, false).out);
-  assert(
-    outer_tail.contains(called(release_function, [b"ctx", b"p0", d]))
-      && outer_tail.contains(b"goto ply_h0;"),
-    Some(String::of_bytes_lossy(outer_tail)),
-  );
-  let quiet = block_opened(printing);
-  assert_eq(block_closed(quiet, 0, 1, true).out, [])
+  with_no_shapes(|| {
+    let a = text_local(0);
+    let b = text_local(1);
+    let d = drop_symbol_text(string());
+    let printing = empty_printing(Map::new().insert(0, b"p0"));
+    let inner = named(block_opened(printing), b);
+    let x = failure_exit(inner.printing, [a, b], b"goto ply_h0;");
+    assert_eq(x.leave, b"goto ply_u1;");
+    let closed = block_closed(x.printing, printing.block, 1, true);
+    let inner_tail = pieces_text(closed.out);
+    assert(
+      inner_tail.contains(b"if (0) {")
+        && inner_tail.contains(called(release_function, [b"ctx", b"t1", d]))
+        && !releases(inner_tail, b"p0"),
+      Some(String::of_bytes_lossy(inner_tail)),
+    );
+    assert_eq(closed.block, printing.block);
+    let outer_tail = pieces_text(block_closed({ ..closed, out: [] }, 0, 0, false).out);
+    assert(
+      outer_tail.contains(called(release_function, [b"ctx", b"p0", d]))
+        && outer_tail.contains(b"goto ply_h0;"),
+      Some(String::of_bytes_lossy(outer_tail)),
+    );
+    let quiet = block_opened(printing);
+    assert_eq(block_closed(quiet, 0, 1, true).out, [])
+  })
 }
 
 fn dropping_of(name: Bytes) -> RootKey = drop_of(NamedType({ name: name, args: [] }))
 
-fn root_symbol_text(k: RootKey) -> Bytes / {abort.raise} = pieces_text([Hole(Symbol(Root(k)))])
+fn root_symbol_text(k: RootKey) -> Bytes / {ShapeReads} = pieces_text([Hole(Symbol(Root(k)))])
 
 fn released_fragment(
   parts: List<Part>,
   ws: List<Bytes>,
-) -> { text: Bytes, calls: List<RootKey>, expects: Int } / {abort.raise} = {
+) -> { text: Bytes, calls: List<RootKey>, expects: Int } / {ShapeReads} = {
   let s = parts_released(empty_printing(Map::new()), parts, ws);
   { text: paired(pieces_text(s.out)), calls: s.printing.calls, expects: s.printing.expects.len() }
 }
 
-fn paired(text: Bytes) -> Bytes / {abort.raise} = {
+fn paired(text: Bytes) -> Bytes / {ShapeReads} = {
   assert(
     text.split(b"(").len() == text.split(b")").len()
       && text.split(b"{").len() == text.split(b"}").len(),
@@ -2471,121 +2471,125 @@ test "a list opened lets go of its owner or else its items, and gives itself bac
 }
 
 test "releasing an array loops over its elements using the length in its header, releases each, and frees the block by its size" {
-  let item = drop_of(string_type);
-  let len = head_field(array_head, b"p0", b"len");
-  let given = |stride: Int|
-    called(free_function, [
-      b"ctx",
-      b"p0",
-      Bytes::concat_all([
-        ascii_of_int(header_bytes + 8 * head_words(array_head)),
-        b" + 8 * ",
-        len,
-        if stride == 1 { b"" } else { b" * ".concat(ascii_of_int(stride)) },
-      ]),
-    ]);
-  let opened = opened_block(
-    empty_printing(Map::new().insert(0, b"p0")),
-    0,
-    placeholder_var(0, AsWord),
-    [],
-    ArrayOf({ element: [word(1, Object(item))], stride: 2 }),
-  );
-  let text = pieces_text(opened.out);
-  assert(
-    [
-      Bytes::concat_all([b"ply_i < ", len]),
-      called(release_function, [b"ctx", b"ply_words(p0)[2 + ply_i * 2]", root_symbol_text(item)]),
-      given(2),
-    ].all(|part: Bytes| text.contains(part)),
-    Some(String::of_bytes_lossy(text)),
-  );
-  assert_eq(opened.calls, [item]);
-  let units = block_contents(
-    empty_printing(Map::new()).constructors,
-    array_type(unit_type),
-    AsWord,
-  );
-  assert_eq(units, ArrayOf({ element: [], stride: 1 }));
-  let none_counted = pieces_text(
-    opened_block(
+  with_no_shapes(|| {
+    let item = drop_of(string_type);
+    let len = head_field(array_head, b"p0", b"len");
+    let given = |stride: Int|
+      called(free_function, [
+        b"ctx",
+        b"p0",
+        Bytes::concat_all([
+          ascii_of_int(header_bytes + 8 * head_words(array_head)),
+          b" + 8 * ",
+          len,
+          if stride == 1 { b"" } else { b" * ".concat(ascii_of_int(stride)) },
+        ]),
+      ]);
+    let opened = opened_block(
       empty_printing(Map::new().insert(0, b"p0")),
       0,
       placeholder_var(0, AsWord),
       [],
-      units,
-    ).out,
-  );
-  assert(none_counted.contains(given(1)) && !none_counted.contains(b"for ("), None)
+      ArrayOf({ element: [word(1, Object(item))], stride: 2 }),
+    );
+    let text = pieces_text(opened.out);
+    assert(
+      [
+        Bytes::concat_all([b"ply_i < ", len]),
+        called(release_function, [b"ctx", b"ply_words(p0)[2 + ply_i * 2]", root_symbol_text(item)]),
+        given(2),
+      ].all(|part: Bytes| text.contains(part)),
+      Some(String::of_bytes_lossy(text)),
+    );
+    assert_eq(opened.calls, [item]);
+    let units = block_contents(array_type(unit_type), AsWord);
+    assert_eq(units, ArrayOf({ element: [], stride: 1 }));
+    let none_counted = pieces_text(
+      opened_block(
+        empty_printing(Map::new().insert(0, b"p0")),
+        0,
+        placeholder_var(0, AsWord),
+        [],
+        units,
+      ).out,
+    );
+    assert(none_counted.contains(given(1)) && !none_counted.contains(b"for ("), None)
+  })
 }
 
 test "releasing the heap block of a 128-bit integer frees the block by its byte size, the same way the type's release function does" {
-  let wide = { ..placeholder_var(0, AsWord), ty: width_type({ bits: 128, signed: false }) };
-  let printing = empty_printing(Map::new().insert(0, b"p0"));
-  let text = pieces_text(
-    opened_block(printing, 0, wide, [], block_contents(printing.constructors, wide.ty, AsWord)).out,
-  );
-  assert(
-    text.contains(
-      call_text(release_box_function, [b"ctx", b"p0", ascii_of_int(header_bytes + 16)]),
-    ),
-    Some(String::of_bytes_lossy(text)),
-  )
+  with_no_shapes(|| {
+    let wide = { ..placeholder_var(0, AsWord), ty: width_type({ bits: 128, signed: false }) };
+    let printing = empty_printing(Map::new().insert(0, b"p0"));
+    let text = pieces_text(
+      opened_block(printing, 0, wide, [], block_contents(wide.ty, AsWord)).out,
+    );
+    assert(
+      text.contains(
+        call_text(release_box_function, [b"ctx", b"p0", ascii_of_int(header_bytes + 16)]),
+      ),
+      Some(String::of_bytes_lossy(text)),
+    )
+  })
 }
 
 test "resetting a heap block with one owner releases its words and turns it into a reuse token, and otherwise decrements the count once" {
-  let item = drop_of(string_type);
-  let boxed = dropping_of(b"m.R");
-  let printing = empty_printing(Map::new().insert(0, b"p0"));
-  let reset = reset_boxed(
-    printing,
-    0,
-    placeholder_var(1, AsReuseToken(2)),
-    placeholder_var(0, AsWord),
-    WordBlock({ parts: [{ at: 0, ty: string_type, representation: AsWord }], words: 2 }),
-    boxed,
-  );
-  let text = pieces_text(reset.out);
-  assert(
-    [
-      b"->rc == 1",
-      called(release_function, [b"ctx", b"ply_words(p0)[0]", root_symbol_text(item)]),
-      b"t1 = p0;",
-      called(release_function, [b"ctx", b"p0", root_symbol_text(boxed)]),
-    ].all(|part: Bytes| text.contains(part)),
-    Some(String::of_bytes_lossy(text)),
-  );
-  let token = placeholder_var(1, AsReuseToken(2));
-  let freed = count_printed(
-    fake_instruction_context,
-    { ..reset, out: [] },
-    Free({ of: token, bytes: IntOperand(24) }),
-  );
-  assert(
-    pieces_text(freed.out).contains(called(free_function, [b"ctx", b"t1", b"INT64_C(24)"])),
-    None,
-  );
-  assert_eq(
-    pieces_text(released(reset, token.ty, token.representation, [b"t1"]).out),
-    b"if (t1) ".concat(called(free_function, [b"ctx", b"t1", b"24"])),
-  )
+  with_no_shapes(|| {
+    let item = drop_of(string_type);
+    let boxed = dropping_of(b"m.R");
+    let printing = empty_printing(Map::new().insert(0, b"p0"));
+    let reset = reset_boxed(
+      printing,
+      0,
+      placeholder_var(1, AsReuseToken(2)),
+      placeholder_var(0, AsWord),
+      WordBlock({ parts: [{ at: 0, ty: string_type, representation: AsWord }], words: 2 }),
+      boxed,
+    );
+    let text = pieces_text(reset.out);
+    assert(
+      [
+        b"->rc == 1",
+        called(release_function, [b"ctx", b"ply_words(p0)[0]", root_symbol_text(item)]),
+        b"t1 = p0;",
+        called(release_function, [b"ctx", b"p0", root_symbol_text(boxed)]),
+      ].all(|part: Bytes| text.contains(part)),
+      Some(String::of_bytes_lossy(text)),
+    );
+    let token = placeholder_var(1, AsReuseToken(2));
+    let freed = count_printed(
+      fake_instruction_context,
+      { ..reset, out: [] },
+      Free({ of: token, bytes: IntOperand(24) }),
+    );
+    assert(
+      pieces_text(freed.out).contains(called(free_function, [b"ctx", b"t1", b"INT64_C(24)"])),
+      None,
+    );
+    assert_eq(
+      pieces_text(released(reset, token.ty, token.representation, [b"t1"]).out),
+      b"if (t1) ".concat(called(free_function, [b"ctx", b"t1", b"24"])),
+    )
+  })
 }
 
 test "releasing or incrementing a value depends on its type: a string is released, a record of strings is incremented as one value, and an `Int` generates no code" {
-  let string = string_type;
-  let pair = RecordType([{ name: b"a", ty: string }, { name: b"b", ty: string }]);
-  let printing = empty_printing(Map::new());
-  let let_go = released(printing, string, AsWord, [b"t1"]);
-  assert_eq(
-    pieces_text(let_go.out),
-    called(release_function, [b"ctx", b"t1", root_symbol_text(drop_of(string_type))]),
-  );
-  assert_eq(
-    pieces_text(duped(printing, pair, AsWord, [b"t2"]).out),
-    called(duplicate_function, [b"t2"]),
-  );
-  assert_eq(pieces_text(duped(printing, int_type, AsWord, [b"t3"]).out), b"");
-  assert_eq(part_names(b"t4", AsWord), [b"t4"])
+  with_no_shapes(|| {
+    let string = string_type;
+    let pair = RecordType([{ name: b"a", ty: string }, { name: b"b", ty: string }]);
+    let printing = empty_printing(Map::new());
+    let let_go = released(printing, string, AsWord, [b"t1"]);
+    assert_eq(
+      pieces_text(let_go.out),
+      called(release_function, [b"ctx", b"t1", root_symbol_text(drop_of(string_type))]),
+    );
+    assert_eq(
+      pieces_text(duped(printing, pair, AsWord, [b"t2"]).out),
+      called(duplicate_function, [b"t2"]),
+    );
+    assert_eq(pieces_text(duped(printing, int_type, AsWord, [b"t3"]).out), b"");
+    assert_eq(part_names(b"t4", AsWord), [b"t4"])
+  })
 }
 
 fn strings_record(n: Int) -> Type =
@@ -2596,132 +2600,126 @@ fn strings_record(n: Int) -> Type =
     }),
   )
 
-fn wide_sums(n: Int) -> Constructors =
-  constructors_of(
-    [],
-    [],
-    [],
-    Map::new().insert(b"m.Many", [
-      {
-        name: b"m.Many",
-        index: 0,
-        fields: range(0, n).map(|_: Int| string()).push(int()),
-        params: [],
-      },
-    ]).insert(b"m.Sparse", [
-      {
-        name: b"m.Sparse",
-        index: 0,
-        fields: [string(), string()].concat(range(0, 20).map(|_: Int| int())),
-        params: [],
-      },
-    ]),
-  )
+fn wide_sums(n: Int) -> Map<Bytes, List<SumConstructor>> =
+  Map::new().insert(b"m.Many", [
+    {
+      name: b"m.Many",
+      index: 0,
+      fields: range(0, n).map(|_: Int| string()).push(int()),
+      params: [],
+    },
+  ]).insert(b"m.Sparse", [
+    {
+      name: b"m.Sparse",
+      index: 0,
+      fields: [string(), string()].concat(range(0, 20).map(|_: Int| int())),
+      params: [],
+    },
+  ])
 
 test "a value of many counted words is incremented or released by one call of its type's function, which handles each word itself" {
   let record_type = NamedType({ name: b"m.Many", args: [] });
-  let printing = { ..empty_printing(Map::new()), constructors: wide_sums(24) };
-  let representation = representation_with(printing.constructors, record_type);
-  let values = part_names(b"t1", representation);
-  let release = root_of(keys::Unboxed(keys::Release), record_type);
-  let dup = root_of(keys::Unboxed(Dup), record_type);
-  let let_go = released(printing, record_type, representation, values);
-  let more = duped(printing, record_type, representation, values);
-  let one_call = |s: Fragment, k: RootKey| {
-    let text = pieces_text(s.out);
-    occurrences(text, root_symbol_text(k)) == 1
-      && values.take(24).all(|v: Bytes| text.contains(v.concat(b",")))
-      && !releases(text, b"t1_0")
-      && !text.contains(duplicate_function.concat(b"("))
-  };
-  assert(
-    one_call(let_go, release) && one_call(more, dup),
-    Some(String::of_bytes_lossy(pieces_text(let_go.out.concat(more.out)))),
-  );
-  assert_eq([let_go.printing.calls, more.printing.calls], [[release], [dup]]);
-  let head_of = |k: RootKey| [signature_types(generated(printing.constructors, k).convention)];
-  assert_eq(let_go.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(release));
-  assert_eq(more.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(dup));
-  let inside = { ..printing, count_root_type: Some(record_type) };
-  let own = pieces_text(released(inside, record_type, representation, values).out);
-  let own_more = pieces_text(duped(inside, record_type, representation, values).out);
-  assert(
-    releases(own, b"t1_0") && releases(own, b"t1_23") && !own.contains(b"t1_24")
-      && own_more.contains(called(duplicate_function, [b"t1_0"]))
-      && own_more.contains(called(duplicate_function, [b"t1_23"]))
-      && !own_more.contains(b"t1_24"),
-    Some(String::of_bytes_lossy(own.concat(own_more))),
-  );
-  let pair = strings_record(2);
-  let pair_held = representation_with(printing.constructors, pair);
-  let pair_values = part_names(b"t4", pair_held);
-  assert(
-    released(printing, pair, pair_held, pair_values).printing.calls
-      == [root_of(keys::Unboxed(keys::Release), pair)]
-      && duped(printing, pair, pair_held, pair_values).printing.calls == [],
-    None,
-  );
-  let single = strings_record(1);
-  let lone = released(printing, single, representation_with(printing.constructors, single), [
-    b"t2_0",
-    b"t2_1",
-  ]);
-  assert(
-    releases(pieces_text(lone.out), b"t2_0") && lone.printing.calls == [drop_of(string())],
-    None,
-  );
-  let sparse = NamedType({ name: b"m.Sparse", args: [] });
-  let thin_held = representation_with(printing.constructors, sparse);
-  let thin = released(printing, sparse, thin_held, part_names(b"t3", thin_held));
-  assert(
-    releases(pieces_text(thin.out), b"t3_0") && releases(pieces_text(thin.out), b"t3_1")
-      && thin.printing.calls == [drop_of(string())],
-    Some(String::of_bytes_lossy(pieces_text(thin.out))),
-  )
+  over_code_facts(table_sources(wide_sums(24)), || {
+    let printing = empty_printing(Map::new());
+    let representation = representation_of(record_type);
+    let values = part_names(b"t1", representation);
+    let release = root_of(keys::Unboxed(keys::Release), record_type);
+    let dup = root_of(keys::Unboxed(Dup), record_type);
+    let let_go = released(printing, record_type, representation, values);
+    let more = duped(printing, record_type, representation, values);
+    let one_call = |s: Fragment, k: RootKey| {
+      let text = pieces_text(s.out);
+      occurrences(text, root_symbol_text(k)) == 1
+        && values.take(24).all(|v: Bytes| text.contains(v.concat(b",")))
+        && !releases(text, b"t1_0")
+        && !text.contains(duplicate_function.concat(b"("))
+    };
+    assert(
+      one_call(let_go, release) && one_call(more, dup),
+      Some(String::of_bytes_lossy(pieces_text(let_go.out.concat(more.out)))),
+    );
+    assert_eq([let_go.printing.calls, more.printing.calls], [[release], [dup]]);
+    let head_of = |k: RootKey| [signature_types(generated(k).convention)];
+    assert_eq(let_go.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(release));
+    assert_eq(more.printing.expects.map(|e: ExpectedPrototype| e.head), head_of(dup));
+    let inside = { ..printing, count_root_type: Some(record_type) };
+    let own = pieces_text(released(inside, record_type, representation, values).out);
+    let own_more = pieces_text(duped(inside, record_type, representation, values).out);
+    assert(
+      releases(own, b"t1_0") && releases(own, b"t1_23") && !own.contains(b"t1_24")
+        && own_more.contains(called(duplicate_function, [b"t1_0"]))
+        && own_more.contains(called(duplicate_function, [b"t1_23"]))
+        && !own_more.contains(b"t1_24"),
+      Some(String::of_bytes_lossy(own.concat(own_more))),
+    );
+    let pair = strings_record(2);
+    let pair_held = representation_of(pair);
+    let pair_values = part_names(b"t4", pair_held);
+    assert(
+      released(printing, pair, pair_held, pair_values).printing.calls
+        == [root_of(keys::Unboxed(keys::Release), pair)]
+        && duped(printing, pair, pair_held, pair_values).printing.calls == [],
+      None,
+    );
+    let single = strings_record(1);
+    let lone = released(printing, single, representation_of(single), [b"t2_0", b"t2_1"]);
+    assert(
+      releases(pieces_text(lone.out), b"t2_0") && lone.printing.calls == [drop_of(string())],
+      None,
+    );
+    let sparse = NamedType({ name: b"m.Sparse", args: [] });
+    let thin_held = representation_of(sparse);
+    let thin = released(printing, sparse, thin_held, part_names(b"t3", thin_held));
+    assert(
+      releases(pieces_text(thin.out), b"t3_0") && releases(pieces_text(thin.out), b"t3_1")
+        && thin.printing.calls == [drop_of(string())],
+      Some(String::of_bytes_lossy(pieces_text(thin.out))),
+    )
+  })
 }
 
 test "a failure releases a value of several counted words with one call of its type's release function" {
-  let record_type = strings_record(3);
-  let printing = empty_printing(Map::new().insert(0, b"p0").insert(1, b"t1"));
-  let flat = {
-    id: 1,
-    ty: record_type,
-    representation: representation_with(printing.constructors, record_type),
-  };
-  let unwinding = failure_exit_text(printing, [text_local(0), flat]);
-  let release = root_symbol_text(root_of(keys::Unboxed(keys::Release), record_type));
-  assert(
-    occurrences(unwinding, release) == 1 && releases(unwinding, b"p0")
-      && !releases(unwinding, b"t1_0"),
-    Some(String::of_bytes_lossy(unwinding)),
-  )
+  with_no_shapes(|| {
+    let record_type = strings_record(3);
+    let printing = empty_printing(Map::new().insert(0, b"p0").insert(1, b"t1"));
+    let flat = { id: 1, ty: record_type, representation: representation_of(record_type) };
+    let unwinding = failure_exit_text(printing, [text_local(0), flat]);
+    let release = root_symbol_text(root_of(keys::Unboxed(keys::Release), record_type));
+    assert(
+      occurrences(unwinding, release) == 1 && releases(unwinding, b"p0")
+        && !releases(unwinding, b"t1_0"),
+      Some(String::of_bytes_lossy(unwinding)),
+    )
+  })
 }
 
 test "the generated code to release a value of many counted words grows by one variable name per word, not by one release call per word" {
-  let site = |n: Int| {
-    let record_type = strings_record(n);
-    let printing = empty_printing(Map::new());
-    let representation = representation_with(printing.constructors, record_type);
-    let s = released(printing, record_type, representation, part_names(b"t1", representation));
-    pieces_text(s.out).len()
-      - root_symbol_text(root_of(keys::Unboxed(keys::Release), record_type)).len()
-  };
-  let sites = [4, 8, 16, 32, 64].map(|n: Int| { leaves: n, bytes: site(n) });
-  let leaf_report = Some(
-    String::of_bytes_lossy(
-      Bytes::join(
-        sites.map(|s: { leaves: Int, bytes: Int }|
-          Bytes::concat_all([
-            ascii_of_int(s.leaves),
-            b" leaves: ",
-            ascii_of_int(s.bytes),
-            b" bytes",
-          ])),
-        b", ",
+  with_no_shapes(|| {
+    let site = |n: Int| {
+      let record_type = strings_record(n);
+      let printing = empty_printing(Map::new());
+      let representation = representation_of(record_type);
+      let s = released(printing, record_type, representation, part_names(b"t1", representation));
+      pieces_text(s.out).len()
+        - root_symbol_text(root_of(keys::Unboxed(keys::Release), record_type)).len()
+    };
+    let sites = [4, 8, 16, 32, 64].map(|n: Int| { leaves: n, bytes: site(n) });
+    let leaf_report = Some(
+      String::of_bytes_lossy(
+        Bytes::join(
+          sites.map(|s: { leaves: Int, bytes: Int }|
+            Bytes::concat_all([
+              ascii_of_int(s.leaves),
+              b" leaves: ",
+              ascii_of_int(s.bytes),
+              b" bytes",
+            ])),
+          b", ",
+        ),
       ),
-    ),
-  );
-  assert(sites.all(|s: { leaves: Int, bytes: Int }| s.bytes <= 12 * s.leaves + 40), leaf_report)
+    );
+    assert(sites.all(|s: { leaves: Int, bytes: Int }| s.bytes <= 12 * s.leaves + 40), leaf_report)
+  })
 }
 
 test "the last-reference test decrements the count, and yields the value itself only when it was the last reference, otherwise 0" {
@@ -2764,7 +2762,7 @@ fn walk_fragment(
   operation: TypeOperation,
   o: BlockContents,
   dropped: RootKey,
-) -> { text: Bytes, calls: List<RootKey> } / {abort.raise} = {
+) -> { text: Bytes, calls: List<RootKey> } / {ShapeReads} = {
   let printing = empty_printing(Map::new().insert(0, b"p0"));
   let w = walk_block(
     printing,
@@ -2801,227 +2799,238 @@ test "a list copied is a fresh list of its items, each counted once more, the or
 }
 
 test "releasing a one-word sum walks the block its case points to, and loops when that block links to another block of the same type" {
-  let string = string_type;
-  let own = NamedType({ name: b"T", args: [] });
-  let tagged = AsSum({
-    layout: {
-      classes: [PointerSum(1)],
-      cases: [
-        { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
-        { test: LowBits({ at: 0, bits: 1, block_tag: None }), payload: Nullary },
-        { test: LowBits({ at: 0, bits: 2, block_tag: None }), payload: Nullary },
-      ],
-    },
-    cases: [b"m.N", b"m.B", b"m.S"],
-  });
-  let blocks = [
-    {
-      case: 1,
-      ty: NamedType({ name: b"m.T", args: [] }),
-      representation: AsSum({ layout: { classes: [Pointer], cases: [] }, cases: [b"m.B"] }),
-      opening: WordBlock({
-        parts: [
-          { at: 0, ty: string, representation: AsWord },
-          { at: 1, ty: own, representation: tagged },
+  with_no_shapes(|| {
+    let string = string_type;
+    let own = NamedType({ name: b"T", args: [] });
+    let tagged = AsSum({
+      layout: {
+        classes: [PointerSum(1)],
+        cases: [
+          { test: WordIs({ at: 0, value: 0 }), payload: Nullary },
+          { test: LowBits({ at: 0, bits: 1, block_tag: None }), payload: Nullary },
+          { test: LowBits({ at: 0, bits: 2, block_tag: None }), payload: Nullary },
         ],
-        words: 2,
-      }),
-    },
-    { case: 2, ty: string, representation: AsWord, opening: BytesBlock },
-  ];
-  let printing = empty_printing(Map::new().insert(0, b"p0"));
-  let walk = |operation: TypeOperation|
-    pieces_text(
-      walk_sum(
-        printing,
-        0,
-        placeholder_var(1, AsWord),
-        placeholder_var(0, tagged),
-        operation,
-        blocks,
-      ).out,
+      },
+      cases: [b"m.N", b"m.B", b"m.S"],
+    });
+    let blocks = [
+      {
+        case: 1,
+        ty: NamedType({ name: b"m.T", args: [] }),
+        representation: AsSum({ layout: { classes: [Pointer], cases: [] }, cases: [b"m.B"] }),
+        opening: WordBlock({
+          parts: [
+            { at: 0, ty: string, representation: AsWord },
+            { at: 1, ty: own, representation: tagged },
+          ],
+          words: 2,
+        }),
+      },
+      { case: 2, ty: string, representation: AsWord, opening: BytesBlock },
+    ];
+    let printing = empty_printing(Map::new().insert(0, b"p0"));
+    let walk = |operation: TypeOperation|
+      pieces_text(
+        walk_sum(
+          printing,
+          0,
+          placeholder_var(1, AsWord),
+          placeholder_var(0, tagged),
+          operation,
+          blocks,
+        ).out,
+      );
+    let permanent_text = walk(Keep);
+    [
+      b"Word t1 = p0; Word *ply_into = &t1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
+      Bytes::concat_all([
+        b"case INT64_C(4097): { Word ply_b = (ply_x & ~(Word)7); if (ply_obj(ply_b)->rc != UINT32_MAX) { Word ply_k = ",
+        call_text(persistent_copy_fn, [b"ctx", b"ply_b", b"24"]),
+      ]),
+      b" *ply_into = ply_k | (ply_x & 7); ply_into = &ply_words(ply_k)[1]; ply_n = *ply_into; }",
+      Bytes::concat_all([
+        b"case INT64_C(4098): { Word ply_b = (ply_x & ~(Word)7); *ply_into = ",
+        root_symbol_text(root_of(Keep, string)),
+        b"(ctx, ply_b) | (ply_x & 7); } break; ",
+      ]),
+      b"} if (!ply_n) break; ply_x = ply_n; }",
+    ].fold((), |_: Unit, part: Bytes| assert(permanent_text.contains(part), None));
+    let chans = [{ case: 2, ty: chan_type(string), representation: AsWord, opening: HandleBlock }];
+    assert_eq(
+      pieces_text(
+        walk_sum(
+          printing,
+          0,
+          placeholder_var(1, AsWord),
+          placeholder_var(0, tagged),
+          Keep,
+          blocks.take(1).concat(chans),
+        ).out,
+      ),
+      b"  Word t1 = 0;\n",
     );
-  let permanent_text = walk(Keep);
-  [
-    b"Word t1 = p0; Word *ply_into = &t1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
-    Bytes::concat_all([
-      b"case INT64_C(4097): { Word ply_b = (ply_x & ~(Word)7); if (ply_obj(ply_b)->rc != UINT32_MAX) { Word ply_k = ",
-      call_text(persistent_copy_fn, [b"ctx", b"ply_b", b"24"]),
-    ]),
-    b" *ply_into = ply_k | (ply_x & 7); ply_into = &ply_words(ply_k)[1]; ply_n = *ply_into; }",
-    Bytes::concat_all([
-      b"case INT64_C(4098): { Word ply_b = (ply_x & ~(Word)7); *ply_into = ",
-      root_symbol_text(root_of(Keep, string)),
-      b"(ctx, ply_b) | (ply_x & 7); } break; ",
-    ]),
-    b"} if (!ply_n) break; ply_x = ply_n; }",
-  ].fold((), |_: Unit, part: Bytes| assert(permanent_text.contains(part), None));
-  let chans = [{ case: 2, ty: chan_type(string), representation: AsWord, opening: HandleBlock }];
-  assert_eq(
-    pieces_text(
-      walk_sum(
-        printing,
-        0,
-        placeholder_var(1, AsWord),
-        placeholder_var(0, tagged),
-        Keep,
-        blocks.take(1).concat(chans),
-      ).out,
-    ),
-    b"  Word t1 = 0;\n",
-  );
-  let shared = walk(Share);
-  [
-    b"Word t1 = 1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
-    Bytes::concat_all([b"if (", unshared_fn, b"(ply_b)) {"]),
-    b" ply_n = ply_words(ply_b)[1]; }",
-    Bytes::concat_all([
-      b"if (!",
-      root_symbol_text(root_of(Share, string)),
-      b"(ctx, ply_b)) t1 = 0;",
-    ]),
-    b" if (t1) { Word ply_x = p0; for (;;) {",
-    Bytes::concat_all([
-      b"if (",
-      unshared_fn,
-      b"(ply_b)) { ",
-      call_text(mark_shared_fn, [b"ply_b"]),
-      b"; ply_n = ply_words(ply_b)[1]; } } break;",
-    ]),
-  ].fold((), |_: Unit, part: Bytes|
-    assert(shared.contains(part), Some(String::of_bytes_lossy(shared))));
-  assert(!permanent_text.contains(root_symbol_text(root_of(Keep, own))), None);
-  assert(!shared.contains(root_symbol_text(root_of(Share, own))), None)
+    let shared = walk(Share);
+    [
+      b"Word t1 = 1; Word ply_x = p0; for (;;) { Word ply_n = 0; switch (",
+      Bytes::concat_all([b"if (", unshared_fn, b"(ply_b)) {"]),
+      b" ply_n = ply_words(ply_b)[1]; }",
+      Bytes::concat_all([
+        b"if (!",
+        root_symbol_text(root_of(Share, string)),
+        b"(ctx, ply_b)) t1 = 0;",
+      ]),
+      b" if (t1) { Word ply_x = p0; for (;;) {",
+      Bytes::concat_all([
+        b"if (",
+        unshared_fn,
+        b"(ply_b)) { ",
+        call_text(mark_shared_fn, [b"ply_b"]),
+        b"; ply_n = ply_words(ply_b)[1]; } } break;",
+      ]),
+    ].fold((), |_: Unit, part: Bytes|
+      assert(shared.contains(part), Some(String::of_bytes_lossy(shared))));
+    assert(!permanent_text.contains(root_symbol_text(root_of(Keep, own))), None);
+    assert(!shared.contains(root_symbol_text(root_of(Share, own))), None)
+  })
 }
 
 test "sharing a heap block marks it shared and shares each block it points to, and making it permanent copies it and makes each of its words permanent" {
-  let string = string_type;
-  let boxed = WordBlock({ parts: [{ at: 0, ty: string, representation: AsWord }], words: 2 });
-  let share = keys::generated_key(Share, string, b"std.prelude");
-  let keep = keys::generated_key(Keep, string, b"std.prelude");
-  let shared = walk_fragment(Share, boxed, dropping_of(b"m.R"));
-  assert(
-    shared.text.contains(
+  with_no_shapes(|| {
+    let string = string_type;
+    let boxed = WordBlock({ parts: [{ at: 0, ty: string, representation: AsWord }], words: 2 });
+    let share = keys::generated_key(Share, string, b"std.prelude");
+    let keep = keys::generated_key(Keep, string, b"std.prelude");
+    let shared = walk_fragment(Share, boxed, dropping_of(b"m.R"));
+    assert(
+      shared.text.contains(
+        Bytes::concat_all([
+          b"if (",
+          call_text(unshared_fn, [b"p0"]),
+          b") { if (ply_words(p0)[0] && !",
+          root_symbol_text(share),
+          b"(ctx, ply_words(p0)[0])) t1 = 0; if (t1) ",
+          call_text(mark_shared_fn, [b"p0"]),
+          b"; }",
+        ]),
+      ),
+      Some(String::of_bytes_lossy(shared.text)),
+    );
+    assert_eq(shared.calls, [share]);
+    let permanent = walk_fragment(Keep, boxed, dropping_of(b"m.R"));
+    [
       Bytes::concat_all([
-        b"if (",
-        call_text(unshared_fn, [b"p0"]),
-        b") { if (ply_words(p0)[0] && !",
-        root_symbol_text(share),
-        b"(ctx, ply_words(p0)[0])) t1 = 0; if (t1) ",
-        call_text(mark_shared_fn, [b"p0"]),
-        b"; }",
+        b"Word t1 = p0; if (p0 && ply_obj(p0)->rc != UINT32_MAX) { t1 = ",
+        call_text(persistent_copy_fn, [b"ctx", b"p0", b"24"]),
       ]),
-    ),
-    Some(String::of_bytes_lossy(shared.text)),
-  );
-  assert_eq(shared.calls, [share]);
-  let permanent = walk_fragment(Keep, boxed, dropping_of(b"m.R"));
-  [
-    Bytes::concat_all([
-      b"Word t1 = p0; if (p0 && ply_obj(p0)->rc != UINT32_MAX) { t1 = ",
-      call_text(persistent_copy_fn, [b"ctx", b"p0", b"24"]),
-    ]),
-    Bytes::concat_all([
-      b"if (ply_words(t1)[0]) ply_words(t1)[0] = ",
-      root_symbol_text(keep),
-      b"(ctx, ply_words(t1)[0]);",
-    ]),
-  ].fold((), |_: Unit, part: Bytes| assert(permanent.text.contains(part), None));
-  assert(
-    walk_fragment(Share, ClosureBlock, dropping_of(b"m.R")).text.contains(b"->share(ctx, p0)"),
-    None,
-  );
-  let fun = FunctionType({
-    keep_parameters: [],
-    once: false,
-    params: [string],
-    return_type: string,
-    effects: no_effects,
-  });
-  let capturing = WordBlock({ parts: [{ at: 1, ty: fun, representation: AsWord }], words: 2 });
-  assert(
-    walk_fragment(Share, capturing, dropping_of(b"m.R")).text.contains(
-      b"->share(ctx, ply_words(p0)[1])) t1 = 0;",
-    ),
-    None,
-  );
-  assert(
-    walk_fragment(Share, HandleBlock, dropping_of(b"m.R")).text.contains(b"if (p0) t1 = 0;"),
-    None,
-  )
+      Bytes::concat_all([
+        b"if (ply_words(t1)[0]) ply_words(t1)[0] = ",
+        root_symbol_text(keep),
+        b"(ctx, ply_words(t1)[0]);",
+      ]),
+    ].fold((), |_: Unit, part: Bytes| assert(permanent.text.contains(part), None));
+    assert(
+      walk_fragment(Share, ClosureBlock, dropping_of(b"m.R")).text.contains(b"->share(ctx, p0)"),
+      None,
+    );
+    let fun = FunctionType({
+      keep_parameters: [],
+      once: false,
+      params: [string],
+      return_type: string,
+      effects: no_effects,
+    });
+    let capturing = WordBlock({ parts: [{ at: 1, ty: fun, representation: AsWord }], words: 2 });
+    assert(
+      walk_fragment(Share, capturing, dropping_of(b"m.R")).text.contains(
+        b"->share(ctx, ply_words(p0)[1])) t1 = 0;",
+      ),
+      None,
+    );
+    assert(
+      walk_fragment(Share, HandleBlock, dropping_of(b"m.R")).text.contains(b"if (p0) t1 = 0;"),
+      None,
+    )
+  })
 }
 
 test "making an `Int` permanent leaves its bits unchanged, and making a `Decimal` permanent copies the runtime's whole box rather than word by word" {
-  let int = int_type;
-  let permanent = walk_fragment(
-    Keep,
-    WordBlock({ parts: [{ at: 0, ty: int, representation: AsWord }], words: 1 }),
-    dropping_of(b"m.R"),
-  );
-  assert_eq(permanent.calls, []);
-  let root = walk_fragment(Keep, ScalarBox(2), drop_of(decimal_type)).text;
-  assert(
-    root.contains(b"Word t1 = p0; if (p0 && ply_obj(p0)->rc != UINT32_MAX) {"),
-    Some(String::of_bytes_lossy(root)),
-  )
+  with_no_shapes(|| {
+    let int = int_type;
+    let permanent = walk_fragment(
+      Keep,
+      WordBlock({ parts: [{ at: 0, ty: int, representation: AsWord }], words: 1 }),
+      dropping_of(b"m.R"),
+    );
+    assert_eq(permanent.calls, []);
+    let root = walk_fragment(Keep, ScalarBox(2), drop_of(decimal_type)).text;
+    assert(
+      root.contains(b"Word t1 = p0; if (p0 && ply_obj(p0)->rc != UINT32_MAX) {"),
+      Some(String::of_bytes_lossy(root)),
+    )
+  })
 }
 
 test "making permanent a runtime handle, a scoped value, a function value, or a value containing one yields 0 at once, without walking or copying anything" {
-  let int = int_type;
-  let string = string_type;
-  let chan = chan_type(int);
-  let hold = scoped_type(label_type(b"r"), string);
-  let captured = |ty: Type|
-    WordBlock({ parts: [{ at: 1, ty: ty, representation: AsWord }], words: 2 });
-  let inner = RecordType([{ name: b"c", ty: chan }, { name: b"n", ty: int }]);
-  let outer = RecordType([{ name: b"r", ty: inner }, { name: b"s", ty: string }]);
-  let closures = ListOf({
-    whole: drop_of(list_type(int)),
-    item: [word(0, ThroughDescriptor)],
-    stride: 1,
-  });
-  let dropped = dropping_of(b"m.R");
-  [
-    captured(chan),
-    captured(hold),
-    HandleBlock,
-    ScopedContents({ at: 1, ty: chan, representation: AsWord }),
-    WordBlock({
-      parts: [
-        { at: 0, ty: inner, representation: AsWord },
-        { at: 1, ty: string, representation: AsWord },
-      ],
-      words: 2,
-    }),
-    block_contents(empty_printing(Map::new()).constructors, outer, AsWord),
-    closures,
-  ].fold((), |_: Unit, o: BlockContents| {
-    let permanent = walk_fragment(Keep, o, dropped);
-    assert(permanent.text.contains(b" = 0;") && !permanent.text.contains(persistent_copy_fn), None);
-    assert_eq(permanent.calls, [])
-  });
-  let plain = walk_fragment(
-    Keep,
-    WordBlock({
-      parts: [
-        { at: 0, ty: int, representation: AsWord },
-        { at: 1, ty: string, representation: AsWord },
-      ],
-      words: 2,
-    }),
-    dropped,
-  );
-  assert(plain.text.contains(call_text(persistent_copy_fn, [b"ctx", b"p0", b"24"])), None);
-  assert_eq(plain.calls, [root_of(Keep, string)]);
-  assert(
-    walk_fragment(Share, captured(chan), dropped).text.contains(
-      Bytes::concat_all([
-        call_text(unshared_fn, [b"p0"]),
-        b") { if (ply_words(p0)[1]) t1 = 0; if (t1) ",
-        call_text(mark_shared_fn, [b"p0"]),
-        b"; }",
-      ]),
-    ),
-    None,
-  )
+  with_no_shapes(|| {
+    let int = int_type;
+    let string = string_type;
+    let chan = chan_type(int);
+    let hold = scoped_type(label_type(b"r"), string);
+    let captured = |ty: Type|
+      WordBlock({ parts: [{ at: 1, ty: ty, representation: AsWord }], words: 2 });
+    let inner = RecordType([{ name: b"c", ty: chan }, { name: b"n", ty: int }]);
+    let outer = RecordType([{ name: b"r", ty: inner }, { name: b"s", ty: string }]);
+    let closures = ListOf({
+      whole: drop_of(list_type(int)),
+      item: [word(0, ThroughDescriptor)],
+      stride: 1,
+    });
+    let dropped = dropping_of(b"m.R");
+    [
+      captured(chan),
+      captured(hold),
+      HandleBlock,
+      ScopedContents({ at: 1, ty: chan, representation: AsWord }),
+      WordBlock({
+        parts: [
+          { at: 0, ty: inner, representation: AsWord },
+          { at: 1, ty: string, representation: AsWord },
+        ],
+        words: 2,
+      }),
+      block_contents(outer, AsWord),
+      closures,
+    ].fold((), |_: Unit, o: BlockContents| {
+      let permanent = walk_fragment(Keep, o, dropped);
+      assert(
+        permanent.text.contains(b" = 0;") && !permanent.text.contains(persistent_copy_fn),
+        None,
+      );
+      assert_eq(permanent.calls, [])
+    });
+    let plain = walk_fragment(
+      Keep,
+      WordBlock({
+        parts: [
+          { at: 0, ty: int, representation: AsWord },
+          { at: 1, ty: string, representation: AsWord },
+        ],
+        words: 2,
+      }),
+      dropped,
+    );
+    assert(plain.text.contains(call_text(persistent_copy_fn, [b"ctx", b"p0", b"24"])), None);
+    assert_eq(plain.calls, [root_of(Keep, string)]);
+    assert(
+      walk_fragment(Share, captured(chan), dropped).text.contains(
+        Bytes::concat_all([
+          call_text(unshared_fn, [b"p0"]),
+          b") { if (ply_words(p0)[1]) t1 = 0; if (t1) ",
+          call_text(mark_shared_fn, [b"p0"]),
+          b"; }",
+        ]),
+      ),
+      None,
+    )
+  })
 }

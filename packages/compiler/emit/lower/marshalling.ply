@@ -1,7 +1,7 @@
 import compiler.emit.code (Code, NBuiltin)
 import std.list
 import std.bytes
-import compiler.syntax.parsing (Span, dummy_span)
+import compiler.syntax.parsing (Span, generated_span)
 import compiler.syntax.type_syntax (RaiseMode, is_raise)
 import compiler.syntax.expressions (is_exit_effect, exit_operation_name)
 import compiler.check.types (Type, NamedType, VariableType, FunctionType, RecordType, NominalType,
@@ -25,17 +25,17 @@ import compiler.emit.typed_ir (Representation, AsInt, AsBool, AsImmediate, AsWor
 import compiler.emit.typed_ir.containers (CopyOut, Length)
 import compiler.emit.typed_ir.strings (AppendBytes)
 import compiler.emit.typed_ir.handling (HandleOperation, UnspecialisedBuiltin, VariableInitialize,
-                                        VariableRead, VariableWrite)
+                                        VariableRead, VariableTake, VariableWrite)
 import compiler.emit.typed_ir.statics (StaticWords, StaticStruct, RawWord, AddressWord, EntryWord,
                                        BytesWord, FieldWord, PreludeWord)
 import compiler.emit.release (word_form_functions)
-import compiler.emit.lower.module_context (CallTypes, effect_operation_of)
-import compiler.emit.lower.representation (representation_of, representation_with, typed_convention)
+import compiler.emit.lower.module_context (CallTypes, effect_operation_of, effect_called)
+import compiler.emit.lower.representation (representation_of, typed_convention)
 import compiler.emit.lower.base (Context, Lowering, LoweredValue, HandlerInstance, unreachable,
                                  bound, bound_as, run_for_effect, represented_as, type_of,
                                  pair_words, with_need, static_added, read_typed)
-import compiler.emit.representations (Constructors, EffectOperation, EffectName, type_variables,
-                                      word_type)
+import compiler.emit.representations (EmitReads, ShapeReads, EffectOperation, EffectName,
+                                      type_variables, word_type)
 import compiler.emit.print.count_functions (never_lifted_function, never_shown_function)
 import compiler.emit.marks (marks_of, marked_key, mark_type_params, function_marks)
 import compiler.emit.output (Exact)
@@ -51,7 +51,7 @@ pub fn left_to_callers(
   args: List<Arg>,
   types: CallTypes,
   at: Span,
-) -> LoweredValue =
+) -> LoweredValue / {ShapeReads} =
   bound(
     context,
     types.params.push(types.result_type).fold(st, |s: Lowering, t: Type|
@@ -77,7 +77,7 @@ pub fn marshalling_builtin_call(
   args: List<Arg>,
   callee: Code,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let at_type = called_at(context, callee, args);
   if name == b"?lower" {
     match args {
@@ -103,7 +103,8 @@ pub fn marshalling_builtin_call(
 }
 
 fn handler_builtin(name: Bytes) -> Bool =
-  name == b"?handler_init" || name == b"?handler_var" || name == b"?handler_set"
+  name == b"?handler_init" || name == b"?handler_var" || name == b"?handler_take"
+    || name == b"?handler_set"
 
 fn handler_variable(
   context: Context,
@@ -112,7 +113,7 @@ fn handler_variable(
   args: List<Arg>,
   callee: Code,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match context.instance {
     Some(i) -> instance_variable(context, st, i, name, args, callee, at),
     None -> unreachable(b"a handler variable is used outside every handle expression"),
@@ -126,7 +127,7 @@ fn instance_variable(
   args: List<Arg>,
   callee: Code,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let place = |a: Arg| match a { IntOperand(n) -> Some(i.variable_count + 2 * n), _ -> None };
   let handling_operation = |o: HandleOperation, operands: List<Arg>, takes: List<Bool>|
     OperationCall({
@@ -140,24 +141,19 @@ fn instance_variable(
       },
     });
   match args {
-    [p] -> if name != b"?handler_var" {
-      unreachable(b"only `?handler_var` may be called with one argument")
-    } else {
-      match ((place(p), callee.ty)) {
-        (Some(word_at), FunctionType(t)) ->
+    [p] -> match ((place(p), callee.ty)) {
+      (Some(word_at), FunctionType(t)) -> {
+        let loaded = |o: HandleOperation|
           represented_as(
-            bound_as(
-              st,
-              t.return_type,
-              AsWord,
-              handling_operation(VariableRead(word_at), [], []),
-              at,
-            ),
-            representation_of(context.setting, t.return_type),
+            bound_as(st, t.return_type, AsWord, handling_operation(o, [], []), at),
+            representation_of(t.return_type),
             at,
-          ),
-        _ -> unreachable(b"a handler variable read has no known storage location or function type"),
-      }
+          );
+        if name == b"?handler_var" { loaded(VariableRead(word_at)) }
+        else if name == b"?handler_take" { loaded(VariableTake(word_at)) }
+        else { unreachable(b"only `?handler_var` and `?handler_take` take one argument") }
+      },
+      _ -> unreachable(b"a handler variable read has no known storage location or function type"),
     },
     [p, x] -> match place(p) {
       None ->
@@ -204,17 +200,13 @@ fn serialize_part(
   x: Arg,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let unmarked_type = marks_of(ty).ty;
   if !fully_known(unmarked_type) {
     unreachable(b"a value is converted at a type that is not fully known")
   } else {
-    let conv = typed_convention(context.setting.constructors, [unmarked_type], unit_type);
-    let h = represented_as(
-      { st: st, arg: x },
-      representation_of(context.setting, unmarked_type),
-      at,
-    );
+    let conv = typed_convention([unmarked_type], unit_type);
+    let h = represented_as({ st: st, arg: x }, representation_of(unmarked_type), at);
     bound_as(
       h.st,
       unit_type,
@@ -235,12 +227,12 @@ fn deserialize_part(
   st: Lowering,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let unmarked_type = marks_of(ty).ty;
   if !fully_known(unmarked_type) {
     unreachable(b"`?lift` is called at a type that is not fully known")
   } else {
-    let conv = typed_convention(context.setting.constructors, [], unmarked_type);
+    let conv = typed_convention([], unmarked_type);
     bound_as(
       st,
       unmarked_type,
@@ -265,13 +257,7 @@ pub fn fully_known(ty: Type) -> Bool =
     NominalType(x) -> x.fields.all(|f: Field| fully_known(f.ty)),
   }
 
-fn shown(
-  context: Context,
-  st: Lowering,
-  x: Arg,
-  ty: Type,
-  at: Span,
-) -> LoweredValue / {abort.raise} = {
+fn shown(context: Context, st: Lowering, x: Arg, ty: Type, at: Span) -> LoweredValue / {EmitReads} = {
   let opened = native_for_effect(st, b"?shown_open", [], false, at);
   let written = serialize_part(context, opened, x, ty, at);
   let n = native_int(written.st, b"?lower_close", [], true, at);
@@ -285,7 +271,7 @@ pub fn assertion_failed(
   expected: Arg,
   ty: Type,
   at: Span,
-) -> Lowering / {abort.raise} = {
+) -> Lowering / {EmitReads} = {
   let a = shown(context, st, actual, ty, at);
   let e = shown(context, a.st, expected, ty, at);
   let a_at = bytes_address(e.st, a.arg, at);
@@ -354,7 +340,7 @@ fn marshalling_native_call(
   args: List<Arg>,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   if m.name == b"?out_decimal" { decimal_out(context, st, args, at) }
   else if m.name == b"?out_fixed" { write_fixed_width(context, st, args, at) }
   else if m.name == b"?in_decimal" { decimal_in(context, st, ty, at) }
@@ -420,7 +406,7 @@ fn decimal_out(
   st: Lowering,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match args {
     [d] -> {
       let w = pair_words(st, d, AsDecimal, at);
@@ -434,7 +420,7 @@ fn write_fixed_width(
   st: Lowering,
   args: List<Arg>,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   match args {
     [x] -> match width_of(type_of(x)) {
       None ->
@@ -475,7 +461,7 @@ fn write_fixed_width(
     _ -> unreachable(b"writing a fixed-width integer needs exactly one argument"),
   }
 
-fn decimal_in(context: Context, st: Lowering, ty: Type, at: Span) -> LoweredValue / {abort.raise} = {
+fn decimal_in(context: Context, st: Lowering, ty: Type, at: Span) -> LoweredValue / {EmitReads} = {
   let lo = native_int(st, b"?in_decimal", [], true, at);
   let hi = native_int(lo.st, b"?in_high", [], false, at);
   bound_as(
@@ -487,7 +473,7 @@ fn decimal_in(context: Context, st: Lowering, ty: Type, at: Span) -> LoweredValu
   )
 }
 
-fn fixed_in(context: Context, st: Lowering, ty: Type, at: Span) -> LoweredValue / {abort.raise} =
+fn fixed_in(context: Context, st: Lowering, ty: Type, at: Span) -> LoweredValue / {EmitReads} =
   match width_of(ty) {
     None ->
       unreachable(
@@ -526,7 +512,7 @@ pub fn bytes_address(
   st: Lowering,
   b: Arg,
   at: Span,
-) -> { st: Lowering, address: Arg, count: Arg } / {abort.raise} = {
+) -> { st: Lowering, address: Arg, count: Arg } / {EmitReads} = {
   let w = represented_as({ st: st, arg: b }, AsWord, at);
   match word_variable(w) {
     None -> unreachable(b"a byte string is not stored in a variable"),
@@ -561,7 +547,7 @@ pub fn taken_out(st: Lowering, n: Arg, ty: Type, at: Span) -> LoweredValue =
     at,
   )
 
-pub fn native_of(name: Bytes) -> Bytes / {abort.raise} = builtin_helper(name).concat(b"_p")
+pub fn native_of(name: Bytes) -> Bytes / {EmitReads} = builtin_helper(name).concat(b"_p")
 
 fn native_uses(args: List<Arg>, fails: Bool) -> OperationSignature =
   { takes: args.map(|_: Arg| false), owned: true, fails: fails, suspends: false }
@@ -572,7 +558,7 @@ fn native_for_effect(
   args: List<Arg>,
   fails: Bool,
   at: Span,
-) -> Lowering / {abort.raise} =
+) -> Lowering / {EmitReads} =
   run_for_effect(
     st,
     Native({
@@ -589,7 +575,7 @@ fn native_int(
   args: List<Arg>,
   fails: Bool,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   bound_as(
     st,
     int_type,
@@ -607,7 +593,7 @@ pub fn concatenated(
   b: Arg,
   ty: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = {
+) -> LoweredValue / {EmitReads} = {
   let w = represented_as({ st: st, arg: a }, AsWord, at);
   let t = bytes_address(w.st, b, at);
   let args = [w.arg, t.address, t.count];
@@ -622,7 +608,7 @@ pub fn concatenated(
     }),
     at,
   );
-  represented_as(g, representation_of(context.setting, ty), at)
+  represented_as(g, representation_of(ty), at)
 }
 
 pub fn machine_word_call(
@@ -634,7 +620,7 @@ pub fn machine_word_call(
   result: Option<Type>,
   callee: Code,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   if args.len() != call.params.len() {
     unreachable(
       b"a runtime function that takes plain integers or floats was called with the wrong number of arguments: ".concat(
@@ -753,14 +739,14 @@ type NativeCall = { name: Bytes, args: List<Arg>, takes: List<Bool> }
 
 fn native_call(
   m: NativeCall,
-) -> { name: Bytes, args: List<Arg>, uses: OperationSignature } / {abort.raise} =
+) -> { name: Bytes, args: List<Arg>, uses: OperationSignature } / {EmitReads} =
   {
     name: native_of(m.name),
     args: m.args,
     uses: { takes: m.takes, owned: true, fails: true, suspends: false },
   }
 
-fn native_word(st: Lowering, m: NativeCall, at: Span) -> LoweredValue / {abort.raise} =
+fn native_word(st: Lowering, m: NativeCall, at: Span) -> LoweredValue / {EmitReads} =
   bound_as(st, int_type, AsInt, Native(native_call(m)), at)
 
 fn object_returned(
@@ -769,12 +755,8 @@ fn object_returned(
   m: NativeCall,
   t: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} =
-  represented_as(
-    bound_as(st, t, AsWord, Native(native_call(m)), at),
-    representation_of(context.setting, t),
-    at,
-  )
+) -> LoweredValue / {EmitReads} =
+  represented_as(bound_as(st, t, AsWord, Native(native_call(m)), at), representation_of(t), at)
 
 fn integer_returned(w: LoweredValue, t: Type, at: Span) -> LoweredValue =
   match t {
@@ -810,7 +792,7 @@ fn integer_returned(w: LoweredValue, t: Type, at: Span) -> LoweredValue =
     _ -> w,
   }
 
-pub fn blake3_of(st: Lowering, a: Arg, at: Span) -> LoweredValue / {abort.raise} = {
+pub fn blake3_of(st: Lowering, a: Arg, at: Span) -> LoweredValue / {EmitReads} = {
   let t = bytes_address(st, a, at);
   let n = native_int(t.st, b"?blake3", [t.address, t.count], false, at);
   taken_out(n.st, n.arg, bytes_type, at)
@@ -822,7 +804,7 @@ pub fn scalar_encoding(
   a: Arg,
   ty: Type,
   at: Span,
-) -> Option<LoweredValue> / {abort.raise} =
+) -> Option<LoweredValue> / {EmitReads} =
   match ty {
     NamedType(c) -> if c.args.len() > 0 { None } else if is_string(ty) || is_bytes(ty) {
       let t = bytes_address(st, a, at);
@@ -907,14 +889,14 @@ pub fn type_descriptor(
   st: Lowering,
   t: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = described(context, st, t, false, at)
+) -> LoweredValue / {EmitReads} = described(context, st, t, false, at)
 
 pub fn serializable_type_descriptor(
   context: Context,
   st: Lowering,
   t: Type,
   at: Span,
-) -> LoweredValue / {abort.raise} = described(context, st, t, true, at)
+) -> LoweredValue / {EmitReads} = described(context, st, t, true, at)
 
 fn described(
   context: Context,
@@ -922,7 +904,7 @@ fn described(
   t: Type,
   shown: Bool,
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   if !fully_known(t) {
     bound_as(
       type_variables(t).fold(st, |s: Lowering, v: Int| with_need(s, { var: v, reads: Exact })),
@@ -936,14 +918,7 @@ fn described(
       at,
     )
   } else {
-    let s = type_static(
-      context.setting.constructors,
-      context.setting.module,
-      st,
-      t,
-      function_marks(t),
-      shown,
-    );
+    let s = type_static(context.setting.module, st, t, function_marks(t), shown);
     bound_as(s.st, int_type, AsInt, Static(s.name), at)
   }
 
@@ -953,7 +928,7 @@ pub fn dynamic_descriptor(
   t: Type,
   built: { equal: Bool, order: Bool },
   at: Span,
-) -> LoweredValue / {abort.raise} =
+) -> LoweredValue / {EmitReads} =
   if !fully_known(t) {
     bound_as(
       type_variables(t).fold(st, |s: Lowering, v: Int| with_need(s, { var: v, reads: Exact })),
@@ -968,7 +943,7 @@ pub fn dynamic_descriptor(
     )
   } else {
     let module = context.setting.module;
-    let ty = type_static(context.setting.constructors, module, st, t, function_marks(t), false);
+    let ty = type_static(module, st, t, function_marks(t), false);
     let entry = |type_operation: TypeOperation, built: Bool|
       if built { EntryWord(keys::generated_key(OnWordForm(type_operation), t, module)) }
       else { RawWord(0) };
@@ -993,7 +968,7 @@ pub fn operation_descriptor(
   operation: EffectOperation,
   params: List<Type>,
   result: Type,
-) -> { st: Lowering, name: Option<Bytes> } / {abort.raise} =
+) -> { st: Lowering, name: Option<Bytes> } / {EmitReads} =
   if !params.push(result).all(fully_known) {
     {
       st: params.push(result).fold(st, |s: Lowering, t: Type|
@@ -1011,7 +986,7 @@ pub fn operation_descriptor(
     let own_variable_types = own_types(operation, params, result);
     if own_variable_types.any(|t: Option<Type>| t == None) { { st: st, name: None } } else {
       let typed = |s: Lowering, t: Type, marks: List<Int>, shown: Bool|
-        type_static(context.setting.constructors, module, s, t, marks, shown);
+        type_static(module, s, t, marks, shown);
       let returned = typed(st, result, marks_of(return_marks.marked).marks, false);
       let taken = range(0, params.len()).fold(
         { st: returned.st, names: [] },
@@ -1076,7 +1051,7 @@ pub fn own_types(
   operation: EffectOperation,
   params: List<Type>,
   result: Type,
-) -> List<Option<Type>> / {abort.raise} = {
+) -> List<Option<Type>> / {EmitReads} = {
   let declared = |i: Int| match operation.params.at(i) { Some(d) -> d, None -> unknown_type };
   let bound = range(0, params.len()).fold(
     [],
@@ -1090,11 +1065,13 @@ pub fn own_types(
       if found == None && b.var == v { Some(b.ty) } else { found }))
 }
 
-pub fn effect_of(context: Context, global: Bytes) -> Option<EffectName> =
+pub fn effect_of(context: Context, global: Bytes) -> Option<EffectName> / {EmitReads} =
   if is_exit_effect(global) { Some(exit_effect_named(global)) } else {
-    match context.setting.effects.find(|e: EffectName|
-        e.global == global && e.operations.len() > 0) {
-      Some(e) -> Some(e),
+    match effect_called(global) {
+      Some(e) -> if e.operations.len() > 0 { Some(e) } else {
+        prelude_effects.find(|p: EffectInfo| p.name == global).map(|p: EffectInfo|
+          { global: p.name, operations: p.operations.map(effect_operation_of) })
+      },
       None ->
         prelude_effects.find(|e: EffectInfo| e.name == global).map(|e: EffectInfo|
           { global: e.name, operations: e.operations.map(effect_operation_of) }),
@@ -1119,7 +1096,7 @@ pub fn pending_abort_raise(
   context: Context,
   st: Lowering,
   word: Variable,
-) -> { st: Lowering, pending: Option<PendingRaise> } / {abort.raise} =
+) -> { st: Lowering, pending: Option<PendingRaise> } / {EmitReads} =
   match effect_of(context, b"abort") {
     None -> { st: st, pending: None },
     Some(e) -> match range(0, e.operations.len()).find(|k: Int|
@@ -1138,7 +1115,6 @@ pub fn pending_abort_raise(
           None -> { st: d.st, pending: None },
           Some(descriptor_name) -> {
             let s = type_static(
-              context.setting.constructors,
               context.setting.module,
               d.st,
               string_type,
@@ -1156,18 +1132,17 @@ pub fn pending_abort_raise(
   }
 
 fn type_static(
-  constructors: Constructors,
   module: Bytes,
   st: Lowering,
   t: Type,
   marks: List<Int>,
   shown: Bool,
-) -> { st: Lowering, name: Bytes } / {abort.raise} = {
+) -> { st: Lowering, name: Bytes } / {EmitReads} = {
   let spelled = encode_type(t);
   let text = static_added(st, StaticWords([BytesWord(spelled)]));
   let marked = |operation: TypeOperation|
     keys::with_marks(keys::generated_key(operation, t, module), marks);
-  let heads = word_form_functions(constructors, t);
+  let heads = word_form_functions(t);
   static_added(
     text.st,
     StaticStruct({
@@ -1194,27 +1169,23 @@ fn type_static(
   )
 }
 
-pub fn serialization_function(constructors: Constructors, k: RootKey) -> Function / {abort.raise} =
+pub fn serialization_function(k: RootKey) -> Function / {EmitReads} =
   match k {
     Generated(w, _) -> {
-      let rep = representation_with(constructors, w.ty);
+      let rep = representation_of(w.ty);
       let word = { id: 0, ty: w.ty, representation: AsWord };
       let represented = { id: 1, ty: w.ty, representation: rep };
       let call = |operation: TypeOperation, args: List<Arg>, result: Type|
         Call({
           callee: Root(keys::with_operation(k, operation)),
           args: args,
-          convention: typed_convention(constructors, args.map(|_: Arg| w.ty), result),
+          convention: typed_convention(args.map(|_: Arg| w.ty), result),
           suspends: false,
         });
       let opened = rep == AsWord;
       match w.operation {
         OnWordForm(Lower) -> {
-          let done = {
-            id: 2,
-            ty: unit_type,
-            representation: representation_with(constructors, unit_type),
-          };
+          let done = { id: 2, ty: unit_type, representation: representation_of(unit_type) };
           entry_function(
             k,
             unit_type,
@@ -1225,7 +1196,7 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Functio
                 Let({
                   var: represented,
                   value: Convert({ arg: VariableOperand(word), to: rep }),
-                  at: dummy_span,
+                  at: generated_span,
                   unwind: [],
                 }),
               ]
@@ -1237,7 +1208,7 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Functio
                   [VariableOperand(if opened { word } else { represented })],
                   unit_type,
                 ),
-                at: dummy_span,
+                at: generated_span,
                 unwind: [],
               }),
               Return(VariableOperand(done)),
@@ -1252,13 +1223,18 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Functio
             AsWord,
             [],
             [
-              Let({ var: represented, value: call(Lift, [], w.ty), at: dummy_span, unwind: [] }),
+              Let({
+                var: represented,
+                value: call(Lift, [], w.ty),
+                at: generated_span,
+                unwind: [],
+              }),
             ].concat(if opened { [Return(VariableOperand(represented))] } else {
               [
                 Let({
                   var: out,
                   value: Convert({ arg: VariableOperand(represented), to: AsWord }),
-                  at: dummy_span,
+                  at: generated_span,
                   unwind: [],
                 }),
                 Return(VariableOperand(out)),
@@ -1278,13 +1254,13 @@ pub fn serialization_function(constructors: Constructors, k: RootKey) -> Functio
           let returned = {
             id: 4,
             ty: returned_type,
-            representation: representation_with(constructors, returned_type),
+            representation: representation_of(returned_type),
           };
           let signed = { id: 5, ty: int_type, representation: AsInt };
           let word_type = if operation == keys::Equal { returned_type } else { int_type };
           let out = { id: 6, ty: word_type, representation: AsWord };
           let let_of = |v: Variable, value: Rvalue|
-            Let({ var: v, value: value, at: dummy_span, unwind: [] });
+            Let({ var: v, value: value, at: generated_span, unwind: [] });
           let held_pair = if opened { [] } else {
             [
               let_of(left, Convert({ arg: VariableOperand(word), to: rep })),

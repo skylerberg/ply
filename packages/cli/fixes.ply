@@ -1,0 +1,145 @@
+import diagnostic (position_of)
+import sources (File)
+import paths (WorkingDirectory)
+import std.json (Json, Str, Array, object)
+import std.bytes
+import std.list
+import std.string
+
+pub type FileEdit = { file: File, start: Int, end: Int, text: Bytes }
+
+pub type PlacedFix = { title: Bytes, first: FileEdit, rest: List<FileEdit> }
+
+pub type UnappliedFix = { title: Bytes, reason: String }
+
+pub type FixPlacement = | Applicable(PlacedFix) | Unapplicable(UnappliedFix)
+
+pub type FixedFile = { file: File, text: Bytes }
+
+pub type Fixed = { files: List<FixedFile>, applied: List<PlacedFix>, unapplied: List<UnappliedFix> }
+
+type Choosing = { taken: List<PlacedFix>, unapplied: List<UnappliedFix> }
+
+fn placed_edits(fix: PlacedFix) -> List<FileEdit> = [fix.first].concat(fix.rest)
+
+fn touches(a: FileEdit, b: FileEdit) -> Bool =
+  a.file.at == b.file.at && a.start <= b.end && b.start <= a.end
+
+fn fits(taken: List<PlacedFix>, fix: PlacedFix) -> Bool =
+  placed_edits(fix).all(|edit: FileEdit|
+    !taken.any(|t: PlacedFix| placed_edits(t).any(|x: FileEdit| touches(x, edit))))
+
+fn applied(text: Bytes, edits: List<FileEdit>) -> Bytes / {abort.raise} =
+  edits.sort_by(|a: FileEdit, b: FileEdit| a.start > b.start).fold(
+    text,
+    |t: Bytes, edit: FileEdit|
+      Bytes::concat_all([t.slice(0, edit.start), edit.text, t.slice(edit.end, t.len())]),
+  )
+
+fn chosen(choosing: Choosing, fix: FixPlacement) -> Choosing / {abort.raise} =
+  match fix {
+    Applicable(placed) -> if fits(choosing.taken, placed) {
+      { ..choosing, taken: choosing.taken.push(placed) }
+    } else {
+      {
+        ..choosing,
+        unapplied: choosing.unapplied.push({
+          title: placed.title,
+          reason: "its edit at " ++ place_of(placed) ++ " overlaps a fix applied in this run",
+        }),
+      }
+    },
+    Unapplicable(unapplied) -> { ..choosing, unapplied: choosing.unapplied.push(unapplied) },
+  }
+
+pub fn fixed(fixes: List<FixPlacement>) -> Fixed / {abort.raise} = {
+  let choice = fixes.fold({ taken: [], unapplied: [] }, chosen);
+  let taken = choice.taken;
+  let edits = taken.flat_map(placed_edits);
+  let files = edits.fold([], |found: List<File>, edit: FileEdit|
+    if found.any(|f: File| f.at == edit.file.at) { found } else { found.push(edit.file) });
+  {
+    files: files.map(|file: File|
+      { file: file, text: applied(file.text, edits.filter(|e: FileEdit| e.file.at == file.at)) }),
+    applied: taken,
+    unapplied: choice.unapplied,
+  }
+}
+
+fn place_of(fix: PlacedFix) -> String / {abort.raise} = {
+  let file = fix.first.file;
+  file.path ++ ":" ++ position_of(file.text, fix.first.start).line.to_string()
+}
+
+fn change_line(fix: PlacedFix) -> String / {abort.raise} =
+  "fixed " ++ place_of(fix) ++ ": " ++ String::of_bytes_lossy(fix.title)
+
+pub fn change_lines(fixes: List<PlacedFix>) -> List<String> / {abort.raise} = fixes.map(change_line)
+
+fn change_json(fix: PlacedFix) -> Json / {abort.raise} =
+  object([
+    { key: "at", value: Str(place_of(fix)) },
+    { key: "title", value: Str(String::of_bytes_lossy(fix.title)) },
+  ])
+
+pub fn changes_json(fixes: List<PlacedFix>) -> Json / {abort.raise} = Array(fixes.map(change_json))
+
+fn unapplied_line(fix: UnappliedFix) -> String =
+  "not fixed: " ++ String::of_bytes_lossy(fix.title) ++ ": " ++ fix.reason
+
+pub fn unapplied_lines(fixes: List<UnappliedFix>) -> List<String> = fixes.map(unapplied_line)
+
+fn unapplied_json(fix: UnappliedFix) -> Json =
+  object([
+    { key: "title", value: Str(String::of_bytes_lossy(fix.title)) },
+    { key: "reason", value: Str(fix.reason) },
+  ])
+
+pub fn unapplied_fixes_json(fixes: List<UnappliedFix>) -> Json = Array(fixes.map(unapplied_json))
+
+fn a_file(path: String, text: Bytes) -> File =
+  { path: path, module: "m", text: text, at: { label: WorkingDirectory, path: path } }
+
+fn effect_fix(file: File, at: Int) -> FixPlacement =
+  Applicable({
+    title: b"add `e` to the effects",
+    first: { file: file, start: at, end: at, text: b"e" },
+    rest: [],
+  })
+
+test "`fixed` applies the fixes of every diagnostic at once, each to its own file, and reports each one at its line" {
+  let c = a_file("c.ply", b"fn c() -> Int / {} = 1\n");
+  let b = a_file("b.ply", b"fn b() -> Int / {} = c()\n");
+  let result = fixed([effect_fix(c, 17), effect_fix(b, 17)]);
+  assert_eq(result.files.map(|f: FixedFile| f.text), [
+    b"fn c() -> Int / {e} = 1\n",
+    b"fn b() -> Int / {e} = c()\n",
+  ]);
+  assert_eq(change_lines(result.applied), [
+    "fixed c.ply:1: add `e` to the effects",
+    "fixed b.ply:1: add `e` to the effects",
+  ])
+}
+
+test "`fixed` leaves out a fix that touches an edit already taken, and reports it as not fixed" {
+  let c = a_file("c.ply", b"fn c() -> Int / {} = 1\n");
+  let result = fixed([effect_fix(c, 17), effect_fix(c, 17)]);
+  assert_eq(result.files.map(|f: FixedFile| f.text), [b"fn c() -> Int / {e} = 1\n"]);
+  assert_eq(change_lines(result.applied), ["fixed c.ply:1: add `e` to the effects"]);
+  assert_eq(unapplied_lines(result.unapplied), [
+    "not fixed: add `e` to the effects: its edit at c.ply:1 overlaps a fix applied in this run",
+  ])
+}
+
+test "`fixed` reports a fix it cannot apply with its reason, and still applies the others" {
+  let c = a_file("c.ply", b"fn c() -> Int / {} = 1\n");
+  let outside = Unapplicable({
+    title: b"add `e` to the effects",
+    reason: "it edits `<std>/json.ply`, which is not a file of this project",
+  });
+  let result = fixed([outside, effect_fix(c, 17)]);
+  assert_eq(change_lines(result.applied), ["fixed c.ply:1: add `e` to the effects"]);
+  assert_eq(unapplied_lines(result.unapplied), [
+    "not fixed: add `e` to the effects: it edits `<std>/json.ply`, which is not a file of this project",
+  ])
+}

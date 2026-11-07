@@ -1,8 +1,10 @@
+import std.set (Set)
 import compiler.check.types (Type, NamedType, FunctionType, RecordType, NominalType, Field,
                              Resource, NamedResource, SingletonResource, ResourceVariable,
                              AnyResource, encode_type, type_bin, resource_bin, int_type,
                              string_type, list_type)
 import compiler.check.resolve.tables (qualify, module_of_name)
+import compiler.syntax.expressions (prelude_module)
 import std.bin
 import std.bytes (ascii_of_int)
 import std.hash (blake3)
@@ -273,10 +275,28 @@ fn digest_text(text: Bytes) -> Bytes = {
   b"%".concat(ascii_of_int(high << 31 | low >>> 1))
 }
 
+pub fn test_roots(module: Bytes, name: Bytes, cases: Bool) -> List<RootKey> / {abort.raise} = {
+  let run = test_key(module, name);
+  if cases { [run, TestCases(run)] } else { [run] }
+}
+
 pub fn entry_name(root: RootName) -> RootName = RootName(root_text(root).concat(b"#entered"))
 
-pub fn has_entry(k: RootKey, arity: Int, stated: Map<Bytes, Bool>) -> Bool =
-  match k { Named(n) -> arity == 0 || stated.contains(n), EntryPoint(_) -> true, _ -> false }
+pub fn definition_of_root(k: RootKey) -> Option<Bytes> =
+  match k {
+    Named(n) -> Some(n),
+    Specialisation(s, _) -> Some(s.definition),
+    Coded(c) -> Some(c.definition),
+    Clause(c) -> definition_of_root(c.definition),
+    EntryPoint(e) -> definition_of_root(e),
+    Generated(_, _) -> None,
+    Test(_) -> None,
+    TestCases(_) -> None,
+    Law(_) -> None,
+  }
+
+pub fn has_entry<| e>(k: RootKey, arity: Int, stated: (Bytes) -> Bool / e) -> Bool / e =
+  match k { Named(n) -> arity == 0 || stated(n), EntryPoint(_) -> true, _ -> false }
 
 pub fn part_name(p: LawPart) -> Bytes = match p { LawGuard -> b"guard", LawBody -> b"body" }
 
@@ -336,12 +356,10 @@ pub fn module_of(k: RootKey) -> Bytes =
     EntryPoint(e) -> module_of(e),
   }
 
-pub fn modules_lowered(ks: List<RootKey>) -> Map<Bytes, Bool> =
-  ks.fold(Map::new(), |accumulator: Map<Bytes, Bool>, k: RootKey|
-    inlined_lambdas(k).fold(
-      accumulator.insert(module_of(k), true),
-      |m: Map<Bytes, Bool>, f: InlinedLambda| m.insert(module_of(f.owner), true),
-    ))
+pub fn modules_lowered(ks: List<RootKey>) -> Set<Bytes> =
+  ks.fold(Set::empty(), |accumulator: Set<Bytes>, k: RootKey|
+    inlined_lambdas(k).fold(accumulator.insert(module_of(k)), |m: Set<Bytes>, f: InlinedLambda|
+      m.insert(module_of(f.owner))))
 
 fn type_module(ty: Type, otherwise: Bytes) -> Bytes =
   match ty {
@@ -362,6 +380,14 @@ pub fn definition_of(k: RootKey) -> Option<Bytes> =
   }
 
 pub fn site_owner(k: RootKey) -> RootName = RootName(site_owner_text(k))
+
+pub fn site_owners(k: RootKey) -> List<RootName> =
+  [site_owner(k), site_owner(parent_root(k))].concat(
+    inlined_lambdas(k).map(|l: InlinedLambda| site_owner(l.owner)),
+  )
+
+fn parent_root(k: RootKey) -> RootKey =
+  match k { Clause(c) -> c.definition, TestCases(t) -> t, _ -> k }
 
 pub fn site_owner_text(k: RootKey) -> Bytes =
   match k {
@@ -431,7 +457,17 @@ pub fn with_operation(k: RootKey, operation: TypeOperation) -> RootKey =
 
 fn generated_with_name(
   w: { operation: TypeOperation, ty: Type, home: Bytes, marks: List<Int> },
-) -> RootKey = Generated(w, generated_name(w))
+) -> RootKey = {
+  let settled = { ..w, home: home_of_operation(w.operation, w.ty, w.home) };
+  Generated(settled, generated_name(settled))
+}
+
+fn home_of_operation(operation: TypeOperation, ty: Type, requesting_module: Bytes) -> Bytes =
+  match operation {
+    Equal -> type_module(ty, prelude_module),
+    Order -> type_module(ty, prelude_module),
+    _ -> requesting_module,
+  }
 
 pub fn unspecialised(k: RootKey) -> RootKey =
   match k { Specialisation(a, _) -> Named(a.definition), _ -> k }
@@ -534,9 +570,8 @@ test "keys for tests, laws and clauses have different names by kind and label, a
 
 test "key names work as map keys, ordered by their printed text" {
   let ks = [Named(b"m.z"), EntryPoint(Named(b"m.a")), Named(b"m.B"), Named(b"m.z")];
-  let table = ks.fold(Map::new(), |m: Map<RootName, Bool>, k: RootKey|
-    m.insert(root_name(k), true));
-  assert_eq(table.keys().map(root_text), [b"m.B", b"m.a#entered", b"m.z"]);
+  let table = ks.fold(Set::empty(), |m: Set<RootName>, k: RootKey| m.insert(root_name(k)));
+  assert_eq(table.elements().map(root_text), [b"m.B", b"m.a#entered", b"m.z"]);
   assert(
     table.contains(root_name(Named(b"m.B"))) && !table.contains(root_name(Named(b"m.b"))),
     None,
@@ -608,6 +643,14 @@ test "a specialization key gives its definition, type arguments and inlined lamb
   let coded = Coded({ definition: b"lib.h", code: b"3f09" });
   assert_eq([definition_of(coded), Some(module_of(coded))], [Some(b"lib.h"), Some(b"lib")]);
   assert_eq(site_owner(coded), site_owner(k))
+}
+
+test "the sites a specialization's code can name are its definition's and the definitions whose lambdas it inlines" {
+  let owner = specialisation_key(b"app.g", [list_type(int_type)], []);
+  let k = specialisation_key(b"lib.h", [int_type], [{ param: 1, owner: owner, nth: 0 }]);
+  assert(site_owners(k).contains(root_name(Named(b"lib.h"))), None);
+  assert(site_owners(k).contains(root_name(Named(b"app.g"))), None);
+  assert(!site_owners(k).contains(root_name(k)), None)
 }
 
 test "a generated key's printed name puts its integer annotations after its type, so keys differing only in annotations print differently" {

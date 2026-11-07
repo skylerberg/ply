@@ -121,21 +121,28 @@ and flag.
 
 ### 1.5 The cache
 
-`ply` stores results in `.ply-cache/` at the project root: checked modules, test results, proofs,
-saved baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is
-always safe, and `ply cache clear` empties it. A run that crashes, or that races another run, can
-make a later run redo work, but never gives a wrong result.
+`ply` stores its work in `.ply-cache/` at the project root: a database of checked modules, saved
+baselines for `ply review` and fetched dependencies. Add it to `.gitignore`. Deleting it is always safe, and `ply cache clear` empties it.
+A run that crashes, or that races another run, can make a later run redo work, but never gives a
+wrong result. A run whose results cannot be saved, because another `ply` was writing the database or
+the directory cannot be written, still finishes and warns that they were not kept (`W0601`). A
+damaged database is reported (`W0602`), and the run starts from an empty one.
+
+Each project has its own database. `ply cache copy CHECKOUT` starts a new checkout with the database
+of another one. The project's compiled code is kept in `.ply-cache/c/`, one library per part of the
+program, and a new build of a part replaces the old one. The standard library's compiled code belongs
+to the `ply` binary: it is kept in a directory for that binary, which a later run of any `ply`
+removes once the binary is deleted or replaced.
+
+A command updates the database for the files that changed, then reads its answer from the database.
+So the work follows the edit, not the size of the program, and no command keeps a result of its own.
 
 A definition's hash is a fingerprint of the definition and of everything it depends on. It does not
 cover the definition's comments, formatting or name. So a rename or a comment edit reruns no test.
-If you edit a function's body and leave its signature unchanged, `ply` rechecks that function and
-every function that calls it, directly or through other callers. A `ply` reuses a cached result only
-if it would compute exactly that result itself. It recomputes results that a different `ply` cached
-(`W0603`).
-
-`PLY_CACHE_UPSTREAM=DIR` adds a second cache that several checkouts or machines share. Test results
-and proofs found there are used, and new ones are written there. `PLY_CACHE_UPSTREAM_READONLY=1`
-only reads it. `--no-cache` ignores both caches.
+If you edit a function's body and leave its signature unchanged, `ply` rechecks that function, and
+its callers only if what they can see of it changed, such as whether it returns. A `ply` reuses a
+cached result only if it would compute exactly that result itself. It recomputes results that a
+different `ply` cached (`W0603`).
 
 ## 2. A tour of Ply
 
@@ -787,7 +794,9 @@ checked against the signature, never against the body.
 
 The written effects are an upper bound: what the body performs must fit inside them (`E0302`, which
 shows the effects to write). An effect the body never performs is the warning `W0614`, which shows
-the narrower signature. An `effect set` counts as performed when any of its members is.
+the narrower signature. An `effect set` counts as performed when any of its members is. A call
+performs an effect only if the callee performs it, so when a chain of callers declares an effect that
+no link performs, one check warns at every link and one `ply check --fix` narrows them all.
 
 **Borrowed function parameters.** A function-typed parameter of a top-level `fn` is *borrowed*: the
 function may use it only until the call returns. It may call it, pass it to another borrowed
@@ -1115,7 +1124,9 @@ cannot show to return, `ply check --types` prints the reason.
 Values never change, but an update reuses memory when nothing else can see the old value.
 `xs.push(x)` appends in place when the caller has the only reference to `xs`. When something else
 refers to `xs`, it takes the next free slot and shares the items, and it copies the list only if
-another push already took that slot. `List::set`, `Array::set` and record updates copy whenever
+another push already took that slot. It also copies when the item's type can hold a list of that
+same type, or a function: such an item could refer to the list's own memory, and the shared slot
+would then keep that memory alive forever. `List::set`, `Array::set` and record updates copy whenever
 something else refers to the value, and `Map::insert` copies one path of the map's tree. A rest,
 `[x, ..rest]`, shares its list instead of copying it.
 
@@ -1418,6 +1429,13 @@ limit, and a few task operations (§9). A clause for `abort.raise` receives the 
 handles it only when named: `try[abort.raise] { .. }`. Unhandled, a failed assertion is an error
 (`E0501`) and any other is an error (`E0502`). Overflow and running out of stack end the program and
 cannot be handled.
+
+**Where a failure is reported.** The error that ends the program points at the expression that
+failed, labelled `raised here`. It also labels each call the failure returned through, `called
+here`, from the innermost call outwards. Each label names the function it is in. So a failing
+`xs.get(9)` names the line inside `List::get` and the line of your code that called it. When the
+run has no source for a label's function, the label becomes a note that names the function.
+Recording these calls costs nothing while the program runs without failing.
 
 **Calls that cannot fail.** A call adds no `abort.raise` when the checker can see that it cannot
 fail where it is written:
@@ -1726,39 +1744,33 @@ snapshots=snapshots` (§14.1).
 
 A test must be deterministic. After the test's own handlers have handled effects, the test must not
 have a `nondet` effect left. If it does, the error is an error (`E0412`). To fix it, handle that
-effect, or write `test/nondet "label" { .. }`. A `test/nondet` is cached like any test. However, the
-values it reads from the clock or the network are not part of the cache key, so a change in those
-values does not make the test run again (§10.3).
+effect, or write `test/nondet "label" { .. }`. A `test/nondet` runs every time, because its effects
+can write (§10.3).
 
 A test is not a process, so it has no standard streams: a test that prints is an error (`E0424`)
 unless it handles the console itself. A test may start the programs `--exec` grants (§14.1).
 
 ### 10.3 Which tests run
 
-`ply test` runs a test only when no passing result is recorded for it. A passing result is recorded
-under two keys. The first key is the test's hash, which covers everything the test depends on but
-not names, comments or formatting. The second key is the compiled code the test ran. If an edit or a
-new `ply` compiles the test to the same code, the hash changes but the code does not, so the
-recorded pass still applies and `ply test` does not run the test.
+`ply test` runs a `test/nondet` every time. It runs any other test only when no passing result is
+recorded for it. A passing result is recorded under two keys. The first key is the test's hash,
+which covers everything the test depends on but not names, comments or formatting. The second key
+is the compiled code the test ran. If an edit or a new `ply` compiles the test to the same code, the
+hash changes but the code does not, so the recorded pass still applies and `ply test` does not run
+the test.
 
-A pass also records what the test read from outside the program, and stays valid only while that
-is unchanged:
-
-- each file and directory it read under a file system root;
-- each standard library function, type and effect it used;
-- everything read by each `ply` process it started;
-- for a test that used the host (the real machine, through the real handlers, rather than handlers
-  the test supplies), the permissions the test ran with (§14.1).
-
-The following do not count as inputs: values supplied by the test's own handlers, files the test
-wrote and then read, the clock, and the network.
+The test's hash covers each standard library function, type and effect the test uses, so a change
+to one of them reruns the test. A test that uses the host also records what it read: files and
+directories under the roots `--fs` grants, configuration keys, standard library module texts, the
+list of shipped modules, the `ply` program, and which roots, programs and effects were granted. `ply test` reuses the recorded
+pass only while each of these still has the value the test read. If any has changed, the test runs
+again.
 
 | flag | meaning |
 | --- | --- |
-| `--explain` | why each test was selected, which input changed, and where the time went |
+| `--explain` | why each test was selected, and where the time went |
 | `--filter TEXT` | run tests whose `<module>.<label>` contains `TEXT`; repeatable. Tests whose `<module>.<label>` does not contain `TEXT` do not run. The trailing dot in `std.json.` is part of the text, so the filter matches every test in the module `std.json` and no test in a module such as `std.jsonl`. |
 | `--shard K/N` | run part `K` of `N`; each test is always in the same part |
-| `--no-cache` | ignore recorded results |
 | `--watch` | run again whenever a source file, or a file the last run embedded, changes |
 
 `ply hash` prints definitions' hashes.
@@ -1779,6 +1791,13 @@ the limit does not fail. It *timed out* (`W0612`), and `ply test` lists it separ
 failures and does not count it as a failure. It runs again the next time. A run in which any test
 timed out is not a success.
 
+A test can crash the process that runs the tests, for example by a bug in Ply or by killing it. Each
+test that passed before the crash stays recorded as passing. The next run reports each test that was
+running when the process died as a failure (`E0505`), without running it, and runs the other tests
+as usual. The run after that runs those tests again. When several tests were running at the time,
+each one's failure names the others; `-j 1` runs one test at a time, so the next crash names the
+test that caused it.
+
 ### 10.5 When a test fails
 
 A failure lists its *changes*: the definitions the test uses that changed since the test last
@@ -1786,8 +1805,8 @@ passed, and the test itself if its text changed. Edited definitions come first, 
 removed ones, then those that changed only because a definition they use changed. After the
 failures, `ply test` prints each change once, as a diff of the old and new text. A test that has
 never passed has no earlier version to compare with, so each definition it uses counts as a change.
-The exception is a definition that any earlier passing run of any test has already used. That
-definition does not count.
+The exception is a definition that was already in the program during an earlier run in which every
+test passed. That definition does not count.
 
 `--json` gives each failure's diagnostic, outside effects, changes and the command that runs it
 again, plus the diffs.
@@ -2032,12 +2051,10 @@ them.
 is a nullable column, and a `List` of those is an array. Any other field is stored as JSON with its
 type's own `json` codec.
 
-**Writing a deriver.** A deriver is a function in a module with the signature `pub fn
-derive(declaration: derive::Declaration) -> Result<String, derive::Refused>`. Its only allowed
-effect is raising an error. The module `std.derive` defines the type `derive::Declaration`, which
-describes the declaration the deriver is run on, and the type `derive::Refused`. The checker runs a
-deriver once per declaration, with a 60-second limit, and caches the result. If the deriver fails,
-or the code it generates does not pass the checker, the error is an error (`E0155`).
+The derivers in the table are the only ones. A `derive` whose module is not one of them is an error
+(`E0160`). A deriver reads only the module that holds the `derive`, so its result changes only when
+that module's text does. If the code a deriver generates does not pass the checker, the error is
+`E0155`.
 
 ## 13. Builtins and the standard library
 
@@ -2327,14 +2344,15 @@ the running `ply`.
 
 ```
 $ ply build . --entry app.serve -o app.plyx
-$ ply build . --digest              # print `b3:...`; write no file
+$ ply build . --digest              # print `b3:...`; write no `.plyx`
 $ ply build . --diff old.plyx       # what a rebuild would change
 $ ply run app.plyx
 ```
 
 `ply build` writes a `.plyx` file that contains everything the program needs to run from an entry
-point (default `main`). The `.plyx` contains:  - the definitions the entry point uses, identified by
-hash and stored as source without tests, laws (properties the program states about its definitions)
+point (default `main`). The `.plyx` contains:  - the definitions the entry point uses, each
+identified by a hash of its text and of what it uses that leaves out every name, so a rename changes
+no hash, and stored as source without tests, laws (properties the program states about its definitions)
 or comments; - the compiled code of those definitions.  Running a `.plyx` checks nothing. The
 `.plyx` has a BLAKE3 digest of that content. An edit to a definition the program does not use is not
 part of the content, so the digest stays the same. A `.plyx` also contains the standard library
@@ -2477,13 +2495,11 @@ whose `TERM` is not `dumb`.
 
 | variable | meaning |
 | --- | --- |
-| `PLY_CACHE_UPSTREAM`, `PLY_CACHE_UPSTREAM_READONLY` | a shared second cache (§1.5) |
 | `PLY_REGISTRY`, `PLY_REGISTRY_TOKEN` | the package registry and its publishing token (§16) |
 | `PLY_ATTESTERS` | public key files that `ply resolve` trusts to vouch for packages, separated as in `PATH` |
 | `PLY_TRUST` | PEM files, separated by `:`, whose certificates `ply`'s own HTTPS connections also trust |
 | `PLY_CC` | the C compiler to run instead of `cc` |
-| `PLY_C_CACHE` | where compiled code is cached (default `ply/cache` in the user's cache directory) |
-| `PLY_C_CACHE_MAX` | a size limit for that cache, in bytes; the least recently used entries go first |
+| `PLY_C_CACHE` | where each `ply` binary keeps its own directory (default `ply/binaries` in the user's cache directory) |
 | `NO_COLOR`, `FORCE_COLOR`, `CLICOLOR_FORCE`, `TERM` | color (§17.1) |
 
 ### 17.3 Commands
@@ -2495,11 +2511,11 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | command | options |
 | --- | --- |
 | `ply new PATH` | `--name NAME`, `--lib` |
-| `ply check [path]` | `--types` (each definition's type and effects), `--costs` (where an update to a value copies it instead of changing it in place, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
-| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--no-cache`, `--explain`, `--watch`, `--coverage` |
+| `ply check [path]` | `--fix` (apply every diagnostic's fix to the files, then check again), `--types` (each definition's type and effects), `--costs` (where an update to a value copies it instead of changing it in place, §6.10), `--explain` (with `--types`, also why a function may raise or not return), `--workspace`, `--verify-dependencies` |
+| `ply test [path]` | `--filter`, `--shard`, `--jobs`/`-j`, `--timeout`, `--explain`, `--watch`, `--coverage` |
 | `ply run [path] [-- ARGS]` | `--seed`, `--timeout`, `--profile`, `--explain`, `--require-signer KEY`, and the flags for choosing the program's hosts (the handlers that supply its real effects), for tracing, and for draining on shutdown. `ARGS` is what `process.args` returns. A `.plyx` path runs a built program. |
-| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--no-cache`, `--no-incremental`, `--explain`, `--static-prover`, `--workspace`, `--verify-dependencies`, simulation flags |
-| `ply review [path]` | `--changed` (default), `--accept`, `--no-cache`, `--no-incremental`, `--prove-budget`, `--timeout`, simulation flags |
+| `ply prove [path]` | `--filter`, `--jobs`, `--prove-budget`, `--timeout`, `--explain`, `--static-prover`, `--workspace`, `--verify-dependencies`, simulation flags |
+| `ply review [path]` | `--changed` (default), `--accept`, `--prove-budget`, `--timeout`, simulation flags |
 | `ply build [path]` | `--entry NAME`, `-o FILE`, `--config-schema`, `--digest`, `--diff OLD.plyx`, `--sign KEY`, `--verify` |
 | `ply hosts [path]` | the flags for choosing the program's hosts (the handlers that supply its real effects), for tracing, and for draining on shutdown, and `--digest` |
 | `ply doc NAME [path]` | for a definition: its signature, doc comment, clauses (the separate cases of its body), location, hash and the laws (the properties declared about it) that use it. For a type: its fields or variants and its functions. For an effect: its operations. For a module: its exports. |
@@ -2521,16 +2537,14 @@ directory. *Host flags* are those in §14 (`--fs`, `--exec`, `--allow`, `--tls`,
 | `ply attest NAME VERSION` | checks, tests and proves a published version; `--sign KEY` |
 | `ply contracts NAME FROM TO` | what changed in the public interface between two published versions |
 | `ply keygen PATH` | writes an Ed25519 key pair |
-| `ply cache clear\|stats\|compact [path]` | empties the cache, reports its size, or reclaims unused space |
+| `ply cache clear\|stats [path]` | empties the cache, or reports its size |
+| `ply cache copy CHECKOUT [path]` | copies another checkout's database into this project |
 | `ply cache inspect DEF [path]` | what the cache stores for a definition or test |
 | `ply work [path]` | the packages `ply.work` lists |
 
 ### 17.4 Reusing results
 
-`ply check`, `ply test`, `ply run` and `ply definitions` remember their last result for the same
-command line. While nothing that result depended on has changed, they return it without loading the
-program. Otherwise they check again only what depends on a change. `--explain` reports whether a
-result was reused. `ply build`, `ply hosts` and `--no-cache` always check from scratch.
+After a change, commands check again only what depends on it.
 
 ### 17.5 Compiling
 
@@ -2593,15 +2607,16 @@ moves. `ply rename` never changes any other text in a string. It reports a warni
 string unchanged, for a string whose whole text is a renamed name but not a full dotted name, and
 for a string that contains a word `--words` renames.
 
-`ply rename` changes nothing and exits with code 2 in either of two cases. In the first case, the
-program does not check before the rename. In the second case, the rename would change what a name
-refers to. Examples are two definitions that would get the same name, a local variable that would be
-hidden by another local variable, a call on a value that could then call a different function, and
-code that a `derive` line generates for a type that uses a name the rename removes. These checks
-ensure that the renamed program has the same types, so `ply rename` does not check the program again
-afterwards. `ply rename` changes only the files under the paths you give it. It stops if another
-file of the package uses a renamed name. `--check` reports what would change without writing any
-file.
+`ply rename` changes nothing and exits with code 2 in any of three cases. In the first case, the
+program does not check before the rename. In the second case, the renamed program does not check:
+`ply rename` checks the files it would change, and the files that use their names, against the
+package's stored results. In the third case, the rename would change what a name refers to.
+Examples are two definitions that would get the same name, a local variable that would be hidden by
+another local variable, a call on a value that could then call a different function, and code that
+a `derive` line generates for a type that uses a name the rename removes. A map of only parameter
+and local lines skips both checks and compares only what each name refers to. `ply rename` changes
+only the files under the paths you give it. It stops if another file of the package uses a renamed
+name. `--check` reports what would change without writing any file.
 
 ### 17.7 Editing one definition
 
@@ -2625,13 +2640,27 @@ The first line has the severity, the code and the message. Then each label shows
 the source line, and marks under the span. A note follows as a `  = ` line. Color never changes the
 text.
 
+A command reports every error it can find in one run, in every module, not only the first. An
+error stays where it is written: other definitions are still checked against the signature the
+broken one declares, and a module that imports a module with errors is still checked. An import
+that fails is reported once, at the import; the names it would bring in produce no further errors
+where they are used.
+
 `E` codes are errors, and so is `X0001` (a character that cannot appear in source). `W` codes are
 warnings, which never mean the program is wrong. `ply explain CODE` describes a code, and `ply
 explain --all` lists them all.
 
 Under `--json`, a diagnostic with a known fix includes `fixes`. Each fix has a `title` and `edits`,
 and each edit replaces the text from `start` to `end` of `file` with `text`. On a terminal, a fix is
-shown as a `= fix:` line. A runtime diagnostic, such as a failed assertion, cuts a long value short
+shown as a `= fix:` line. A diagnostic offers either one fix or several alternatives, such as which
+`raise` a `try` handles. Its `fix_choice` is `none`, `apply` (one fix) or `choose_one` (the `fixes`
+are alternatives). `ply check --fix` applies only a diagnostic's single fix, and leaves a choice
+between alternatives to you. It prints a `fixed` line for each fix it applied and a `not fixed` line,
+with the reason, for each fix it did not apply: a choice between alternatives, an edit outside the
+project's own files (in a dependency or a shipped module), or an edit that overlaps a fix applied in
+the same run. Under `--json` these are `fixed` and `not_fixed`. When a body performs an effect its
+signature lacks, every caller that does not handle the effect gets its own error and fix in the same
+run, so `ply check --fix` fixes the whole chain at once. A runtime diagnostic, such as a failed assertion, cuts a long value short
 with `… N more`; under `--json` the whole value is in `values`.
 
 ## 19. Limits and sharp edges
