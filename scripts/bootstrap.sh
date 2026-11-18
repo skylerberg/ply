@@ -21,7 +21,7 @@ if [ ! -x "$ply" ]; then
       --jq '.assets[0].updatedAt' 2>/dev/null); then
     released=$(date -u -jf "%Y-%m-%dT%H:%M:%SZ" "$updated" +%s 2>/dev/null \
       || date -d "$updated" +%s 2>/dev/null || echo 0)
-    modified=$(stat -f %m "$ply" 2>/dev/null || stat -c %Y "$ply")
+    modified=$(stat -c %Y "$ply" 2>/dev/null || stat -f %m "$ply")
     if [ "$released" -gt "$modified" ]; then
       echo "stage0: the release is newer than $ply; scripts/stage0.sh refreshes it" >&2
     fi
